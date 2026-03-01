@@ -14,7 +14,7 @@ Any vm-host interations must be explicitly declared by the host.
 
 You can get acquainted with the standart library here.
 [Standart library](./Cs/BCL/CoreBCL.cs)
-[Extended library]](./Cs/BCL/CoreBCL.cs)
+[Extended library](./Cs/BCL/ExtendedBCL.cs)
 
 ---
 
