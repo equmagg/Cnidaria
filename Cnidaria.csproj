@@ -1,0 +1,25 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+	<LangVersion>10.0</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<Compile Remove="Cs\BCL\**\*.cs" />
+    <EmbeddedResource Include="Cs\BCL\**\*.cs" Pack="true" />
+  </ItemGroup>
+	
+  <PropertyGroup>
+    <PackageId>Cnidaria</PackageId>
+    <Version>0.1.3</Version>
+    <Authors>equmag</Authors>
+    <Description>Lightweight RCE safe interpreter collection</Description>
+
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)nuget</PackageOutputPath>
+  </PropertyGroup>
+</Project>
