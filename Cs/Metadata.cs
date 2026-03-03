@@ -28,7 +28,7 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int Table(int token) => token & unchecked((int)0xFF000000);
     }
-    internal enum MetadataTableKind
+    public enum MetadataTableKind
     {
         AssemblyRef,
         TypeRef,
@@ -44,7 +44,7 @@ namespace Cnidaria.Cs
         Property
     }
 
-    internal interface IMetadataView
+    public interface IMetadataView
     {
         string ModuleName { get; }
         string DefaultExternalAssemblyName { get; }
@@ -464,7 +464,7 @@ namespace Cnidaria.Cs
         public MethodDefRow GetMethodDef(int rid) => _md.Methods[rid - 1];
         public ParamRow GetParam(int rid) => _md.Params[rid - 1];
         public MemberRefRow GetMemberRef(int rid) => _md.MemberRefs[rid - 1];
-        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1]; 
+        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1];
         public MethodSpecRow GetMethodSpec(int rid) => _md.MethodSpecs[rid - 1];
         public ConstantRow GetConstant(int rid) => _md.Constants[rid - 1];
         public PropertyRow GetProperty(int rid) => _md.Properties[rid - 1];
@@ -976,7 +976,7 @@ namespace Cnidaria.Cs
             }
         }
     }
-    internal sealed class MetadataImage
+    public sealed class MetadataImage
     {
         public string ModuleName { get; }
         public string DefaultExternalAssemblyName { get; }
@@ -1005,7 +1005,7 @@ namespace Cnidaria.Cs
                 : defaultExternalAssemblyName;
         }
     }
-    internal sealed class StringsHeap
+    public sealed class StringsHeap
     {
         private readonly Dictionary<string, int> _map = new(StringComparer.Ordinal);
         private readonly List<string> _items = new() { "" }; // index 0 => empty
@@ -1027,7 +1027,7 @@ namespace Cnidaria.Cs
             return _items[index];
         }
     }
-    internal sealed class UserStringsHeap
+    public sealed class UserStringsHeap
     {
         private readonly Dictionary<string, int> _map = new(StringComparer.Ordinal);
         private int _nextRid = 1;
@@ -1045,7 +1045,7 @@ namespace Cnidaria.Cs
             return MetadataToken.Make(MetadataToken.UserString, rid);
         }
     }
-    internal sealed class BlobHeap
+    public sealed class BlobHeap
     {
         private readonly Dictionary<string, int> _map = new(StringComparer.Ordinal);
         private readonly List<byte[]> _items = new() { Array.Empty<byte>() }; // index 0 unused
@@ -1066,12 +1066,12 @@ namespace Cnidaria.Cs
             return _items[index];
         }
     }
-    internal struct AssemblyRefRow
+    public struct AssemblyRefRow
     {
         public int Name; // #Strings index
         public AssemblyRefRow(int name) => Name = name;
     }
-    internal struct TypeRefRow
+    public struct TypeRefRow
     {
         public int ResolutionScopeToken;
         public int Name;      // #Strings
@@ -1084,7 +1084,7 @@ namespace Cnidaria.Cs
             Namespace = @namespace;
         }
     }
-    internal struct TypeDefRow
+    public struct TypeDefRow
     {
         public int Flags;
         public int Name;      // #Strings
@@ -1104,7 +1104,7 @@ namespace Cnidaria.Cs
             MethodList = methodList;
         }
     }
-    internal struct NestedClassRow
+    public struct NestedClassRow
     {
         public int NestedTypeRid;
         public int EnclosingTypeRid;
@@ -1115,7 +1115,7 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal struct FieldRow
+    public struct FieldRow
     {
         public ushort Flags;
         public int Name;       // #Strings
@@ -1127,7 +1127,7 @@ namespace Cnidaria.Cs
             Signature = signature;
         }
     }
-    internal struct MethodDefRow
+    public struct MethodDefRow
     {
         public ushort ImplFlags;
         public ushort Flags;
@@ -1145,7 +1145,7 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal struct ParamRow
+    public struct ParamRow
     {
         public ushort Flags;
         public ushort Sequence; // 1..N
@@ -1157,7 +1157,7 @@ namespace Cnidaria.Cs
             Name = name;
         }
     }
-    internal struct ConstantRow
+    public struct ConstantRow
     {
         public int ParentToken;
         public byte TypeCode;
@@ -1169,7 +1169,7 @@ namespace Cnidaria.Cs
             Value = valueBlob;
         }
     }
-    internal struct PropertyRow
+    public struct PropertyRow
     {
         public ushort Flags;
         public int Name;       // #Strings
@@ -1185,7 +1185,7 @@ namespace Cnidaria.Cs
             SetMethod = setMethod;
         }
     }
-    internal struct MemberRefRow
+    public struct MemberRefRow
     {
         public int ClassToken;
         public int Name;      // #Strings
@@ -1198,12 +1198,12 @@ namespace Cnidaria.Cs
             Signature = signature;
         }
     }
-    internal struct TypeSpecRow
+    public struct TypeSpecRow
     {
         public int Signature; // #Blob
         public TypeSpecRow(int signature) => Signature = signature;
     }
-    internal struct MethodSpecRow
+    public struct MethodSpecRow
     {
         public int Method;        // MethodDef or MemberRef token
         public int Instantiation; // #Blob
@@ -1322,16 +1322,21 @@ namespace Cnidaria.Cs
         private readonly Func<NamedTypeSymbol, string?>? _externalAssemblyResolver;
         private readonly Dictionary<string, int> _assemblyRefTokenByName = new(StringComparer.Ordinal);
 
+        private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
+
         private int _defaultExternalAssemblyRefToken; // AssemblyRef
         private int _localFunctionsHostTypeToken;     // TypeDef
+        private readonly NamedTypeSymbol _systemObject;
+        private NamespaceSymbol? _sysNsCache;
         public MetadataTokenProvider(
             string moduleName,
             NamespaceSymbol moduleGlobalNamespace,
+            NamedTypeSymbol systemObject,
             string defaultExternalAssemblyName = "std",
             Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null)
         {
             if (moduleGlobalNamespace is null) throw new ArgumentNullException(nameof(moduleGlobalNamespace));
-
+            _systemObject = systemObject ?? throw new ArgumentNullException(nameof(systemObject));
             _externalAssemblyResolver = externalAssemblyResolver;
 
             Image = new MetadataImage(moduleName, defaultExternalAssemblyName);
@@ -1402,10 +1407,65 @@ namespace Cnidaria.Cs
             };
         }
         public int GetUserStringToken(string value) => Image.UserStrings.GetToken(value);
+        private NamespaceSymbol GetSystemNamespaceOrThrow()
+        {
+            if (_sysNsCache != null) return _sysNsCache;
+            if (_systemObject.ContainingSymbol is NamespaceSymbol ns && string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                return _sysNsCache = ns;
+            throw new InvalidOperationException("System.Object must be declared in namespace System.");
+        }
+        private NamedTypeSymbol GetValueTupleDef(int arity)
+        {
+            if (_valueTupleDefCache.TryGetValue(arity, out var t))
+                return t;
+
+            var sys = GetSystemNamespaceOrThrow();
+            var cands = sys.GetTypeMembers("ValueTuple", arity);
+            if (cands.IsDefaultOrEmpty)
+                throw new InvalidOperationException($"Missing System.ValueTuple with arity {arity}.");
+
+            t = cands[0];
+            _valueTupleDefCache[arity] = t;
+            return t;
+        }
+        private void WriteValueTupleSigForElements(SigWriter w, ImmutableArray<TypeSymbol> elems, int start)
+        {
+            int remaining = elems.Length - start;
+            if (remaining == 0)
+            {
+                var def0 = GetValueTupleDef(0);
+                w.Byte((byte)SigElementType.VALUETYPE);
+                w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(GetTypeToken(def0)));
+                return;
+            }
+
+            if (remaining <= 7)
+            {
+                var def = GetValueTupleDef(remaining);
+                w.Byte((byte)SigElementType.GENERICINST);
+                w.Byte((byte)SigElementType.VALUETYPE);
+                w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(GetTypeToken(def)));
+                w.CompressedUInt((uint)remaining);
+                for (int i = 0; i < remaining; i++)
+                    WriteTypeSig(w, elems[start + i]);
+                return;
+            }
+
+            var def8 = GetValueTupleDef(8);
+            w.Byte((byte)SigElementType.GENERICINST);
+            w.Byte((byte)SigElementType.VALUETYPE);
+            w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(GetTypeToken(def8)));
+            w.CompressedUInt(8);
+            for (int i = 0; i < 7; i++)
+                WriteTypeSig(w, elems[start + i]);
+
+            WriteValueTupleSigForElements(w, elems, start + 7);
+        }
         public int GetTypeToken(TypeSymbol type)
         {
             if (type is null) throw new ArgumentNullException(nameof(type));
-
+            if (type is TupleTypeSymbol)
+                return GetOrAddTypeSpec(type);
             // Named type
             if (type is NamedTypeSymbol nt)
             {
@@ -1476,7 +1536,7 @@ namespace Cnidaria.Cs
             _assemblyRefTokenByName[name] = tok;
             return tok;
         }
-        
+
         private ImmutableArray<NamedTypeSymbol> CollectAllModuleTypes(NamespaceSymbol root)
         {
             var set = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
@@ -1718,7 +1778,7 @@ namespace Cnidaria.Cs
             {
                 var def = type.OriginalDefinition;
                 string asm =
-                    _externalAssemblyResolver?.Invoke(def) 
+                    _externalAssemblyResolver?.Invoke(def)
                     ?? Image.DefaultExternalAssemblyName; // fallback to default
 
                 scopeTok = EnsureAssemblyRef(asm);
@@ -1833,8 +1893,7 @@ namespace Cnidaria.Cs
             int nameIdx = Image.Strings.Add("<$LocalFunctions>");
             int nsIdx = 0;
 
-            var fakeObject = new ErrorTypeSymbol("System.Object", containing: null, locations: ImmutableArray<Location>.Empty);
-            int objTok = GetTypeToken(fakeObject); // will become TypeRef to default external
+            int objTok = GetTypeToken(_systemObject);
             int extendsEncoded = unchecked((int)SigEncoding.EncodeTypeDefOrRef(objTok));
 
             int fieldList = Image.Fields.Count + 1;
@@ -1954,8 +2013,9 @@ namespace Cnidaria.Cs
                     w.Byte((byte)SigElementType.BYREF);
                     WriteTypeSig(w, br.ElementType);
                     return;
-                case TupleTypeSymbol:
-                    throw new NotSupportedException("TupleTypeSymbol is not encodable without mapping to System.ValueTuple types.");
+                case TupleTypeSymbol tt:
+                    WriteValueTupleSigForElements(w, tt.ElementTypes, 0);
+                    return;
 
                 case SubstitutedNamedTypeSymbol snt:
                     // Generic instantiation type signature

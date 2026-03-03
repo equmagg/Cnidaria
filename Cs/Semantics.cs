@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Text;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -157,6 +156,7 @@ namespace Cnidaria.Cs
     public interface IDiagnostic
     {
         public string GetMessage();
+        public DiagnosticSeverity GetSeverity();
     }
     public readonly struct Diagnostic : IDiagnostic
     {
@@ -172,8 +172,9 @@ namespace Cnidaria.Cs
             Message = message;
             Location = location;
         }
-        public override string ToString() => $"{Severity}: {Message} [{Location}]";
+        public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location}])")}";
         public string GetMessage() => this.ToString();
+        public DiagnosticSeverity GetSeverity() => this.Severity;
     }
     public readonly struct Optional<T>
     {
@@ -704,7 +705,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        internal (MetadataImage md, Dictionary<int, BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
+        public (MetadataImage md, Dictionary<int, BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
             string moduleName,
             SyntaxTree tree,
             bool includeCoreTypesInTypeDefs,
@@ -724,10 +725,11 @@ namespace Cnidaria.Cs
             var rootNs = includeCoreTypesInTypeDefs
                 ? compilation.GlobalNamespace
                 : compilation.SourceGlobalNamespace;
-
+            var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
             var tokens = new MetadataTokenProvider(
                 moduleName,
                 rootNs,
+                systemObject,
                 defaultExternalAssemblyName,
                 externalAssemblyResolver);
 
@@ -736,8 +738,7 @@ namespace Cnidaria.Cs
             try
             {
                 if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
-                    return (tokens.Image, functions, diagnostics,
-                        new InvalidOperationException($"Cannot emit module '{moduleName}' because semantic errors were found."));
+                    return (tokens.Image, functions, diagnostics, null);
                 void AddFn(BytecodeFunction fn)
                 {
                     if (!functions.TryAdd(fn.MethodToken, fn))
@@ -768,34 +769,289 @@ namespace Cnidaria.Cs
                     var body = (BoundMethodBody)model.GetBoundNode(owner);
                     EmitBody(body);
                 }
+                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(compilation, tree))
+                {
+                    int ctorTok = tokens.GetMethodToken(ctor);
+                    if (functions.ContainsKey(ctorTok))
+                        continue;
+                    var ret = new BoundReturnStatement(tree.Root, expression: null);
+                    var block = new BoundBlockStatement(tree.Root, ImmutableArray.Create<BoundStatement>(ret));
+                    var body = new BoundMethodBody(tree.Root, ctor, block);
+                    EmitBody(body);
+                }
+                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(compilation, tree))
+                {
+                    int cctorTok = tokens.GetMethodToken(cctor);
+                    if (functions.ContainsKey(cctorTok))
+                        continue;
+
+                    var body = BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor);
+                    EmitBody(body);
+                }
                 return (tokens.Image, functions, diagnostics, null);
             }
             catch (Exception ex)
             {
                 if (print)
-                    Console.WriteLine(ex.ToString());
+                    Console.WriteLine(ex.Message);
                 return (tokens.Image, functions, diagnostics, ex);
             }
 
         }
+        private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            MethodSymbol cctor)
+        {
+            var bag = new DiagnosticBag();
+
+            IBindingRecorder recorder =
+                model is IBindingRecorder r ? r : NullRecorder.Instance;
+
+            var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, bag);
+            var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
+            var exprBinder = new LocalScopeBinder(parent: typeBinder, flags: BinderFlags.InMethod, containing: cctor);
+
+            var ctx = new BindingContext(compilation, model, cctor, recorder);
+
+            var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
+
+            var ownerType = (NamedTypeSymbol)cctor.ContainingSymbol!;
+            var members = ownerType.GetMembers();
+
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not SourceFieldSymbol fs)
+                    continue;
+                if (!fs.IsStatic || fs.IsConst)
+                    continue;
+
+                var declRefs = fs.DeclaringSyntaxReferences;
+                if (declRefs.IsDefaultOrEmpty)
+                    continue;
+
+                if (declRefs[0].Node is not VariableDeclaratorSyntax vd)
+                    continue;
+                if (vd.Initializer is null)
+                    continue;
+
+                var rhsSyntax = vd.Initializer.Value;
+                var rhsBound = exprBinder.BindExpression(rhsSyntax, ctx, bag);
+
+                rhsBound = exprBinder.ApplyConversion(
+                    exprSyntax: rhsSyntax,
+                    expr: rhsBound,
+                    targetType: fs.Type,
+                    diagnosticNode: rhsSyntax,
+                    context: ctx,
+                    diagnostics: bag,
+                    requireImplicit: true);
+
+                var lhs = new BoundMemberAccessExpression(
+                    syntax: rhsSyntax,
+                    receiverOpt: null,
+                    member: fs,
+                    type: fs.Type,
+                    isLValue: true);
+
+                var ass = new BoundAssignmentExpression(vd, lhs, rhsBound);
+                stmts.Add(new BoundExpressionStatement(vd, ass));
+            }
+
+            stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
+            var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
+            return new BoundMethodBody(tree.Root, cctor, block);
+        }
+        private static IEnumerable<SynthesizedConstructorSymbol> EnumerateSynthesizedInstanceCtorsInTree(
+            Compilation compilation, SyntaxTree tree)
+        {
+            static bool IsDeclaredInTree(SourceNamedTypeSymbol t, SyntaxTree tree)
+            {
+                var refs = t.DeclaringSyntaxReferences;
+                if (refs.IsDefaultOrEmpty)
+                    return false;
+                for (int i = 0; i < refs.Length; i++)
+                {
+                    if (ReferenceEquals(refs[i].SyntaxTree, tree))
+                        return true;
+                }
+                return false;
+            }
+            static void AddTypeAndNested(
+                NamedTypeSymbol t,
+                SyntaxTree tree,
+                List<SourceNamedTypeSymbol> dst)
+            {
+                if (t is SourceNamedTypeSymbol st && IsDeclaredInTree(st, tree))
+                    dst.Add(st);
+
+                var members = t.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is NamedTypeSymbol nested)
+                        AddTypeAndNested(nested, tree, dst);
+                }
+            }
+            static void VisitNs(
+                NamespaceSymbol ns,
+                SyntaxTree tree,
+                List<SourceNamedTypeSymbol> dst)
+            {
+                var types = ns.GetTypeMembers();
+                for (int i = 0; i < types.Length; i++)
+                    AddTypeAndNested(types[i], tree, dst);
+                var nss = ns.GetNamespaceMembers();
+                for (int i = 0; i < nss.Length; i++)
+                    VisitNs(nss[i], tree, dst);
+            }
+            var list = new List<SourceNamedTypeSymbol>();
+            VisitNs(compilation.SourceGlobalNamespace, tree, list);
+            for (int ti = 0; ti < list.Count; ti++)
+            {
+                var members = list[ti].GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is SynthesizedConstructorSymbol ctor && !ctor.IsStatic)
+                        yield return ctor;
+                }
+            }
+        }
+        private static IEnumerable<MethodSymbol> EnumerateSynthesizedStaticCctorsInTree(Compilation compilation, SyntaxTree tree)
+        {
+            static bool IsDeclaredInTree(SourceNamedTypeSymbol t, SyntaxTree tree)
+            {
+                var refs = t.DeclaringSyntaxReferences;
+                if (refs.IsDefaultOrEmpty) return false;
+                for (int i = 0; i < refs.Length; i++)
+                    if (ReferenceEquals(refs[i].SyntaxTree, tree))
+                        return true;
+                return false;
+            }
+
+            static void AddTypeAndNested(NamedTypeSymbol t, SyntaxTree tree, List<SourceNamedTypeSymbol> dst)
+            {
+                if (t is SourceNamedTypeSymbol st && IsDeclaredInTree(st, tree))
+                    dst.Add(st);
+
+                var mem = t.GetMembers();
+                for (int i = 0; i < mem.Length; i++)
+                    if (mem[i] is NamedTypeSymbol nested)
+                        AddTypeAndNested(nested, tree, dst);
+            }
+
+            static void VisitNs(NamespaceSymbol ns, SyntaxTree tree, List<SourceNamedTypeSymbol> dst)
+            {
+                var types = ns.GetTypeMembers();
+                for (int i = 0; i < types.Length; i++)
+                    AddTypeAndNested(types[i], tree, dst);
+
+                var nss = ns.GetNamespaceMembers();
+                for (int i = 0; i < nss.Length; i++)
+                    VisitNs(nss[i], tree, dst);
+            }
+
+            var list = new List<SourceNamedTypeSymbol>();
+            VisitNs(compilation.SourceGlobalNamespace, tree, list);
+
+            for (int ti = 0; ti < list.Count; ti++)
+            {
+                var members = list[ti].GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is MethodSymbol ms &&
+                        ms.IsStatic &&
+                        ms.Parameters.Length == 0 &&
+                        StringComparer.Ordinal.Equals(ms.Name, ".cctor") &&
+                        (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty))
+                    {
+                        yield return ms;
+                    }
+                }
+            }
+        }
     }
     internal sealed class Imports
     {
+        public static readonly Imports Empty = new Imports(
+         containers: ImmutableArray<Symbol>.Empty,
+         aliases: ImmutableDictionary<string, AliasSymbol>.Empty.WithComparers(StringComparer.Ordinal),
+         staticTypes: ImmutableArray<NamedTypeSymbol>.Empty);
         public ImmutableArray<Symbol> Containers { get; } // NamespaceSymbol or NamedTypeSymbol
         public ImmutableDictionary<string, AliasSymbol> Aliases { get; }
         public ImmutableArray<NamedTypeSymbol> StaticTypes { get; }
+
         public Imports(
-        ImmutableArray<Symbol> containers,
-        ImmutableDictionary<string, AliasSymbol> aliases,
-        ImmutableArray<NamedTypeSymbol> staticTypes)
+            ImmutableArray<Symbol> containers,
+            ImmutableDictionary<string, AliasSymbol> aliases,
+            ImmutableArray<NamedTypeSymbol> staticTypes)
         {
-            Containers = containers;
-            Aliases = aliases;
-            StaticTypes = staticTypes;
+            Containers = containers.IsDefault ? ImmutableArray<Symbol>.Empty : containers;
+            Aliases = aliases ?? ImmutableDictionary<string, AliasSymbol>.Empty.WithComparers(StringComparer.Ordinal);
+            StaticTypes = staticTypes.IsDefault ? ImmutableArray<NamedTypeSymbol>.Empty : staticTypes;
         }
 
         public bool TryGetAlias(string name, out AliasSymbol? alias)
             => Aliases.TryGetValue(name, out alias);
+    }
+    internal sealed class ImportScopeMap
+    {
+        private readonly ImmutableArray<(TextSpan Span, Imports Imports)> _scopes;
+
+        public Imports RootImports { get; }
+
+        public ImportScopeMap(
+            Imports rootImports,
+            ImmutableArray<(TextSpan Span, Imports Imports)> scopes)
+        {
+            RootImports = rootImports ?? throw new ArgumentNullException(nameof(rootImports));
+            _scopes = scopes.IsDefault ? ImmutableArray<(TextSpan Span, Imports Imports)>.Empty : scopes;
+        }
+
+        public Imports GetImportsForPosition(int position)
+        {
+            // Select the smallest scope span containing the position
+            Imports best = RootImports;
+            int bestLen = int.MaxValue;
+
+            for (int i = 0; i < _scopes.Length; i++)
+            {
+                var (span, imports) = _scopes[i];
+
+                if (position < span.Start || position >= span.End)
+                    continue;
+
+                int len = span.Length;
+                if (len < bestLen)
+                {
+                    bestLen = len;
+                    best = imports;
+                }
+            }
+
+            return best;
+        }
+
+        public Imports GetImportsForSymbol(Symbol containingSymbol)
+        {
+            if (containingSymbol is null)
+                return RootImports;
+
+            var refs = containingSymbol.DeclaringSyntaxReferences;
+            if (refs.IsDefaultOrEmpty)
+                return RootImports;
+
+            var node = refs[0].Node;
+            return GetImportsForPosition(node.Span.Start);
+        }
+
+        public Imports GetImportsForNode(SyntaxNode node)
+        {
+            if (node is null)
+                return RootImports;
+
+            return GetImportsForPosition(node.Span.Start);
+        }
     }
     public readonly struct SyntaxReference
     {
@@ -1016,8 +1272,8 @@ namespace Cnidaria.Cs
             var bag = new DiagnosticBag();
             var recorder = (IBindingRecorder)this;
 
-            var imports = ImportsBuilder.Build(Compilation, SyntaxTree, recorder, bag);
-            var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: Compilation, imports: imports);
+            var importScopeMap = ImportsBuilder.BuildImportScopeMap(Compilation, SyntaxTree, recorder, bag);
+            var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: Compilation, importScopeMap: importScopeMap);
 
             // Bind top level statements if present
             var entryPoint = Compilation.EntryPoint;
@@ -1585,6 +1841,271 @@ namespace Cnidaria.Cs
 
             return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
         }
+        public static ImportScopeMap BuildImportScopeMap(
+            Compilation compilation,
+            SyntaxTree tree,
+            IBindingRecorder recorder,
+            DiagnosticBag diagnostics)
+        {
+            var compilationLevel = BuildCompilationLevelImports(compilation, tree, recorder, diagnostics);
+
+            var rootImports = ApplyUsingDirectives(
+                compilation: compilation,
+                tree: tree,
+                usings: tree.Root.Usings,
+                baseImports: compilationLevel,
+                recorder: recorder,
+                diagnostics: diagnostics,
+                allowGlobalUsing: true,
+                includeGlobalDirectives: false);
+
+            var scopes = new List<(TextSpan Span, Imports Imports)>();
+
+            var members = tree.Root.Members;
+            for (int i = 0; i < members.Count; i++)
+            {
+                if (members[i] is BaseNamespaceDeclarationSyntax ns)
+                    BuildNamespaceScopes(compilation, tree, ns, rootImports, recorder, diagnostics, scopes);
+            }
+
+            var b = ImmutableArray.CreateBuilder<(TextSpan Span, Imports Imports)>(scopes.Count);
+            for (int i = 0; i < scopes.Count; i++)
+                b.Add(scopes[i]);
+
+            return new ImportScopeMap(rootImports, b.ToImmutable());
+        }
+        private static void BuildNamespaceScopes(
+            Compilation compilation,
+            SyntaxTree tree,
+            BaseNamespaceDeclarationSyntax ns,
+            Imports parentImports,
+            IBindingRecorder recorder,
+            DiagnosticBag diagnostics,
+            List<(TextSpan Span, Imports Imports)> scopes)
+        {
+            var nsImports = ApplyUsingDirectives(
+                compilation: compilation,
+                tree: tree,
+                usings: ns.Usings,
+                baseImports: parentImports,
+                recorder: recorder,
+                diagnostics: diagnostics,
+                allowGlobalUsing: false,
+                includeGlobalDirectives: false);
+
+            scopes.Add((ns.Span, nsImports));
+
+            var members = ns.Members;
+            for (int i = 0; i < members.Count; i++)
+            {
+                if (members[i] is BaseNamespaceDeclarationSyntax inner)
+                    BuildNamespaceScopes(compilation, tree, inner, nsImports, recorder, diagnostics, scopes);
+            }
+        }
+        private static Imports BuildCompilationLevelImports(
+            Compilation compilation,
+            SyntaxTree requestingTree,
+            IBindingRecorder recorder,
+            DiagnosticBag diagnostics)
+        {
+            var baseImports = CreateImplicitImports(compilation);
+
+            var containers = baseImports.Containers.ToBuilder();
+            var aliases = baseImports.Aliases.ToBuilder();
+            var staticTypes = baseImports.StaticTypes.ToBuilder();
+
+            var seenGlobalAliases = new HashSet<string>(StringComparer.Ordinal);
+
+            var trees = compilation.SyntaxTrees;
+            for (int ti = 0; ti < trees.Length; ti++)
+            {
+                var tree = trees[ti];
+                var usings = tree.Root.Usings;
+
+                for (int ui = 0; ui < usings.Count; ui++)
+                {
+                    var u = usings[ui];
+                    bool isGlobal = u.GlobalKeyword.Span.Length != 0;
+                    if (!isGlobal)
+                        continue;
+
+                    ApplyOneUsingDirective(
+                        compilation: compilation,
+                        tree: tree,
+                        usingDirective: u,
+                        containers: containers,
+                        aliases: aliases,
+                        staticTypes: staticTypes,
+                        recorder: ReferenceEquals(tree, requestingTree) ? recorder : null,
+                        diagnostics: diagnostics,
+                        allowGlobalUsing: true,
+                        includeGlobalDirectives: true,
+                        seenAliasesInCurrentScope: seenGlobalAliases);
+                }
+            }
+
+            return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
+        }
+        private static Imports CreateImplicitImports(Compilation compilation)
+        {
+            var containers = ImmutableArray.CreateBuilder<Symbol>();
+            var aliases = ImmutableDictionary.CreateBuilder<string, AliasSymbol>(StringComparer.Ordinal);
+            var staticTypes = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
+
+            AddImplicitUsing(compilation, containers, "System");
+            AddImplicitUsing(compilation, containers, "System.Collections");
+            AddImplicitUsing(compilation, containers, "System.Collections.Generic");
+            AddImplicitUsing(compilation, containers, "System.Runtime.CompilerServices");
+
+            return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
+        }
+        private static Imports ApplyUsingDirectives(
+            Compilation compilation,
+            SyntaxTree tree,
+            SyntaxList<UsingDirectiveSyntax> usings,
+            Imports baseImports,
+            IBindingRecorder recorder,
+            DiagnosticBag diagnostics,
+            bool allowGlobalUsing,
+            bool includeGlobalDirectives)
+        {
+            var containers = baseImports.Containers.ToBuilder();
+            var aliases = baseImports.Aliases.ToBuilder();
+            var staticTypes = baseImports.StaticTypes.ToBuilder();
+
+            var seenAliasesInThisScope = new HashSet<string>(StringComparer.Ordinal);
+
+            for (int i = 0; i < usings.Count; i++)
+            {
+                ApplyOneUsingDirective(
+                    compilation: compilation,
+                    tree: tree,
+                    usingDirective: usings[i],
+                    containers: containers,
+                    aliases: aliases,
+                    staticTypes: staticTypes,
+                    recorder: recorder,
+                    diagnostics: diagnostics,
+                    allowGlobalUsing: allowGlobalUsing,
+                    includeGlobalDirectives: includeGlobalDirectives,
+                    seenAliasesInCurrentScope: seenAliasesInThisScope);
+            }
+
+            return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
+        }
+        private static void ApplyOneUsingDirective(
+            Compilation compilation,
+            SyntaxTree tree,
+            UsingDirectiveSyntax usingDirective,
+            ImmutableArray<Symbol>.Builder containers,
+            ImmutableDictionary<string, AliasSymbol>.Builder aliases,
+            ImmutableArray<NamedTypeSymbol>.Builder staticTypes,
+            IBindingRecorder? recorder,
+            DiagnosticBag diagnostics,
+            bool allowGlobalUsing,
+            bool includeGlobalDirectives,
+            HashSet<string> seenAliasesInCurrentScope)
+        {
+            bool isGlobal = usingDirective.GlobalKeyword.Span.Length != 0;
+
+            if (isGlobal && !allowGlobalUsing)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_GLOBAL001",
+                    DiagnosticSeverity.Error,
+                    "The 'global using' directive is only permitted at the compilation unit level.",
+                    new Location(tree, usingDirective.Span)));
+                return;
+            }
+
+            if (isGlobal && !includeGlobalDirectives)
+            {
+                // Already processed at compilation level
+                return;
+            }
+
+            bool isStatic = usingDirective.StaticKeyword.Span.Length != 0;
+
+            if (isStatic && usingDirective.Alias != null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_STATIC_ALIAS001",
+                    DiagnosticSeverity.Error,
+                    "A 'using static' directive cannot declare an alias.",
+                    new Location(tree, usingDirective.Span)));
+                return;
+            }
+
+            var importedContainersSnapshot = containers.ToImmutable();
+            var aliasesSnapshot = aliases.ToImmutable();
+
+            var target = ResolveNamespaceOrType(
+                compilation,
+                usingDirective.Name,
+                importedContainersSnapshot,
+                aliasesSnapshot,
+                diagnostics,
+                tree);
+
+            if (target is null)
+                return;
+
+            if (isStatic)
+            {
+                if (target is not NamedTypeSymbol nt)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_USING_STATIC001",
+                        DiagnosticSeverity.Error,
+                        "A 'using static' directive must reference a type.",
+                        new Location(tree, usingDirective.Span)));
+                    return;
+                }
+
+                AddStaticTypeUnique(staticTypes, nt);
+                return;
+            }
+
+            if (usingDirective.Alias != null)
+            {
+                var aliasName = usingDirective.Alias.Name.Identifier.ValueText ?? "";
+                if (aliasName.Length == 0)
+                    return;
+
+                if (!seenAliasesInCurrentScope.Add(aliasName))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_USING_ALIAS_DUP001",
+                        DiagnosticSeverity.Error,
+                        $"The using alias '{aliasName}' is declared more than once in this scope.",
+                        new Location(tree, usingDirective.Alias.Span)));
+                    return;
+                }
+
+                var aliasSym = new AliasSymbol(
+                    name: aliasName,
+                    containing: null,
+                    target: target,
+                    locations: ImmutableArray.Create(new Location(tree, usingDirective.Alias.Span)));
+
+                // Inner alias hides outer alias of the same name
+                aliases[aliasName] = aliasSym;
+
+                recorder?.RecordDeclared(usingDirective, aliasSym);
+                return;
+            }
+
+            AddContainerUnique(containers, target);
+        }
+        private static void AddStaticTypeUnique(ImmutableArray<NamedTypeSymbol>.Builder staticTypes, NamedTypeSymbol nt)
+        {
+            for (int i = 0; i < staticTypes.Count; i++)
+            {
+                if (ReferenceEquals(staticTypes[i], nt))
+                    return;
+            }
+            staticTypes.Add(nt);
+        }
         private static Symbol? ResolveNamespaceOrType(
             Compilation compilation,
             NameSyntax name,
@@ -1652,20 +2173,48 @@ namespace Cnidaria.Cs
 
             return null;
         }
-        private static void AddImplicitUsing(Compilation compilation, ImmutableArray<Symbol>.Builder containers, string ns)
+        private static void AddImplicitUsing(Compilation compilation, ImmutableArray<Symbol>.Builder containers, string nsName)
         {
-            var sys = TryGetTopLevelNamespace(compilation.GlobalNamespace, ns);
-            if (sys != null)
-                AddContainerUnique(containers, sys);
+            var ns = TryGetNamespace(compilation.GlobalNamespace, nsName);
+            if (ns != null)
+                AddContainerUnique(containers, ns);
         }
-        private static NamespaceSymbol? TryGetTopLevelNamespace(NamespaceSymbol global, string name)
+        private static NamespaceSymbol? TryGetNamespace(NamespaceSymbol global, string dottedName)
         {
-            foreach (var ns in global.GetNamespaceMembers())
+            if (string.IsNullOrEmpty(dottedName))
+                return null;
+
+            NamespaceSymbol? cur = global;
+            int pos = 0;
+
+            while (pos < dottedName.Length)
             {
-                if (StringComparer.Ordinal.Equals(ns.Name, name))
-                    return ns;
+                int nextDot = dottedName.IndexOf('.', pos);
+                string part = nextDot < 0
+                    ? dottedName.Substring(pos)
+                    : dottedName.Substring(pos, nextDot - pos);
+
+                NamespaceSymbol? next = null;
+                foreach (var ns in cur!.GetNamespaceMembers())
+                {
+                    if (StringComparer.Ordinal.Equals(ns.Name, part))
+                    {
+                        next = ns;
+                        break;
+                    }
+                }
+
+                if (next is null)
+                    return null;
+
+                cur = next;
+                if (nextDot < 0)
+                    break;
+
+                pos = nextDot + 1;
             }
-            return null;
+
+            return cur;
         }
         private static void AddContainerUnique(ImmutableArray<Symbol>.Builder containers, Symbol sym)
         {
@@ -1777,6 +2326,7 @@ namespace Cnidaria.Cs
         SizeOfExpression,
         CheckedExpression,
         UncheckedExpression,
+        ThrowExpression,
         // Statements
         BadStatement,
         Block,

@@ -1,9 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Globalization;
+using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Runtime.Intrinsics.Arm;
 using System.Text;
 using System.Threading;
 
@@ -202,7 +201,7 @@ namespace Cnidaria.Cs
                         location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
                 }
                 // where T : notnull
-                if ((constraints & (GenericConstraintsFlags.StructConstraint 
+                if ((constraints & (GenericConstraintsFlags.StructConstraint
                     | GenericConstraintsFlags.UnmanagedConstraint)) == 0
                     && (constraints & GenericConstraintsFlags.NotNullConstraint) != 0
                     && !GenericConstraintFacts.IsNotNullType(arg))
@@ -416,11 +415,11 @@ namespace Cnidaria.Cs
             public override Symbol? GetDeclaredSymbol(SyntaxNode declaration, CancellationToken cancellationToken = default) => null;
             public override SymbolInfo GetSymbolInfo(SyntaxNode node, CancellationToken cancellationToken = default) => SymbolInfo.None;
             public override Symbol? GetAliasInfo(NameSyntax nameSyntax, CancellationToken cancellationToken = default) => null;
-            public override TypeInfo GetTypeInfo(ExpressionSyntax expr, CancellationToken cancellationToken = default) 
+            public override TypeInfo GetTypeInfo(ExpressionSyntax expr, CancellationToken cancellationToken = default)
                 => new TypeInfo(null, null);
-            public override Optional<object> GetConstantValue(ExpressionSyntax expr, CancellationToken cancellationToken = default) 
+            public override Optional<object> GetConstantValue(ExpressionSyntax expr, CancellationToken cancellationToken = default)
                 => Optional<object>.None;
-            public override Conversion GetConversion(ExpressionSyntax expr, CancellationToken cancellationToken = default) 
+            public override Conversion GetConversion(ExpressionSyntax expr, CancellationToken cancellationToken = default)
                 => new Conversion(ConversionKind.None);
             public override Symbol? GetEnclosingSymbol(int position, CancellationToken cancellationToken = default) => null;
             public override ImmutableArray<Symbol> LookupSymbols(int position, string? name = null, CancellationToken cancellationToken = default)
@@ -435,13 +434,13 @@ namespace Cnidaria.Cs
             foreach (var tree in trees)
             {
                 var stubModel = new SemanticModelStub(compilation, tree);
-                var imports = ImportsBuilder.Build(compilation, tree, NullRecorder.Instance, diagnostics);
+                var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, NullRecorder.Instance, diagnostics);
                 if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
                     continue;
                 var safeTypeBinder = new TypeBinder(
-                    parent: null, flags: BinderFlags.None, compilation: compilation, imports: imports);
+                    parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
                 var unsafeTypeBinder = new TypeBinder(
-                    parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, imports: imports);
+                    parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, importScopeMap: importScopeMap);
                 BindEnumUnderlyingTypesForTree(
                     compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
                 foreach (var kv in declMap)
@@ -695,7 +694,7 @@ namespace Cnidaria.Cs
                     continue;
 
                 if (!TryBindConstFieldInitializer(
-                    compilation: compilation, 
+                    compilation: compilation,
                     pending: pending,
                     reportDiagnostics: true,
                     diagnostics: diagnostics,
@@ -710,8 +709,8 @@ namespace Cnidaria.Cs
             }
         }
         private static bool TryBindConstFieldInitializer(
-            Compilation compilation, 
-            in PendingConstField pending, 
+            Compilation compilation,
+            in PendingConstField pending,
             bool reportDiagnostics,
             DiagnosticBag diagnostics,
             out Optional<object> constantValueOpt)
@@ -1016,7 +1015,7 @@ namespace Cnidaria.Cs
                 if (m.Kind == k) return true;
             return false;
         }
-        
+
         private static bool TryIncrementEnumConstantValue(object current, TypeSymbol underlyingType, out object next)
         {
             next = current;
@@ -1084,15 +1083,14 @@ namespace Cnidaria.Cs
             }
         }
     }
+    internal sealed class NullRecorder : IBindingRecorder
+    {
+        public static readonly NullRecorder Instance = new();
+        public void RecordBound(SyntaxNode syntax, BoundNode bound) { }
+        public void RecordDeclared(SyntaxNode syntax, Symbol symbol) { }
+    }
     internal static class AttributeBinder
     {
-        private sealed class NullRecorder : IBindingRecorder
-        {
-            public static readonly NullRecorder Instance = new();
-            public void RecordBound(SyntaxNode syntax, BoundNode bound) { }
-            public void RecordDeclared(SyntaxNode syntax, Symbol symbol) { }
-        }
-
         private sealed class SemanticModelStub : SemanticModel
         {
             public SemanticModelStub(Compilation c, SyntaxTree t)
@@ -1208,10 +1206,12 @@ namespace Cnidaria.Cs
             {
                 var tree = trees[ti];
                 var stubModel = new SemanticModelStub(compilation, tree);
-                var imports = ImportsBuilder.Build(compilation, tree, NullRecorder.Instance, diagnostics);
+                var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, NullRecorder.Instance, diagnostics);
 
-                var safeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, imports: imports);
-                var unsafeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, imports: imports);
+                var safeTypeBinder = new TypeBinder(
+                    parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
+                var unsafeTypeBinder = new TypeBinder(
+                    parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, importScopeMap: importScopeMap);
 
                 if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
                     continue;
@@ -2211,9 +2211,9 @@ namespace Cnidaria.Cs
             {
                 var tree = trees[ti];
                 var stubModel = new SemanticModelStub(compilation, tree);
-                var imports = ImportsBuilder.Build(compilation, tree, NullRecorder.Instance, diagnostics);
-                var safeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, imports: imports);
-                var unsafeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, imports: imports);
+                var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, NullRecorder.Instance, diagnostics);
+                var safeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
+                var unsafeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, importScopeMap: importScopeMap);
                 if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
                     continue;
 
@@ -2285,7 +2285,7 @@ namespace Cnidaria.Cs
             }
             BindOverrides(compilation, trees, diagnostics);
         }
-        
+
         private static BaseListSyntax? GetBaseList(TypeDeclarationSyntax syntax) => syntax switch
         {
             ClassDeclarationSyntax c => c.BaseList,
@@ -2519,7 +2519,7 @@ namespace Cnidaria.Cs
                 DeclareCompilationUnit(tree, tree.Root, _global);
             }
             SynthesizeDefaultConstructors();
-
+            SynthesizeTypeInitializers();
             var immutable = _declByTree.ToImmutableDictionary(
                 kv => kv.Key,
                 kv => kv.Value.ToImmutableDictionary());
@@ -2531,6 +2531,66 @@ namespace Cnidaria.Cs
             foreach (var kv in _typeCache)
                 if (kv.Value is SourceNamedTypeSymbol s)
                     EnsureDefaultConstructor(s);
+        }
+        private void SynthesizeTypeInitializers()
+        {
+            foreach (var kv in _typeCache)
+                if (kv.Value is SourceNamedTypeSymbol s)
+                    EnsureTypeInitializer(s);
+        }
+        private void EnsureTypeInitializer(SourceNamedTypeSymbol type)
+        {
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is MethodSymbol ms &&
+                    ms.IsStatic &&
+                    ms.Parameters.Length == 0 &&
+                    StringComparer.Ordinal.Equals(ms.Name, ".cctor"))
+                {
+                    return;
+                }
+            }
+
+            bool needsCctor = false;
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not SourceFieldSymbol fs)
+                    continue;
+                if (!fs.IsStatic || fs.IsConst)
+                    continue;
+
+                var declRefs = fs.DeclaringSyntaxReferences;
+                if (declRefs.IsDefaultOrEmpty)
+                    continue;
+
+                if (declRefs[0].Node is VariableDeclaratorSyntax vd && vd.Initializer is not null)
+                {
+                    needsCctor = true;
+                    break;
+                }
+            }
+
+            if (!needsCctor)
+                return;
+
+            var voidType = _types.GetSpecialType(SpecialType.System_Void);
+
+            var cctor = new SourceMethodSymbol(
+                name: ".cctor",
+                containing: type,
+                returnType: voidType,
+                typeParameters: default,
+                isStatic: true,
+                isConstructor: true,
+                isAsync: false,
+                locations: ImmutableArray<Location>.Empty,
+                declaredAccessibility: Accessibility.Private);
+
+            cctor.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+            cctor.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+
+            type.AddMember(cctor);
         }
         private void EnsureDefaultConstructor(SourceNamedTypeSymbol type)
         {
@@ -2567,6 +2627,7 @@ namespace Cnidaria.Cs
                     isStatic: false,
                     parameters: ImmutableArray<ParameterSymbol>.Empty));
         }
+
         private static void AddMemberToType(NamedTypeSymbol containingType, Symbol member)
         {
             switch (containingType)
@@ -2846,10 +2907,10 @@ namespace Cnidaria.Cs
                 else
                 {
                     var s = new SourceNamedTypeSymbol(
-                        name, 
-                        container, 
-                        kind, 
-                        arity, 
+                        name,
+                        container,
+                        kind,
+                        arity,
                         declaredAcc,
                         isFromMetadata: false,
                         isReadOnlyStruct: kind == TypeKind.Struct && isReadOnlyStruct,
@@ -3072,6 +3133,7 @@ namespace Cnidaria.Cs
                 var p = syntax.ParameterList.Parameters[i];
                 var pName = p.Identifier.ValueText ?? "";
                 var pType = new ErrorTypeSymbol("unbound-param", containing: null, ImmutableArray<Location>.Empty);
+                bool isParams = IsParamsParameter(p);
 
                 var param = new ParameterSymbol(
                     name: pName,
@@ -3080,7 +3142,8 @@ namespace Cnidaria.Cs
                     locations: ImmutableArray.Create(new Location(tree, p.Span)),
                     isReadOnlyRef: IsReadOnlyByRefParameter(p),
                     refKind: GetParameterRefKind(p),
-                    isScoped: IsScopedParameter(p));
+                    isScoped: IsScopedParameter(p),
+                    isParams: isParams);
 
                 ps.Add(param);
                 RecordDeclared(tree, p, param);
@@ -3092,10 +3155,12 @@ namespace Cnidaria.Cs
             AddMemberToType(container, method);
             RecordDeclared(tree, syntax, method);
         }
+        internal static bool IsParamsParameter(ParameterSyntax p)
+            => HasModifier(p.Modifiers, SyntaxKind.ParamsKeyword);
         internal static bool IsReadOnlyByRefParameter(ParameterSyntax p)
         {
             return HasModifier(p.Modifiers, SyntaxKind.InKeyword)
-                || (HasModifier(p.Modifiers, SyntaxKind.RefKeyword) 
+                || (HasModifier(p.Modifiers, SyntaxKind.RefKeyword)
                 && HasModifier(p.Modifiers, SyntaxKind.ReadOnlyKeyword));
         }
         internal static ParameterRefKind GetParameterRefKind(ParameterSyntax p)
@@ -3233,7 +3298,7 @@ namespace Cnidaria.Cs
                     name: pName,
                     containing: method,
                     type: pType,
-                    locations: ImmutableArray.Create(new Location(tree, p.Span)), 
+                    locations: ImmutableArray.Create(new Location(tree, p.Span)),
                     isReadOnlyRef: IsReadOnlyByRefParameter(p),
                     refKind: GetParameterRefKind(p),
                     isScoped: IsScopedParameter(p));
@@ -3258,24 +3323,39 @@ namespace Cnidaria.Cs
             {
                 case "+":
                     if (arity == 1) { name = $"{OpetatorPrefix}UnaryPlus"; return true; }
-                    if (arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedAddition" : $"{OpetatorPrefix}Addition"; return true; }
+                    if (arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedAddition" : $"{OpetatorPrefix}Addition"; return true;
+                    }
                     break;
 
                 case "-":
-                    if (arity == 1) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedUnaryNegation" : $"{OpetatorPrefix}UnaryNegation"; return true; }
-                    if (arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedSubtraction" : $"{OpetatorPrefix}Subtraction"; return true; }
+                    if (arity == 1)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedUnaryNegation" : $"{OpetatorPrefix}UnaryNegation"; return true;
+                    }
+                    if (arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedSubtraction" : $"{OpetatorPrefix}Subtraction"; return true;
+                    }
                     break;
 
                 case "*":
-                    if (arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedMultiply" : $"{OpetatorPrefix}Multiply"; return true; }
+                    if (arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedMultiply" : $"{OpetatorPrefix}Multiply"; return true;
+                    }
                     break;
                 case "/":
-                    if (arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedDivision" : $"{OpetatorPrefix}Division"; return true; }
+                    if (arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedDivision" : $"{OpetatorPrefix}Division"; return true;
+                    }
                     break;
                 case "%":
                     if (arity == 2) { name = $"{OpetatorPrefix}Modulus"; return true; }
@@ -3328,12 +3408,18 @@ namespace Cnidaria.Cs
                     break;
 
                 case "++":
-                    if (arity == 0 || arity == 1) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedIncrement" : $"{OpetatorPrefix}Increment"; return true; }
+                    if (arity == 0 || arity == 1)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedIncrement" : $"{OpetatorPrefix}Increment"; return true;
+                    }
                     break;
                 case "--":
-                    if (arity == 0 || arity == 1) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedDecrement" : $"{OpetatorPrefix}Decrement"; return true; }
+                    if (arity == 0 || arity == 1)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedDecrement" : $"{OpetatorPrefix}Decrement"; return true;
+                    }
                     break;
 
                 case "true":
@@ -3344,20 +3430,32 @@ namespace Cnidaria.Cs
                     break;
 
                 case "+=":
-                    if (arity == 1 || arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedAdditionAssignment" : $"{OpetatorPrefix}AdditionAssignment"; return true; }
+                    if (arity == 1 || arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedAdditionAssignment" : $"{OpetatorPrefix}AdditionAssignment"; return true;
+                    }
                     break;
                 case "-=":
-                    if (arity == 1 || arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedSubtractionAssignment" : $"{OpetatorPrefix}SubtractionAssignment"; return true; }
+                    if (arity == 1 || arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedSubtractionAssignment" : $"{OpetatorPrefix}SubtractionAssignment"; return true;
+                    }
                     break;
                 case "*=":
-                    if (arity == 1 || arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedMultiplyAssignment" : $"{OpetatorPrefix}MultiplyAssignment"; return true; }
+                    if (arity == 1 || arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedMultiplyAssignment" : $"{OpetatorPrefix}MultiplyAssignment"; return true;
+                    }
                     break;
                 case "/=":
-                    if (arity == 1 || arity == 2) { name = isChecked 
-                            ? $"{OpetatorPrefix}CheckedDivisionAssignment" : $"{OpetatorPrefix}DivisionAssignment"; return true; }
+                    if (arity == 1 || arity == 2)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedDivisionAssignment" : $"{OpetatorPrefix}DivisionAssignment"; return true;
+                    }
                     break;
 
                 case "%=":
@@ -3388,9 +3486,9 @@ namespace Cnidaria.Cs
         }
         private void DeclareConstructorDeclaration(SyntaxTree tree, ConstructorDeclarationSyntax syntax, NamedTypeSymbol container)
         {
-            var name = syntax.Identifier.ValueText ?? container.Name;
             var isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
             var isAsync = HasModifier(syntax.Modifiers, SyntaxKind.AsyncKeyword);
+            var name = isStatic ? ".cctor" : (syntax.Identifier.ValueText ?? container.Name);
             var typeDefaultAcc = container is NamedTypeSymbol
                 ? Accessibility.Private
                 : Accessibility.Internal;
@@ -3420,6 +3518,7 @@ namespace Cnidaria.Cs
                 var p = syntax.ParameterList.Parameters[i];
                 var pName = p.Identifier.ValueText ?? "";
                 var pType = new ErrorTypeSymbol("unbound-param", containing: null, ImmutableArray<Location>.Empty);
+                bool isParams = IsParamsParameter(p);
 
                 var param = new ParameterSymbol(
                     name: pName,
@@ -3428,7 +3527,8 @@ namespace Cnidaria.Cs
                     locations: ImmutableArray.Create(new Location(tree, p.Span)),
                     isReadOnlyRef: IsReadOnlyByRefParameter(p),
                     refKind: GetParameterRefKind(p),
-                    isScoped: IsScopedParameter(p));
+                    isScoped: IsScopedParameter(p),
+                    isParams: isParams);
 
                 ps.Add(param);
                 RecordDeclared(tree, p, param);
@@ -4025,19 +4125,22 @@ namespace Cnidaria.Cs
         public abstract Symbol? GetDeclaredSymbol(SyntaxNode declaration);
         public virtual Symbol? BindNamespaceOrType(ExpressionSyntax expr, BindingContext context, DiagnosticBag diagnostics)
             => Parent?.BindNamespaceOrType(expr, context, diagnostics);
-        internal virtual Imports? ImportsOpt => Parent?.ImportsOpt;
+        internal virtual Imports GetImports(BindingContext context)
+            => Parent?.GetImports(context) ?? Imports.Empty;
     }
     internal sealed class TypeBinder : Binder
     {
         private readonly Compilation _compilation;
-        private readonly Imports _imports;
-        public TypeBinder(Binder? parent, BinderFlags flags, Compilation compilation, Imports imports)
+        private readonly ImportScopeMap _importScopeMap;
+        public TypeBinder(Binder? parent, BinderFlags flags, Compilation compilation, ImportScopeMap importScopeMap)
             : base(parent, flags)
         {
             _compilation = compilation;
-            _imports = imports;
+            _importScopeMap = importScopeMap;
         }
-        internal override Imports? ImportsOpt => _imports;
+
+        internal override Imports GetImports(BindingContext context)
+            => _importScopeMap.GetImportsForSymbol(context.ContainingSymbol);
         public override ImmutableArray<Symbol> LookupSymbols(int position, string? name = null)
         {
             return Parent?.LookupSymbols(position, name) ?? ImmutableArray<Symbol>.Empty;
@@ -4118,8 +4221,8 @@ namespace Cnidaria.Cs
                 case SyntaxKind.VoidKeyword: return _compilation.GetSpecialType(SpecialType.System_Void);
 
                 case SyntaxKind.IdentifierToken:
-                    if(p.Keyword.ValueText == "nint") return _compilation.GetSpecialType(SpecialType.System_IntPtr);
-                    if(p.Keyword.ValueText == "nuint") return _compilation.GetSpecialType(SpecialType.System_UIntPtr);
+                    if (p.Keyword.ValueText == "nint") return _compilation.GetSpecialType(SpecialType.System_IntPtr);
+                    if (p.Keyword.ValueText == "nuint") return _compilation.GetSpecialType(SpecialType.System_UIntPtr);
                     break;
             }
             diagnostics.Add(new Diagnostic("CN_TYPE001", DiagnosticSeverity.Error,
@@ -4390,6 +4493,7 @@ namespace Cnidaria.Cs
             bool allowAttributeSuffix = false,
             bool allowTypeParameterLookup = true)
         {
+            var imports = GetImports(context);
             var parts = CollectParts(name);
             if (parts.Count == 0)
                 return new ErrorTypeSymbol("type", containing: null, ImmutableArray<Location>.Empty);
@@ -4418,11 +4522,11 @@ namespace Cnidaria.Cs
                     !part.Name.EndsWith("Attribute", StringComparison.Ordinal))
                 {
                     nextSet = CollectNext(
-                        currentSet, 
-                        part.Name + "Attribute", 
-                        0, 
-                        hasTypeArgs: false, 
-                        boundTypeArgs: default, 
+                        currentSet,
+                        part.Name + "Attribute",
+                        0,
+                        hasTypeArgs: false,
+                        boundTypeArgs: default,
                         context);
                 }
                 if (hasTypeArgs && part.TypeArgListOpt is not null)
@@ -4455,7 +4559,7 @@ namespace Cnidaria.Cs
             var current = new List<Symbol>(capacity: 8);
             int startIndex = 0;
 
-            if (_imports.TryGetAlias(parts[0].Name, out var alias))
+            if (imports.TryGetAlias(parts[0].Name, out var alias))
             {
                 current.Add(alias!.Target);
                 startIndex = 1;
@@ -4465,7 +4569,7 @@ namespace Cnidaria.Cs
                 var layer0 = new List<Symbol>(8);
                 var layer1 = new List<Symbol>(8);
                 var layer2 = new List<Symbol>(1);
-                BuildRootLayers(context, layer0, layer1, layer2);
+                BuildRootLayers(context, imports, layer0, layer1, layer2);
 
                 var first = parts[0];
                 var hasTypeArgs = first.TypeArgListOpt != null;
@@ -4537,6 +4641,7 @@ namespace Cnidaria.Cs
 
         public override Symbol? BindNamespaceOrType(ExpressionSyntax expr, BindingContext context, DiagnosticBag diagnostics)
         {
+            var imports = GetImports(context);
             var parts = CollectExprParts(expr);
             if (parts.Count == 0)
                 return null;
@@ -4571,17 +4676,17 @@ namespace Cnidaria.Cs
             List<Symbol> current = new(capacity: 8);
             int startIndex = 0;
 
-            if (_imports.TryGetAlias(parts[0].Name, out var alias))
+            if (imports.TryGetAlias(parts[0].Name, out var alias))
             {
                 current.Add(alias!.Target);
                 startIndex = 1;
             }
-            else 
+            else
             {
                 var layer0 = new List<Symbol>(8);
                 var layer1 = new List<Symbol>(8);
                 var layer2 = new List<Symbol>(1);
-                BuildRootLayers(context, layer0, layer1, layer2);
+                BuildRootLayers(context, imports, layer0, layer1, layer2);
 
                 var first = parts[0];
                 var hasTypeArgs = first.TypeArgListOpt != null;
@@ -4719,7 +4824,7 @@ namespace Cnidaria.Cs
                     return;
             list.Add(sym);
         }
-        private void BuildRootLayers(BindingContext context, List<Symbol> layer0, List<Symbol> layer1, List<Symbol> layer2)
+        private void BuildRootLayers(BindingContext context, Imports imports, List<Symbol> layer0, List<Symbol> layer1, List<Symbol> layer2)
         {
             // Enclosing types
             for (Symbol? s = context.ContainingSymbol; s != null; s = s.ContainingSymbol)
@@ -4727,19 +4832,21 @@ namespace Cnidaria.Cs
                 if (s is NamedTypeSymbol nt)
                     AddUnique(layer0, nt);
             }
+
             if (!TryAddMergedEnclosingNamespaces(context.ContainingSymbol, layer0))
             {
                 var ns = GetEnclosingNamespace(context.ContainingSymbol);
                 for (NamespaceSymbol? n = ns; n != null; n = n.ContainingSymbol as NamespaceSymbol)
                     AddUnique(layer0, n);
             }
+
             // Imported containers
-            for (int i = 0; i < _imports.Containers.Length; i++)
-                AddUnique(layer1, _imports.Containers[i]);
+            for (int i = 0; i < imports.Containers.Length; i++)
+                AddUnique(layer1, imports.Containers[i]);
 
             // using static
-            for (int i = 0; i < _imports.StaticTypes.Length; i++)
-                AddUnique(layer1, _imports.StaticTypes[i]);
+            for (int i = 0; i < imports.StaticTypes.Length; i++)
+                AddUnique(layer1, imports.StaticTypes[i]);
 
             // Global
             AddUnique(layer2, _compilation.GlobalNamespace);
@@ -4887,7 +4994,7 @@ namespace Cnidaria.Cs
             private readonly List<(GotoStatementSyntax Syntax, LabelSymbol Label)> _gotos = new();
             private readonly List<ExceptionRegionFrame> _exceptionRegionStack = new();
             private readonly Dictionary<LabelSymbol, ImmutableArray<ExceptionRegionFrame>> _labelRegions = new();
-            private readonly List<(GotoStatementSyntax Syntax, LabelSymbol Label, 
+            private readonly List<(GotoStatementSyntax Syntax, LabelSymbol Label,
                 ImmutableArray<ExceptionRegionFrame> SourceRegions)> _gotoRegions = new();
             private readonly Stack<(LabelSymbol BreakLabel, LabelSymbol ContinueLabel)> _loopStack = new();
             private int _nextGeneratedId;
@@ -5104,6 +5211,7 @@ namespace Cnidaria.Cs
         private const string OperatorPrefix = "op_";
         private static BindingContext WithRecorder(BindingContext context, IBindingRecorder recorder)
             => new BindingContext(context.Compilation, context.SemanticModel, context.ContainingSymbol, recorder);
+        private static readonly SyntaxTrivia[] s_noTrivia = Array.Empty<SyntaxTrivia>();
         private readonly Symbol _containing;
         private readonly ControlFlowScope _flow;
         private readonly Dictionary<string, LocalSymbol> _locals = new(StringComparer.Ordinal);
@@ -5185,6 +5293,56 @@ namespace Cnidaria.Cs
         }
         internal void ReportControlFlowDiagnostics(BindingContext context, DiagnosticBag diagnostics)
             => _flow.ReportUndefinedLabels(context, diagnostics);
+        private static IdentifierNameSyntax MakeIdentifierName(string name, TextSpan span)
+            => new IdentifierNameSyntax(
+                new SyntaxToken(SyntaxKind.IdentifierToken, span, valueText: name, value: name, leadingTrivia: s_noTrivia, trailingTrivia: s_noTrivia));
+        private static SyntaxToken MakeToken(SyntaxKind kind, TextSpan span)
+            => new SyntaxToken(kind, span, valueText: null, value: null, leadingTrivia: s_noTrivia, trailingTrivia: s_noTrivia);
+        private BoundExpression MakeBoolLiteral(SyntaxNode syntax, BindingContext ctx, bool value)
+            => new BoundLiteralExpression(syntax, ctx.Compilation.GetSpecialType(SpecialType.System_Boolean), value);
+        private static bool TryGetBoolConstant(BoundExpression expr, out bool value)
+        {
+            if (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is bool b)
+            {
+                value = b;
+                return true;
+            }
+            value = false;
+            return false;
+        }
+        private BoundExpression MakeLogicalAnd(SyntaxNode syntax, BoundExpression left, BoundExpression right, BindingContext ctx, DiagnosticBag diagnostics)
+        {
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            if (left.HasErrors || right.HasErrors)
+                return new BoundBadExpression(syntax);
+            if (left.Type.SpecialType != SpecialType.System_Boolean || right.Type.SpecialType != SpecialType.System_Boolean)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SWITCH_BOOL000",
+                    DiagnosticSeverity.Error,
+                    "Internal error: synthesized switch condition is not boolean.",
+                    new Location(ctx.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+            return new BoundBinaryExpression(syntax, BoundBinaryOperatorKind.LogicalAnd, boolType, left, right, Optional<object>.None);
+        }
+
+        private BoundExpression MakeLogicalOr(SyntaxNode syntax, BoundExpression left, BoundExpression right, BindingContext ctx, DiagnosticBag diagnostics)
+        {
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            if (left.HasErrors || right.HasErrors)
+                return new BoundBadExpression(syntax);
+            if (left.Type.SpecialType != SpecialType.System_Boolean || right.Type.SpecialType != SpecialType.System_Boolean)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SWITCH_BOOL000",
+                    DiagnosticSeverity.Error,
+                    "Internal error: synthesized switch condition is not boolean.",
+                    new Location(ctx.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+            return new BoundBinaryExpression(syntax, BoundBinaryOperatorKind.LogicalOr, boolType, left, right, Optional<object>.None);
+        }
         private bool TryGetLocalFromEnclosingScopes(string name, out LocalSymbol? local)
         {
             for (Binder? b = this; b is LocalScopeBinder ls; b = ls.Parent)
@@ -5265,8 +5423,8 @@ namespace Cnidaria.Cs
         {
             result = null!;
 
-            var imports = ImportsOpt;
-            if (imports is null || imports.StaticTypes.IsDefaultOrEmpty)
+            var imports = GetImports(context);
+            if (imports.StaticTypes.IsDefaultOrEmpty)
                 return false;
 
             FieldSymbol? field = null;
@@ -5378,8 +5536,8 @@ namespace Cnidaria.Cs
         }
         private ImmutableArray<MethodSymbol> LookupImportedStaticMethods(string name, BindingContext context)
         {
-            var imports = ImportsOpt;
-            if (imports is null || imports.StaticTypes.IsDefaultOrEmpty)
+            var imports = GetImports(context);
+            if (imports.StaticTypes.IsDefaultOrEmpty)
                 return ImmutableArray<MethodSymbol>.Empty;
 
             var b = ImmutableArray.CreateBuilder<MethodSymbol>();
@@ -5497,6 +5655,30 @@ namespace Cnidaria.Cs
                 sideEffects: ImmutableArray.Create<BoundStatement>(countDecl, ptrDecl),
                 value: created);
         }
+        private static bool TryGetSystemSpanDefinition(Compilation compilation, out NamedTypeSymbol spanDef)
+        {
+            spanDef = null!;
+
+            NamespaceSymbol? system = null;
+            var nss = compilation.GlobalNamespace.GetNamespaceMembers();
+            for (int i = 0; i < nss.Length; i++)
+            {
+                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                {
+                    system = nss[i];
+                    break;
+                }
+            }
+            if (system is null)
+                return false;
+
+            var spans = system.GetTypeMembers("Span", arity: 1);
+            if (spans.IsDefaultOrEmpty)
+                return false;
+
+            spanDef = spans[0].OriginalDefinition;
+            return true;
+        }
         private static bool TryGetSpanLikeElementType(TypeSymbol type, out NamedTypeSymbol spanLikeType, out TypeSymbol elementType)
         {
             spanLikeType = null!;
@@ -5584,7 +5766,9 @@ namespace Cnidaria.Cs
                     new Location(tree, lf.TypeParameterList.Span)));
             }
 
-            var isStatic = HasModifier(lf.Modifiers, SyntaxKind.StaticKeyword);
+            var isStatic =
+                HasModifier(lf.Modifiers, SyntaxKind.StaticKeyword) ||
+                (_containing is MethodSymbol containingMethod && containingMethod.IsStatic);
             var isAsync = HasModifier(lf.Modifiers, SyntaxKind.AsyncKeyword);
             var isUnsafe = HasModifier(lf.Modifiers, SyntaxKind.UnsafeKeyword);
 
@@ -5629,13 +5813,14 @@ namespace Cnidaria.Cs
                 if (pRefKind != ParameterRefKind.None && pt is not ByRefTypeSymbol)
                     pt = context.Compilation.CreateByRefType(pt);
                 pb.Add(new ParameterSymbol(
-                    pn, 
-                    sym, 
-                    pt, 
+                    pn,
+                    sym,
+                    pt,
                     ImmutableArray.Create(new Location(tree, p.Identifier.Span)),
                     isReadOnlyRef: DeclarationBuilder.IsReadOnlyByRefParameter(p),
                     refKind: pRefKind,
-                    isScoped: DeclarationBuilder.IsScopedParameter(p)));
+                    isScoped: DeclarationBuilder.IsScopedParameter(p),
+                    isParams: DeclarationBuilder.IsParamsParameter(p)));
             }
 
             sym.SetSignature(returnType, pb.ToImmutable());
@@ -5713,6 +5898,9 @@ namespace Cnidaria.Cs
                     break;
                 case CheckedStatementSyntax chk:
                     result = BindCheckedStatement(chk, context, diagnostics);
+                    break;
+                case SwitchStatementSyntax sw:
+                    result = BindSwitchStatement(sw, context, diagnostics);
                     break;
 
                 default:
@@ -5817,7 +6005,21 @@ namespace Cnidaria.Cs
                 case SizeOfExpressionSyntax sz:
                     result = BindSizeOf(sz, context, diagnostics);
                     break;
+                case ThrowExpressionSyntax te:
+                    result = BindThrowExpression(te, context, diagnostics);
+                    break;
+                case SwitchExpressionSyntax sw:
+                    result = BindSwitchExpression(sw, context, diagnostics);
+                    break;
 
+                case RangeExpressionSyntax r:
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE012",
+                        DiagnosticSeverity.Error,
+                        "Range expressions are only supported inside element access expressions.",
+                        new Location(context.SemanticModel.SyntaxTree, r.Span)));
+                    result = new BoundBadExpression(r);
+                    break;
                 default:
                     if (Parent != null)
                         result = Parent.BindExpression(node, context, diagnostics);
@@ -5983,8 +6185,8 @@ namespace Cnidaria.Cs
                     size = 16; align = 8; return true;
                 case SpecialType.System_IntPtr:
                 case SpecialType.System_UIntPtr:
-                    size = RuntimeTypeSystem.PointerSize; 
-                    align = RuntimeTypeSystem.PointerSize; 
+                    size = RuntimeTypeSystem.PointerSize;
+                    align = RuntimeTypeSystem.PointerSize;
                     return true;
             }
 
@@ -5994,6 +6196,24 @@ namespace Cnidaria.Cs
         {
             int mask = align - 1;
             return (value + mask) & ~mask;
+        }
+        private BoundExpression BindThrowExpression(ThrowExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            var exType = GetSystemExceptionTypeOrReport(node, context, diagnostics);
+            if (exType.Kind == SymbolKind.Error)
+                return new BoundBadExpression(node);
+
+            var expr = BindExpression(node.Expression, context, diagnostics);
+            expr = ApplyConversion(
+                exprSyntax: node.Expression,
+                expr: expr,
+                targetType: exType,
+                diagnosticNode: node,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            return new BoundThrowExpression(node, expr);
         }
         private BoundExpression BindCheckedExpression(CheckedExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -6373,9 +6593,9 @@ namespace Cnidaria.Cs
             return true;
         }
         private BoundExpression BindRefExpression(
-            PrefixUnaryExpressionSyntax node, 
-            BoundExpression operand, 
-            BindingContext context, 
+            PrefixUnaryExpressionSyntax node,
+            BoundExpression operand,
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             if (!operand.IsLValue)
@@ -6885,8 +7105,21 @@ namespace Cnidaria.Cs
             BindingContext ctx,
             DiagnosticBag diagnostics)
         {
+            if (TryBindUserDefinedBinaryOperator(
+                operatorSyntax: node,
+                leftSyntax: node.Left,
+                left: left,
+                rightSyntax: node.Right,
+                right: right,
+                op: op,
+                context: ctx,
+                diagnostics: diagnostics,
+                out var userDefined))
+            {
+                return userDefined;
+            }
             if (op == BoundBinaryOperatorKind.Add &&
-                (left.Type.SpecialType == SpecialType.System_String 
+                (left.Type.SpecialType == SpecialType.System_String
                 || right.Type.SpecialType == SpecialType.System_String))
             {
                 return BindStringConcatenation(node, left, right, ctx, diagnostics);
@@ -6930,6 +7163,20 @@ namespace Cnidaria.Cs
             BindingContext ctx,
             DiagnosticBag diagnostics)
         {
+            if (TryBindUserDefinedBinaryOperator(
+                operatorSyntax: node,
+                leftSyntax: node.Left,
+                left: left,
+                rightSyntax: node.Right,
+                right: right,
+                op: op,
+                context: ctx,
+                diagnostics: diagnostics,
+                out var userDefined))
+            {
+                return userDefined;
+            }
+
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
 
             // bool
@@ -6973,6 +7220,19 @@ namespace Cnidaria.Cs
             BindingContext ctx,
             DiagnosticBag diagnostics)
         {
+            if (TryBindUserDefinedBinaryOperator(
+                operatorSyntax: node,
+                leftSyntax: node.Left,
+                left: left,
+                rightSyntax: node.Right,
+                right: right,
+                op: op,
+                context: ctx,
+                diagnostics: diagnostics,
+                out var userDefined))
+            {
+                return userDefined;
+            }
             if (!IsIntegral(left.Type.SpecialType) || !IsIntegral(right.Type.SpecialType))
             {
                 diagnostics.Add(new Diagnostic("CN_SHIFT000", DiagnosticSeverity.Error,
@@ -7019,10 +7279,10 @@ namespace Cnidaria.Cs
             bool ok =
                 conv.Exists &&
                 (conv.IsImplicit ||
-                conv.Kind 
-                is ConversionKind.ExplicitNumeric 
-                or ConversionKind.ExplicitReference 
-                or ConversionKind.Unboxing 
+                conv.Kind
+                is ConversionKind.ExplicitNumeric
+                or ConversionKind.ExplicitReference
+                or ConversionKind.Unboxing
                 or ConversionKind.UserDefined);
 
             if (!ok)
@@ -7545,9 +7805,9 @@ namespace Cnidaria.Cs
             }
         }
         private BoundExpression BindMemberAccessInvocation(
-            InvocationExpressionSyntax inv, 
-            MemberAccessExpressionSyntax ma, 
-            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes, 
+            InvocationExpressionSyntax inv,
+            MemberAccessExpressionSyntax ma,
+            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes,
             ImmutableArray<BoundExpression> args,
             BindingContext context,
             DiagnosticBag diagnostics)
@@ -7785,11 +8045,11 @@ namespace Cnidaria.Cs
             return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
         }
         private bool TryBindReceiverForMemberAccess(
-            ExpressionSyntax receiverSyntax, 
+            ExpressionSyntax receiverSyntax,
             bool isPointerAccess,
             out BoundExpression? receiverValue,
-            out NamedTypeSymbol? receiverType, 
-            BindingContext context, 
+            out NamedTypeSymbol? receiverType,
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             receiverValue = null;
@@ -7881,10 +8141,11 @@ namespace Cnidaria.Cs
             receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type);
             return true;
         }
+
         private BoundExpression BindMemberAccess(
-            MemberAccessExpressionSyntax ma, 
-            BindValueKind valueKind, 
-            BindingContext context, 
+            MemberAccessExpressionSyntax ma,
+            BindValueKind valueKind,
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             var name = GetSimpleName(ma.Name);
@@ -7899,11 +8160,11 @@ namespace Cnidaria.Cs
             BoundExpression? receiverValue;
             NamedTypeSymbol? receiverType;
             if (!TryBindReceiverForMemberAccess(
-                ma.Expression, 
-                isPointerAccess, 
-                out receiverValue, 
-                out receiverType, 
-                context, 
+                ma.Expression,
+                isPointerAccess,
+                out receiverValue,
+                out receiverType,
+                context,
                 diagnostics))
             {
                 var sym = BindNamespaceOrType(ma.Expression, context, diagnostics);
@@ -8051,11 +8312,11 @@ namespace Cnidaria.Cs
 
                 var cv = field.IsConst ? field.ConstantValueOpt : Optional<object>.None;
                 return new BoundMemberAccessExpression(
-                    ma, 
-                    receiverValue, 
-                    field, 
-                    fieldValueType, 
-                    isLValue: canWriteField, 
+                    ma,
+                    receiverValue,
+                    field,
+                    fieldValueType,
+                    isLValue: canWriteField,
                     constantValueOpt: cv);
             }
             // property
@@ -8121,10 +8382,10 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(ma);
             }
             return new BoundMemberAccessExpression(
-                ma, 
-                receiverValue, 
-                prop, 
-                prop.Type, 
+                ma,
+                receiverValue,
+                prop,
+                prop.Type,
                 isLValue: canWriteProperty || allowCtorAutoPropWrite);
         }
         private static NamedTypeSymbol? GetReceiverTypeForMemberLookup(TypeSymbol type)
@@ -8278,10 +8539,10 @@ namespace Cnidaria.Cs
             return BindImplicitObjectCreation(node, targetType, args.ToImmutable(), context, diagnostics);
         }
         private BoundExpression BindImplicitObjectCreation(
-            ImplicitObjectCreationExpressionSyntax node, 
+            ImplicitObjectCreationExpressionSyntax node,
             TypeSymbol targetType,
             ImmutableArray<BoundExpression> boundArgs,
-            BindingContext context, 
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             if (node.Initializer != null)
@@ -8420,47 +8681,35 @@ namespace Cnidaria.Cs
             convertedArgs = default;
 
             MethodSymbol? best = null;
+            bool bestUsesParamsExpansion = false;
             int bestScore = int.MaxValue;
             bool ambiguous = false;
 
             for (int i = 0; i < candidates.Length; i++)
             {
                 var m = candidates[i];
-                if (m.Parameters.Length != args.Length)
-                    continue;
+                var ps = m.Parameters;
 
-                int score = 0;
-                bool ok = true;
-
-                for (int a = 0; a < args.Length; a++)
+                // Regular form
+                if (ps.Length == args.Length)
                 {
-                    if (getArgRefKindKeyword is not null &&
-                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), m.Parameters[a]))
-                    {
-                        ok = false;
-                        break;
-                    }
-                    var conv = ClassifyConversion(args[a], m.Parameters[a].Type, context);
-                    if (!conv.Exists || !conv.IsImplicit)
-                    {
-                        ok = false;
-                        break;
-                    }
-                    score += ConversionScore(conv.Kind);
+                    if (TryScoreRegular(m, args, getArgRefKindKeyword, context, out int score))
+                        ConsiderCandidate(m, usesParamsExpansion: false, score);
                 }
 
-                if (!ok)
-                    continue;
-
-                if (score < bestScore)
+                // Params expansion form
+                if (ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1)
                 {
-                    bestScore = score;
-                    best = m;
-                    ambiguous = false;
-                }
-                else if (score == bestScore)
-                {
-                    ambiguous = true;
+                    int fixedCount = ps.Length - 1;
+                    if (args.Length >= fixedCount)
+                    {
+                        if (TryScoreParamsExpanded(m, args, fixedCount, at.ElementType, getArgRefKindKeyword, context, out int score))
+                        {
+                            // Penalize params-expansion so that non-expanded matches win when both are viable.
+                            score += 5;
+                            ConsiderCandidate(m, usesParamsExpansion: true, score);
+                        }
+                    }
                 }
             }
             if (best is null)
@@ -8478,24 +8727,205 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return false;
             }
-
-            var converted = ImmutableArray.CreateBuilder<BoundExpression>(args.Length);
-            for (int a = 0; a < args.Length; a++)
+            var converted = ImmutableArray.CreateBuilder<BoundExpression>(best.Parameters.Length);
+            if (!bestUsesParamsExpansion)
             {
-                converted.Add(ApplyConversion(
-                    exprSyntax: getArgExprSyntax(a),
-                    expr: args[a],
-                    targetType: best.Parameters[a].Type,
-                    diagnosticNode: diagnosticNode,
-                    context: context,
-                    diagnostics: diagnostics,
-                    requireImplicit: true));
+                for (int a = 0; a < args.Length; a++)
+                {
+                    converted.Add(ApplyConversion(
+                        exprSyntax: getArgExprSyntax(a),
+                        expr: args[a],
+                        targetType: best.Parameters[a].Type,
+                        diagnosticNode: diagnosticNode,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true));
+                }
             }
+            else
+            {
+                var ps = best.Parameters;
+                int fixedCount = ps.Length - 1;
+                var paramsParam = ps[^1];
+                var paramsArrayType = (ArrayTypeSymbol)paramsParam.Type;
+                var elementType = paramsArrayType.ElementType;
 
+                // Fixed parameters
+                for (int a = 0; a < fixedCount; a++)
+                {
+                    converted.Add(ApplyConversion(
+                        exprSyntax: getArgExprSyntax(a),
+                        expr: args[a],
+                        targetType: ps[a].Type,
+                        diagnosticNode: diagnosticNode,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true));
+                }
+
+                // Pack remaining arguments into the params array
+                int elemCount = args.Length - fixedCount;
+                var int32Type = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+
+                var arrLocal = NewTemp("<params$>", paramsArrayType);
+                var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2 + elemCount);
+
+                // arr = new T[elemCount]
+                var countLit = new BoundLiteralExpression(diagnosticNode, int32Type, elemCount);
+                var newArr = new BoundArrayCreationExpression(diagnosticNode, paramsArrayType, elementType, countLit, initializerOpt: null);
+
+                sideEffects.Add(new BoundExpressionStatement(
+                    diagnosticNode,
+                    new BoundAssignmentExpression(
+                        diagnosticNode,
+                        new BoundLocalExpression(diagnosticNode, arrLocal),
+                        newArr)));
+
+                // arr[i] = (T)arg
+                for (int i = 0; i < elemCount; i++)
+                {
+                    int argIndex = fixedCount + i;
+
+                    var idxLit = new BoundLiteralExpression(diagnosticNode, int32Type, i);
+                    var elemAccess = new BoundArrayElementAccessExpression(
+                        diagnosticNode,
+                        elementType,
+                        new BoundLocalExpression(diagnosticNode, arrLocal),
+                        idxLit);
+
+                    var elemValue = ApplyConversion(
+                        exprSyntax: getArgExprSyntax(argIndex),
+                        expr: args[argIndex],
+                        targetType: elementType,
+                        diagnosticNode: diagnosticNode,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+
+                    sideEffects.Add(new BoundExpressionStatement(
+                        diagnosticNode,
+                        new BoundAssignmentExpression(diagnosticNode, elemAccess, elemValue)));
+                }
+
+                var packedArray = new BoundSequenceExpression(
+                    diagnosticNode,
+                    locals: ImmutableArray.Create(arrLocal),
+                    sideEffects: sideEffects.ToImmutable(),
+                    value: new BoundLocalExpression(diagnosticNode, arrLocal));
+
+                converted.Add(packedArray);
+            }
             chosen = best;
             convertedArgs = converted.ToImmutable();
             return true;
 
+            void ConsiderCandidate(MethodSymbol m, bool usesParamsExpansion, int score)
+            {
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = m;
+                    bestUsesParamsExpansion = usesParamsExpansion;
+                    ambiguous = false;
+                }
+                else if (score == bestScore)
+                {
+                    if (ReferenceEquals(best, m) && bestUsesParamsExpansion && !usesParamsExpansion)
+                    {
+                        bestUsesParamsExpansion = false;
+                        ambiguous = false;
+                        return;
+                    }
+
+                    if (!ReferenceEquals(best, m) || bestUsesParamsExpansion != usesParamsExpansion)
+                        ambiguous = true;
+                }
+            }
+            bool TryScoreRegular(
+                MethodSymbol m,
+                ImmutableArray<BoundExpression> args,
+                Func<int, SyntaxToken?>? getArgRefKindKeyword,
+                BindingContext context,
+                out int score)
+            {
+                score = 0;
+                var ps = m.Parameters;
+
+                for (int a = 0; a < args.Length; a++)
+                {
+                    if (getArgRefKindKeyword is not null &&
+                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    var conv = ClassifyConversion(args[a], ps[a].Type, context);
+                    if (!conv.Exists || !conv.IsImplicit)
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    score += ConversionScore(conv.Kind);
+                }
+
+                return true;
+            }
+            bool TryScoreParamsExpanded(
+                MethodSymbol m,
+                ImmutableArray<BoundExpression> args,
+                int fixedCount,
+                TypeSymbol elementType,
+                Func<int, SyntaxToken?>? getArgRefKindKeyword,
+                BindingContext context,
+                out int score)
+            {
+                score = 0;
+                var ps = m.Parameters;
+
+                // Fixed parameters
+                for (int a = 0; a < fixedCount; a++)
+                {
+                    if (getArgRefKindKeyword is not null &&
+                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    var conv = ClassifyConversion(args[a], ps[a].Type, context);
+                    if (!conv.Exists || !conv.IsImplicit)
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    score += ConversionScore(conv.Kind);
+                }
+
+                // Expanded elements
+                for (int a = fixedCount; a < args.Length; a++)
+                {
+                    if (getArgRefKindKeyword is not null &&
+                        GetArgRefKind(getArgRefKindKeyword(a)) != ParameterRefKind.None)
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    var conv = ClassifyConversion(args[a], elementType, context);
+                    if (!conv.Exists || !conv.IsImplicit)
+                    {
+                        score = 0;
+                        return false;
+                    }
+
+                    score += ConversionScore(conv.Kind);
+                }
+
+                return true;
+            }
             static int ConversionScore(ConversionKind k) => k switch
             {
                 ConversionKind.Identity => 0,
@@ -8813,9 +9243,9 @@ namespace Cnidaria.Cs
         {
             return op switch
             {
-            BoundBinaryOperatorKind.Add => isChecked
-                    ? ImmutableArray.Create($"{OperatorPrefix}CheckedAddition", $"{OperatorPrefix}Addition")
-                    : ImmutableArray.Create($"{OperatorPrefix}Addition"),
+                BoundBinaryOperatorKind.Add => isChecked
+                        ? ImmutableArray.Create($"{OperatorPrefix}CheckedAddition", $"{OperatorPrefix}Addition")
+                        : ImmutableArray.Create($"{OperatorPrefix}Addition"),
                 BoundBinaryOperatorKind.Subtract => isChecked
                     ? ImmutableArray.Create($"{OperatorPrefix}CheckedSubtraction", $"{OperatorPrefix}Subtraction")
                     : ImmutableArray.Create($"{OperatorPrefix}Subtraction"),
@@ -8929,7 +9359,7 @@ namespace Cnidaria.Cs
                 var cv = FoldUnaryConstant(opKind, boolType, operand, isChecked: false);
                 return new BoundUnaryExpression(node, opKind, boolType, operand, cv, isChecked: false);
             }
-            
+
             // numeric / integral
             var promotedType = GetUnaryPromotionType(
                 context.Compilation, context.SemanticModel.SyntaxTree, opKind, operand.Type, node, diagnostics);
@@ -9292,7 +9722,7 @@ namespace Cnidaria.Cs
                     switch (type.SpecialType)
                     {
                         case SpecialType.System_Int32:
-                            if (v is int i) 
+                            if (v is int i)
                             {
                                 try
                                 {
@@ -9516,10 +9946,10 @@ namespace Cnidaria.Cs
             return BindEqualityBinary(fakeNotEq, asBound, nullBound, ctx, diagnostics);
         }
         private BoundExpression BindNumericBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -9545,7 +9975,7 @@ namespace Cnidaria.Cs
                 return userDefined;
             }
             if (op == BoundBinaryOperatorKind.Add &&
-                (left.Type.SpecialType == SpecialType.System_String 
+                (left.Type.SpecialType == SpecialType.System_String
                 || right.Type.SpecialType == SpecialType.System_String))
             {
                 return BindStringConcatenation(bin, left, right, ctx, diagnostics);
@@ -9592,7 +10022,7 @@ namespace Cnidaria.Cs
                 return new BoundBinaryExpression(bin, op, promoted, leftConv, rightConv, constValue, isChecked);
 
             }
-            
+
             {
                 var promoted = GetBinaryNumericPromotionType(
                     ctx.Compilation, ctx.SemanticModel.SyntaxTree, left.Type, right.Type, bin, diagnostics);
@@ -9610,10 +10040,10 @@ namespace Cnidaria.Cs
             }
         }
         private BoundExpression BindBitwiseBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -9674,10 +10104,10 @@ namespace Cnidaria.Cs
             return new BoundBinaryExpression(bin, op, promoted, left, right, folded);
         }
         private BoundExpression BindConditionalLogicalBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -9698,10 +10128,10 @@ namespace Cnidaria.Cs
             return new BoundBinaryExpression(bin, op, boolType, left, right, Optional<object>.None);
         }
         private BoundExpression BindEqualityBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -9861,10 +10291,10 @@ namespace Cnidaria.Cs
             }
         }
         private BoundExpression BindRelationalBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -9911,10 +10341,10 @@ namespace Cnidaria.Cs
             return new BoundBinaryExpression(bin, op, boolType, left, right, Optional<object>.None);
         }
         private BoundExpression BindShiftBinary(
-            BinaryExpressionSyntax bin, 
-            BoundExpression left, 
-            BoundExpression right, 
-            BindingContext ctx, 
+            BinaryExpressionSyntax bin,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
             DiagnosticBag diagnostics)
         {
             var op = bin.Kind switch
@@ -10432,6 +10862,9 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(t1, t2))
                 return t1;
 
+            if (t1 is ThrowTypeSymbol) return t2;
+            if (t2 is ThrowTypeSymbol) return t1;
+
             // null + ref => ref
             if (t1 is NullTypeSymbol && t2.IsReferenceType) return t2;
             if (t2 is NullTypeSymbol && t1.IsReferenceType) return t1;
@@ -10457,7 +10890,7 @@ namespace Cnidaria.Cs
                 new Location(tree, diagNode.Span)));
             return null;
 
-            
+
         }
         private static Optional<object> FoldConditionalConstant(BoundExpression condition, BoundExpression whenTrue, BoundExpression whenFalse)
         {
@@ -11058,8 +11491,29 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        localType = rhs.Type;
-                        init = rhs;
+
+                        if (rhs is BoundStackAllocArrayCreationExpression sa && (Flags & BinderFlags.UnsafeRegion) == 0 &&
+                            TryGetSystemSpanDefinition(context.Compilation, out var spanDef))
+                        {
+                            localType = context.Compilation.ConstructNamedType(
+                                spanDef,
+                                ImmutableArray.Create<TypeSymbol>(sa.ElementType));
+                            init = ApplyConversion(
+                                exprSyntax: v.Initializer.Value,
+                                expr: rhs,
+                                targetType: localType,
+                                diagnosticNode: v.Initializer,
+                                context: context,
+                                diagnostics: diagnostics,
+                                requireImplicit: true);
+                        }
+                        else
+                        {
+                            if (rhs is BoundStackAllocArrayCreationExpression)
+                                EnsureUnsafe(v.Initializer.Value, context, diagnostics);
+                            localType = rhs.Type;
+                            init = rhs;
+                        }
                     }
                 }
             }
@@ -11080,7 +11534,7 @@ namespace Cnidaria.Cs
                         requireImplicit: true);
                 }
             }
-            
+
             Optional<object> constValueOpt = Optional<object>.None;
             if (isConst)
             {
@@ -11110,15 +11564,29 @@ namespace Cnidaria.Cs
             return new BoundLocalDeclarationStatement(ownerSyntax, local, init);
         }
         private BoundExpression BindElementAccess(
-            ElementAccessExpressionSyntax node, 
-            BindValueKind bindValueKind, 
-            BindingContext context, 
+            ElementAccessExpressionSyntax node,
+            BindValueKind bindValueKind,
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             var expr = BindExpression(node.Expression, context, diagnostics);
             if (expr.HasErrors)
                 return new BoundBadExpression(node);
+            if (node.ArgumentList.Arguments.Count == 1 &&
+                node.ArgumentList.Arguments[0].Expression is RangeExpressionSyntax range)
+            {
+                if (bindValueKind == BindValueKind.LValue)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE000",
+                        DiagnosticSeverity.Error,
+                        "Cannot assign to a slice.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
 
+                return BindSliceElementAccess(node, expr, range, context, diagnostics);
+            }
             if (expr.Type is ArrayTypeSymbol at)
             {
                 if (node.ArgumentList.Arguments.Count != at.Rank)
@@ -11134,24 +11602,156 @@ namespace Cnidaria.Cs
                 }
 
                 var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
-                var indices = ImmutableArray.CreateBuilder<BoundExpression>(node.ArgumentList.Arguments.Count);
 
+                // a[^x] => a[a.Length - x]
+                bool hasFromEndIndex = false;
                 for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
                 {
-                    var arg = node.ArgumentList.Arguments[i];
-                    var indexExpr = BindExpression(arg.Expression, context, diagnostics);
-                    indexExpr = ApplyConversion(
-                        exprSyntax: arg.Expression,
-                        expr: indexExpr,
+                    if (node.ArgumentList.Arguments[i].Expression is PrefixUnaryExpressionSyntax pre &&
+                        pre.Kind == SyntaxKind.IndexExpression)
+                    {
+                        hasFromEndIndex = true;
+                        break;
+                    }
+                }
+
+                if (!hasFromEndIndex)
+                {
+                    var indices = ImmutableArray.CreateBuilder<BoundExpression>(node.ArgumentList.Arguments.Count);
+
+                    for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
+                    {
+                        var arg = node.ArgumentList.Arguments[i];
+                        var indexExpr = BindExpression(arg.Expression, context, diagnostics);
+                        indexExpr = ApplyConversion(
+                            exprSyntax: arg.Expression,
+                            expr: indexExpr,
+                            targetType: intType,
+                            diagnosticNode: node,
+                            context: context,
+                            diagnostics: diagnostics,
+                            requireImplicit: true);
+                        indices.Add(indexExpr);
+                    }
+
+                    return new BoundArrayElementAccessExpression(node, at.ElementType, expr, indices.ToImmutable());
+                }
+
+                if (at.Rank != 1)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ELEM004",
+                        DiagnosticSeverity.Error,
+                        "Index-from-end (^) is only supported for single-dimensional arrays.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var recvTmp = NewTemp("$idx_recv", expr.Type);
+                var recvDecl = new BoundLocalDeclarationStatement(node, recvTmp, expr);
+                var recvExpr = new BoundLocalExpression(node, recvTmp);
+
+                var receiverTypeForLookup = GetReceiverTypeForMemberLookup(expr.Type);
+                if (receiverTypeForLookup is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ELEM005",
+                        DiagnosticSeverity.Error,
+                        "Index-from-end (^) is not supported for this receiver type.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                Symbol? lengthMember = null;
+                {
+                    var members = LookupMembers(receiverTypeForLookup, "Length");
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        var m = members[i];
+                        if (m is PropertySymbol p && !p.IsStatic && ReferenceEquals(p.Type, intType))
+                        {
+                            lengthMember = p;
+                            break;
+                        }
+                        if (m is FieldSymbol f && !f.IsStatic && ReferenceEquals(f.Type, intType))
+                        {
+                            lengthMember = f;
+                            break;
+                        }
+                    }
+                }
+                if (lengthMember is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ELEM006",
+                        DiagnosticSeverity.Error,
+                        "Receiver type does not have an accessible 'Length' member required for index-from-end (^).",
+                        new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var lenTmp = NewTemp("$idx_len", intType);
+                var lenAccess = new BoundMemberAccessExpression(
+                    (ExpressionSyntax)node.Expression,
+                    receiverOpt: recvExpr,
+                    member: lengthMember,
+                    type: intType,
+                    isLValue: false);
+                var lenDecl = new BoundLocalDeclarationStatement(node, lenTmp, lenAccess);
+                var lenExpr = new BoundLocalExpression(node, lenTmp);
+
+                var locals = ImmutableArray.CreateBuilder<LocalSymbol>(2 + node.ArgumentList.Arguments.Count);
+                var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2 + node.ArgumentList.Arguments.Count);
+                var indices2 = ImmutableArray.CreateBuilder<BoundExpression>(node.ArgumentList.Arguments.Count);
+
+                locals.Add(recvTmp);
+                sideEffects.Add(recvDecl);
+
+                // Capture each argument expression
+                for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
+                {
+                    var argSyntax = node.ArgumentList.Arguments[i].Expression;
+
+                    bool fromEnd = argSyntax is PrefixUnaryExpressionSyntax pre && pre.Kind == SyntaxKind.IndexExpression;
+                    var valueSyntax = fromEnd ? ((PrefixUnaryExpressionSyntax)argSyntax).Operand : argSyntax;
+
+                    var boundValue = BindExpression(valueSyntax, context, diagnostics);
+                    boundValue = ApplyConversion(
+                        exprSyntax: valueSyntax,
+                        expr: boundValue,
                         targetType: intType,
                         diagnosticNode: node,
                         context: context,
                         diagnostics: diagnostics,
                         requireImplicit: true);
-                    indices.Add(indexExpr);
+
+                    if (boundValue.HasErrors)
+                        return new BoundBadExpression(node);
+
+                    var valTmp = NewTemp($"$idx_arg{i}", intType);
+                    locals.Add(valTmp);
+                    sideEffects.Add(new BoundLocalDeclarationStatement(node, valTmp, boundValue));
+                    var valExpr = new BoundLocalExpression(node, valTmp);
+
+                    BoundExpression finalIndex = fromEnd
+                        ? (BoundExpression)new BoundBinaryExpression(
+                            node,
+                            BoundBinaryOperatorKind.Subtract,
+                            intType,
+                            lenExpr,
+                            valExpr,
+                            Optional<object>.None,
+                            isChecked: false)
+                        : (BoundExpression)valExpr;
+
+                    indices2.Add(finalIndex);
                 }
 
-                return new BoundArrayElementAccessExpression(node, at.ElementType, expr, indices.ToImmutable());
+                locals.Add(lenTmp);
+                sideEffects.Add(lenDecl);
+
+                var access = new BoundArrayElementAccessExpression(node, at.ElementType, recvExpr, indices2.ToImmutable());
+                return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), access);
             }
             if (expr.Type is PointerTypeSymbol pt)
             {
@@ -11324,6 +11924,416 @@ namespace Cnidaria.Cs
                 "CN_ELEM000",
                 DiagnosticSeverity.Error,
                 "Element access is not implemented for this type.",
+                new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+            return new BoundBadExpression(node);
+        }
+        private BoundExpression BindSliceElementAccess(
+            ElementAccessExpressionSyntax node,
+            BoundExpression receiver,
+            RangeExpressionSyntax range,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            static bool IsFromEndIndex(ExpressionSyntax expr, out ExpressionSyntax valueExpression)
+            {
+                if (expr is PrefixUnaryExpressionSyntax pre && pre.Kind == SyntaxKind.IndexExpression)
+                {
+                    valueExpression = pre.Operand;
+                    return true;
+                }
+
+                valueExpression = expr;
+                return false;
+            }
+
+            var int32 = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+
+            // Capture receiver
+            var recvTmp = NewTemp("$slice_recv", receiver.Type);
+            var recvDecl = new BoundLocalDeclarationStatement(node, recvTmp, receiver);
+            var recvExpr = new BoundLocalExpression(node, recvTmp);
+
+            BoundExpression? leftValueExpr = null;
+            bool leftFromEnd = false;
+            LocalSymbol? leftTmp = null;
+            BoundStatement? leftDecl = null;
+
+            if (range.LeftOperand is ExpressionSyntax leftSyntax)
+            {
+                leftFromEnd = IsFromEndIndex(leftSyntax, out var leftValueSyntax);
+                var boundLeft = BindExpression(leftValueSyntax, context, diagnostics);
+                boundLeft = ApplyConversion(
+                    exprSyntax: leftValueSyntax,
+                    expr: boundLeft,
+                    targetType: int32,
+                    diagnosticNode: node,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+                if (boundLeft.HasErrors)
+                    return new BoundBadExpression(node);
+
+                leftTmp = NewTemp("$slice_left", int32);
+                leftDecl = new BoundLocalDeclarationStatement(node, leftTmp, boundLeft);
+                leftValueExpr = new BoundLocalExpression(node, leftTmp);
+            }
+
+            BoundExpression? rightValueExpr = null;
+            bool rightFromEnd = false;
+            LocalSymbol? rightTmp = null;
+            BoundStatement? rightDecl = null;
+
+            if (range.RightOperand is ExpressionSyntax rightSyntax)
+            {
+                rightFromEnd = IsFromEndIndex(rightSyntax, out var rightValueSyntax);
+                var boundRight = BindExpression(rightValueSyntax, context, diagnostics);
+                boundRight = ApplyConversion(
+                    exprSyntax: rightValueSyntax,
+                    expr: boundRight,
+                    targetType: int32,
+                    diagnosticNode: node,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+                if (boundRight.HasErrors)
+                    return new BoundBadExpression(node);
+
+                rightTmp = NewTemp("$slice_right", int32);
+                rightDecl = new BoundLocalDeclarationStatement(node, rightTmp, boundRight);
+                rightValueExpr = new BoundLocalExpression(node, rightTmp);
+            }
+
+            // Determine slicing strategy
+            var receiverTypeForLookup = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverTypeForLookup is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SLICE001",
+                    DiagnosticSeverity.Error,
+                    "Slicing is not supported for this receiver type.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            // Find instance Length
+            Symbol? lengthMember = null;
+            {
+                var members = LookupMembers(receiverTypeForLookup, "Length");
+                for (int i = 0; i < members.Length; i++)
+                {
+                    var m = members[i];
+                    if (m is PropertySymbol p && !p.IsStatic && ReferenceEquals(p.Type, int32))
+                    {
+                        lengthMember = p;
+                        break;
+                    }
+                    if (m is FieldSymbol f && !f.IsStatic && ReferenceEquals(f.Type, int32))
+                    {
+                        lengthMember = f;
+                        break;
+                    }
+                }
+            }
+            if (lengthMember is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SLICE002",
+                    DiagnosticSeverity.Error,
+                    "Receiver type does not have an accessible 'Length' member required for slicing.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            // lenTmp = recv.Length
+            var lenTmp = NewTemp("$slice_len", int32);
+            var lenAccess = new BoundMemberAccessExpression(
+                (ExpressionSyntax)node.Expression,
+                receiverOpt: recvExpr,
+                member: lengthMember,
+                type: int32,
+                isLValue: false);
+            var lenDecl = new BoundLocalDeclarationStatement(node, lenTmp, lenAccess);
+            var lenExpr = new BoundLocalExpression(node, lenTmp);
+
+            // startTmp
+            var startTmp = NewTemp("$slice_start", int32);
+            BoundExpression startInit;
+            if (leftValueExpr is null)
+            {
+                startInit = new BoundLiteralExpression(node, int32, 0);
+            }
+            else if (leftFromEnd)
+            {
+                startInit = new BoundBinaryExpression(
+                    node,
+                    BoundBinaryOperatorKind.Subtract,
+                    int32,
+                    lenExpr,
+                    leftValueExpr,
+                    Optional<object>.None,
+                    isChecked: false);
+            }
+            else
+            {
+                startInit = leftValueExpr;
+            }
+            var startDecl = new BoundLocalDeclarationStatement(node, startTmp, startInit);
+            var startExpr = new BoundLocalExpression(node, startTmp);
+
+            // sliceLenTmp
+            var sliceLenTmp = NewTemp("$slice_count", int32);
+            BoundExpression sliceLenInit;
+            if (rightValueExpr is null)
+            {
+                // len - start
+                sliceLenInit = new BoundBinaryExpression(
+                    node,
+                    BoundBinaryOperatorKind.Subtract,
+                    int32,
+                    lenExpr,
+                    startExpr,
+                    Optional<object>.None,
+                    isChecked: false);
+            }
+            else
+            {
+                BoundExpression endExpr = rightFromEnd
+                    ? new BoundBinaryExpression(
+                        node,
+                        BoundBinaryOperatorKind.Subtract,
+                        int32,
+                        lenExpr,
+                        rightValueExpr,
+                        Optional<object>.None,
+                        isChecked: false)
+                    : rightValueExpr;
+
+                sliceLenInit = new BoundBinaryExpression(
+                    node,
+                    BoundBinaryOperatorKind.Subtract,
+                    int32,
+                    endExpr,
+                    startExpr,
+                    Optional<object>.None,
+                    isChecked: false);
+            }
+            var sliceLenDecl = new BoundLocalDeclarationStatement(node, sliceLenTmp, sliceLenInit);
+            var sliceLenExpr = new BoundLocalExpression(node, sliceLenTmp);
+
+            var locals = ImmutableArray.CreateBuilder<LocalSymbol>(8);
+            var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(8);
+
+            locals.Add(recvTmp);
+            sideEffects.Add(recvDecl);
+
+            if (leftTmp is not null)
+            {
+                locals.Add(leftTmp);
+                sideEffects.Add(leftDecl!);
+            }
+            if (rightTmp is not null)
+            {
+                locals.Add(rightTmp);
+                sideEffects.Add(rightDecl!);
+            }
+
+            locals.Add(lenTmp);
+            sideEffects.Add(lenDecl);
+            locals.Add(startTmp);
+            sideEffects.Add(startDecl);
+            locals.Add(sliceLenTmp);
+            sideEffects.Add(sliceLenDecl);
+
+            // string slicing => string.Substring
+            if (receiver.Type.SpecialType == SpecialType.System_String)
+            {
+                var stringType = (NamedTypeSymbol)context.Compilation.GetSpecialType(SpecialType.System_String);
+
+                MethodSymbol? substring = null;
+                bool useTwoArgs = rightValueExpr is not null;
+                int desiredParamCount = useTwoArgs ? 2 : 1;
+
+                var members = stringType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol m) continue;
+                    if (m.IsStatic || m.IsConstructor) continue;
+                    if (!string.Equals(m.Name, "Substring", StringComparison.Ordinal)) continue;
+                    if (m.Parameters.Length != desiredParamCount) continue;
+                    if (!ReferenceEquals(m.ReturnType, stringType)) continue;
+                    if (!ReferenceEquals(m.Parameters[0].Type, int32)) continue;
+                    if (desiredParamCount == 2 && !ReferenceEquals(m.Parameters[1].Type, int32)) continue;
+                    substring = m;
+                    break;
+                }
+
+                if (substring is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE010",
+                        DiagnosticSeverity.Error,
+                        "Missing required 'string.Substring' overload for slicing.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var args = useTwoArgs
+                    ? ImmutableArray.Create<BoundExpression>(startExpr, sliceLenExpr)
+                    : ImmutableArray.Create<BoundExpression>(startExpr);
+
+                var call = new BoundCallExpression(node, recvExpr, substring, args);
+                return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), call);
+            }
+
+            // span slicing => Slice(start) / Slice(start, length)
+            if (TryGetSpanLikeElementType(receiver.Type, out var spanLikeType, out _))
+            {
+                bool useTwoArgs = rightValueExpr is not null;
+                int desiredParamCount = useTwoArgs ? 2 : 1;
+
+                MethodSymbol? slice = null;
+                var members = spanLikeType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol m) continue;
+                    if (m.IsStatic || m.IsConstructor) continue;
+                    if (!string.Equals(m.Name, "Slice", StringComparison.Ordinal)) continue;
+                    if (m.Parameters.Length != desiredParamCount) continue;
+                    if (!ReferenceEquals(m.Parameters[0].Type, int32)) continue;
+                    if (desiredParamCount == 2 && !ReferenceEquals(m.Parameters[1].Type, int32)) continue;
+                    if (!ReferenceEquals(m.ReturnType, spanLikeType)) continue;
+                    slice = m;
+                    break;
+                }
+
+                if (slice is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE011",
+                        DiagnosticSeverity.Error,
+                        "Missing required 'Slice' method overload for span slicing.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var args = useTwoArgs
+                    ? ImmutableArray.Create<BoundExpression>(startExpr, sliceLenExpr)
+                    : ImmutableArray.Create<BoundExpression>(startExpr);
+
+                var call = new BoundCallExpression(node, recvExpr, slice, args);
+                return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), call);
+            }
+
+            // array slicing => allocate + Array.Copy
+            if (receiver.Type is ArrayTypeSymbol at)
+            {
+                if (at.Rank != 1)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE020",
+                        DiagnosticSeverity.Error,
+                        "Array slicing is only supported for single-dimensional arrays.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var resultArrTmp = NewTemp("$slice_arr", receiver.Type);
+                locals.Add(resultArrTmp);
+
+                var created = new BoundArrayCreationExpression(
+                    syntax: node,
+                    type: (ArrayTypeSymbol)receiver.Type,
+                    elementType: at.ElementType,
+                    count: sliceLenExpr,
+                    initializerOpt: null);
+
+                var resultArrDecl = new BoundLocalDeclarationStatement(node, resultArrTmp, created);
+                sideEffects.Add(resultArrDecl);
+
+                var resultArrExpr = new BoundLocalExpression(node, resultArrTmp);
+
+                // Find Array.Copy(Array, int, Array, int, int)
+                var arrayBase = context.Compilation.GetSpecialType(SpecialType.System_Array);
+                if (arrayBase is not NamedTypeSymbol arrayType)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE021",
+                        DiagnosticSeverity.Error,
+                        "Missing special type System.Array required for array slicing.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                MethodSymbol? copy = null;
+                var arrayMembers = arrayType.GetMembers();
+                for (int i = 0; i < arrayMembers.Length; i++)
+                {
+                    if (arrayMembers[i] is not MethodSymbol m) continue;
+                    if (!m.IsStatic || m.IsConstructor) continue;
+                    if (!string.Equals(m.Name, "Copy", StringComparison.Ordinal)) continue;
+                    if (m.Parameters.Length != 5) continue;
+                    if (!ReferenceEquals(m.Parameters[0].Type, arrayType)) continue;
+                    if (!ReferenceEquals(m.Parameters[1].Type, int32)) continue;
+                    if (!ReferenceEquals(m.Parameters[2].Type, arrayType)) continue;
+                    if (!ReferenceEquals(m.Parameters[3].Type, int32)) continue;
+                    if (!ReferenceEquals(m.Parameters[4].Type, int32)) continue;
+                    copy = m;
+                    break;
+                }
+
+                if (copy is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_SLICE022",
+                        DiagnosticSeverity.Error,
+                        "Missing required 'Array.Copy(Array, int, Array, int, int)' overload for array slicing.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                var zero = new BoundLiteralExpression(node, int32, 0);
+
+                var srcAsArray = ApplyConversion(
+                    exprSyntax: node.Expression,
+                    expr: recvExpr,
+                    targetType: arrayType,
+                    diagnosticNode: node,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+                var dstAsArray = ApplyConversion(
+                    exprSyntax: node.Expression,
+                    expr: resultArrExpr,
+                    targetType: arrayType,
+                    diagnosticNode: node,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+                if (srcAsArray.HasErrors || dstAsArray.HasErrors)
+                    return new BoundBadExpression(node);
+
+                var copyArgs = ImmutableArray.Create<BoundExpression>(
+                    srcAsArray,
+                    startExpr,
+                    dstAsArray,
+                    zero,
+                    sliceLenExpr);
+
+                var copyCall = new BoundCallExpression(node, receiverOpt: null, copy, copyArgs);
+                sideEffects.Add(new BoundExpressionStatement(node, copyCall));
+
+                return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), resultArrExpr);
+            }
+
+            diagnostics.Add(new Diagnostic(
+                "CN_SLICE003",
+                DiagnosticSeverity.Error,
+                "Slicing is not supported for this receiver type.",
                 new Location(context.SemanticModel.SyntaxTree, node.Span)));
 
             return new BoundBadExpression(node);
@@ -11838,8 +12848,6 @@ namespace Cnidaria.Cs
         private BoundExpression BindStackAlloc(
             StackAllocArrayCreationExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            EnsureUnsafe(node, context, diagnostics);
-
             if (node.Type is not ArrayTypeSyntax at)
             {
                 diagnostics.Add(new Diagnostic(
@@ -11923,8 +12931,6 @@ namespace Cnidaria.Cs
         }
         private BoundExpression BindImplicitStackAlloc(ImplicitStackAllocArrayCreationExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            EnsureUnsafe(node, context, diagnostics);
-
             if (node.Initializer is null)
             {
                 diagnostics.Add(new Diagnostic(
@@ -11985,9 +12991,9 @@ namespace Cnidaria.Cs
             return new BoundStackAllocArrayCreationExpression(node, ptrType, elemType, countExpr, initializerOpt);
         }
         private BoundArrayInitializerExpression? BindStackAllocInitializer(
-            InitializerExpressionSyntax? init, 
-            TypeSymbol elemType, 
-            BindingContext context, 
+            InitializerExpressionSyntax? init,
+            TypeSymbol elemType,
+            BindingContext context,
             DiagnosticBag diagnostics)
         {
             if (init is null)
@@ -12087,7 +13093,8 @@ namespace Cnidaria.Cs
 
         private BoundStatement BindContinue(ContinueStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            if (!_flow.TryGetCurrentLoop(out _, out var continueLabel))
+            if (!_flow.TryGetCurrentLoop(out var breakLabel, out var continueLabel)
+                || ReferenceEquals(breakLabel, continueLabel))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_FLOW002",
@@ -12229,7 +13236,7 @@ namespace Cnidaria.Cs
                     "Constructor initializer must be this or base.",
                     new Location(context.SemanticModel.SyntaxTree, initSyntax.Span)));
                 var empty = new BoundEmptyStatement(initSyntax);
-                context.Recorder.RecordBound(initSyntax, empty); 
+                context.Recorder.RecordBound(initSyntax, empty);
                 return empty;
             }
 
@@ -12347,7 +13354,16 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(expr.Type, targetType))
                 return expr;
 
+            if (expr is BoundThrowExpression te)
+            {
+                te.SetType(targetType);
+                return te;
+            }
+
             var conv = ClassifyConversion(expr, targetType, context);
+
+            if (expr is BoundStackAllocArrayCreationExpression && conv.Kind != ConversionKind.ImplicitStackAlloc)
+                EnsureUnsafe(exprSyntax, context, diagnostics);
 
             if (conv.Kind == ConversionKind.ImplicitStackAlloc)
             {
@@ -12645,10 +13661,10 @@ namespace Cnidaria.Cs
             {
                 bool hasDeclaredParameterlessCtor = false;
                 for (int i = 0; i < allCtorCandidates.Length; i++)
-                    if (allCtorCandidates[i].Parameters.Length == 0) 
-                    { 
-                        hasDeclaredParameterlessCtor = true; 
-                        break; 
+                    if (allCtorCandidates[i].Parameters.Length == 0)
+                    {
+                        hasDeclaredParameterlessCtor = true;
+                        break;
                     }
                 if (!hasDeclaredParameterlessCtor)
                     return true;
@@ -12665,9 +13681,9 @@ namespace Cnidaria.Cs
                 for (int a = 0; a < boundArgs.Length; a++)
                 {
                     if (!ArgumentRefKindMatchesParameter(argSyntaxes[a].RefKindKeyword, m.Parameters[a]))
-                    { 
-                        ok = false; 
-                        break; 
+                    {
+                        ok = false;
+                        break;
                     }
                     var conv = ClassifyConversion(boundArgs[a], m.Parameters[a].Type, context);
                     if (!conv.Exists || !conv.IsImplicit)
@@ -12807,6 +13823,9 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(expr.Type, target))
                 return new Conversion(ConversionKind.Identity);
 
+            if (expr is BoundThrowExpression || expr.Type is ThrowTypeSymbol)
+                return new Conversion(ConversionKind.Identity);
+
             // null literal
             if (expr.Type is NullTypeSymbol)
             {
@@ -12833,7 +13852,7 @@ namespace Cnidaria.Cs
                     return new Conversion(ConversionKind.None);
                 return new Conversion(underlyingConv2.IsImplicit ? ConversionKind.ImplicitNullable : ConversionKind.ExplicitNullable);
             }
-            if (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is null 
+            if (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is null
                 && (target.IsReferenceType || target is PointerTypeSymbol))
                 return new Conversion(ConversionKind.NullLiteral);
 
@@ -12871,7 +13890,7 @@ namespace Cnidaria.Cs
             {
                 return new Conversion(ConversionKind.ExplicitNumeric);
             }
-            
+
             // tuple conversions
             if (expr.Type is TupleTypeSymbol fromTuple && target is TupleTypeSymbol toTuple)
             {
@@ -12906,6 +13925,17 @@ namespace Cnidaria.Cs
             }
             bool exprHasRefLike = RefLikeRestrictionFacts.ContainsRefLike(expr.Type);
             bool targetHasRefLike = RefLikeRestrictionFacts.ContainsRefLike(target);
+
+            // type parameter conversions
+            if (expr.Type is TypeParameterSymbol tp)
+            {
+                if ((tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
+                    return new Conversion(ConversionKind.None);
+
+                // T -> object
+                if (target.SpecialType == SpecialType.System_Object)
+                    return new Conversion(ConversionKind.Boxing);
+            }
 
             // boxing
             if (expr.Type.IsValueType && target.SpecialType == SpecialType.System_Object)
@@ -13041,7 +14071,7 @@ namespace Cnidaria.Cs
                 SpecialType.System_UInt32 => (uint.MinValue, uint.MaxValue, true),
                 SpecialType.System_Int64 => (long.MinValue, long.MaxValue, true),
                 SpecialType.System_UInt64 => (0m, (decimal)ulong.MaxValue, true),
-                SpecialType.System_IntPtr => 
+                SpecialType.System_IntPtr =>
                     (RuntimeTypeSystem.PointerSize == 4 ? int.MinValue : long.MinValue,
                     RuntimeTypeSystem.PointerSize == 4 ? int.MaxValue : long.MaxValue, true),
                 SpecialType.System_UIntPtr =>
@@ -13092,9 +14122,9 @@ namespace Cnidaria.Cs
                         or SpecialType.System_UInt64 or SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal
                         or SpecialType.System_IntPtr or SpecialType.System_UIntPtr,
 
-                    SpecialType.System_Int32 => to is SpecialType.System_Int64 or SpecialType.System_Single or SpecialType.System_Double 
+                    SpecialType.System_Int32 => to is SpecialType.System_Int64 or SpecialType.System_Single or SpecialType.System_Double
                         or SpecialType.System_Decimal or SpecialType.System_IntPtr,
-                    SpecialType.System_UInt32 => to is SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_Single 
+                    SpecialType.System_UInt32 => to is SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_Single
                         or SpecialType.System_Double or SpecialType.System_Decimal or SpecialType.System_UIntPtr,
                     SpecialType.System_Int64 => to is SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal,
                     SpecialType.System_UInt64 => to is SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal,
@@ -13445,7 +14475,384 @@ namespace Cnidaria.Cs
 
             return new BoundIfStatement(node, condition, thenStmt, elseStmt);
         }
+        private BoundExpression BindSwitchLabelCondition(
+    SyntaxNode diagnosticNode,
+    ExpressionSyntax tmpExprSyntax,
+    BoundExpression tmpExpr,
+    TypeSymbol governingType,
+    SwitchLabelSyntax label,
+    BindingContext ctx,
+    DiagnosticBag diagnostics,
+    out bool isFallbackLabel)
+        {
+            isFallbackLabel = false;
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
 
+            if (label is DefaultSwitchLabelSyntax)
+            {
+                isFallbackLabel = true;
+                return MakeBoolLiteral(label, ctx, value: true);
+            }
+
+            if (label is CaseSwitchLabelSyntax cs)
+            {
+                var value = BindExpression(cs.Value, ctx, diagnostics);
+                value = ApplyConversion(cs.Value, value, governingType, diagnosticNode, ctx, diagnostics, requireImplicit: true);
+                if (value.HasErrors) return new BoundBadExpression(label);
+                if (!value.ConstantValueOpt.HasValue)
+                {
+                    diagnostics.Add(new Diagnostic("CN_SWITCH000", DiagnosticSeverity.Error,
+                        "A switch case label must be a constant expression.",
+                        new Location(ctx.SemanticModel.SyntaxTree, cs.Value.Span)));
+                    return MakeBoolLiteral(label, ctx, value: false);
+                }
+
+                var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, cs.CaseKeyword.Span);
+                var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, cs.Value);
+                return BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
+            }
+
+            if (label is CasePatternSwitchLabelSyntax cps)
+            {
+                BoundExpression match;
+                switch (cps.Pattern)
+                {
+                    case ConstantPatternSyntax cp:
+                        {
+                            var value = BindExpression(cp.Expression, ctx, diagnostics);
+                            value = ApplyConversion(cp.Expression, value, governingType, diagnosticNode, ctx, diagnostics, requireImplicit: true);
+                            if (value.HasErrors) return new BoundBadExpression(label);
+                            if (!value.ConstantValueOpt.HasValue)
+                            {
+                                diagnostics.Add(new Diagnostic("CN_SWITCH000", DiagnosticSeverity.Error,
+                                    "A switch case label must be a constant expression.",
+                                    new Location(ctx.SemanticModel.SyntaxTree, cp.Expression.Span)));
+                                match = MakeBoolLiteral(label, ctx, value: false);
+                                break;
+                            }
+
+                            var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, cps.CaseKeyword.Span);
+                            var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, cp.Expression);
+                            match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
+                            break;
+                        }
+                    case DiscardPatternSyntax:
+                        match = MakeBoolLiteral(label, ctx, value: true);
+                        isFallbackLabel = cps.WhenClause is null;
+                        break;
+                    default:
+                        diagnostics.Add(new Diagnostic("CN_SWITCH001", DiagnosticSeverity.Error,
+                            $"Switch pattern '{cps.Pattern.Kind}' is not supported.",
+                            new Location(ctx.SemanticModel.SyntaxTree, cps.Pattern.Span)));
+                        match = new BoundBadExpression(label);
+                        break;
+                }
+
+                if (cps.WhenClause is null) return match;
+
+                var whenCond = BindExpression(cps.WhenClause.Condition, ctx, diagnostics);
+                whenCond = ApplyConversion(cps.WhenClause.Condition, whenCond, boolType, cps.WhenClause, ctx, diagnostics, requireImplicit: true);
+                if (match.HasErrors || whenCond.HasErrors) return new BoundBadExpression(label);
+                return MakeLogicalAnd(label, match, whenCond, ctx, diagnostics);
+            }
+
+            diagnostics.Add(new Diagnostic("CN_SWITCH002", DiagnosticSeverity.Error,
+                $"Switch label '{label.Kind}' is not supported.",
+                new Location(ctx.SemanticModel.SyntaxTree, label.Span)));
+            return new BoundBadExpression(label);
+        }
+
+        private BoundExpression BindSwitchExpressionArmCondition(
+            SwitchExpressionArmSyntax arm,
+            ExpressionSyntax tmpExprSyntax,
+            BoundExpression tmpExpr,
+            TypeSymbol governingType,
+            BindingContext ctx,
+            DiagnosticBag diagnostics)
+        {
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            BoundExpression match;
+            switch (arm.Pattern)
+            {
+                case ConstantPatternSyntax cp:
+                    {
+                        var value = BindExpression(cp.Expression, ctx, diagnostics);
+                        value = ApplyConversion(cp.Expression, value, governingType, arm, ctx, diagnostics, requireImplicit: true);
+                        if (value.HasErrors) return new BoundBadExpression(arm);
+                        if (!value.ConstantValueOpt.HasValue)
+                        {
+                            diagnostics.Add(new Diagnostic("CN_SWITCHEXPR000", DiagnosticSeverity.Error,
+                                "A switch expression arm pattern must be a constant expression.",
+                                new Location(ctx.SemanticModel.SyntaxTree, cp.Expression.Span)));
+                            match = MakeBoolLiteral(arm, ctx, value: false);
+                            break;
+                        }
+
+                        var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, arm.EqualsGreaterThanToken.Span);
+                        var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, cp.Expression);
+                        match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
+                        break;
+                    }
+                case DiscardPatternSyntax:
+                    match = MakeBoolLiteral(arm, ctx, value: true);
+                    break;
+                default:
+                    diagnostics.Add(new Diagnostic("CN_SWITCHEXPR001", DiagnosticSeverity.Error,
+                        $"Switch expression pattern '{arm.Pattern.Kind}' is not supported.",
+                        new Location(ctx.SemanticModel.SyntaxTree, arm.Pattern.Span)));
+                    match = new BoundBadExpression(arm);
+                    break;
+            }
+
+            if (arm.WhenClause is null) return match;
+            var whenCond = BindExpression(arm.WhenClause.Condition, ctx, diagnostics);
+            whenCond = ApplyConversion(arm.WhenClause.Condition, whenCond, boolType, arm.WhenClause, ctx, diagnostics, requireImplicit: true);
+            if (match.HasErrors || whenCond.HasErrors) return new BoundBadExpression(arm);
+            return MakeLogicalAnd(arm, match, whenCond, ctx, diagnostics);
+        }
+
+        private BoundStatement BindSwitchStatement(SwitchStatementSyntax node, BindingContext ctx, DiagnosticBag diagnostics)
+        {
+            var governing = BindExpression(node.Expression, ctx, diagnostics);
+            if (governing.HasErrors) return new BoundBadStatement(node);
+            if (governing.Type.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic("CN_SWITCH003", DiagnosticSeverity.Error,
+                    "The switch expression must not be of type 'void'.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.Expression.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            var tmp = NewTemp("$switch_tmp", governing.Type);
+            var tmpSyntax = MakeIdentifierName(tmp.Name, node.Expression.Span);
+            var tmpExpr = new BoundLocalExpression(tmpSyntax, tmp);
+            var tmpDecl = new BoundLocalDeclarationStatement(node, tmp, governing);
+
+            var breakLabel = _flow.NewGeneratedLabel("switch_break");
+            int sectionCount = node.Sections.Count;
+            var sectionLabels = new LabelSymbol[sectionCount];
+            for (int i = 0; i < sectionCount; i++)
+                sectionLabels[i] = _flow.NewGeneratedLabel("switch_section");
+
+            var sectionConds = new BoundExpression[sectionCount];
+            int fallbackSection = -1;
+
+            for (int i = 0; i < sectionCount; i++)
+            {
+                var sec = node.Sections[i];
+                BoundExpression? cond = null;
+                bool secHasFallback = false;
+
+                for (int l = 0; l < sec.Labels.Count; l++)
+                {
+                    bool isFallback;
+                    var labelCond = BindSwitchLabelCondition(node, tmpSyntax, tmpExpr, governing.Type, sec.Labels[l], ctx, diagnostics, out isFallback);
+                    if (isFallback) secHasFallback = true;
+                    else cond = cond is null ? labelCond : MakeLogicalOr(sec, cond, labelCond, ctx, diagnostics);
+                }
+
+                sectionConds[i] = cond ?? MakeBoolLiteral(sec, ctx, value: false);
+                if (secHasFallback)
+                {
+                    if (fallbackSection < 0) fallbackSection = i;
+                    else
+                        diagnostics.Add(new Diagnostic("CN_SWITCH004", DiagnosticSeverity.Error,
+                            "Multiple default labels in switch statement.",
+                            new Location(ctx.SemanticModel.SyntaxTree, sec.Span)));
+                }
+            }
+
+            var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
+            stmts.Add(tmpDecl);
+
+            for (int i = 0; i < sectionCount; i++)
+            {
+                var cond = sectionConds[i];
+                if (TryGetBoolConstant(cond, out var bc) && bc == false) continue;
+                if (TryGetBoolConstant(cond, out bc) && bc == true)
+                {
+                    stmts.Add(new BoundGotoStatement(node, sectionLabels[i]));
+                    continue;
+                }
+                stmts.Add(new BoundConditionalGotoStatement(node, cond, sectionLabels[i], jumpIfTrue: true));
+            }
+
+            if (fallbackSection >= 0) stmts.Add(new BoundGotoStatement(node, sectionLabels[fallbackSection]));
+            else stmts.Add(new BoundGotoStatement(node, breakLabel));
+
+            _flow.PushLoop(breakLabel, breakLabel); // break only loop marker
+            try
+            {
+                for (int i = 0; i < sectionCount; i++)
+                {
+                    var sec = node.Sections[i];
+                    stmts.Add(new BoundLabelStatement(sec, sectionLabels[i]));
+
+                    var sectionBinder = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+                    var secStatements = sec.Statements.ToArray();
+                    sectionBinder.PredeclareLocalFunctionsInStatementList(ImmutableArray.CreateRange(secStatements), ctx, diagnostics);
+
+                    var boundSecStmts = ImmutableArray.CreateBuilder<BoundStatement>(secStatements.Length);
+                    for (int s = 0; s < secStatements.Length; s++)
+                        boundSecStmts.Add(sectionBinder.BindStatement(secStatements[s], ctx, diagnostics));
+
+                    stmts.Add(new BoundBlockStatement(sec, boundSecStmts.ToImmutable()));
+                    stmts.Add(new BoundGotoStatement(sec, breakLabel)); // implicit break
+                }
+            }
+            finally { _flow.PopLoop(); }
+
+            stmts.Add(new BoundLabelStatement(node, breakLabel));
+            return new BoundBlockStatement(node, stmts.ToImmutable());
+        }
+
+        private BoundExpression BindSwitchExpression(SwitchExpressionSyntax node, BindingContext ctx, DiagnosticBag diagnostics)
+        {
+            var governing = BindExpression(node.GoverningExpression, ctx, diagnostics);
+            if (governing.HasErrors) return new BoundBadExpression(node);
+            if (governing.Type.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic("CN_SWITCHEXPR002", DiagnosticSeverity.Error,
+                    "The switch governing expression must not be of type 'void'.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.GoverningExpression.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            var tmp = NewTemp("$switch_expr_tmp", governing.Type);
+            var tmpSyntax = MakeIdentifierName(tmp.Name, node.GoverningExpression.Span);
+            var tmpExpr = new BoundLocalExpression(tmpSyntax, tmp);
+            var tmpDecl = new BoundLocalDeclarationStatement(node, tmp, governing);
+
+            var arms = node.Arms;
+            int armCount = arms.Count;
+            if (armCount == 0)
+            {
+                diagnostics.Add(new Diagnostic("CN_SWITCHEXPR003", DiagnosticSeverity.Error,
+                    "A switch expression must have at least one arm.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            var boundArmExprs = new BoundExpression[armCount];
+            var armIsThrow = new bool[armCount];
+            for (int i = 0; i < armCount; i++)
+            {
+                armIsThrow[i] = arms[i].Expression is ThrowExpressionSyntax;
+                boundArmExprs[i] = BindExpression(arms[i].Expression, ctx, diagnostics);
+            }
+
+            TypeSymbol? resultType = null;
+            for (int i = 0; i < armCount; i++)
+            {
+                if (armIsThrow[i])
+                    continue;
+                var t = boundArmExprs[i].Type;
+                if (t is ErrorTypeSymbol)
+                    continue;
+                if (resultType is null)
+                {
+                    resultType = t;
+                    continue;
+                }
+                var probe = new DiagnosticBag();
+                var merged = ClassifyConditionalResultType(
+                    ctx.Compilation,
+                    ctx.SemanticModel.SyntaxTree,
+                    resultType,
+                    t,
+                    node,
+                    probe);
+                if (merged is null || merged is ErrorTypeSymbol)
+                {
+                    resultType = null;
+                    break;
+                }
+                resultType = merged;
+            }
+            if (resultType is null || resultType is ErrorTypeSymbol)
+            {
+                var objType = ctx.Compilation.GetSpecialType(SpecialType.System_Object);
+                bool ok = true;
+                for (int i = 0; i < armCount; i++)
+                {
+                    if (armIsThrow[i])
+                        continue;
+                    var e = boundArmExprs[i];
+                    if (e.HasErrors)
+                        continue;
+                    var conv = ClassifyConversion(e, objType, ctx);
+                    if (!conv.Exists || !conv.IsImplicit)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok)
+                    resultType = objType;
+            }
+            if (resultType is null || resultType is ErrorTypeSymbol || resultType.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic("CN_SWITCHEXPR004", DiagnosticSeverity.Error,
+                    "Cannot determine a common type for switch expression arms.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            var resultLocal = NewTemp("$switch_expr_result", resultType);
+            var resultSyntax = MakeIdentifierName(resultLocal.Name, node.SwitchKeyword.Span);
+            var resultLocalExpr = new BoundLocalExpression(resultSyntax, resultLocal);
+            var resultDecl = new BoundLocalDeclarationStatement(node, resultLocal, initializer: null);
+
+            var endLabel = _flow.NewGeneratedLabel("switch_expr_end");
+            var armLabels = new LabelSymbol[armCount];
+            for (int i = 0; i < armCount; i++)
+                armLabels[i] = _flow.NewGeneratedLabel("switch_expr_arm");
+
+            var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
+            sideEffects.Add(tmpDecl);
+            sideEffects.Add(resultDecl);
+
+            for (int i = 0; i < armCount; i++)
+            {
+                var arm = arms[i];
+                var cond = BindSwitchExpressionArmCondition(arm, tmpSyntax, tmpExpr, governing.Type, ctx, diagnostics);
+                if (TryGetBoolConstant(cond, out var bc) && bc == false) continue;
+                if (TryGetBoolConstant(cond, out bc) && bc == true)
+                {
+                    sideEffects.Add(new BoundGotoStatement(arm, armLabels[i]));
+                    continue;
+                }
+                sideEffects.Add(new BoundConditionalGotoStatement(arm, cond, armLabels[i], jumpIfTrue: true));
+            }
+
+            sideEffects.Add(new BoundGotoStatement(node, endLabel)); // no match => default(resultLocal)
+
+            for (int i = 0; i < armCount; i++)
+            {
+                var arm = arms[i];
+                sideEffects.Add(new BoundLabelStatement(arm, armLabels[i]));
+                var armValue = boundArmExprs[i];
+                if (!armIsThrow[i] && !armValue.HasErrors)
+                {
+                    armValue = ApplyConversion(arm.Expression, armValue, resultType, arm, ctx, diagnostics, requireImplicit: true);
+                }
+                else if (armValue is BoundBadExpression bad)
+                {
+                    bad.SetType(resultType);
+                }
+                var assign = new BoundAssignmentExpression(arm, resultLocalExpr, armValue);
+                sideEffects.Add(new BoundExpressionStatement(arm, assign));
+                sideEffects.Add(new BoundGotoStatement(arm, endLabel));
+            }
+
+            sideEffects.Add(new BoundLabelStatement(node, endLabel));
+
+            return new BoundSequenceExpression(
+                node,
+                locals: ImmutableArray.Create(tmp, resultLocal),
+                sideEffects: sideEffects.ToImmutable(),
+                value: resultLocalExpr);
+        }
         private BoundStatement BindWhile(WhileStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);

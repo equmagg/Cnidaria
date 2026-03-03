@@ -1,11 +1,10 @@
 ﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Globalization;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -52,7 +51,7 @@ namespace Cnidaria.Cs
             return BitConverter.Int64BitsToDouble(Payload);
         }
     }
-    internal sealed class ExecutionLimits
+    public sealed class ExecutionLimits
     {
         public int MaxCallDepth { get; init; } = 128;
         public long MaxInstructions { get; init; } = 100_000_000;
@@ -71,7 +70,7 @@ namespace Cnidaria.Cs
         private readonly struct PendingCtorResult
         {
             public readonly PendingCtorResultKind Kind;
-            public readonly long Payload;      
+            public readonly long Payload;
             public readonly RuntimeType? Type;
 
             public PendingCtorResult(PendingCtorResultKind kind, long payload, RuntimeType? type)
@@ -251,6 +250,11 @@ namespace Cnidaria.Cs
         private readonly int _stackBase;
         private readonly int _stackEnd;
 
+        private int _stackPeakAbs;
+        private int _heapPeakAbs;
+        public int StackPeakBytes => _stackPeakAbs - _stackBase;
+        public int HeapPeakBytes => _heapPeakAbs - _heapBase;
+
         private int _sp;          // absolute offset into _mem
         private int _frameBase;   // absolute offset to current frame header, -1 if none
         private int _callDepth;
@@ -272,6 +276,8 @@ namespace Cnidaria.Cs
         private readonly List<int> _heapObjects = new();
         private readonly Dictionary<string, int> _internPool = new(StringComparer.Ordinal);
         private readonly TextWriter _textWriter;
+        private readonly Dictionary<int, HostOverride> _hostOverrides = new();
+        private readonly VmCallContext _hostCtx;
 
         private RuntimeModule? _curModule;
         private BytecodeFunction? _curFn;
@@ -291,7 +297,13 @@ namespace Cnidaria.Cs
 
 
         private readonly List<FreeBlock> _freeBlocks = new();
-        private readonly HashSet<int> _heapDirtyFrames = new();
+        private readonly HashSet<int> _heapAllocFrames = new();
+
+        private long _allocDebtBytes;
+        private int _allocBudgetBytes;
+        private int _minTailFreeBytes;
+        private bool _gcRequested;
+        private bool _gcRunning;
         public Vm(
             byte[] memory,
             int metaEnd,
@@ -308,11 +320,13 @@ namespace Cnidaria.Cs
             _stackEnd = stackEnd;
             _sp = stackBase;
             _frameBase = -1;
+            _stackPeakAbs = _sp;
 
             _heapBase = AlignUp(_stackEnd, 8);
             _heapEnd = _mem.Length;
             _heapPtr = _heapBase;
             _heapFloor = _heapPtr;
+            _heapPeakAbs = _heapPtr;
             if (_heapBase > _heapEnd)
                 throw new ArgumentOutOfRangeException("Heap region is empty or invalid.");
 
@@ -331,6 +345,9 @@ namespace Cnidaria.Cs
             if (!(0 <= _metaEnd && _metaEnd <= _stackBase && _stackBase < _stackEnd && _stackEnd <= _mem.Length))
                 throw new ArgumentOutOfRangeException("Bad memory layout.");
             _textWriter = textWriter;
+            _hostCtx = new VmCallContext(this);
+
+            RecomputeGcThresholds();
         }
         // Frame header layout (all int32, little-endian)
         // 0:  prevFrameBase
@@ -353,7 +370,12 @@ namespace Cnidaria.Cs
         // 68: frameEnd (absolute)
         // 72: runtimeMethodId (0 if unresolved)
         private const int FrameHeaderSize = 76;
-        public void Execute(RuntimeModule entryModule, BytecodeFunction entry, CancellationToken ct, ExecutionLimits limits)
+        public void Execute(
+            RuntimeModule entryModule,
+            BytecodeFunction entry,
+            CancellationToken ct,
+            ExecutionLimits limits,
+            ReadOnlySpan<Slot> initialArgs = default)
         {
             if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
             if (entry is null) throw new ArgumentNullException(nameof(entry));
@@ -365,7 +387,7 @@ namespace Cnidaria.Cs
 
             // Push initial frame
             PushFrame(entryModule, entry, returnPc: -1, returnMethodToken: 0, returnModuleId: -1, ct, limits,
-                runtimeMethod: ResolveRuntimeMethodOrThrow(entryModule, entry.MethodToken));
+                runtimeMethod: ResolveRuntimeMethodOrThrow(entryModule, entry.MethodToken), initialArgs: initialArgs);
 
             while (_frameBase >= 0)
             {
@@ -378,6 +400,8 @@ namespace Cnidaria.Cs
                     _tick = 0;
                     ct.ThrowIfCancellationRequested();
                 }
+                MaybeCollectGarbage(force: false);
+
                 PruneCatchContextsForPc(_curPc);
 
                 var mod = _curModule ?? throw new InvalidOperationException("No current module.");
@@ -609,7 +633,7 @@ namespace Cnidaria.Cs
 
                                 var (targetModuleOpt, targetFn) = _domain.ResolveCall(mod, callTok);
                                 var targetModule = targetModuleOpt ?? mod;
-                                var rm = ResolveRuntimeMethodOrThrow(mod, callTok);
+                                var rm = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
                                 if (rm.IsStatic && !StringComparer.Ordinal.Equals(rm.Name, ".cctor"))
                                 {
                                     if (TryDeferTypeInitialization(rm.DeclaringType, resumePc: pc, ct, limits))
@@ -635,8 +659,14 @@ namespace Cnidaria.Cs
                                         _hotEvalSlots[thisIndex] = new Slot(SlotKind.ByRef, payloadAbs, aux: sz);
                                     }
                                 }
+
+                                if (rm.IsStatic && TryInvokeHostOverride(rm, total, ct))
+                                    break;
+
                                 if (TryInvokeIntrinsic(rm, total, ct))
                                     break;
+
+
 
                                 int callerModuleId = ReadI32(_frameBase + 20);
 
@@ -671,7 +701,7 @@ namespace Cnidaria.Cs
                                 var receiver = _hotEvalSlots[thisIndex];
                                 var receiverType = GetObjectTypeFromRef(receiver); // includes null check
 
-                                var declared = ResolveRuntimeMethodOrThrow(mod, callTok);
+                                var declared = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
                                 var targetRm = ResolveVirtualDispatch(receiverType, declared);
                                 if (targetRm.DeclaringType.IsValueType && receiver.Kind == SlotKind.Ref)
                                 {
@@ -889,6 +919,26 @@ namespace Cnidaria.Cs
             var allocated = new HashSet<int>(_heapObjects);
             var markStack = new Stack<int>();
 
+            var objRanges = new List<(int Start, int End, int ObjAbs)>(_heapObjects.Count);
+            for (int i = 0; i < _heapObjects.Count; i++)
+            {
+                int objAbs = _heapObjects[i];
+                if (!allocated.Contains(objAbs))
+                    continue;
+
+                CheckHeapAccess(objAbs, ObjectHeaderSize, writable: false);
+                int flags = ReadI32(objAbs + 4);
+                if ((flags & GcFlagAllocated) == 0)
+                    continue;
+
+                int typeId = ReadI32(objAbs + 0);
+                var t = _rts.GetTypeById(typeId);
+                int size = GetHeapObjectSize(objAbs, t);
+                int end = checked(objAbs + size);
+                objRanges.Add((objAbs, end, objAbs));
+            }
+            objRanges.Sort((a, b) => a.Start.CompareTo(b.Start));
+
             void TryMarkObject(int objAbs)
             {
                 if (!allocated.Contains(objAbs))
@@ -906,7 +956,29 @@ namespace Cnidaria.Cs
                 WriteI32(objAbs + 4, flags | GcFlagMark);
                 markStack.Push(objAbs);
             }
+            void TryMarkObjectFromInteriorPointer(int targetAbs)
+            {
+                if (targetAbs == 0)
+                    return;
 
+                if (targetAbs < _heapBase || targetAbs > _heapPtr)
+                    return;
+
+                // Binary search
+                int lo = 0, hi = objRanges.Count - 1, idx = -1;
+                while (lo <= hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    if (objRanges[mid].Start <= targetAbs) { idx = mid; lo = mid + 1; }
+                    else { hi = mid - 1; }
+                }
+                if (idx < 0)
+                    return;
+
+                var r = objRanges[idx];
+                if (targetAbs < r.End)
+                    TryMarkObject(r.ObjAbs);
+            }
             void VisitRefCell(int cellAbs)
             {
                 CheckRange(cellAbs, RuntimeTypeSystem.PointerSize);
@@ -944,7 +1016,7 @@ namespace Cnidaria.Cs
                 {
                     var t = frameLayout.ArgTypes[i];
                     int off = frameLayout.ArgOffsets[i];
-                    VisitManagedRefCellsInTypedStorage(argsAbs + off, t, VisitRefCell);
+                    VisitManagedRefCellsInTypedStorage(argsAbs + off, t, VisitRefCell, TryMarkObjectFromInteriorPointer);
                 }
 
                 // Locals
@@ -953,7 +1025,7 @@ namespace Cnidaria.Cs
                 {
                     var t = frameLayout.LocalTypes[i];
                     int off = frameLayout.LocalOffsets[i];
-                    VisitManagedRefCellsInTypedStorage(localsAbs + off, t, VisitRefCell);
+                    VisitManagedRefCellsInTypedStorage(localsAbs + off, t, VisitRefCell, TryMarkObjectFromInteriorPointer);
                 }
 
                 // Eval stack
@@ -969,10 +1041,16 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
+                    if (slot.Kind is SlotKind.ByRef or SlotKind.Ptr)
+                    {
+                        TryMarkObjectFromInteriorPointer(checked((int)slot.Payload));
+                        continue;
+                    }
+
                     if (slot.Kind == SlotKind.Value)
                     {
                         var vt = _rts.GetTypeById(slot.Aux);
-                        VisitManagedRefCellsInTypedStorage(checked((int)slot.Payload), vt, VisitRefCell);
+                        VisitManagedRefCellsInTypedStorage(checked((int)slot.Payload), vt, VisitRefCell, TryMarkObjectFromInteriorPointer);
                     }
                 }
             }
@@ -1064,7 +1142,7 @@ namespace Cnidaria.Cs
                 int typeId = ReadI32(objAbs + 0);
                 var objType = _rts.GetTypeById(typeId);
 
-                VisitManagedRefCellsInObject(objAbs, objType, VisitRefCell);
+                VisitManagedRefCellsInObject(objAbs, objType, VisitRefCell, TryMarkObjectFromInteriorPointer);
             }
             // Sweep
             var live = new List<int>(_heapObjects.Count);
@@ -1190,18 +1268,50 @@ namespace Cnidaria.Cs
 
             _freeBlocks.Insert(idx, new FreeBlock(newAbs, checked(newEnd - newAbs)));
         }
-        private void MarkCurrentFrameHeapDirty()
+        private void RecomputeGcThresholds()
+        {
+            int heapSize = _heapEnd - _heapBase;
+            _allocBudgetBytes = Math.Max(128, heapSize / 8);
+            _minTailFreeBytes = Math.Max(128, heapSize / 10);
+        }
+        private void MaybeCollectGarbage(bool force)
+        {
+            if (_gcRunning) return;
+
+            if (!force)
+            {
+                if (!_gcRequested) return;
+
+                int tailFree = _heapEnd - _heapPtr;
+                if (_allocDebtBytes < _allocBudgetBytes && tailFree >= _minTailFreeBytes)
+                    return;
+            }
+
+            _gcRunning = true;
+            SpillCurrentFrameHotState();
+            CollectGarbage();
+            _allocDebtBytes = 0;
+            _gcRequested = false;
+            RecomputeGcThresholds();
+            // no try finally for better inlining, since GC failure is fatal
+            _gcRunning = false;
+        }
+        private void MarkCurrentFrameHeapAllocated()
         {
             if (_frameBase >= 0)
-                _heapDirtyFrames.Add(_frameBase);
+                _heapAllocFrames.Add(_frameBase);
         }
-
-        private void MarkHeapWriteIfInsideHeap(int abs, int size)
+        private void OnHeapAllocated(int bytes)
         {
-            if (abs >= _heapBase && abs + size <= _heapPtr)
-                MarkCurrentFrameHeapDirty();
+            MarkCurrentFrameHeapAllocated();
+            if (bytes > 0) _allocDebtBytes += bytes;
+
+            int tailFree = _heapEnd - _heapPtr;
+            if (_allocDebtBytes >= _allocBudgetBytes || tailFree < _minTailFreeBytes)
+                _gcRequested = true;
         }
-        private void VisitManagedRefCellsInTypedStorage(int abs, RuntimeType t, Action<int> callback)
+        private void VisitManagedRefCellsInTypedStorage(
+            int abs, RuntimeType t, Action<int> callback, Action<int>? interiorPointerCallback = null)
         {
             const int MaxNodes = 2_000_000;
 
@@ -1228,7 +1338,15 @@ namespace Cnidaria.Cs
 
                 // Unmanaged / not GC tracked
                 if (curType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                {
+                    if (interiorPointerCallback != null)
+                    {
+                        long raw = ReadNativeInt(curAbs);
+                        if (raw != 0)
+                            interiorPointerCallback(checked((int)raw));
+                    }
                     continue;
+                }
 
                 if (!curType.IsValueType)
                     continue;
@@ -1272,7 +1390,8 @@ namespace Cnidaria.Cs
             if (len < 0) throw new InvalidOperationException("Corrupted array length.");
             return len;
         }
-        private void VisitManagedRefCellsInObject(int objAbs, RuntimeType objType, Action<int> callback)
+        private void VisitManagedRefCellsInObject(
+            int objAbs, RuntimeType objType, Action<int> callback, Action<int>? interiorPointerCallback = null)
         {
             if (objType.IsValueType)
             {
@@ -1303,7 +1422,7 @@ namespace Cnidaria.Cs
                 {
                     var f = t.InstanceFields[i];
                     int fieldAbs = checked(objAbs + f.Offset);
-                    VisitManagedRefCellsInTypedStorage(fieldAbs, f.FieldType, callback);
+                    VisitManagedRefCellsInTypedStorage(fieldAbs, f.FieldType, callback, interiorPointerCallback);
                 }
             }
         }
@@ -1395,21 +1514,6 @@ namespace Cnidaria.Cs
 
             return abs;
         }
-
-        private int AllocStringRepeat(char ch, int length)
-        {
-            int abs = AllocStringUninitialized(length);
-            int charsAbs = GetStringCharsAbs(abs);
-
-            ushort u = ch;
-            for (int i = 0; i < length; i++)
-            {
-                BinaryPrimitives.WriteUInt16LittleEndian(_mem.AsSpan(charsAbs + i * 2, 2), u);
-            }
-
-            return abs;
-        }
-
         private void ValidateStringRef(Slot s, out int strObjAbs)
         {
             if (s.Kind == SlotKind.Null)
@@ -1440,12 +1544,14 @@ namespace Cnidaria.Cs
             // Exact match for now
             if (actualType.ElementType.TypeId != expectedElemType.TypeId)
                 throw new InvalidOperationException(
-                    $"Array element type mismatch: actual={actualType.ElementType.Namespace}.{actualType.ElementType.Name}, expected={expectedElemType.Namespace}.{expectedElemType.Name}");
+                    $"Array element type mismatch: actual={actualType.ElementType.Namespace}.{actualType.ElementType.Name}, " +
+                    $"expected={expectedElemType.Namespace}.{expectedElemType.Name}");
 
             length = GetArrayLengthFromObject(arrObjAbs);
         }
 
-        private void VisitManagedRefCellsInArray(int objAbs, RuntimeType arrayType, Action<int> callback)
+        private void VisitManagedRefCellsInArray(
+            int objAbs, RuntimeType arrayType, Action<int> callback, Action<int>? interiorPointerCallback = null)
         {
             if (arrayType.ElementType is null)
                 throw new InvalidOperationException("Array type has no element type.");
@@ -1457,7 +1563,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < length; i++)
             {
                 int elemAbs = checked(dataAbs + checked(i * elemSize));
-                VisitManagedRefCellsInTypedStorage(elemAbs, arrayType.ElementType, callback);
+                VisitManagedRefCellsInTypedStorage(elemAbs, arrayType.ElementType, callback, interiorPointerCallback);
             }
         }
         private int AllocHeapBytes(int bytes, int align)
@@ -1467,7 +1573,7 @@ namespace Cnidaria.Cs
 
             if (TryAllocFromFreeList(bytes, align, out int reusedAbs))
             {
-                MarkCurrentFrameHeapDirty();
+                OnHeapAllocated(bytes);
                 return reusedAbs;
             }
 
@@ -1475,10 +1581,12 @@ namespace Cnidaria.Cs
             int end = checked(abs + bytes);
 
             if (end > _heapEnd)
-                throw new OutOfMemoryException("VM heap is full.");
+                throw new OutOfMemoryException("Out of memory.");
 
             _heapPtr = end;
-            MarkCurrentFrameHeapDirty();
+            if (_heapPtr > _heapPeakAbs) _heapPeakAbs = _heapPtr;
+
+            OnHeapAllocated(bytes);
             return abs;
         }
         private bool TryAllocFromFreeList(int bytes, int align, out int abs)
@@ -1652,7 +1760,7 @@ namespace Cnidaria.Cs
                 Consider(GetArgType(rm, i));
 
             for (int i = 0; i < fn.LocalTypeTokens.Length; i++)
-                Consider(_rts.ResolveType(module, fn.LocalTypeTokens[i]));
+                Consider(_rts.ResolveTypeInMethodContext(module, fn.LocalTypeTokens[i], rm));
 
             // Instruction operands
             foreach (var ins in fn.Instructions)
@@ -1693,7 +1801,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Stelem:
                     case BytecodeOp.Newarr:
                         {
-                            var t = _rts.ResolveType(module, ins.Operand0);
+                            var t = _rts.ResolveTypeInMethodContext(module, ins.Operand0, rm);
                             Consider(t);
                             break;
                         }
@@ -2072,7 +2180,7 @@ namespace Cnidaria.Cs
             if (len < 0)
                 throw new InvalidOperationException("Negative array length.");
 
-            var elemType = _rts.ResolveType(mod, elemTypeToken);
+            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
             var arrayType = _rts.GetArrayType(elemType);
 
             int arrAbs = AllocArrayObject(arrayType, len);
@@ -2100,7 +2208,7 @@ namespace Cnidaria.Cs
             int index = PopSlot().AsI4Checked();
             var arr = PopSlot();
 
-            var elemType = _rts.ResolveType(mod, elemTypeToken);
+            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
             ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
 
             if ((uint)index >= (uint)length)
@@ -2119,7 +2227,7 @@ namespace Cnidaria.Cs
             int index = PopSlot().AsI4Checked();
             var arr = PopSlot();
 
-            var elemType = _rts.ResolveType(mod, elemTypeToken);
+            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
             ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
 
             if ((uint)index >= (uint)length)
@@ -2189,7 +2297,7 @@ namespace Cnidaria.Cs
             int newEndAbs = checked(baseAbs + newSpBytes);
 
             if (newEndAbs > _stackEnd)
-                throw new InvalidOperationException("VM stack overflow (stackalloc).");
+                throw new InvalidOperationException("Stack overflow (stackalloc).");
 
             WriteI32(_frameBase + 64, newSpBytes);
 
@@ -2198,6 +2306,7 @@ namespace Cnidaria.Cs
             {
                 WriteI32(_frameBase + 68, newEndAbs);
                 _sp = newEndAbs;
+                if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
             }
 
             PushSlot(new Slot(SlotKind.Ptr, alignedAbs, aux: elemSize));
@@ -2335,7 +2444,7 @@ namespace Cnidaria.Cs
             // Resolve ctor body
             var (targetModuleOpt, targetFn) = _domain.ResolveCall(callerModule, ctorToken);
             var targetModule = targetModuleOpt ?? callerModule;
-            var ctor = ResolveRuntimeMethodOrThrow(callerModule, ctorToken);
+            var ctor = ResolveRuntimeMethodOrThrow(callerModule, ctorToken, _curLayout?.Method);
 
             // Pop explicit args from caller eval stack
             var args = new Slot[argCount];
@@ -2493,7 +2602,7 @@ namespace Cnidaria.Cs
 
                 _pendingCtorResults[_frameBase] = PendingCtorResult.ForValue(vt, tempAbs);
             }
-            
+
         }
         private int AllocFrameScratch(int bytes, int align)
         {
@@ -2516,6 +2625,7 @@ namespace Cnidaria.Cs
             {
                 WriteI32(_frameBase + 68, newEndAbs);
                 _sp = newEndAbs;
+                if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
             }
 
             return alignedAbs;
@@ -2698,7 +2808,7 @@ namespace Cnidaria.Cs
             CancellationToken ct,
             ExecutionLimits limits)
         {
-            var ctor = ResolveRuntimeMethodOrThrow(callerModule, ctorToken);
+            var ctor = ResolveRuntimeMethodOrThrow(callerModule, ctorToken, _curLayout?.Method);
             return TryDeferTypeInitialization(ctor.DeclaringType, resumePc, ct, limits);
         }
         private static RuntimeMethod? FindTypeInitializer(RuntimeType t)
@@ -2794,7 +2904,8 @@ namespace Cnidaria.Cs
             CancellationToken ct,
             ExecutionLimits limits,
             int totalArgsOnCallerStack = 0,
-            RuntimeMethod? runtimeMethod = null)
+            RuntimeMethod? runtimeMethod = null,
+            ReadOnlySpan<Slot> initialArgs = default)
         {
             if (++_callDepth > limits.MaxCallDepth)
                 throw new InvalidOperationException("Max call depth exceeded.");
@@ -2803,6 +2914,9 @@ namespace Cnidaria.Cs
             var rm = layout.Method;
 
             int argsCount = layout.ArgTypes.Length;
+
+            if (!initialArgs.IsEmpty && initialArgs.Length != argsCount)
+                throw new InvalidOperationException($"Initial arg count mismatch: expected {argsCount}, got {initialArgs.Length}");
 
             if (totalArgsOnCallerStack != 0 && totalArgsOnCallerStack != argsCount)
                 throw new InvalidOperationException($"Stack arg count mismatch: expected {argsCount}, got {totalArgsOnCallerStack}");
@@ -2863,10 +2977,15 @@ namespace Cnidaria.Cs
             WriteI32(newBase + 68, newBase + frameEnd);
             WriteI32(newBase + 72, rm.MethodId);
 
-            if (totalArgsOnCallerStack != 0)
-            {
-                int calleeArgsAbs = newBase + argsBase;
+            int calleeArgsAbs = newBase + argsBase;
 
+            if (!initialArgs.IsEmpty)
+            {
+                for (int i = 0; i < argsCount; i++)
+                    StoreArgRawAt(layout, i, calleeArgsAbs, initialArgs[i]);
+            }
+            else if (totalArgsOnCallerStack != 0)
+            {
                 for (int i = argsCount - 1; i >= 0; i--)
                 {
                     var slot = PopSlot();
@@ -2877,6 +2996,7 @@ namespace Cnidaria.Cs
 
             _frameBase = newBase;
             _sp = newSp;
+            if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
             _curModule = module;
             _curFn = fn;
             _curLayout = layout;
@@ -2975,7 +3095,7 @@ namespace Cnidaria.Cs
                 _typeInitState[typeId] = 2;
             }
 
-            bool runGcAfterReturn = _heapDirtyFrames.Remove(finishedFrame);
+            bool frameAllocatedHeap = _heapAllocFrames.Remove(finishedFrame);
 
             PopFrame();
 
@@ -2998,10 +3118,11 @@ namespace Cnidaria.Cs
                 PushSlot(retVal);
             }
 
-            if (runGcAfterReturn)
+            if (frameAllocatedHeap)
             {
-                SpillCurrentFrameHotState();
-                CollectGarbage();
+                if ((_heapEnd - _heapPtr) < _minTailFreeBytes)
+                    _gcRequested = true;
+                MaybeCollectGarbage(force: false);
             }
         }
         private void ClearFinallyContextsForFrame(int frameBase)
@@ -3218,7 +3339,7 @@ namespace Cnidaria.Cs
 
             if (hostEx is OverflowException)
                 return TryCreateCoreException("System", "DivideByZeroException", msg, out vmEx)
-                    || TryCreateCoreException("System", "ArithmeticException", msg,out vmEx)
+                    || TryCreateCoreException("System", "ArithmeticException", msg, out vmEx)
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
             return false;
@@ -3301,11 +3422,13 @@ namespace Cnidaria.Cs
                     ResetEvalStackForExceptionHandler();
                     _catchStack.Add(new CatchContext(_frameBase, handler.HandlerStartPc, handler.HandlerEndPc, ex));
                     _curPc = handler.HandlerStartPc;
+                    MaybeCollectGarbage(force: false);
                     return;
                 }
                 if (TryFindFinallyHandlerForPc(fn, pcInFrame, out var fin))
                 {
                     BeginFinally(fin, FinallyContext.ForThrow(_frameBase, fin, ex));
+                    MaybeCollectGarbage(force: false);
                     return;
                 }
                 int returnPc = ReadI32(_frameBase + 4);
@@ -3326,7 +3449,11 @@ namespace Cnidaria.Cs
                     _pendingTypeInitFrames.Remove(curBase);
                     _typeInitState[typeId] = 0; // allow retry
                 }
-                _heapDirtyFrames.Remove(curBase);
+                if (_heapAllocFrames.Remove(curBase))
+                {
+                    if ((_heapEnd - _heapPtr) < _minTailFreeBytes)
+                        _gcRequested = true;
+                }
                 ClearFinallyContextsForFrame(curBase);
                 PopFrame();
                 pcInFrame = returnPc - 1;
@@ -3609,11 +3736,14 @@ namespace Cnidaria.Cs
 
             // Writes must not touch metadata
             CheckWritableRange(abs, sz);
-            MarkHeapWriteIfInsideHeap(abs, sz);
+            //MarkHeapWriteIfInsideHeap(abs, sz);
             if (t.IsReferenceType)
             {
                 if (v.Kind is not (SlotKind.Ref or SlotKind.Null))
                     throw new InvalidOperationException($"Storing {v.Kind} into managed ref.");
+
+                if ((_heapEnd - _heapPtr) < _minTailFreeBytes)
+                    _gcRequested = true;
 
                 long h = v.Kind == SlotKind.Null ? 0 : v.Payload;
                 WriteNativeInt(abs, h);
@@ -3769,7 +3899,7 @@ namespace Cnidaria.Cs
             CheckActiveStackAccess(abs, size, writable);
         }
         private static int AlignUp(int v, int a) => (v + (a - 1)) & ~(a - 1);
-        
+
         private void ExecNeg()
         {
             var v = PopSlot();
@@ -4513,16 +4643,24 @@ namespace Cnidaria.Cs
             {
                 if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
                 if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
+                if (a.GenericArity != b.GenericArity) return false;
                 for (int i = 0; i < a.ParameterTypes.Length; i++)
                     if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
                 return true;
             }
         }
         private RuntimeMethod ResolveRuntimeMethodOrThrow(RuntimeModule mod, int methodToken)
+            => ResolveRuntimeMethodOrThrow(mod, methodToken, methodContext: null);
+        private RuntimeMethod ResolveRuntimeMethodOrThrow(RuntimeModule mod, int methodToken, RuntimeMethod? methodContext)
         {
-            if (_rts.TryResolveMethod(mod, methodToken, out var rm) && rm != null)
-                return rm;
-            throw new MissingMethodException($"RuntimeMethod not found: {mod.Name} 0x{methodToken:X8}");
+            try
+            {
+                return _rts.ResolveMethodInMethodContext(mod, methodToken, methodContext);
+            }
+            catch (Exception ex)
+            {
+                throw new MissingMethodException($"RuntimeMethod not found: {mod.Name} 0x{methodToken:X8}", ex);
+            }
         }
         private RuntimeType GetValueSlotType(Slot v)
         {
@@ -4780,7 +4918,7 @@ namespace Cnidaria.Cs
                 "Int32" or "UInt32" => FastCellKind.I4,
                 "Int64" or "UInt64" => FastCellKind.I8,
                 "Double" => FastCellKind.R8,
-                "IntPtr" or "UIntPtr" => RuntimeTypeSystem.PointerSize == 8 
+                "IntPtr" or "UIntPtr" => RuntimeTypeSystem.PointerSize == 8
                                             ? FastCellKind.I8 : FastCellKind.I4,
                 _ => FastCellKind.None
             };
@@ -4801,6 +4939,174 @@ namespace Cnidaria.Cs
             }
 
             return t.InstanceFields.Length > 0 ? t.InstanceFields[0].FieldType : null;
+        }
+        private static bool IsVoidReturn(RuntimeType t)
+            => t.Namespace == "System" && t.Name == "Void";
+
+        private Slot NormalizeReturnValue(RuntimeType t, VmValue v)
+        {
+            // ref
+            if (t.IsReferenceType)
+            {
+                if (v.Kind == VmValueKind.Null) return new Slot(SlotKind.Null, 0);
+                if (v.Kind == VmValueKind.Ref) return new Slot(SlotKind.Ref, v.Payload);
+                throw new InvalidOperationException($"Return type mismatch: expected managed ref, got {v.Kind}");
+            }
+
+            // ptr / byref
+            if (t.Kind == RuntimeTypeKind.Pointer)
+            {
+                if (v.Kind == VmValueKind.Null) return new Slot(SlotKind.Null, 0);
+                if (v.Kind == VmValueKind.Ptr) return new Slot(SlotKind.Ptr, v.Payload, v.Aux);
+                throw new InvalidOperationException($"Return type mismatch: expected ptr, got {v.Kind}");
+            }
+            if (t.Kind == RuntimeTypeKind.ByRef)
+            {
+                if (v.Kind == VmValueKind.Null) return new Slot(SlotKind.Null, 0);
+                if (v.Kind == VmValueKind.ByRef) return new Slot(SlotKind.ByRef, v.Payload, v.Aux);
+                throw new InvalidOperationException($"Return type mismatch: expected byref, got {v.Kind}");
+            }
+
+            // scalar value types
+            if (t.Namespace == "System")
+            {
+                switch (t.Name)
+                {
+                    case "Boolean":
+                    case "Char":
+                    case "SByte":
+                    case "Byte":
+                    case "Int16":
+                    case "UInt16":
+                    case "Int32":
+                    case "UInt32":
+                        return new Slot(SlotKind.I4, v.AsInt32());
+
+                    case "Int64":
+                    case "UInt64":
+                        return new Slot(SlotKind.I8, v.AsInt64());
+
+                    case "Single":
+                    case "Double":
+                        return new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(v.AsDouble()));
+
+                    case "IntPtr":
+                    case "UIntPtr":
+                        return RuntimeTypeSystem.PointerSize == 8
+                            ? new Slot(SlotKind.I8, v.AsInt64())
+                            : new Slot(SlotKind.I4, v.AsInt32());
+                }
+            }
+            throw new NotSupportedException($"Host return marshal not supported for value type: {t.Namespace}.{t.Name}");
+        }
+        internal string? HostReadString(VmValue v, CancellationToken ct)
+        {
+            if (v.Kind == VmValueKind.Null) return null;
+
+            var s = v.ToSlot();
+            ValidateStringRef(s, out int strObjAbs);
+
+            int len = GetStringLengthFromObject(strObjAbs);
+            int charsAbs = GetStringCharsAbs(strObjAbs);
+
+            var chars = new char[len];
+            for (int i = 0; i < len; i++)
+            {
+                if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+                chars[i] = (char)ReadU16(charsAbs + i * 2);
+            }
+            return new string(chars);
+        }
+
+        internal VmValue HostAllocString(string? s)
+        {
+            if (s is null) return VmValue.Null;
+            int abs = AllocStringFromManaged(s);
+            return new VmValue(VmValueKind.Ref, abs);
+        }
+        internal VmValue HostAllocStringArray(RuntimeType arrayType, ReadOnlySpan<string?> values)
+        {
+            if (arrayType.Kind != RuntimeTypeKind.Array)
+                throw new ArgumentException("Type is not an array.", nameof(arrayType));
+            if (arrayType.ElementType is null)
+                throw new ArgumentException("Array type has no element type.", nameof(arrayType));
+            if (arrayType.ElementType.TypeId != _rts.SystemString.TypeId)
+                throw new NotSupportedException("Only string[] is supported for host array allocation.");
+
+            int arrAbs = AllocArrayObject(arrayType, values.Length);
+
+            var elemType = arrayType.ElementType;
+            var (elemSize, _) = GetStorageSizeAlign(elemType);
+
+            for (int i = 0; i < values.Length; i++)
+            {
+                int elemAbs = checked(arrAbs + ArrayDataOffset + checked(i * elemSize));
+                if (values[i] is null)
+                {
+                    StoreSlotAsValue(elemAbs, 0, elemType, new Slot(SlotKind.Null, 0));
+                }
+                else
+                {
+                    int strAbs = AllocStringFromManaged(values[i]!);
+                    StoreSlotAsValue(elemAbs, 0, elemType, new Slot(SlotKind.Ref, strAbs));
+                }
+            }
+
+            return new VmValue(VmValueKind.Ref, arrAbs);
+        }
+        internal int HostGetAddress(VmValue v)
+        {
+            return GetAddressAbsOrThrow(v.ToSlot());
+        }
+
+        internal Span<byte> HostGetSpan(int abs, int size, bool writable)
+        {
+            CheckIndirectAccess(abs, size, writable);
+            return _mem.AsSpan(abs, size);
+        }
+        internal void RegisterHostOverride(HostOverride ov)
+        {
+            if (ov is null) throw new ArgumentNullException(nameof(ov));
+            _hostOverrides[ov.Method.MethodId] = ov;
+        }
+        private bool TryInvokeHostOverride(RuntimeMethod rm, int totalArgs, CancellationToken ct)
+        {
+            if (!_hostOverrides.TryGetValue(rm.MethodId, out var ov))
+                return false;
+
+            if (!rm.IsStatic || rm.HasThis)
+                return false;
+
+            Span<VmValue> args = totalArgs <= 32
+                ? stackalloc VmValue[totalArgs]
+                : new VmValue[totalArgs];
+
+            for (int i = totalArgs - 1; i >= 0; i--)
+                args[i] = new VmValue(PopSlot());
+
+            _hostCtx.SetToken(ct);
+
+            try
+            {
+                VmValue ret = ov.Handler(_hostCtx, args);
+
+                if (!IsVoidReturn(rm.ReturnType))
+                {
+                    var retSlot = NormalizeReturnValue(rm.ReturnType, ret);
+                    PushSlot(retSlot);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (TryTranslateHostExceptionToVm(ex, out var vmEx))
+                {
+                    ThrowException(vmEx, throwPc: _curPc - 1);
+                    return true;
+                }
+                throw;
+            }
         }
         private bool TryInvokeIntrinsic(RuntimeMethod rm, int totalArgs, CancellationToken ct)
         {
@@ -4903,7 +5209,7 @@ namespace Cnidaria.Cs
 
                         CheckRange(srcStart, bytes);
                         CheckWritableRange(dstStart, bytes);
-                        MarkHeapWriteIfInsideHeap(dstStart, bytes);
+                        //MarkHeapWriteIfInsideHeap(dstStart, bytes);
 
                         _mem.AsSpan(srcStart, bytes).CopyTo(_mem.AsSpan(dstStart, bytes));
                         ok = true;
@@ -4922,7 +5228,7 @@ namespace Cnidaria.Cs
 
                             CheckRange(srcStart, bytes);
                             CheckWritableRange(dstStart, bytes);
-                            MarkHeapWriteIfInsideHeap(dstStart, bytes);
+                            //MarkHeapWriteIfInsideHeap(dstStart, bytes);
 
                             _mem.AsSpan(srcStart, bytes).CopyTo(_mem.AsSpan(dstStart, bytes));
                             ok = true;
@@ -4957,7 +5263,7 @@ namespace Cnidaria.Cs
 
                                 CheckRange(srcStart, bytes);
                                 CheckWritableRange(dstStart, bytes);
-                                MarkHeapWriteIfInsideHeap(dstStart, bytes);
+                                //MarkHeapWriteIfInsideHeap(dstStart, bytes);
 
                                 _mem.AsSpan(srcStart, bytes).CopyTo(_mem.AsSpan(dstStart, bytes));
                                 ok = true;
@@ -4990,7 +5296,7 @@ namespace Cnidaria.Cs
 
                             int dstCellAbs = checked(dstBase + checked(i * ptrSize));
                             CheckWritableRange(dstCellAbs, ptrSize);
-                            MarkHeapWriteIfInsideHeap(dstCellAbs, ptrSize);
+                            //MarkHeapWriteIfInsideHeap(dstCellAbs, ptrSize);
                             WriteNativeInt(dstCellAbs, boxedAbs);
                         }
 

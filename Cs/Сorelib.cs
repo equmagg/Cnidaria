@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Security.Cryptography;
+using System.Linq;
 using System.Text;
 
 namespace Cnidaria.Cs
@@ -18,7 +18,7 @@ namespace Cnidaria.Cs
 
         private readonly HashSet<string> _seenModules = new(StringComparer.Ordinal);
 
-        internal MetadataReferenceSet(IEnumerable<IMetadataView> references)
+        public MetadataReferenceSet(IEnumerable<IMetadataView> references)
         {
             if (references is null) throw new ArgumentNullException(nameof(references));
             _refs = references.ToImmutableArray();
@@ -195,8 +195,8 @@ namespace Cnidaria.Cs
             }
         }
         public NamedTypeSymbol AddType(
-            string @namespace, 
-            string name, 
+            string @namespace,
+            string name,
             TypeKind kind,
             int arity = 0,
             Accessibility declaredAccessibility = Accessibility.Public,
@@ -311,7 +311,7 @@ namespace Cnidaria.Cs
         private readonly IMetadataView _md;
         internal MetadataCoreLibProvider(MetadataImage md)
         : this(new MetadataImageView(md))
-        {  }
+        { }
         internal MetadataCoreLibProvider(IMetadataView md)
             => _md = md ?? throw new ArgumentNullException(nameof(md));
         public void Populate(CoreLibraryBuilder core)
@@ -356,8 +356,8 @@ namespace Cnidaria.Cs
                     continue; // special types already have BaseType fixed
 
                 var baseType = ResolveTypeDefOrRef(
-                    unchecked((uint)td.ExtendsEncoded), 
-                    typeByRid, 
+                    unchecked((uint)td.ExtendsEncoded),
+                    typeByRid,
                     core,
                     declaringType: null,
                     methodTypeParameters: ImmutableArray<TypeParameterSymbol>.Empty);
@@ -554,7 +554,7 @@ namespace Cnidaria.Cs
         {
             var constByParent = new Dictionary<int, ConstantRow>();
             for (int i = 0; i < _md.GetRowCount(MetadataTableKind.Constant); i++)
-                constByParent[_md.GetConstant(i+1).ParentToken] = _md.GetConstant(i+1);
+                constByParent[_md.GetConstant(i + 1).ParentToken] = _md.GetConstant(i + 1);
             for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
             {
                 var declaringType = typeByRid[rid];
@@ -594,12 +594,12 @@ namespace Cnidaria.Cs
                             cval = DecodeConstant(ftype, crow);
                     }
                     core.AddExternalField(
-                        declaringType, 
-                        fname, 
-                        ftype, 
-                        isStatic, 
+                        declaringType,
+                        fname,
+                        ftype,
+                        isStatic,
                         isConst,
-                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags), 
+                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags),
                         cval);
                 }
             }
@@ -999,20 +999,20 @@ namespace Cnidaria.Cs
             var elem = ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
 
             uint rank = reader.ReadCompressedUInt();
-            uint numSizes = reader.ReadCompressedUInt(); 
-            for (int i = 0; i < numSizes; i++) 
+            uint numSizes = reader.ReadCompressedUInt();
+            for (int i = 0; i < numSizes; i++)
                 _ = reader.ReadCompressedUInt();
 
             uint numLoBounds = reader.ReadCompressedUInt();
-            for (int i = 0; i < numLoBounds; i++) 
+            for (int i = 0; i < numLoBounds; i++)
                 _ = reader.ReadCompressedUInt();
             if (rank == 0)
                 return new ErrorTypeSymbol("array-rank-0", containing: null, locations: ImmutableArray<Location>.Empty);
             return core.CreateArrayType(elem, checked((int)rank));
         }
         private TypeSymbol ResolveTypeDefOrRef(
-            uint encoded, 
-            NamedTypeSymbol[] typeByRid, 
+            uint encoded,
+            NamedTypeSymbol[] typeByRid,
             CoreLibraryBuilder core,
             NamedTypeSymbol? declaringType,
             ImmutableArray<TypeParameterSymbol> methodTypeParameters)

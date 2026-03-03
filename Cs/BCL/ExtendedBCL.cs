@@ -1,5 +1,36 @@
-﻿using System.Runtime.CompilerServices;
+﻿namespace CliTools
+{
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class CommandAttribute : Attribute
+    {
+        public CommandAttribute(string value)
+        {
+            Value = value;
+        }
+        public string Value { get; }
+    }
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class ButtonAttribute : Attribute
+    {
+        public ButtonAttribute(string value)
+        {
+            Value = value;
+        }
+        public string Value { get; }
+    }
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    public sealed class RemainderAttribute : Attribute
+    {
+        public RemainderAttribute() { }
+    }
+}
+namespace System.Text.Json
+{
+    public static class JsonSerializer
+    {
 
+    }
+}
 namespace System.Collections
 {
     public interface IList : ICollection
@@ -119,6 +150,105 @@ namespace System.Collections.Generic
         }
 
         //public Enumerator GetEnumerator() => new Enumerator(this);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item)
+        {
+            _version++;
+            T[] array = _items;
+            int size = _size;
+            if ((uint)size < (uint)array.Length)
+            {
+                _size = size + 1;
+                array[size] = item;
+            }
+            else
+            {
+                AddWithResize(item);
+            }
+        }
+
+        // Non-inline from List.Add to improve its code quality as uncommon path
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AddWithResize(T item)
+        {
+            int size = _size;
+            Grow(size + 1);
+            _size = size + 1;
+            _items[size] = item;
+        }
+
+        internal void Grow(int capacity)
+        {
+            Capacity = GetNewCapacity(capacity);
+        }
+        internal void GrowForInsertion(int indexToInsert, int insertionCount = 1)
+        {
+            int requiredCapacity = checked(_size + insertionCount);
+            int newCapacity = GetNewCapacity(requiredCapacity);
+
+            // Inline and adapt logic from set_Capacity
+
+            T[] newItems = new T[newCapacity];
+            if (indexToInsert != 0)
+            {
+                Array.Copy(_items, newItems, length: indexToInsert);
+            }
+
+            if (_size != indexToInsert)
+            {
+                Array.Copy(_items, indexToInsert, newItems, indexToInsert + insertionCount, _size - indexToInsert);
+            }
+
+            _items = newItems;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int GetNewCapacity(int capacity)
+        {
+            int newCapacity = _items.Length == 0 ? DefaultCapacity : 2 * _items.Length;
+
+            if ((uint)newCapacity > Array.MaxLength) newCapacity = Array.MaxLength;
+
+            if (newCapacity < capacity) newCapacity = capacity;
+
+            return newCapacity;
+        }
+        public void Insert(int index, T item)
+        {
+            // Note that insertions at the end are legal.
+            if ((uint)index > (uint)_size)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            if (_size == _items.Length)
+            {
+                GrowForInsertion(index, 1);
+            }
+            else if (index < _size)
+            {
+                Array.Copy(_items, index, _items, index + 1, _size - index);
+            }
+            _items[index] = item;
+            _size++;
+            _version++;
+        }
+
+        public void CopyTo(int index, T[] array, int arrayIndex, int count)
+        {
+            if (_size - index < count)
+            {
+                throw new ArgumentException();
+            }
+
+            // Delegate rest of error checking to Array.Copy.
+            Array.Copy(_items, index, array, arrayIndex, count);
+        }
+
+        public void CopyTo(T[] array, int arrayIndex)
+        {
+            // Delegate rest of error checking to Array.Copy.
+            Array.Copy(_items, 0, array, arrayIndex, _size);
+        }
     }
 }
 namespace System.Numerics
@@ -160,6 +290,75 @@ namespace System.Numerics
         {
             return $"<{X.ToString()}, {Y.ToString()}>";
         }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator +(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X += right.X;
+            result.Y += right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator /(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X /= right.X;
+            result.Y /= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator /(Vector2 value1, float value2)
+        {
+            var result = new Vector2(value1.X, value1.Y);
+            result.X /= value2;
+            result.Y /= value2;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool operator ==(Vector2 left, Vector2 right) => left.X == right.X && left.Y == right.Y;
+
+        public static bool operator !=(Vector2 left, Vector2 right) => !(left == right);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator *(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X *= right.X;
+            result.Y *= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator *(Vector2 left, float right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X *= right;
+            result.Y *= right;
+            return result;
+        }
+
+        public static Vector2 operator *(float left, Vector2 right)
+        {
+            var result = new Vector2(right.X, right.Y);
+            result.X *= left;
+            result.Y *= left;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator -(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X -= right.X;
+            result.Y -= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator -(Vector2 value) => new Vector2(-(value.X), -(value.Y));
     }
     public struct Vector3
     {

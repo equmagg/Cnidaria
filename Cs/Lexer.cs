@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Numerics;
 using System.Text;
@@ -28,8 +29,17 @@ namespace Cnidaria.Cs
             Start = start;
             Length = length;
         }
-
+        public static bool operator ==(TextSpan left, TextSpan right) => left.Start == right.Start && left.Length == right.Length;
+        public static bool operator !=(TextSpan left, TextSpan right) => !(left == right);
         public override string ToString() => $"[{Start}..{End})";
+        public override bool Equals(object? obj)
+        {
+            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length;
+        }
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Start, Length);
+        }
     }
     public readonly struct SyntaxDiagnostic : IDiagnostic
     {
@@ -43,6 +53,7 @@ namespace Cnidaria.Cs
         }
         public override string ToString() => $"{Position}: {Message}";
         public string GetMessage() => $"Parser error: {this.ToString()}";
+        public DiagnosticSeverity GetSeverity() => DiagnosticSeverity.Error;
     }
     public readonly struct SyntaxTrivia
     {
@@ -1504,7 +1515,7 @@ namespace Cnidaria.Cs
             else
                 ReadIntegerSuffixIfAny();
 
-            ComputeTokenValue:
+        ComputeTokenValue:
 
             var span = new TextSpan(start, _pos - start);
             var text = _text.AsSpan(span.Start, span.Length);
@@ -1831,10 +1842,10 @@ namespace Cnidaria.Cs
                         bool isU8 = TryConsumeU8Suffix();
                         SyntaxKind kind;
                         if (isU8)
-                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken 
+                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken
                                 : SyntaxKind.Utf8SingleLineRawStringLiteralToken;
                         else
-                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken 
+                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken
                                 : SyntaxKind.SingleLineRawStringLiteralToken;
 
                         var span = new TextSpan(start, _pos - start);

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 using System.Text;
 
 namespace Cnidaria.Cs
@@ -129,6 +130,17 @@ namespace Cnidaria.Cs
 
         private NullTypeSymbol() { }
     }
+    internal sealed class ThrowTypeSymbol : TypeSymbol
+    {
+        public static readonly ThrowTypeSymbol Instance = new();
+        public override SymbolKind Kind => SymbolKind.Error;
+        public override string Name => "<throw>";
+        public override Symbol? ContainingSymbol => null;
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+        public override bool IsReferenceType => false;
+        public override bool IsValueType => false;
+        private ThrowTypeSymbol() { }
+    }
     public abstract class NamedTypeSymbol : TypeSymbol
     {
         public abstract TypeKind TypeKind { get; }
@@ -163,7 +175,7 @@ namespace Cnidaria.Cs
         None = 0,
         UnmanagedConstraint = 1 << 0,
         NotNullConstraint = 1 << 1,
-        StructConstraint = 1 << 2, 
+        StructConstraint = 1 << 2,
         AllowsRefStruct = 1 << 3,
     }
 
@@ -250,6 +262,8 @@ namespace Cnidaria.Cs
     {
         private readonly TypeSymbol _baseType;
 
+        private ImmutableArray<Symbol> _members;
+        private bool _membersInitialized;
         public override Symbol? ContainingSymbol => null;
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
 
@@ -302,10 +316,57 @@ namespace Cnidaria.Cs
         }
 
         public override ImmutableArray<Symbol> GetMembers()
-            => ImmutableArray<Symbol>.Empty;
+        {
+            if (_membersInitialized)
+                return _members;
+
+            _membersInitialized = true;
+
+            if (ElementTypes.IsDefaultOrEmpty)
+            {
+                _members = ImmutableArray<Symbol>.Empty;
+                return _members;
+            }
+
+            var b = ImmutableArray.CreateBuilder<Symbol>(ElementTypes.Length * 2);
+
+            for (int i = 0; i < ElementTypes.Length; i++)
+            {
+                string itemName = "Item" + (i + 1).ToString();
+                b.Add(new TupleElementFieldSymbol(itemName, this, i, ElementTypes[i]));
+
+                var n = ElementNames.IsDefault ? null : ElementNames[i];
+                if (!string.IsNullOrEmpty(n) && !StringComparer.Ordinal.Equals(n, itemName))
+                    b.Add(new TupleElementFieldSymbol(n!, this, i, ElementTypes[i]));
+            }
+
+            _members = b.ToImmutable();
+            return _members;
+        }
 
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
             => ImmutableArray<NamedTypeSymbol>.Empty;
+    }
+    internal sealed class TupleElementFieldSymbol : FieldSymbol
+    {
+        public override string Name { get; }
+        public override Symbol? ContainingSymbol { get; }
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+
+        public override TypeSymbol Type { get; }
+        public override bool IsStatic => false;
+        public override bool IsConst => false;
+        public override Optional<object> ConstantValueOpt => Optional<object>.None;
+
+        public int ElementIndex { get; }
+
+        public TupleElementFieldSymbol(string name, TupleTypeSymbol containingTuple, int elementIndex, TypeSymbol elementType)
+        {
+            Name = name;
+            ContainingSymbol = containingTuple;
+            ElementIndex = elementIndex;
+            Type = elementType;
+        }
     }
     public sealed class ErrorTypeSymbol : NamedTypeSymbol
     {
@@ -425,10 +486,10 @@ namespace Cnidaria.Cs
         public override TypeSymbol Type => _type;
 
         public SynthesizedBackingFieldSymbol(
-            string name, 
-            Symbol containing, 
-            TypeSymbol placeholderType, 
-            bool isStatic, 
+            string name,
+            Symbol containing,
+            TypeSymbol placeholderType,
+            bool isStatic,
             bool isReadOnly)
         {
             Name = name;
@@ -457,15 +518,17 @@ namespace Cnidaria.Cs
         private List<AttributeData>? _attributes;
         public bool IsReadOnlyRef { get; internal set; }
         public bool IsScoped { get; internal set; }
+        public bool IsParams { get; internal set; }
         public ParameterRefKind RefKind { get; internal set; }
         public ParameterSymbol(
-            string name, 
-            Symbol containing, 
-            TypeSymbol type, 
-            ImmutableArray<Location> locations, 
+            string name,
+            Symbol containing,
+            TypeSymbol type,
+            ImmutableArray<Location> locations,
             bool isReadOnlyRef = false,
             ParameterRefKind refKind = ParameterRefKind.None,
-            bool isScoped = false)
+            bool isScoped = false,
+            bool isParams = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -474,6 +537,7 @@ namespace Cnidaria.Cs
             IsReadOnlyRef = isReadOnlyRef;
             RefKind = refKind;
             IsScoped = isScoped;
+            IsParams = isParams;
         }
         public override ImmutableArray<AttributeData> GetAttributes()
         => _attributes is null ? ImmutableArray<AttributeData>.Empty : _attributes.ToImmutableArray();
@@ -819,9 +883,9 @@ namespace Cnidaria.Cs
             _typeParameters = tps;
         }
         public SourceNamedTypeSymbol(
-            string name, 
-            Symbol? containing, 
-            TypeKind typeKind, 
+            string name,
+            Symbol? containing,
+            TypeKind typeKind,
             int arity,
             Accessibility declaredAccessibility,
             bool isFromMetadata = false,
@@ -1321,7 +1385,7 @@ namespace Cnidaria.Cs
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
                 b.Add(new ParameterSymbol(
-                    p.Name, this, pt, p.Locations, 
+                    p.Name, this, pt, p.Locations,
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped));

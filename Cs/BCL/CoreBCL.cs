@@ -32,6 +32,7 @@
     }
     public class Array
     {
+        public static int MaxLength => 0X7FFFFFC7;
         public int Length
         {
             [RuntimeIntrinsic]
@@ -214,6 +215,20 @@
         }
         public static bool operator !=(string left, string right) => !(left == right);
         public static bool IsNullOrEmpty(string value) => (object)value == null || value.Length == 0;
+        public static bool IsNullOrWhiteSpace(string value)
+        {
+            if ((object)value == null) return true;
+            int n = value.Length;
+            if (n == 0) return true;
+
+            ref char p = ref value.GetPinnableReference();
+            for (int i = 0; i < n; i++)
+            {
+                if (!Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i)))
+                    return false;
+            }
+            return true;
+        }
         public ReadOnlySpan<char> AsSpan()
         {
             ref char r = ref GetPinnableReference();
@@ -245,6 +260,51 @@
             for (int i = 0; i < Length; i++)
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
                     return i;
+            return -1;
+        }
+        private int IndexOf(char value, int startIndex)
+        {
+            if ((uint)startIndex > (uint)Length) throw new ArgumentOutOfRangeException("startIndex");
+
+            ref char src = ref GetPinnableReference();
+            for (int i = startIndex; i < Length; i++)
+                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
+                    return i;
+            return -1;
+        }
+        private int IndexOf(string value, int startIndex)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if ((uint)startIndex > (uint)Length) throw new ArgumentOutOfRangeException("startIndex");
+
+            int m = value.Length;
+            if (m == 0) return startIndex;
+            if (m == 1) return IndexOf(value[0], startIndex);
+
+            int n = Length;
+            if (m > n - startIndex) return -1;
+
+            ref char a = ref GetPinnableReference();
+            ref char b = ref value.GetPinnableReference();
+
+            int last = n - m;
+            char b0 = System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, 0);
+
+            for (int i = startIndex; i <= last; i++)
+            {
+                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i) != b0)
+                    continue;
+
+                int j = 1;
+                for (; j < m; j++)
+                {
+                    if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i + j) !=
+                        System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, j))
+                        break;
+                }
+                if (j == m) return i;
+            }
+
             return -1;
         }
         public bool StartsWith(string value)
@@ -306,6 +366,74 @@
 
             return dstStr;
         }
+        public string Replace(string oldValue, string newValue)
+        {
+            if ((object)oldValue == null) throw new ArgumentNullException("oldValue");
+            if ((object)newValue == null) newValue = Empty;
+
+            int oldLen = oldValue.Length;
+            if (oldLen == 0) throw new ArgumentException("oldValue cannot be empty.", "oldValue");
+
+            int len = Length;
+            if (len == 0) return this;
+
+            int first = IndexOf(oldValue, 0);
+            if (first < 0) return this;
+
+            int newLen = newValue.Length;
+
+            // Count occurrences
+            int count = 0;
+            int idx = first;
+            while (idx >= 0)
+            {
+                count++;
+                idx = IndexOf(oldValue, idx + oldLen);
+            }
+
+            long resultLen = (long)len + (long)count * ((long)newLen - (long)oldLen);
+            if (resultLen <= 0) return Empty;
+            if (resultLen > int.MaxValue) throw new OutOfMemoryException();
+
+            string dstStr = FastAllocateString((int)resultLen);
+            ref char dst = ref dstStr.GetRawStringData();
+
+            ref char src = ref GetPinnableReference();
+            ref char ov = ref oldValue.GetPinnableReference();
+
+            int srcPos = 0;
+            int dstPos = 0;
+            int match = first;
+
+            while (match >= 0)
+            {
+                // copy segment before match
+                int segLen = match - srcPos;
+                for (int i = 0; i < segLen; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, dstPos + i) =
+                        System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, srcPos + i);
+
+                dstPos += segLen;
+
+                // copy replacement
+                if (newLen != 0)
+                {
+                    CopyTo(newValue, ref dst, dstPos);
+                    dstPos += newLen;
+                }
+
+                srcPos = match + oldLen;
+                match = IndexOf(oldValue, srcPos);
+            }
+
+            // copy tail
+            int tail = len - srcPos;
+            for (int i = 0; i < tail; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, dstPos + i) =
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, srcPos + i);
+
+            return dstStr;
+        }
         public char[] ToCharArray()
         {
             int n = Length;
@@ -315,6 +443,7 @@
                 a[i] = System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
             return a;
         }
+
         private static string ObjToString(object o)
         {
             if (o == null) return Empty;
@@ -322,6 +451,17 @@
             if (s != null) return s;
             return o.ToString();
         }
+        private static void CopyTo(string srcStr, ref char dst, int dstIndex)
+        {
+            int len = srcStr.Length;
+            if (len == 0) return;
+
+            ref char src = ref srcStr.GetPinnableReference();
+            for (int i = 0; i < len; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, dstIndex + i) =
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
+        }
+
         public static string Concat(object a, object b)
         {
             string s0 = ObjToString(a);
@@ -418,6 +558,151 @@
             => Concat(Concat(a, b), c);
         public static string Concat(string a, string b, string c, string d)
             => Concat(Concat(a, b), Concat(c, d));
+
+        public static string Join(string separator, string[] value)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if ((object)separator == null) separator = Empty;
+
+            int n = value.Length;
+            if (n == 0) return Empty;
+            if (n == 1)
+            {
+                string s0 = value[0];
+                return (object)s0 == null ? Empty : s0;
+            }
+
+            int sepLen = separator.Length;
+            long total = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                string s = value[i];
+                if ((object)s != null) total += s.Length;
+            }
+            total += (long)sepLen * (n - 1);
+
+            if (total <= 0) return Empty;
+            if (total > int.MaxValue) throw new OutOfMemoryException();
+
+            string dstStr = FastAllocateString((int)total);
+            ref char dst = ref dstStr.GetRawStringData();
+
+            int pos = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (i != 0 && sepLen != 0)
+                {
+                    CopyTo(separator, ref dst, pos);
+                    pos += sepLen;
+                }
+
+                string s = value[i];
+                if ((object)s != null && s.Length != 0)
+                {
+                    CopyTo(s, ref dst, pos);
+                    pos += s.Length;
+                }
+            }
+
+            return dstStr;
+        }
+        public static string Join(string separator, object[] values)
+        {
+            if ((object)values == null) throw new ArgumentNullException("values");
+            if ((object)separator == null) separator = Empty;
+
+            int n = values.Length;
+            if (n == 0) return Empty;
+            if (n == 1) return ObjToString(values[0]);
+
+            int sepLen = separator.Length;
+            var parts = new string[n];
+            long total = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                string s = ObjToString(values[i]);
+                parts[i] = s;
+                total += s.Length;
+            }
+            total += (long)sepLen * (n - 1);
+
+            if (total <= 0) return Empty;
+            if (total > int.MaxValue) throw new OutOfMemoryException();
+
+            string dstStr = FastAllocateString((int)total);
+            ref char dst = ref dstStr.GetRawStringData();
+
+            int pos = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (i != 0 && sepLen != 0)
+                {
+                    CopyTo(separator, ref dst, pos);
+                    pos += sepLen;
+                }
+
+                string s = parts[i];
+                if (s.Length != 0)
+                {
+                    CopyTo(s, ref dst, pos);
+                    pos += s.Length;
+                }
+            }
+
+            return dstStr;
+        }
+
+        public string TrimStart()
+        {
+            int len = Length;
+            if (len == 0) return this;
+
+            int i = 0;
+            while (i < len && Char.IsWhiteSpace(this[i])) i++;
+
+            if (i == 0) return this;
+            if (i == len) return Empty;
+            return Substring(i);
+        }
+
+        public string TrimEnd()
+        {
+            int len = Length;
+            if (len == 0) return this;
+
+            int i = len - 1;
+            while (i >= 0 && Char.IsWhiteSpace(this[i])) i--;
+
+            if (i == len - 1) return this;
+            if (i < 0) return Empty;
+            return Substring(0, i + 1);
+        }
+
+        public string Trim()
+        {
+            int len = Length;
+            if (len == 0) return this;
+
+            int start = 0;
+            while (start < len && Char.IsWhiteSpace(this[start])) start++;
+            if (start == len) return Empty;
+
+            int end = len - 1;
+            while (end >= start && Char.IsWhiteSpace(this[end])) end--;
+
+            if (start == 0 && end == len - 1) return this;
+            return Substring(start, end - start + 1);
+        }
+
+        public bool Contains(char value) => IndexOf(value) >= 0;
+
+        public bool Contains(string value)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            return IndexOf(value, 0) >= 0;
+        }
     }
 
     public struct Boolean
@@ -481,7 +766,25 @@
         public static bool IsAsciiLetterOrDigit(char c) => IsAsciiLetter(c) | IsBetween(c, '0', '9');
         public static bool IsAsciiLetterLower(char c) => IsBetween(c, 'a', 'z');
         public static bool IsAsciiLetterUpper(char c) => IsBetween(c, 'A', 'Z');
+
+
+        public static bool IsWhiteSpace(char c)
+        {
+            if (IsLatin1(c))
+            {
+                return IsWhiteSpaceLatin1(c);
+            }
+            //return CharUnicodeInfo.GetIsWhiteSpace(c);
+            if (c == '\u1680') return true;
+            if (c >= '\u2000' && c <= '\u200A') return true;
+            if (c == '\u2028' || c == '\u2029') return true;
+            if (c == '\u202F' || c == '\u205F') return true;
+            if (c == '\u3000' || c == '\uFEFF') return true;
+            return false;
+        }
+
         private static bool IsLatin1(char c) => (uint)c < (uint)Latin1CharInfo.Length;
+        private static bool IsWhiteSpaceLatin1(char c) => (Latin1CharInfo[c] & IsWhiteSpaceFlag) != 0;
         private static System.Globalization.UnicodeCategory GetLatin1UnicodeCategory(char c)
             => (System.Globalization.UnicodeCategory)(Latin1CharInfo[c] & UnicodeCategoryMask);
     }
@@ -492,6 +795,20 @@
         public const sbyte MaxValue = (sbyte)0x7F;
         public const sbyte MinValue = unchecked((sbyte)0x80);
 
+        public static sbyte Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            sbyte r;
+            var st = System.Number.TryParseSByte(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out sbyte result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseSByte(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.Int32ToString((int)m_value);
@@ -503,6 +820,20 @@
         public const byte MaxValue = (byte)0xFF;
         public const byte MinValue = 0;
 
+        public static byte Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            byte r;
+            var st = System.Number.TryParseByte(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out byte result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseByte(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.UInt32ToString((uint)m_value);
@@ -514,6 +845,21 @@
         public const short MaxValue = (short)0x7FFF;
         public const short MinValue = unchecked((short)0x8000);
 
+
+        public static short Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            short r;
+            var st = System.Number.TryParseInt16(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out short result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseInt16(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.Int32ToString((int)m_value);
@@ -525,6 +871,20 @@
         public const ushort MaxValue = (ushort)0xFFFF;
         public const ushort MinValue = 0;
 
+        public static ushort Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            ushort r;
+            var st = System.Number.TryParseUInt16(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out ushort result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseUInt16(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.UInt32ToString((uint)m_value);
@@ -538,12 +898,17 @@
 
         public static int Parse(String str)
         {
-            return -1;
+            if ((object)str == null) throw new ArgumentNullException("str");
+            int r;
+            var st = System.Number.TryParseInt32(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
         }
         public static bool TryParse(String str, out int result)
         {
-            result = -1;
-            return false;
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseInt32(str, out result) == System.Number.ParseStatus.OK;
         }
         public override string ToString()
         {
@@ -556,6 +921,20 @@
         public const uint MaxValue = (uint)0xffffffff;
         public const uint MinValue = 0U;
 
+        public static uint Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            uint r;
+            var st = System.Number.TryParseUInt32(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out uint result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseUInt32(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.UInt32ToString(m_value);
@@ -567,6 +946,20 @@
         public const long MaxValue = 0x7fffffffffffffffL;
         public const long MinValue = unchecked((long)0x8000000000000000L);
 
+        public static long Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            long r;
+            var st = System.Number.TryParseInt64(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out long result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseInt64(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.Int64ToString(m_value);
@@ -579,6 +972,20 @@
         public const ulong MinValue = 0x0;
 
 
+        public static ulong Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            ulong r;
+            var st = System.Number.TryParseUInt64(str, out r);
+            if (st == System.Number.ParseStatus.OK) return r;
+            if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
+            throw new FormatException();
+        }
+        public static bool TryParse(String str, out ulong result)
+        {
+            if ((object)str == null) { result = 0; return false; }
+            return System.Number.TryParseUInt64(str, out result) == System.Number.ParseStatus.OK;
+        }
         public override string ToString()
         {
             return System.Number.UInt64ToString(m_value);
@@ -649,6 +1056,12 @@
 
     internal static unsafe class Number
     {
+        internal enum ParseStatus : byte
+        {
+            OK = 0,
+            Format = 1,
+            Overflow = 2,
+        }
         internal static string CharToString(char c)
         {
             string s = String.FastAllocateString(1);
@@ -771,7 +1184,276 @@
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static string _DoubleToStringImpl(double value)
         {
-            return string.Empty; // handled by VM intrinsic
+            return string.Empty;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int SkipWhiteSpace(ref char p, int i, int len)
+        {
+            while (i < len && Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i)))
+                i++;
+            return i;
+        }
+
+        internal static ParseStatus TryParseInt32(string s, out int result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+
+            int len = s.Length;
+            if (len == 0) return ParseStatus.Format;
+
+            ref char p = ref s.GetPinnableReference();
+            int i = SkipWhiteSpace(ref p, 0, len);
+            if (i >= len) return ParseStatus.Format;
+
+            bool neg = false;
+            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            if (c == '+' || c == '-')
+            {
+                neg = (c == '-');
+                i++;
+                if (i >= len) return ParseStatus.Format;
+            }
+
+            uint limit = neg ? 2147483648u : 2147483647u;
+            uint acc = 0;
+            bool any = false;
+
+            while (i < len)
+            {
+                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                uint digit = (uint)(c - '0');
+                if (digit > 9u) break;
+
+                any = true;
+
+                // acc = acc * 10 + digit
+                if (acc > (limit - digit) / 10u)
+                    return ParseStatus.Overflow;
+
+                acc = acc * 10u + digit;
+                i++;
+            }
+
+            if (!any) return ParseStatus.Format;
+
+            i = SkipWhiteSpace(ref p, i, len);
+            if (i != len) return ParseStatus.Format;
+
+            if (neg)
+            {
+                if (acc == 2147483648u)
+                    result = unchecked((int)0x80000000);
+                else
+                    result = -(int)acc;
+            }
+            else
+            {
+                result = (int)acc;
+            }
+
+            return ParseStatus.OK;
+        }
+        internal static ParseStatus TryParseUInt32(string s, out uint result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+
+            int len = s.Length;
+            if (len == 0) return ParseStatus.Format;
+
+            ref char p = ref s.GetPinnableReference();
+            int i = SkipWhiteSpace(ref p, 0, len);
+            if (i >= len) return ParseStatus.Format;
+
+            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            if (c == '+')
+            {
+                i++;
+                if (i >= len) return ParseStatus.Format;
+            }
+            else if (c == '-')
+            {
+                return ParseStatus.Format;
+            }
+
+            uint acc = 0;
+            bool any = false;
+
+            while (i < len)
+            {
+                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                uint digit = (uint)(c - '0');
+                if (digit > 9u) break;
+
+                any = true;
+
+                if (acc > (uint.MaxValue - digit) / 10u)
+                    return ParseStatus.Overflow;
+
+                acc = acc * 10u + digit;
+                i++;
+            }
+
+            if (!any) return ParseStatus.Format;
+
+            i = SkipWhiteSpace(ref p, i, len);
+            if (i != len) return ParseStatus.Format;
+
+            result = acc;
+            return ParseStatus.OK;
+        }
+        internal static ParseStatus TryParseInt64(string s, out long result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+
+            int len = s.Length;
+            if (len == 0) return ParseStatus.Format;
+
+            ref char p = ref s.GetPinnableReference();
+            int i = SkipWhiteSpace(ref p, 0, len);
+            if (i >= len) return ParseStatus.Format;
+
+            bool neg = false;
+            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            if (c == '+' || c == '-')
+            {
+                neg = (c == '-');
+                i++;
+                if (i >= len) return ParseStatus.Format;
+            }
+
+            ulong limit = neg ? 9223372036854775808UL : 9223372036854775807UL;
+            ulong acc = 0;
+            bool any = false;
+
+            while (i < len)
+            {
+                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                ulong digit = (ulong)(c - '0');
+                if (digit > 9UL) break;
+
+                any = true;
+
+                if (acc > (limit - digit) / 10UL)
+                    return ParseStatus.Overflow;
+
+                acc = acc * 10UL + digit;
+                i++;
+            }
+
+            if (!any) return ParseStatus.Format;
+
+            i = SkipWhiteSpace(ref p, i, len);
+            if (i != len) return ParseStatus.Format;
+
+            if (neg)
+            {
+                if (acc == 9223372036854775808UL)
+                    result = unchecked((long)0x8000000000000000L);
+                else
+                    result = -(long)acc;
+            }
+            else
+            {
+                result = (long)acc;
+            }
+
+            return ParseStatus.OK;
+        }
+
+        internal static ParseStatus TryParseUInt64(string s, out ulong result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+
+            int len = s.Length;
+            if (len == 0) return ParseStatus.Format;
+
+            ref char p = ref s.GetPinnableReference();
+            int i = SkipWhiteSpace(ref p, 0, len);
+            if (i >= len) return ParseStatus.Format;
+
+            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            if (c == '+')
+            {
+                i++;
+                if (i >= len) return ParseStatus.Format;
+            }
+            else if (c == '-')
+            {
+                return ParseStatus.Format;
+            }
+
+            ulong acc = 0;
+            bool any = false;
+
+            while (i < len)
+            {
+                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                ulong digit = (ulong)(c - '0');
+                if (digit > 9UL) break;
+
+                any = true;
+
+                if (acc > (ulong.MaxValue - digit) / 10UL)
+                    return ParseStatus.Overflow;
+
+                acc = acc * 10UL + digit;
+                i++;
+            }
+
+            if (!any) return ParseStatus.Format;
+
+            i = SkipWhiteSpace(ref p, i, len);
+            if (i != len) return ParseStatus.Format;
+
+            result = acc;
+            return ParseStatus.OK;
+        }
+
+
+        internal static ParseStatus TryParseInt16(string s, out short result)
+        {
+            result = 0;
+            int tmp;
+            var st = TryParseInt32(s, out tmp);
+            if (st != ParseStatus.OK) return st;
+            if (tmp < -32768 || tmp > 32767) return ParseStatus.Overflow;
+            result = (short)tmp;
+            return ParseStatus.OK;
+        }
+        internal static ParseStatus TryParseUInt16(string s, out ushort result)
+        {
+            result = 0;
+            uint tmp;
+            var st = TryParseUInt32(s, out tmp);
+            if (st != ParseStatus.OK) return st;
+            if (tmp > 65535u) return ParseStatus.Overflow;
+            result = (ushort)tmp;
+            return ParseStatus.OK;
+        }
+        internal static ParseStatus TryParseSByte(string s, out sbyte result)
+        {
+            result = 0;
+            int tmp;
+            var st = TryParseInt32(s, out tmp);
+            if (st != ParseStatus.OK) return st;
+            if (tmp < -128 || tmp > 127) return ParseStatus.Overflow;
+            result = (sbyte)tmp;
+            return ParseStatus.OK;
+        }
+        internal static ParseStatus TryParseByte(string s, out byte result)
+        {
+            result = 0;
+            uint tmp;
+            var st = TryParseUInt32(s, out tmp);
+            if (st != ParseStatus.OK) return st;
+            if (tmp > 255u) return ParseStatus.Overflow;
+            result = (byte)tmp;
+            return ParseStatus.OK;
         }
     }
 
@@ -807,6 +1489,224 @@
 
         public readonly T GetValueOrDefault(T defaultValue) =>
             hasValue ? value : defaultValue;
+    }
+
+    public struct ValueTuple
+    {
+
+    }
+    public struct ValueTuple<T1> : ITuple
+    {
+        public T1 Item1;
+
+        public ValueTuple(T1 item1)
+        {
+            Item1 = item1;
+        }
+        int ITuple.Length => 1;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+
+        public ValueTuple(T1 item1, T2 item2)
+        {
+            Item1 = item1;
+            Item2 = item2;
+        }
+        int ITuple.Length => 2;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+        }
+        int ITuple.Length => 3;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3, T4> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+        public T4 Item4;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3, T4 item4)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
+        }
+        int ITuple.Length => 4;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                3 => Item4,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3, T4, T5> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+        public T4 Item4;
+        public T5 Item5;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3, T4 item4, T5 item5)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
+            Item5 = item5;
+        }
+        int ITuple.Length => 5;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                3 => Item4,
+                4 => Item5,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3, T4, T5, T6> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+        public T4 Item4;
+        public T5 Item5;
+        public T6 Item6;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3, T4 item4, T5 item5, T6 item6)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
+            Item5 = item5;
+            Item6 = item6;
+        }
+        int ITuple.Length => 6;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                3 => Item4,
+                4 => Item5,
+                5 => Item6,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3, T4, T5, T6, T7> : ITuple
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+        public T4 Item4;
+        public T5 Item5;
+        public T6 Item6;
+        public T7 Item7;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3, T4 item4, T5 item5, T6 item6, T7 item7)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
+            Item5 = item5;
+            Item6 = item6;
+            Item7 = item7;
+        }
+        int ITuple.Length => 7;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                3 => Item4,
+                4 => Item5,
+                5 => Item6,
+                6 => Item7,
+                _ => throw new IndexOutOfRangeException(),
+            };
+    }
+    public struct ValueTuple<T1, T2, T3, T4, T5, T6, T7, TRest> : ITuple
+        where TRest : struct
+    {
+        public T1 Item1;
+        public T2 Item2;
+        public T3 Item3;
+        public T4 Item4;
+        public T5 Item5;
+        public T6 Item6;
+        public T7 Item7;
+        public TRest Rest;
+
+        public ValueTuple(T1 item1, T2 item2, T3 item3, T4 item4, T5 item5, T6 item6, T7 item7, TRest rest)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
+            Item5 = item5;
+            Item6 = item6;
+            Item7 = item7;
+            Rest = rest;
+        }
+        int ITuple.Length => 8;
+        object ITuple.this[int index] =>
+            index switch
+            {
+                0 => Item1,
+                1 => Item2,
+                2 => Item3,
+                3 => Item4,
+                4 => Item5,
+                5 => Item6,
+                6 => Item7,
+                7 => Rest,
+                _ => throw new IndexOutOfRangeException(),
+            };
     }
 
     public readonly struct IntPtr
@@ -1197,6 +2097,12 @@
         }
     }
     // interfaces
+    public interface ITuple
+    {
+        int Length { get; }
+
+        object this[int index] { get; }
+    }
     public interface IDisposable
     {
         void Dispose();
@@ -1667,6 +2573,15 @@
         public SystemException(string message, Exception innerException)
             : base(message, innerException)
         { }
+    }
+    public class FormatException : SystemException
+    {
+        public FormatException()
+            : base() { }
+        public FormatException(string message)
+            : base(message) { }
+        public FormatException(string message, Exception innerException)
+            : base(message, innerException) { }
     }
     public class ArrayTypeMismatchException : SystemException
     {
@@ -2209,7 +3124,7 @@ namespace System.Runtime.InteropServices
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static ref T GetArrayDataReference<T>(T[] array)
         {
-            return ref GetArrayDataReference<T>(array);
+            throw new NotSupportedException();
         }
 
         [Intrinsic]

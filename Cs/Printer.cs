@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
 
@@ -6,87 +7,6 @@ namespace Cnidaria.Cs
 {
     internal static class BytecodeDump
     {
-        public static int FindEntryPointMethodDef(RuntimeModule module)
-        {
-            if (TryFindEntryByName(module, "<Main>$", out var tok))
-                return tok;
-
-            if (TryFindStaticMain(module, out tok))
-                return tok;
-
-            throw new InvalidOperationException("Entry point not found in module metadata.");
-        }
-
-        private static bool TryFindEntryByName(RuntimeModule m, string name, out int methodDefToken)
-        {
-            var md = m.Md;
-            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
-            {
-                var row = md.GetMethodDef(rid);
-                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), name))
-                    continue;
-
-                methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
-                return true;
-            }
-
-            methodDefToken = 0;
-            return false;
-        }
-
-        private static bool TryFindStaticMain(RuntimeModule m, out int methodDefToken)
-        {
-            var md = m.Md;
-
-            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
-            {
-                var row = md.GetMethodDef(rid);
-                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), "Main"))
-                    continue;
-
-                if (!IsStaticMainStringArraySignature(md.GetBlob(row.Signature)))
-                    continue;
-
-                methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
-                return true;
-            }
-
-            methodDefToken = 0;
-            return false;
-        }
-
-        private static bool IsStaticMainStringArraySignature(ReadOnlySpan<byte> sig)
-        {
-            var r = new SigReader(sig);
-            byte cc = r.ReadByte();
-
-            // Must be static (no HASTHIS)
-            if ((cc & 0x20) != 0)
-                return false;
-
-            // Reject generic mains
-            if ((cc & 0x10) != 0)
-            {
-                r.ReadCompressedUInt(); // generic arity
-                return false;
-            }
-
-            uint paramCount = r.ReadCompressedUInt();
-            if (paramCount != 1)
-                return false;
-
-            // ret: void
-            if ((SigElementType)r.ReadByte() != SigElementType.VOID)
-                return false;
-
-            // arg0: string[]
-            if ((SigElementType)r.ReadByte() != SigElementType.SZARRAY)
-                return false;
-            if ((SigElementType)r.ReadByte() != SigElementType.STRING)
-                return false;
-
-            return true;
-        }
         public static void DumpReachable(
             IReadOnlyDictionary<string, RuntimeModule> modules,
             RuntimeModule entryModule,
@@ -140,7 +60,7 @@ namespace Cnidaria.Cs
 
                 Console.WriteLine();
 
-                
+
             }
             void Enqueue(RuntimeModule m, BytecodeFunction f)
             {
@@ -639,8 +559,8 @@ namespace Cnidaria.Cs
             for (int tdIndex = 0; tdIndex < md.GetRowCount(MetadataTableKind.TypeDef); tdIndex++)
             {
                 int start = md.GetTypeDef(tdIndex + 1).MethodList;
-                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef)) 
-                    ? md.GetTypeDef(tdIndex+2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
+                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef))
+                    ? md.GetTypeDef(tdIndex + 2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
                 if (methodRid >= start && methodRid < end)
                     return tdIndex + 1;
             }
@@ -961,6 +881,7 @@ namespace Cnidaria.Cs
                     BoundCheckedExpression => "BoundCheckedExpression",
                     BoundUncheckedExpression => "BoundUncheckedExpression",
                     BoundSizeOfExpression => "BoundSizeOfExpression",
+                    BoundThrowExpression => "BoundThrowExpression",
                     _ => node.GetType().Name
                 };
             }
@@ -1379,16 +1300,16 @@ namespace Cnidaria.Cs
                     case BoundArrayInitializerExpression ai:
                         return $"Length={ai.Elements.Length}";
 
-                    case BoundArrayCreationExpression ac: 
+                    case BoundArrayCreationExpression ac:
                         return $"ElementType={FormatType(ac.ElementType)}, Rank={ac.DimensionSizes.Length}, HasInitializer={(ac.InitializerOpt != null ? "true" : "false")}";
 
-                    case BoundArrayElementAccessExpression aea: 
+                    case BoundArrayElementAccessExpression aea:
                         return $"Rank={aea.Indices.Length}, IsLValue={(aea.IsLValue ? "true" : "false")}";
 
                     case BoundStackAllocArrayCreationExpression sa:
                         return $"ElementType={FormatType(sa.ElementType)}";
 
-                    case BoundRefExpression: 
+                    case BoundRefExpression:
                         return "Kind=ref";
 
                     case BoundConditionalGotoStatement cg:

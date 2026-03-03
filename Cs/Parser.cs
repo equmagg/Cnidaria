@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
-using System.Text;
+using System.Linq;
 
 namespace Cnidaria.Cs
 {
@@ -359,7 +358,7 @@ namespace Cnidaria.Cs
             var attrs = ParseAttributeLists();
 
             if (_tokens.CurrentKind == SyntaxKind.NamespaceKeyword)
-            { 
+            {
                 int nsStart = _tokens.Current.Span.Start;
                 var ns = ParseNamespaceDeclaration(attrs);
 
@@ -995,7 +994,7 @@ namespace Cnidaria.Cs
                 return ParseConstructorDeclarationAfterHeader(attrs, modifiers, id2);
             }
             // conversion operator
-            if ((_tokens.CurrentKind == SyntaxKind.ImplicitKeyword 
+            if ((_tokens.CurrentKind == SyntaxKind.ImplicitKeyword
                 || _tokens.CurrentKind == SyntaxKind.ExplicitKeyword) &&
                 _tokens.Peek(1).Kind == SyntaxKind.OperatorKeyword)
             {
@@ -1007,25 +1006,38 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.OperatorKeyword)
                 return ParseOperatorDeclarationAfterHeader(attrs, modifiers, type);
 
-            if (_tokens.CurrentKind == SyntaxKind.ThisKeyword && _tokens.Peek(1).Kind == SyntaxKind.OpenBracketToken)
-                return ParseIndexerDeclarationAfterHeader(attrs, modifiers, type);
-
-            var id = MatchToken(SyntaxKind.IdentifierToken);
-
+            ExplicitInterfaceSpecifierSyntax? explicitInterface = null;
+            SyntaxToken explicitMemberId = default;
+            SyntaxToken explicitThisKeyword = default;
+            bool hasExplicitInterface = TryParseExplicitInterfaceSpecifier(out explicitInterface, out explicitMemberId, out explicitThisKeyword);
+            if (explicitThisKeyword.Kind == SyntaxKind.ThisKeyword)
+            {
+                return ParseIndexerDeclarationAfterHeader(attrs, modifiers, type, explicitInterface, explicitThisKeyword);
+            }
+            if (!hasExplicitInterface && _tokens.CurrentKind == SyntaxKind.ThisKeyword && _tokens.Peek(1).Kind == SyntaxKind.OpenBracketToken)
+            {
+                var thisKeyword = MatchToken(SyntaxKind.ThisKeyword);
+                return ParseIndexerDeclarationAfterHeader(attrs, modifiers, type, explicitInterfaceSpecifier: null, thisKeyword: thisKeyword);
+            }
+            var id = hasExplicitInterface ? explicitMemberId : MatchToken(SyntaxKind.IdentifierToken);
             TypeParameterListSyntax? methodTypeParams = null;
             if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
                 methodTypeParams = ParseTypeParameterList();
 
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
-                return ParseMethodDeclarationAfterHeader(attrs, modifiers, type, id, methodTypeParams);
+                return ParseMethodDeclarationAfterHeader(attrs, modifiers, type, explicitInterface, id, methodTypeParams);
 
             if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken || _tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken)
-                return ParsePropertyDeclarationAfterHeader(attrs, modifiers, type, id);
+                return ParsePropertyDeclarationAfterHeader(attrs, modifiers, type, explicitInterface, id);
 
             return ParseFieldDeclarationAfterHeader(attrs, modifiers, type, id);
         }
         private PropertyDeclarationSyntax ParsePropertyDeclarationAfterHeader(
-            SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers, TypeSyntax type, SyntaxToken id)
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            TypeSyntax type,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
+            SyntaxToken id)
         {
             if (_tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken)
             {
@@ -1033,12 +1045,13 @@ namespace Cnidaria.Cs
                 var semi = MatchToken(SyntaxKind.SemicolonToken);
                 return new PropertyDeclarationSyntax(
                     attributeLists,
-                    modifiers, 
-                    type, 
-                    id, 
-                    accessorList: null, 
-                    expressionBody: exprBody, 
-                    initializer: null, 
+                    modifiers,
+                    type,
+                    explicitInterfaceSpecifier,
+                    id,
+                    accessorList: null,
+                    expressionBody: exprBody,
+                    initializer: null,
                     semicolonToken: semi);
             }
             var accessorList = ParseAccessorList();
@@ -1053,13 +1066,14 @@ namespace Cnidaria.Cs
             }
 
             return new PropertyDeclarationSyntax(
-                attributeLists, 
-                modifiers, 
-                type, 
-                id, 
-                accessorList, 
-                expressionBody: null, 
-                initializer: init, 
+                attributeLists,
+                modifiers,
+                type,
+                explicitInterfaceSpecifier,
+                id,
+                accessorList,
+                expressionBody: null,
+                initializer: init,
                 semicolonToken: semi2);
         }
         private AccessorListSyntax ParseAccessorList()
@@ -1145,9 +1159,10 @@ namespace Cnidaria.Cs
         private IndexerDeclarationSyntax ParseIndexerDeclarationAfterHeader(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
-            TypeSyntax type)
+            TypeSyntax type,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
+            SyntaxToken thisKeyword)
         {
-            var thisKeyword = MatchToken(SyntaxKind.ThisKeyword);
             var parameterList = ParseBracketedParameterList();
 
             if (_tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken)
@@ -1159,6 +1174,7 @@ namespace Cnidaria.Cs
                     attributeLists,
                     modifiers,
                     type,
+                    explicitInterfaceSpecifier,
                     thisKeyword,
                     parameterList,
                     accessorList: null,
@@ -1171,6 +1187,7 @@ namespace Cnidaria.Cs
                 attributeLists,
                 modifiers,
                 type,
+                explicitInterfaceSpecifier,
                 thisKeyword,
                 parameterList,
                 accessorList,
@@ -1327,10 +1344,11 @@ namespace Cnidaria.Cs
             }
         }
         private MethodDeclarationSyntax ParseMethodDeclarationAfterHeader(
-            SyntaxList<AttributeListSyntax> attributeLists, 
-            SyntaxTokenList modifiers, 
-            TypeSyntax returnType, 
-            SyntaxToken id, 
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            TypeSyntax returnType,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
+            SyntaxToken id,
             TypeParameterListSyntax? typeParams)
         {
             var parameters = ParseParameterList();
@@ -1351,16 +1369,66 @@ namespace Cnidaria.Cs
 
 
             return new MethodDeclarationSyntax(
-                attributeLists, 
-                modifiers, 
-                returnType, 
-                id, 
-                typeParams, 
-                parameters, 
-                constraintClauses, 
-                body, 
-                exprBody, 
+                attributeLists,
+                modifiers,
+                returnType,
+                explicitInterfaceSpecifier,
+                id,
+                typeParams,
+                parameters,
+                constraintClauses,
+                body,
+                exprBody,
                 semi);
+        }
+        private bool TryParseExplicitInterfaceSpecifier(
+            out ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
+            out SyntaxToken memberIdentifier,
+            out SyntaxToken thisKeyword)
+        {
+            explicitInterfaceSpecifier = null;
+            memberIdentifier = default;
+            thisKeyword = default;
+
+            if (_tokens.CurrentKind != SyntaxKind.IdentifierToken || _tokens.Peek(1).Kind != SyntaxKind.DotToken)
+                return false;
+
+            NameSyntax name = ParseSimpleName();
+            while (_tokens.CurrentKind == SyntaxKind.DotToken)
+            {
+                if (_tokens.Peek(1).Kind == SyntaxKind.ThisKeyword)
+                {
+                    var dot = _tokens.EatToken();
+                    thisKeyword = MatchToken(SyntaxKind.ThisKeyword);
+                    explicitInterfaceSpecifier = new ExplicitInterfaceSpecifierSyntax(name, dot);
+                    return true;
+                }
+                if (_tokens.Peek(1).Kind != SyntaxKind.IdentifierToken)
+                    return false;
+
+                bool isQualifierDot = Probe(
+                    scan: () =>
+                    {
+                        _tokens.EatToken(); // dot
+                        ParseSimpleName();
+                        return _tokens.CurrentKind == SyntaxKind.DotToken;
+                    },
+                    requireProgress: true);
+
+                if (isQualifierDot)
+                {
+                    var dot = _tokens.EatToken();
+                    var right = ParseSimpleName();
+                    name = new QualifiedNameSyntax(name, dot, right);
+                    continue;
+                }
+
+                var explicitDot = _tokens.EatToken();
+                memberIdentifier = MatchToken(SyntaxKind.IdentifierToken);
+                explicitInterfaceSpecifier = new ExplicitInterfaceSpecifierSyntax(name, explicitDot);
+                return true;
+            }
+            return false;
         }
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
@@ -2968,7 +3036,7 @@ namespace Cnidaria.Cs
             }
             // predefined
             else if (IsPredefinedTypeKeyword(_tokens.Current.Kind)
-                || (_tokens.Current.Kind == SyntaxKind.IdentifierToken 
+                || (_tokens.Current.Kind == SyntaxKind.IdentifierToken
                 && (_tokens.Current.ValueText == "nint" || _tokens.Current.ValueText == "nuint")))
             {
                 _tokens.EatToken();
@@ -3107,7 +3175,7 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
                 return ParseTupleType();
 
-            if (IsPredefinedTypeKeyword(_tokens.CurrentKind) 
+            if (IsPredefinedTypeKeyword(_tokens.CurrentKind)
                 || (_tokens.Current.Kind == SyntaxKind.IdentifierToken
                 && (_tokens.Current.ValueText == "nint" || _tokens.Current.ValueText == "nuint")))
             {
@@ -3281,6 +3349,9 @@ namespace Cnidaria.Cs
 
         private ExpressionSyntax ParseUnaryExpression()
         {
+            if (_tokens.CurrentKind == SyntaxKind.ThrowKeyword)
+                return ParseThrowExpression();
+
             if (IsAwaitKeyword())
             {
                 var awaitKeyword = _tokens.EatToken();
@@ -3303,6 +3374,24 @@ namespace Cnidaria.Cs
             // postfix unary
             return ParsePostfixExpression();
 
+        }
+        private ThrowExpressionSyntax ParseThrowExpression()
+        {
+            var throwKeyword = MatchToken(SyntaxKind.ThrowKeyword);
+
+            if (_tokens.CurrentKind is SyntaxKind.SemicolonToken
+                or SyntaxKind.CommaToken
+                or SyntaxKind.CloseParenToken
+                or SyntaxKind.CloseBracketToken
+                or SyntaxKind.CloseBraceToken
+                or SyntaxKind.EndOfFileToken)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(throwKeyword.Span.End, "Expected expression after 'throw'."));
+                var missing = CreateMissingIdentifierName(throwKeyword.Span.End);
+                return new ThrowExpressionSyntax(throwKeyword, missing);
+            }
+            var expr = ParseExpression();
+            return new ThrowExpressionSyntax(throwKeyword, expr);
         }
         private bool TryParseCastExpression(out ExpressionSyntax expr)
         {
@@ -3498,7 +3587,7 @@ namespace Cnidaria.Cs
             if (IsDeclarationExpressionStart())
                 return ParseDeclarationExpression();
 
-            if (IsPredefinedTypeKeyword(t.Kind) 
+            if (IsPredefinedTypeKeyword(t.Kind)
                 || (t.Kind == SyntaxKind.IdentifierToken && (t.ValueText == "nint" || t.ValueText == "nuint")))
                 return new PredefinedTypeSyntax(_tokens.EatToken());
 
@@ -4047,7 +4136,7 @@ namespace Cnidaria.Cs
 
             // Argument modifier ref/out/in
             SyntaxToken? refKindKeyword = null;
-            if (_tokens.CurrentKind == SyntaxKind.RefKeyword || 
+            if (_tokens.CurrentKind == SyntaxKind.RefKeyword ||
                 _tokens.CurrentKind == SyntaxKind.InKeyword ||
                 _tokens.CurrentKind == SyntaxKind.OutKeyword)
             {
@@ -4328,6 +4417,9 @@ namespace Cnidaria.Cs
             if (t.Kind == SyntaxKind.EndOfFileToken)
                 return false;
 
+            if (t.Kind == SyntaxKind.ThrowKeyword)
+                return true;
+
             if (t.Kind == SyntaxKind.TypeOfKeyword || t.Kind == SyntaxKind.SizeOfKeyword)
                 return true;
 
@@ -4460,7 +4552,7 @@ namespace Cnidaria.Cs
             SyntaxKind.ColonToken => true,
             _ => false
         };
-        private static bool IsOverloadableOperatorToken(SyntaxKind kind) => kind switch 
+        private static bool IsOverloadableOperatorToken(SyntaxKind kind) => kind switch
         {
             SyntaxKind.PlusToken => true,
             SyntaxKind.MinusToken => true,
@@ -4603,16 +4695,16 @@ namespace Cnidaria.Cs
                     _ => false
                 },
 
-                ModifierContext.Accessor => t.Kind switch 
+                ModifierContext.Accessor => t.Kind switch
                 {
-                    SyntaxKind.PublicKeyword or SyntaxKind.PrivateKeyword or SyntaxKind.ProtectedKeyword 
+                    SyntaxKind.PublicKeyword or SyntaxKind.PrivateKeyword or SyntaxKind.ProtectedKeyword
                     or SyntaxKind.InterfaceKeyword or SyntaxKind.ReadOnlyKeyword
                     => true,
                     _ => false
                 },
 
 
-            _ => false
+                _ => false
             };
         }
         private static bool IsLiteralToken(SyntaxKind kind) => kind switch

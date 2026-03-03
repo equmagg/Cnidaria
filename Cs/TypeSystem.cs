@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -140,14 +141,14 @@ namespace Cnidaria.Cs
             // tag: 0=TypeDef, 1=TypeRef, 2=TypeSpec
             if (tag == 0)
             {
-                var (ns, name) = GetTypeDefFullNameByRid(rid); // nested-aware
+                var (ns, name) = GetTypeDefFullNameByRid(rid); // nested aware
                 sb.Append(":").Append(Name).Append(':').Append(ns).Append('.').Append(name);
                 return;
             }
 
             if (tag == 1)
             {
-                var (asm, ns, name) = Domain.ResolveTypeRefFullName(this, rid); // nested-aware
+                var (asm, ns, name) = Domain.ResolveTypeRefFullName(this, rid); // nested aware
                 sb.Append(":").Append(asm).Append(':').Append(ns).Append('.').Append(name);
                 return;
             }
@@ -749,8 +750,11 @@ namespace Cnidaria.Cs
             byte cc = sr.ReadByte();
             bool hasThis = (cc & 0x20) != 0;
 
+            int genericArity = 0;
             if ((cc & 0x10) != 0)
-                throw new NotSupportedException("Generic method MemberRef signatures are not supported.");
+            {
+                genericArity = checked((int)sr.ReadCompressedUInt());
+            }
 
             uint paramCount = sr.ReadCompressedUInt();
             RuntimeType ret = ReadTypeSig(module, ref sr);
@@ -759,6 +763,18 @@ namespace Cnidaria.Cs
             for (int i = 0; i < ps.Length; i++)
                 ps[i] = ReadTypeSig(module, ref sr);
 
+            var ownerTypeArgs = owner.GenericTypeArguments ?? Array.Empty<RuntimeType>();
+            if (ownerTypeArgs.Length != 0)
+            {
+                ret = SubstituteRuntimeType(ret, ownerTypeArgs);
+                for (int i = 0; i < ps.Length; i++)
+                    ps[i] = SubstituteRuntimeType(ps[i], ownerTypeArgs);
+            }
+
+
+
+            RuntimeMethod? wildcardMatch = null;
+
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
@@ -766,42 +782,376 @@ namespace Cnidaria.Cs
                     continue;
                 if (m.HasThis != hasThis)
                     continue;
-                if (!ReferenceEquals(m.ReturnType, ret))
+                if (m.GenericArity != genericArity)
                     continue;
                 if (m.ParameterTypes.Length != ps.Length)
                     continue;
 
-                bool same = true;
-                for (int p = 0; p < ps.Length; p++)
+                bool strict = ReferenceEquals(m.ReturnType, ret);
+                if (strict)
                 {
-                    if (!ReferenceEquals(m.ParameterTypes[p], ps[p]))
+                    for (int p = 0; p < ps.Length; p++)
                     {
-                        same = false;
-                        break;
+                        if (!ReferenceEquals(m.ParameterTypes[p], ps[p]))
+                        {
+                            strict = false;
+                            break;
+                        }
                     }
                 }
 
-                if (!same)
-                    continue;
+                if (strict)
+                {
+                    _methodCache[(module.Name, methodToken)] = m;
+                    return m;
+                }
 
-                _methodCache[(module.Name, methodToken)] = m;
+                if (wildcardMatch is null && CompatibleType(m.ReturnType, ret))
+                {
+                    bool ok = true;
+                    for (int p = 0; p < ps.Length; p++)
+                    {
+                        if (!CompatibleType(m.ParameterTypes[p], ps[p]))
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok)
+                        wildcardMatch = m;
+                }
+            }
+
+            if (wildcardMatch is not null)
+            {
+                _methodCache[(module.Name, methodToken)] = wildcardMatch;
+                return wildcardMatch;
+            }
+
+            throw new MissingMethodException($"{owner.Namespace}.{owner.Name}.{methodName} not found (memberref in {module.Name})");
+
+            static bool CompatibleType(RuntimeType def, RuntimeType actual)
+            {
+                if (def.Kind == RuntimeTypeKind.TypeParam)
+                    return true;
+
+                if (ReferenceEquals(def, actual) || def.TypeId == actual.TypeId)
+                    return true;
+
+                if (def.Kind != actual.Kind)
+                    return false;
+
+                if (def.Kind == RuntimeTypeKind.Array)
+                {
+                    if (def.ArrayRank != actual.ArrayRank)
+                        return false;
+                    if (def.ElementType is null || actual.ElementType is null)
+                        return false;
+                    return CompatibleType(def.ElementType, actual.ElementType);
+                }
+
+                if (def.Kind == RuntimeTypeKind.Pointer || def.Kind == RuntimeTypeKind.ByRef)
+                {
+                    if (def.ElementType is null || actual.ElementType is null)
+                        return false;
+                    return CompatibleType(def.ElementType, actual.ElementType);
+                }
+
+                if (def.GenericTypeDefinition is not null)
+                {
+                    if (actual.GenericTypeDefinition is null)
+                        return false;
+                    if (!ReferenceEquals(def.GenericTypeDefinition, actual.GenericTypeDefinition))
+                        return false;
+                    var da = def.GenericTypeArguments;
+                    var aa = actual.GenericTypeArguments;
+                    if (da.Length != aa.Length)
+                        return false;
+                    for (int i = 0; i < da.Length; i++)
+                        if (!CompatibleType(da[i], aa[i]))
+                            return false;
+                    return true;
+                }
+
+                return false;
+            }
+        }
+        public RuntimeMethod ResolveMethodInMethodContext(RuntimeModule module, int methodToken, RuntimeMethod? methodContext)
+        {
+            if (methodContext is null)
+                return ResolveMethod(module, methodToken);
+
+            int table = MetadataToken.Table(methodToken);
+            int rid = MetadataToken.Rid(methodToken);
+
+            if (table == MetadataToken.MethodDef)
+            {
+                var m = ResolveMethod(module, methodToken);
+
+                var ctxOwner = methodContext.DeclaringType;
+                if (ctxOwner.GenericTypeDefinition is not null &&
+                    ReferenceEquals(m.DeclaringType, ctxOwner.GenericTypeDefinition))
+                {
+                    EnsureConstructedMembers(ctxOwner);
+
+                    // Fast path
+                    var defMethods = ctxOwner.GenericTypeDefinition.Methods;
+                    for (int i = 0; i < defMethods.Length; i++)
+                    {
+                        if (ReferenceEquals(defMethods[i], m))
+                            return ctxOwner.Methods[i];
+                    }
+
+                    // Fallback
+                    var ownerTypeArgs = ctxOwner.GenericTypeArguments;
+                    var expectedRet = SubstituteRuntimeType(m.ReturnType, ownerTypeArgs);
+                    var expectedPs = new RuntimeType[m.ParameterTypes.Length];
+                    for (int p = 0; p < expectedPs.Length; p++)
+                        expectedPs[p] = SubstituteRuntimeType(m.ParameterTypes[p], ownerTypeArgs);
+
+                    for (int i = 0; i < ctxOwner.Methods.Length; i++)
+                    {
+                        var cand = ctxOwner.Methods[i];
+                        if (!StringComparer.Ordinal.Equals(cand.Name, m.Name))
+                            continue;
+                        if (cand.HasThis != m.HasThis) continue;
+                        if (cand.IsStatic != m.IsStatic) continue;
+                        if (cand.IsVirtual != m.IsVirtual) continue;
+                        if (cand.IsNewSlot != m.IsNewSlot) continue;
+                        if (cand.IsFinal != m.IsFinal) continue;
+                        if (cand.GenericArity != m.GenericArity) continue;
+                        if (!ReferenceEquals(cand.ReturnType, expectedRet))
+                            continue;
+                        if (cand.ParameterTypes.Length != expectedPs.Length)
+                            continue;
+
+                        bool same = true;
+                        for (int p = 0; p < expectedPs.Length; p++)
+                        {
+                            if (!ReferenceEquals(cand.ParameterTypes[p], expectedPs[p]))
+                            {
+                                same = false;
+                                break;
+                            }
+                        }
+
+                        if (same)
+                            return cand;
+                    }
+                }
+
                 return m;
             }
-            throw new MissingMethodException($"{owner.Namespace}.{owner.Name}.{methodName} not found (memberref in {module.Name})");
-        }
-        public bool TryResolveMethod(RuntimeModule module, int methodToken, out RuntimeMethod? m)
-        {
-            if (_methodCache.TryGetValue((module.Name, methodToken), out m))
-                return true;
 
-            try
+            if (table == MetadataToken.MethodSpec)
             {
-                m = ResolveMethod(module, methodToken);
-                return true;
+                var ms = module.Md.GetMethodSpec(rid);
+
+                var genericMethod = ResolveMethodInMethodContext(module, ms.Method, methodContext);
+
+                var sig = module.Md.GetBlob(ms.Instantiation);
+                var sr = new SigReader(sig);
+                byte kind = sr.ReadByte();
+                if (kind != 0x0A) // METHODSPEC
+                    throw new InvalidOperationException($"Bad MethodSpec signature kind: 0x{kind:X2}");
+
+                uint argcU = sr.ReadCompressedUInt();
+                int argc = checked((int)argcU);
+                var methodArgs = new RuntimeType[argc];
+                for (int i = 0; i < methodArgs.Length; i++)
+                    methodArgs[i] = ReadTypeSig(module, ref sr);
+
+                var ctxOwnerArgs = methodContext.DeclaringType.GenericTypeArguments;
+                var ctxMethodArgs = methodContext.MethodGenericArguments;
+                if (ctxOwnerArgs.Length != 0 || ctxMethodArgs.Length != 0)
+                {
+                    for (int i = 0; i < methodArgs.Length; i++)
+                        methodArgs[i] = SubstituteRuntimeType(methodArgs[i], ctxOwnerArgs, ctxMethodArgs);
+                }
+
+                if (methodArgs.Length != 0 &&
+                    LooksLikeOpenGenericDefinition(genericMethod.DeclaringType) &&
+                    UsesOwnerTypeParameters(genericMethod) &&
+                    !UsesMethodTypeParameters(genericMethod) &&
+                    MethodSpecArgsMatchDeclaringTypeArity(genericMethod.DeclaringType, methodArgs.Length))
+                {
+                    var constructedOwner = GetOrCreateGenericInstanceType(genericMethod.DeclaringType, methodArgs);
+                    EnsureConstructedMembers(constructedOwner);
+
+                    var expectedRet = SubstituteRuntimeType(genericMethod.ReturnType, methodArgs);
+                    var expectedPs = new RuntimeType[genericMethod.ParameterTypes.Length];
+                    for (int i = 0; i < expectedPs.Length; i++)
+                        expectedPs[i] = SubstituteRuntimeType(genericMethod.ParameterTypes[i], methodArgs);
+
+                    for (int i = 0; i < constructedOwner.Methods.Length; i++)
+                    {
+                        var cand = constructedOwner.Methods[i];
+                        if (!StringComparer.Ordinal.Equals(cand.Name, genericMethod.Name))
+                            continue;
+                        if (cand.HasThis != genericMethod.HasThis) continue;
+                        if (cand.IsStatic != genericMethod.IsStatic) continue;
+                        if (cand.IsVirtual != genericMethod.IsVirtual) continue;
+                        if (cand.IsNewSlot != genericMethod.IsNewSlot) continue;
+                        if (cand.IsFinal != genericMethod.IsFinal) continue;
+                        if (!ReferenceEquals(cand.ReturnType, expectedRet))
+                            continue;
+                        if (cand.ParameterTypes.Length != expectedPs.Length)
+                            continue;
+
+                        bool same = true;
+                        for (int p = 0; p < expectedPs.Length; p++)
+                        {
+                            if (!ReferenceEquals(cand.ParameterTypes[p], expectedPs[p]))
+                            {
+                                same = false;
+                                break;
+                            }
+                        }
+
+                        if (same)
+                            return cand;
+                    }
+                }
+
+                return GetOrCreateConstructedMethod(genericMethod, methodArgs);
             }
-            catch
+
+            if (table != MetadataToken.MemberRef)
+                return ResolveMethod(module, methodToken);
+
             {
-                m = null;
+                var mr = module.Md.GetMemberRef(rid);
+                string methodName = module.Md.GetString(mr.Name);
+
+                RuntimeType owner = ResolveMemberRefOwnerType(module, mr.ClassToken);
+
+                var ownerTypeArgs = methodContext.DeclaringType.GenericTypeArguments;
+                var methodTypeArgs = methodContext.MethodGenericArguments;
+
+                if (ownerTypeArgs.Length != 0 || methodTypeArgs.Length != 0)
+                    owner = SubstituteRuntimeType(owner, ownerTypeArgs, methodTypeArgs);
+
+                EnsureConstructedMembers(owner);
+
+                var sig = module.Md.GetBlob(mr.Signature);
+                var sr = new SigReader(sig);
+                byte cc = sr.ReadByte();
+                bool hasThis = (cc & 0x20) != 0;
+
+                int genericArity = 0;
+                if ((cc & 0x10) != 0)
+                    genericArity = checked((int)sr.ReadCompressedUInt());
+
+                uint paramCount = sr.ReadCompressedUInt();
+                RuntimeType ret = ReadTypeSig(module, ref sr);
+
+                var ps = new RuntimeType[paramCount];
+                for (int i = 0; i < ps.Length; i++)
+                    ps[i] = ReadTypeSig(module, ref sr);
+
+                if (ownerTypeArgs.Length != 0 || methodTypeArgs.Length != 0)
+                {
+                    ret = SubstituteRuntimeType(ret, ownerTypeArgs, methodTypeArgs);
+                    for (int i = 0; i < ps.Length; i++)
+                        ps[i] = SubstituteRuntimeType(ps[i], ownerTypeArgs, methodTypeArgs);
+                }
+
+                RuntimeMethod? wildcardMatch = null;
+
+                for (int i = 0; i < owner.Methods.Length; i++)
+                {
+                    var m = owner.Methods[i];
+                    if (!StringComparer.Ordinal.Equals(m.Name, methodName))
+                        continue;
+                    if (m.HasThis != hasThis)
+                        continue;
+                    if (m.GenericArity != genericArity)
+                        continue;
+                    if (m.ParameterTypes.Length != ps.Length)
+                        continue;
+
+                    bool strict = ReferenceEquals(m.ReturnType, ret);
+                    if (strict)
+                    {
+                        for (int p = 0; p < ps.Length; p++)
+                        {
+                            if (!ReferenceEquals(m.ParameterTypes[p], ps[p]))
+                            {
+                                strict = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (strict)
+                        return m;
+
+                    if (wildcardMatch is null && CompatibleType(m.ReturnType, ret))
+                    {
+                        bool ok = true;
+                        for (int p = 0; p < ps.Length; p++)
+                        {
+                            if (!CompatibleType(m.ParameterTypes[p], ps[p]))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (ok)
+                            wildcardMatch = m;
+                    }
+                }
+
+                if (wildcardMatch is not null)
+                    return wildcardMatch;
+
+                throw new MissingMethodException($"{owner.Namespace}.{owner.Name}.{methodName} not found (memberref in {module.Name})");
+            }
+
+
+            static bool CompatibleType(RuntimeType def, RuntimeType actual)
+            {
+                if (def.Kind == RuntimeTypeKind.TypeParam)
+                    return true;
+
+                if (ReferenceEquals(def, actual) || def.TypeId == actual.TypeId)
+                    return true;
+
+                if (def.Kind != actual.Kind)
+                    return false;
+
+                if (def.Kind == RuntimeTypeKind.Array)
+                {
+                    if (def.ArrayRank != actual.ArrayRank)
+                        return false;
+                    if (def.ElementType is null || actual.ElementType is null)
+                        return false;
+                    return CompatibleType(def.ElementType, actual.ElementType);
+                }
+
+                if (def.Kind == RuntimeTypeKind.Pointer || def.Kind == RuntimeTypeKind.ByRef)
+                {
+                    if (def.ElementType is null || actual.ElementType is null)
+                        return false;
+                    return CompatibleType(def.ElementType, actual.ElementType);
+                }
+
+                if (def.GenericTypeDefinition is not null)
+                {
+                    if (actual.GenericTypeDefinition is null)
+                        return false;
+                    if (!ReferenceEquals(def.GenericTypeDefinition, actual.GenericTypeDefinition))
+                        return false;
+                    var da = def.GenericTypeArguments;
+                    var aa = actual.GenericTypeArguments;
+                    if (da.Length != aa.Length)
+                        return false;
+                    for (int i = 0; i < da.Length; i++)
+                        if (!CompatibleType(da[i], aa[i]))
+                            return false;
+                    return true;
+                }
+
                 return false;
             }
         }
@@ -936,6 +1286,8 @@ namespace Cnidaria.Cs
         }
         private static bool UsesMethodTypeParameters(RuntimeMethod m)
         {
+            if (m.GenericArity != 0)
+                return true;
             if (UsesTypeParameters(m.ReturnType, wantMethod: true))
                 return true;
             for (int i = 0; i < m.ParameterTypes.Length; i++)
@@ -989,6 +1341,7 @@ namespace Cnidaria.Cs
             m.BodyModule = genericMethod.BodyModule;
             m.Body = genericMethod.Body;
             m.GenericMethodDefinition = genericMethod;
+            m.GenericArity = genericMethod.GenericArity;
             m.MethodGenericArguments = methodArgs;
             _constructedMethods[key] = m;
             _methodById[m.MethodId] = m;
@@ -1459,10 +1812,10 @@ namespace Cnidaria.Cs
                 bool isNewSlot = (attrs & System.Reflection.MethodAttributes.NewSlot) != 0;
                 bool isFinal = (attrs & System.Reflection.MethodAttributes.Final) != 0;
 
+                int genericArity = 0;
                 if ((cc & 0x10) != 0)
                 {
-                    // Generic arity
-                    _ = sr.ReadCompressedUInt();
+                    genericArity = checked((int)sr.ReadCompressedUInt());
                 }
 
                 uint paramCount = sr.ReadCompressedUInt();
@@ -1474,6 +1827,7 @@ namespace Cnidaria.Cs
 
                 var rm = new RuntimeMethod(_nextMethodId++, declaringType, name, ret, ps, hasThis, isVirtual, isStatic, isNewSlot, isFinal);
                 rm.BodyModule = m;
+                rm.GenericArity = genericArity;
                 if (m.MethodsByDefToken.TryGetValue(methodTok, out var bodyFn))
                     rm.Body = bodyFn;
                 _methodById[rm.MethodId] = rm;
@@ -1548,6 +1902,7 @@ namespace Cnidaria.Cs
         {
             if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
             if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
+            if (a.GenericArity != b.GenericArity) return false;
             for (int i = 0; i < a.ParameterTypes.Length; i++)
                 if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
             return true;
@@ -1846,6 +2201,7 @@ namespace Cnidaria.Cs
 
                     dst.BodyModule = src.BodyModule;
                     dst.Body = src.Body;
+                    dst.GenericArity = src.GenericArity;
                     _methodById[dst.MethodId] = dst;
                     methods[i] = dst;
                 }
@@ -2096,6 +2452,7 @@ namespace Cnidaria.Cs
         public BytecodeFunction? Body { get; internal set; }
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         public RuntimeType[] MethodGenericArguments { get; internal set; } = Array.Empty<RuntimeType>();
+        public int GenericArity { get; internal set; }
         public RuntimeMethod(
             int methodId,
             RuntimeType declType,

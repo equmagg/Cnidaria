@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    
+
     public abstract class BoundNode
     {
         public abstract BoundNodeKind Kind { get; }
@@ -82,8 +82,24 @@ namespace Cnidaria.Cs
         {
             Type = type;
             Value = value;
-            ConstantValueOpt = new Optional<object>(value!); 
+            ConstantValueOpt = new Optional<object>(value!);
         }
+    }
+    internal sealed class BoundThrowExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ThrowExpression;
+        public BoundExpression Exception { get; }
+
+        public BoundThrowExpression(ThrowExpressionSyntax syntax, BoundExpression exception)
+            : base(syntax)
+        {
+            Exception = exception;
+            Type = ThrowTypeSymbol.Instance;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = exception.HasErrors;
+        }
+
+        internal void SetType(TypeSymbol type) => Type = type;
     }
     internal sealed class BoundTupleExpression : BoundExpression
     {
@@ -580,7 +596,7 @@ namespace Cnidaria.Cs
         : base(syntax)
         {
             Type = resultType; // always int
-            OperandType = operandType; 
+            OperandType = operandType;
             ConstantValueOpt = Optional<object>.None;
         }
     }
@@ -1272,10 +1288,10 @@ namespace Cnidaria.Cs
         public ImmutableArray<BoundExpression> Arguments { get; }
         public BoundObjectCreationExpression(
             SyntaxNode syntax,
-            NamedTypeSymbol type, 
+            NamedTypeSymbol type,
             MethodSymbol? constructorOpt,
-            ImmutableArray<BoundExpression> arguments, 
-            bool hasErrors = false) 
+            ImmutableArray<BoundExpression> arguments,
+            bool hasErrors = false)
             : base(syntax)
         {
             Type = type;

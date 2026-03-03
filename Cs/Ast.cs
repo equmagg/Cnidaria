@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    
+
     internal static class NodeSpan
     {
         public static TextSpan Combine(TextSpan first, TextSpan second)
@@ -229,7 +229,7 @@ namespace Cnidaria.Cs
     public sealed class BaseListSyntax : SyntaxNode
     {
         public SyntaxToken ColonToken { get; }
-        public SeparatedSyntaxList<BaseTypeSyntax> Types { get; } 
+        public SeparatedSyntaxList<BaseTypeSyntax> Types { get; }
 
         public BaseListSyntax(SyntaxToken colonToken, SeparatedSyntaxList<BaseTypeSyntax> types)
             : base(SyntaxKind.BaseList, types.Count > 0
@@ -242,7 +242,7 @@ namespace Cnidaria.Cs
     }
     public sealed class ArrowExpressionClauseSyntax : SyntaxNode
     {
-        public SyntaxToken ArrowToken { get; } 
+        public SyntaxToken ArrowToken { get; }
         public ExpressionSyntax Expression { get; }
 
         public ArrowExpressionClauseSyntax(SyntaxToken arrowToken, ExpressionSyntax expression)
@@ -256,7 +256,7 @@ namespace Cnidaria.Cs
     {
         protected TypeSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
-    
+
     public abstract class NameSyntax : TypeSyntax
     {
         protected NameSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
@@ -300,7 +300,7 @@ namespace Cnidaria.Cs
     public sealed class ExternAliasDirectiveSyntax : SyntaxNode
     {
         public SyntaxToken ExternKeyword { get; }
-        public SyntaxToken AliasKeyword { get; } 
+        public SyntaxToken AliasKeyword { get; }
         public SyntaxToken Identifier { get; }
         public SyntaxToken SemicolonToken { get; }
 
@@ -424,7 +424,18 @@ namespace Cnidaria.Cs
             Right = right;
         }
     }
+    public sealed class ExplicitInterfaceSpecifierSyntax : SyntaxNode
+    {
+        public NameSyntax Name { get; }
+        public SyntaxToken DotToken { get; }
 
+        public ExplicitInterfaceSpecifierSyntax(NameSyntax name, SyntaxToken dotToken)
+            : base(SyntaxKind.ExplicitInterfaceSpecifier, NodeSpan.From(name.Span, dotToken.Span))
+        {
+            Name = name;
+            DotToken = dotToken;
+        }
+    }
     public sealed class PredefinedTypeSyntax : TypeSyntax
     {
         public SyntaxToken Keyword { get; }
@@ -1833,8 +1844,8 @@ namespace Cnidaria.Cs
         public EqualsValueClauseSyntax? EqualsValue { get; }
 
         public EnumMemberDeclarationSyntax(SyntaxList<AttributeListSyntax> attributeLists, SyntaxToken identifier, EqualsValueClauseSyntax? equalsValue)
-            : base(SyntaxKind.EnumMemberDeclaration, 
-                  attributeLists, 
+            : base(SyntaxKind.EnumMemberDeclaration,
+                  attributeLists,
                   NodeSpan.FromNonNull(attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null, identifier.Span, equalsValue?.Span))
         {
             Identifier = identifier;
@@ -1982,6 +1993,7 @@ namespace Cnidaria.Cs
     {
         public SyntaxTokenList Modifiers { get; }
         public TypeSyntax ReturnType { get; }
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
         public SyntaxToken Identifier { get; }
         public TypeParameterListSyntax? TypeParameterList { get; }
         public ParameterListSyntax ParameterList { get; }
@@ -1994,6 +2006,7 @@ namespace Cnidaria.Cs
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             TypeSyntax returnType,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
             SyntaxToken identifier,
             TypeParameterListSyntax? typeParameterList,
             ParameterListSyntax parameterList,
@@ -2008,10 +2021,13 @@ namespace Cnidaria.Cs
                     attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                     modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     returnType.Span,
+                    explicitInterfaceSpecifier?.Span,
+                    identifier.Span,
                     (body != null ? body.Span : (expressionBody != null ? expressionBody.Span : semicolonToken.Span))))
         {
             Modifiers = modifiers;
             ReturnType = returnType;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
             Identifier = identifier;
             TypeParameterList = typeParameterList;
             ParameterList = parameterList;
@@ -2172,9 +2188,9 @@ namespace Cnidaria.Cs
         public SyntaxToken SemicolonToken { get; }
 
         public FieldDeclarationSyntax(
-            SyntaxList<AttributeListSyntax> attributeLists, 
-            SyntaxTokenList modifiers, 
-            VariableDeclarationSyntax declaration, 
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            VariableDeclarationSyntax declaration,
             SyntaxToken semicolonToken)
             : base(
                 SyntaxKind.FieldDeclaration,
@@ -2563,7 +2579,18 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    public sealed class ThrowExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken ThrowKeyword { get; }
+        public ExpressionSyntax Expression { get; }
 
+        public ThrowExpressionSyntax(SyntaxToken throwKeyword, ExpressionSyntax expression)
+            : base(SyntaxKind.ThrowExpression, NodeSpan.From(throwKeyword.Span, expression.Span))
+        {
+            ThrowKeyword = throwKeyword;
+            Expression = expression;
+        }
+    }
     public sealed class PostfixUnaryExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Operand { get; }
@@ -2848,11 +2875,11 @@ namespace Cnidaria.Cs
             SyntaxToken newKeyword,
             ArgumentListSyntax argumentList,
             InitializerExpressionSyntax? initializer)
-            : base (
+            : base(
                   SyntaxKind.ImplicitObjectCreationExpression,
                   NodeSpan.FromNonNull(newKeyword.Span, argumentList.Span, initializer?.Span))
         {
-            NewKeyword = newKeyword; 
+            NewKeyword = newKeyword;
             ArgumentList = argumentList;
             Initializer = initializer;
         }
@@ -2972,6 +2999,7 @@ namespace Cnidaria.Cs
     {
         public SyntaxTokenList Modifiers { get; }
         public TypeSyntax Type { get; }
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
         public SyntaxToken Identifier { get; }
 
         public AccessorListSyntax? AccessorList { get; }
@@ -2983,6 +3011,7 @@ namespace Cnidaria.Cs
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             TypeSyntax type,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
             SyntaxToken identifier,
             AccessorListSyntax? accessorList,
             ArrowExpressionClauseSyntax? expressionBody,
@@ -2995,10 +3024,13 @@ namespace Cnidaria.Cs
                     attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                     modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     type.Span,
+                    explicitInterfaceSpecifier?.Span,
+                    identifier.Span,
                     (semicolonToken.Span.Length != 0 ? semicolonToken.Span : (accessorList?.Span ?? expressionBody?.Span))))
         {
             Modifiers = modifiers;
             Type = type;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
             Identifier = identifier;
             AccessorList = accessorList;
             ExpressionBody = expressionBody;
@@ -3010,6 +3042,7 @@ namespace Cnidaria.Cs
     {
         public SyntaxTokenList Modifiers { get; }
         public TypeSyntax Type { get; }
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
         public SyntaxToken ThisKeyword { get; }
         public BracketedParameterListSyntax ParameterList { get; }
 
@@ -3020,6 +3053,7 @@ namespace Cnidaria.Cs
         SyntaxList<AttributeListSyntax> attributeLists,
         SyntaxTokenList modifiers,
         TypeSyntax type,
+        ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
         SyntaxToken thisKeyword,
         BracketedParameterListSyntax parameterList,
         AccessorListSyntax? accessorList,
@@ -3032,10 +3066,13 @@ namespace Cnidaria.Cs
                 attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                 modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                 type.Span,
+                explicitInterfaceSpecifier?.Span,
+                thisKeyword.Span,
                 (semicolonToken.Span.Length != 0 ? semicolonToken.Span : (accessorList?.Span ?? expressionBody?.Span))))
         {
             Modifiers = modifiers;
             Type = type;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
             ThisKeyword = thisKeyword;
             ParameterList = parameterList;
             AccessorList = accessorList;

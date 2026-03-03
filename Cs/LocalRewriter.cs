@@ -157,6 +157,7 @@ namespace Cnidaria.Cs
                 BoundLabelExpression e => e,
                 BoundSizeOfExpression e => e,
 
+                BoundThrowExpression e => RewriteThrowExpression(e),
                 BoundTupleExpression e => RewriteTupleExpression(e),
                 BoundArrayInitializerExpression e => RewriteArrayInitializerExpression(e),
                 BoundArrayCreationExpression e => RewriteArrayCreationExpression(e),
@@ -422,7 +423,17 @@ namespace Cnidaria.Cs
 
             return node;
         }
-
+        protected virtual BoundExpression RewriteThrowExpression(BoundThrowExpression node)
+        {
+            var ex = RewriteExpression(node.Exception);
+            if (!ReferenceEquals(ex, node.Exception))
+            {
+                var rewritten = new BoundThrowExpression((ThrowExpressionSyntax)node.Syntax, ex);
+                rewritten.SetType(node.Type);
+                return rewritten;
+            }
+            return node;
+        }
         protected virtual BoundExpression RewriteArrayInitializerExpression(BoundArrayInitializerExpression node)
         {
             var elems = RewriteExpressions(node.Elements, out var changed);
@@ -743,6 +754,8 @@ namespace Cnidaria.Cs
             private int _labelId;
             private int _tempId;
             private bool? _checkedContextOverride;
+            private NamespaceSymbol? _systemNsCache;
+            private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
             private IDisposable PushCheckedContext(bool value)
             {
                 var previous = _checkedContextOverride;
@@ -770,13 +783,46 @@ namespace Cnidaria.Cs
                 _compilation = compilation;
                 _method = method;
             }
+            private NamespaceSymbol GetSystemNamespaceOrThrow()
+            {
+                if (_systemNsCache != null) return _systemNsCache;
 
+                var g = _compilation.GlobalNamespace;
+                var nss = g.GetNamespaceMembers();
+                for (int i = 0; i < nss.Length; i++)
+                {
+                    if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                        return _systemNsCache = nss[i];
+                }
+
+                throw new InvalidOperationException("Tuples require namespace 'System' with ValueTuple definitions.");
+            }
             private LabelSymbol GenerateLabel(string debugName)
                 => LabelSymbol.CreateGenerated($"<{debugName}_{_labelId++}>", _method);
 
             private LocalSymbol CreateTempLocal(TypeSymbol type)
                 => new LocalSymbol($"$temp{_tempId++}", _method, type, ImmutableArray<Location>.Empty);
+            private NamedTypeSymbol GetValueTupleDef(int arity)
+            {
+                if (_valueTupleDefCache.TryGetValue(arity, out var t))
+                    return t;
 
+                var sys = GetSystemNamespaceOrThrow();
+                var cands = sys.GetTypeMembers("ValueTuple", arity);
+                if (cands.IsDefaultOrEmpty)
+                    throw new InvalidOperationException($"Tuples require 'System.ValueTuple' with arity {arity}.");
+
+                t = cands[0];
+                _valueTupleDefCache[arity] = t;
+                return t;
+            }
+
+            private TypeSymbol MapTupleElementType(TypeSymbol t)
+            {
+                if (t is TupleTypeSymbol tt)
+                    return GetValueTupleTypeForElements(tt.ElementTypes);
+                return t;
+            }
             private BoundStatement MakeConditionalGoto(SyntaxNode syntax, BoundExpression condition, LabelSymbol target, bool jumpIfTrue)
             {
                 condition = SimplifyConditionForBranch(condition, ref jumpIfTrue);
@@ -839,7 +885,135 @@ namespace Cnidaria.Cs
                 value = default;
                 return false;
             }
+            private NamedTypeSymbol GetValueTupleTypeForElements(ImmutableArray<TypeSymbol> elems)
+            {
+                if (elems.Length == 0)
+                    return GetValueTupleDef(0);
 
+                if (elems.Length <= 7)
+                {
+                    var def = GetValueTupleDef(elems.Length);
+                    var b = ImmutableArray.CreateBuilder<TypeSymbol>(elems.Length);
+                    for (int i = 0; i < elems.Length; i++)
+                        b.Add(MapTupleElementType(elems[i]));
+                    return _compilation.ConstructNamedType(def, b.ToImmutable());
+                }
+                else
+                {
+                    var def8 = GetValueTupleDef(8);
+
+                    var b = ImmutableArray.CreateBuilder<TypeSymbol>(8);
+                    for (int i = 0; i < 7; i++)
+                        b.Add(MapTupleElementType(elems[i]));
+
+                    var restElems = SliceTypes(elems, 7, elems.Length - 7);
+                    var restType = GetValueTupleTypeForElements(restElems);
+                    b.Add(restType);
+
+                    return _compilation.ConstructNamedType(def8, b.ToImmutable());
+                }
+            }
+
+            private static ImmutableArray<TypeSymbol> SliceTypes(ImmutableArray<TypeSymbol> src, int start, int count)
+            {
+                var b = ImmutableArray.CreateBuilder<TypeSymbol>(count);
+                for (int i = 0; i < count; i++)
+                    b.Add(src[start + i]);
+                return b.ToImmutable();
+            }
+
+            private static ImmutableArray<BoundExpression> SliceExprs(ImmutableArray<BoundExpression> src, int start, int count)
+            {
+                var b = ImmutableArray.CreateBuilder<BoundExpression>(count);
+                for (int i = 0; i < count; i++)
+                    b.Add(src[start + i]);
+                return b.ToImmutable();
+            }
+
+            private static MethodSymbol FindCtorOrThrow(NamedTypeSymbol vt, int argCount)
+            {
+                var members = vt.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is MethodSymbol m && m.IsConstructor && !m.IsStatic && m.Parameters.Length == argCount)
+                        return m;
+                }
+                throw new InvalidOperationException($"No suitable ValueTuple ctor found for '{vt.Name}' with {argCount} args.");
+            }
+            private BoundExpression CreateValueTupleValue(
+                SyntaxNode syntax,
+                ImmutableArray<TypeSymbol> tupleElemTypes,
+                ImmutableArray<BoundExpression> values)
+            {
+                if (tupleElemTypes.Length != values.Length)
+                    throw new InvalidOperationException("Tuple element type/value length mismatch.");
+
+                int n = tupleElemTypes.Length;
+
+                // () => default(ValueTuple)
+                if (n == 0)
+                {
+                    var vt0 = GetValueTupleDef(0);
+                    return new BoundObjectCreationExpression(syntax, vt0, constructorOpt: null, ImmutableArray<BoundExpression>.Empty);
+                }
+
+                if (n <= 7)
+                {
+                    var vt = GetValueTupleTypeForElements(tupleElemTypes);
+                    var ctor = FindStructCtorByParamCount(vt, n);
+                    return new BoundObjectCreationExpression(syntax, vt, ctor, values);
+                }
+                else
+                {
+                    // Build Rest recursively
+                    var firstTypes = SliceTypes(tupleElemTypes, 0, 7);
+                    var restTypes = SliceTypes(tupleElemTypes, 7, n - 7);
+
+                    var firstVals = SliceExprs(values, 0, 7);
+                    var restVals = SliceExprs(values, 7, n - 7);
+
+                    var restExpr = CreateValueTupleValue(syntax, restTypes, restVals);
+
+                    var vt8 = GetValueTupleTypeForElements(tupleElemTypes); // ValueTuple`8<...>
+                    var ctor8 = FindStructCtorByParamCount(vt8, 8);
+
+                    var args = ImmutableArray.CreateBuilder<BoundExpression>(8);
+                    args.AddRange(firstVals);
+                    args.Add(restExpr);
+
+                    return new BoundObjectCreationExpression(syntax, vt8, ctor8, args.ToImmutable());
+                }
+            }
+            private BoundExpression ReadValueTupleElement(
+                ExpressionSyntax syntax,
+                BoundExpression receiver,
+                NamedTypeSymbol receiverVtType,
+                TupleTypeSymbol semanticTuple,
+                int elementIndex)
+            {
+                BoundExpression cur = receiver;
+                NamedTypeSymbol curType = receiverVtType;
+
+                int i = elementIndex;
+
+                while (curType.Arity == 8 && i >= 7)
+                {
+                    var restField = GetFieldOrThrow(curType, "Rest");
+                    cur = new BoundMemberAccessExpression(
+                        syntax, cur, restField, restField.Type,
+                        isLValue: (cur.IsLValue || cur is BoundThisExpression));
+                    curType = (NamedTypeSymbol)restField.Type;
+                    i -= 7;
+                }
+
+                string itemName = "Item" + (i + 1).ToString();
+                var itemField = GetFieldOrThrow(curType, itemName);
+
+                var viewType = semanticTuple.ElementTypes[elementIndex];
+                return new BoundMemberAccessExpression(
+                    syntax, cur, itemField, viewType,
+                    isLValue: (cur.IsLValue || cur is BoundThisExpression));
+            }
             private static bool IsNoOpStatement(BoundStatement statement)
             {
                 if (statement is BoundEmptyStatement)
@@ -851,6 +1025,14 @@ namespace Cnidaria.Cs
             {
                 var statements = RewriteStatements(node.Statements, out _);
                 return new BoundBlockStatement(node.Syntax, statements);
+            }
+            protected override BoundExpression RewriteTupleExpression(BoundTupleExpression node)
+            {
+                // Rewrite elements first
+                var elems = RewriteExpressions(node.Elements, out _);
+
+                var tupleType = (TupleTypeSymbol)node.Type;
+                return CreateValueTupleValue(node.Syntax, tupleType.ElementTypes, elems);
             }
             protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
             {
@@ -1112,13 +1294,138 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteConversionExpression(BoundConversionExpression node)
             {
-                var operand = RewriteExpression(node.Operand);
-                var isChecked = GetEffectiveIsChecked(node.IsChecked);
+                var effectiveChecked = GetEffectiveIsChecked(node.IsChecked);
 
-                if (!ReferenceEquals(operand, node.Operand) || isChecked != node.IsChecked)
-                    return new BoundConversionExpression(node.Syntax, node.Type, operand, node.Conversion, isChecked);
+                // Lower tuple conversions
+                if ((node.Conversion.Kind == ConversionKind.ImplicitTuple || node.Conversion.Kind == ConversionKind.ExplicitTuple) &&
+                    node.Type is TupleTypeSymbol toTuple &&
+                    node.Operand.Type is TupleTypeSymbol fromTuple)
+                {
+                    int n = toTuple.ElementTypes.Length;
+                    if (n != fromTuple.ElementTypes.Length)
+                        throw new InvalidOperationException("Tuple conversion arity mismatch.");
+
+                    var exprSyntax = node.Syntax as ExpressionSyntax
+                        ?? node.Operand.Syntax as ExpressionSyntax
+                        ?? throw new InvalidOperationException("Expected ExpressionSyntax for tuple conversion.");
+
+                    // Fast path
+                    if (node.Operand is BoundTupleExpression lit)
+                    {
+                        var converted = ImmutableArray.CreateBuilder<BoundExpression>(n);
+
+                        for (int i = 0; i < n; i++)
+                        {
+                            var src = RewriteExpression(lit.Elements[i]);
+                            var targetType = toTuple.ElementTypes[i];
+
+                            var conv = LocalScopeBinder.ClassifyConversion(src, targetType);
+                            if (!conv.Exists)
+                                throw new InvalidOperationException($"No element conversion for tuple element {i}.");
+
+                            BoundExpression e = conv.Kind == ConversionKind.Identity
+                                ? src
+                                : new BoundConversionExpression(exprSyntax, targetType, src, conv, effectiveChecked);
+
+                            // allow nested tuple conversions to lower
+                            e = RewriteExpression(e);
+                            converted.Add(e);
+                        }
+
+                        return CreateValueTupleValue(node.Syntax, toTuple.ElementTypes, converted.ToImmutable());
+                    }
+
+                    // General path
+                    var operandLowered = RewriteExpression(node.Operand);
+
+                    var srcVtType = GetValueTupleTypeForElements(fromTuple.ElementTypes);
+                    var tmp = CreateTempLocal(srcVtType);
+                    var tmpExpr = new BoundLocalExpression(exprSyntax, tmp);
+
+                    var assign = new BoundAssignmentExpression(exprSyntax, tmpExpr, operandLowered);
+                    var side = new BoundExpressionStatement(exprSyntax, assign);
+
+                    var converted2 = ImmutableArray.CreateBuilder<BoundExpression>(n);
+
+                    for (int i = 0; i < n; i++)
+                    {
+                        var read = ReadValueTupleElement(exprSyntax, tmpExpr, srcVtType, fromTuple, i);
+                        var targetType = toTuple.ElementTypes[i];
+
+                        var conv = LocalScopeBinder.ClassifyConversion(read, targetType);
+                        if (!conv.Exists)
+                            throw new InvalidOperationException($"No element conversion for tuple element {i}.");
+
+                        BoundExpression e = conv.Kind == ConversionKind.Identity
+                            ? read
+                            : new BoundConversionExpression(exprSyntax, targetType, read, conv, effectiveChecked);
+
+                        e = RewriteExpression(e);
+                        converted2.Add(e);
+                    }
+
+                    var value = CreateValueTupleValue(node.Syntax, toTuple.ElementTypes, converted2.ToImmutable());
+
+                    return new BoundSequenceExpression(
+                        syntax: exprSyntax,
+                        locals: ImmutableArray.Create(tmp),
+                        sideEffects: ImmutableArray.Create<BoundStatement>(side),
+                        value: value);
+                }
+
+                // default behavior
+                var operand = RewriteExpression(node.Operand);
+                if (!ReferenceEquals(operand, node.Operand) || effectiveChecked != node.IsChecked)
+                    return new BoundConversionExpression(node.Syntax, node.Type, operand, node.Conversion, effectiveChecked);
 
                 return node;
+            }
+            private static MethodSymbol? FindStructCtorByParamCount(NamedTypeSymbol type, int paramCount)
+            {
+                if (paramCount == 0)
+                    return null;
+
+                var members = type.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is MethodSymbol m &&
+                        m.IsConstructor &&
+                        !m.IsStatic &&
+                        m.Parameters.Length == paramCount)
+                    {
+                        return m;
+                    }
+                }
+                throw new InvalidOperationException($"No ctor found for '{type.Name}' with {paramCount} parameters.");
+            }
+            private static FieldSymbol GetFieldOrThrow(NamedTypeSymbol type, string fieldName)
+            {
+                var members = type.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is FieldSymbol f && string.Equals(f.Name, fieldName, StringComparison.Ordinal))
+                        return f;
+                }
+                throw new InvalidOperationException($"Field '{fieldName}' not found in '{type.Name}'.");
+            }
+            private BoundExpression MakeFieldAccess(
+                ExpressionSyntax syntax,
+                BoundExpression receiver,
+                NamedTypeSymbol receiverType,
+                string fieldName,
+                bool isLValue,
+                TypeSymbol? viewTypeOverride = null)
+            {
+                var members = receiverType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is FieldSymbol f && string.Equals(f.Name, fieldName, StringComparison.Ordinal))
+                    {
+                        var viewType = viewTypeOverride ?? f.Type;
+                        return new BoundMemberAccessExpression(syntax, receiver, f, viewType, isLValue);
+                    }
+                }
+                throw new InvalidOperationException($"Field '{fieldName}' not found in '{receiverType.Name}'.");
             }
             protected override BoundStatement RewriteExpressionStatement(BoundExpressionStatement node)
             {
@@ -1405,6 +1712,20 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteMemberAccessExpression(BoundMemberAccessExpression node)
             {
+                // Tuple element access
+                if (node.Member is TupleElementFieldSymbol tef &&
+                    node.ReceiverOpt is not null &&
+                    node.ReceiverOpt.Type is TupleTypeSymbol tuple)
+                {
+                    var exprSyntax = node.Syntax as ExpressionSyntax
+                        ?? node.ReceiverOpt.Syntax as ExpressionSyntax
+                        ?? throw new InvalidOperationException("Expected ExpressionSyntax for tuple member access.");
+
+                    var receiver = RewriteExpression(node.ReceiverOpt);
+                    var vtType = GetValueTupleTypeForElements(tuple.ElementTypes);
+                    return ReadValueTupleElement(exprSyntax, receiver, vtType, tuple, tef.ElementIndex);
+                }
+
                 // Auto property
                 if (node.Member is PropertySymbol prop && TryGetAutoPropertyBackingField(prop, out var backingField))
                 {
@@ -2315,7 +2636,7 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
 
-                
+
                 SpillIndexerReceiverAndArguments(
                     node.Syntax,
                     left.Receiver,

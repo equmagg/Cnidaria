@@ -8,7 +8,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    
+
     [Flags]
     internal enum NumericConvFlags : byte
     {
@@ -26,7 +26,7 @@ namespace Cnidaria.Cs
         U4,
         I8,
     }
-    internal enum BytecodeOp : byte
+    public enum BytecodeOp : byte
     {
         Nop,
         // Stack / constants
@@ -139,7 +139,7 @@ namespace Cnidaria.Cs
         NativeInt,
         NativeUInt
     }
-    internal readonly struct Instruction
+    public readonly struct Instruction
     {
         public readonly BytecodeOp Op;
         public readonly int Operand0;
@@ -166,7 +166,7 @@ namespace Cnidaria.Cs
         public BcLabel(int id) => Id = id;
         public override string ToString() => $"L{Id}";
     }
-    internal readonly struct ExceptionHandler
+    public readonly struct ExceptionHandler
     {
         public readonly int TryStartPc;
         public readonly int TryEndPc;
@@ -184,6 +184,87 @@ namespace Cnidaria.Cs
     }
     internal sealed class BytecodeBuilder
     {
+        public static int FindEntryPointMethodDef(RuntimeModule module)
+        {
+            if (TryFindEntryByName(module, "<Main>$", out var tok))
+                return tok;
+
+            if (TryFindStaticMain(module, out tok))
+                return tok;
+
+            throw new InvalidOperationException("Entry point not found in module metadata.");
+        }
+
+        private static bool TryFindEntryByName(RuntimeModule m, string name, out int methodDefToken)
+        {
+            var md = m.Md;
+            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
+            {
+                var row = md.GetMethodDef(rid);
+                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), name))
+                    continue;
+
+                methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
+                return true;
+            }
+
+            methodDefToken = 0;
+            return false;
+        }
+
+        private static bool TryFindStaticMain(RuntimeModule m, out int methodDefToken)
+        {
+            var md = m.Md;
+
+            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
+            {
+                var row = md.GetMethodDef(rid);
+                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), "Main"))
+                    continue;
+
+                if (!IsStaticMainStringArraySignature(md.GetBlob(row.Signature)))
+                    continue;
+
+                methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
+                return true;
+            }
+
+            methodDefToken = 0;
+            return false;
+        }
+
+        private static bool IsStaticMainStringArraySignature(ReadOnlySpan<byte> sig)
+        {
+            var r = new SigReader(sig);
+            byte cc = r.ReadByte();
+
+            // Must be static (no HASTHIS)
+            if ((cc & 0x20) != 0)
+                return false;
+
+            // Reject generic mains
+            if ((cc & 0x10) != 0)
+            {
+                r.ReadCompressedUInt(); // generic arity
+                return false;
+            }
+
+            uint paramCount = r.ReadCompressedUInt();
+            if (paramCount != 1)
+                return false;
+
+            // ret: void
+            if ((SigElementType)r.ReadByte() != SigElementType.VOID)
+                return false;
+
+            // arg0: string[]
+            if ((SigElementType)r.ReadByte() != SigElementType.SZARRAY)
+                return false;
+            if ((SigElementType)r.ReadByte() != SigElementType.STRING)
+                return false;
+
+            return true;
+        }
         private readonly List<Instruction> _insns = new();
         private readonly List<int> _labelToPc = new();
         private readonly List<(int pc, BcLabel label)> _fixups = new();
@@ -253,7 +334,7 @@ namespace Cnidaria.Cs
             return baked.ToImmutableArray();
         }
     }
-    internal sealed class BytecodeFunction
+    public sealed class BytecodeFunction
     {
         public int MethodToken { get; }
         public ImmutableArray<int> LocalTypeTokens { get; }
@@ -261,9 +342,9 @@ namespace Cnidaria.Cs
         public ImmutableArray<ExceptionHandler> ExceptionHandlers { get; }
         public int MaxStack { get; }
 
-        public BytecodeFunction(int methodToken, 
-            ImmutableArray<int> localTypeTokens, 
-            ImmutableArray<Instruction> instructions, 
+        public BytecodeFunction(int methodToken,
+            ImmutableArray<int> localTypeTokens,
+            ImmutableArray<Instruction> instructions,
             int maxStack,
             ImmutableArray<ExceptionHandler> exceptionHandlers)
         {
@@ -866,6 +947,11 @@ namespace Cnidaria.Cs
                         EmitConversion(conv, mode);
                         return;
 
+                    case BoundThrowExpression tex:
+                        EmitExpression(tex.Exception, EmitMode.Value);
+                        _il.Emit(BytecodeOp.Throw, pop: 1, push: 0);
+                        return;
+
                     case BoundAsExpression @as:
                         EmitAs(@as, mode);
                         return;
@@ -1227,7 +1313,7 @@ namespace Cnidaria.Cs
 
                 EmitBinaryOperator(bin);
             }
-            
+
             private void EmitBinaryOperator(BoundBinaryExpression bin)
             {
                 var op = bin.OperatorKind;
@@ -1377,9 +1463,6 @@ namespace Cnidaria.Cs
 
                 // Both operands satisfied condition
                 _il.Emit(BytecodeOp.Ldc_I4, operand0: bin.OperatorKind == BoundBinaryOperatorKind.LogicalAnd ? 1 : 0, pop: 0, push: 1);
-
-                if (bin.OperatorKind == BoundBinaryOperatorKind.LogicalOr)
-                    _il.Emit(BytecodeOp.Not, pop: 1, push: 1);
 
                 _il.EmitBranch(BytecodeOp.Br, lEnd, pop: 0);
 
@@ -1704,7 +1787,7 @@ namespace Cnidaria.Cs
                             EmitExpression(recv, EmitMode.Value);
                         }
                     }
-                    
+
                 }
 
                 var args = call.Arguments;
@@ -1844,7 +1927,7 @@ namespace Cnidaria.Cs
                         ps[0].Type is ByRefTypeSymbol && ps[1].Type is ByRefTypeSymbol)
                     {
                         EmitExpression(call.Arguments[0], EmitMode.Value);
-                        EmitExpression(call.Arguments[1], EmitMode.Value); 
+                        EmitExpression(call.Arguments[1], EmitMode.Value);
                         _il.Emit(BytecodeOp.Ceq, pop: 2, push: 1);
                         if (mode == EmitMode.Discard)
                             _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
@@ -2399,5 +2482,5 @@ namespace Cnidaria.Cs
             }
         }
     }
-    
+
 }
