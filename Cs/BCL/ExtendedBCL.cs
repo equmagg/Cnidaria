@@ -249,6 +249,26 @@ namespace System.Collections.Generic
             // Delegate rest of error checking to Array.Copy.
             Array.Copy(_items, 0, array, arrayIndex, _size);
         }
+
+        // Clears the contents of List.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Clear()
+        {
+            _version++;
+            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                int size = _size;
+                _size = 0;
+                if (size > 0)
+                {
+                    Array.Clear(_items, 0, size); // Clear the elements so that the gc can reclaim the references.
+                }
+            }
+            else
+            {
+                _size = 0;
+            }
+        }
     }
 }
 namespace System.Numerics

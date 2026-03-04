@@ -32,6 +32,10 @@
     }
     public class Array
     {
+        private static class EmptyArray<T>
+        {
+            internal static readonly T[] Value = new T[0];
+        }
         public static int MaxLength => 0X7FFFFFC7;
         public int Length
         {
@@ -42,6 +46,80 @@
         public System.Collections.IEnumerator GetEnumerator()
         {
             return null;
+        }
+
+        public static T[] Empty<T>()
+        {
+            return new T[0];//return EmptyArray<T>.Value;
+        }
+
+        public static void Clear(Array array)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            Clear(array, 0, array.Length);
+        }
+
+        public static void Clear(Array array, int index, int length)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("index");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+
+            int alen = array.Length;
+            if (alen - index < length) throw new IndexOutOfRangeException();
+            if (length == 0) return;
+
+            ClearInternal(array, index, length);
+        }
+
+        [RuntimeIntrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ClearInternal(Array array, int index, int length)
+        {
+            // handled in runtime
+        }
+
+        public static void Fill<T>(T[] array, T value)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            Fill<T>(array, value, 0, array.Length);
+        }
+        public static void Fill<T>(T[] array, T value, int startIndex, int count)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+
+            int len = array.Length;
+            if ((uint)startIndex > (uint)len) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > len - count) throw new ArgumentOutOfRangeException("count");
+            if (count == 0) return;
+
+            ref T r0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference<T>(array);
+            ref T dst = ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref r0, startIndex);
+
+            for (int i = 0; i < count; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<T>(ref dst, i) = value;
+        }
+        public static void Resize<T>([NotNull] ref T[] array, int newSize)
+        {
+            if (newSize < 0)
+                throw new ArgumentOutOfRangeException();
+
+            T[] larray = array; // local copy
+            if (larray == null)
+            {
+                array = new T[newSize];
+                return;
+            }
+
+            if (larray.Length != newSize)
+            {
+                T[] newArray = new T[newSize];
+                Buffer.Memmove<T>(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference<T>(newArray),
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference<T>(larray),
+                    (uint)Math.Min(newSize, larray.Length));
+                array = newArray;
+            }
         }
 
         public static void Copy(Array sourceArray, Array destinationArray, long length)
@@ -95,17 +173,34 @@
 
             if (length == 0) return;
 
-            if (!_CopyImpl(sourceArray, sourceIndex, destinationArray, destinationIndex, length))
+            if (!CopyInternal(sourceArray, sourceIndex, destinationArray, destinationIndex, length))
                 throw new ArrayTypeMismatchException();
         }
         [RuntimeIntrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static bool _CopyImpl(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
+        private static bool CopyInternal(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
             => false;
     }
     public abstract unsafe class Delegate
     {
 
+    }
+
+    public enum StringComparison
+    {
+        CurrentCulture = 0,
+        CurrentCultureIgnoreCase = 1,
+        InvariantCulture = 2,
+        InvariantCultureIgnoreCase = 3,
+        Ordinal = 4,
+        OrdinalIgnoreCase = 5,
+    }
+    [Flags]
+    public enum StringSplitOptions
+    {
+        None = 0,
+        RemoveEmptyEntries = 1,
+        TrimEntries = 2
     }
     public sealed class String
     {
@@ -307,6 +402,105 @@
 
             return -1;
         }
+
+        public int LastIndexOf(char value)
+        {
+            int n = Length;
+            if (n == 0) return -1;
+
+            ref char src = ref GetPinnableReference();
+            for (int i = n - 1; i >= 0; i--)
+                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
+                    return i;
+
+            return -1;
+        }
+
+        public int LastIndexOf(char value, int startIndex) => LastIndexOf(value, startIndex, startIndex + 1);
+
+        public int LastIndexOf(char value, int startIndex, int count)
+        {
+            int len = Length;
+            if (len == 0) return -1;
+
+            if ((uint)startIndex >= (uint)len) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if ((uint)count > (uint)startIndex + 1u) throw new ArgumentOutOfRangeException("count");
+
+            int startSearchAt = startIndex + 1 - count;
+
+            ref char src = ref GetPinnableReference();
+            for (int i = startIndex; i >= startSearchAt; i--)
+                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
+                    return i;
+
+            return -1;
+        }
+
+        public int LastIndexOf(string value) => LastIndexOf(value, Length - 1, Length);
+
+        public int LastIndexOf(string value, int startIndex) => LastIndexOf(value, startIndex, startIndex + 1);
+
+        public int LastIndexOf(string value, int startIndex, int count)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+
+            int thisLen = Length;
+            int valueLen = value.Length;
+
+            if (valueLen == 0)
+            {
+                if (thisLen == 0)
+                {
+                    if (startIndex < -1 || startIndex > 0) throw new ArgumentOutOfRangeException("startIndex");
+                    if (count < 0) throw new ArgumentOutOfRangeException("count");
+                    if (count > 1) throw new ArgumentOutOfRangeException("count");
+                    return 0;
+                }
+
+                if (count < 0) throw new ArgumentOutOfRangeException("count");
+                if (startIndex < 0 || startIndex > thisLen) throw new ArgumentOutOfRangeException("startIndex");
+
+                if (startIndex == thisLen) startIndex = thisLen - 1;
+                if (count > startIndex + 1) throw new ArgumentOutOfRangeException("count");
+
+                return startIndex + 1;
+            }
+
+            if (thisLen == 0) return -1;
+
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if (startIndex < 0 || startIndex > thisLen) throw new ArgumentOutOfRangeException("startIndex");
+            if (startIndex == thisLen) startIndex = thisLen - 1;
+            if (count > startIndex + 1) throw new ArgumentOutOfRangeException("count");
+
+            int searchStart = startIndex + 1 - count;
+
+            if (valueLen > count) return -1;
+
+            ref char a = ref GetPinnableReference();
+            ref char b = ref value.GetPinnableReference();
+
+            int last = startIndex - valueLen + 1;
+            for (int i = last; i >= searchStart; i--)
+            {
+                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i) !=
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, 0))
+                    continue;
+
+                int j = 1;
+                for (; j < valueLen; j++)
+                {
+                    if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i + j) !=
+                        System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, j))
+                        break;
+                }
+                if (j == valueLen) return i;
+            }
+
+            return -1;
+        }
+
         public bool StartsWith(string value)
         {
             if ((object)value == null) throw new ArgumentNullException("value");
@@ -654,6 +848,70 @@
             return dstStr;
         }
 
+        private static void CheckStringSplitOptions(StringSplitOptions options)
+        {
+            const StringSplitOptions All =
+                StringSplitOptions.None |
+                StringSplitOptions.RemoveEmptyEntries |
+                StringSplitOptions.TrimEntries;
+
+            if ((options & ~All) != 0)
+                throw new ArgumentException("options");
+        }
+        private string[] CreateSplitArrayOfThisAsSoleValue(StringSplitOptions options, int count)
+        {
+            if (count != 0)
+            {
+                string candidate = this;
+
+                if ((options & StringSplitOptions.TrimEntries) != 0)
+                {
+                    candidate = candidate.Trim();
+                }
+
+                if ((options & StringSplitOptions.RemoveEmptyEntries) == 0 || candidate.Length != 0)
+                {
+                    return new string[] { candidate };
+                }
+            }
+
+            return Array.Empty<string>();
+        }
+        // This function will not trim entries or special-case empty entries
+        private string[] SplitWithoutPostProcessing(ReadOnlySpan<int> sepList, ReadOnlySpan<int> lengthList, int defaultLength, int count)
+        {
+            int currIndex = 0;
+            int arrIndex = 0;
+
+            count--;
+            int numActualReplaces = (sepList.Length < count) ? sepList.Length : count;
+
+            // Allocate space for the new array.
+            // +1 for the string from the end of the last replace to the end of the string.
+            string[] splitStrings = new string[numActualReplaces + 1];
+
+            for (int i = 0; i < numActualReplaces && currIndex < Length; i++)
+            {
+                splitStrings[arrIndex++] = Substring(currIndex, sepList[i] - currIndex);
+                currIndex = sepList[i] + (lengthList.IsEmpty ? defaultLength : lengthList[i]);
+            }
+
+            // Handle the last string at the end of the array if there is one.
+            if (currIndex < Length && numActualReplaces >= 0)
+            {
+                splitStrings[arrIndex] = Substring(currIndex);
+            }
+            else if (arrIndex == numActualReplaces)
+            {
+                // We had a separator character at the end of a string.  Rather than just allowing
+                // a null character, we'll replace the last element in the array with an empty string.
+                splitStrings[arrIndex] = Empty;
+            }
+
+            return splitStrings;
+        }
+
+
         public string TrimStart()
         {
             int len = Length;
@@ -696,6 +954,51 @@
             return Substring(start, end - start + 1);
         }
 
+        public string PadLeft(int totalWidth) => PadLeft(totalWidth, ' ');
+        public string PadLeft(int totalWidth, char paddingChar)
+        {
+            if (totalWidth < 0) throw new ArgumentOutOfRangeException("totalWidth");
+
+            int oldLength = Length;
+            int padCount = totalWidth - oldLength;
+            if (padCount <= 0) return this;
+
+            string result = FastAllocateString(totalWidth);
+            ref char dst = ref result.GetRawStringData();
+
+            for (int i = 0; i < padCount; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = paddingChar;
+
+            ref char src = ref GetPinnableReference();
+            for (int i = 0; i < oldLength; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, padCount + i) =
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
+
+            return result;
+        }
+
+        public string PadRight(int totalWidth) => PadRight(totalWidth, ' ');
+        public string PadRight(int totalWidth, char paddingChar)
+        {
+            if (totalWidth < 0) throw new ArgumentOutOfRangeException("totalWidth");
+
+            int oldLength = Length;
+            int padCount = totalWidth - oldLength;
+            if (padCount <= 0) return this;
+
+            string result = FastAllocateString(totalWidth);
+            ref char dst = ref result.GetRawStringData();
+
+            ref char src = ref GetPinnableReference();
+            for (int i = 0; i < oldLength; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
+
+            for (int i = 0; i < padCount; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, oldLength + i) = paddingChar;
+
+            return result;
+        }
         public bool Contains(char value) => IndexOf(value) >= 0;
 
         public bool Contains(string value)
@@ -1041,6 +1344,10 @@
         {
             return System.Number.DoubleToString(m_value);
         }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNaN(double d) => d != d;
     }
     public struct Decimal
     {
@@ -2112,6 +2419,20 @@
         object GetFormat(Type formatType);
     }
     // math
+    public enum MidpointRounding
+    {
+        ToEven = 0,
+        AwayFromZero = 1,
+        ToZero = 2,
+        ToNegativeInfinity = 3,
+        ToPositiveInfinity = 4
+    }
+    public static class BitConverter
+    {
+        public static readonly bool IsLittleEndian = true;
+
+        public static byte[] GetBytes(bool value) => new byte[] { (value ? (byte)1 : (byte)0) };
+    }
     public static class Math
     {
         public const double E = 2.7182818284590452354;
@@ -2120,6 +2441,196 @@
 
         private const int maxRoundingDigits = 15;
         private const double doubleRoundLimit = 1e16d;
+
+        private static ReadOnlySpan<double> RoundPower10Double => new double[]
+        {
+            1E0, 1E1, 1E2, 1E3, 1E4, 1E5, 1E6, 1E7, 1E8,
+            1E9, 1E10, 1E11, 1E12, 1E13, 1E14, 1E15
+        };
+
+        private const double SCALEB_C1 = 8.98846567431158E+307; // 0x1p1023
+
+        private const double SCALEB_C2 = 2.2250738585072014E-308; // 0x1p-1022
+
+        private const double SCALEB_C3 = 9007199254740992; // 0x1p53
+
+        private const double Ln2 = 0.693147180559945309417232121458176568;
+        private const double Ln10 = 2.302585092994045684017991454684364208;
+        private const double Log2E = 1.442695040888963407359924681001892137; // 1/ln2
+
+        internal static void ThrowNegateTwosCompOverflow()
+        {
+            throw new OverflowException();
+        }
+
+        public static byte Min(byte val1, byte val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static short Min(short val1, short val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static int Min(int val1, int val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static long Min(long val1, long val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static nint Min(nint val1, nint val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static sbyte Min(sbyte val1, sbyte val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static ushort Min(ushort val1, ushort val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static uint Min(uint val1, uint val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static ulong Min(ulong val1, ulong val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static nuint Min(nuint val1, nuint val2)
+        {
+            return (val1 <= val2) ? val1 : val2;
+        }
+
+        public static byte Max(byte val1, byte val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+        public static short Max(short val1, short val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static int Max(int val1, int val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static long Max(long val1, long val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static nint Max(nint val1, nint val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static sbyte Max(sbyte val1, sbyte val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static ushort Max(ushort val1, ushort val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static uint Max(uint val1, uint val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static ulong Max(ulong val1, ulong val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        public static nuint Max(nuint val1, nuint val2)
+        {
+            return (val1 >= val2) ? val1 : val2;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static short Abs(short value)
+        {
+            if (value < 0)
+            {
+                value = (short)-value;
+                if (value < 0)
+                {
+                    ThrowNegateTwosCompOverflow();
+                }
+            }
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Abs(int value)
+        {
+            if (value < 0)
+            {
+                value = -value;
+                if (value < 0)
+                {
+                    ThrowNegateTwosCompOverflow();
+                }
+            }
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long Abs(long value)
+        {
+            if (value < 0)
+            {
+                value = -value;
+                if (value < 0)
+                {
+                    ThrowNegateTwosCompOverflow();
+                }
+            }
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static nint Abs(nint value)
+        {
+            if (value < 0)
+            {
+                value = -value;
+                if (value < 0)
+                {
+                    ThrowNegateTwosCompOverflow();
+                }
+            }
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static sbyte Abs(sbyte value)
+        {
+            if (value < 0)
+            {
+                value = (sbyte)-value;
+                if (value < 0)
+                {
+                    ThrowNegateTwosCompOverflow();
+                }
+            }
+            return value;
+        }
     }
 
     // delegates
@@ -2490,19 +3001,6 @@
     {
 
     }
-    public enum MethodImplOptions
-    {
-        Unmanaged = 0x0004,
-        NoInlining = 0x0008,
-        ForwardRef = 0x0010,
-        Synchronized = 0x0020,
-        NoOptimization = 0x0040,
-        PreserveSig = 0x0080,
-        AggressiveInlining = 0x0100,
-        AggressiveOptimization = 0x0200,
-        Async = 0x2000,
-        InternalCall = 0x1000
-    }
 
     public enum AttributeTargets
     {
@@ -2841,30 +3339,17 @@
 
         public bool Inherited { get; set; }
     }
-    [System.AttributeUsage(System.AttributeTargets.Parameter, Inherited = false)]
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
     public sealed class AllowNullAttribute : Attribute
     {
         public AllowNullAttribute()
         { }
     }
-    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
-    public sealed class MethodImplAttribute : Attribute
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    public sealed class NotNullAttribute : Attribute
     {
-        public MethodImplAttribute(MethodImplOptions methodImplOptions)
-        {
-            Value = methodImplOptions;
-        }
-
-        public MethodImplAttribute(short value)
-        {
-            Value = (MethodImplOptions)value;
-        }
-
-        public MethodImplAttribute()
-        {
-        }
-
-        public MethodImplOptions Value { get; }
+        public NotNullAttribute()
+        { }
     }
     [AttributeUsage(AttributeTargets.Enum, Inherited = false)]
     public class FlagsAttribute : Attribute
@@ -2988,80 +3473,7 @@
         public static void Write(float value) { Write((double)value); }
         public static unsafe void Write(double value)
         {
-            char* buffer = stackalloc char[64];
-            char* p = buffer;
-            // Handle NaN
-            if (value != value)
-            {
-                char* nan = stackalloc char[] { 'N', 'a', 'N', '\0' };
-                _Write(nan);
-                return;
-            }
-            // Handle Infinity
-            if (value == ((double)1.0 / (double)(0.0)))
-            {
-                char* inf = stackalloc char[] { 'I', 'n', 'f', 'i', 'n', 'i', 't', 'y', '\0' };
-                _Write(inf);
-                return;
-            }
-            if (value == ((double)-1.0 / (double)(0.0)))
-            {
-                char* inf = stackalloc char[] { '-', 'I', 'n', 'f', 'i', 'n', 'i', 't', 'y', '\0' };
-                _Write(inf);
-                return;
-            }
-
-            // Sign
-            if (value < 0)
-            {
-                *p++ = '-';
-                value = -value;
-            }
-
-            // Integer part
-            long integer = (long)value;
-            double frac = value - integer;
-
-            // Convert integer part
-            char* intBuf = stackalloc char[21];
-            char* end = intBuf + 20;
-            char* ip = end;
-            *ip = '\0';
-
-            if (integer == 0)
-            {
-                *--ip = '0';
-            }
-            else
-            {
-                while (integer != 0)
-                {
-                    long digit = integer % 10;
-                    integer /= 10;
-                    *--ip = (char)('0' + digit);
-                }
-            }
-
-            // Copy integer part
-            while (*ip != '\0')
-                *p++ = *ip++;
-
-            // Fractional part
-            const int precision = 6; // fixed precision
-            if (precision > 0)
-            {
-                *p++ = '.';
-                for (int i = 0; i < precision; i++)
-                {
-                    frac *= 10;
-                    int digit = (int)frac;
-                    *p++ = (char)('0' + digit);
-                    frac -= digit;
-                }
-            }
-            *p = '\0';
-
-            _Write(buffer);
+            _Write(value.ToString());
         }
         public static unsafe void Write(char value) { char* str = stackalloc char[] { value, '\0' }; _Write(str); }
         public static unsafe void Write(bool value)
@@ -3115,6 +3527,45 @@
         private static void _Write(Span<char> value) { }
     }
 
+    public unsafe class Buffer
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal static void Memmove<T>(ref T dest, ref T src, nuint len)
+        {
+            if (len == (nuint)0)
+                return;
+
+            if (System.Runtime.CompilerServices.Unsafe.AreSame<T>(ref dest, ref src))
+                return;
+
+            int n = (int)len;
+            if ((nuint)n != len)
+                throw new ArgumentOutOfRangeException("len");
+
+            nuint elemSize = (nuint)System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+            nuint byteLen = elemSize * len;
+
+            nint byteOffset = System.Runtime.CompilerServices.Unsafe.ByteOffset<T>(ref src, ref dest); // dest - src
+            bool copyBackwards = (byteOffset > 0) && ((nuint)byteOffset < byteLen);
+
+            if (!copyBackwards)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    System.Runtime.CompilerServices.Unsafe.Add<T>(ref dest, i) =
+                        System.Runtime.CompilerServices.Unsafe.Add<T>(ref src, i);
+                }
+            }
+            else
+            {
+                for (int i = n - 1; i >= 0; i--)
+                {
+                    System.Runtime.CompilerServices.Unsafe.Add<T>(ref dest, i) =
+                        System.Runtime.CompilerServices.Unsafe.Add<T>(ref src, i);
+                }
+            }
+        }
+    }
 }
 namespace System.Runtime.InteropServices
 {
@@ -3141,11 +3592,62 @@ namespace System.Runtime.CompilerServices
 {
     public static class RuntimeHelpers
     {
-
+        [RuntimeIntrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static bool IsReferenceOrContainsReferences<T>() where T : allows ref struct => IsReferenceOrContainsReferences<T>();
     }
+    public enum MethodImplOptions
+    {
+        Unmanaged = 0x0004,
+        NoInlining = 0x0008,
+        ForwardRef = 0x0010,
+        Synchronized = 0x0020,
+        NoOptimization = 0x0040,
+        PreserveSig = 0x0080,
+        AggressiveInlining = 0x0100,
+        AggressiveOptimization = 0x0200,
+        Async = 0x2000,
+        InternalCall = 0x1000
+    }
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
+    public sealed class MethodImplAttribute : Attribute
+    {
+        public MethodImplAttribute(MethodImplOptions methodImplOptions)
+        {
+            Value = methodImplOptions;
+        }
 
+        public MethodImplAttribute(short value)
+        {
+            Value = (MethodImplOptions)value;
+        }
+
+        public MethodImplAttribute()
+        {
+        }
+
+        public MethodImplOptions Value { get; }
+    }
     public static unsafe class Unsafe
     {
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static T As<T>(object o) where T : class?
+        {
+            throw new PlatformNotSupportedException();
+            // ldarg.0
+            // ret
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static ref TTo As<TFrom, TTo>(ref TFrom source)
+            where TFrom : allows ref struct
+            where TTo : allows ref struct
+        {
+            throw new PlatformNotSupportedException();
+            // ldarg.0
+            // ret
+        }
         [Intrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static unsafe ref T AsRef<T>(void* source)
@@ -3224,6 +3726,20 @@ namespace System.Runtime.CompilerServices
             // add
             // ret
             return ref source;
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static nint ByteOffset<T>(ref T origin, ref T target)
+            where T : allows ref struct
+        {
+            return 0;
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static int SizeOf<T>()
+            where T : allows ref struct
+        {
+            return 0;
         }
         [Intrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]

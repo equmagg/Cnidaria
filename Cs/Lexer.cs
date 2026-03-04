@@ -32,6 +32,11 @@ namespace Cnidaria.Cs
         public static bool operator ==(TextSpan left, TextSpan right) => left.Start == right.Start && left.Length == right.Length;
         public static bool operator !=(TextSpan left, TextSpan right) => !(left == right);
         public override string ToString() => $"[{Start}..{End})";
+        public string ToString(string souce)
+        {
+            var res = GetLineAndColumn(souce, Start);
+            return $"[{res.line}, {res.column}]";
+        }
         public override bool Equals(object? obj)
         {
             return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length;
@@ -39,6 +44,43 @@ namespace Cnidaria.Cs
         public override int GetHashCode()
         {
             return HashCode.Combine(Start, Length);
+        }
+
+        public static (int line, int column) GetLineAndColumn(string text, int index)
+        {
+            if (text == null)
+                throw new ArgumentNullException(nameof(text));
+
+            if ((uint)index > (uint)text.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+
+            int line = 1;
+            int column = 1;
+
+            for (int i = 0; i < index; i++)
+            {
+                char c = text[i];
+
+                if (c == '\n')
+                {
+                    line++;
+                    column = 1;
+                }
+                else if (c == '\r')
+                {
+                    line++;
+                    column = 1;
+
+                    if (i + 1 < index && text[i + 1] == '\n')
+                        i++;
+                }
+                else
+                {
+                    column++;
+                }
+            }
+
+            return (line, column);
         }
     }
     public readonly struct SyntaxDiagnostic : IDiagnostic
@@ -52,8 +94,39 @@ namespace Cnidaria.Cs
             Message = message;
         }
         public override string ToString() => $"{Position}: {Message}";
+        public string ToString(string source) => $"{GetLineNumber(source, Position)}: {Message}";
         public string GetMessage() => $"Parser error: {this.ToString()}";
+        public string GetMessage(string source) => $"Parser error: {this.ToString(source)}";
         public DiagnosticSeverity GetSeverity() => DiagnosticSeverity.Error;
+        public static int GetLineNumber(string text, int index)
+        {
+            if (text == null)
+                throw new ArgumentNullException(nameof(text));
+
+            if ((uint)index > (uint)text.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+
+            int line = 1;
+
+            for (int i = 0; i < index; i++)
+            {
+                char c = text[i];
+
+                if (c == '\n')
+                {
+                    line++;
+                }
+                else if (c == '\r')
+                {
+                    line++;
+
+                    if (i + 1 < index && text[i + 1] == '\n')
+                        i++;
+                }
+            }
+
+            return line;
+        }
     }
     public readonly struct SyntaxTrivia
     {

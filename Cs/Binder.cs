@@ -5310,6 +5310,41 @@ namespace Cnidaria.Cs
             value = false;
             return false;
         }
+        private static bool IsTrueErrorType(TypeSymbol type)
+        {
+            if (type is not NamedTypeSymbol nt)
+                return false;
+
+            if (nt.TypeKind != TypeKind.Error)
+                return false;
+
+            return !string.Equals(nt.Name, "<unbound>", StringComparison.Ordinal);
+        }
+
+        private static bool ShouldSuppressCascade(BoundExpression expr)
+            => expr.HasErrors || IsTrueErrorType(expr.Type);
+
+        private static BoundExpression CreateErrorConversion(ExpressionSyntax exprSyntax, BoundExpression expr, TypeSymbol targetType)
+        {
+            if (ReferenceEquals(expr.Type, targetType))
+                return expr;
+
+            if (expr is BoundThrowExpression te)
+            {
+                te.SetType(targetType);
+                return te;
+            }
+
+            var converted = new BoundConversionExpression(
+                exprSyntax,
+                targetType,
+                expr,
+                new Conversion(ConversionKind.None),
+                isChecked: false);
+
+            converted.SetHasErrors();
+            return converted;
+        }
         private BoundExpression MakeLogicalAnd(SyntaxNode syntax, BoundExpression left, BoundExpression right, BindingContext ctx, DiagnosticBag diagnostics)
         {
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
@@ -5846,6 +5881,21 @@ namespace Cnidaria.Cs
                         else
                             expr = BindExpression(es.Expression, context, diagnostics);
                         result = new BoundExpressionStatement(es, expr);
+                    }
+                    break;
+
+                case UnsafeStatementSyntax us:
+                    {
+                        var unsafeBinder = (Flags & BinderFlags.UnsafeRegion) != 0
+                            ? this
+                            : WithFlags(Flags | BinderFlags.UnsafeRegion);
+
+                        var inner = unsafeBinder.BindStatement(us.Block, context, diagnostics);
+
+                        if (inner is BoundBlockStatement b)
+                            result = new BoundBlockStatement(us, b.Statements);
+                        else
+                            result = inner;
                     }
                     break;
 
@@ -8684,7 +8734,15 @@ namespace Cnidaria.Cs
             bool bestUsesParamsExpansion = false;
             int bestScore = int.MaxValue;
             bool ambiguous = false;
-
+            bool allowErrorRecovery = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (ShouldSuppressCascade(args[i]))
+                {
+                    allowErrorRecovery = true;
+                    break;
+                }
+            }
             for (int i = 0; i < candidates.Length; i++)
             {
                 var m = candidates[i];
@@ -8853,6 +8911,9 @@ namespace Cnidaria.Cs
 
                 for (int a = 0; a < args.Length; a++)
                 {
+                    if (allowErrorRecovery && ShouldSuppressCascade(args[a]))
+                        continue;
+
                     if (getArgRefKindKeyword is not null &&
                         !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
                     {
@@ -8887,6 +8948,9 @@ namespace Cnidaria.Cs
                 // Fixed parameters
                 for (int a = 0; a < fixedCount; a++)
                 {
+                    if (allowErrorRecovery && ShouldSuppressCascade(args[a]))
+                        continue;
+
                     if (getArgRefKindKeyword is not null &&
                         !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
                     {
@@ -9685,6 +9749,8 @@ namespace Cnidaria.Cs
                     }
                     return operandType;
                 case BoundUnaryOperatorKind.BitwiseNot:
+                    if (IsEnumType(operandType))
+                        return operandType;
                     if (!IsIntegral(st))
                     {
                         diagnostics.Add(new Diagnostic("CN_UNARY_INT000", DiagnosticSeverity.Error,
@@ -9759,8 +9825,20 @@ namespace Cnidaria.Cs
                     }
                     break;
                 case BoundUnaryOperatorKind.BitwiseNot:
-                    switch (type.SpecialType)
+                    switch (GetEffectiveNumericSpecialType(type))
                     {
+                        case SpecialType.System_Int8:
+                            if (v is sbyte sb) return new Optional<object>((sbyte)~sb);
+                            break;
+                        case SpecialType.System_UInt8:
+                            if (v is byte bt) return new Optional<object>((byte)~bt);
+                            break;
+                        case SpecialType.System_Int16:
+                            if (v is short s) return new Optional<object>((short)~s);
+                            break;
+                        case SpecialType.System_UInt16:
+                            if (v is ushort us) return new Optional<object>((ushort)~us);
+                            break;
                         case SpecialType.System_Int32:
                             if (v is int i) return new Optional<object>(~i);
                             break;
@@ -10168,6 +10246,49 @@ namespace Cnidaria.Cs
                 var cv = FoldBooleanBinaryConstant(op, left, right);
                 return new BoundBinaryExpression(bin, op, boolType, left, right, cv);
             }
+            // enum == 0 / enum != 0
+            if (IsEnumType(left.Type) && !IsEnumType(right.Type))
+            {
+                var conv = ClassifyConversion(right, left.Type);
+                if (conv.Exists && conv.IsImplicit)
+                {
+                    var r2 = ApplyConversion(
+                        exprSyntax: bin.Right,
+                        expr: right,
+                        targetType: left.Type,
+                        diagnosticNode: bin,
+                        context: ctx,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+
+                    if (!r2.HasErrors)
+                    {
+                        var cv = FoldBooleanBinaryConstant(op, left, r2);
+                        return new BoundBinaryExpression(bin, op, boolType, left, r2, cv);
+                    }
+                }
+            }
+            if (IsEnumType(right.Type) && !IsEnumType(left.Type))
+            {
+                var conv = ClassifyConversion(left, right.Type);
+                if (conv.Exists && conv.IsImplicit)
+                {
+                    var l2 = ApplyConversion(
+                        exprSyntax: bin.Left,
+                        expr: left,
+                        targetType: right.Type,
+                        diagnosticNode: bin,
+                        context: ctx,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+
+                    if (!l2.HasErrors)
+                    {
+                        var cv = FoldBooleanBinaryConstant(op, l2, right);
+                        return new BoundBinaryExpression(bin, op, boolType, l2, right, cv);
+                    }
+                }
+            }
             // enum == enum
             if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
             {
@@ -10186,8 +10307,11 @@ namespace Cnidaria.Cs
                 return new BoundBinaryExpression(bin, op, boolType, lp, rp, Optional<object>.None);
 
             // reference equality
-            if (TryBindReferenceEquality(left, right, bin, ctx, diagnostics, out var l2, out var r2))
-                return new BoundBinaryExpression(bin, op, boolType, l2, r2, Optional<object>.None);
+            {
+                if (TryBindReferenceEquality(left, right, bin, ctx, diagnostics, out var l2, out var r2))
+                    return new BoundBinaryExpression(bin, op, boolType, l2, r2, Optional<object>.None);
+            }
+
 
             diagnostics.Add(new Diagnostic("CN_EQ000", DiagnosticSeverity.Error,
                 $"Operator '{bin.OperatorToken.Kind}' cannot be applied to operands of type '{left.Type.Name}' and '{right.Type.Name}'.",
@@ -10568,6 +10692,8 @@ namespace Cnidaria.Cs
                     {
                         return compilation.GetSpecialType(SpecialType.System_IntPtr);
                     }
+                    if (other is SpecialType.System_Int64 or SpecialType.System_UInt32)
+                        return compilation.GetSpecialType(SpecialType.System_Int64);
                 }
 
                 if (ls == SpecialType.System_UIntPtr || rs == SpecialType.System_UIntPtr)
@@ -13340,6 +13466,12 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics,
             bool requireImplicit)
         {
+            if (IsTrueErrorType(targetType))
+            {
+                var converted = CreateErrorConversion(exprSyntax, expr, targetType);
+                context.Recorder.RecordBound(exprSyntax, converted);
+                return converted;
+            }
             // Target typed new expression
             if (exprSyntax is ImplicitObjectCreationExpressionSyntax ioc)
             {
@@ -13359,7 +13491,12 @@ namespace Cnidaria.Cs
                 te.SetType(targetType);
                 return te;
             }
-
+            if (ShouldSuppressCascade(expr))
+            {
+                var converted = CreateErrorConversion(exprSyntax, expr, targetType);
+                context.Recorder.RecordBound(exprSyntax, converted);
+                return converted;
+            }
             var conv = ClassifyConversion(expr, targetType, context);
 
             if (expr is BoundStackAllocArrayCreationExpression && conv.Kind != ConversionKind.ImplicitStackAlloc)
@@ -13835,6 +13972,10 @@ namespace Cnidaria.Cs
                     return new Conversion(ConversionKind.NullLiteral);
                 return new Conversion(ConversionKind.None);
             }
+
+            if (IsTrueErrorType(expr.Type) || IsTrueErrorType(target))
+                return new Conversion(ConversionKind.Identity);
+
             if (TryGetSystemNullableInfo(target, out _, out var targetUnderlying))
             {
                 // Nullable<S> to Nullable<T>

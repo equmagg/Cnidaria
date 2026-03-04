@@ -286,7 +286,8 @@ namespace Cnidaria.Cs
             bool isVirtual,
             bool isAbstract,
             bool isOverride,
-            bool isSealed)
+            bool isSealed,
+            ImmutableArray<TypeParameterSymbol> typeParameters)
         {
             var m = new ExternalMethodSymbol(
                 name: name,
@@ -300,6 +301,9 @@ namespace Cnidaria.Cs
                 isAbstract: isAbstract,
                 isOverride: isOverride,
                 isSealed: isSealed);
+
+            if (!typeParameters.IsDefaultOrEmpty && m is ExternalMethodSymbol em)
+                em.SetTypeParameters(typeParameters);
 
             AddMemberToType(containingType, m);
             return m;
@@ -501,13 +505,25 @@ namespace Cnidaria.Cs
                     var reader = new SigReader(sig);
 
                     byte cc = reader.ReadByte();
+
+                    uint genArity = 0;
                     if ((cc & 0x10) != 0)
-                        _ = reader.ReadCompressedUInt();
+                        genArity = reader.ReadCompressedUInt();
                     uint paramCount = reader.ReadCompressedUInt();
 
                     bool hasThis = (cc & 0x20) != 0;
                     bool isStatic = !hasThis;
-
+                    ImmutableArray<TypeParameterSymbol> mtps = ImmutableArray<TypeParameterSymbol>.Empty;
+                    if (genArity != 0)
+                    {
+                        var b = ImmutableArray.CreateBuilder<TypeParameterSymbol>((int)genArity);
+                        for (int i = 0; i < (int)genArity; i++)
+                        {
+                            string tpName = (i == 0) ? "T" : $"T{i}";
+                            b.Add(new TypeParameterSymbol(tpName, containing: null, ordinal: i, locations: ImmutableArray<Location>.Empty));
+                        }
+                        mtps = b.ToImmutable();
+                    }
                     var retType = ReadType(core, typeByRid, ref reader, declaringType, ImmutableArray<TypeParameterSymbol>.Empty);
 
                     var ps = ImmutableArray.CreateBuilder<(string name, TypeSymbol type)>((int)paramCount);
@@ -539,7 +555,8 @@ namespace Cnidaria.Cs
                         isVirtual: isVirtual,
                         isAbstract: isAbstract,
                         isOverride: isOverride,
-                        isSealed: isSealed);
+                        isSealed: isSealed,
+                        typeParameters: mtps);
 
                     ApplyParamRefKinds(ms, mdRow.ParamList, (int)paramCount);
 

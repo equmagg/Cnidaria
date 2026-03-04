@@ -1645,13 +1645,15 @@ namespace Cnidaria.Cs
         private readonly bool _isAbstract;
         private readonly bool _isOverride;
         private readonly bool _isSealed;
+        private ImmutableArray<TypeParameterSymbol> _typeParameters;
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
 
         public override TypeSymbol ReturnType { get; }
         public override ImmutableArray<ParameterSymbol> Parameters { get; }
-        public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+        public override ImmutableArray<TypeParameterSymbol> TypeParameters
+         => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
         public override Accessibility DeclaredAccessibility { get; }
         public override bool IsFromMetadata => true;
         public override bool IsStatic { get; }
@@ -1692,6 +1694,9 @@ namespace Cnidaria.Cs
             }
             Parameters = ps.ToImmutable();
         }
+        internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> tps)
+            => _typeParameters = tps.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : tps;
+
     }
     internal sealed class ExternalFieldSymbol : FieldSymbol
     {

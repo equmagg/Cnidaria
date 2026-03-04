@@ -4379,7 +4379,7 @@ namespace Cnidaria.Cs
                 {
                     var start = _tokens.Current;
 
-                    if (!ScanType())
+                    if (!ScanTypeNoPointerSuffix())
                         return false;
 
                     if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
@@ -4411,6 +4411,62 @@ namespace Cnidaria.Cs
                 },
                 tempContext: ParseContext.Type,
                 requireProgress: true);
+        }
+        private bool ScanTypeNoPointerSuffix()
+        {
+            if (_tokens.Current.Kind == SyntaxKind.RefKeyword)
+            {
+                _tokens.EatToken(); // ref
+                if (_tokens.Current.Kind == SyntaxKind.ReadOnlyKeyword)
+                    _tokens.EatToken(); // readonly
+                return ScanTypeNoPointerSuffix();
+            }
+
+            if (_tokens.Current.Kind == SyntaxKind.OpenParenToken)
+            {
+                if (!ScanTupleTypeCore())
+                    return false;
+            }
+            else if (IsPredefinedTypeKeyword(_tokens.Current.Kind)
+                || (_tokens.Current.Kind == SyntaxKind.IdentifierToken
+                    && (_tokens.Current.ValueText == "nint" || _tokens.Current.ValueText == "nuint")))
+            {
+                _tokens.EatToken();
+            }
+            else
+            {
+                if (!ScanName())
+                    return false;
+            }
+
+            while (true)
+            {
+                if (_tokens.Current.Kind == SyntaxKind.QuestionToken)
+                {
+                    _tokens.EatToken();
+                    continue;
+                }
+
+                if (_tokens.Current.Kind == SyntaxKind.OpenBracketToken)
+                {
+                    do
+                    {
+                        _tokens.EatToken(); // '['
+                        while (_tokens.Current.Kind == SyntaxKind.CommaToken)
+                            _tokens.EatToken();
+                        if (_tokens.Current.Kind != SyntaxKind.CloseBracketToken)
+                            return false;
+                        _tokens.EatToken(); // ']'
+                    }
+                    while (_tokens.Current.Kind == SyntaxKind.OpenBracketToken);
+
+                    continue;
+                }
+
+                break;
+            }
+
+            return true;
         }
         private static bool IsStartOfUnaryExpression(SyntaxToken t)
         {

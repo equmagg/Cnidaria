@@ -25,6 +25,7 @@ namespace Cnidaria.Cs
         I4,
         U4,
         I8,
+        Ref,
     }
     public enum BytecodeOp : byte
     {
@@ -109,18 +110,21 @@ namespace Cnidaria.Cs
         StackAlloc,  // operand0: elementSize
         PtrElemAddr, // operand0: elementSize
         PtrToByRef,  // stack: ptr -> byref
-        Ldind,       // operand0: IndirLoadKind
-        Stind,       // operand0: elementSize
+        // Typed indirect
+        Ldobj,   // operand0: Type token, stack: addr(byref/ptr) -> value
+        Stobj,   // operand0: Type token, stack: addr(byref/ptr), value ->
 
         Newarr,  // operand0: element Type token, stack: length -> arrayref
         Ldlen,   // stack: arrayref -> int32
         Ldelem,  // operand0: element Type token, stack: arrayref, index -> value
+        Ldelema, // operand0: element Type token, stack: arrayref, index -> byref
         Stelem,  // operand0: element Type token, stack: arrayref, index, value ->
         LdArrayDataRef, // stack: arrayref -> byref
 
         Sizeof,  // operand0: Type token, stack: -> int32
         PtrDiff, // operand0: elementSize, stack: ptrA, ptrB -> nint
         Isinst, // operand0: type token, stack: obj -> obj
+
     }
     internal enum NumericConvKind : byte
     {
@@ -932,8 +936,7 @@ namespace Cnidaria.Cs
                         {
                             EmitCall(call, EmitMode.Value);
 
-                            int elemSize = GetElementSizeOrThrow(br.ElementType);
-                            _il.Emit(BytecodeOp.Ldind, operand0: elemSize, pop: 1, push: 1);
+                            _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(br.ElementType), pop: 1, push: 1);
                             return;
                         }
                         EmitCall(call, mode);
@@ -1195,7 +1198,7 @@ namespace Cnidaria.Cs
                 if (loc.Local.IsByRef)
                 {
                     _il.Emit(BytecodeOp.Ldloc, operand0: idx, pop: 0, push: 1);
-                    _il.Emit(BytecodeOp.Ldind, operand0: (int)GetIndirLoadKind(loc.Local.Type), pop: 1, push: 1);
+                    _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(loc.Local.Type), pop: 1, push: 1);
                     return;
                 }
 
@@ -1211,7 +1214,7 @@ namespace Cnidaria.Cs
                 if (par.Parameter.Type is ByRefTypeSymbol br)
                 {
                     _il.Emit(BytecodeOp.Ldarg, operand0: idx, pop: 0, push: 1);
-                    _il.Emit(BytecodeOp.Ldind, operand0: (int)GetIndirLoadKind(br.ElementType), pop: 1, push: 1);
+                    _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(br.ElementType), pop: 1, push: 1);
                     return;
                 }
 
@@ -1262,36 +1265,6 @@ namespace Cnidaria.Cs
                     SpecialType.System_UInt32 or
                     SpecialType.System_UInt64 or
                     SpecialType.System_UIntPtr;
-            }
-            private static IndirLoadKind GetIndirLoadKind(TypeSymbol t)
-            {
-                if (t is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum)
-                {
-                    t = nt.EnumUnderlyingType ?? t;
-                    if (ReferenceEquals(t, nt))
-                        return IndirLoadKind.I4;
-                }
-                return t.SpecialType switch
-                {
-                    SpecialType.System_Int8 => IndirLoadKind.I1,
-                    SpecialType.System_UInt8 => IndirLoadKind.U1,
-                    SpecialType.System_Boolean => IndirLoadKind.U1,
-
-                    SpecialType.System_Int16 => IndirLoadKind.I2,
-                    SpecialType.System_UInt16 => IndirLoadKind.U2,
-                    SpecialType.System_Char => IndirLoadKind.U2,
-
-                    SpecialType.System_Int32 => IndirLoadKind.I4,
-                    SpecialType.System_UInt32 => IndirLoadKind.U4,
-
-                    SpecialType.System_Int64 => IndirLoadKind.I8,
-                    SpecialType.System_UInt64 => IndirLoadKind.I8,
-
-                    SpecialType.System_IntPtr => RuntimeTypeSystem.PointerSize == 8 ? IndirLoadKind.I8 : IndirLoadKind.I4,
-                    SpecialType.System_UIntPtr => RuntimeTypeSystem.PointerSize == 8 ? IndirLoadKind.I8 : IndirLoadKind.U4,
-
-                    _ => throw new NotSupportedException($"Ldind for '{t.Name}' is not supported.")
-                };
             }
             private void EmitBinary(BoundBinaryExpression bin, EmitMode mode)
             {
@@ -1568,11 +1541,11 @@ namespace Cnidaria.Cs
                         _il.Emit(BytecodeOp.Ldloc, operand0: idx, pop: 0, push: 1); // load address
                         EmitExpression(assignment.Right, EmitMode.Value);
 
-                        int elemSize2 = GetElementSizeOrThrow(leftLocal.Local.Type);
+                        int elemTok2 = _tokens.GetTypeToken(leftLocal.Local.Type);
 
                         if (mode == EmitMode.Discard)
                         {
-                            _il.Emit(BytecodeOp.Stind, operand0: elemSize2, pop: 2, push: 0);
+                            _il.Emit(BytecodeOp.Stobj, operand0: elemTok2, pop: 2, push: 0);
                             return;
                         }
 
@@ -1581,7 +1554,7 @@ namespace Cnidaria.Cs
                         // Stack: addr, val
                         _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);                       // addr, val, val
                         _il.Emit(BytecodeOp.Stloc, operand0: spill2, pop: 1, push: 0);    // addr, val
-                        _il.Emit(BytecodeOp.Stind, operand0: elemSize2, pop: 2, push: 0); //
+                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok2, pop: 2, push: 0);
                         _il.Emit(BytecodeOp.Ldloc, operand0: spill2, pop: 0, push: 1);
                         return;
                     }
@@ -1602,18 +1575,18 @@ namespace Cnidaria.Cs
                         _il.Emit(BytecodeOp.Ldarg, operand0: idx, pop: 0, push: 1);
                         EmitExpression(assignment.Right, EmitMode.Value);
 
-                        int byRefElemSize = GetElementSizeOrThrow(byRefPar.ElementType);
+                        int byRefElemTok = _tokens.GetTypeToken(byRefPar.ElementType);
 
                         if (mode == EmitMode.Discard)
                         {
-                            _il.Emit(BytecodeOp.Stind, operand0: byRefElemSize, pop: 2, push: 0);
+                            _il.Emit(BytecodeOp.Stobj, operand0: byRefElemTok, pop: 2, push: 0);
                             return;
                         }
 
                         int spill2 = AllocateSpillLocal(assignment.Type);
                         _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
                         _il.Emit(BytecodeOp.Stloc, operand0: spill2, pop: 1, push: 0);
-                        _il.Emit(BytecodeOp.Stind, operand0: byRefElemSize, pop: 2, push: 0);
+                        _il.Emit(BytecodeOp.Stobj, operand0: byRefElemTok, pop: 2, push: 0);
                         _il.Emit(BytecodeOp.Ldloc, operand0: spill2, pop: 0, push: 1);
                         return;
                     }
@@ -1629,11 +1602,11 @@ namespace Cnidaria.Cs
                     EmitLoadAddressOfLValue(assignment.Left);
                     EmitExpression(assignment.Right, EmitMode.Value);
 
-                    int elemSize = GetElementSizeOrThrow(assignment.Left.Type);
+                    int elemTok = _tokens.GetTypeToken(assignment.Left.Type);
 
                     if (mode == EmitMode.Discard)
                     {
-                        _il.Emit(BytecodeOp.Stind, operand0: elemSize, pop: 2, push: 0);
+                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0);
                         return;
                     }
 
@@ -1642,7 +1615,7 @@ namespace Cnidaria.Cs
                     // Stack: addr, val
                     _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);             // addr, val, val
                     _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0); // addr, val
-                    _il.Emit(BytecodeOp.Stind, operand0: elemSize, pop: 2, push: 0);
+                    _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0);
                     _il.Emit(BytecodeOp.Ldloc, operand0: spill, pop: 0, push: 1);
                 }
             }
@@ -1845,6 +1818,41 @@ namespace Cnidaria.Cs
                 {
                     var ps = call.Method.Parameters;
 
+                    // Unsafe.SizeOf<T>()
+                    if (def.Name == "SizeOf" && ps.Length == 0)
+                    {
+                        var tas = call.Method.TypeArguments;
+                        if (tas.Length != 1) return false;
+
+                        _il.Emit(BytecodeOp.Sizeof, operand0: _tokens.GetTypeToken(tas[0]), pop: 0, push: 1);
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
+                    }
+                    // Unsafe.As<T>
+                    if (def.Name == "As" && ps.Length == 1)
+                    {
+                        // Unsafe.As<T>(object)
+                        if (ps[0].Type.SpecialType == SpecialType.System_Object)
+                        {
+                            EmitExpression(call.Arguments[0], EmitMode.Value);
+                            if (mode == EmitMode.Discard)
+                                _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                            return true;
+                        }
+
+                        // Unsafe.As<TFrom, TTo>(ref TFrom)
+                        if (ps[0].Type is ByRefTypeSymbol)
+                        {
+                            EmitExpression(call.Arguments[0], EmitMode.Value);
+                            if (mode == EmitMode.Discard)
+                                _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                            return true;
+                        }
+                    }
+
                     // Unsafe.AsRef<T>
                     if (def.Name == "AsRef" && ps.Length == 1)
                     {
@@ -1902,6 +1910,22 @@ namespace Cnidaria.Cs
                                 _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
                             return true;
                         }
+                    }
+
+                    // Unsafe.ByteOffset<T>(ref T origin, ref T target)
+                    if (def.Name == "ByteOffset" && ps.Length == 2 &&
+                        ps[0].Type is ByRefTypeSymbol && ps[1].Type is ByRefTypeSymbol)
+                    {
+                        EmitExpression(call.Arguments[0], EmitMode.Value); // origin
+                        EmitExpression(call.Arguments[1], EmitMode.Value); // target
+
+                        _il.Emit(BytecodeOp.PtrDiff, operand0: 1, pop: 2, push: 1); // origin - target
+                        _il.Emit(BytecodeOp.Neg, pop: 1, push: 1);// target - origin
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
                     }
                     // Unsafe.AddByteOffset<T>(ref T, IntPtr/nuint)
                     if (def.Name == "AddByteOffset" && ps.Length == 2 && ps[0].Type is ByRefTypeSymbol)
@@ -2217,7 +2241,7 @@ namespace Cnidaria.Cs
                 }
 
                 EmitExpression(pind.Operand, EmitMode.Value);
-                _il.Emit(BytecodeOp.Ldind, operand0: (int)GetIndirLoadKind(pind.Type), pop: 1, push: 1);
+                _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(pind.Type), pop: 1, push: 1);
             }
 
             private void EmitPointerElementAccess(BoundPointerElementAccessExpression pea, EmitMode mode)
@@ -2235,7 +2259,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                _il.Emit(BytecodeOp.Ldind, operand0: (int)GetIndirLoadKind(pea.Type), pop: 1, push: 1);
+                _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(pea.Type), pop: 1, push: 1);
             }
 
             private void EmitStackAlloc(BoundStackAllocArrayCreationExpression sa, EmitMode mode)
@@ -2245,7 +2269,7 @@ namespace Cnidaria.Cs
 
                 int size = GetElementSizeOrThrow(sa.ElementType);
                 _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
-
+                int elemTok = _tokens.GetTypeToken(sa.ElementType);
                 if (sa.InitializerOpt is not null)
                 {
                     var elems = sa.InitializerOpt.Elements;
@@ -2255,7 +2279,7 @@ namespace Cnidaria.Cs
                         _il.Emit(BytecodeOp.Ldc_I4, operand0: i, pop: 0, push: 1); // ptr, ptr, i
                         _il.Emit(BytecodeOp.PtrElemAddr, operand0: size, pop: 2, push: 1); // ptr, addr
                         EmitExpression(elems[i], EmitMode.Value); // ptr, addr, val
-                        _il.Emit(BytecodeOp.Stind, operand0: size, pop: 2, push: 0); // ptr
+                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0); // ptr
                     }
                 }
 
@@ -2279,7 +2303,18 @@ namespace Cnidaria.Cs
                             }
                             return;
                         }
+                    case BoundArrayElementAccessExpression aea:
+                        {
+                            if (aea.Indices.Length != 1)
+                                throw new NotSupportedException("Only single dimensional arrays are supported.");
 
+                            EmitExpression(aea.Expression, EmitMode.Value);
+                            EmitExpression(aea.Indices[0], EmitMode.Value);
+
+                            int elemTok = _tokens.GetTypeToken(aea.Type);
+                            _il.Emit(BytecodeOp.Ldelema, operand0: elemTok, pop: 2, push: 1);
+                        }
+                        return;
                     case BoundParameterExpression par:
                         if (par.Parameter.Type is ByRefTypeSymbol)
                         {

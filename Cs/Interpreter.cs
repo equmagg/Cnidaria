@@ -804,12 +804,12 @@ namespace Cnidaria.Cs
                             ExecPtrDiff(ins.Operand0);
                             break;
 
-                        case BytecodeOp.Ldind:
-                            ExecLdind((IndirLoadKind)ins.Operand0);
+                        case BytecodeOp.Ldobj:
+                            ExecLdobj(mod, ins.Operand0);
                             break;
 
-                        case BytecodeOp.Stind:
-                            ExecStind(ins.Operand0);
+                        case BytecodeOp.Stobj:
+                            ExecStobj(mod, ins.Operand0);
                             break;
 
                         case BytecodeOp.Newobj:
@@ -859,6 +859,10 @@ namespace Cnidaria.Cs
 
                         case BytecodeOp.Ldelem:
                             ExecLdelem(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.Ldelema:
+                            ExecLdelema(mod, ins.Operand0);
                             break;
 
                         case BytecodeOp.Stelem:
@@ -2202,7 +2206,23 @@ namespace Cnidaria.Cs
             int len = GetArrayLengthFromObject(arrAbs);
             PushSlot(new Slot(SlotKind.I4, len));
         }
+        private void ExecLdelema(RuntimeModule mod, int elemTypeToken)
+        {
+            int index = PopSlot().AsI4Checked();
+            var arr = PopSlot();
 
+            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
+            ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
+
+            if ((uint)index >= (uint)length)
+                throw new IndexOutOfRangeException();
+
+            var (elemSize, _) = GetStorageSizeAlign(elemType);
+            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+
+            CheckHeapAccess(elemAbs, elemSize, writable: false);
+            PushSlot(new Slot(SlotKind.ByRef, elemAbs, aux: elemSize));
+        }
         private void ExecLdelem(RuntimeModule mod, int elemTypeToken)
         {
             int index = PopSlot().AsI4Checked();
@@ -2348,97 +2368,30 @@ namespace Cnidaria.Cs
             else
                 PushSlot(new Slot(SlotKind.I4, unchecked((int)diffElems)));
         }
-        private void ExecLdind(IndirLoadKind kind)
+
+        private void ExecLdobj(RuntimeModule mod, int typeToken)
         {
             var a = PopSlot();
             int abs = GetAddressAbsOrThrow(a);
 
-            int size = kind switch
-            {
-                IndirLoadKind.I1 or IndirLoadKind.U1 => 1,
-                IndirLoadKind.I2 or IndirLoadKind.U2 => 2,
-                IndirLoadKind.I4 or IndirLoadKind.U4 => 4,
-                IndirLoadKind.I8 => 8,
-                _ => throw new NotSupportedException($"Ldind kind {kind} not supported.")
-            };
+            var t = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            var (sz, _) = GetStorageSizeAlign(t);
+            CheckIndirectAccess(abs, sz, writable: false);
 
-            CheckIndirectAccess(abs, size, writable: false);
-
-            switch (kind)
-            {
-                case IndirLoadKind.I1:
-                    PushSlot(new Slot(SlotKind.I4, unchecked((sbyte)_mem[abs])));
-                    return;
-
-                case IndirLoadKind.U1:
-                    PushSlot(new Slot(SlotKind.I4, _mem[abs]));
-                    return;
-
-                case IndirLoadKind.I2:
-                    PushSlot(new Slot(SlotKind.I4, BinaryPrimitives.ReadInt16LittleEndian(_mem.AsSpan(abs, 2))));
-                    return;
-
-                case IndirLoadKind.U2:
-                    PushSlot(new Slot(SlotKind.I4, BinaryPrimitives.ReadUInt16LittleEndian(_mem.AsSpan(abs, 2))));
-                    return;
-
-                case IndirLoadKind.I4:
-                    PushSlot(new Slot(SlotKind.I4, BinaryPrimitives.ReadInt32LittleEndian(_mem.AsSpan(abs, 4))));
-                    return;
-
-                case IndirLoadKind.U4:
-                    {
-                        uint v = BinaryPrimitives.ReadUInt32LittleEndian(_mem.AsSpan(abs, 4));
-                        PushSlot(new Slot(SlotKind.I4, unchecked((int)v))); // keep raw 32-bit pattern
-                        return;
-                    }
-
-                case IndirLoadKind.I8:
-                    PushSlot(new Slot(SlotKind.I8, BinaryPrimitives.ReadInt64LittleEndian(_mem.AsSpan(abs, 8))));
-                    return;
-            }
-
-            throw new NotSupportedException($"Ldind kind {kind} not supported.");
+            PushSlot(LoadValueAsSlot(abs, 0, t));
         }
-        private void ExecStind(int size)
+        private void ExecStobj(RuntimeModule mod, int typeToken)
         {
             var v = PopSlot();
             var a = PopSlot();
             int abs = GetAddressAbsOrThrow(a);
 
-            CheckIndirectAccess(abs, size, writable: true);
+            var t = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            var (sz, _) = GetStorageSizeAlign(t);
+            CheckIndirectAccess(abs, sz, writable: true);
 
-            if (v.Kind == SlotKind.Value)
-            {
-                int vSize = GetValueSlotSize(v);
-                if (vSize != size)
-                    throw new InvalidOperationException($"stind size mismatch: slot={vSize}, opcode={size}");
-
-                int srcAbs = checked((int)v.Payload);
-                CheckRange(srcAbs, size);
-                Buffer.BlockCopy(_mem, srcAbs, _mem, abs, size);
-                return;
-            }
-
-            switch (size)
-            {
-                case 1:
-                    _mem[abs] = unchecked((byte)v.AsI4Checked());
-                    return;
-                case 2:
-                    BinaryPrimitives.WriteUInt16LittleEndian(_mem.AsSpan(abs, 2), unchecked((ushort)v.AsI4Checked()));
-                    return;
-                case 4:
-                    BinaryPrimitives.WriteInt32LittleEndian(_mem.AsSpan(abs, 4), v.AsI4Checked());
-                    return;
-                case 8:
-                    BinaryPrimitives.WriteInt64LittleEndian(_mem.AsSpan(abs, 8), v.Kind == SlotKind.I8 ? v.Payload : v.AsI4Checked());
-                    return;
-                default:
-                    throw new NotSupportedException($"Stind size {size} not supported.");
-            }
+            StoreSlotAsValue(abs, 0, t, v);
         }
-
         private void ExecNewobj(RuntimeModule callerModule, int ctorToken, int argCount, CancellationToken ct, ExecutionLimits limits)
         {
             // Resolve ctor body
@@ -4923,6 +4876,95 @@ namespace Cnidaria.Cs
                 _ => FastCellKind.None
             };
         }
+        private static bool IsNoRefPrimitive(RuntimeType t)
+        {
+            if (t.Namespace != "System")
+                return false;
+
+            switch (t.Name)
+            {
+                case "Void":
+                case "Boolean":
+                case "Char":
+                case "SByte":
+                case "Byte":
+                case "Int16":
+                case "UInt16":
+                case "Int32":
+                case "UInt32":
+                case "Int64":
+                case "UInt64":
+                case "Single":
+                case "Double":
+                case "Decimal":
+                case "IntPtr":
+                case "UIntPtr":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        private bool TypeIsReferenceOrContainsReferences(RuntimeType t)
+        {
+            if (t is null)
+                return true;
+            if (t.IsReferenceType)
+                return true;
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                return false;
+            if (IsNoRefPrimitive(t))
+                return false;
+            if (t.Kind == RuntimeTypeKind.TypeParam)
+                return true;
+
+            // cycle guard
+            var visiting = new HashSet<int>();
+            return TypeIsReferenceOrContainsReferencesCore(t, visiting);
+        }
+        private bool TypeIsReferenceOrContainsReferencesCore(RuntimeType t, HashSet<int> visiting)
+        {
+            if (t is null)
+                return true;
+
+            if (t.IsReferenceType)
+                return true;
+
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                return false;
+
+            if (IsNoRefPrimitive(t))
+                return false;
+
+            if (t.Kind == RuntimeTypeKind.TypeParam)
+                return true;
+
+            if (!visiting.Add(t.TypeId))
+                return true;
+
+            _ = _rts.GetStorageSizeAlign(t);
+
+            bool contains = false;
+
+            if (t.IsValueType)
+            {
+                var fs = t.InstanceFields;
+                for (int i = 0; i < fs.Length; i++)
+                {
+                    if (TypeIsReferenceOrContainsReferencesCore(fs[i].FieldType, visiting))
+                    {
+                        contains = true;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                contains = true;
+            }
+
+            visiting.Remove(t.TypeId);
+            return contains;
+        }
         private static RuntimeType? TryGetEnumUnderlyingType(RuntimeType t)
         {
             if (t.Kind != RuntimeTypeKind.Enum)
@@ -5130,18 +5172,57 @@ namespace Cnidaria.Cs
                     PushSlot(new Slot(SlotKind.I4, len));
                     return true;
                 }
-
-                // private static bool _CopyImpl(Array, int, Array, int, int)
+                // private static void ClearInternal(Array, int, int)
                 if (!rm.HasThis &&
-                    rm.Name == "_CopyImpl" &&
-                    rm.ParameterTypes.Length == 5 &&
-                    totalArgs == 5 &&
-                    rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
+                    rm.Name == "ClearInternal" &&
+                    rm.ParameterTypes.Length == 3 &&
+                    totalArgs == 3 &&
+                    IsVoidReturn(rm.ReturnType) &&
                     rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
                     rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
-                    rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
-                    rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
-                    rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
+                    rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Int32")
+                {
+                    int length = PopSlot().AsI4Checked();
+                    int index = PopSlot().AsI4Checked();
+                    var arrRef = PopSlot();
+
+                    if (arrRef.Kind == SlotKind.Null)
+                        throw new NullReferenceException();
+
+                    var arrType = GetObjectTypeFromRef(arrRef);
+                    if (arrType.Kind != RuntimeTypeKind.Array)
+                        throw new InvalidOperationException("System.Array._ClearImpl expects array.");
+
+                    if (arrType.ArrayRank != 1)
+                        throw new NotSupportedException("Only single dimensional arrays are supported.");
+
+                    if (length <= 0)
+                        return true;
+
+                    int arrAbs = checked((int)arrRef.Payload);
+                    var elem = arrType.ElementType ?? throw new InvalidOperationException("Corrupted array type (no ElementType).");
+                    var (elemSize, _) = GetStorageSizeAlign(elem);
+
+                    int bytes = checked(length * elemSize);
+                    int start = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+
+                    CheckRange(start, bytes);
+                    CheckWritableRange(start, bytes);
+                    _mem.AsSpan(start, bytes).Clear();
+
+                    return true;
+                }
+                // private static bool _CopyImpl(Array, int, Array, int, int)
+                if (!rm.HasThis &&
+                rm.Name == "CopyInternal" &&
+                rm.ParameterTypes.Length == 5 &&
+                totalArgs == 5 &&
+                rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
+                rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
+                rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
+                rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
+                rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
+                rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
                 {
                     int length = PopSlot().AsI4Checked();
                     int dstIndex = PopSlot().AsI4Checked();
@@ -5309,6 +5390,32 @@ namespace Cnidaria.Cs
 
                 DoneCopy:
                     PushSlot(new Slot(SlotKind.I4, ok ? 1 : 0));
+                    return true;
+                }
+            }
+            if (rm.DeclaringType.Namespace == "System.Runtime.CompilerServices" &&
+                rm.DeclaringType.Name == "RuntimeHelpers")
+            {
+                // static bool IsReferenceOrContainsReferences<T>()
+                if (!rm.HasThis &&
+                    rm.Name == "IsReferenceOrContainsReferences" &&
+                    rm.ParameterTypes.Length == 0 &&
+                    totalArgs == 0 &&
+                    rm.ReturnType.Namespace == "System" &&
+                    rm.ReturnType.Name == "Boolean")
+                {
+                    bool result;
+                    if (rm.MethodGenericArguments.Length == 1)
+                    {
+                        result = TypeIsReferenceOrContainsReferences(rm.MethodGenericArguments[0]);
+                    }
+                    else
+                    {
+                        // Unconstructed generic
+                        result = true;
+                    }
+
+                    PushSlot(new Slot(SlotKind.I4, result ? 1 : 0));
                     return true;
                 }
             }

@@ -152,10 +152,12 @@ namespace Cnidaria.Cs
             Span = span;
         }
         public override string ToString() => $"{Span}";
+        public string ToString(string sorce) => Span.ToString(sorce);
     }
     public interface IDiagnostic
     {
         public string GetMessage();
+        public string GetMessage(string source);
         public DiagnosticSeverity GetSeverity();
     }
     public readonly struct Diagnostic : IDiagnostic
@@ -174,7 +176,10 @@ namespace Cnidaria.Cs
         }
         public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location}])")}";
         public string GetMessage() => this.ToString();
+        public string GetMessage(string souce)
+            => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location.ToString(souce)}])")}";
         public DiagnosticSeverity GetSeverity() => this.Severity;
+
     }
     public readonly struct Optional<T>
     {

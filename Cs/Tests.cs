@@ -587,6 +587,47 @@ internal class Program
 }
 ", "752296015");
 
+            // 62 stackalloc byte
+            RunTest(@"
+unsafe
+{
+    byte* p = stackalloc byte[4];
+    p[0] = 1;
+    p[1] = 2;
+    p[2] = 3;
+    p[3] = 4;
+    Console.Write(p[0]);
+    Console.Write(p[3]);
+    Console.Write(p[1] + p[2]);
+}
+", "145");
+            // 63 generic byref parameter assignment
+            RunTest(@"
+namespace Ns;
+public struct Pair
+{
+    public int A;
+    public int B;
+    public Pair(int a, int b) { A = a; B = b; }
+}
+internal class Program
+{
+    static void Set<T>(ref T dst, T v)
+    {
+        dst = v;
+    }
+    public static void Main(string[] args)
+    {
+        Pair p = new Pair(1,2);
+        Set<Pair>(ref p, new Pair(9, 4));
+        Console.Write(p.A);
+        Console.Write(p.B);
+    }
+}
+", "94");
+
+
+
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)
             {
