@@ -520,6 +520,8 @@ namespace Cnidaria.Cs
         public bool IsScoped { get; internal set; }
         public bool IsParams { get; internal set; }
         public ParameterRefKind RefKind { get; internal set; }
+        public bool HasExplicitDefault { get; internal set; }
+        public Optional<object> DefaultValueOpt { get; internal set; }
         public ParameterSymbol(
             string name,
             Symbol containing,
@@ -528,7 +530,9 @@ namespace Cnidaria.Cs
             bool isReadOnlyRef = false,
             ParameterRefKind refKind = ParameterRefKind.None,
             bool isScoped = false,
-            bool isParams = false)
+            bool isParams = false,
+            bool hasExplicitDefault = false,
+            Optional<object> defaultValueOpt = default)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -538,12 +542,19 @@ namespace Cnidaria.Cs
             RefKind = refKind;
             IsScoped = isScoped;
             IsParams = isParams;
+            HasExplicitDefault = hasExplicitDefault;
+            DefaultValueOpt = defaultValueOpt;
         }
         public override ImmutableArray<AttributeData> GetAttributes()
         => _attributes is null ? ImmutableArray<AttributeData>.Empty : _attributes.ToImmutableArray();
         internal void AddAttribute(AttributeData a)
         {
             (_attributes ??= new List<AttributeData>()).Add(a);
+        }
+        internal void SetDefaultValue(Optional<object> constantValueOpt)
+        {
+            HasExplicitDefault = true;
+            DefaultValueOpt = constantValueOpt;
         }
     }
     public sealed class LocalSymbol : Symbol
@@ -1346,7 +1357,9 @@ namespace Cnidaria.Cs
                         p.Name, this, pt, p.Locations,
                         isReadOnlyRef: p.IsReadOnlyRef,
                         refKind: p.RefKind,
-                        isScoped: p.IsScoped));
+                        isScoped: p.IsScoped,
+                        hasExplicitDefault: p.HasExplicitDefault,
+                        defaultValueOpt: p.DefaultValueOpt));
                 }
                 _parameters = b.ToImmutable();
             }
@@ -1388,7 +1401,9 @@ namespace Cnidaria.Cs
                     p.Name, this, pt, p.Locations,
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
-                    isScoped: p.IsScoped));
+                    isScoped: p.IsScoped,
+                    hasExplicitDefault: p.HasExplicitDefault,
+                    defaultValueOpt: p.DefaultValueOpt));
             }
             _parameters = b.ToImmutable();
         }
@@ -1438,7 +1453,17 @@ namespace Cnidaria.Cs
             {
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
-                b.Add(new ParameterSymbol(p.Name, this, pt, p.Locations, isReadOnlyRef: p.IsReadOnlyRef));
+                b.Add(new ParameterSymbol(
+                    p.Name,
+                    this,
+                    pt,
+                    p.Locations,
+                    isReadOnlyRef: p.IsReadOnlyRef,
+                    refKind: p.RefKind,
+                    isScoped: p.IsScoped,
+                    isParams: p.IsParams,
+                    hasExplicitDefault: p.HasExplicitDefault,
+                    defaultValueOpt: p.DefaultValueOpt));
             }
             _parameters = b.ToImmutable();
         }
@@ -1690,7 +1715,11 @@ namespace Cnidaria.Cs
             for (int i = 0; i < parameters.Length; i++)
             {
                 var p = parameters[i];
-                ps.Add(new ParameterSymbol(p.name, this, p.type, ImmutableArray<Location>.Empty));
+                ps.Add(new ParameterSymbol(
+                    p.name,
+                    this,
+                    p.type,
+                    ImmutableArray<Location>.Empty));
             }
             Parameters = ps.ToImmutable();
         }

@@ -431,6 +431,7 @@ namespace Cnidaria.Cs
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             var pendingConstFields = new List<PendingConstField>();
+            var pendingOptionalParameters = new List<PendingOptionalParameter>();
             foreach (var tree in trees)
             {
                 var stubModel = new SemanticModelStub(compilation, tree);
@@ -459,6 +460,9 @@ namespace Cnidaria.Cs
                             var pt = BindParameterType(typeBinder, pars[i], ctx, diagnostics, out var isReadOnlyRef);
                             sm.Parameters[i].Type = pt;
                             sm.Parameters[i].IsReadOnlyRef = isReadOnlyRef;
+                            if (pars[i].Default is not null)
+                                pendingOptionalParameters.Add(
+                                    new PendingOptionalParameter(tree, pars[i], sm.Parameters[i], sm, typeBinder, stubModel));
                         }
                     }
                     else if (kv.Key is ConstructorDeclarationSyntax cd && kv.Value is SourceMethodSymbol ctor)
@@ -473,6 +477,9 @@ namespace Cnidaria.Cs
                             var pt = BindParameterType(typeBinder, pars[i], ctx, diagnostics, out var isReadOnlyRef);
                             ctor.Parameters[i].Type = pt;
                             ctor.Parameters[i].IsReadOnlyRef = isReadOnlyRef;
+                            if (pars[i].Default is not null)
+                                pendingOptionalParameters.Add(
+                                    new PendingOptionalParameter(tree, pars[i], ctor.Parameters[i], ctor, typeBinder, stubModel));
                         }
                     }
                     else if (kv.Key is OperatorDeclarationSyntax od && kv.Value is SourceMethodSymbol opMethod)
@@ -631,6 +638,7 @@ namespace Cnidaria.Cs
                     compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
             }
             BindPendingConstFields(compilation, pendingConstFields, diagnostics);
+            BindPendingOptionalParameters(compilation, pendingOptionalParameters, diagnostics);
         }
         private readonly struct PendingConstField
         {
@@ -650,6 +658,31 @@ namespace Cnidaria.Cs
                 Tree = tree;
                 Declarator = declarator;
                 Field = field;
+                TypeBinder = typeBinder;
+                StubModel = stubModel;
+            }
+        }
+        private readonly struct PendingOptionalParameter
+        {
+            public readonly SyntaxTree Tree;
+            public readonly ParameterSyntax ParameterSyntax;
+            public readonly ParameterSymbol Parameter;
+            public readonly MethodSymbol ContainingMethod;
+            public readonly TypeBinder TypeBinder;
+            public readonly SemanticModel StubModel;
+
+            public PendingOptionalParameter(
+                SyntaxTree tree,
+                ParameterSyntax parameterSyntax,
+                ParameterSymbol parameter,
+                MethodSymbol containingMethod,
+                TypeBinder typeBinder,
+                SemanticModel stubModel)
+            {
+                Tree = tree;
+                ParameterSyntax = parameterSyntax;
+                Parameter = parameter;
+                ContainingMethod = containingMethod;
                 TypeBinder = typeBinder;
                 StubModel = stubModel;
             }
@@ -733,6 +766,85 @@ namespace Cnidaria.Cs
                 diagnosticNode: pending.Declarator,
                 context: ctx,
                 diagnostics: sink,
+                requireImplicit: true);
+
+            if (!init.ConstantValueOpt.HasValue)
+                return false;
+
+            constantValueOpt = init.ConstantValueOpt;
+            return true;
+        }
+        private static void BindPendingOptionalParameters(
+    Compilation compilation,
+    List<PendingOptionalParameter> pending,
+    DiagnosticBag diagnostics)
+        {
+            for (int i = 0; i < pending.Count; i++)
+            {
+                var p = pending[i];
+                if (p.Parameter.HasExplicitDefault)
+                    continue;
+
+                if (!TryBindOptionalParameterDefault(compilation, p, diagnostics, out var c))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_PARAMDEFAULT001",
+                        DiagnosticSeverity.Error,
+                        "Optional parameter default value must be a compile-time constant.",
+                        new Location(p.Tree, p.ParameterSyntax.Default!.Span)));
+                    continue;
+                }
+
+                p.Parameter.SetDefaultValue(c);
+            }
+        }
+
+        private static bool TryBindOptionalParameterDefault(
+            Compilation compilation,
+            in PendingOptionalParameter pending,
+            DiagnosticBag diagnostics,
+            out Optional<object> constantValueOpt)
+        {
+            constantValueOpt = Optional<object>.None;
+            var def = pending.ParameterSyntax.Default;
+            if (def is null)
+                return false;
+
+            if (pending.Parameter.RefKind != ParameterRefKind.None)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PARAMDEFAULT002",
+                    DiagnosticSeverity.Error,
+                    "Optional parameters cannot be ref/out/in.",
+                    new Location(pending.Tree, def.Span)));
+                return false;
+            }
+
+            if (pending.Parameter.IsParams)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PARAMDEFAULT003",
+                    DiagnosticSeverity.Error,
+                    "'params' parameters cannot have a default value.",
+                    new Location(pending.Tree, def.Span)));
+                return false;
+            }
+
+            var ctx = new BindingContext(compilation, pending.StubModel, pending.ContainingMethod, NullRecorder.Instance);
+            var exprBinder = new LocalScopeBinder(
+                parent: pending.TypeBinder,
+                flags: pending.TypeBinder.Flags,
+                containing: pending.ContainingMethod,
+                inheritFlowFromParent: false);
+
+            var init = exprBinder.BindExpression(def.Value, ctx, diagnostics);
+            init = exprBinder.ApplyConversion(
+                exprSyntax: def.Value,
+                expr: init,
+                targetType: pending.Parameter.Type,
+                diagnosticNode: pending.ParameterSyntax,
+                context: ctx,
+                diagnostics: diagnostics,
                 requireImplicit: true);
 
             if (!init.ConstantValueOpt.HasValue)
@@ -7187,11 +7299,8 @@ namespace Cnidaria.Cs
             {
                 return ptrArith;
             }
-            var promoted = GetBinaryNumericPromotionType(
-                ctx.Compilation, ctx.SemanticModel.SyntaxTree,
-                left.Type, right.Type,
-                node, diagnostics);
 
+            var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, node, diagnostics);
             if (promoted is null || promoted is ErrorTypeSymbol)
                 return new BoundBadExpression(node);
 
@@ -7245,11 +7354,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            var promoted = GetBinaryIntegralPromotionType(
-                ctx.Compilation, ctx.SemanticModel.SyntaxTree,
-                left.Type, right.Type,
-                node, diagnostics);
-
+            var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, node, diagnostics);
             if (promoted is null || promoted is ErrorTypeSymbol)
                 return new BoundBadExpression(node);
 
@@ -7761,6 +7866,7 @@ namespace Cnidaria.Cs
                     args: args,
                     getArgExprSyntax: i => argSyntaxes[i].Expression,
                     getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                    getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                     chosen: out var chosen,
                     convertedArgs: out var convertedArgs,
                     context: context,
@@ -7833,6 +7939,7 @@ namespace Cnidaria.Cs
                     args: args,
                     getArgExprSyntax: i => argSyntaxes[i].Expression,
                     getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                    getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                     chosen: out var chosen,
                     convertedArgs: out var convertedArgs,
                     context: context,
@@ -7981,6 +8088,7 @@ namespace Cnidaria.Cs
                 args: args,
                 getArgExprSyntax: i => argSyntaxes[i].Expression,
                 getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                 chosen: out var chosen,
                 convertedArgs: out var convertedArgs,
                 context: context,
@@ -8074,6 +8182,7 @@ namespace Cnidaria.Cs
                 args: args,
                 getArgExprSyntax: i => argSyntaxes[i].Expression,
                 getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                 chosen: out var chosen,
                 convertedArgs: out var convertedArgs,
                 context: context,
@@ -8704,6 +8813,7 @@ namespace Cnidaria.Cs
                 args: boundArgs,
                 getArgExprSyntax: i => argSyntaxes[i].Expression,
                 getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                 chosen: out var chosen,
                 convertedArgs: out var convertedArgs,
                 context: context,
@@ -8725,15 +8835,88 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics,
             SyntaxNode diagnosticNode,
-            Func<int, SyntaxToken?>? getArgRefKindKeyword = null)
+            Func<int, SyntaxToken?>? getArgRefKindKeyword = null,
+            Func<int, string?>? getArgName = null)
         {
             chosen = null;
             convertedArgs = default;
 
+            if (getArgName is not null)
+            {
+                bool sawNamed = false;
+                var seenNames = new HashSet<string>(StringComparer.Ordinal);
+
+                for (int i = 0; i < args.Length; i++)
+                {
+                    var n = getArgName(i);
+                    if (!string.IsNullOrEmpty(n))
+                    {
+                        sawNamed = true;
+                        if (!seenNames.Add(n!))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_NAMEDARG002",
+                                DiagnosticSeverity.Error,
+                                $"Named argument '{n}' is specified multiple times.",
+                                new Location(context.SemanticModel.SyntaxTree, getArgExprSyntax(i).Span)));
+                            return false;
+                        }
+                    }
+                    else if (sawNamed)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_NAMEDARG001",
+                            DiagnosticSeverity.Error,
+                            "Positional arguments cannot appear after named arguments.",
+                            new Location(context.SemanticModel.SyntaxTree, getArgExprSyntax(i).Span)));
+                        return false;
+                    }
+                }
+
+                foreach (var name in seenNames)
+                {
+                    bool found = false;
+                    for (int c = 0; c < candidates.Length && !found; c++)
+                    {
+                        var ps = candidates[c].Parameters;
+                        for (int p = 0; p < ps.Length; p++)
+                        {
+                            if (string.Equals(ps[p].Name, name, StringComparison.Ordinal))
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        // Pick the first occurrence for location
+                        for (int i = 0; i < args.Length; i++)
+                        {
+                            var n = getArgName(i);
+                            if (string.Equals(n, name, StringComparison.Ordinal))
+                            {
+                                diagnostics.Add(new Diagnostic(
+                                    "CN_NAMEDARG003",
+                                    DiagnosticSeverity.Error,
+                                    $"No parameter named '{name}' exists in any candidate overload.",
+                                    new Location(context.SemanticModel.SyntaxTree, getArgExprSyntax(i).Span)));
+                                break;
+                            }
+                        }
+                        return false;
+                    }
+                }
+            }
+
             MethodSymbol? best = null;
             bool bestUsesParamsExpansion = false;
             int bestScore = int.MaxValue;
+            int[]? bestArgToParamMap = null;
+            int[]? bestParamsElementArgIndices = null;
             bool ambiguous = false;
+
             bool allowErrorRecovery = false;
             for (int i = 0; i < args.Length; i++)
             {
@@ -8743,36 +8926,39 @@ namespace Cnidaria.Cs
                     break;
                 }
             }
+
             for (int i = 0; i < candidates.Length; i++)
             {
                 var m = candidates[i];
                 var ps = m.Parameters;
 
                 // Regular form
-                if (ps.Length == args.Length)
+                if (args.Length <= ps.Length)
                 {
-                    if (TryScoreRegular(m, args, getArgRefKindKeyword, context, out int score))
-                        ConsiderCandidate(m, usesParamsExpansion: false, score);
+                    if (TryScoreRegular(m, args, getArgRefKindKeyword, getArgName, context, out int score, out var map))
+                        ConsiderCandidate(m, usesParamsExpansion: false, score, map, paramsElementArgIndices: null);
                 }
 
                 // Params expansion form
                 if (ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1)
                 {
                     int fixedCount = ps.Length - 1;
-                    if (args.Length >= fixedCount)
+
+                    if (TryScoreParamsExpanded(m, args, fixedCount, at.ElementType, getArgRefKindKeyword, getArgName,
+                        context, out int score, out var map, out var paramsElementArgIndices))
                     {
-                        if (TryScoreParamsExpanded(m, args, fixedCount, at.ElementType, getArgRefKindKeyword, context, out int score))
-                        {
-                            // Penalize params-expansion so that non-expanded matches win when both are viable.
-                            score += 5;
-                            ConsiderCandidate(m, usesParamsExpansion: true, score);
-                        }
+                        // Penalize params-expansion so that non-expanded matches win when both are viable.
+                        score += 5;
+                        ConsiderCandidate(m, usesParamsExpansion: true, score, map, paramsElementArgIndices);
                     }
                 }
             }
+
             if (best is null)
             {
-                diagnostics.Add(new Diagnostic("CN_OVL001", DiagnosticSeverity.Error,
+                diagnostics.Add(new Diagnostic(
+                    "CN_OVL001",
+                    DiagnosticSeverity.Error,
                     "No overload matches the argument list.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return false;
@@ -8780,49 +8966,95 @@ namespace Cnidaria.Cs
 
             if (ambiguous)
             {
-                diagnostics.Add(new Diagnostic("CN_OVL002", DiagnosticSeverity.Error,
+                diagnostics.Add(new Diagnostic(
+                    "CN_OVL002",
+                    DiagnosticSeverity.Error,
                     "Overload resolution is ambiguous.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return false;
             }
-            var converted = ImmutableArray.CreateBuilder<BoundExpression>(best.Parameters.Length);
+
+            var chosenMap = bestArgToParamMap;
+            if (chosenMap is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OVL_INTERNAL001",
+                    DiagnosticSeverity.Error,
+                    "Internal error: overload resolution map is missing.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return false;
+            }
+
+            var converted = new BoundExpression[best.Parameters.Length];
             if (!bestUsesParamsExpansion)
             {
+                var ps = best.Parameters;
+                var assigned = new bool[ps.Length];
+
                 for (int a = 0; a < args.Length; a++)
                 {
-                    converted.Add(ApplyConversion(
+                    int p = chosenMap[a];
+                    assigned[p] = true;
+
+                    converted[p] = ApplyConversion(
                         exprSyntax: getArgExprSyntax(a),
                         expr: args[a],
-                        targetType: best.Parameters[a].Type,
+                        targetType: ps[p].Type,
                         diagnosticNode: diagnosticNode,
                         context: context,
                         diagnostics: diagnostics,
-                        requireImplicit: true));
+                        requireImplicit: true);
                 }
+
+                for (int p = 0; p < ps.Length; p++)
+                    if (!assigned[p])
+                        converted[p] = CreateOmittedArgument(ps[p]);
             }
             else
             {
                 var ps = best.Parameters;
                 int fixedCount = ps.Length - 1;
-                var paramsParam = ps[^1];
+                int paramsIndex = ps.Length - 1;
+
+                var paramsParam = ps[paramsIndex];
                 var paramsArrayType = (ArrayTypeSymbol)paramsParam.Type;
                 var elementType = paramsArrayType.ElementType;
 
-                // Fixed parameters
-                for (int a = 0; a < fixedCount; a++)
+                // Figure out which arg supplies each fixed parameter
+                var fixedArgIndex = new int[fixedCount];
+                for (int p = 0; p < fixedCount; p++)
+                    fixedArgIndex[p] = -1;
+
+                for (int a = 0; a < args.Length; a++)
                 {
-                    converted.Add(ApplyConversion(
-                        exprSyntax: getArgExprSyntax(a),
-                        expr: args[a],
-                        targetType: ps[a].Type,
-                        diagnosticNode: diagnosticNode,
-                        context: context,
-                        diagnostics: diagnostics,
-                        requireImplicit: true));
+                    int p = chosenMap[a];
+                    if ((uint)p < (uint)fixedCount)
+                        fixedArgIndex[p] = a;
                 }
 
-                // Pack remaining arguments into the params array
-                int elemCount = args.Length - fixedCount;
+                // Fixed parameters
+                for (int p = 0; p < fixedCount; p++)
+                {
+                    int a = fixedArgIndex[p];
+                    if (a >= 0)
+                    {
+                        converted[p] = ApplyConversion(
+                            exprSyntax: getArgExprSyntax(a),
+                            expr: args[a],
+                            targetType: ps[p].Type,
+                            diagnosticNode: diagnosticNode,
+                            context: context,
+                            diagnostics: diagnostics,
+                            requireImplicit: true);
+                    }
+                    else
+                    {
+                        converted[p] = CreateOmittedArgument(ps[p]);
+                    }
+                }
+
+                var paramElems = bestParamsElementArgIndices ?? Array.Empty<int>();
+                int elemCount = paramElems.Length;
                 var int32Type = context.Compilation.GetSpecialType(SpecialType.System_Int32);
 
                 var arrLocal = NewTemp("<params$>", paramsArrayType);
@@ -8842,7 +9074,7 @@ namespace Cnidaria.Cs
                 // arr[i] = (T)arg
                 for (int i = 0; i < elemCount; i++)
                 {
-                    int argIndex = fixedCount + i;
+                    int argIndex = paramElems[i];
 
                     var idxLit = new BoundLiteralExpression(diagnosticNode, int32Type, i);
                     var elemAccess = new BoundArrayElementAccessExpression(
@@ -8871,124 +9103,347 @@ namespace Cnidaria.Cs
                     sideEffects: sideEffects.ToImmutable(),
                     value: new BoundLocalExpression(diagnosticNode, arrLocal));
 
-                converted.Add(packedArray);
+                converted[paramsIndex] = packedArray;
             }
+
             chosen = best;
-            convertedArgs = converted.ToImmutable();
+            convertedArgs = ImmutableArray.Create(converted);
             return true;
 
-            void ConsiderCandidate(MethodSymbol m, bool usesParamsExpansion, int score)
+            void ConsiderCandidate(MethodSymbol m, bool usesParamsExpansion, int score, int[] argToParamMap, int[]? paramsElementArgIndices)
             {
                 if (score < bestScore)
                 {
                     bestScore = score;
                     best = m;
                     bestUsesParamsExpansion = usesParamsExpansion;
+                    bestArgToParamMap = argToParamMap;
+                    bestParamsElementArgIndices = paramsElementArgIndices;
                     ambiguous = false;
+                    return;
                 }
-                else if (score == bestScore)
+
+                if (score != bestScore)
+                    return;
+
+                if (ReferenceEquals(best, m))
                 {
-                    if (ReferenceEquals(best, m) && bestUsesParamsExpansion && !usesParamsExpansion)
+                    if (bestUsesParamsExpansion && !usesParamsExpansion)
                     {
                         bestUsesParamsExpansion = false;
+                        bestArgToParamMap = argToParamMap;
+                        bestParamsElementArgIndices = paramsElementArgIndices;
                         ambiguous = false;
-                        return;
                     }
-
-                    if (!ReferenceEquals(best, m) || bestUsesParamsExpansion != usesParamsExpansion)
-                        ambiguous = true;
+                    return;
                 }
+
+                ambiguous = true;
             }
+
             bool TryScoreRegular(
                 MethodSymbol m,
                 ImmutableArray<BoundExpression> args,
                 Func<int, SyntaxToken?>? getArgRefKindKeyword,
+                Func<int, string?>? getArgName,
                 BindingContext context,
-                out int score)
+                out int score,
+                out int[] argToParamMap)
             {
                 score = 0;
+                argToParamMap = Array.Empty<int>();
+
                 var ps = m.Parameters;
+                if (!TryBuildRegularArgMap(ps, args.Length, getArgName, out var map, out var assigned))
+                    return false;
+
+                for (int p = 0; p < ps.Length; p++)
+                {
+                    if (!assigned[p] && !IsOmittable(ps[p]))
+                        return false;
+                }
 
                 for (int a = 0; a < args.Length; a++)
                 {
                     if (allowErrorRecovery && ShouldSuppressCascade(args[a]))
                         continue;
 
+                    int p = map[a];
+
                     if (getArgRefKindKeyword is not null &&
-                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
+                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[p]))
                     {
-                        score = 0;
                         return false;
                     }
 
-                    var conv = ClassifyConversion(args[a], ps[a].Type, context);
+                    var conv = ClassifyConversion(args[a], ps[p].Type, context);
                     if (!conv.Exists || !conv.IsImplicit)
-                    {
-                        score = 0;
                         return false;
-                    }
 
                     score += ConversionScore(conv.Kind);
                 }
 
+                argToParamMap = map;
                 return true;
             }
             bool TryScoreParamsExpanded(
-                MethodSymbol m,
-                ImmutableArray<BoundExpression> args,
-                int fixedCount,
-                TypeSymbol elementType,
-                Func<int, SyntaxToken?>? getArgRefKindKeyword,
-                BindingContext context,
-                out int score)
+        MethodSymbol m,
+        ImmutableArray<BoundExpression> args,
+        int fixedCount,
+        TypeSymbol elementType,
+        Func<int, SyntaxToken?>? getArgRefKindKeyword,
+        Func<int, string?>? getArgName,
+        BindingContext context,
+        out int score,
+        out int[] argToParamMap,
+        out int[] paramsElementArgIndices)
             {
                 score = 0;
-                var ps = m.Parameters;
+                argToParamMap = Array.Empty<int>();
+                paramsElementArgIndices = Array.Empty<int>();
 
-                // Fixed parameters
-                for (int a = 0; a < fixedCount; a++)
+                var ps = m.Parameters;
+                if (ps.Length == 0)
+                    return false;
+
+                if (!TryBuildParamsExpandedArgMap(ps, args.Length, fixedCount, getArgName,
+                    out var map, out var fixedAssigned, out var elems))
+                {
+                    return false;
+                }
+
+                // Any fixed parameter not assigned by an argument must have a default.
+                for (int p = 0; p < fixedCount; p++)
+                {
+                    if (!fixedAssigned[p] && !ps[p].HasExplicitDefault)
+                        return false;
+                }
+
+                int paramsIndex = ps.Length - 1;
+
+                for (int a = 0; a < args.Length; a++)
                 {
                     if (allowErrorRecovery && ShouldSuppressCascade(args[a]))
                         continue;
 
-                    if (getArgRefKindKeyword is not null &&
-                        !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[a]))
-                    {
-                        score = 0;
-                        return false;
-                    }
+                    int p = map[a];
 
-                    var conv = ClassifyConversion(args[a], ps[a].Type, context);
-                    if (!conv.Exists || !conv.IsImplicit)
+                    if (p != paramsIndex)
                     {
-                        score = 0;
-                        return false;
-                    }
+                        if (getArgRefKindKeyword is not null &&
+                            !ArgumentRefKindMatchesParameter(getArgRefKindKeyword(a), ps[p]))
+                        {
+                            return false;
+                        }
 
-                    score += ConversionScore(conv.Kind);
+                        var conv = ClassifyConversion(args[a], ps[p].Type, context);
+                        if (!conv.Exists || !conv.IsImplicit)
+                            return false;
+
+                        score += ConversionScore(conv.Kind);
+                    }
+                    else
+                    {
+                        if (getArgRefKindKeyword is not null &&
+                            GetArgRefKind(getArgRefKindKeyword(a)) != ParameterRefKind.None)
+                        {
+                            return false;
+                        }
+
+                        var conv = ClassifyConversion(args[a], elementType, context);
+                        if (!conv.Exists || !conv.IsImplicit)
+                            return false;
+
+                        score += ConversionScore(conv.Kind);
+                    }
                 }
 
-                // Expanded elements
-                for (int a = fixedCount; a < args.Length; a++)
+                argToParamMap = map;
+                paramsElementArgIndices = elems;
+                return true;
+            }
+
+            static bool TryBuildRegularArgMap(
+                ImmutableArray<ParameterSymbol> parameters,
+                int argCount,
+                Func<int, string?>? getArgName,
+                out int[] map,
+                out bool[] assigned)
+            {
+                map = new int[argCount];
+                assigned = new bool[parameters.Length];
+
+                // Fast path for purely positional
+                if (getArgName is null)
                 {
-                    if (getArgRefKindKeyword is not null &&
-                        GetArgRefKind(getArgRefKindKeyword(a)) != ParameterRefKind.None)
+                    for (int i = 0; i < argCount; i++)
                     {
-                        score = 0;
-                        return false;
+                        map[i] = i;
+                        if ((uint)i < (uint)assigned.Length)
+                            assigned[i] = true;
+                    }
+                    return true;
+                }
+
+                int nextPositional = 0;
+
+                for (int a = 0; a < argCount; a++)
+                {
+                    var name = getArgName(a);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        int p = IndexOfParameter(parameters, name!);
+                        if (p < 0) return false;
+                        if (assigned[p]) return false;
+
+                        assigned[p] = true;
+                        map[a] = p;
+                        continue;
                     }
 
-                    var conv = ClassifyConversion(args[a], elementType, context);
-                    if (!conv.Exists || !conv.IsImplicit)
-                    {
-                        score = 0;
-                        return false;
-                    }
+                    while (nextPositional < parameters.Length && assigned[nextPositional])
+                        nextPositional++;
 
-                    score += ConversionScore(conv.Kind);
+                    if (nextPositional >= parameters.Length)
+                        return false;
+
+                    assigned[nextPositional] = true;
+                    map[a] = nextPositional;
+                    nextPositional++;
                 }
 
                 return true;
+            }
+
+            static bool TryBuildParamsExpandedArgMap(
+                ImmutableArray<ParameterSymbol> parameters,
+                int argCount,
+                int fixedCount,
+                Func<int, string?>? getArgName,
+                out int[] map,
+                out bool[] fixedAssigned,
+                out int[] paramsElementArgIndices)
+            {
+                map = new int[argCount];
+                fixedAssigned = new bool[Math.Max(0, fixedCount)];
+                paramsElementArgIndices = Array.Empty<int>();
+                int paramsIndex = parameters.Length - 1;
+
+                // Fast path for positional
+                if (getArgName is null)
+                {
+                    var elems = new int[Math.Max(0, argCount - fixedCount)];
+                    int e = 0;
+
+                    for (int a = 0; a < argCount; a++)
+                    {
+                        if (a < fixedCount)
+                        {
+                            map[a] = a;
+                            fixedAssigned[a] = true;
+                        }
+                        else
+                        {
+                            map[a] = paramsIndex;
+                            elems[e++] = a;
+                        }
+                    }
+
+                    paramsElementArgIndices = elems;
+                    return true;
+                }
+
+                var elemList = new List<int>();
+                int nextPositional = 0;
+
+                for (int a = 0; a < argCount; a++)
+                {
+                    var name = getArgName(a);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        int p = IndexOfParameter(parameters, name!);
+                        if (p < 0) return false;
+
+                        if (p != paramsIndex)
+                        {
+                            if ((uint)p >= (uint)fixedCount) return false;
+                            if (fixedAssigned[p]) return false;
+
+                            fixedAssigned[p] = true;
+                            map[a] = p;
+                        }
+                        else
+                        {
+                            map[a] = paramsIndex;
+                            elemList.Add(a);
+                        }
+
+                        continue;
+                    }
+
+                    while (nextPositional < fixedCount && fixedAssigned[nextPositional])
+                        nextPositional++;
+
+                    if (nextPositional < fixedCount)
+                    {
+                        fixedAssigned[nextPositional] = true;
+                        map[a] = nextPositional;
+                        nextPositional++;
+                    }
+                    else
+                    {
+                        map[a] = paramsIndex;
+                        elemList.Add(a);
+                    }
+                }
+
+                paramsElementArgIndices = elemList.Count == 0 ? Array.Empty<int>() : elemList.ToArray();
+                return true;
+            }
+
+            static int IndexOfParameter(ImmutableArray<ParameterSymbol> parameters, string name)
+            {
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    if (string.Equals(parameters[i].Name, name, StringComparison.Ordinal))
+                        return i;
+                }
+                return -1;
+            }
+
+            static bool IsOmittable(ParameterSymbol p)
+                => p.IsParams || p.HasExplicitDefault;
+
+            BoundExpression CreateOmittedArgument(ParameterSymbol p)
+            {
+                if (p.IsParams)
+                {
+                    if (p.Type is not ArrayTypeSymbol at || at.Rank != 1)
+                    {
+                        var bad = new BoundBadExpression(diagnosticNode);
+                        bad.SetType(p.Type);
+                        return bad;
+                    }
+
+                    var int32Type = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                    var zero = new BoundLiteralExpression(diagnosticNode, int32Type, 0);
+                    return new BoundArrayCreationExpression(diagnosticNode, at, at.ElementType, zero, initializerOpt: null);
+                }
+
+                if (!p.HasExplicitDefault || !p.DefaultValueOpt.HasValue)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_OVL003",
+                        DiagnosticSeverity.Error,
+                        $"Missing argument for parameter '{p.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                    var bad = new BoundBadExpression(diagnosticNode);
+                    bad.SetType(p.Type);
+                    return bad;
+                }
+
+                return new BoundLiteralExpression(diagnosticNode, p.Type, p.DefaultValueOpt.Value);
             }
             static int ConversionScore(ConversionKind k) => k switch
             {
@@ -9582,13 +10037,7 @@ namespace Cnidaria.Cs
                 return ptrArith;
             }
 
-            var promoted = GetBinaryNumericPromotionType(
-                ctx.Compilation,
-                ctx.SemanticModel.SyntaxTree,
-                left.Type,
-                one.Type,
-                operatorSyntax,
-                diagnostics);
+            var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, one, operatorSyntax, diagnostics);
 
             if (promoted is null || promoted is ErrorTypeSymbol)
                 return new BoundBadExpression(operatorSyntax);
@@ -9780,6 +10229,9 @@ namespace Cnidaria.Cs
 
             switch (op)
             {
+                case BoundUnaryOperatorKind.UnaryPlus:
+                    return operand.ConstantValueOpt;
+
                 case BoundUnaryOperatorKind.LogicalNot:
                     if (v is bool b) return new Optional<object>(!b);
                     break;
@@ -10102,8 +10554,7 @@ namespace Cnidaria.Cs
             }
 
             {
-                var promoted = GetBinaryNumericPromotionType(
-                    ctx.Compilation, ctx.SemanticModel.SyntaxTree, left.Type, right.Type, bin, diagnostics);
+                var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, bin, diagnostics);
                 if (promoted is null || promoted is ErrorTypeSymbol)
                     return new BoundBadExpression(bin);
 
@@ -10168,7 +10619,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(bin);
             }
 
-            var promoted = GetBinaryIntegralPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left.Type, right.Type, bin, diagnostics);
+            var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, bin, diagnostics);
             if (promoted is null || promoted is ErrorTypeSymbol)
                 return new BoundBadExpression(bin);
 
@@ -10235,8 +10686,7 @@ namespace Cnidaria.Cs
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
             if (IsNumeric(left.Type.SpecialType) && IsNumeric(right.Type.SpecialType))
             {
-                var promoted = GetBinaryNumericPromotionType(
-                    ctx.Compilation, ctx.SemanticModel.SyntaxTree, left.Type, right.Type, bin, diagnostics);
+                var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, bin, diagnostics);
                 if (promoted is null || promoted is ErrorTypeSymbol) return new BoundBadExpression(bin);
 
                 left = ApplyConversion(bin.Left, left, promoted, bin, ctx, diagnostics, requireImplicit: true);
@@ -10453,8 +10903,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(bin);
             }
 
-            var promoted = GetBinaryNumericPromotionType(
-                ctx.Compilation, ctx.SemanticModel.SyntaxTree, left.Type, right.Type, bin, diagnostics);
+            var promoted = GetBinaryNumericPromotionType(ctx.Compilation, ctx.SemanticModel.SyntaxTree, left, right, bin, diagnostics);
             if (promoted is null || promoted is ErrorTypeSymbol) return new BoundBadExpression(bin);
 
             left = ApplyConversion(bin.Left, left, promoted, bin, ctx, diagnostics, requireImplicit: true);
@@ -10510,7 +10959,118 @@ namespace Cnidaria.Cs
 
             if (left.HasErrors || right.HasErrors) return new BoundBadExpression(bin);
 
-            return new BoundBinaryExpression(bin, op, leftPromoted, left, right, Optional<object>.None);
+            var constValue = FoldShiftConstant(op, leftPromoted, left, right);
+            return new BoundBinaryExpression(bin, op, leftPromoted, left, right, constValue);
+        }
+        private static Optional<object> FoldShiftConstant(
+            BoundBinaryOperatorKind op,
+            TypeSymbol leftType,
+            BoundExpression left,
+            BoundExpression right)
+        {
+            if (!left.ConstantValueOpt.HasValue || !right.ConstantValueOpt.HasValue)
+                return Optional<object>.None;
+
+            if (right.ConstantValueOpt.Value is not int shift)
+                return Optional<object>.None;
+
+            int mask = leftType.SpecialType switch
+            {
+                SpecialType.System_Int32 or SpecialType.System_UInt32 => 0x1F,
+                SpecialType.System_Int64 or SpecialType.System_UInt64 => 0x3F,
+                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => RuntimeTypeSystem.PointerSize == 4 ? 0x1F : 0x3F,
+                _ => 0x1F
+            };
+            shift &= mask;
+
+            object lv = left.ConstantValueOpt.Value!;
+            switch (leftType.SpecialType)
+            {
+                case SpecialType.System_Int32:
+                    if (lv is int i32)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(i32 << shift),
+                            BoundBinaryOperatorKind.RightShift => i32 >> shift,
+                            BoundBinaryOperatorKind.UnsignedRightShift => (int)((uint)i32 >> shift),
+                            _ => 0
+                        });
+                    break;
+
+                case SpecialType.System_UInt32:
+                    if (lv is uint u32)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(u32 << shift),
+                            BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => u32 >> shift,
+                            _ => 0u
+                        });
+                    break;
+
+                case SpecialType.System_Int64:
+                    if (lv is long i64)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(i64 << shift),
+                            BoundBinaryOperatorKind.RightShift => i64 >> shift,
+                            BoundBinaryOperatorKind.UnsignedRightShift => (long)((ulong)i64 >> shift),
+                            _ => 0L
+                        });
+                    break;
+
+                case SpecialType.System_UInt64:
+                    if (lv is ulong u64)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(u64 << shift),
+                            BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => u64 >> shift,
+                            _ => 0UL
+                        });
+                    break;
+
+                case SpecialType.System_IntPtr:
+                    if (RuntimeTypeSystem.PointerSize == 4 && lv is int ni32)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(ni32 << shift),
+                            BoundBinaryOperatorKind.RightShift => ni32 >> shift,
+                            BoundBinaryOperatorKind.UnsignedRightShift => (int)((uint)ni32 >> shift),
+                            _ => 0
+                        });
+                    if (RuntimeTypeSystem.PointerSize == 8 && (lv is long or int))
+                    {
+                        long ni64 = lv is long l ? l : (int)lv;
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(ni64 << shift),
+                            BoundBinaryOperatorKind.RightShift => ni64 >> shift,
+                            BoundBinaryOperatorKind.UnsignedRightShift => (long)((ulong)ni64 >> shift),
+                            _ => 0L
+                        });
+                    }
+                    break;
+
+                case SpecialType.System_UIntPtr:
+                    if (RuntimeTypeSystem.PointerSize == 4 && lv is uint nu32)
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(nu32 << shift),
+                            BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => nu32 >> shift,
+                            _ => 0u
+                        });
+                    if (RuntimeTypeSystem.PointerSize == 8 && (lv is ulong or uint))
+                    {
+                        ulong nu64 = lv is ulong ul ? ul : (uint)lv;
+                        return new Optional<object>(op switch
+                        {
+                            BoundBinaryOperatorKind.LeftShift => unchecked(nu64 << shift),
+                            BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => nu64 >> shift,
+                            _ => 0UL
+                        });
+                    }
+                    break;
+            }
+            return Optional<object>.None;
         }
         private static TypeSymbol? GetBinaryIntegralPromotionType(
             Compilation compilation,
@@ -10648,6 +11208,36 @@ namespace Cnidaria.Cs
                 _ => Optional<object>.None
             };
         }
+        private static bool IsSignedIntegral(SpecialType t) => t is
+                SpecialType.System_Int8 or SpecialType.System_Int16 or
+                SpecialType.System_Int32 or SpecialType.System_Int64;
+        private static TypeSymbol? GetBinaryNumericPromotionType(
+            Compilation compilation,
+            SyntaxTree tree,
+            BoundExpression left,
+            BoundExpression right,
+            SyntaxNode diagnosticNode,
+            DiagnosticBag diagnostics)
+        {
+            var ls = left.Type.SpecialType;
+            var rs = right.Type.SpecialType;
+
+            if (ls == SpecialType.System_UInt64 || rs == SpecialType.System_UInt64)
+            {
+                var otherExpr = (ls == SpecialType.System_UInt64) ? right : left;
+
+                if (IsSignedIntegral(otherExpr.Type.SpecialType))
+                {
+                    var u64 = compilation.GetSpecialType(SpecialType.System_UInt64);
+                    var conv = ClassifyConversion(otherExpr, u64);
+
+                    if (conv.Kind == ConversionKind.ImplicitConstant)
+                        return u64;
+                }
+            }
+
+            return GetBinaryNumericPromotionType(compilation, tree, left.Type, right.Type, diagnosticNode, diagnostics);
+        }
         private static TypeSymbol? GetBinaryNumericPromotionType(
             Compilation compilation,
             SyntaxTree tree,
@@ -10659,8 +11249,6 @@ namespace Cnidaria.Cs
             var ls = left.SpecialType;
             var rs = right.SpecialType;
 
-            bool IsSignedIntegral(SpecialType t) => t is
-                SpecialType.System_Int8 or SpecialType.System_Int16 or SpecialType.System_Int32 or SpecialType.System_Int64;
             bool IsNativeInt(SpecialType t) => t is SpecialType.System_IntPtr or SpecialType.System_UIntPtr;
 
             if (!IsNumeric(ls) || !IsNumeric(rs))
@@ -13422,6 +14010,7 @@ namespace Cnidaria.Cs
                 args: boundArgs,
                 getArgExprSyntax: i => argSyntaxes[i].Expression,
                 getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
                 chosen: out var chosen,
                 convertedArgs: out var convertedArgs,
                 context: context,
@@ -14151,6 +14740,9 @@ namespace Cnidaria.Cs
             return new Conversion(ConversionKind.None);
 
             static bool IsIntegralConstantSource(SpecialType t) => t is
+                SpecialType.System_Int8 or SpecialType.System_UInt8 or
+                SpecialType.System_Int16 or SpecialType.System_UInt16 or
+                SpecialType.System_Char or
                 SpecialType.System_Int32 or SpecialType.System_UInt32 or
                 SpecialType.System_Int64 or SpecialType.System_UInt64;
 

@@ -476,10 +476,50 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        private void ApplyParamDefaultValues(
+            MethodSymbol method, int paramListRid, int paramCount, Dictionary<int, ConstantRow> constByParent)
+        {
+            if (method is null || paramCount <= 0)
+                return;
+            if (constByParent is null || constByParent.Count == 0)
+                return;
+
+            int totalParams = _md.GetRowCount(MetadataTableKind.Param);
+            if (totalParams == 0)
+                return;
+            if (paramListRid <= 0 || paramListRid > totalParams)
+                return;
+
+            var ps = method.Parameters;
+            for (int i = 0; i < paramCount && i < ps.Length; i++)
+            {
+                int rid = paramListRid + i;
+                if (rid > totalParams)
+                    break;
+
+                var row = _md.GetParam(rid);
+                if (row.Sequence != (ushort)(i + 1))
+                    continue;
+
+                var p = ps[i];
+                if (p.Type is ByRefTypeSymbol)
+                    continue;
+
+                int parentTok = MetadataToken.Make(MetadataToken.ParamDef, rid);
+                if (!constByParent.TryGetValue(parentTok, out var crow))
+                    continue;
+
+                var cval = DecodeConstant(p.Type, crow);
+                if (cval.HasValue)
+                    p.SetDefaultValue(cval);
+            }
+        }
         private Dictionary<int, MethodSymbol> AddMethods(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid)
         {
             var methodByRid = new Dictionary<int, MethodSymbol>();
-
+            var constByParent = new Dictionary<int, ConstantRow>();
+            for (int i = 0; i < _md.GetRowCount(MetadataTableKind.Constant); i++)
+                constByParent[_md.GetConstant(i + 1).ParentToken] = _md.GetConstant(i + 1);
             for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
             {
                 var declaringType = typeByRid[rid];
@@ -527,10 +567,23 @@ namespace Cnidaria.Cs
                     var retType = ReadType(core, typeByRid, ref reader, declaringType, ImmutableArray<TypeParameterSymbol>.Empty);
 
                     var ps = ImmutableArray.CreateBuilder<(string name, TypeSymbol type)>((int)paramCount);
+                    int totalParams = _md.GetRowCount(MetadataTableKind.Param);
                     for (int i = 0; i < paramCount; i++)
                     {
                         var pt = ReadType(core, typeByRid, ref reader, declaringType, ImmutableArray<TypeParameterSymbol>.Empty);
-                        ps.Add(($"arg{i}", pt));
+                        string paramName = $"arg{i}";
+                        int prid = mdRow.ParamList + i;
+                        if (mdRow.ParamList > 0 && prid > 0 && prid <= totalParams)
+                        {
+                            var prow = _md.GetParam(prid);
+                            if (prow.Sequence == (ushort)(i + 1) && prow.Name != 0)
+                            {
+                                var decodedName = _md.GetString(prow.Name);
+                                if (!string.IsNullOrEmpty(decodedName))
+                                    paramName = decodedName;
+                            }
+                        }
+                        ps.Add((paramName, pt));
                     }
 
                     bool isCtor =
@@ -559,7 +612,7 @@ namespace Cnidaria.Cs
                         typeParameters: mtps);
 
                     ApplyParamRefKinds(ms, mdRow.ParamList, (int)paramCount);
-
+                    ApplyParamDefaultValues(ms, mdRow.ParamList, (int)paramCount, constByParent);
                     methodByRid[mrid] = ms;
                 }
             }

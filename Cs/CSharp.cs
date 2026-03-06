@@ -397,10 +397,10 @@ namespace Cnidaria.Cs
                 int c = a.cost.CompareTo(b.cost);
                 if (c != 0) return c;
 
-                c = a.defaultsUsed.CompareTo(b.defaultsUsed);
+                c = a.usedParams.CompareTo(b.usedParams); // false < true
                 if (c != 0) return c;
 
-                c = a.usedParams.CompareTo(b.usedParams); // false < true
+                c = a.defaultsUsed.CompareTo(b.defaultsUsed);
                 if (c != 0) return c;
 
                 return b.values.Length.CompareTo(a.values.Length);
@@ -519,13 +519,13 @@ namespace Cnidaria.Cs
             }
         }
         private static bool TryBindPositionalArguments(
-            Compilation compilation,
-            MethodSymbol m,
-            string[] callArgs,
-            out object?[] values,
-            out int cost,
-            out int defaultsUsed,
-            out bool usedParams)
+    Compilation compilation,
+    MethodSymbol m,
+    string[] callArgs,
+    out object?[] values,
+    out int cost,
+    out int defaultsUsed,
+    out bool usedParams)
         {
             cost = 0;
             defaultsUsed = 0;
@@ -536,13 +536,14 @@ namespace Cnidaria.Cs
 
             int ai = 0;
 
-            bool hasParams = ps.Length > 0 && ps[ps.Length - 1].IsParams && IsParamsStringArray(ps[ps.Length - 1].Type);
+            bool hasParams = ps.Length > 0 && ps[^1].IsParams && IsParamsStringArray(ps[^1].Type);
             int fixedCount = hasParams ? ps.Length - 1 : ps.Length;
 
             // Bind fixed parameters
             for (int pi = 0; pi < fixedCount; pi++)
             {
                 var p = ps[pi];
+
                 if (ai < callArgs.Length)
                 {
                     if (!TryParseStringToType(callArgs[ai], p.Type, out var v, out var c))
@@ -554,16 +555,15 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    if (!TryGetOptionalDefault(compilation, m, pi, out var dv))
+                    if (!TryGetOptionalDefault(p, out var dv))
                         return false;
 
                     values[pi] = dv;
                     defaultsUsed++;
-                    cost += 1000; // defaults penalty
                 }
             }
 
-            // Bind params
+            // Bind params string[]
             if (hasParams)
             {
                 usedParams = true;
@@ -575,17 +575,15 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < rest; i++)
                     arr[i] = callArgs[ai + i];
 
-                values[ps.Length - 1] = arr;
+                values[^1] = arr;
 
                 cost += 5;
+
                 ai += rest;
             }
 
             // Extra args => reject
-            if (ai != callArgs.Length)
-                return false;
-
-            return true;
+            return ai == callArgs.Length;
         }
         private static bool IsParamsStringArray(TypeSymbol t)
         {
@@ -594,35 +592,18 @@ namespace Cnidaria.Cs
             return at.ElementType.SpecialType == SpecialType.System_String;
         }
 
-        private static bool TryGetOptionalDefault(Compilation compilation, MethodSymbol m, int paramIndex, out object? value)
+        private static bool TryGetOptionalDefault(ParameterSymbol p, out object? value)
         {
             value = null;
 
-            var decls = m.DeclaringSyntaxReferences;
-            for (int i = 0; i < decls.Length; i++)
-            {
-                var sr = decls[i];
-                if (sr.Node is not MethodDeclarationSyntax md)
-                    continue;
+            if (!p.HasExplicitDefault)
+                return false;
 
-                var plist = md.ParameterList.Parameters;
-                if (paramIndex < 0 || paramIndex >= plist.Count)
-                    return false;
+            if (!p.DefaultValueOpt.HasValue)
+                return false;
 
-                var ps = plist[paramIndex];
-                if (ps.Default is null)
-                    return false;
-
-                var model = compilation.GetSemanticModel(sr.SyntaxTree);
-                var opt = model.GetConstantValue(ps.Default.Value);
-                if (!opt.HasValue)
-                    return false;
-
-                value = opt.Value; // may be null
-                return true;
-            }
-
-            return false;
+            value = p.DefaultValueOpt.Value;
+            return true;
         }
         private static ArgLexKind ClassifyArg(string s)
         {

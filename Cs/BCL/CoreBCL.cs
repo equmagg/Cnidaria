@@ -848,6 +848,30 @@
             return dstStr;
         }
 
+        public string[] Split(char separator)
+        {
+            return SplitInternal(new ReadOnlySpan<char>(in separator), int.MaxValue, StringSplitOptions.None);
+        }
+
+        public string[] Split(char separator, StringSplitOptions options)
+        {
+            return SplitInternal(new ReadOnlySpan<char>(in separator), int.MaxValue, options);
+        }
+
+        public string[] Split(char separator, int count, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitInternal(new ReadOnlySpan<char>(in separator), count, options);
+        }
+        public string[] Split(char[] separator, int count, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitInternal(new ReadOnlySpan<char>(separator), count, options);
+        }
+
+        public string[] Split(char[] separator, StringSplitOptions options)
+        {
+            return SplitInternal(new ReadOnlySpan<char>(separator), int.MaxValue, options);
+        }
+
         private static void CheckStringSplitOptions(StringSplitOptions options)
         {
             const StringSplitOptions All =
@@ -858,6 +882,170 @@
             if ((options & ~All) != 0)
                 throw new ArgumentException("options");
         }
+
+        private string[] SplitInternal(ReadOnlySpan<char> separators, int count, StringSplitOptions options)
+        {
+            CheckStringSplitOptions(options);
+
+            if (count < 0)
+                throw new ArgumentOutOfRangeException("count");
+
+            if (count == 0)
+                return Array.Empty<string>();
+
+            if (count == 1 || Length == 0)
+                return CreateSplitArrayOfThisAsSoleValue(options, count);
+
+            bool trimEntries = (options & StringSplitOptions.TrimEntries) != 0;
+            bool removeEmpty = (options & StringSplitOptions.RemoveEmptyEntries) != 0;
+
+            int len = Length;
+
+            int maxPossible = len + 1;
+            int capacity = (count < maxPossible) ? count : maxPossible;
+
+            string[] results = new string[capacity];
+            int resultCount = 0;
+
+            int start = 0;
+
+            while (resultCount < count - 1)
+            {
+                int sepIndex = IndexOfAnySeparator(separators, start);
+                if (sepIndex < 0)
+                    break;
+
+                int segStart = start;
+                int segEnd = sepIndex;
+
+                if (trimEntries)
+                    TrimRange(segStart, segEnd, out segStart, out segEnd);
+
+                if (!removeEmpty || segStart != segEnd)
+                {
+                    results[resultCount++] = Substring(segStart, segEnd - segStart);
+                }
+
+                start = sepIndex + 1;
+
+                if (removeEmpty && resultCount == count - 1)
+                {
+                    start = SkipEmptyEntriesBeforeLast(separators, start, trimEntries);
+                    break;
+                }
+            }
+
+            // Last element is the remainder
+            int lastStart = start;
+            int lastEnd = len;
+
+            if (trimEntries)
+                TrimRange(lastStart, lastEnd, out lastStart, out lastEnd);
+
+            if (!removeEmpty || lastStart != lastEnd)
+            {
+                results[resultCount++] = Substring(lastStart, lastEnd - lastStart);
+            }
+
+            if (resultCount == results.Length)
+                return results;
+
+            // Shrink to actual length
+            string[] finalArr = new string[resultCount];
+            for (int i = 0; i < resultCount; i++)
+                finalArr[i] = results[i];
+            return finalArr;
+        }
+        private int IndexOfAnySeparator(ReadOnlySpan<char> separators, int startIndex)
+        {
+            int len = Length;
+            if ((uint)startIndex > (uint)len)
+                throw new ArgumentOutOfRangeException("startIndex");
+
+            ref char src = ref GetPinnableReference();
+
+            if (separators.IsEmpty)
+            {
+                for (int i = startIndex; i < len; i++)
+                {
+                    if (Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i)))
+                        return i;
+                }
+                return -1;
+            }
+
+            if (separators.Length == 1)
+            {
+                return IndexOf(separators[0], startIndex);
+            }
+
+            for (int i = startIndex; i < len; i++)
+            {
+                char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
+                for (int j = 0; j < separators.Length; j++)
+                {
+                    if (c == separators[j])
+                        return i;
+                }
+            }
+
+            return -1;
+        }
+        private void TrimRange(int start, int end, out int trimmedStart, out int trimmedEnd)
+        {
+            trimmedStart = start;
+            trimmedEnd = end;
+
+            if (start >= end)
+                return;
+
+            ref char src = ref GetPinnableReference();
+
+            while (trimmedStart < trimmedEnd &&
+                   Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, trimmedStart)))
+            {
+                trimmedStart++;
+            }
+
+            while (trimmedEnd > trimmedStart &&
+                   Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, trimmedEnd - 1)))
+            {
+                trimmedEnd--;
+            }
+        }
+        private int SkipEmptyEntriesBeforeLast(ReadOnlySpan<char> separators, int startIndex, bool trimEntries)
+        {
+            int len = Length;
+            int start = startIndex;
+
+            while (start < len)
+            {
+                int sepIndex = IndexOfAnySeparator(separators, start);
+                int end = (sepIndex >= 0) ? sepIndex : len;
+
+                int segStart = start;
+                int segEnd = end;
+
+                if (trimEntries)
+                    TrimRange(segStart, segEnd, out segStart, out segEnd);
+
+                if (segStart != segEnd)
+                    break;
+
+                if (sepIndex < 0)
+                {
+                    // Only empty till end
+                    start = len;
+                    break;
+                }
+
+                // Skip this empty entry by moving past the separator
+                start = sepIndex + 1;
+            }
+
+            return start;
+        }
+
         private string[] CreateSplitArrayOfThisAsSoleValue(StringSplitOptions options, int count)
         {
             if (count != 0)
@@ -1332,6 +1520,46 @@
         public const double PositiveInfinity = (double)1.0 / (double)(0.0);
         public const double NaN = (double)0.0 / (double)0.0;
 
+        internal const ulong SignMask = 0x8000_0000_0000_0000;
+        internal const int SignShift = 63;
+        internal const byte ShiftedSignMask = (byte)(SignMask >> SignShift);
+
+        internal const ulong BiasedExponentMask = 0x7FF0_0000_0000_0000;
+        internal const int BiasedExponentShift = 52;
+        internal const int BiasedExponentLength = 11;
+        internal const ushort ShiftedBiasedExponentMask = (ushort)(BiasedExponentMask >> BiasedExponentShift);
+
+        internal const ulong TrailingSignificandMask = 0x000F_FFFF_FFFF_FFFF;
+
+        internal const byte MinSign = 0;
+        internal const byte MaxSign = 1;
+
+        internal const ushort MinBiasedExponent = 0x0000;
+        internal const ushort MaxBiasedExponent = 0x07FF;
+
+        internal const ushort ExponentBias = 1023;
+
+        internal const short MinExponent = -1022;
+        internal const short MaxExponent = +1023;
+
+        internal const ulong MinTrailingSignificand = 0x0000_0000_0000_0000;
+        internal const ulong MaxTrailingSignificand = 0x000F_FFFF_FFFF_FFFF;
+
+        internal const int TrailingSignificandLength = 52;
+        internal const int SignificandLength = TrailingSignificandLength + 1;
+
+
+        internal const ulong PositiveZeroBits = 0x0000_0000_0000_0000;
+        internal const ulong NegativeZeroBits = 0x8000_0000_0000_0000;
+
+        internal const ulong EpsilonBits = 0x0000_0000_0000_0001;
+
+        internal const ulong PositiveInfinityBits = 0x7FF0_0000_0000_0000;
+        internal const ulong NegativeInfinityBits = 0xFFF0_0000_0000_0000;
+
+        internal const ulong SmallestNormalBits = 0x0010_0000_0000_0000;
+
+
         public override string ToString()
         {
             return System.Number.DoubleToString(m_value);
@@ -1345,9 +1573,80 @@
             return System.Number.DoubleToString(m_value);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode()
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(m_value);
+
+            if (IsNaNOrZero(m_value))
+            {
+                // Ensure that all NaNs and both zeros have the same hash code
+                bits &= PositiveInfinityBits;
+            }
+
+            return unchecked((int)bits) ^ ((int)(bits >> 32));
+        }
+
+        public static double Abs(double value) => Math.Abs(value);
+        public static double Truncate(double x) => Math.Truncate(x);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsFinite(double d)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(d);
+            return (~bits & PositiveInfinityBits) != 0;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsInfinity(double d)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(Abs(d));
+            return bits == PositiveInfinityBits;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IsNaN(double d) => d != d;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsPositiveInfinity(double d)
+        {
+            return d == PositiveInfinity;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegativeInfinity(double d)
+        {
+            return d == NegativeInfinity;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegative(double d)
+        {
+            return BitConverter.DoubleToInt64Bits(d) < 0;
+        }
+        public static bool IsPositive(double value) => BitConverter.DoubleToInt64Bits(value) >= 0;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNormal(double d)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(Abs(d));
+            return (bits - SmallestNormalBits) < (PositiveInfinityBits - SmallestNormalBits);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsSubnormal(double d)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(Abs(d));
+            return (bits - 1) < MaxTrailingSignificand;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsZero(double d)
+        {
+            return d == 0;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsNaNOrZero(double d)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(d);
+            return ((bits - 1) & ~SignMask) >= PositiveInfinityBits;
+        }
+        public static bool IsInteger(double value) => IsFinite(value) && (value == Truncate(value));
+        public static bool IsEvenInteger(double value) => IsInteger(value) && (Abs(value % 2) == 0);
+        public static bool IsOddInteger(double value) => IsInteger(value) && (Abs(value % 2) == 1);
+
     }
     public struct Decimal
     {
@@ -2432,6 +2731,20 @@
         public static readonly bool IsLittleEndian = true;
 
         public static byte[] GetBytes(bool value) => new byte[] { (value ? (byte)1 : (byte)0) };
+
+
+        public static long DoubleToInt64Bits(double value) => Unsafe.BitCast<double, long>(value);
+        public static double Int64BitsToDouble(long value) => Unsafe.BitCast<long, double>(value);
+
+
+        public static int SingleToInt32Bits(float value) => Unsafe.BitCast<float, int>(value);
+        public static float Int32BitsToSingle(int value) => Unsafe.BitCast<int, float>(value);
+
+        public static ulong DoubleToUInt64Bits(double value) => Unsafe.BitCast<double, ulong>(value);
+        public static double UInt64BitsToDouble(ulong value) => Unsafe.BitCast<ulong, double>(value);
+
+        public static uint SingleToUInt32Bits(float value) => Unsafe.BitCast<float, uint>(value);
+        public static float UInt32BitsToSingle(uint value) => Unsafe.BitCast<uint, float>(value);
     }
     public static class Math
     {
@@ -2630,6 +2943,365 @@
                 }
             }
             return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Abs(double value)
+        {
+            const ulong mask = 0x7FFFFFFFFFFFFFFF;
+            ulong raw = BitConverter.DoubleToUInt64Bits(value);
+
+            return BitConverter.UInt64BitsToDouble(raw & mask);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Abs(float value)
+        {
+            const uint mask = 0x7FFFFFFF;
+            uint raw = BitConverter.SingleToUInt32Bits(value);
+
+            return BitConverter.UInt32BitsToSingle(raw & mask);
+        }
+
+
+        public static double Truncate(double value)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(value);
+
+            int biasedExp = (int)((bits >> 52) & 0x7FF);
+
+            if (biasedExp == 0x7FF)
+                return value;
+
+            int exp = biasedExp - 1023;
+
+            if (exp < 0)
+                return BitConverter.UInt64BitsToDouble(bits & 0x8000_0000_0000_0000UL);
+
+            if (exp >= 52)
+                return value;
+
+            int fracBits = 52 - exp;
+            ulong mask = (1UL << fracBits) - 1UL;
+            bits &= ~mask;
+
+            return BitConverter.UInt64BitsToDouble(bits);
+        }
+
+        public static float Truncate(float value)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(value);
+
+            int biasedExp = (int)((bits >> 23) & 0xFF);
+
+            if (biasedExp == 0xFF)
+                return value;
+
+            int exp = biasedExp - 127;
+
+            if (exp < 0)
+                return BitConverter.UInt32BitsToSingle(bits & 0x8000_0000u);
+
+            if (exp >= 23)
+                return value;
+
+            int fracBits = 23 - exp;
+            uint mask = (1u << fracBits) - 1u;
+            bits &= ~mask;
+
+            return BitConverter.UInt32BitsToSingle(bits);
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Pow(double x, double y)
+        {
+            if (y == 0.0)
+                return 1.0;
+            if (x == 1.0)
+                return 1.0;
+            if (Double.IsNaN(x) || Double.IsNaN(y))
+                return Double.NaN;
+            if (Double.IsInfinity(y))
+            {
+                double ax = Abs(x);
+
+                if (ax == 1.0)
+                    return 1.0;
+
+                if (y > 0.0)
+                    return (ax > 1.0) ? Double.PositiveInfinity : 0.0;
+                else
+                    return (ax > 1.0) ? 0.0 : Double.PositiveInfinity;
+            }
+            if (x == 0.0)
+            {
+                bool xNeg = Double.IsNegative(x);
+                bool odd = Double.IsOddInteger(y);
+
+                if (y > 0.0)
+                {
+                    return (odd && xNeg) ? -0.0 : 0.0;
+                }
+                else
+                {
+                    if (odd)
+                        return xNeg ? Double.NegativeInfinity : Double.PositiveInfinity;
+                    return Double.PositiveInfinity;
+                }
+            }
+
+            if (Double.IsInfinity(x))
+            {
+                if (!Double.IsInteger(y))
+                {
+                    return (x > 0.0)
+                        ? ((y > 0.0) ? Double.PositiveInfinity : 0.0)
+                        : Double.NaN;
+                }
+
+                if (TryGetInt64FromIntegralDouble(y, out long yn))
+                    return PowInteger(x, yn);
+
+                return (y > 0.0) ? Double.PositiveInfinity : 0.0;
+            }
+
+            if (TryGetInt64FromIntegralDouble(y, out long n))
+            {
+                return PowInteger(x, n);
+            }
+            else if (Double.IsInteger(y))
+            {
+                double ax = (x < 0.0) ? -x : x;
+                return Exp(y * Log(ax));
+            }
+
+            if (x < 0.0)
+                return Double.NaN;
+
+            // General case
+            return Exp(y * Log(x));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static double PowInteger(double x, long n)
+        {
+            if (n == 0)
+                return 1.0;
+
+            bool negExp = n < 0;
+
+            ulong e = negExp ? (ulong)(-(n + 1)) + 1UL : (ulong)n;
+
+            double result = 1.0;
+            double baseVal = x;
+
+            while (e != 0)
+            {
+                if ((e & 1UL) != 0)
+                    result *= baseVal;
+
+                baseVal *= baseVal;
+                e >>= 1;
+            }
+
+            return negExp ? (1.0 / result) : result;
+        }
+
+        private static bool TryGetInt64FromIntegralDouble(double value, out long result)
+        {
+            result = 0;
+
+            if (!Double.IsFinite(value))
+                return false;
+
+            if (value == 0.0)
+                return true;
+
+            ulong bits = BitConverter.DoubleToUInt64Bits(value);
+
+            bool neg = (bits & 0x8000_0000_0000_0000UL) != 0;
+            ulong absBits = bits & 0x7FFF_FFFF_FFFF_FFFFUL;
+
+            int bexp = (int)((absBits >> 52) & 0x7FF);
+            if (bexp == 0)
+                return false;
+
+            int exp = bexp - 1023;
+            if (exp < 0)
+                return false;
+
+            // Check fractional part
+            ulong mantOnly = absBits & 0x000F_FFFF_FFFF_FFFFUL;
+            if (exp < 52)
+            {
+                ulong fracMask = (1UL << (52 - exp)) - 1UL;
+                if ((mantOnly & fracMask) != 0)
+                    return false;
+            }
+
+            if (exp > 63)
+                return false;
+
+            ulong mant = mantOnly | (1UL << 52); // implicit leading 1
+
+            ulong intVal;
+            if (exp >= 52)
+                intVal = mant << (exp - 52);
+            else
+                intVal = mant >> (52 - exp);
+
+            if (!neg)
+            {
+                if (intVal > 0x7FFF_FFFF_FFFF_FFFFUL)
+                    return false;
+                result = (long)intVal;
+                return true;
+            }
+            else
+            {
+                // allow exactly 2^63 => long.MinValue
+                if (intVal == 0x8000_0000_0000_0000UL)
+                {
+                    result = unchecked((long)0x8000_0000_0000_0000UL);
+                    return true;
+                }
+                if (intVal > 0x7FFF_FFFF_FFFF_FFFFUL)
+                    return false;
+
+                result = -(long)intVal;
+                return true;
+            }
+        }
+
+        private const double ExpOverflowThreshold = 709.782712893384;   // ~ln(Double.MaxValue)
+        private const double ExpUnderflowThreshold = -745.133219101941; // ~ln(Double.MinSubnormal)
+
+        private static double Exp(double x)
+        {
+            if (Double.IsNaN(x))
+                return Double.NaN;
+
+            if (x == Double.PositiveInfinity)
+                return Double.PositiveInfinity;
+            if (x == Double.NegativeInfinity)
+                return 0.0;
+
+            if (x >= ExpOverflowThreshold)
+                return Double.PositiveInfinity;
+            if (x <= ExpUnderflowThreshold)
+                return 0.0;
+
+            // x = k*ln2 + r, r in ~[-ln2/2, ln2/2]
+            double kReal = x / Ln2;
+
+            int k = (int)kReal;
+            double frac = kReal - (double)k;
+            if (kReal >= 0.0)
+            {
+                if (frac > 0.5) k++;
+            }
+            else
+            {
+                if (-frac > 0.5) k--;
+            }
+
+            double r = x - (double)k * Ln2;
+
+            double r2 = r * r;
+
+            // 1 + r + r^2/2 + r^3/6 + ... + r^10/10!
+            double p =
+                1.0 +
+                r * (1.0 +
+                r * (0.5 +
+                r * (0.16666666666666666 +
+                r * (0.041666666666666664 +
+                r * (0.008333333333333333 +
+                r * (0.001388888888888889 +
+                r * (0.0001984126984126984 +
+                r * (0.0000248015873015873 +
+                r * (0.0000027557319223985893 +
+                r * (0.0000002755731922398589))))))))));
+
+            return Pow2(k) * p;
+        }
+
+        private static double Pow2(int k)
+        {
+            if (k > 1023)
+                return Double.PositiveInfinity;
+            if (k < -1074)
+                return 0.0;
+
+            if (k >= -1022)
+            {
+                ulong bits = (ulong)(k + 1023) << 52;
+                return BitConverter.UInt64BitsToDouble(bits);
+            }
+            else
+            {
+                // subnormal
+                int shift = k + 1074; // 0..51
+                ulong mant = 1UL << shift;
+                return BitConverter.UInt64BitsToDouble(mant);
+            }
+        }
+
+        private static double Log(double x)
+        {
+            if (Double.IsNaN(x))
+                return Double.NaN;
+
+            if (x == 0.0)
+                return Double.NegativeInfinity;
+
+            if (x < 0.0)
+                return Double.NaN;
+
+            if (x == Double.PositiveInfinity)
+                return Double.PositiveInfinity;
+
+            // Decompose x = m * 2^e with m in [1,2)
+            ulong bits = BitConverter.DoubleToUInt64Bits(x);
+            int bexp = (int)((bits >> 52) & 0x7FF);
+            ulong mant = bits & 0x000F_FFFF_FFFF_FFFFUL;
+
+            int e;
+            if (bexp == 0)
+            {
+                const double TwoPow52 = 4503599627370496.0; // 2^52
+                x *= TwoPow52;
+
+                bits = BitConverter.DoubleToUInt64Bits(x);
+                bexp = (int)((bits >> 52) & 0x7FF);
+                mant = bits & 0x000F_FFFF_FFFF_FFFFUL;
+
+                e = (bexp - 1023) - 52;
+            }
+            else
+            {
+                e = bexp - 1023;
+            }
+
+            // normalize mantissa to [1,2)
+            double m = BitConverter.UInt64BitsToDouble(mant | 0x3FF0_0000_0000_0000UL);
+
+            // ln(m) = 2 * (t + t^3/3 + t^5/5 + ...), t = (m-1)/(m+1)
+            double t = (m - 1.0) / (m + 1.0);
+            double t2 = t * t;
+
+            double s = t;
+
+            double term = t;
+            term *= t2; s += term / 3.0;
+            term *= t2; s += term / 5.0;
+            term *= t2; s += term / 7.0;
+            term *= t2; s += term / 9.0;
+            term *= t2; s += term / 11.0;
+
+            double ln_m = 2.0 * s;
+
+            return (double)e * Ln2 + ln_m;
         }
     }
 
@@ -3565,7 +4237,7 @@
                 }
             }
         }
-    }
+}
 }
 namespace System.Runtime.InteropServices
 {
@@ -3630,6 +4302,28 @@ namespace System.Runtime.CompilerServices
     }
     public static unsafe class Unsafe
     {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static TTo BitCast<TFrom, TTo>(TFrom source)
+            where TFrom : allows ref struct
+            where TTo : allows ref struct
+        {
+            if (sizeof(TFrom) != sizeof(TTo))
+            {
+                throw new NotSupportedException();
+            }
+            return ReadUnaligned<TTo>(ref As<TFrom, byte>(ref source));
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static T ReadUnaligned<T>(scoped ref readonly byte source)
+            where T : allows ref struct
+        {
+            return As<byte, T>(ref Unsafe.AsRef<byte>(in source));
+            // ldarg.0
+            // unaligned. 0x1
+            // ldobj !!T
+            // ret
+        }
         [Intrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static T As<T>(object o) where T : class?

@@ -625,8 +625,28 @@ internal class Program
     }
 }
 ", "94");
-
-
+            // 64 bit cast double to long
+            RunTest(@"
+Console.Write(BitConverter.DoubleToInt64Bits(0.0) == 0x0000000000000000);
+Console.Write(BitConverter.DoubleToInt64Bits(-0.0) == unchecked((long)0x8000000000000000));
+Console.Write(BitConverter.DoubleToInt64Bits(1.0) == unchecked((long)0x3FF0000000000000));
+Console.Write(BitConverter.DoubleToInt64Bits(-1.0) == unchecked((long)0xBFF0000000000000));
+Console.Write(BitConverter.DoubleToInt64Bits(double.PositiveInfinity) == unchecked((long)0x7FF0000000000000));
+Console.Write(BitConverter.DoubleToInt64Bits(double.NegativeInfinity) == unchecked((long)0xFFF0000000000000));
+", "truetruetruetruetruetrue");
+            // 65 Math.Pow
+            RunTest(@"
+Console.Write(Math.Pow(2, 3) == 8.0);
+Console.Write(Math.Pow(2, -3) == 0.125);
+Console.Write(Math.Pow(0.25, 0.5) == 0.5);
+Console.Write(Math.Pow(16, 0.25) == 2.0);
+", "truetruetruetrue");
+            // 66 Split(char separator)
+            RunTest(@"
+string str = ""aa,b,,c"";
+string[] strs = str.Split(',');
+Console.WriteLine(strs[0]);
+", "aa");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)

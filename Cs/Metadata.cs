@@ -1296,9 +1296,11 @@ namespace Cnidaria.Cs
     internal sealed class MetadataTokenProvider : ITokenProvider
     {
         private static bool EmitParamRows = true;
-        private static bool EmitParamNames = false;
+        private static bool EmitParamNames = true;
         private const ushort ParamAttrIn = 0x0001;
         private const ushort ParamAttrOut = 0x0002;
+        private const ushort ParamAttrOptional = 0x0010;
+        private const ushort ParamAttrHasDefault = 0x1000;
         public MetadataImage Image { get; }
 
         private readonly Dictionary<TypeSymbol, int> _typeDefTokens
@@ -1362,6 +1364,9 @@ namespace Cnidaria.Cs
                 flags |= ParamAttrOut;
             else if (p.RefKind == ParameterRefKind.In || p.IsReadOnlyRef)
                 flags |= ParamAttrIn;
+
+            if (p.HasExplicitDefault)
+                flags |= (ushort)(ParamAttrOptional | ParamAttrHasDefault);
             return flags;
         }
         private static System.Reflection.FieldAttributes MapFieldAccessibility(Accessibility a) => a switch
@@ -1638,8 +1643,11 @@ namespace Cnidaria.Cs
                     {
                         for (int p = 0; p < ps.Length; p++)
                         {
+                            int paramRid = Image.Params.Count + 1;
                             int pNameIdx = EmitParamNames ? Image.Strings.Add(ps[p].Name) : 0;
                             Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
+                            int paramDefToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
+                            TryAddParameterDefault(ps[p], paramDefToken);
                         }
                     }
                     ushort mflags = 0;
@@ -1705,6 +1713,21 @@ namespace Cnidaria.Cs
 
             int blobIdx = Image.Blob.Add(bytes);
             Image.Constants.Add(new ConstantRow(parentToken: fieldDefToken, typeCode: typeCode, valueBlob: blobIdx));
+        }
+        private void TryAddParameterDefault(ParameterSymbol p, int paramDefToken)
+        {
+            if (p is null)
+                return;
+            if (!p.HasExplicitDefault)
+                return;
+            if (!p.DefaultValueOpt.HasValue)
+                return;
+
+            if (!TryEncodeConstant(p.Type, p.DefaultValueOpt.Value, out byte typeCode, out byte[] bytes))
+                return;
+
+            int blobIdx = Image.Blob.Add(bytes);
+            Image.Constants.Add(new ConstantRow(parentToken: paramDefToken, typeCode: typeCode, valueBlob: blobIdx));
         }
         private static bool TryEncodeConstant(TypeSymbol type, object? value, out byte typeCode, out byte[] bytes)
         {
@@ -1919,8 +1942,11 @@ namespace Cnidaria.Cs
             {
                 for (int p = 0; p < ps.Length; p++)
                 {
+                    int paramRid = Image.Params.Count + 1;
                     int pNameIdx = EmitParamNames ? Image.Strings.Add(ps[p].Name) : 0;
                     Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
+                    int paramDefToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
+                    TryAddParameterDefault(ps[p], paramDefToken);
                 }
             }
 
