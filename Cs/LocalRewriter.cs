@@ -157,6 +157,7 @@ namespace Cnidaria.Cs
                 BoundLabelExpression e => e,
                 BoundSizeOfExpression e => e,
 
+
                 BoundThrowExpression e => RewriteThrowExpression(e),
                 BoundTupleExpression e => RewriteTupleExpression(e),
                 BoundArrayInitializerExpression e => RewriteArrayInitializerExpression(e),
@@ -186,6 +187,8 @@ namespace Cnidaria.Cs
                 BoundMemberAccessExpression e => RewriteMemberAccessExpression(e),
                 BoundCheckedExpression e => RewriteCheckedExpression(e),
                 BoundUncheckedExpression e => RewriteUncheckedExpression(e),
+
+                BoundIsPatternExpression e => RewriteIsPatternExpression(e),
 
                 _ => throw new NotSupportedException($"Unexpected bound expression: {node.GetType().Name}")
             };
@@ -218,7 +221,8 @@ namespace Cnidaria.Cs
         }
         protected virtual BoundStatement RewriteTryStatement(BoundTryStatement node)
         {
-            var tryBlock = (BoundBlockStatement)RewriteStatement(node.TryBlock);
+            var rewrittenTry = RewriteStatement(node.TryBlock);
+            var tryBlock = EnsureBlockStatement(node.TryBlock, rewrittenTry);
 
             bool catchesChanged = false;
             var catches = ImmutableArray.CreateBuilder<BoundCatchBlock>(node.CatchBlocks.Length);
@@ -230,9 +234,12 @@ namespace Cnidaria.Cs
                 catches.Add(c);
             }
 
-            var finallyBlock = node.FinallyBlockOpt is null
-                ? null
-                : (BoundBlockStatement)RewriteStatement(node.FinallyBlockOpt);
+            BoundBlockStatement? finallyBlock = null;
+            if (node.FinallyBlockOpt is not null)
+            {
+                var rewrittenFinally = RewriteStatement(node.FinallyBlockOpt);
+                finallyBlock = EnsureBlockStatement(node.FinallyBlockOpt, rewrittenFinally);
+            }
 
             if (!ReferenceEquals(tryBlock, node.TryBlock) ||
                 catchesChanged ||
@@ -251,7 +258,9 @@ namespace Cnidaria.Cs
         protected virtual BoundCatchBlock RewriteCatchBlock(BoundCatchBlock node)
         {
             var filter = node.FilterOpt is null ? null : RewriteExpression(node.FilterOpt);
-            var body = (BoundBlockStatement)RewriteStatement(node.Body);
+
+            var rewrittenBody = RewriteStatement(node.Body);
+            var body = EnsureBlockStatement(node.Body, rewrittenBody);
 
             if (!ReferenceEquals(filter, node.FilterOpt) || !ReferenceEquals(body, node.Body))
             {
@@ -264,6 +273,22 @@ namespace Cnidaria.Cs
             }
 
             return node;
+        }
+        private static BoundBlockStatement EnsureBlockStatement(BoundBlockStatement original, BoundStatement rewritten)
+        {
+            if (rewritten is BoundBlockStatement block)
+                return block;
+
+            var statements = rewritten is BoundEmptyStatement
+                ? ImmutableArray<BoundStatement>.Empty
+                : ImmutableArray.Create(rewritten);
+
+            var wrapped = new BoundBlockStatement(original.Syntax, statements);
+
+            if (rewritten.HasErrors)
+                wrapped.SetHasErrors();
+
+            return wrapped;
         }
         protected virtual BoundExpression RewriteIndexerAccessExpression(BoundIndexerAccessExpression node)
         {
@@ -306,12 +331,27 @@ namespace Cnidaria.Cs
                 return new BoundCheckedExpression((CheckedExpressionSyntax)node.Syntax, expr);
             return node;
         }
-
         protected virtual BoundExpression RewriteUncheckedExpression(BoundUncheckedExpression node)
         {
             var expr = RewriteExpression(node.Expression);
             if (!ReferenceEquals(expr, node.Expression))
                 return new BoundUncheckedExpression((CheckedExpressionSyntax)node.Syntax, expr);
+            return node;
+        }
+        protected virtual BoundExpression RewriteIsPatternExpression(BoundIsPatternExpression node)
+        {
+            var operand = RewriteExpression(node.Operand);
+            if (!ReferenceEquals(operand, node.Operand))
+            {
+                return new BoundIsPatternExpression(
+                    node.Syntax,
+                    operand,
+                    node.PatternType,
+                    node.DeclaredLocalOpt,
+                    node.Type,
+                    node.IsDiscard);
+            }
+
             return node;
         }
         protected virtual BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)

@@ -532,6 +532,92 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    public sealed class DeclarationPatternSyntax : PatternSyntax
+    {
+        public TypeSyntax Type { get; }
+        public VariableDesignationSyntax Designation { get; }
+
+        public DeclarationPatternSyntax(TypeSyntax type, VariableDesignationSyntax designation)
+            : base(SyntaxKind.DeclarationPattern, NodeSpan.From(type.Span, designation.Span))
+        {
+            Type = type;
+            Designation = designation;
+        }
+    }
+    public sealed class VarPatternSyntax : PatternSyntax
+    {
+        public SyntaxToken VarKeyword { get; }
+        public VariableDesignationSyntax Designation { get; }
+
+        public VarPatternSyntax(SyntaxToken varKeyword, VariableDesignationSyntax designation)
+            : base(SyntaxKind.VarPattern, NodeSpan.From(varKeyword.Span, designation.Span))
+        {
+            VarKeyword = varKeyword;
+            Designation = designation;
+        }
+    }
+    public sealed class TypePatternSyntax : PatternSyntax
+    {
+        public TypeSyntax Type { get; }
+
+        public TypePatternSyntax(TypeSyntax type)
+            : base(SyntaxKind.TypePattern, type.Span)
+        {
+            Type = type;
+        }
+    }
+    public sealed class RelationalPatternSyntax : PatternSyntax
+    {
+        public SyntaxToken OperatorToken { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public RelationalPatternSyntax(SyntaxToken operatorToken, ExpressionSyntax expression)
+            : base(SyntaxKind.RelationalPattern, NodeSpan.From(operatorToken.Span, expression.Span))
+        {
+            OperatorToken = operatorToken;
+            Expression = expression;
+        }
+    }
+    public sealed class BinaryPatternSyntax : PatternSyntax
+    {
+        public PatternSyntax Left { get; }
+        public SyntaxToken OperatorToken { get; }
+        public PatternSyntax Right { get; }
+
+        public BinaryPatternSyntax(SyntaxKind kind, PatternSyntax left, SyntaxToken operatorToken, PatternSyntax right)
+            : base(kind, NodeSpan.From(left.Span, right.Span))
+        {
+            Left = left;
+            OperatorToken = operatorToken;
+            Right = right;
+        }
+    }
+    public sealed class UnaryPatternSyntax : PatternSyntax
+    {
+        public SyntaxToken OperatorToken { get; }
+        public PatternSyntax Pattern { get; }
+
+        public UnaryPatternSyntax(SyntaxKind kind, SyntaxToken operatorToken, PatternSyntax pattern)
+            : base(kind, NodeSpan.From(operatorToken.Span, pattern.Span))
+        {
+            OperatorToken = operatorToken;
+            Pattern = pattern;
+        }
+    }
+    public sealed class ParenthesizedPatternSyntax : PatternSyntax
+    {
+        public SyntaxToken OpenParenToken { get; }
+        public PatternSyntax Pattern { get; }
+        public SyntaxToken CloseParenToken { get; }
+
+        public ParenthesizedPatternSyntax(SyntaxToken openParenToken, PatternSyntax pattern, SyntaxToken closeParenToken)
+            : base(SyntaxKind.ParenthesizedPattern, NodeSpan.From(openParenToken.Span, closeParenToken.Span))
+        {
+            OpenParenToken = openParenToken;
+            Pattern = pattern;
+            CloseParenToken = closeParenToken;
+        }
+    }
     public sealed class DiscardPatternSyntax : PatternSyntax
     {
         public SyntaxToken UnderscoreToken { get; }
@@ -2433,6 +2519,26 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    public sealed class DefaultExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken DefaultKeyword { get; }
+        public SyntaxToken OpenParenToken { get; }
+        public TypeSyntax Type { get; }
+        public SyntaxToken CloseParenToken { get; }
+
+        public DefaultExpressionSyntax(
+            SyntaxToken defaultKeyword,
+            SyntaxToken openParenToken,
+            TypeSyntax type,
+            SyntaxToken closeParenToken)
+            : base(SyntaxKind.DefaultExpression, NodeSpan.From(defaultKeyword.Span, closeParenToken.Span))
+        {
+            DefaultKeyword = defaultKeyword;
+            OpenParenToken = openParenToken;
+            Type = type;
+            CloseParenToken = closeParenToken;
+        }
+    }
     public sealed class CheckedExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken Keyword { get; }
@@ -2616,6 +2722,20 @@ namespace Cnidaria.Cs
             Left = left;
             OperatorToken = operatorToken;
             Right = right;
+        }
+    }
+    public sealed class IsPatternExpressionSyntax : ExpressionSyntax
+    {
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken IsKeyword { get; }
+        public PatternSyntax Pattern { get; }
+
+        public IsPatternExpressionSyntax(ExpressionSyntax expression, SyntaxToken isKeyword, PatternSyntax pattern)
+            : base(SyntaxKind.IsPatternExpression, NodeSpan.From(expression.Span, pattern.Span))
+        {
+            Expression = expression;
+            IsKeyword = isKeyword;
+            Pattern = pattern;
         }
     }
     public sealed class AssignmentExpressionSyntax : ExpressionSyntax

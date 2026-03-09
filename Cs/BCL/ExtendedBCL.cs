@@ -233,6 +233,17 @@ namespace System.Collections.Generic
             _version++;
         }
 
+        public int IndexOf(T item)
+            => Array.IndexOf<T>(_items, item, 0, _size);
+
+        public bool Contains(T item)
+        {
+            return _size != 0 && IndexOf(item) >= 0;
+        }
+
+        public void CopyTo(T[] array)
+            => CopyTo(array, 0);
+
         public void CopyTo(int index, T[] array, int arrayIndex, int count)
         {
             if (_size - index < count)
@@ -269,6 +280,68 @@ namespace System.Collections.Generic
                 _size = 0;
             }
         }
+
+        public bool Remove(T item)
+        {
+            int index = IndexOf(item);
+            if (index >= 0)
+            {
+                RemoveAt(index);
+                return true;
+            }
+
+            return false;
+        }
+
+        public void RemoveAt(int index)
+        {
+            if ((uint)index >= (uint)_size)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            _size--;
+            if (index < _size)
+            {
+                Array.Copy(_items, index + 1, _items, index, _size - index);
+            }
+            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                _items[_size] = default;
+            }
+            _version++;
+        }
+
+        public void RemoveRange(int index, int count)
+        {
+            if (index < 0)
+            {
+                throw new IndexOutOfRangeException();
+            }
+
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            if (_size - index < count)
+                throw new ArgumentOutOfRangeException();
+
+            if (count > 0)
+            {
+                _size -= count;
+                if (index < _size)
+                {
+                    Array.Copy(_items, index + count, _items, index, _size - index);
+                }
+
+                _version++;
+                if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    Array.Clear(_items, _size, count);
+                }
+            }
+        }
+
     }
 }
 namespace System.Numerics

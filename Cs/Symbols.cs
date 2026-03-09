@@ -130,6 +130,20 @@ namespace Cnidaria.Cs
 
         private NullTypeSymbol() { }
     }
+    internal sealed class DefaultLiteralTypeSymbol : TypeSymbol
+    {
+        public static readonly DefaultLiteralTypeSymbol Instance = new();
+
+        public override SymbolKind Kind => SymbolKind.Error;
+        public override string Name => "<default>";
+        public override Symbol? ContainingSymbol => null;
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+
+        public override bool IsReferenceType => false;
+        public override bool IsValueType => false;
+
+        private DefaultLiteralTypeSymbol() { }
+    }
     internal sealed class ThrowTypeSymbol : TypeSymbol
     {
         public static readonly ThrowTypeSymbol Instance = new();

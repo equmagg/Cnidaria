@@ -4344,16 +4344,41 @@ namespace Cnidaria.Cs
         }
         private TypeSymbol BindNullableType(NullableTypeSyntax nt, BindingContext context, DiagnosticBag diagnostics)
         {
+            if (nt.ElementType is NullableTypeSyntax)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_TYPE_NULL003",
+                    DiagnosticSeverity.Error,
+                    "Cannot apply '?' to a nullable type.",
+                    new Location(context.SemanticModel.SyntaxTree, nt.Span)));
+
+                return new ErrorTypeSymbol("nullable", containing: null, ImmutableArray<Location>.Empty);
+            }
+
             var element = BindType(nt.ElementType, context, diagnostics);
             if (element.Kind == SymbolKind.Error)
                 return element;
 
-            if (!element.IsValueType || element is PointerTypeSymbol || element.SpecialType == SpecialType.System_Void)
+            if (element is PointerTypeSymbol or ByRefTypeSymbol || element.SpecialType == SpecialType.System_Void)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_TYPE_NULL002",
                     DiagnosticSeverity.Error,
-                    "The '?' type modifier can only be applied to non-nullable value types.",
+                    "The '?' type modifier cannot be applied to this type.",
+                    new Location(context.SemanticModel.SyntaxTree, nt.Span)));
+
+                return new ErrorTypeSymbol("nullable", containing: null, ImmutableArray<Location>.Empty);
+            }
+
+            if (element.IsReferenceType)
+                return element;
+
+            if (!element.IsValueType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_TYPE_NULL002",
+                    DiagnosticSeverity.Error,
+                    "The '?' type modifier can only be applied to reference types or non-nullable value types.",
                     new Location(context.SemanticModel.SyntaxTree, nt.Span)));
 
                 return new ErrorTypeSymbol("nullable", containing: null, ImmutableArray<Location>.Empty);
@@ -4373,6 +4398,7 @@ namespace Cnidaria.Cs
             var nullableDef = GetSystemNullableDefinitionOrReport(context, diagnostics, nt);
             if (nullableDef.Kind == SymbolKind.Error)
                 return nullableDef;
+
             var typeArgs = ImmutableArray.Create(element);
             var constructed = _compilation.ConstructNamedType(nullableDef, typeArgs);
 
@@ -5137,7 +5163,6 @@ namespace Cnidaria.Cs
                 }
                 return label;
             }
-
             public void RegisterGoto(GotoStatementSyntax syntax, LabelSymbol label)
             {
                 var snapshot = SnapshotExceptionRegions();
@@ -5330,6 +5355,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<string, ParameterSymbol> _parameters = new(StringComparer.Ordinal);
         private readonly Dictionary<string, LocalFunctionSymbol> _localFunctions = new(StringComparer.Ordinal);
         private readonly LocalScopeBinder? _nameConflictStop;
+
         private int _tempId;
         public LocalScopeBinder(
             Binder? parent,
@@ -5403,6 +5429,17 @@ namespace Cnidaria.Cs
                 SpecialType.System_Int64 or
                 SpecialType.System_UInt64;
         }
+        private void ImportFlowingLocal(LocalSymbol local)
+            => _locals[local.Name] = local;
+        private static void AddUniqueLocal(ImmutableArray<LocalSymbol>.Builder builder, LocalSymbol local)
+        {
+            for (int i = 0; i < builder.Count; i++)
+            {
+                if (ReferenceEquals(builder[i], local))
+                    return;
+            }
+            builder.Add(local);
+        }
         internal void ReportControlFlowDiagnostics(BindingContext context, DiagnosticBag diagnostics)
             => _flow.ReportUndefinedLabels(context, diagnostics);
         private static IdentifierNameSyntax MakeIdentifierName(string name, TextSpan span)
@@ -5435,6 +5472,7 @@ namespace Cnidaria.Cs
 
         private static bool ShouldSuppressCascade(BoundExpression expr)
             => expr.HasErrors || IsTrueErrorType(expr.Type);
+
 
         private static BoundExpression CreateErrorConversion(ExpressionSyntax exprSyntax, BoundExpression expr, TypeSymbol targetType)
         {
@@ -6170,6 +6208,9 @@ namespace Cnidaria.Cs
                 case ThrowExpressionSyntax te:
                     result = BindThrowExpression(te, context, diagnostics);
                     break;
+                case IsPatternExpressionSyntax ip:
+                    result = BindIsPatternExpression(ip, context, diagnostics);
+                    break;
                 case SwitchExpressionSyntax sw:
                     result = BindSwitchExpression(sw, context, diagnostics);
                     break;
@@ -6388,7 +6429,6 @@ namespace Cnidaria.Cs
                 ? new BoundCheckedExpression(node, expr)
                 : new BoundUncheckedExpression(node, expr);
         }
-
         private BoundStatement BindCheckedStatement(CheckedStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             bool isChecked = node.Keyword.Kind == SyntaxKind.CheckedKeyword;
@@ -6399,6 +6439,226 @@ namespace Cnidaria.Cs
             return isChecked
                 ? new BoundCheckedStatement(node, statement)
                 : new BoundUncheckedStatement(node, statement);
+        }
+        private BoundExpression BindIsPatternExpression(IsPatternExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            var operand = BindExpression(node.Expression, context, diagnostics);
+            if (operand.HasErrors)
+                return new BoundBadExpression(node);
+            return BindIsPatternCore(node, operand, node.Pattern, context, diagnostics);
+        }
+        private BoundExpression BindIsPatternCore(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            PatternSyntax pattern,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            switch (pattern)
+            {
+                case ParenthesizedPatternSyntax paren:
+                    return BindIsPatternCore(wholeSyntax, operand, paren.Pattern, context, diagnostics);
+
+                case TypePatternSyntax typePattern:
+                    {
+                        var patternType = BindType(typePattern.Type, context, diagnostics);
+                        return BindIsTypePattern(
+                            wholeSyntax,
+                            operand,
+                            patternType,
+                            declaredLocalOpt: null,
+                            isDiscard: false,
+                            diagnosticNode: typePattern,
+                            context,
+                            diagnostics);
+                    }
+
+                case DeclarationPatternSyntax declPattern:
+                    {
+                        var patternType = BindType(declPattern.Type, context, diagnostics);
+                        if (patternType is ErrorTypeSymbol)
+                            return new BoundBadExpression(wholeSyntax);
+
+                        if (!TryBindPatternDesignation(
+                            declPattern.Designation,
+                            patternType,
+                            context,
+                            diagnostics,
+                            out var local,
+                            out var isDiscard))
+                        {
+                            return new BoundBadExpression(wholeSyntax);
+                        }
+
+                        return BindIsTypePattern(
+                            wholeSyntax,
+                            operand,
+                            patternType,
+                            local,
+                            isDiscard,
+                            declPattern,
+                            context,
+                            diagnostics);
+                    }
+
+                case ConstantPatternSyntax:
+                    diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS001",
+                    DiagnosticSeverity.Error,
+                    "Constant patterns in 'is' expressions are not supported yet.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+                    return new BoundBadExpression(wholeSyntax);
+
+                case VarPatternSyntax:
+                    diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS002",
+                    DiagnosticSeverity.Error,
+                    "'var' patterns are not supported yet.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+                    return new BoundBadExpression(wholeSyntax);
+
+                case DiscardPatternSyntax:
+                    diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS003",
+                    DiagnosticSeverity.Error,
+                    "Discard-only patterns in 'is' expressions are not supported yet.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+                    return new BoundBadExpression(wholeSyntax);
+
+                default:
+                    diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS004",
+                    DiagnosticSeverity.Error,
+                    $"Pattern '{pattern.Kind}' is not supported in 'is' expressions.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+                    return new BoundBadExpression(wholeSyntax);
+            }
+        }
+        private bool TryBindPatternDesignation(
+            VariableDesignationSyntax designation,
+            TypeSymbol localType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out LocalSymbol? local,
+            out bool isDiscard)
+        {
+            switch (designation)
+            {
+                case DiscardDesignationSyntax:
+                    local = null;
+                    isDiscard = true;
+                    return true;
+
+                case SingleVariableDesignationSyntax single:
+                    {
+                        var name = single.Identifier.ValueText ?? string.Empty;
+                        if (name.Length == 0)
+                        {
+                            local = null;
+                            isDiscard = false;
+                            return false;
+                        }
+
+                        if (IsNameDeclaredInEnclosingScopes(name))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_PAT_IS005",
+                                DiagnosticSeverity.Error,
+                                $"A local named '{name}' is already declared in this scope.",
+                                new Location(context.SemanticModel.SyntaxTree, single.Span)));
+                        }
+
+                        local = new LocalSymbol(
+                            name: name,
+                            containing: _containing,
+                            type: localType,
+                            locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, single.Span)),
+                            isConst: false,
+                            constantValueOpt: Optional<object>.None,
+                            isByRef: false);
+
+                        context.Recorder.RecordDeclared(single, local);
+                        isDiscard = false;
+                        return true;
+                    }
+
+                default:
+                    diagnostics.Add(new Diagnostic(
+                        "CN_PAT_IS006",
+                        DiagnosticSeverity.Error,
+                        "Only single-variable and discard designations are supported in patterns.",
+                        new Location(context.SemanticModel.SyntaxTree, designation.Span)));
+                    local = null;
+                    isDiscard = false;
+                    return false;
+            }
+        }
+        private BoundExpression BindIsTypePattern(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            TypeSymbol patternType,
+            LocalSymbol? declaredLocalOpt,
+            bool isDiscard,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (patternType is ErrorTypeSymbol)
+                return new BoundBadExpression(wholeSyntax);
+
+            if (patternType.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS007",
+                    DiagnosticSeverity.Error,
+                    "Pattern type cannot be 'void'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            if (patternType is PointerTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS008",
+                    DiagnosticSeverity.Error,
+                    "Pattern type cannot be a pointer type.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            if (patternType.IsRefLikeType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS009",
+                    DiagnosticSeverity.Error,
+                    "Pattern matching against ref-like types is not supported.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            var conversion = ClassifyConversion(operand, patternType, context);
+            if (!IsConversionOfIsTypePattern(conversion))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS010",
+                    DiagnosticSeverity.Error,
+                    $"Cannot test expression of type '{operand.Type.Name}' against pattern type '{patternType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            return new BoundIsPatternExpression(wholeSyntax, operand, patternType, declaredLocalOpt, boolType, isDiscard);
+
+        }
+        private static bool IsConversionOfIsTypePattern(Conversion conversion)
+        {
+            return conversion.Kind is ConversionKind.Identity
+                or ConversionKind.ImplicitReference
+                or ConversionKind.ExplicitReference
+                or ConversionKind.Boxing
+                or ConversionKind.Unboxing
+                or ConversionKind.NullLiteral;
         }
         private BoundExpression BindTupleExpression(TupleExpressionSyntax te, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -8271,6 +8531,8 @@ namespace Cnidaria.Cs
                 }
                 return false;
             }
+            if (receiverSyntax is GenericNameSyntax)
+                return false;
             if (receiverSyntax is MemberAccessExpressionSyntax)
             {
                 var tmpDiagnostics = new DiagnosticBag();
@@ -10314,6 +10576,8 @@ namespace Cnidaria.Cs
                 return BindAsExpression(bin, context, diagnostics);
             if (bin.Kind == SyntaxKind.IsExpression)
                 return BindIsExpression(bin, context, diagnostics);
+            if (bin.Kind == SyntaxKind.LogicalAndExpression || bin.Kind == SyntaxKind.LogicalOrExpression)
+                return BindConditionalLogicalBinary(bin, context, diagnostics);
             var left = BindExpression(bin.Left, context, diagnostics);
             var right = BindExpression(bin.Right, context, diagnostics);
 
@@ -10339,7 +10603,7 @@ namespace Cnidaria.Cs
                 // conditional logical && ||
                 case SyntaxKind.LogicalAndExpression:
                 case SyntaxKind.LogicalOrExpression:
-                    return BindConditionalLogicalBinary(bin, left, right, context, diagnostics);
+                    return BindConditionalLogicalBinary(bin, context, diagnostics);
 
                 // equality
                 case SyntaxKind.EqualsExpression:
@@ -10634,8 +10898,6 @@ namespace Cnidaria.Cs
         }
         private BoundExpression BindConditionalLogicalBinary(
             BinaryExpressionSyntax bin,
-            BoundExpression left,
-            BoundExpression right,
             BindingContext ctx,
             DiagnosticBag diagnostics)
         {
@@ -10648,8 +10910,13 @@ namespace Cnidaria.Cs
 
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
 
+            var left = BindExpression(bin.Left, ctx, diagnostics);
             left = ApplyConversion(bin.Left, left, boolType, bin, ctx, diagnostics, requireImplicit: true);
-            right = ApplyConversion(bin.Right, right, boolType, bin, ctx, diagnostics, requireImplicit: true);
+            var rightBinder = op == BoundBinaryOperatorKind.LogicalAnd
+                ? CreateFlowScopeBinderForTrue(left) : this;
+
+            var right = rightBinder.BindExpression(bin.Right, ctx, diagnostics);
+            right = rightBinder.ApplyConversion(bin.Right, right, boolType, bin, ctx, diagnostics, requireImplicit: true);
 
             if (left.HasErrors || right.HasErrors)
                 return new BoundBadExpression(bin);
@@ -11478,12 +11745,12 @@ namespace Cnidaria.Cs
             }
 
             var resultTypeRef = ClassifyConditionalResultType(
-        compilation,
-        tree,
-        left.Type,
-        right.Type,
-        bin,
-        diagnostics);
+                compilation,
+                tree,
+                left.Type,
+                right.Type,
+                bin,
+                diagnostics);
 
             if (resultTypeRef is null || resultTypeRef is ErrorTypeSymbol || resultTypeRef.SpecialType == SpecialType.System_Void)
                 return new BoundBadExpression(bin);
@@ -11538,6 +11805,53 @@ namespace Cnidaria.Cs
             var name = $"{prefix}{_tempId++}";
             return new LocalSymbol(name, _containing, type, ImmutableArray<Location>.Empty);
         }
+        private void CollectPatternLocalsWhenTrue(BoundExpression condition, ImmutableArray<LocalSymbol>.Builder builder)
+        {
+            switch (condition)
+            {
+                case BoundIsPatternExpression isPattern when isPattern.DeclaredLocalOpt is not null && !isPattern.IsDiscard:
+                    AddUniqueLocal(builder, isPattern.DeclaredLocalOpt);
+                    return;
+
+                case BoundBinaryExpression bin when bin.OperatorKind == BoundBinaryOperatorKind.LogicalAnd:
+                    CollectPatternLocalsWhenTrue(bin.Left, builder);
+                    CollectPatternLocalsWhenTrue(bin.Right, builder);
+                    return;
+
+                case BoundCheckedExpression chk:
+                    CollectPatternLocalsWhenTrue(chk.Expression, builder);
+                    return;
+
+                case BoundUncheckedExpression unchk:
+                    CollectPatternLocalsWhenTrue(unchk.Expression, builder);
+                    return;
+
+                case BoundConversionExpression conv
+                    when conv.Conversion.Kind == ConversionKind.Identity &&
+                         conv.Type.SpecialType == SpecialType.System_Boolean:
+                    CollectPatternLocalsWhenTrue(conv.Operand, builder);
+                    return;
+            }
+        }
+
+        private ImmutableArray<LocalSymbol> GetPatternLocalsWhenTrue(BoundExpression condition)
+        {
+            var builder = ImmutableArray.CreateBuilder<LocalSymbol>();
+            CollectPatternLocalsWhenTrue(condition, builder);
+            return builder.ToImmutable();
+        }
+
+        private LocalScopeBinder CreateFlowScopeBinderForTrue(BoundExpression condition)
+        {
+            var locals = GetPatternLocalsWhenTrue(condition);
+            if (locals.IsDefaultOrEmpty)
+                return this;
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            for (int i = 0; i < locals.Length; i++)
+                scope.ImportFlowingLocal(locals[i]);
+            return scope;
+        }
         private BoundExpression BindConditional(ConditionalExpressionSyntax node, BindingContext ctx, DiagnosticBag diagnostics)
         {
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
@@ -11545,7 +11859,8 @@ namespace Cnidaria.Cs
             var condition = BindExpression(node.Condition, ctx, diagnostics);
             condition = ApplyConversion(node.Condition, condition, boolType, node, ctx, diagnostics, requireImplicit: true);
 
-            var whenTrue = BindExpression(node.WhenTrue, ctx, diagnostics);
+            var whenTrueBinder = CreateFlowScopeBinderForTrue(condition);
+            var whenTrue = whenTrueBinder.BindExpression(node.WhenTrue, ctx, diagnostics);
             var whenFalse = BindExpression(node.WhenFalse, ctx, diagnostics);
 
             if (condition.HasErrors || whenTrue.HasErrors || whenFalse.HasErrors)
@@ -11590,8 +11905,8 @@ namespace Cnidaria.Cs
             // reference
             if (t1.IsReferenceType && t2.IsReferenceType)
             {
-                if (IsBaseTypeOf(t1, t2)) return t1;
-                if (IsBaseTypeOf(t2, t1)) return t2;
+                if (HasImplicitReferenceConversion(t2, t1)) return t1;
+                if (HasImplicitReferenceConversion(t1, t2)) return t2;
 
                 diagnostics.Add(new Diagnostic("CN_COND_REF000", DiagnosticSeverity.Error,
                     $"Cannot determine common type for '{t1.Name}' and '{t2.Name}'.",
@@ -11886,6 +12201,10 @@ namespace Cnidaria.Cs
             if (token.Kind == SyntaxKind.NullKeyword)
             {
                 return new BoundLiteralExpression(lit, NullTypeSymbol.Instance, null);
+            }
+            if (lit.Kind == SyntaxKind.DefaultLiteralExpression || token.Kind == SyntaxKind.DefaultKeyword)
+            {
+                return new BoundLiteralExpression(lit, DefaultLiteralTypeSymbol.Instance, null);
             }
             if (value is null)
             {
@@ -13548,8 +13867,8 @@ namespace Cnidaria.Cs
 
             if (t1.IsReferenceType && t2.IsReferenceType)
             {
-                if (IsBaseTypeOf(t1, t2)) return t1;
-                if (IsBaseTypeOf(t2, t1)) return t2;
+                if (HasImplicitReferenceConversion(t2, t1)) return t1;
+                if (HasImplicitReferenceConversion(t1, t2)) return t2;
             }
 
             diagnostics.Add(new Diagnostic(
@@ -14072,6 +14391,28 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
+            // Target typed default literal
+            if (expr.Type is DefaultLiteralTypeSymbol)
+            {
+                if (targetType.SpecialType == SpecialType.System_Void || targetType is ByRefTypeSymbol)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_CONV001",
+                        DiagnosticSeverity.Error,
+                        $"No {(requireImplicit ? "implicit " : "")}conversion from '{expr.Type.Name}' to '{targetType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                    var bad = new BoundBadExpression(exprSyntax);
+                    bad.SetType(targetType);
+                    context.Recorder.RecordBound(exprSyntax, bad);
+                    return bad;
+                }
+
+                var lowered = MakeDefaultValue(exprSyntax, targetType);
+                context.Recorder.RecordBound(exprSyntax, lowered);
+                return lowered;
+            }
+
             if (ReferenceEquals(expr.Type, targetType))
                 return expr;
 
@@ -14080,6 +14421,7 @@ namespace Cnidaria.Cs
                 te.SetType(targetType);
                 return te;
             }
+
             if (ShouldSuppressCascade(expr))
             {
                 var converted = CreateErrorConversion(exprSyntax, expr, targetType);
@@ -14552,6 +14894,14 @@ namespace Cnidaria.Cs
             if (expr is BoundThrowExpression || expr.Type is ThrowTypeSymbol)
                 return new Conversion(ConversionKind.Identity);
 
+            // default literal
+            if (expr.Type is DefaultLiteralTypeSymbol)
+            {
+                if (target.SpecialType == SpecialType.System_Void || target is ByRefTypeSymbol)
+                    return new Conversion(ConversionKind.None);
+
+                return new Conversion(ConversionKind.Identity);
+            }
             // null literal
             if (expr.Type is NullTypeSymbol)
             {
@@ -14729,12 +15079,11 @@ namespace Cnidaria.Cs
                 return new Conversion(ConversionKind.ExplicitNumeric);
             }
 
-            // reference upcast
-            if (expr.Type.IsReferenceType && target.IsReferenceType && IsBaseTypeOf(target, expr.Type))
+            // reference conversions
+            if (HasImplicitReferenceConversion(expr.Type, target))
                 return new Conversion(ConversionKind.ImplicitReference);
 
-            // explicit downcast
-            if (expr.Type.IsReferenceType && target.IsReferenceType && IsBaseTypeOf(expr.Type, target))
+            if (HasExplicitReferenceConversion(expr.Type, target))
                 return new Conversion(ConversionKind.ExplicitReference);
 
             return new Conversion(ConversionKind.None);
@@ -14884,6 +15233,59 @@ namespace Cnidaria.Cs
                     _ => false
                 };
             }
+        }
+        private static bool HasImplicitReferenceConversion(TypeSymbol source, TypeSymbol destination)
+        {
+            if (!source.IsReferenceType || !destination.IsReferenceType)
+                return false;
+
+            if (ReferenceEquals(source, destination))
+                return true;
+
+            // Normal upcast
+            if (IsBaseTypeOf(destination, source))
+                return true;
+
+            // Array covariance
+            if (source is ArrayTypeSymbol srcArr && destination is ArrayTypeSymbol dstArr)
+            {
+                if (srcArr.Rank != dstArr.Rank)
+                    return false;
+
+                if (!srcArr.ElementType.IsReferenceType || !dstArr.ElementType.IsReferenceType)
+                    return false;
+
+                return HasImplicitReferenceConversion(srcArr.ElementType, dstArr.ElementType);
+            }
+
+            return false;
+        }
+
+        private static bool HasExplicitReferenceConversion(TypeSymbol source, TypeSymbol destination)
+        {
+            if (!source.IsReferenceType || !destination.IsReferenceType)
+                return false;
+
+            if (ReferenceEquals(source, destination))
+                return true;
+
+            // Normal downcast
+            if (IsBaseTypeOf(source, destination))
+                return true;
+
+            // Array covariance
+            if (source is ArrayTypeSymbol srcArr && destination is ArrayTypeSymbol dstArr)
+            {
+                if (srcArr.Rank != dstArr.Rank)
+                    return false;
+
+                if (!srcArr.ElementType.IsReferenceType || !dstArr.ElementType.IsReferenceType)
+                    return false;
+
+                return HasExplicitReferenceConversion(srcArr.ElementType, dstArr.ElementType);
+            }
+
+            return false;
         }
         private static bool TryGetSystemNullableInfo(TypeSymbol t, out NamedTypeSymbol nullableType, out TypeSymbol underlying)
         {
@@ -15200,7 +15602,8 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics,
                 requireImplicit: true);
 
-            var thenStmt = BindStatement(node.Statement, context, diagnostics);
+            var thenBinder = CreateFlowScopeBinderForTrue(condition);
+            var thenStmt = thenBinder.BindStatement(node.Statement, context, diagnostics);
 
             BoundStatement? elseStmt = null;
             if (node.Else != null)
@@ -15603,11 +16006,12 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics,
                 requireImplicit: true);
 
+            var bodyBinder = CreateFlowScopeBinderForTrue(condition);
             _flow.PushLoop(breakLabel, continueLabel);
             BoundStatement body;
             try
             {
-                body = BindStatement(node.Statement, context, diagnostics);
+                body = bodyBinder.BindStatement(node.Statement, context, diagnostics);
             }
             finally
             {

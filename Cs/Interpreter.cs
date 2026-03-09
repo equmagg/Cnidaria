@@ -853,10 +853,6 @@ namespace Cnidaria.Cs
                             ExecNewarr(mod, ins.Operand0);
                             break;
 
-                        case BytecodeOp.Ldlen:
-                            ExecLdlen();
-                            break;
-
                         case BytecodeOp.Ldelem:
                             ExecLdelem(mod, ins.Operand0);
                             break;
@@ -1531,7 +1527,12 @@ namespace Cnidaria.Cs
             if (!IsSystemStringType(t))
                 throw new InvalidOperationException($"Expected System.String, got {t.Namespace}.{t.Name}");
         }
-        private void ValidateArrayRef(Slot s, RuntimeType expectedElemType, out int arrObjAbs, out int length)
+        private void ValidateArrayRefExact(
+    Slot s,
+    RuntimeType expectedElemType,
+    out int arrObjAbs,
+    out int length,
+    out RuntimeType actualElemType)
         {
             if (s.Kind == SlotKind.Null)
                 throw new NullReferenceException();
@@ -1545,10 +1546,46 @@ namespace Cnidaria.Cs
             if (actualType.Kind != RuntimeTypeKind.Array || actualType.ElementType is null)
                 throw new InvalidOperationException($"Expected array, got {actualType.Namespace}.{actualType.Name}");
 
-            // Exact match for now
-            if (actualType.ElementType.TypeId != expectedElemType.TypeId)
-                throw new InvalidOperationException(
-                    $"Array element type mismatch: actual={actualType.ElementType.Namespace}.{actualType.ElementType.Name}, " +
+            actualElemType = actualType.ElementType;
+
+            if (actualElemType.TypeId != expectedElemType.TypeId)
+                throw new ArrayTypeMismatchException(
+                    $"Array element type mismatch: actual={actualElemType.Namespace}.{actualElemType.Name}, " +
+                    $"expected={expectedElemType.Namespace}.{expectedElemType.Name}");
+
+            length = GetArrayLengthFromObject(arrObjAbs);
+        }
+
+        private void ValidateArrayRefReadable(
+            Slot s,
+            RuntimeType expectedElemType,
+            out int arrObjAbs,
+            out int length,
+            out RuntimeType actualElemType)
+        {
+            if (s.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+
+            if (s.Kind != SlotKind.Ref)
+                throw new InvalidOperationException($"Expected array ref, got {s.Kind}");
+
+            arrObjAbs = checked((int)s.Payload);
+
+            var actualType = GetObjectTypeFromRef(s);
+            if (actualType.Kind != RuntimeTypeKind.Array || actualType.ElementType is null)
+                throw new InvalidOperationException($"Expected array, got {actualType.Namespace}.{actualType.Name}");
+
+            actualElemType = actualType.ElementType;
+
+            bool ok =
+                actualElemType.TypeId == expectedElemType.TypeId ||
+                (actualElemType.IsReferenceType &&
+                 expectedElemType.IsReferenceType &&
+                 IsAssignableTo(actualElemType, expectedElemType));
+
+            if (!ok)
+                throw new ArrayTypeMismatchException(
+                    $"Array element type mismatch: actual={actualElemType.Namespace}.{actualElemType.Name}, " +
                     $"expected={expectedElemType.Namespace}.{expectedElemType.Name}");
 
             length = GetArrayLengthFromObject(arrObjAbs);
@@ -1695,11 +1732,29 @@ namespace Cnidaria.Cs
 
         private bool IsAssignableTo(RuntimeType actual, RuntimeType target)
         {
-            for (var t = actual; t != null; t = t.BaseType)
+            if (ReferenceEquals(actual, target))
+                return true;
+
+            if (actual.Kind == RuntimeTypeKind.Array &&
+                target.Kind == RuntimeTypeKind.Array)
+            {
+                if (actual.ArrayRank == target.ArrayRank &&
+                    actual.ElementType is RuntimeType actualElem &&
+                    target.ElementType is RuntimeType targetElem &&
+                    actualElem.IsReferenceType &&
+                    targetElem.IsReferenceType &&
+                    IsAssignableTo(actualElem, targetElem))
+                {
+                    return true;
+                }
+            }
+
+            for (var t = actual.BaseType; t != null; t = t.BaseType)
             {
                 if (ReferenceEquals(t, target))
                     return true;
             }
+
             return false;
         }
 
@@ -2191,28 +2246,13 @@ namespace Cnidaria.Cs
             PushSlot(new Slot(SlotKind.Ref, arrAbs));
         }
 
-        private void ExecLdlen()
-        {
-            var arr = PopSlot();
-
-            if (arr.Kind == SlotKind.Null)
-                throw new NullReferenceException();
-
-            var t = GetObjectTypeFromRef(arr);
-            if (t.Kind != RuntimeTypeKind.Array)
-                throw new InvalidOperationException($"Ldlen expects array, got {t.Namespace}.{t.Name}");
-
-            int arrAbs = checked((int)arr.Payload);
-            int len = GetArrayLengthFromObject(arrAbs);
-            PushSlot(new Slot(SlotKind.I4, len));
-        }
         private void ExecLdelema(RuntimeModule mod, int elemTypeToken)
         {
             int index = PopSlot().AsI4Checked();
             var arr = PopSlot();
 
             var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
+            ValidateArrayRefExact(arr, elemType, out int arrAbs, out int length, out var actualElemType);
 
             if ((uint)index >= (uint)length)
                 throw new IndexOutOfRangeException();
@@ -2229,7 +2269,7 @@ namespace Cnidaria.Cs
             var arr = PopSlot();
 
             var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
+            ValidateArrayRefReadable(arr, elemType, out int arrAbs, out int length, out var actualElemType);
 
             if ((uint)index >= (uint)length)
                 throw new IndexOutOfRangeException();
@@ -2248,7 +2288,7 @@ namespace Cnidaria.Cs
             var arr = PopSlot();
 
             var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRef(arr, elemType, out int arrAbs, out int length);
+            ValidateArrayRefReadable(arr, elemType, out int arrAbs, out int length, out var actualElemType);
 
             if ((uint)index >= (uint)length)
                 throw new IndexOutOfRangeException();
@@ -2428,7 +2468,7 @@ namespace Cnidaria.Cs
                     if (args[0].Kind == SlotKind.Null) length = 0;
                     else
                     {
-                        ValidateArrayRef(args[0], ctor.ParameterTypes[0].ElementType!, out _, out int arrLen);
+                        ValidateArrayRefExact(args[0], ctor.ParameterTypes[0].ElementType!, out _, out int arrLen, out _);
                         length = arrLen;
                     }
                 }

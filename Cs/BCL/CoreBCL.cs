@@ -17,8 +17,27 @@
     {
         public Object() { }
         public virtual string ToString() { return "System.Object"; }
-        public virtual bool Equals(object obj) { return false; }
-        public virtual int GetHashCode() { return 0; }
+        public virtual bool Equals(object? obj)
+        {
+            return this == obj;
+        }
+        public static bool Equals(object? objA, object? objB)
+        {
+            if (objA == objB)
+            {
+                return true;
+            }
+            if (objA == null || objB == null)
+            {
+                return false;
+            }
+            return objA.Equals(objB);
+        }
+        public static bool ReferenceEquals(object? objA, object? objB)
+        {
+            return objA == objB;
+        }
+        public virtual int GetHashCode() { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this); }
     }
 
     public class ValueType { }
@@ -50,7 +69,54 @@
 
         public static T[] Empty<T>()
         {
-            return new T[0];//return EmptyArray<T>.Value;
+            return EmptyArray<T>.Value;
+        }
+
+        public static int IndexOf<T>(T[] array, T value)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            return IndexOf<T>(array, value, 0, array.Length);
+        }
+
+        public static int IndexOf<T>(T[] array, T value, int startIndex)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+
+            int len = array.Length;
+            if ((uint)startIndex > (uint)len) throw new ArgumentOutOfRangeException("startIndex");
+
+            return IndexOf<T>(array, value, startIndex, len - startIndex);
+        }
+
+        public static int IndexOf<T>(T[] array, T value, int startIndex, int count)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+
+            int len = array.Length;
+            if ((uint)startIndex > (uint)len) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > len - count) throw new ArgumentOutOfRangeException("count");
+
+            int end = startIndex + count;
+
+            if ((object)value == null)
+            {
+                for (int i = startIndex; i < end; i++)
+                {
+                    if ((object)array[i] == null)
+                        return i;
+                }
+
+                return -1;
+            }
+
+            object boxedValue = value;
+            for (int i = startIndex; i < end; i++)
+            {
+                if (boxedValue.Equals(array[i]))
+                    return i;
+            }
+
+            return -1;
         }
 
         public static void Clear(Array array)
@@ -349,40 +415,58 @@
 
             return dstStr;
         }
-        public int IndexOf(char value)
-        {
-            ref char src = ref GetPinnableReference();
-            for (int i = 0; i < Length; i++)
-                if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
-                    return i;
-            return -1;
-        }
-        private int IndexOf(char value, int startIndex)
+        public int IndexOf(char value) => IndexOf(value, 0, Length);
+
+        public int IndexOf(char value, int startIndex)
         {
             if ((uint)startIndex > (uint)Length) throw new ArgumentOutOfRangeException("startIndex");
+            return IndexOf(value, startIndex, Length - startIndex);
+        }
 
+        public int IndexOf(char value, int startIndex, int count)
+        {
+            int len = Length;
+            if ((uint)startIndex > (uint)len) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > len - count) throw new ArgumentOutOfRangeException("count");
+
+            int end = startIndex + count;
             ref char src = ref GetPinnableReference();
-            for (int i = startIndex; i < Length; i++)
+
+            for (int i = startIndex; i < end; i++)
+            {
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
                     return i;
+            }
+
             return -1;
         }
-        private int IndexOf(string value, int startIndex)
+        public int IndexOf(string value) => IndexOf(value, 0, Length);
+
+        public int IndexOf(string value, int startIndex)
         {
             if ((object)value == null) throw new ArgumentNullException("value");
             if ((uint)startIndex > (uint)Length) throw new ArgumentOutOfRangeException("startIndex");
 
-            int m = value.Length;
-            if (m == 0) return startIndex;
-            if (m == 1) return IndexOf(value[0], startIndex);
+            return IndexOf(value, startIndex, Length - startIndex);
+        }
+
+        public int IndexOf(string value, int startIndex, int count)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
 
             int n = Length;
-            if (m > n - startIndex) return -1;
+            if ((uint)startIndex > (uint)n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > n - count) throw new ArgumentOutOfRangeException("count");
+
+            int m = value.Length;
+            if (m == 0) return startIndex;
+            if (m == 1) return IndexOf(value[0], startIndex, count);
+            if (m > count) return -1;
 
             ref char a = ref GetPinnableReference();
             ref char b = ref value.GetPinnableReference();
 
-            int last = n - m;
+            int last = startIndex + count - m;
             char b0 = System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, 0);
 
             for (int i = startIndex; i <= last; i++)
@@ -397,7 +481,9 @@
                         System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, j))
                         break;
                 }
-                if (j == m) return i;
+
+                if (j == m)
+                    return i;
             }
 
             return -1;
@@ -1218,6 +1304,22 @@
         public const char MaxValue = (char)0xFFFF;
         public const char MinValue = (char)0x00;
 
+        public bool Equals(char obj)
+        {
+            return m_value == obj;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is char))
+            {
+                return false;
+            }
+            return m_value == ((char)obj).m_value;
+        }
+        public override int GetHashCode()
+        {
+            return (int)m_value | ((int)m_value << 16);
+        }
         public override string ToString()
         {
             return System.Number.CharToString(m_value);
@@ -1286,6 +1388,22 @@
         public const sbyte MaxValue = (sbyte)0x7F;
         public const sbyte MinValue = unchecked((sbyte)0x80);
 
+        public bool Equals(sbyte obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is sbyte))
+            {
+                return false;
+            }
+            return m_value == ((sbyte)obj).m_value;
+        }
         public static sbyte Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1311,6 +1429,22 @@
         public const byte MaxValue = (byte)0xFF;
         public const byte MinValue = 0;
 
+        public bool Equals(byte obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is byte))
+            {
+                return false;
+            }
+            return m_value == ((byte)obj).m_value;
+        }
         public static byte Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1336,7 +1470,22 @@
         public const short MaxValue = (short)0x7FFF;
         public const short MinValue = unchecked((short)0x8000);
 
-
+        public bool Equals(short obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is short))
+            {
+                return false;
+            }
+            return m_value == ((short)obj).m_value;
+        }
         public static short Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1362,6 +1511,22 @@
         public const ushort MaxValue = (ushort)0xFFFF;
         public const ushort MinValue = 0;
 
+        public bool Equals(ushort obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return (int)m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is ushort))
+            {
+                return false;
+            }
+            return m_value == ((ushort)obj).m_value;
+        }
         public static ushort Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1387,6 +1552,22 @@
         public const int MaxValue = 0x7fffffff;
         public const int MinValue = unchecked((int)0x80000000);
 
+        public bool Equals(int obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is int))
+            {
+                return false;
+            }
+            return m_value == ((int)obj).m_value;
+        }
         public static int Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1412,6 +1593,22 @@
         public const uint MaxValue = (uint)0xffffffff;
         public const uint MinValue = 0U;
 
+        public bool Equals(uint obj)
+        {
+            return m_value == obj;
+        }
+        public override int GetHashCode()
+        {
+            return (int)m_value;
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is uint))
+            {
+                return false;
+            }
+            return m_value == ((uint)obj).m_value;
+        }
         public static uint Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1437,6 +1634,23 @@
         public const long MaxValue = 0x7fffffffffffffffL;
         public const long MinValue = unchecked((long)0x8000000000000000L);
 
+        public bool Equals(long obj)
+        {
+            return m_value == obj;
+        }
+        // The value of the lower 32 bits XORed with the uppper 32 bits.
+        public override int GetHashCode()
+        {
+            return unchecked((int)((long)m_value)) ^ (int)(m_value >> 32);
+        }
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (!(obj is long))
+            {
+                return false;
+            }
+            return m_value == ((long)obj).m_value;
+        }
         public static long Parse(String str)
         {
             if ((object)str == null) throw new ArgumentNullException("str");
@@ -1462,6 +1676,15 @@
         public const ulong MaxValue = (ulong)0xffffffffffffffffL;
         public const ulong MinValue = 0x0;
 
+        public bool Equals(ulong obj)
+        {
+            return m_value == obj;
+        }
+        // The value of the lower 32 bits XORed with the uppper 32 bits.
+        public override int GetHashCode()
+        {
+            return ((int)m_value) ^ (int)(m_value >> 32);
+        }
 
         public static ulong Parse(String str)
         {
@@ -1495,6 +1718,77 @@
 
         internal const float AdditiveIdentity = 0.0f;
         internal const float MultiplicativeIdentity = 1.0f;
+        internal const float One = 1.0f;
+        internal const float Zero = 0.0f;
+        internal const float NegativeOne = -1.0f;
+        public const float NegativeZero = -0.0f;
+
+
+        internal const uint SignMask = 0x8000_0000;
+        internal const int SignShift = 31;
+        internal const byte ShiftedSignMask = (byte)(SignMask >> SignShift);
+
+        internal const uint BiasedExponentMask = 0x7F80_0000;
+        internal const int BiasedExponentShift = 23;
+        internal const int BiasedExponentLength = 8;
+        internal const byte ShiftedBiasedExponentMask = (byte)(BiasedExponentMask >> BiasedExponentShift);
+
+        internal const uint TrailingSignificandMask = 0x007F_FFFF;
+
+        internal const byte MinSign = 0;
+        internal const byte MaxSign = 1;
+
+        internal const byte MinBiasedExponent = 0x00;
+        internal const byte MaxBiasedExponent = 0xFF;
+
+        internal const byte ExponentBias = 127;
+
+        internal const sbyte MinExponent = -126;
+        internal const sbyte MaxExponent = +127;
+
+        internal const uint MinTrailingSignificand = 0x0000_0000;
+        internal const uint MaxTrailingSignificand = 0x007F_FFFF;
+
+        internal const int TrailingSignificandLength = 23;
+        internal const int SignificandLength = TrailingSignificandLength + 1;
+
+        // Constants representing the private bit-representation for various default values
+
+        internal const uint PositiveZeroBits = 0x0000_0000;
+        internal const uint NegativeZeroBits = 0x8000_0000;
+
+        internal const uint EpsilonBits = 0x0000_0001;
+
+        internal const uint PositiveInfinityBits = 0x7F80_0000;
+        internal const uint NegativeInfinityBits = 0xFF80_0000;
+
+        internal const uint SmallestNormalBits = 0x0080_0000;
+
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            return (obj is float other) && Equals(other);
+        }
+        public bool Equals(float obj)
+        {
+            if (obj == m_value)
+            {
+                return true;
+            }
+            return IsNaN(obj) && IsNaN(m_value);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode()
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(m_value);
+
+            if (IsNaNOrZero(m_value))
+            {
+                // Ensure that all NaNs and both zeros have the same hash code
+                bits &= PositiveInfinityBits;
+            }
+
+            return (int)bits;
+        }
 
         public override string ToString()
         {
@@ -1507,6 +1801,41 @@
         public string ToString(string format, System.Globalization.CultureInfo cultureInfo)
         {
             return System.Number.DoubleToString((double)m_value);
+        }
+        public static float Abs(float value) => MathF.Abs(value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsFinite(float f)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(f);
+            return (~bits & PositiveInfinityBits) != 0;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsInfinity(float f)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(Abs(f));
+            return bits == PositiveInfinityBits;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNaN(float f)
+        {
+            return f != f;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsNaNOrZero(float f)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(f);
+            return ((bits - 1) & ~SignMask) >= PositiveInfinityBits;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegative(float f)
+        {
+            return BitConverter.SingleToInt32Bits(f) < 0;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegativeInfinity(float f)
+        {
+            return f == NegativeInfinity;
         }
     }
     public struct Double
@@ -1573,6 +1902,18 @@
             return System.Number.DoubleToString(m_value);
         }
 
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            return (obj is double other) && Equals(other);
+        }
+        public bool Equals(double obj)
+        {
+            if (obj == m_value)
+            {
+                return true;
+            }
+            return IsNaN(obj) && IsNaN(m_value);
+        }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override int GetHashCode()
         {
@@ -2360,6 +2701,20 @@
                     ? unchecked((long)0x8000000000000000L)
                     : unchecked((int)0x80000000)));
         }
+
+        public override bool Equals([NotNullWhen(true)] object? obj) => (obj is nint other) && Equals(other);
+        public override int GetHashCode()
+        {
+            if (Environment.Target64)
+            {
+                long value = _value;
+                return value.GetHashCode();
+            }
+            else
+            {
+                return (int)_value;
+            }
+        }
     }
     public readonly struct UIntPtr
     {
@@ -2388,6 +2743,20 @@
         public static int Size
         {
             get => Environment.SystemTarget / 8;
+        }
+
+        public override bool Equals([NotNullWhen(true)] object? obj) => (obj is nuint other) && Equals(other);
+        public override int GetHashCode()
+        {
+            if (Environment.Target64)
+            {
+                ulong value = _value;
+                return value.GetHashCode();
+            }
+            else
+            {
+                return (int)_value;
+            }
         }
     }
 
@@ -2745,6 +3114,14 @@
 
         public static uint SingleToUInt32Bits(float value) => Unsafe.BitCast<float, uint>(value);
         public static float UInt32BitsToSingle(uint value) => Unsafe.BitCast<uint, float>(value);
+    }
+    public static class MathF
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Abs(float x)
+        {
+            return Math.Abs(x);
+        }
     }
     public static class Math
     {
@@ -3744,6 +4121,12 @@
             : base(message, innerException)
         { }
     }
+    public class InvalidCastException : SystemException
+    {
+        public InvalidCastException() : base("Specified cast is not valid.") { }
+        public InvalidCastException(string message) : base(message) { }
+        public InvalidCastException(string message, Exception innerException) : base(message, innerException) { }
+    }
     public class FormatException : SystemException
     {
         public FormatException()
@@ -4023,6 +4406,13 @@
         public NotNullAttribute()
         { }
     }
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    public sealed class NotNullWhenAttribute : Attribute
+    {
+        public NotNullWhenAttribute(bool returnValue) => ReturnValue = returnValue;
+
+        public bool ReturnValue { get; }
+    }
     [AttributeUsage(AttributeTargets.Enum, Inherited = false)]
     public class FlagsAttribute : Attribute
     {
@@ -4164,6 +4554,7 @@
         public static unsafe void Write(char* value) { _Write(value); }
         public static void Write(Span<char> value) { _Write(value); }
         public static void Write(string value) { _Write(value); }
+        public static void Write(object value) { _Write(value.ToString()); }
 
         public static void WriteLine(sbyte value) { Write(value); Write('\n'); }
         public static void WriteLine(byte value) { Write(value); Write('\n'); }
@@ -4180,6 +4571,14 @@
         public static void WriteLine(string value) { Write(value); Write('\n'); }
         public static void WriteLine(Span<char> value) { Write(value); Write('\n'); }
         public static unsafe void WriteLine(char* value) { Write(value); Write('\n'); }
+        public static void WriteLine(object value)
+        {
+            if (value != null)
+            {
+                Write(value);
+            }
+            Write('\n');
+        }
         // convenience aliases
         public static void print(bool value) { Write(value); }
         public static void print(char value) { Write(value); }
@@ -4187,6 +4586,7 @@
         public static void print(ulong value) { Write(value); }
         public static void print(double value) { Write(value); }
         public static void print(string value) { WriteLine(value); }
+        public static void print(object value) { WriteLine(value); }
         // intrinsics
         [RuntimeIntrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -4237,7 +4637,8 @@
                 }
             }
         }
-}
+    }
+
 }
 namespace System.Runtime.InteropServices
 {
@@ -4267,6 +4668,12 @@ namespace System.Runtime.CompilerServices
         [RuntimeIntrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static bool IsReferenceOrContainsReferences<T>() where T : allows ref struct => IsReferenceOrContainsReferences<T>();
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static int GetHashCode(object o)
+        {
+            return 0; // to do
+        }
     }
     public enum MethodImplOptions
     {

@@ -115,7 +115,6 @@ namespace Cnidaria.Cs
         Stobj,   // operand0: Type token, stack: addr(byref/ptr), value ->
 
         Newarr,  // operand0: element Type token, stack: length -> arrayref
-        Ldlen,   // stack: arrayref -> int32
         Ldelem,  // operand0: element Type token, stack: arrayref, index -> value
         Ldelema, // operand0: element Type token, stack: arrayref, index -> byref
         Stelem,  // operand0: element Type token, stack: arrayref, index, value ->
@@ -959,6 +958,10 @@ namespace Cnidaria.Cs
                         EmitAs(@as, mode);
                         return;
 
+                    case BoundIsPatternExpression isPattern:
+                        EmitIsPattern(isPattern, mode);
+                        return;
+
                     case BoundSequenceExpression seq:
                         EmitSequence(seq, mode);
                         return;
@@ -1790,23 +1793,6 @@ namespace Cnidaria.Cs
             }
             private bool TryEmitIntrinsic(BoundCallExpression call, EmitMode mode)
             {
-                // System.Array.get_Length intrinsic
-                if (!call.Method.IsStatic &&
-                    call.Method.Name == "get_Length" &&
-                    call.Method.ContainingSymbol is NamedTypeSymbol ct &&
-                    ct.SpecialType == SpecialType.System_Array &&
-                    call.Arguments.Length == 0)
-                {
-                    if (call.ReceiverOpt is null)
-                        throw new InvalidOperationException("Array.get_Length without receiver.");
-
-                    EmitExpression(call.ReceiverOpt, EmitMode.Value);
-                    _il.Emit(BytecodeOp.Ldlen, pop: 1, push: 1);
-                    if (mode == EmitMode.Discard)
-                        _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
-                    return true;
-                }
-
                 var def = call.Method.OriginalDefinition;
                 if (!def.IsStatic)
                     return false;
@@ -2112,6 +2098,49 @@ namespace Cnidaria.Cs
 
                 // Reference type target
                 _il.Emit(BytecodeOp.Isinst, operand0: _tokens.GetTypeToken(@as.Type), pop: 1, push: 1);
+            }
+            private void EmitIsPattern(BoundIsPatternExpression isPattern, EmitMode mode)
+            {
+                EmitExpression(isPattern.Operand, EmitMode.Value);
+
+                if (isPattern.Operand.Type.IsValueType)
+                    _il.Emit(BytecodeOp.Box, operand0: _tokens.GetTypeToken(isPattern.Operand.Type), pop: 1, push: 1);
+
+                _il.Emit(BytecodeOp.Isinst, operand0: _tokens.GetTypeToken(isPattern.PatternType), pop: 1, push: 1);
+
+                if (mode == EmitMode.Discard)
+                {
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                    return;
+                }
+
+                var lFalse = _il.DefineLabel();
+                var lEnd = _il.DefineLabel();
+
+                _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                _il.EmitBranch(BytecodeOp.Brfalse, lFalse, pop: 1);
+
+                if (isPattern.DeclaredLocalOpt is not null && !isPattern.IsDiscard)
+                {
+                    int localIndex = GetOrCreateLocal(isPattern.DeclaredLocalOpt);
+                    if (isPattern.PatternType.IsValueType)
+                        _il.Emit(BytecodeOp.UnboxAny, operand0: _tokens.GetTypeToken(isPattern.PatternType), pop: 1, push: 1);
+
+                    _il.Emit(BytecodeOp.Stloc, operand0: localIndex, pop: 1, push: 0);
+                }
+                else
+                {
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                }
+
+                _il.Emit(BytecodeOp.Ldc_I4, operand0: 1, pop: 0, push: 1);
+                _il.EmitBranch(BytecodeOp.Br, lEnd, pop: 0);
+
+                _il.MarkLabel(lFalse);
+                _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
+
+                _il.MarkLabel(lEnd);
             }
             private void EmitConversion(BoundConversionExpression conv, EmitMode mode)
             {

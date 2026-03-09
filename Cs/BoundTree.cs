@@ -1387,4 +1387,30 @@ namespace Cnidaria.Cs
                 SetHasErrors();
         }
     }
+    internal sealed class BoundIsPatternExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.IsPatternExpression;
+
+        public BoundExpression Operand { get; }
+        public TypeSymbol PatternType { get; }
+        public LocalSymbol? DeclaredLocalOpt { get; }
+        public bool IsDiscard { get; }
+
+        public BoundIsPatternExpression(
+            SyntaxNode syntax,
+            BoundExpression operand,
+            TypeSymbol patternType,
+            LocalSymbol? declaredLocalOpt,
+            TypeSymbol boolType,
+            bool isDiscard)
+            : base(syntax)
+        {
+            Operand = operand;
+            PatternType = patternType;
+            DeclaredLocalOpt = declaredLocalOpt;
+            IsDiscard = isDiscard;
+            Type = boolType;
+        }
+
+    }
 }

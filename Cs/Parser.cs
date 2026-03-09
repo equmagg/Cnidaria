@@ -1530,7 +1530,7 @@ namespace Cnidaria.Cs
             var pattern = ParsePatternCore();
 
             WhenClauseSyntax? whenClause = null;
-            if (_tokens.CurrentKind == SyntaxKind.WhenKeyword)
+            if (IsCurrentContextual(SyntaxKind.WhenKeyword))
                 whenClause = ParseWhenClause();
 
             var arrow = MatchToken(SyntaxKind.EqualsGreaterThanToken);
@@ -2164,7 +2164,7 @@ namespace Cnidaria.Cs
                 decl = ParseCatchDeclaration();
 
             CatchFilterClauseSyntax? filter = null;
-            if (_tokens.CurrentKind == SyntaxKind.WhenKeyword)
+            if (IsCurrentContextual(SyntaxKind.WhenKeyword))
                 filter = ParseCatchFilterClause();
 
             var block = ParseBlock();
@@ -2197,7 +2197,7 @@ namespace Cnidaria.Cs
         }
         private CatchFilterClauseSyntax ParseCatchFilterClause()
         {
-            var whenKeyword = MatchToken(SyntaxKind.WhenKeyword);
+            var whenKeyword = MatchContextualKeyword(SyntaxKind.WhenKeyword);
             var openParen = MatchToken(SyntaxKind.OpenParenToken);
 
             ExpressionSyntax filterExpr;
@@ -2729,7 +2729,7 @@ namespace Cnidaria.Cs
             var pattern = ParsePatternCore();
 
             WhenClauseSyntax? whenClause = null;
-            if (_tokens.CurrentKind == SyntaxKind.WhenKeyword)
+            if (IsCurrentContextual(SyntaxKind.WhenKeyword))
                 whenClause = ParseWhenClause();
 
             if (whenClause is null &&
@@ -3303,8 +3303,15 @@ namespace Cnidaria.Cs
 
                 var op = _tokens.EatToken();
 
+                if (op.Kind == SyntaxKind.IsKeyword)
+                {
+                    var pattern = ParsePatternCore();
+                    left = new IsPatternExpressionSyntax(left, op, pattern);
+                    continue;
+                }
+
                 ExpressionSyntax right;
-                if (op.Kind == SyntaxKind.IsKeyword || op.Kind == SyntaxKind.AsKeyword)
+                if (op.Kind == SyntaxKind.AsKeyword)
                 {
                     right = ParseType();
                 }
@@ -3555,7 +3562,6 @@ namespace Cnidaria.Cs
 
             return new TypeOfExpressionSyntax(typeOfKeyword, openParen, type, closeParen);
         }
-
         private SizeOfExpressionSyntax ParseSizeOfExpression()
         {
             var sizeOfKeyword = MatchToken(SyntaxKind.SizeOfKeyword);
@@ -3564,6 +3570,15 @@ namespace Cnidaria.Cs
             var closeParen = MatchToken(SyntaxKind.CloseParenToken);
 
             return new SizeOfExpressionSyntax(sizeOfKeyword, openParen, type, closeParen);
+        }
+        private DefaultExpressionSyntax ParseDefaultExpression()
+        {
+            var defaultKeyword = MatchToken(SyntaxKind.DefaultKeyword);
+            var openParen = MatchToken(SyntaxKind.OpenParenToken);
+            var type = ParseType();
+            var closeParen = MatchToken(SyntaxKind.CloseParenToken);
+
+            return new DefaultExpressionSyntax(defaultKeyword, openParen, type, closeParen);
         }
         private CheckedExpressionSyntax ParseCheckedExpression(bool isChecked)
         {
@@ -3598,6 +3613,15 @@ namespace Cnidaria.Cs
 
                 case SyntaxKind.SizeOfKeyword:
                     return ParseSizeOfExpression();
+
+                case SyntaxKind.DefaultKeyword:
+                    if (_tokens.Peek(1).Kind == SyntaxKind.OpenParenToken)
+                        return ParseDefaultExpression();
+
+                    return new LiteralExpressionSyntax(
+                        SyntaxKind.DefaultLiteralExpression,
+                        _tokens.EatToken());
+
                 case SyntaxKind.InterpolatedStringStartToken:
                 case SyntaxKind.InterpolatedVerbatimStringStartToken:
                 case SyntaxKind.InterpolatedSingleLineRawStringStartToken:
@@ -4215,6 +4239,62 @@ namespace Cnidaria.Cs
         // =patterns=
         private PatternSyntax ParsePatternCore()
         {
+            return ParseDisjunctivePattern();
+        }
+        private PatternSyntax ParseDisjunctivePattern()
+        {
+            var left = ParseConjunctivePattern();
+
+            while (IsCurrentContextual(SyntaxKind.OrKeyword))
+            {
+                var op = _tokens.EatToken();
+                var right = ParseConjunctivePattern();
+                left = new BinaryPatternSyntax(SyntaxKind.OrPattern, left, op, right);
+            }
+
+            return left;
+        }
+        private PatternSyntax ParseConjunctivePattern()
+        {
+            var left = ParseNegatedPattern();
+
+            while (IsCurrentContextual(SyntaxKind.AndKeyword))
+            {
+                var op = _tokens.EatToken();
+                var right = ParseNegatedPattern();
+                left = new BinaryPatternSyntax(SyntaxKind.AndPattern, left, op, right);
+            }
+
+            return left;
+        }
+        private PatternSyntax ParseNegatedPattern()
+        {
+            if (IsCurrentContextual(SyntaxKind.NotKeyword))
+            {
+                var op = _tokens.EatToken();
+                var pattern = ParseNegatedPattern();
+                return new UnaryPatternSyntax(SyntaxKind.NotPattern, op, pattern);
+            }
+
+            return ParsePrimaryPattern();
+        }
+        private PatternSyntax ParsePrimaryPattern()
+        {
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+            {
+                var open = _tokens.EatToken();
+                var pattern = ParsePatternCore();
+                var close = MatchToken(SyntaxKind.CloseParenToken);
+                return new ParenthesizedPatternSyntax(open, pattern, close);
+            }
+
+            if (IsCurrentContextual(SyntaxKind.VarKeyword))
+            {
+                var varKeyword = _tokens.EatToken();
+                var designation = ParseVariableDesignation();
+                return new VarPatternSyntax(varKeyword, designation);
+            }
+
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
                 string.Equals(_tokens.Current.ValueText, "_", StringComparison.Ordinal))
             {
@@ -4222,13 +4302,73 @@ namespace Cnidaria.Cs
                 return new DiscardPatternSyntax(underscore);
             }
 
-            // constant pattern
-            var expr = ParseExpression();
-            return new ConstantPatternSyntax(expr);
+            if (IsRelationalPatternOperator(_tokens.CurrentKind))
+            {
+                var op = _tokens.EatToken();
+                var expr = ParseExpression();
+                return new RelationalPatternSyntax(op, expr);
+            }
+
+            var resetPoint = GetResetPoint();
+            if (TryParse(
+                parse: ParseType,
+                out TypeSyntax parsedType,
+                tempContext: ParseContext.Type,
+                requireProgress: true,
+                requireNoNewDiagnostics: true))
+            {
+                if (CanStartPatternDesignation())
+                {
+                    var designation = ParseVariableDesignation();
+                    return new DeclarationPatternSyntax(parsedType, designation);
+                }
+
+                if (IsDefiniteTypePattern(parsedType) && IsPatternTerminatorOrOperator())
+                    return new TypePatternSyntax(parsedType);
+
+                Reset(resetPoint);
+            }
+
+            var expr2 = ParseExpression();
+            return new ConstantPatternSyntax(expr2);
         }
+        private bool CanStartPatternDesignation()
+            => _tokens.CurrentKind == SyntaxKind.IdentifierToken ||
+               _tokens.CurrentKind == SyntaxKind.OpenParenToken;
+        private bool IsPatternTerminatorOrOperator()
+        {
+            switch (_tokens.CurrentKind)
+            {
+                case SyntaxKind.SemicolonToken:
+                case SyntaxKind.CommaToken:
+                case SyntaxKind.CloseParenToken:
+                case SyntaxKind.CloseBracketToken:
+                case SyntaxKind.CloseBraceToken:
+                case SyntaxKind.ColonToken:
+                case SyntaxKind.EqualsGreaterThanToken:
+                case SyntaxKind.EndOfFileToken:
+                    return true;
+            }
+
+            return IsCurrentContextual(SyntaxKind.WhenKeyword) ||
+                   IsCurrentContextual(SyntaxKind.AndKeyword) ||
+                   IsCurrentContextual(SyntaxKind.OrKeyword);
+        }
+        private bool IsDefiniteTypePattern(TypeSyntax type)
+        {
+            if (TypeDefinitelyNotExpression(type))
+                return true;
+
+            return type is GenericNameSyntax;
+        }
+        private static bool IsRelationalPatternOperator(SyntaxKind kind)
+            => kind == SyntaxKind.LessThanToken ||
+               kind == SyntaxKind.LessThanEqualsToken ||
+               kind == SyntaxKind.GreaterThanToken ||
+               kind == SyntaxKind.GreaterThanEqualsToken;
         private WhenClauseSyntax ParseWhenClause()
         {
-            var whenKeyword = MatchToken(SyntaxKind.WhenKeyword);
+            var whenKeyword = MatchContextualKeyword(SyntaxKind.WhenKeyword);
 
             ExpressionSyntax condition;
             if (_tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken ||

@@ -2332,6 +2332,7 @@ namespace Cnidaria.Cs
         CheckedExpression,
         UncheckedExpression,
         ThrowExpression,
+        IsPatternExpression,
         // Statements
         BadStatement,
         Block,

@@ -564,13 +564,13 @@ namespace Cnidaria.Cs
                         }
                         mtps = b.ToImmutable();
                     }
-                    var retType = ReadType(core, typeByRid, ref reader, declaringType, ImmutableArray<TypeParameterSymbol>.Empty);
+                    var retType = ReadType(core, typeByRid, ref reader, declaringType, mtps);
 
                     var ps = ImmutableArray.CreateBuilder<(string name, TypeSymbol type)>((int)paramCount);
                     int totalParams = _md.GetRowCount(MetadataTableKind.Param);
                     for (int i = 0; i < paramCount; i++)
                     {
-                        var pt = ReadType(core, typeByRid, ref reader, declaringType, ImmutableArray<TypeParameterSymbol>.Empty);
+                        var pt = ReadType(core, typeByRid, ref reader, declaringType, mtps);
                         string paramName = $"arg{i}";
                         int prid = mdRow.ParamList + i;
                         if (mdRow.ParamList > 0 && prid > 0 && prid <= totalParams)
