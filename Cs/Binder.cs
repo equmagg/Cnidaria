@@ -1121,13 +1121,18 @@ namespace Cnidaria.Cs
                 _ => 0
             };
         }
-        private static bool HasModifier(SyntaxTokenList mods, SyntaxKind k)
+        private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
-            foreach (var m in mods)
-                if (m.Kind == k) return true;
+            for (int i = 0; i < mods.Count; i++)
+            {
+                var m = mods[i];
+                if (m.Kind == kind)
+                    return true;
+                if (m.Kind == SyntaxKind.IdentifierToken && m.ContextualKind == kind)
+                    return true;
+            }
             return false;
         }
-
         private static bool TryIncrementEnumConstantValue(object current, TypeSymbol underlyingType, out object next)
         {
             next = current;
@@ -3120,8 +3125,13 @@ namespace Cnidaria.Cs
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
             for (int i = 0; i < mods.Count; i++)
-                if (mods[i].Kind == kind)
+            {
+                var m = mods[i];
+                if (m.Kind == kind)
                     return true;
+                if (m.Kind == SyntaxKind.IdentifierToken && m.ContextualKind == kind)
+                    return true;
+            }
             return false;
         }
         private Accessibility DecodeDeclaredAccessibility(
@@ -3234,7 +3244,9 @@ namespace Cnidaria.Cs
                 isConstructor: false,
                 isAsync: isAsync,
                 locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
-                declaredAccessibility: declaredAcc);
+                declaredAccessibility: declaredAcc,
+                isExtensionMethod: syntax.ParameterList.Parameters.Count != 0
+                    && HasModifier(syntax.ParameterList.Parameters[0].Modifiers, SyntaxKind.ThisKeyword));
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);
             method.SetTypeParameters(tps);
@@ -6205,6 +6217,9 @@ namespace Cnidaria.Cs
                 case SizeOfExpressionSyntax sz:
                     result = BindSizeOf(sz, context, diagnostics);
                     break;
+                case DefaultExpressionSyntax def:
+                    result = BindDefaultExpression(def, context, diagnostics);
+                    break;
                 case ThrowExpressionSyntax te:
                     result = BindThrowExpression(te, context, diagnostics);
                     break;
@@ -6237,6 +6252,37 @@ namespace Cnidaria.Cs
             }
 
             return Record(node, result, context);
+        }
+        private BoundExpression BindDefaultExpression(
+            DefaultExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var type = BindType(node.Type, context, diagnostics);
+            if (type is ErrorTypeSymbol)
+                return new BoundBadExpression(node);
+
+            if (type.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DEF001",
+                    DiagnosticSeverity.Error,
+                    "The default value of 'void' is not valid.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (type is ByRefTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DEF002",
+                    DiagnosticSeverity.Error,
+                    "The default value of a byref type is not valid.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            return MakeDefaultValue(node, type);
         }
         private BoundExpression BindSizeOf(SizeOfExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -7604,7 +7650,13 @@ namespace Cnidaria.Cs
             {
                 return new BoundBinaryExpression(node, op, boolType, left, right, Optional<object>.None);
             }
-
+            // enum op enum
+            if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
+            {
+                var underlying = GetEnumUnderlyingTypeOrDefault(ctx.Compilation, left.Type);
+                var constValue = FoldBitwiseConstant(op, underlying.SpecialType, left, right);
+                return new BoundBinaryExpression(node, op, left.Type, left, right, constValue);
+            }
             // integral only
             if (!IsIntegral(left.Type.SpecialType) || !IsIntegral(right.Type.SpecialType))
             {
@@ -8245,7 +8297,6 @@ namespace Cnidaria.Cs
 
             if (!TryBindReceiverForMemberAccess(ma.Expression, isPointerAccess, out receiverValue, out receiverType, context, diagnostics))
             {
-                // Treat it as a namespace/type receiver (e.g. System.Console.WriteLine()). 
                 var sym = BindNamespaceOrType(ma.Expression, context, diagnostics);
                 receiverType = sym as NamedTypeSymbol;
                 receiverValue = null;
@@ -8264,18 +8315,13 @@ namespace Cnidaria.Cs
                 ? candidates.Where(m => m.IsStatic).ToImmutableArray()
                 : candidates.Where(m => !m.IsStatic).ToImmutableArray();
 
-            if (candidates.IsDefaultOrEmpty)
-            {
-                diagnostics.Add(new Diagnostic("CN_CALL022", DiagnosticSeverity.Error,
-                    $"No method '{name}' found on type '{receiverType.Name}'.",
-                    new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
-                return new BoundBadExpression(inv);
-            }
+            bool methodFound = !candidates.IsDefaultOrEmpty;
+
             candidates = candidates
                 .Where(m => AccessibilityHelper.IsAccessible(m, context))
                 .ToImmutableArray();
 
-            if (candidates.IsDefaultOrEmpty)
+            if (methodFound && candidates.IsDefaultOrEmpty) // method exists but not accessible
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_CALL_ACC002",
@@ -8284,81 +8330,112 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
                 return new BoundBadExpression(inv);
             }
-            if (ma.Name is GenericNameSyntax gName)
+            if (!candidates.IsDefaultOrEmpty)
             {
-                var explicitTypeArgs = BindTypeArguments(gName.TypeArgumentList.Arguments, context, diagnostics);
-                var arity = explicitTypeArgs.Length;
-
-                var arityMatches = candidates.Where(m => m.TypeParameters.Length == arity).ToImmutableArray();
-                if (arityMatches.IsDefaultOrEmpty)
+                if (ma.Name is GenericNameSyntax gName)
                 {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALLG010",
-                        DiagnosticSeverity.Error,
-                        $"No overload of '{name}' has {arity} type parameter(s).",
-                        new Location(context.SemanticModel.SyntaxTree, gName.Span)));
-                    return new BoundBadExpression(inv);
-                }
+                    var explicitTypeArgs = BindTypeArguments(gName.TypeArgumentList.Arguments, context, diagnostics);
+                    var arity = explicitTypeArgs.Length;
 
-                var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
-                for (int i = 0; i < arityMatches.Length; i++)
-                {
-                    var def = arityMatches[i];
-                    if (!GenericConstraintChecker.CheckMethodInstantiation(
-                        methodDefinition: def,
-                        typeArguments: explicitTypeArgs,
-                        getArgSpan: a => gName.TypeArgumentList.Arguments[a].Span,
-                        context: context,
-                        diagnostics: diagnostics))
+                    var arityMatches = candidates.Where(m => m.TypeParameters.Length == arity).ToImmutableArray();
+                    if (arityMatches.IsDefaultOrEmpty)
                     {
-                        continue;
+                        diagnostics.Add(new Diagnostic(
+                            "CN_CALLG010",
+                            DiagnosticSeverity.Error,
+                            $"No overload of '{name}' has {arity} type parameter(s).",
+                            new Location(context.SemanticModel.SyntaxTree, gName.Span)));
+                        return new BoundBadExpression(inv);
                     }
-                    constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
-                }
-                if (constructed.Count == 0)
-                {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALLG_CONSTR001",
-                        DiagnosticSeverity.Error,
-                        $"No overload of '{name}' satisfies the generic constraints for the provided type argument(s).",
-                        new Location(context.SemanticModel.SyntaxTree, gName.Span)));
-                    return new BoundBadExpression(inv);
-                }
-                candidates = constructed.ToImmutable();
-            }
-            else
-            {
-                var nonGeneric = candidates.Where(m => m.TypeParameters.IsDefaultOrEmpty).ToImmutableArray();
-                if (!nonGeneric.IsDefaultOrEmpty)
-                {
-                    candidates = nonGeneric;
+
+                    var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
+                    for (int i = 0; i < arityMatches.Length; i++)
+                    {
+                        var def = arityMatches[i];
+                        if (!GenericConstraintChecker.CheckMethodInstantiation(
+                            methodDefinition: def,
+                            typeArguments: explicitTypeArgs,
+                            getArgSpan: a => gName.TypeArgumentList.Arguments[a].Span,
+                            context: context,
+                            diagnostics: diagnostics))
+                        {
+                            continue;
+                        }
+
+                        constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
+                    }
+
+                    candidates = constructed.ToImmutable();
                 }
                 else
                 {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALLG011",
-                        DiagnosticSeverity.Error,
-                        $"Generic method '{name}' requires explicit type arguments (type inference is not implemented).",
-                        new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
+                    var nonGeneric = candidates.Where(m => m.TypeParameters.IsDefaultOrEmpty).ToImmutableArray();
+                    if (!nonGeneric.IsDefaultOrEmpty)
+                    {
+                        candidates = nonGeneric;
+                    }
+                    else
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_CALLG011",
+                            DiagnosticSeverity.Error,
+                            $"Generic method '{name}' requires explicit type arguments (type inference is not implemented).",
+                            new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
+                        return new BoundBadExpression(inv);
+                    }
+                }
+                if (TryResolveOverload(
+                    candidates: candidates,
+                    args: args,
+                    getArgExprSyntax: i => argSyntaxes[i].Expression,
+                    getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                    getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
+                    chosen: out var chosen,
+                    convertedArgs: out var convertedArgs,
+                    context: context,
+                    diagnostics: diagnostics,
+                    diagnosticNode: inv))
+                {
+                    return new BoundCallExpression(inv, receiverOpt: receiverValue, method: chosen!, arguments: convertedArgs);
+                }
+                return new BoundBadExpression(inv);
+            }
+            // extentions
+            if (receiverValue is not null)
+            {
+                var extensionCandidates = LookupExtensionMethods(name, receiverValue, context);
+
+                if (!extensionCandidates.IsDefaultOrEmpty)
+                {
+                    var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(args.Length + 1);
+                    extArgsBuilder.Add(receiverValue);
+                    extArgsBuilder.AddRange(args);
+                    var extArgs = extArgsBuilder.ToImmutable();
+
+                    if (TryResolveOverload(
+                        candidates: extensionCandidates,
+                        args: extArgs,
+                        getArgExprSyntax: i => i == 0 ? ma.Expression : argSyntaxes[i - 1].Expression,
+                        getArgRefKindKeyword: i => i == 0 ? null : argSyntaxes[i - 1].RefKindKeyword,
+                        getArgName: i => i == 0 ? null : argSyntaxes[i - 1].NameColon?.Name.Identifier.ValueText,
+                        chosen: out var chosen,
+                        convertedArgs: out var convertedArgs,
+                        context: context,
+                        diagnostics: diagnostics,
+                        diagnosticNode: inv))
+                    {
+                        return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
+                    }
+
                     return new BoundBadExpression(inv);
                 }
             }
-            if (!TryResolveOverload(
-                candidates: candidates,
-                args: args,
-                getArgExprSyntax: i => argSyntaxes[i].Expression,
-                getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
-                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
-                chosen: out var chosen,
-                convertedArgs: out var convertedArgs,
-                context: context,
-                diagnostics: diagnostics,
-                diagnosticNode: inv))
-            {
-                return new BoundBadExpression(inv);
-            }
 
-            return new BoundCallExpression(inv, receiverValue, chosen!, convertedArgs);
+            diagnostics.Add(new Diagnostic("CN_CALL022", DiagnosticSeverity.Error,
+                $"No method '{name}' found on type '{receiverType.Name}'.",
+                new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
+
+            return new BoundBadExpression(inv);
         }
         private BoundExpression BindGenericSimpleInvocation(
             InvocationExpressionSyntax inv,
@@ -8834,6 +8911,89 @@ namespace Cnidaria.Cs
             }
 
             return b.Count == members.Length ? members : b.ToImmutable();
+        }
+        private IEnumerable<NamedTypeSymbol> EnumerateExtensionContainerTypes(BindingContext context)
+        {
+            var imports = GetImports(context);
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+
+            // using static X;
+            for (int i = 0; i < imports.StaticTypes.Length; i++)
+            {
+                var t = imports.StaticTypes[i];
+                if (seen.Add(t))
+                    yield return t;
+            }
+
+            // regular namespace/type imports
+            for (int i = 0; i < imports.Containers.Length; i++)
+            {
+                switch (imports.Containers[i])
+                {
+                    case NamedTypeSymbol nt:
+                        if (seen.Add(nt))
+                            yield return nt;
+                        break;
+
+                    case NamespaceSymbol ns:
+                        {
+                            var types = ns.GetTypeMembers();
+                            for (int j = 0; j < types.Length; j++)
+                                if (seen.Add(types[j]))
+                                    yield return types[j];
+                            break;
+                        }
+                }
+            }
+
+            // current enclosing type namespace
+            for (Symbol? s = context.ContainingSymbol; s is not null; s = s.ContainingSymbol)
+            {
+                if (s is NamespaceSymbol curNs)
+                {
+                    var types = curNs.GetTypeMembers();
+                    for (int j = 0; j < types.Length; j++)
+                        if (seen.Add(types[j]))
+                            yield return types[j];
+                    break;
+                }
+            }
+        }
+        private ImmutableArray<MethodSymbol> LookupExtensionMethods(
+            string name,
+            BoundExpression receiver,
+            BindingContext context)
+        {
+            var b = ImmutableArray.CreateBuilder<MethodSymbol>();
+
+            foreach (var containerType in EnumerateExtensionContainerTypes(context))
+            {
+                var methods = LookupMethods(containerType, name);
+                if (methods.IsDefaultOrEmpty)
+                    continue;
+
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    var m = methods[i];
+                    if (!IsExtensionMethod(m))
+                        continue;
+
+                    if (!AccessibilityHelper.IsAccessible(m, context))
+                        continue;
+
+                    if (m.Parameters.Length == 0)
+                        continue;
+
+                    var firstParamType = m.Parameters[0].Type;
+                    var conv = ClassifyConversion(receiver, firstParamType, context);
+                    if (!conv.Exists || !conv.IsImplicit)
+                        continue;
+
+                    b.Add(m);
+                }
+            }
+
+            return b.Count == 0 ? ImmutableArray<MethodSymbol>.Empty : b.ToImmutable();
         }
         private static ImmutableArray<Symbol> LookupMembers(NamedTypeSymbol type, string name)
         {
@@ -12283,9 +12443,21 @@ namespace Cnidaria.Cs
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
             for (int i = 0; i < mods.Count; i++)
-                if (mods[i].Kind == kind)
+            {
+                var m = mods[i];
+                if (m.Kind == kind)
                     return true;
+                if (m.Kind == SyntaxKind.IdentifierToken && m.ContextualKind == kind)
+                    return true;
+            }
             return false;
+        }
+        private static bool IsExtensionMethod(MethodSymbol method)
+        {
+            if (method is null || !method.IsStatic || method.Parameters.Length == 0)
+                return false;
+
+            return method.IsExtensionMethod;
         }
         private BoundStatement BindLocalFunctionStatement(
             LocalFunctionStatementSyntax lf,
@@ -12850,12 +13022,135 @@ namespace Cnidaria.Cs
 
                     var rawArgs = ImmutableArray.CreateBuilder<BoundExpression>(node.ArgumentList.Arguments.Count);
                     bool hasArgErrors = false;
+                    bool hasFromEndIndex = false;
                     for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
                     {
-                        var arg = BindExpression(node.ArgumentList.Arguments[i].Expression, context, diagnostics);
-                        rawArgs.Add(arg);
-                        if (arg.HasErrors)
-                            hasArgErrors = true;
+                        if (node.ArgumentList.Arguments[i].Expression is PrefixUnaryExpressionSyntax pre &&
+                            pre.Kind == SyntaxKind.IndexExpression)
+                        {
+                            hasFromEndIndex = true;
+                            break;
+                        }
+                    }
+                    BoundExpression indexerReceiver = expr;
+                    ImmutableArray<LocalSymbol> seqLocals = default;
+                    ImmutableArray<BoundStatement> seqSideEffects = default;
+
+                    if (hasFromEndIndex)
+                    {
+                        var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+
+                        Symbol? lengthMember = null;
+                        {
+                            var members = LookupMembers(receiverType, "Length");
+                            for (int i = 0; i < members.Length; i++)
+                            {
+                                var m = members[i];
+                                if (m is PropertySymbol p && !p.IsStatic && ReferenceEquals(p.Type, intType))
+                                {
+                                    lengthMember = p;
+                                    break;
+                                }
+                                if (m is FieldSymbol f && !f.IsStatic && ReferenceEquals(f.Type, intType))
+                                {
+                                    lengthMember = f;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (lengthMember is null)
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_ELEM006",
+                                DiagnosticSeverity.Error,
+                                "Receiver type does not have an accessible 'Length' member required for index-from-end (^).",
+                                new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                            return new BoundBadExpression(node);
+                        }
+
+                        // Capture receiver
+                        var recvTmp = NewTemp("$idx_recv", expr.Type);
+                        var recvDecl = new BoundLocalDeclarationStatement(node, recvTmp, expr);
+                        var recvExpr = new BoundLocalExpression(node, recvTmp);
+
+                        // Capture length
+                        var lenTmp = NewTemp("$idx_len", intType);
+                        var lenAccess = new BoundMemberAccessExpression(
+                            (ExpressionSyntax)node.Expression,
+                            receiverOpt: recvExpr,
+                            member: lengthMember,
+                            type: intType,
+                            isLValue: false);
+                        var lenDecl = new BoundLocalDeclarationStatement(node, lenTmp, lenAccess);
+                        var lenExpr = new BoundLocalExpression(node, lenTmp);
+
+                        var locals = ImmutableArray.CreateBuilder<LocalSymbol>(2);
+                        var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2);
+
+                        locals.Add(recvTmp);
+                        sideEffects.Add(recvDecl);
+
+                        locals.Add(lenTmp);
+                        sideEffects.Add(lenDecl);
+
+                        indexerReceiver = recvExpr;
+
+                        for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
+                        {
+                            var argSyntax = node.ArgumentList.Arguments[i].Expression;
+
+                            if (argSyntax is PrefixUnaryExpressionSyntax pre &&
+                                pre.Kind == SyntaxKind.IndexExpression)
+                            {
+                                var valueSyntax = pre.Operand;
+                                var valueExpr = BindExpression(valueSyntax, context, diagnostics);
+                                valueExpr = ApplyConversion(
+                                    exprSyntax: valueSyntax,
+                                    expr: valueExpr,
+                                    targetType: intType,
+                                    diagnosticNode: node,
+                                    context: context,
+                                    diagnostics: diagnostics,
+                                    requireImplicit: true);
+
+                                if (valueExpr.HasErrors)
+                                {
+                                    hasArgErrors = true;
+                                }
+                                else
+                                {
+                                    rawArgs.Add(new BoundBinaryExpression(
+                                        node,
+                                        BoundBinaryOperatorKind.Subtract,
+                                        intType,
+                                        lenExpr,
+                                        valueExpr,
+                                        Optional<object>.None,
+                                        isChecked: false));
+                                }
+                            }
+                            else
+                            {
+                                var arg = BindExpression(argSyntax, context, diagnostics);
+                                rawArgs.Add(arg);
+                                if (arg.HasErrors)
+                                    hasArgErrors = true;
+                            }
+                        }
+
+                        seqLocals = locals.ToImmutable();
+                        seqSideEffects = sideEffects.ToImmutable();
+                    }
+                    else
+                    {
+                        for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
+                        {
+                            var arg = BindExpression(node.ArgumentList.Arguments[i].Expression, context, diagnostics);
+                            rawArgs.Add(arg);
+                            if (arg.HasErrors)
+                                hasArgErrors = true;
+                        }
                     }
 
                     if (hasArgErrors)
@@ -12943,13 +13238,18 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    return new BoundIndexerAccessExpression(
+                    var result = new BoundIndexerAccessExpression(
                         node,
-                        expr,
+                        indexerReceiver,
                         chosenIndexer,
                         convertedArgs,
                         isLValue: canWriteIndexer || allowCtorAutoPropWrite || (isRefReturnIndexer && canReadIndexer),
                         hasErrors: hasErrors);
+
+                    if (hasFromEndIndex)
+                        return new BoundSequenceExpression(node, seqLocals, seqSideEffects, result);
+
+                    return result;
                 }
             }
 

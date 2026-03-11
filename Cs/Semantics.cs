@@ -27,7 +27,7 @@ namespace Cnidaria.Cs
         System_String,
         System_Single,
         System_Double,
-        System_Decimal,
+        System_Decimal, 
         System_IntPtr,
         System_UIntPtr,
         System_Exception,
@@ -128,7 +128,7 @@ namespace Cnidaria.Cs
             or ConversionKind.NullLiteral
             || (Kind == ConversionKind.UserDefined && UserDefinedIsImplicit);
 
-        public Conversion(ConversionKind kind)
+        public Conversion(ConversionKind kind) 
         {
             Kind = kind;
             UserDefinedMethod = null;
@@ -174,12 +174,12 @@ namespace Cnidaria.Cs
             Message = message;
             Location = location;
         }
-        public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location}])")}";
+        public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span==default(TextSpan) ? "" : $"[{Location}])")}";
         public string GetMessage() => this.ToString();
-        public string GetMessage(string souce)
+        public string GetMessage(string souce) 
             => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location.ToString(souce)}])")}";
         public DiagnosticSeverity GetSeverity() => this.Severity;
-
+        
     }
     public readonly struct Optional<T>
     {
@@ -613,6 +613,7 @@ namespace Cnidaria.Cs
         internal TypeManager TypeManager => _types;
         internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
             = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
+        private readonly Dictionary<(SyntaxTree Tree, bool IgnoreAccessibility), SemanticModel> _semanticModelCache = new();
         public Compilation(
             ImmutableArray<SyntaxTree> syntaxTrees,
             NamespaceSymbol sourceGlobalNamespace,
@@ -640,7 +641,16 @@ namespace Cnidaria.Cs
         public ByRefTypeSymbol CreateByRefType(TypeSymbol elementType)
             => TypeManager.GetByRefType(elementType);
         public SemanticModel GetSemanticModel(SyntaxTree tree, bool ignoreAccessibility = false)
-            => new SourceSemanticModel(this, tree, ignoreAccessibility);
+        {
+            var key = (tree, ignoreAccessibility);
+
+            if (_semanticModelCache.TryGetValue(key, out var model))
+                return model;
+
+            model = new SourceSemanticModel(this, tree, ignoreAccessibility);
+            _semanticModelCache.Add(key, model);
+            return model;
+        }
         public IEnumerable<SyntaxNode> EnumerateMethodBodyOwners(SyntaxTree tree)
         {
             Compilation c = this;
@@ -716,6 +726,7 @@ namespace Cnidaria.Cs
             bool includeCoreTypesInTypeDefs,
             string defaultExternalAssemblyName,
             Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
+            bool allowInlining = true,
             bool print = false)
         {
             Compilation compilation = this;
@@ -749,6 +760,8 @@ namespace Cnidaria.Cs
                     if (!functions.TryAdd(fn.MethodToken, fn))
                         throw new InvalidOperationException($"Duplicate bytecode for token 0x{fn.MethodToken:X8}");
                 }
+                var sharedInlineBodyCache =
+                    new Dictionary<MethodSymbol, BoundMethodBody>(ReferenceEqualityComparer<MethodSymbol>.Instance);
                 void EmitBody(BoundMethodBody body)
                 {
                     if (print)
@@ -757,7 +770,7 @@ namespace Cnidaria.Cs
                         Console.WriteLine(printedFull);
                     }
 
-                    var lowered = IRLowering.Rewrite(compilation, body);
+                    var lowered = IRLowering.Rewrite(compilation, body, allowInlining, sharedInlineBodyCache);
                     var emit = BytecodeEmitter.Emit(lowered, tokens);
 
                     AddFn(emit.Entry);
@@ -968,7 +981,7 @@ namespace Cnidaria.Cs
                         ms.IsStatic &&
                         ms.Parameters.Length == 0 &&
                         StringComparer.Ordinal.Equals(ms.Name, ".cctor") &&
-                        (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty))
+                        (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty)) 
                     {
                         yield return ms;
                     }
@@ -1095,7 +1108,7 @@ namespace Cnidaria.Cs
             ConvertedType = convertedType;
         }
     }
-
+    
 
 
 
@@ -1540,7 +1553,7 @@ namespace Cnidaria.Cs
 
             var valueExpr = new BoundParameterExpression(ownerSyntax, method.Parameters[0]);
             var assignExpr = new BoundAssignmentExpression(ownerSyntax, FieldAccess(isLValue: true), valueExpr);
-            var setBody = new BoundBlockStatement(ownerSyntax,
+            var setBody = new BoundBlockStatement(ownerSyntax, 
                 ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(ownerSyntax, assignExpr)));
             recorder.RecordBound(ownerSyntax, new BoundMethodBody(ownerSyntax, method, setBody));
         }
@@ -1841,7 +1854,7 @@ namespace Cnidaria.Cs
                         containers.Add(target);
                     }
                 }
-
+                
             }
 
             return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
@@ -2364,8 +2377,8 @@ namespace Cnidaria.Cs
         public Symbol ContainingSymbol { get; }
         public IBindingRecorder Recorder { get; }
         public BindingContext(
-            Compilation compilation,
-            SemanticModel semanticModel,
+            Compilation compilation, 
+            SemanticModel semanticModel, 
             Symbol containingSymbol,
             IBindingRecorder recorder)
         {
@@ -2375,5 +2388,5 @@ namespace Cnidaria.Cs
             Recorder = recorder;
         }
     }
-
+    
 }

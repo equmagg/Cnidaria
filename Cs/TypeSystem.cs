@@ -1107,7 +1107,7 @@ namespace Cnidaria.Cs
 
                 throw new MissingMethodException($"{owner.Namespace}.{owner.Name}.{methodName} not found (memberref in {module.Name})");
             }
-
+            
 
             static bool CompatibleType(RuntimeType def, RuntimeType actual)
             {
@@ -1336,7 +1336,8 @@ namespace Cnidaria.Cs
                 isVirtual: genericMethod.IsVirtual,
                 isStatic: genericMethod.IsStatic,
                 isNewSlot: genericMethod.IsNewSlot,
-                isFinal: genericMethod.IsFinal);
+                isFinal: genericMethod.IsFinal,
+                implFlags: genericMethod.ImplFlags);
 
             m.BodyModule = genericMethod.BodyModule;
             m.Body = genericMethod.Body;
@@ -1825,7 +1826,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < paramCount; i++)
                     ps[i] = ReadTypeSig(m, ref sr);
 
-                var rm = new RuntimeMethod(_nextMethodId++, declaringType, name, ret, ps, hasThis, isVirtual, isStatic, isNewSlot, isFinal);
+                var rm = new RuntimeMethod(_nextMethodId++, declaringType, name, ret, ps, hasThis, isVirtual, isStatic, isNewSlot, isFinal, mr.ImplFlags);
                 rm.BodyModule = m;
                 rm.GenericArity = genericArity;
                 if (m.MethodsByDefToken.TryGetValue(methodTok, out var bodyFn))
@@ -2132,20 +2133,26 @@ namespace Cnidaria.Cs
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
-            EnsureConstructedMembers(t);
-            EnsureLayout(t);
             return t;
         }
         private void EnsureConstructedMembers(RuntimeType t)
         {
             if (t.GenericTypeDefinition is null)
                 return;
-            if (t.ConstructedMembersInitialized)
-                return;
-
-            t.ConstructedMembersInitialized = true;
 
             var genericDef = t.GenericTypeDefinition;
+
+            if (t.ConstructedMembersInitialized)
+            {
+                bool staleInstanceFields = genericDef.InstanceFields.Length != 0 && t.InstanceFields.Length == 0;
+                bool staleStaticFields = genericDef.StaticFields.Length != 0 && t.StaticFields.Length == 0;
+                bool staleMethods = genericDef.Methods.Length != 0 && t.Methods.Length == 0;
+
+                if (!staleInstanceFields && !staleStaticFields && !staleMethods)
+                    return;
+            }
+            t.ConstructedMembersInitialized = true;
+
             var typeArgs = t.GenericTypeArguments;
 
             t.BaseType = genericDef.BaseType is null
@@ -2197,7 +2204,8 @@ namespace Cnidaria.Cs
                         src.IsVirtual,
                         src.IsStatic,
                         src.IsNewSlot,
-                        src.IsFinal);
+                        src.IsFinal,
+                        src.ImplFlags);
 
                     dst.BodyModule = src.BodyModule;
                     dst.Body = src.Body;
@@ -2447,6 +2455,9 @@ namespace Cnidaria.Cs
         public bool IsStatic { get; }
         public bool IsNewSlot { get; }
         public bool IsFinal { get; }
+        public ushort ImplFlags { get; }
+        public bool HasNoInlining => (ImplFlags & MetadataFlagBits.NoInlining) != 0;
+        public bool HasAggressiveInlining => (ImplFlags & MetadataFlagBits.AggressiveInlining) != 0;
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
         public BytecodeFunction? Body { get; internal set; }
@@ -2463,7 +2474,8 @@ namespace Cnidaria.Cs
             bool isVirtual,
             bool isStatic,
             bool isNewSlot,
-            bool isFinal)
+            bool isFinal,
+            ushort implFlags)
         {
             MethodId = methodId;
             DeclaringType = declType;
@@ -2475,6 +2487,7 @@ namespace Cnidaria.Cs
             IsStatic = isStatic;
             IsNewSlot = isNewSlot;
             IsFinal = isFinal;
+            ImplFlags = implFlags;
         }
     }
 }

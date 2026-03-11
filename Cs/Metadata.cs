@@ -20,6 +20,7 @@ namespace Cnidaria.Cs
         public const int MethodSpec = 0x2B000000;
         public const int AssemblyRef = 0x23000000;
         public const int Constant = 0x0B000000;
+        public const int CustomAttribute = 0x0C000000;
         public const int PropertyDef = 0x17000000;
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int Make(int tableToken, int rid) => tableToken | rid;
@@ -41,7 +42,8 @@ namespace Cnidaria.Cs
         TypeSpec,
         MethodSpec,
         Constant,
-        Property
+        Property,
+        CustomAttribute
     }
 
     public interface IMetadataView
@@ -69,12 +71,13 @@ namespace Cnidaria.Cs
         MethodSpecRow GetMethodSpec(int rid);
         ConstantRow GetConstant(int rid);
         PropertyRow GetProperty(int rid);
+        CustomAttributeRow GetCustomAttribute(int rid);
 
     }
     internal sealed class FlatMetadataView : IMetadataView
     {
         private readonly ReadOnlyMemory<byte> _data;
-        private readonly SectionDesc[] _sections = new SectionDesc[112];
+        private readonly SectionDesc[] _sections = new SectionDesc[(int)FlatMdSection.CustomAttributeTable + 1];
         public FlatMetadataView(ReadOnlyMemory<byte> data)
         {
             _data = data;
@@ -98,6 +101,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.MethodSpec => Section(FlatMdSection.MethodSpecTable).Count,
             MetadataTableKind.Constant => Section(FlatMdSection.ConstantTable).Count,
             MetadataTableKind.Property => Section(FlatMdSection.PropertyTable).Count,
+            MetadataTableKind.CustomAttribute => Section(FlatMdSection.CustomAttributeTable).Count,
             _ => throw new ArgumentOutOfRangeException(nameof(table))
         };
 
@@ -152,6 +156,15 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        public CustomAttributeRow GetCustomAttribute(int rid)
+        {
+            int p = GetRowOffset(FlatMdSection.CustomAttributeTable, rid, 16);
+            int parentToken = ReadI32(_data.Span, p); p += 4;
+            int attributeTypeToken = ReadI32(_data.Span, p); p += 4;
+            int value = ReadI32(_data.Span, p); p += 4;
+            byte target = _data.Span[p];
+            return new CustomAttributeRow(parentToken, attributeTypeToken, value, target);
+        }
 
         public AssemblyRefRow GetAssemblyRef(int rid)
         {
@@ -428,6 +441,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.MethodSpec => _md.MethodSpecs.Count,
             MetadataTableKind.Constant => _md.Constants.Count,
             MetadataTableKind.Property => _md.Properties.Count,
+            MetadataTableKind.CustomAttribute => _md.CustomAttributes.Count,
             _ => throw new ArgumentOutOfRangeException(nameof(table))
         };
 
@@ -464,10 +478,11 @@ namespace Cnidaria.Cs
         public MethodDefRow GetMethodDef(int rid) => _md.Methods[rid - 1];
         public ParamRow GetParam(int rid) => _md.Params[rid - 1];
         public MemberRefRow GetMemberRef(int rid) => _md.MemberRefs[rid - 1];
-        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1];
+        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1]; 
         public MethodSpecRow GetMethodSpec(int rid) => _md.MethodSpecs[rid - 1];
         public ConstantRow GetConstant(int rid) => _md.Constants[rid - 1];
         public PropertyRow GetProperty(int rid) => _md.Properties[rid - 1];
+        public CustomAttributeRow GetCustomAttribute(int rid) => _md.CustomAttributes[rid - 1];
     }
     internal enum FlatMdSection : ushort
     {
@@ -495,6 +510,144 @@ namespace Cnidaria.Cs
         ConstantTable = 109,
         PropertyTable = 110,
         MethodSpecTable = 111,
+        CustomAttributeTable = 112,
+    }
+    internal sealed class AttrBlobWriter
+    {
+        private readonly List<byte> _buffer = new();
+
+        public void WriteByte(byte value) => _buffer.Add(value);
+        public void WriteSByte(sbyte value) => _buffer.Add(unchecked((byte)value));
+
+        public void WriteInt16(short value)
+        {
+            Span<byte> tmp = stackalloc byte[2];
+            BinaryPrimitives.WriteInt16LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteUInt16(ushort value)
+        {
+            Span<byte> tmp = stackalloc byte[2];
+            BinaryPrimitives.WriteUInt16LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteInt32(int value)
+        {
+            Span<byte> tmp = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteUInt32(uint value)
+        {
+            Span<byte> tmp = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteInt64(long value)
+        {
+            Span<byte> tmp = stackalloc byte[8];
+            BinaryPrimitives.WriteInt64LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteUInt64(ulong value)
+        {
+            Span<byte> tmp = stackalloc byte[8];
+            BinaryPrimitives.WriteUInt64LittleEndian(tmp, value);
+            WriteBytes(tmp);
+        }
+
+        public void WriteSingle(float value) => WriteUInt32(BitConverter.SingleToUInt32Bits(value));
+        public void WriteDouble(double value) => WriteUInt64(BitConverter.DoubleToUInt64Bits(value));
+
+        public void WriteBytes(ReadOnlySpan<byte> bytes)
+        {
+            for (int i = 0; i < bytes.Length; i++)
+                _buffer.Add(bytes[i]);
+        }
+
+        public byte[] ToArray() => _buffer.ToArray();
+    }
+    internal ref struct AttrBlobReader
+    {
+        private ReadOnlySpan<byte> _data;
+        private int _offset;
+
+        public AttrBlobReader(ReadOnlySpan<byte> data)
+        {
+            _data = data;
+            _offset = 0;
+        }
+
+        public byte ReadByte()
+        {
+            if ((uint)_offset >= (uint)_data.Length)
+                throw new InvalidOperationException("Attribute blob is truncated.");
+            return _data[_offset++];
+        }
+
+        public sbyte ReadSByte() => unchecked((sbyte)ReadByte());
+
+        public short ReadInt16()
+        {
+            Ensure(2);
+            short v = BinaryPrimitives.ReadInt16LittleEndian(_data.Slice(_offset, 2));
+            _offset += 2;
+            return v;
+        }
+
+        public ushort ReadUInt16()
+        {
+            Ensure(2);
+            ushort v = BinaryPrimitives.ReadUInt16LittleEndian(_data.Slice(_offset, 2));
+            _offset += 2;
+            return v;
+        }
+
+        public int ReadInt32()
+        {
+            Ensure(4);
+            int v = BinaryPrimitives.ReadInt32LittleEndian(_data.Slice(_offset, 4));
+            _offset += 4;
+            return v;
+        }
+
+        public uint ReadUInt32()
+        {
+            Ensure(4);
+            uint v = BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(_offset, 4));
+            _offset += 4;
+            return v;
+        }
+
+        public long ReadInt64()
+        {
+            Ensure(8);
+            long v = BinaryPrimitives.ReadInt64LittleEndian(_data.Slice(_offset, 8));
+            _offset += 8;
+            return v;
+        }
+
+        public ulong ReadUInt64()
+        {
+            Ensure(8);
+            ulong v = BinaryPrimitives.ReadUInt64LittleEndian(_data.Slice(_offset, 8));
+            _offset += 8;
+            return v;
+        }
+
+        public float ReadSingle() => BitConverter.UInt32BitsToSingle(ReadUInt32());
+        public double ReadDouble() => BitConverter.UInt64BitsToDouble(ReadUInt64());
+
+        private void Ensure(int count)
+        {
+            if ((uint)count > (uint)(_data.Length - _offset))
+                throw new InvalidOperationException("Attribute blob is truncated.");
+        }
     }
     internal static class FlatMetadataBuilder
     {
@@ -572,6 +725,7 @@ namespace Cnidaria.Cs
             WriteConstants(md.Constants, plan.Get(FlatMdSection.ConstantTable), dest);
             WriteProperties(md.Properties, plan.Get(FlatMdSection.PropertyTable), dest);
             WriteMethodSpecs(md.MethodSpecs, plan.Get(FlatMdSection.MethodSpecTable), dest);
+            WriteCustomAttributes(md.CustomAttributes, plan.Get(FlatMdSection.CustomAttributeTable), dest);
         }
         private static LayoutPlan BuildPlan(MetadataImage md)
         {
@@ -615,6 +769,9 @@ namespace Cnidaria.Cs
             Add(ref i, FlatMdSection.ConstantTable, elemSize: 9, count: md.Constants.Count, size: checked(md.Constants.Count * 9), ref cursor, sections);
             Add(ref i, FlatMdSection.PropertyTable, elemSize: 18, count: md.Properties.Count, size: checked(md.Properties.Count * 18), ref cursor, sections);
             Add(ref i, FlatMdSection.MethodSpecTable, elemSize: 8, count: md.MethodSpecs.Count, size: checked(md.MethodSpecs.Count * 8), ref cursor, sections);
+
+            Add(ref i, FlatMdSection.CustomAttributeTable, elemSize: 16, count: md.CustomAttributes.Count, 
+                size: checked(md.CustomAttributes.Count * 16), ref cursor, sections);
 
             return new LayoutPlan(
                 headerSize: headerBytes,
@@ -739,6 +896,22 @@ namespace Cnidaria.Cs
 
             if (dataCursor != dataSection.Size)
                 throw new InvalidOperationException("Blob heap size mismatch.");
+        }
+
+        private static void WriteCustomAttributes(List<CustomAttributeRow> rows, SectionDesc s, Span<byte> dest)
+        {
+            int p = s.Offset;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                WriteI32(dest, ref p, r.ParentToken);
+                WriteI32(dest, ref p, r.AttributeTypeToken);
+                WriteI32(dest, ref p, r.Value);
+                WriteU8(dest, ref p, r.Target);
+                WriteU8(dest, ref p, 0);
+                WriteU8(dest, ref p, 0);
+                WriteU8(dest, ref p, 0);
+            }
         }
 
         private static void WriteAssemblyRefs(List<AssemblyRefRow> rows, SectionDesc s, Span<byte> dest)
@@ -997,6 +1170,7 @@ namespace Cnidaria.Cs
         public List<MethodSpecRow> MethodSpecs { get; } = new();
         public List<ConstantRow> Constants { get; } = new();
         public List<PropertyRow> Properties { get; } = new();
+        public List<CustomAttributeRow> CustomAttributes { get; } = new();
         public MetadataImage(string moduleName, string defaultExternalAssemblyName)
         {
             ModuleName = moduleName ?? "";
@@ -1214,6 +1388,21 @@ namespace Cnidaria.Cs
             Instantiation = instantiation;
         }
     }
+    public struct CustomAttributeRow
+    {
+        public int ParentToken;
+        public int AttributeTypeToken;
+        public int Value;              // #Blob
+        public byte Target;
+
+        public CustomAttributeRow(int parentToken, int attributeTypeToken, int value, byte target)
+        {
+            ParentToken = parentToken;
+            AttributeTypeToken = attributeTypeToken;
+            Value = value;
+            Target = target;
+        }
+    }
     internal enum SigElementType : byte
     {
         END = 0x00,
@@ -1326,6 +1515,9 @@ namespace Cnidaria.Cs
 
         private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
 
+        private readonly Dictionary<ParameterSymbol, int> _paramDefTokens
+            = new(ReferenceEqualityComparer<ParameterSymbol>.Instance);
+
         private int _defaultExternalAssemblyRefToken; // AssemblyRef
         private int _localFunctionsHostTypeToken;     // TypeDef
         private readonly NamedTypeSymbol _systemObject;
@@ -1355,6 +1547,8 @@ namespace Cnidaria.Cs
             }
             for (int i = 0; i < allTypes.Length; i++)
                 FillTypeDefAndMembers(allTypes[i]);
+
+            EmitCustomAttributes(allTypes);
         }
         private static ushort MapParamFlags(ParameterSymbol p)
         {
@@ -1541,7 +1735,7 @@ namespace Cnidaria.Cs
             _assemblyRefTokenByName[name] = tok;
             return tok;
         }
-
+        
         private ImmutableArray<NamedTypeSymbol> CollectAllModuleTypes(NamespaceSymbol root)
         {
             var set = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
@@ -1645,13 +1839,18 @@ namespace Cnidaria.Cs
                         {
                             int paramRid = Image.Params.Count + 1;
                             int pNameIdx = EmitParamNames ? Image.Strings.Add(ps[p].Name) : 0;
-                            Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
                             int paramDefToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
+                            Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
+                            _paramDefTokens[ps[p]] = paramDefToken;
                             TryAddParameterDefault(ps[p], paramDefToken);
                         }
                     }
                     ushort mflags = 0;
                     mflags |= (ushort)MapMethodAccessibility(m.DeclaredAccessibility);
+                    if (m.IsStatic)
+                        mflags |= (ushort)System.Reflection.MethodAttributes.Static;
+                    if (m.IsExtensionMethod)
+                        mflags |= MetadataFlagBits.Extension;
                     if (!m.IsStatic && !m.IsConstructor && (m.IsVirtual || m.IsAbstract || m.IsOverride))
                     {
                         mflags |= (ushort)System.Reflection.MethodAttributes.Virtual;
@@ -1663,7 +1862,8 @@ namespace Cnidaria.Cs
                         if (m.IsOverride && m.IsSealed)
                             mflags |= (ushort)System.Reflection.MethodAttributes.Final;
                     }
-                    Image.Methods.Add(new MethodDefRow(implFlags: 0, flags: mflags, name: mNameIdx, signature: sigIdx, paramList: paramListRid));
+                    ushort implFlags = MethodAttributeFacts.GetMethodImplFlags(m);
+                    Image.Methods.Add(new MethodDefRow(implFlags: implFlags, flags: mflags, name: mNameIdx, signature: sigIdx, paramList: paramListRid));
                 }
             }
 
@@ -1801,7 +2001,7 @@ namespace Cnidaria.Cs
             {
                 var def = type.OriginalDefinition;
                 string asm =
-                    _externalAssemblyResolver?.Invoke(def)
+                    _externalAssemblyResolver?.Invoke(def) 
                     ?? Image.DefaultExternalAssemblyName; // fallback to default
 
                 scopeTok = EnsureAssemblyRef(asm);
@@ -1944,13 +2144,22 @@ namespace Cnidaria.Cs
                 {
                     int paramRid = Image.Params.Count + 1;
                     int pNameIdx = EmitParamNames ? Image.Strings.Add(ps[p].Name) : 0;
-                    Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
                     int paramDefToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
+                    _paramDefTokens[ps[p]] = paramDefToken;
+                    Image.Params.Add(new ParamRow(flags: MapParamFlags(ps[p]), sequence: (ushort)(p + 1), name: pNameIdx));
                     TryAddParameterDefault(ps[p], paramDefToken);
                 }
             }
+            ushort flags = 0;
+            if (method.IsStatic)
+                flags |= (ushort)System.Reflection.MethodAttributes.Static;
 
-            Image.Methods.Add(new MethodDefRow(implFlags: 0, flags: 0, name: nameIdx, signature: sigIdx, paramList: paramListRid));
+            Image.Methods.Add(new MethodDefRow(
+                implFlags: 0,
+                flags: flags,
+                name: nameIdx,
+                signature: sigIdx,
+                paramList: paramListRid));
             return tok;
         }
         private int BuildFieldSig(TypeSymbol fieldType)
@@ -2099,6 +2308,110 @@ namespace Cnidaria.Cs
             w.Byte((byte)et.Value);
             return true;
         }
+
+        private void EmitCustomAttributes(ImmutableArray<NamedTypeSymbol> allTypes)
+        {
+            for (int i = 0; i < allTypes.Length; i++)
+            {
+                var t = allTypes[i];
+                EmitAttributes(_typeDefTokens[t], t.GetAttributes());
+
+                var members = t.GetMembers();
+                for (int m = 0; m < members.Length; m++)
+                {
+                    switch (members[m])
+                    {
+                        case FieldSymbol f when _fieldDefTokens.TryGetValue(f, out var ftok):
+                            EmitAttributes(ftok, f.GetAttributes());
+                            break;
+
+                        case MethodSymbol mm when _methodDefTokens.TryGetValue(mm, out var mtok):
+                            EmitAttributes(mtok, mm.GetAttributes());
+
+                            var ps = mm.Parameters;
+                            for (int p = 0; p < ps.Length; p++)
+                                if (_paramDefTokens.TryGetValue(ps[p], out var ptok))
+                                    EmitAttributes(ptok, ps[p].GetAttributes());
+                            break;
+
+                        case PropertySymbol p when _propertyDefTokens.TryGetValue(p, out var ptok):
+                            EmitAttributes(ptok, p.GetAttributes());
+                            break;
+                    }
+                }
+            }
+        }
+        private void EmitAttributes(int parentToken, ImmutableArray<AttributeData> attrs)
+        {
+            for (int i = 0; i < attrs.Length; i++)
+            {
+                var a = attrs[i];
+                int attrTypeTok = GetTypeToken(a.AttributeClass);
+                int blobIdx = BuildCustomAttributeBlob(a);
+
+                Image.CustomAttributes.Add(new CustomAttributeRow(
+                    parentToken: parentToken,
+                    attributeTypeToken: attrTypeTok,
+                    value: blobIdx,
+                    target: (byte)a.Target));
+            }
+        }
+        private int BuildCustomAttributeBlob(AttributeData attr)
+        {
+            var w = new AttrBlobWriter();
+
+            var ctorParams = attr.Constructor.Parameters;
+            w.WriteInt32(ctorParams.Length);
+            for (int i = 0; i < ctorParams.Length; i++)
+                w.WriteInt32(GetTypeToken(ctorParams[i].Type));
+
+            w.WriteInt32(attr.ConstructorArguments.Length);
+            for (int i = 0; i < attr.ConstructorArguments.Length; i++)
+                WriteTypedConstant(w, attr.ConstructorArguments[i]);
+
+            w.WriteInt32(attr.NamedArguments.Length);
+            for (int i = 0; i < attr.NamedArguments.Length; i++)
+            {
+                var na = attr.NamedArguments[i];
+                w.WriteByte(na.Member is PropertySymbol ? (byte)2 : (byte)1);
+                w.WriteInt32(Image.Strings.Add(na.Name));
+                WriteTypedConstant(w, na.Value);
+            }
+
+            return Image.Blob.Add(w.ToArray());
+        }
+        private void WriteTypedConstant(AttrBlobWriter w, TypedConstant tc)
+        {
+            w.WriteInt32(GetTypeToken(tc.Type));
+
+            object? v = tc.Value;
+            if (v is null)
+            {
+                w.WriteByte(0);
+                return;
+            }
+
+            switch (v)
+            {
+                case bool x: w.WriteByte(1); w.WriteByte((byte)(x ? 1 : 0)); return;
+                case char x: w.WriteByte(2); w.WriteUInt16(x); return;
+                case sbyte x: w.WriteByte(3); w.WriteSByte(x); return;
+                case byte x: w.WriteByte(4); w.WriteByte(x); return;
+                case short x: w.WriteByte(5); w.WriteInt16(x); return;
+                case ushort x: w.WriteByte(6); w.WriteUInt16(x); return;
+                case int x: w.WriteByte(7); w.WriteInt32(x); return;
+                case uint x: w.WriteByte(8); w.WriteUInt32(x); return;
+                case long x: w.WriteByte(9); w.WriteInt64(x); return;
+                case ulong x: w.WriteByte(10); w.WriteUInt64(x); return;
+                case float x: w.WriteByte(11); w.WriteSingle(x); return;
+                case double x: w.WriteByte(12); w.WriteDouble(x); return;
+                case string x: w.WriteByte(13); w.WriteInt32(Image.Strings.Add(x)); return;
+                case TypeSymbol t: w.WriteByte(14); w.WriteInt32(GetTypeToken(t)); return;
+                default:
+                    throw new NotSupportedException($"Unsupported attribute constant value: {v.GetType().FullName}");
+            }
+        }
+
         private static string GetMetadataTypeName(NamedTypeSymbol t)
             => t.Arity == 0 ? t.Name : $"{t.Name}`{t.Arity}";
 

@@ -60,7 +60,7 @@ namespace Cnidaria.Cs
 
                 Console.WriteLine();
 
-
+                
             }
             void Enqueue(RuntimeModule m, BytecodeFunction f)
             {
@@ -559,8 +559,8 @@ namespace Cnidaria.Cs
             for (int tdIndex = 0; tdIndex < md.GetRowCount(MetadataTableKind.TypeDef); tdIndex++)
             {
                 int start = md.GetTypeDef(tdIndex + 1).MethodList;
-                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef))
-                    ? md.GetTypeDef(tdIndex + 2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
+                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef)) 
+                    ? md.GetTypeDef(tdIndex+2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
                 if (methodRid >= start && methodRid < end)
                     return tdIndex + 1;
             }
@@ -852,13 +852,16 @@ namespace Cnidaria.Cs
                     BoundParameterExpression => "BoundParameterExpression",
                     BoundLabelExpression => "BoundLabelExpression",
                     BoundConversionExpression => "BoundConversionExpression",
+                    BoundAsExpression => "BoundAsExpression",
                     BoundBinaryExpression => "BoundBinaryExpression",
                     BoundUnaryExpression => "BoundUnaryExpression",
                     BoundConditionalExpression => "BoundConditionalExpression",
                     BoundCallExpression => "BoundCallExpression",
                     BoundObjectCreationExpression => "BoundObjectCreationExpression",
+                    BoundUnboundImplicitObjectCreationExpression => "BoundUnboundImplicitObjectCreationExpression",
                     BoundAssignmentExpression => "BoundAssignmentExpression",
                     BoundCompoundAssignmentExpression => "BoundCompoundAssignmentExpression",
+                    BoundNullCoalescingAssignmentExpression => "BoundNullCoalescingAssignmentExpression",
                     BoundIncrementDecrementExpression => "BoundIncrementDecrementExpression",
                     BoundArrayInitializerExpression => "BoundArrayInitializerExpression",
                     BoundArrayCreationExpression => "BoundArrayCreationExpression",
@@ -873,6 +876,7 @@ namespace Cnidaria.Cs
                     BoundConditionalGotoStatement => "BoundConditionalGotoStatement",
                     BoundMemberAccessExpression => "BoundMemberAccessExpression",
                     BoundIndexerAccessExpression => "BoundIndexerAccessExpression",
+                    BoundIsPatternExpression => "BoundIsPatternExpression",
                     BoundLocalFunctionStatement => "BoundLocalFunctionStatement",
                     BoundTryStatement => "BoundTryStatement",
                     BoundCatchBlock => "BoundCatchBlock",
@@ -941,11 +945,17 @@ namespace Cnidaria.Cs
                     case BoundReturnStatement rs:
                         return new[] { new Child("Expression", rs.Expression) };
 
-                    case BoundThrowStatement ts: // <-- add
+                    case BoundThrowStatement ts:
                         return new[] { new Child("Expression", ts.ExpressionOpt) };
+
+                    case BoundThrowExpression te:
+                        return new[] { new Child("Exception", te.Exception) };
 
                     case BoundConversionExpression ce:
                         return new[] { new Child("Operand", ce.Operand) };
+
+                    case BoundAsExpression ae:
+                        return new[] { new Child("Operand", ae.Operand) };
 
                     case BoundUnaryExpression un:
                         return new[] { new Child("Operand", un.Operand) };
@@ -966,8 +976,14 @@ namespace Cnidaria.Cs
                     case BoundAssignmentExpression asg:
                         return new[]
                         {
-                        new Child("Left", asg.Left),
-                        new Child("Right", asg.Right)
+                            new Child("Left", asg.Left),
+                            new Child("Right", asg.Right)
+                        };
+                    case BoundNullCoalescingAssignmentExpression nca:
+                        return new[]
+                        {
+                            new Child("Left", nca.Left),
+                            new Child("Value", nca.Value)
                         };
                     case BoundCallExpression call:
                         {
@@ -1093,12 +1109,27 @@ namespace Cnidaria.Cs
                                 list.Add(new Child($"Arguments[{i}]", oc.Arguments[i]));
                             return list.ToArray();
                         }
+                    case BoundUnboundImplicitObjectCreationExpression uioc:
+                        {
+                            var list = new Child[uioc.Arguments.Length];
+                            for (int i = 0; i < uioc.Arguments.Length; i++)
+                                list[i] = new Child($"Arguments[{i}]", uioc.Arguments[i]);
+                            return list;
+                        }
                     case BoundMemberAccessExpression ma:
                         {
                             return new[]
                             {
                                 new Child("Receiver", ma.ReceiverOpt),
                             };
+                        }
+                    case BoundIndexerAccessExpression ia:
+                        {
+                            var list = new List<Child>(1 + ia.Arguments.Length);
+                            list.Add(new Child("Receiver", ia.Receiver));
+                            for (int i = 0; i < ia.Arguments.Length; i++)
+                                list.Add(new Child($"Arguments[{i}]", ia.Arguments[i]));
+                            return list.ToArray();
                         }
 
                     case BoundLocalFunctionStatement lfs:
@@ -1133,12 +1164,19 @@ namespace Cnidaria.Cs
                             new Child("Filter", cb.FilterOpt),
                             new Child("Body", cb.Body),
                         };
+
                     case BoundIncrementDecrementExpression id:
                         return new[]
                         {
                             new Child("Target", id.Target),
                             new Child("Read", id.Read),
                             new Child("Value", id.Value),
+                        };
+
+                    case BoundIsPatternExpression ip:
+                        return new[]
+                        {
+                            new Child("Operand", ip.Operand),
                         };
 
                     default:
@@ -1227,12 +1265,21 @@ namespace Cnidaria.Cs
                             return parts.Count == 0 ? "" : string.Join(", ", parts);
                         }
 
+                    case BoundAsExpression ae:
+                        {
+                            var parts = new List<string>(2) { "Operator=as" };
+                            if (_opt.IncludeConversionKind)
+                                parts.Add($"Conversion={ae.Conversion.Kind} (implicit={ae.Conversion.IsImplicit})");
+                            return string.Join(", ", parts);
+                        }
+
                     case BoundUnaryExpression un:
                         {
                             var text = $"Operator={FormatUnaryOperator(un.OperatorKind)}";
                             if (un.IsChecked) text += ", Checked=true";
                             return text;
                         }
+
                     case BoundBinaryExpression bin:
                         {
                             var text = $"Operator={FormatBinaryOperator(bin.OperatorKind)}";
@@ -1253,6 +1300,9 @@ namespace Cnidaria.Cs
                             var ctor = oc.ConstructorOpt is null ? "<default>" : FormatMethod(oc.ConstructorOpt);
                             return $"Ctor={ctor}, Args={oc.Arguments.Length}";
                         }
+
+                    case BoundUnboundImplicitObjectCreationExpression uioc:
+                        return $"Ctor=<unbound>, Args={uioc.Arguments.Length}";
 
                     case BoundCompoundAssignmentExpression ca:
                         {
@@ -1300,17 +1350,23 @@ namespace Cnidaria.Cs
                     case BoundArrayInitializerExpression ai:
                         return $"Length={ai.Elements.Length}";
 
-                    case BoundArrayCreationExpression ac:
+                    case BoundArrayCreationExpression ac: 
                         return $"ElementType={FormatType(ac.ElementType)}, Rank={ac.DimensionSizes.Length}, HasInitializer={(ac.InitializerOpt != null ? "true" : "false")}";
 
-                    case BoundArrayElementAccessExpression aea:
+                    case BoundArrayElementAccessExpression aea: 
                         return $"Rank={aea.Indices.Length}, IsLValue={(aea.IsLValue ? "true" : "false")}";
+
+                    case BoundNullCoalescingAssignmentExpression:
+                        return "Operator=??=";
 
                     case BoundStackAllocArrayCreationExpression sa:
                         return $"ElementType={FormatType(sa.ElementType)}";
 
-                    case BoundRefExpression:
+                    case BoundRefExpression: 
                         return "Kind=ref";
+
+                    case BoundSizeOfExpression so:
+                        return $"OperandType={FormatType(so.OperandType)}";
 
                     case BoundConditionalGotoStatement cg:
                         return $"Target={FormatLabel(cg.TargetLabel)}, JumpIfTrue={(cg.JumpIfTrue ? "true" : "false")}";
@@ -1323,6 +1379,17 @@ namespace Cnidaria.Cs
 
                     case BoundMemberAccessExpression ma:
                         return $"Member={FormatSymbol(ma.Member)}, IsLValue={(ma.IsLValue ? "true" : "false")}";
+
+                    case BoundIndexerAccessExpression ia:
+                        return $"Indexer={ia.Indexer.Name}, Args={ia.Arguments.Length}, IsLValue={(ia.IsLValue ? "true" : "false")}";
+
+                    case BoundIsPatternExpression ip:
+                        {
+                            var declaredLocal = ip.DeclaredLocalOpt is null
+                                ? "<none>"
+                                : FormatLocal(ip.DeclaredLocalOpt);
+                            return $"PatternType={FormatType(ip.PatternType)}, DeclaredLocal={declaredLocal}, IsDiscard={(ip.IsDiscard ? "true" : "false")}";
+                        }
 
                     case BoundLocalFunctionStatement lfs:
                         return $"LocalFunction={FormatMethod(lfs.LocalFunction)}";

@@ -12,11 +12,12 @@ using System.Threading;
 namespace Cnidaria.Cs
 {
     public static class CSharp
-    {
-
-        public readonly static (IMetadataView meta, Dictionary<int, BytecodeFunction> funcs)
+    {   
+        private static bool HasErrors(List<IDiagnostic> diags)
+            => diags.Any(x => x.GetSeverity() == DiagnosticSeverity.Error);
+        public readonly static (IMetadataView meta, Dictionary<int, BytecodeFunction> funcs) 
             StandartLibrary = CompileCoreLibrary(GetCoreBCLSource());
-        public readonly static (IMetadataView meta, Dictionary<int, BytecodeFunction> funcs, List<IDiagnostic> diags)
+        public readonly static (IMetadataView meta, Dictionary<int, BytecodeFunction> funcs, List<IDiagnostic> diags) 
             ExtendedLibrary = CompileLibrary(GetExtendedBCLSource(), "extendedStd");
         public readonly struct ExecutionContext
         {
@@ -33,8 +34,466 @@ namespace Cnidaria.Cs
             }
             public static ExecutionContext Empty => new ExecutionContext(-1, TimeSpan.MinValue, -1, -1);
         }
-        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
+        private readonly struct CompiledModuleData
+        {
+            public readonly byte[] Image;
+            public readonly IMetadataView Meta;
+            public readonly Dictionary<int, BytecodeFunction> Funcs;
+
+            public CompiledModuleData(byte[] image, IMetadataView meta, Dictionary<int, BytecodeFunction> funcs)
+            {
+                Image = image;
+                Meta = meta;
+                Funcs = funcs;
+            }
+
+            public static CompiledModuleData Load(byte[] image)
+            {
+                var (_, meta, funcs) = BytecodeSerializer.DeserializeCompiledModule(image);
+                return new CompiledModuleData(image, meta, funcs);
+            }
+        }
+        private readonly struct CompiledRunnableApplicationData
+        {
+            public readonly byte[] Image;
+            public readonly CompiledModuleData Module;
+
+            public CompiledRunnableApplicationData(byte[] image, CompiledModuleData module)
+            {
+                Image = image;
+                Module = module;
+            }
+
+            public static CompiledRunnableApplicationData Load(byte[] image)
+            {
+                return new CompiledRunnableApplicationData(image, CompiledModuleData.Load(image));
+            }
+        }
+        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileApplicationToRunnableBytes(
             string source,
+            byte[]? externalLibImage = null,
+            bool allowInlining = true)
+        {
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            var parser = new Parser(source);
+            var root = parser.Parse();
+
+            foreach (var diag in parser.LexerDiagnostics)
+                diagnostics.Add(diag);
+            foreach (var diag in parser.Diagnostics)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            var tree = new SyntaxTree(root, "app");
+            var trees = ImmutableArray.Create(tree);
+
+            CompiledModuleData? ext = null;
+            MetadataReferenceSet refs;
+
+            if (externalLibImage != null)
+            {
+                ext = CompiledModuleData.Load(externalLibImage);
+                refs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, ext.Value.Meta });
+            }
+            else
+            {
+                refs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+            }
+
+            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+            foreach (var diag in declDiag)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            var (md, funcs, diags, ex) = compilation.BuildModule(
+                moduleName: "app",
+                tree: tree,
+                includeCoreTypesInTypeDefs: false,
+                defaultExternalAssemblyName: "std",
+                allowInlining: allowInlining,
+                externalAssemblyResolver: refs.ResolveAssemblyName,
+                print: false);
+
+            if (ex != null)
+                diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+
+            foreach (var diag in diags)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            byte[] flatMd = FlatMetadataBuilder.Build(md);
+            byte[] moduleImage = BytecodeSerializer.SerializeCompiledModule(flatMd, funcs);
+
+            return (moduleImage, diagnostics);
+        }
+        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
+            byte[] runnableAppImage,
+            CancellationTokenSource cts,
+            int heapSize = 32 * 1024,
+            int stackSize = 4 * 1024,
+            int metaSize = 0,
+            int outputLimit = 4 * 1024 - 1,
+            ExecutionLimits? execLimits = null,
+            byte[]? externalLibImage = null,
+            Action<Cnidaria.Cs.HostInterface>? host = null,
+            Action<string>? streamAction = null,
+            string? entryAttributeTypeName = null,
+            string[]? entryAttributeArgs = null,
+            string[]? entryMethodArgs = null)
+        {
+            execLimits ??= new ExecutionLimits();
+            var output = new StringBuilder();
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            try
+            {
+                var app = CompiledRunnableApplicationData.Load(runnableAppImage);
+                CompiledModuleData? ext = null;
+
+                if (externalLibImage != null)
+                    ext = CompiledModuleData.Load(externalLibImage);
+
+                return ExecuteCompiledApplication(
+                    app,
+                    ext,
+                    cts,
+                    heapSize,
+                    stackSize,
+                    metaSize,
+                    outputLimit,
+                    execLimits,
+                    host,
+                    streamAction,
+                    entryAttributeTypeName,
+                    entryAttributeArgs,
+                    entryMethodArgs);
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (output.ToString(), diagnostics, ExecutionContext.Empty);
+            }
+        }
+        private static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) ExecuteCompiledApplication(
+            CompiledRunnableApplicationData app,
+            CompiledModuleData? ext,
+            CancellationTokenSource cts,
+            int heapSize,
+            int stackSize,
+            int metaSize,
+            int outputLimit,
+            ExecutionLimits? execLimits,
+            Action<Cnidaria.Cs.HostInterface>? host,
+            Action<string>? streamAction,
+            string? entryAttributeTypeName,
+            string[]? entryAttributeArgs,
+            string[]? entryMethodArgs)
+        {
+            execLimits ??= new ExecutionLimits();
+            var output = new StringBuilder();
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            try
+            {
+                var domain = new Domain();
+
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(app.Module.Meta.ModuleName, app.Module.Meta, app.Module.Funcs);
+
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+
+                void AddUnique(RuntimeModule m)
+                {
+                    if (!modules.TryAdd(m.Name, m))
+                        throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
+                    domain.Add(m);
+                }
+
+                AddUnique(stdModule);
+                AddUnique(extStdModule);
+                AddUnique(appModule);
+
+                if (ext != null)
+                {
+                    var extModule = new RuntimeModule(ext.Value.Meta.ModuleName, ext.Value.Meta, ext.Value.Funcs);
+                    AddUnique(extModule);
+                }
+
+                int entryTok;
+                object?[]? selectedValues = null;
+
+                if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
+                {
+                    entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                }
+                else
+                {
+                    var attrArgs = entryAttributeArgs ?? Array.Empty<string>();
+                    var callArgs = entryMethodArgs ?? Array.Empty<string>();
+
+                    if (!TryResolveAttributedEntryPoint(
+                            app.Module.Meta,
+                            entryAttributeTypeName!,
+                            attrArgs,
+                            callArgs,
+                            out entryTok,
+                            out selectedValues,
+                            out var err))
+                    {
+                        var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
+                        diagnostics.Add(diagnostic);
+                        output.AppendLine(diagnostic.GetMessage());
+                        return (output.ToString(), diagnostics, ExecutionContext.Empty);
+                    }
+                }
+
+                var rts = new RuntimeTypeSystem(modules);
+
+                byte[] mem = new byte[stackSize + heapSize + metaSize];
+                int metaEnd = metaSize;
+                int stackBase = metaEnd;
+                int stackEnd = stackBase + stackSize;
+
+                var sb = new StringBuilder();
+                long instructionCount = -1;
+                long stackUsage = -1;
+                long heapUsage = -1;
+                TimeSpan timeElapsed = TimeSpan.MinValue;
+
+                using var stringWriter = new StringWriter(sb);
+                using var writer = new BoundedTextWriter(
+                    inner: stringWriter,
+                    maxChars: outputLimit,
+                    mode: BoundedTextWriter.OverflowMode.Truncate,
+                    onChunk: streamAction,
+                    streamOnlyWhatWasWritten: true);
+
+                var vm = new Vm(
+                    memory: mem,
+                    metaEnd: metaEnd,
+                    stackBase: stackBase,
+                    stackEnd: stackEnd,
+                    domain: domain,
+                    rts: rts,
+                    modules: modules,
+                    textWriter: writer);
+
+                var entryFn = appModule.MethodsByDefToken[entryTok];
+                Slot[]? initialArgs = null;
+
+                if (selectedValues != null)
+                {
+                    var rm = rts.ResolveMethod(appModule, entryTok);
+
+                    if (!rm.IsStatic || rm.HasThis)
+                        throw new InvalidOperationException("Command entrypoints must be static.");
+
+                    initialArgs = BuildInitialArgs(vm, rts, rm, selectedValues);
+                }
+
+                var t = Stopwatch.StartNew();
+                try
+                {
+                    host?.Invoke(new HostInterface(vm, rts, modules));
+                    if (initialArgs != null)
+                        vm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
+                    else
+                        vm.Execute(appModule, entryFn, cts.Token, execLimits);
+                }
+                catch (Exception e)
+                {
+                    var diagnostic = new Diagnostic("INTERNAL", DiagnosticSeverity.Error, e.ToString(), default);
+                    diagnostics.Add(diagnostic);
+                    output.AppendLine(diagnostic.GetMessage());
+                    return (sb.ToString() + output.ToString(), diagnostics, ExecutionContext.Empty);
+                }
+
+                t.Stop();
+
+                instructionCount = vm.InctructionsElapsed;
+                stackUsage = vm.StackPeakBytes;
+                heapUsage = vm.HeapPeakBytes;
+                timeElapsed = t.Elapsed;
+
+                return (
+                    sb.ToString(),
+                    diagnostics,
+                    new ExecutionContext(Math.Max(instructionCount, -1), timeElapsed, stackUsage, heapUsage));
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (output.ToString(), diagnostics, ExecutionContext.Empty);
+            }
+        }
+        private readonly struct MetadataEntryParameterSpec
+        {
+            public readonly SpecialType SpecialType;
+            public readonly bool IsParamsStringArray;
+            public readonly bool HasDefault;
+            public readonly object? DefaultValue;
+
+            public MetadataEntryParameterSpec(
+                SpecialType specialType,
+                bool isParamsStringArray,
+                bool hasDefault,
+                object? defaultValue)
+            {
+                SpecialType = specialType;
+                IsParamsStringArray = isParamsStringArray;
+                HasDefault = hasDefault;
+                DefaultValue = defaultValue;
+            }
+        }
+
+        private readonly struct MetadataAttributeSpec
+        {
+            public readonly string Namespace;
+            public readonly string Name;
+            public readonly string[] CtorArgs;
+            public readonly AttributeApplicationTarget Target;
+
+            public MetadataAttributeSpec(
+                string @namespace,
+                string name,
+                string[] ctorArgs,
+                AttributeApplicationTarget target)
+            {
+                Namespace = @namespace ?? string.Empty;
+                Name = name ?? string.Empty;
+                CtorArgs = ctorArgs ?? Array.Empty<string>();
+                Target = target;
+            }
+        }
+
+
+
+
+        private static bool TryBindPositionalArguments(
+            MetadataEntryParameterSpec[] ps,
+            string[] callArgs,
+            out object?[] values,
+            out int cost,
+            out int defaultsUsed,
+            out bool usedParams)
+        {
+            cost = 0;
+            defaultsUsed = 0;
+            usedParams = false;
+            values = new object?[ps.Length];
+
+            int ai = 0;
+            bool hasParams = ps.Length > 0 && ps[^1].IsParamsStringArray;
+            int fixedCount = hasParams ? ps.Length - 1 : ps.Length;
+
+            for (int pi = 0; pi < fixedCount; pi++)
+            {
+                var p = ps[pi];
+
+                if (ai < callArgs.Length)
+                {
+                    if (!TryParseStringToSpecialType(callArgs[ai], p.SpecialType, out var v, out var c))
+                        return false;
+
+                    values[pi] = v;
+                    cost += c;
+                    ai++;
+                }
+                else
+                {
+                    if (!p.HasDefault)
+                        return false;
+
+                    values[pi] = p.DefaultValue;
+                    defaultsUsed++;
+                }
+            }
+
+            if (hasParams)
+            {
+                usedParams = true;
+
+                int rest = callArgs.Length - ai;
+                if (rest < 0) rest = 0;
+
+                var arr = new string?[rest];
+                for (int i = 0; i < rest; i++)
+                    arr[i] = callArgs[ai + i];
+
+                values[^1] = arr;
+                cost += 5;
+                ai += rest;
+            }
+
+            return ai == callArgs.Length;
+        }
+
+        private static bool TryParseStringToSpecialType(string token, SpecialType st, out object? value, out int cost)
+        {
+            value = null;
+            cost = 0;
+
+            var k = ClassifyArg(token);
+
+            switch (st)
+            {
+                case SpecialType.System_String:
+                    value = token;
+                    cost = (k == ArgLexKind.Other) ? 0 : 10;
+                    return true;
+
+                case SpecialType.System_Boolean:
+                    if (bool.TryParse(token, out var b))
+                    {
+                        value = b;
+                        return true;
+                    }
+                    return false;
+
+                case SpecialType.System_Char:
+                    if (token.Length == 1)
+                    {
+                        value = token[0];
+                        return true;
+                    }
+                    return false;
+
+                case SpecialType.System_Int8:
+                    return TryParseInt(token, NumberStyles.Integer, out sbyte _, out value, out cost, 0);
+                case SpecialType.System_UInt8:
+                    return TryParseInt(token, NumberStyles.Integer, out byte _, out value, out cost, 0);
+                case SpecialType.System_Int16:
+                    return TryParseInt(token, NumberStyles.Integer, out short _, out value, out cost, 1);
+                case SpecialType.System_UInt16:
+                    return TryParseInt(token, NumberStyles.Integer, out ushort _, out value, out cost, 1);
+                case SpecialType.System_Int32:
+                    return TryParseInt(token, NumberStyles.Integer, out int _, out value, out cost, 2);
+                case SpecialType.System_UInt32:
+                    return TryParseInt(token, NumberStyles.Integer, out uint _, out value, out cost, 2);
+                case SpecialType.System_Int64:
+                    return TryParseInt(token, NumberStyles.Integer, out long _, out value, out cost, 3);
+                case SpecialType.System_UInt64:
+                    return TryParseInt(token, NumberStyles.Integer, out ulong _, out value, out cost, 3);
+
+                case SpecialType.System_Single:
+                    return TryParseFloat(token, out float _, out value, out cost, k, 1);
+
+                case SpecialType.System_Double:
+                    return TryParseFloat(token, out double _, out value, out cost, k, 0);
+
+                default:
+                    return false;
+            }
+        }
+
+
+        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
+            string source, 
             CancellationTokenSource cts,
             int heapSize = 32 * 1024,
             int stackSize = 4 * 1024,
@@ -46,7 +505,8 @@ namespace Cnidaria.Cs
             Action<string>? streamAction = null,
             string? entryAttributeTypeName = null,
             string[]? entryAttributeArgs = null,
-            string[]? entryMethodArgs = null)
+            string[]? entryMethodArgs = null,
+            bool allowInlining = true)
         {
             execLimits ??= new ExecutionLimits();
             var output = new StringBuilder();
@@ -63,9 +523,9 @@ namespace Cnidaria.Cs
                 {
                     diagnostics.Add(diag);
                 }
-                if (diagnostics.Count > 0)
+                if (diagnostics.Count > 0) 
                 {
-                    return (output.ToString(), diagnostics, ExecutionContext.Empty);
+                    return (output.ToString(), diagnostics, ExecutionContext.Empty); 
                 }
                 var syntaxTree = new SyntaxTree(root, "std");
                 var trees = ImmutableArray.Create(new SyntaxTree[] { syntaxTree });
@@ -73,14 +533,14 @@ namespace Cnidaria.Cs
                 (IMetadataView meta, Dictionary<int, BytecodeFunction> funcs, List<IDiagnostic> diags)? externLib = null;
                 if (externalLibSource != null)
                 {
-                    externLib = CompileLibrary(externalLibSource, "extenal");
+                    externLib = CompileLibrary(externalLibSource, "external");
                     appRefs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, externLib.Value.meta });
                 }
                 else
                 {
                     appRefs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
                 }
-
+                
                 Compilation compilation = CompilationFactory.Create(trees, appRefs, out var declDiag);
                 foreach (var diag in declDiag)
                 {
@@ -95,11 +555,12 @@ namespace Cnidaria.Cs
                     tree: trees[0],
                     includeCoreTypesInTypeDefs: false,
                     defaultExternalAssemblyName: "std",
+                    allowInlining: allowInlining,
                     externalAssemblyResolver: appRefs.ResolveAssemblyName,
                     print: false);
                 if (ex != null)
                 {
-                    var diagnostic = new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.Message, default);
+                    var diagnostic = new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default);
                     diagnostics.Add(diagnostic);
                 }
                 foreach (var diag in diags)
@@ -110,7 +571,7 @@ namespace Cnidaria.Cs
                 {
                     return (output.ToString(), diagnostics, ExecutionContext.Empty);
                 }
-                IMetadataView appViewFlat = new FlatMetadataView(FlatMetadataBuilder.Build(appMd));
+                IMetadataView appViewFlat = new FlatMetadataView(FlatMetadataBuilder.Build(appMd));                  
 
                 var domain = new Cnidaria.Cs.Domain();
                 var stdModule = new Cnidaria.Cs.RuntimeModule("std", StandartLibrary.meta, StandartLibrary.funcs);
@@ -131,14 +592,12 @@ namespace Cnidaria.Cs
 
                 if (externalLibSource != null && externLib != null)
                 {
-                    var externModule = new Cnidaria.Cs.RuntimeModule("extenal", externLib.Value.meta, externLib.Value.funcs);
+                    var externModule = new Cnidaria.Cs.RuntimeModule("external", externLib.Value.meta, externLib.Value.funcs);
                     AddUnique(externModule);
                 }
 
                 int entryTok;
-                MethodSymbol? selectedMethod = null;
                 object?[]? selectedValues = null;
-                bool usesParamsStringArray = false;
 
                 if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
                 {
@@ -150,13 +609,12 @@ namespace Cnidaria.Cs
                     var callArgs = entryMethodArgs ?? Array.Empty<string>();
 
                     if (!TryResolveAttributedEntryPoint(
-                            compilation,
+                            appViewFlat,
                             entryAttributeTypeName!,
                             attrArgs,
-                            callArgs,
-                            out selectedMethod,
+                            callArgs, 
+                            out entryTok,
                             out selectedValues,
-                            out usesParamsStringArray,
                             out var err))
                     {
                         var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
@@ -164,16 +622,6 @@ namespace Cnidaria.Cs
                         output.AppendLine(diagnostic.GetMessage());
                         return (output.ToString(), diagnostics, ExecutionContext.Empty);
                     }
-
-                    var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
-                    var tp = new MetadataTokenProvider(
-                        moduleName: "app",
-                        moduleGlobalNamespace: compilation.SourceGlobalNamespace,
-                        systemObject: systemObject,
-                        defaultExternalAssemblyName: "std",
-                        externalAssemblyResolver: appRefs.ResolveAssemblyName);
-
-                    entryTok = tp.GetMethodToken(selectedMethod);
 
                     if (MetadataToken.Table(entryTok) != MetadataToken.MethodDef)
                     {
@@ -218,7 +666,7 @@ namespace Cnidaria.Cs
                     textWriter: writer);
                     var entryFn = appModule.MethodsByDefToken[entryTok];
                     Slot[]? initialArgs = null;
-                    if (selectedMethod != null)
+                    if (selectedValues != null)
                     {
                         var rm = rts.ResolveMethod(appModule, entryTok);
 
@@ -227,7 +675,7 @@ namespace Cnidaria.Cs
 
                         initialArgs = BuildInitialArgs(vm, rts, rm, selectedValues!);
                     }
-                    if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error))
+                    if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error)) 
                         return (output.ToString(), diagnostics, ExecutionContext.Empty);
                     var t = Stopwatch.StartNew();
                     try
@@ -254,7 +702,7 @@ namespace Cnidaria.Cs
                     timeElapsed = t.Elapsed;
                 }
 
-                return (result, diagnostics,
+                return (result, diagnostics, 
                     new ExecutionContext(Math.Max(instructionCount, -1), timeElapsed, stackUsage, heapUsage));
             }
             catch (Exception ex)
@@ -276,6 +724,7 @@ namespace Cnidaria.Cs
                 tree: stdTrees[0],
                 includeCoreTypesInTypeDefs: true,
                 defaultExternalAssemblyName: "std",
+                allowInlining: true,
                 print: false);
             byte[] stdFlatMd = Cnidaria.Cs.FlatMetadataBuilder.Build(stdMd);
             IMetadataView stdViewFlat = new FlatMetadataView(stdFlatMd);
@@ -316,6 +765,7 @@ namespace Cnidaria.Cs
                 tree: trees[0],
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
+                allowInlining: true,
                 print: false,
                 externalAssemblyResolver: refs.ResolveAssemblyName);
             if (ex != null)
@@ -334,6 +784,124 @@ namespace Cnidaria.Cs
             byte[] flatMd = Cnidaria.Cs.FlatMetadataBuilder.Build(md);
             IMetadataView viewFlat = new FlatMetadataView(flatMd);
             return (viewFlat, funcs, diagnostics);
+        }
+        private static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, BytecodeFunction>? funcs, List<IDiagnostic> diags)
+            CompileLibraryCore(string source, string moduleName)
+        {
+            var diagnostics = new List<IDiagnostic>();
+            var parser = new Parser(source);
+            var root = parser.Parse();
+
+            foreach (var diag in parser.LexerDiagnostics)
+                diagnostics.Add(diag);
+            foreach (var diag in parser.Diagnostics)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, null, null, diagnostics);
+
+            var tree = new SyntaxTree(root, moduleName);
+            var trees = ImmutableArray.Create(tree);
+            var refs = new MetadataReferenceSet(new[] { StandartLibrary.meta });
+            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+
+            foreach (var diag in declDiag)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, null, null, diagnostics);
+
+            var (md, funcs, diags, ex) = compilation.BuildModule(
+                moduleName: moduleName,
+                tree: tree,
+                includeCoreTypesInTypeDefs: false,
+                defaultExternalAssemblyName: "std",
+                allowInlining: true,
+                print: false,
+                externalAssemblyResolver: refs.ResolveAssemblyName);
+
+            if (ex != null)
+                diagnostics.Add(new Diagnostic("LIBINT", DiagnosticSeverity.Error, ex.Message, default));
+
+            foreach (var diag in diags)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, null, null, diagnostics);
+
+            byte[] flatMd = FlatMetadataBuilder.Build(md);
+            IMetadataView viewFlat = new FlatMetadataView(flatMd);
+
+            return (flatMd, viewFlat, funcs, diagnostics);
+        }
+
+        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
+            string source,
+            string moduleName = "external")
+        {
+            var (flatMd, _, funcs, diags) = CompileLibraryCore(source, moduleName);
+            if (HasErrors(diags) || flatMd == null || funcs == null)
+                return (null, diags);
+
+            return (BytecodeSerializer.SerializeCompiledModule(flatMd, funcs), diags);
+        }
+        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileApplicationToBytes(
+            string source,
+            byte[]? externalLibImage = null,
+            bool allowInlining = true)
+        {
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            var parser = new Parser(source);
+            var root = parser.Parse();
+
+            foreach (var diag in parser.LexerDiagnostics)
+                diagnostics.Add(diag);
+            foreach (var diag in parser.Diagnostics)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            var tree = new SyntaxTree(root, "app");
+            var trees = ImmutableArray.Create(tree);
+
+            CompiledModuleData? ext = null;
+            MetadataReferenceSet refs;
+
+            if (externalLibImage != null)
+            {
+                ext = CompiledModuleData.Load(externalLibImage);
+                refs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, ext.Value.Meta });
+            }
+            else
+            {
+                refs = new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+            }
+
+            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+
+            foreach (var diag in declDiag)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            var (md, funcs, diags, ex) = compilation.BuildModule(
+                moduleName: "app",
+                tree: tree,
+                includeCoreTypesInTypeDefs: false,
+                defaultExternalAssemblyName: "std",
+                allowInlining: allowInlining,
+                externalAssemblyResolver: refs.ResolveAssemblyName,
+                print: false);
+
+            if (ex != null)
+                diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+
+            foreach (var diag in diags)
+                diagnostics.Add(diag);
+            if (HasErrors(diagnostics))
+                return (null, diagnostics);
+
+            byte[] flatMd = FlatMetadataBuilder.Build(md);
+            byte[] image = BytecodeSerializer.SerializeCompiledModule(flatMd, funcs);
+            return (image, diagnostics);
         }
         internal static string GetCoreBCLSource()
         {
@@ -354,36 +922,36 @@ namespace Cnidaria.Cs
         }
         private enum ArgLexKind { Other, Integer, Floating }
         private static bool TryResolveAttributedEntryPoint(
-            Compilation compilation,
+            IMetadataView metadata,
             string attributeTypeName,
             string[] attributeArgs,
             string[] callArgs,
-            out MethodSymbol selected,
+            out int entryTok,
             out object?[]? boundValues,
-            out bool usesParamsStringArray,
             out string error)
         {
-            selected = null!;
+            entryTok = 0;
             boundValues = null;
-            usesParamsStringArray = false;
             error = string.Empty;
 
             string wantAttr = NormalizeAttrName(attributeTypeName);
+            var constantsByParent = BuildConstantMap(metadata);
+            var attributesByParent = BuildAttributeMap(metadata);
 
-            var candidates = new List<(MethodSymbol m, object?[] values, int cost, int defaultsUsed, bool usedParams)>();
+            var candidates = new List<(int methodToken, object?[] values, int cost, int defaultsUsed, bool usedParams)>();
 
-            foreach (var m in EnumerateAllSourceMethods(compilation.SourceGlobalNamespace))
+            foreach (int methodToken in EnumerateMethodDefTokens(metadata))
             {
-                if (!IsValidCommandMethodShape(compilation, m))
+                if (!HasMatchingAttribute(attributesByParent, methodToken, wantAttr, attributeArgs))
                     continue;
 
-                if (!HasMatchingAttribute(m, wantAttr, attributeArgs))
+                if (!TryGetEntryParameterSpecs(metadata, methodToken, constantsByParent, attributesByParent, out var parameters))
                     continue;
 
-                if (!TryBindPositionalArguments(compilation, m, callArgs, out var values, out var cost, out var defaultsUsed, out var usedParams))
+                if (!TryBindPositionalArguments(parameters, callArgs, out var values, out var cost, out var defaultsUsed, out var usedParams))
                     continue;
 
-                candidates.Add((m, values, cost, defaultsUsed, usedParams));
+                candidates.Add((methodToken, values, cost, defaultsUsed, usedParams));
             }
 
             if (candidates.Count == 0)
@@ -397,7 +965,7 @@ namespace Cnidaria.Cs
                 int c = a.cost.CompareTo(b.cost);
                 if (c != 0) return c;
 
-                c = a.usedParams.CompareTo(b.usedParams); // false < true
+                c = a.usedParams.CompareTo(b.usedParams);
                 if (c != 0) return c;
 
                 c = a.defaultsUsed.CompareTo(b.defaultsUsed);
@@ -421,10 +989,487 @@ namespace Cnidaria.Cs
                 }
             }
 
-            selected = candidates[0].m;
+            entryTok = candidates[0].methodToken;
             boundValues = candidates[0].values;
-            usesParamsStringArray = candidates[0].usedParams;
             return true;
+        }
+        private static Dictionary<int, ConstantRow> BuildConstantMap(IMetadataView metadata)
+        {
+            var result = new Dictionary<int, ConstantRow>();
+            int count = metadata.GetRowCount(MetadataTableKind.Constant);
+
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = metadata.GetConstant(rid);
+                result[row.ParentToken] = row;
+            }
+
+            return result;
+        }
+
+        private static Dictionary<int, List<MetadataAttributeSpec>> BuildAttributeMap(IMetadataView metadata)
+        {
+            var result = new Dictionary<int, List<MetadataAttributeSpec>>();
+            int count = metadata.GetRowCount(MetadataTableKind.CustomAttribute);
+
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = metadata.GetCustomAttribute(rid);
+                if (!TryDecodeAttribute(metadata, row, out var spec))
+                    continue;
+
+                if (!result.TryGetValue(row.ParentToken, out var list))
+                {
+                    list = new List<MetadataAttributeSpec>();
+                    result.Add(row.ParentToken, list);
+                }
+
+                list.Add(spec);
+            }
+
+            return result;
+        }
+
+        private static IEnumerable<int> EnumerateMethodDefTokens(IMetadataView metadata)
+        {
+            int count = metadata.GetRowCount(MetadataTableKind.MethodDef);
+            for (int rid = 1; rid <= count; rid++)
+                yield return MetadataToken.Make(MetadataToken.MethodDef, rid);
+        }
+
+        private static bool HasMatchingAttribute(
+            Dictionary<int, List<MetadataAttributeSpec>> attributesByParent,
+            int methodToken,
+            string wantAttrShort,
+            string[] wantCtorArgs)
+        {
+            if (!attributesByParent.TryGetValue(methodToken, out var attrs))
+                return false;
+
+            for (int i = 0; i < attrs.Count; i++)
+            {
+                var a = attrs[i];
+                if (a.Target != AttributeApplicationTarget.Method)
+                    continue;
+
+                if (!StringComparer.Ordinal.Equals(NormalizeAttrName(a.Name), wantAttrShort))
+                    continue;
+
+                if (a.CtorArgs.Length != wantCtorArgs.Length)
+                    continue;
+
+                bool same = true;
+                for (int j = 0; j < wantCtorArgs.Length; j++)
+                {
+                    if (!StringComparer.Ordinal.Equals(a.CtorArgs[j], wantCtorArgs[j]))
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+
+                if (same)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetEntryParameterSpecs(
+            IMetadataView metadata,
+            int methodToken,
+            Dictionary<int, ConstantRow> constantsByParent,
+            Dictionary<int, List<MetadataAttributeSpec>> attributesByParent,
+            out MetadataEntryParameterSpec[] parameters)
+        {
+            parameters = Array.Empty<MetadataEntryParameterSpec>();
+
+            if (MetadataToken.Table(methodToken) != MetadataToken.MethodDef)
+                return false;
+
+            int methodRid = MetadataToken.Rid(methodToken);
+            var method = metadata.GetMethodDef(methodRid);
+            string methodName = metadata.GetString(method.Name);
+
+            if ((method.Flags & 0x0800) != 0) // MethodAttributes.SpecialName
+                return false;
+
+            if (methodName is ".ctor" or ".cctor")
+                return false;
+
+            var sig = new SigReader(metadata.GetBlob(method.Signature));
+            byte callConv = sig.ReadByte();
+
+            bool hasThis = (callConv & 0x20) != 0;
+            if (hasThis)
+                return false;
+
+            if ((callConv & 0x10) != 0) // GENERIC
+                _ = sig.ReadCompressedUInt();
+
+            uint paramCount = sig.ReadCompressedUInt();
+
+            if (!TryReadVoidReturnType(ref sig))
+                return false;
+
+            int totalParamRows = metadata.GetRowCount(MetadataTableKind.Param);
+            int paramListRid = method.ParamList;
+            if (paramCount == 0)
+            {
+                parameters = Array.Empty<MetadataEntryParameterSpec>();
+                return true;
+            }
+
+            if (paramListRid <= 0 || paramListRid > totalParamRows)
+                return false;
+
+            var result = new MetadataEntryParameterSpec[checked((int)paramCount)];
+
+            for (int i = 0; i < (int)paramCount; i++)
+            {
+                if (!TryReadSupportedEntryParameterType(ref sig, out var specialType, out var isStringArray))
+                    return false;
+
+                int paramRid = paramListRid + i;
+                if (paramRid > totalParamRows)
+                    return false;
+
+                var param = metadata.GetParam(paramRid);
+                if (param.Sequence != (ushort)(i + 1))
+                    return false;
+
+                int paramToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
+
+                bool isParamsStringArray = false;
+                if (isStringArray)
+                {
+                    if (i != (int)paramCount - 1)
+                        return false;
+
+                    isParamsStringArray = HasParamArrayAttribute(attributesByParent, paramToken);
+                    if (!isParamsStringArray)
+                        return false;
+                }
+
+                bool hasDefault = false;
+                object? defaultValue = null;
+
+                if (constantsByParent.TryGetValue(paramToken, out var constant))
+                {
+                    if (!TryDecodeConstant(metadata, constant, out defaultValue))
+                        return false;
+
+                    hasDefault = true;
+                }
+
+                if (isParamsStringArray && hasDefault)
+                    return false;
+
+                result[i] = new MetadataEntryParameterSpec(
+                    specialType: isStringArray ? SpecialType.System_String : specialType,
+                    isParamsStringArray: isParamsStringArray,
+                    hasDefault: hasDefault,
+                    defaultValue: defaultValue);
+            }
+
+            parameters = result;
+            return true;
+        }
+
+        private static bool HasParamArrayAttribute(
+            Dictionary<int, List<MetadataAttributeSpec>> attributesByParent,
+            int paramToken)
+        {
+            if (!attributesByParent.TryGetValue(paramToken, out var attrs))
+                return false;
+
+            for (int i = 0; i < attrs.Count; i++)
+            {
+                var a = attrs[i];
+                if (a.Target != AttributeApplicationTarget.Parameter)
+                    continue;
+
+                if (!StringComparer.Ordinal.Equals(a.Namespace, "System"))
+                    continue;
+
+                if (StringComparer.Ordinal.Equals(a.Name, "ParamArrayAttribute"))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryDecodeAttribute(
+            IMetadataView metadata,
+            CustomAttributeRow row,
+            out MetadataAttributeSpec spec)
+        {
+            spec = default;
+
+            if (!TryGetTypeTokenName(metadata, row.AttributeTypeToken, out var @namespace, out var name))
+                return false;
+
+            if (!TryReadAttributeCtorArgs(metadata, row.Value, out var ctorArgs))
+                return false;
+
+            spec = new MetadataAttributeSpec(
+                @namespace: @namespace,
+                name: name,
+                ctorArgs: ctorArgs,
+                target: (AttributeApplicationTarget)row.Target);
+
+            return true;
+        }
+
+        private static bool TryReadAttributeCtorArgs(
+            IMetadataView metadata,
+            int blobIndex,
+            out string[] ctorArgs)
+        {
+            ctorArgs = Array.Empty<string>();
+
+            try
+            {
+                var reader = new AttrBlobReader(metadata.GetBlob(blobIndex));
+
+                int ctorParamCount = reader.ReadInt32();
+                for (int i = 0; i < ctorParamCount; i++)
+                    _ = reader.ReadInt32();
+
+                int ctorArgCount = reader.ReadInt32();
+                var args = new string[ctorArgCount];
+
+                for (int i = 0; i < ctorArgCount; i++)
+                {
+                    if (!TryReadAttributeCtorArg(metadata, ref reader, out var value))
+                        return false;
+
+                    args[i] = value is null
+                        ? "null"
+                        : Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+                }
+
+                ctorArgs = args;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryReadAttributeCtorArg(
+            IMetadataView metadata,
+            ref AttrBlobReader reader,
+            out object? value)
+        {
+            value = null;
+
+            _ = reader.ReadInt32(); // type token
+            byte kind = reader.ReadByte();
+
+            switch (kind)
+            {
+                case 0:
+                    value = null;
+                    return true;
+                case 1:
+                    value = reader.ReadByte() != 0;
+                    return true;
+                case 2:
+                    value = (char)reader.ReadUInt16();
+                    return true;
+                case 3:
+                    value = reader.ReadSByte();
+                    return true;
+                case 4:
+                    value = reader.ReadByte();
+                    return true;
+                case 5:
+                    value = reader.ReadInt16();
+                    return true;
+                case 6:
+                    value = reader.ReadUInt16();
+                    return true;
+                case 7:
+                    value = reader.ReadInt32();
+                    return true;
+                case 8:
+                    value = reader.ReadUInt32();
+                    return true;
+                case 9:
+                    value = reader.ReadInt64();
+                    return true;
+                case 10:
+                    value = reader.ReadUInt64();
+                    return true;
+                case 11:
+                    value = reader.ReadSingle();
+                    return true;
+                case 12:
+                    value = reader.ReadDouble();
+                    return true;
+                case 13:
+                    value = metadata.GetString(reader.ReadInt32());
+                    return true;
+                case 14:
+                    if (!TryGetTypeTokenName(metadata, reader.ReadInt32(), out var @namespace, out var name))
+                        return false;
+
+                    value = string.IsNullOrEmpty(@namespace) ? name : @namespace + "." + name;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryGetTypeTokenName(
+            IMetadataView metadata,
+            int token,
+            out string @namespace,
+            out string name)
+        {
+            @namespace = string.Empty;
+            name = string.Empty;
+
+            int table = MetadataToken.Table(token);
+            int rid = MetadataToken.Rid(token);
+
+            switch (table)
+            {
+                case MetadataToken.TypeDef:
+                    if (rid <= 0 || rid > metadata.GetRowCount(MetadataTableKind.TypeDef))
+                        return false;
+
+                    var td = metadata.GetTypeDef(rid);
+                    @namespace = metadata.GetString(td.Namespace);
+                    name = metadata.GetString(td.Name);
+                    return true;
+
+                case MetadataToken.TypeRef:
+                    if (rid <= 0 || rid > metadata.GetRowCount(MetadataTableKind.TypeRef))
+                        return false;
+
+                    var tr = metadata.GetTypeRef(rid);
+                    @namespace = metadata.GetString(tr.Namespace);
+                    name = metadata.GetString(tr.Name);
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryDecodeConstant(
+            IMetadataView metadata,
+            ConstantRow row,
+            out object? value)
+        {
+            value = null;
+            var blob = metadata.GetBlob(row.Value);
+
+            if (row.TypeCode == 0 && blob.Length == 0)
+            {
+                value = null;
+                return true;
+            }
+
+            switch (row.TypeCode)
+            {
+                case 0x02: value = blob[0] != 0; return true;
+                case 0x03: value = BitConverter.ToChar(blob); return true;
+                case 0x04: value = unchecked((sbyte)blob[0]); return true;
+                case 0x05: value = blob[0]; return true;
+                case 0x06: value = BitConverter.ToInt16(blob); return true;
+                case 0x07: value = BitConverter.ToUInt16(blob); return true;
+                case 0x08: value = BitConverter.ToInt32(blob); return true;
+                case 0x09: value = BitConverter.ToUInt32(blob); return true;
+                case 0x0A: value = BitConverter.ToInt64(blob); return true;
+                case 0x0B: value = BitConverter.ToUInt64(blob); return true;
+                case 0x0C: value = BitConverter.ToSingle(blob); return true;
+                case 0x0D: value = BitConverter.ToDouble(blob); return true;
+                case 0x0E: value = Encoding.UTF8.GetString(blob); return true;
+                default: return false;
+            }
+        }
+
+        private static bool TryReadVoidReturnType(ref SigReader reader)
+        {
+            return (SigElementType)reader.ReadByte() == SigElementType.VOID;
+        }
+
+        private static bool TryReadSupportedEntryParameterType(
+            ref SigReader reader,
+            out SpecialType specialType,
+            out bool isStringArray)
+        {
+            specialType = SpecialType.None;
+            isStringArray = false;
+
+            switch ((SigElementType)reader.ReadByte())
+            {
+                case SigElementType.STRING:
+                    specialType = SpecialType.System_String;
+                    return true;
+
+                case SigElementType.BOOLEAN:
+                    specialType = SpecialType.System_Boolean;
+                    return true;
+
+                case SigElementType.CHAR:
+                    specialType = SpecialType.System_Char;
+                    return true;
+
+                case SigElementType.I1:
+                    specialType = SpecialType.System_Int8;
+                    return true;
+
+                case SigElementType.U1:
+                    specialType = SpecialType.System_UInt8;
+                    return true;
+
+                case SigElementType.I2:
+                    specialType = SpecialType.System_Int16;
+                    return true;
+
+                case SigElementType.U2:
+                    specialType = SpecialType.System_UInt16;
+                    return true;
+
+                case SigElementType.I4:
+                    specialType = SpecialType.System_Int32;
+                    return true;
+
+                case SigElementType.U4:
+                    specialType = SpecialType.System_UInt32;
+                    return true;
+
+                case SigElementType.I8:
+                    specialType = SpecialType.System_Int64;
+                    return true;
+
+                case SigElementType.U8:
+                    specialType = SpecialType.System_UInt64;
+                    return true;
+
+                case SigElementType.R4:
+                    specialType = SpecialType.System_Single;
+                    return true;
+
+                case SigElementType.R8:
+                    specialType = SpecialType.System_Double;
+                    return true;
+
+                case SigElementType.SZARRAY:
+                    if ((SigElementType)reader.ReadByte() != SigElementType.STRING)
+                        return false;
+
+                    isStringArray = true;
+                    return true;
+
+                default:
+                    return false;
+            }
         }
         private static bool IsValidCommandMethodShape(Compilation compilation, MethodSymbol m)
         {
@@ -972,7 +2017,6 @@ namespace Cnidaria.Cs
             int len = span.Length;
             if (len == 0) return;
 
-            // Entire span doesn't fit
             if (len > _remaining)
             {
                 if (_mode == OverflowMode.Drop)

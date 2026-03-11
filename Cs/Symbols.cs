@@ -82,6 +82,136 @@ namespace Cnidaria.Cs
             Target = target;
         }
     }
+    internal static class MetadataFlagBits
+    {
+        public const ushort NoInlining = 0x0008;
+        public const ushort AggressiveInlining = 0x0100;
+        public const ushort Extension = 0x8000;
+        public const int CustomAttribute = 0x0C000000;
+    }
+    internal static class MethodAttributeFacts
+    {
+        public static ushort GetMethodImplFlags(MethodSymbol method)
+        {
+            if (method is null)
+                return 0;
+
+            var attrs = method.OriginalDefinition.GetAttributes();
+            for (int i = 0; i < attrs.Length; i++)
+            {
+                var attr = attrs[i];
+                if (!IsAttribute(attr, "System.Runtime.CompilerServices", "MethodImplAttribute"))
+                    continue;
+
+                if (TryGetUInt16(attr, out var flags))
+                    return flags;
+            }
+
+            return 0;
+        }
+        public static bool HasNoInlining(MethodSymbol method)
+            => (GetMethodImplFlags(method) & MetadataFlagBits.NoInlining) != 0;
+
+        public static bool HasAggressiveInlining(MethodSymbol method)
+            => (GetMethodImplFlags(method) & MetadataFlagBits.AggressiveInlining) != 0;
+
+        public static bool HasRuntimeIntrinsic(MethodSymbol method)
+            => HasAttribute(method, "System", "RuntimeIntrinsicAttribute");
+        public static bool HasIntrinsic(MethodSymbol method)
+            => HasAttribute(method, "System", "IntrinsicAttribute");
+        public static bool HasAttribute(MethodSymbol method, string @namespace, string name)
+        {
+            if (method is null)
+                return false;
+
+            var attrs = method.OriginalDefinition.GetAttributes();
+            for (int i = 0; i < attrs.Length; i++)
+            {
+                if (IsAttribute(attrs[i], @namespace, name))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsAttribute(AttributeData attr, string @namespace, string name)
+        {
+            var attrClass = attr.AttributeClass;
+            if (!string.Equals(attrClass.Name, name, StringComparison.Ordinal))
+                return false;
+
+            if (attrClass.ContainingSymbol is not NamespaceSymbol ns)
+                return false;
+
+            return string.Equals(GetNamespaceFullName(ns), @namespace, StringComparison.Ordinal);
+        }
+
+        private static string GetNamespaceFullName(NamespaceSymbol ns)
+        {
+            if (ns.IsGlobalNamespace)
+                return string.Empty;
+
+            var parts = new Stack<string>();
+            Symbol? cur = ns;
+            while (cur is NamespaceSymbol curNs && !curNs.IsGlobalNamespace)
+            {
+                parts.Push(curNs.Name);
+                cur = curNs.ContainingSymbol;
+            }
+
+            return string.Join(".", parts);
+        }
+
+        private static bool TryGetUInt16(AttributeData attr, out ushort value)
+        {
+            value = 0;
+            var args = attr.ConstructorArguments;
+            if (args.IsDefaultOrEmpty)
+                return true;
+
+            return TryConvertToUInt16(args[0].Value, out value);
+        }
+
+        private static bool TryConvertToUInt16(object? value, out ushort result)
+        {
+            switch (value)
+            {
+                case null:
+                    result = 0;
+                    return false;
+                case byte v:
+                    result = v;
+                    return true;
+                case sbyte v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case short v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case ushort v:
+                    result = v;
+                    return true;
+                case int v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case uint v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case long v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case ulong v:
+                    result = unchecked((ushort)v);
+                    return true;
+                case Enum e:
+                    result = Convert.ToUInt16(e);
+                    return true;
+                default:
+                    result = 0;
+                    return false;
+            }
+        }
+    }
     public abstract class Symbol
     {
         public abstract SymbolKind Kind { get; }
@@ -149,7 +279,7 @@ namespace Cnidaria.Cs
         public static readonly ThrowTypeSymbol Instance = new();
         public override SymbolKind Kind => SymbolKind.Error;
         public override string Name => "<throw>";
-        public override Symbol? ContainingSymbol => null;
+        public override Symbol? ContainingSymbol => null; 
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
         public override bool IsReferenceType => false;
         public override bool IsValueType => false;
@@ -189,7 +319,7 @@ namespace Cnidaria.Cs
         None = 0,
         UnmanagedConstraint = 1 << 0,
         NotNullConstraint = 1 << 1,
-        StructConstraint = 1 << 2,
+        StructConstraint = 1 << 2, 
         AllowsRefStruct = 1 << 3,
     }
 
@@ -431,6 +561,7 @@ namespace Cnidaria.Cs
         public abstract bool IsStatic { get; }
         public abstract bool IsConstructor { get; }
         public abstract bool IsAsync { get; }
+        public virtual bool IsExtensionMethod => false;
         public virtual bool IsVirtual => false;
         public virtual bool IsAbstract => false;
         public virtual bool IsOverride => false;
@@ -500,10 +631,10 @@ namespace Cnidaria.Cs
         public override TypeSymbol Type => _type;
 
         public SynthesizedBackingFieldSymbol(
-            string name,
-            Symbol containing,
-            TypeSymbol placeholderType,
-            bool isStatic,
+            string name, 
+            Symbol containing, 
+            TypeSymbol placeholderType, 
+            bool isStatic, 
             bool isReadOnly)
         {
             Name = name;
@@ -537,10 +668,10 @@ namespace Cnidaria.Cs
         public bool HasExplicitDefault { get; internal set; }
         public Optional<object> DefaultValueOpt { get; internal set; }
         public ParameterSymbol(
-            string name,
-            Symbol containing,
-            TypeSymbol type,
-            ImmutableArray<Location> locations,
+            string name, 
+            Symbol containing, 
+            TypeSymbol type, 
+            ImmutableArray<Location> locations, 
             bool isReadOnlyRef = false,
             ParameterRefKind refKind = ParameterRefKind.None,
             bool isScoped = false,
@@ -908,9 +1039,9 @@ namespace Cnidaria.Cs
             _typeParameters = tps;
         }
         public SourceNamedTypeSymbol(
-            string name,
-            Symbol? containing,
-            TypeKind typeKind,
+            string name, 
+            Symbol? containing, 
+            TypeKind typeKind, 
             int arity,
             Accessibility declaredAccessibility,
             bool isFromMetadata = false,
@@ -1046,7 +1177,8 @@ namespace Cnidaria.Cs
         private readonly List<SyntaxReference> _declRefs = new();
         private readonly List<AttributeData> _attributes = new();
         public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => _declRefs.ToImmutableArray();
-
+        private readonly bool _isExtensionMethod;
+        public override bool IsExtensionMethod => _isExtensionMethod;
         public SourceMethodSymbol(
             string name,
             Symbol containing,
@@ -1056,7 +1188,8 @@ namespace Cnidaria.Cs
             bool isConstructor,
             bool isAsync,
             ImmutableArray<Location> locations,
-            Accessibility declaredAccessibility = Accessibility.Public)
+            Accessibility declaredAccessibility = Accessibility.Public,
+            bool isExtensionMethod = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1065,6 +1198,7 @@ namespace Cnidaria.Cs
             IsStatic = isStatic;
             IsConstructor = isConstructor;
             IsAsync = isAsync;
+            _isExtensionMethod = isExtensionMethod;
             Locations = locations;
             DeclaredAccessibility = declaredAccessibility;
             _parameters = default;
@@ -1394,10 +1528,12 @@ namespace Cnidaria.Cs
         public override bool IsStatic => _original.IsStatic;
         public override bool IsConstructor => _original.IsConstructor;
         public override bool IsAsync => _original.IsAsync;
+        public override bool IsExtensionMethod => _original.IsExtensionMethod;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _original.TypeParameters;
         public override TypeSymbol ReturnType => _returnType;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override MethodSymbol OriginalDefinition => _original.OriginalDefinition;
+        public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
         public SubstitutedMethodSymbol(MethodSymbol original, NamedTypeSymbol containing, TypeManager types, ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
         {
             _original = original;
@@ -1412,7 +1548,7 @@ namespace Cnidaria.Cs
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
                 b.Add(new ParameterSymbol(
-                    p.Name, this, pt, p.Locations,
+                    p.Name, this, pt, p.Locations, 
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped,
@@ -1439,10 +1575,12 @@ namespace Cnidaria.Cs
         public override bool IsStatic => _definition.IsStatic;
         public override bool IsConstructor => _definition.IsConstructor;
         public override bool IsAsync => _definition.IsAsync;
+        public override bool IsExtensionMethod => _definition.IsExtensionMethod;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _definition.TypeParameters;
 
         public override TypeSymbol ReturnType => _returnType;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
+        public override ImmutableArray<AttributeData> GetAttributes() => _definition.GetAttributes();
         public ConstructedMethodSymbol(MethodSymbol definition, ImmutableArray<TypeSymbol> typeArguments, TypeManager types)
         {
             _definition = definition;
@@ -1468,10 +1606,10 @@ namespace Cnidaria.Cs
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
                 b.Add(new ParameterSymbol(
-                    p.Name,
-                    this,
-                    pt,
-                    p.Locations,
+                    p.Name, 
+                    this, 
+                    pt, 
+                    p.Locations, 
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped,
@@ -1684,7 +1822,9 @@ namespace Cnidaria.Cs
         private readonly bool _isAbstract;
         private readonly bool _isOverride;
         private readonly bool _isSealed;
+        private readonly bool _isExtensionMethod;
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
+        private readonly List<AttributeData> _attributes = new();
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -1698,6 +1838,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic { get; }
         public override bool IsConstructor { get; }
         public override bool IsAsync => false;
+        public override bool IsExtensionMethod => _isExtensionMethod;
         public override bool IsVirtual => _isVirtual;
         public override bool IsAbstract => _isAbstract;
         public override bool IsOverride => _isOverride;
@@ -1713,7 +1854,8 @@ namespace Cnidaria.Cs
             bool isVirtual,
             bool isAbstract,
             bool isOverride,
-            bool isSealed)
+            bool isSealed,
+            bool isExtensionMethod)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1725,24 +1867,27 @@ namespace Cnidaria.Cs
             _isAbstract = isAbstract;
             _isOverride = isOverride;
             _isSealed = isSealed;
+            _isExtensionMethod = isExtensionMethod;
             var ps = ImmutableArray.CreateBuilder<ParameterSymbol>(parameters.Length);
             for (int i = 0; i < parameters.Length; i++)
             {
                 var p = parameters[i];
                 ps.Add(new ParameterSymbol(
-                    p.name,
-                    this,
-                    p.type,
+                    p.name, 
+                    this, 
+                    p.type, 
                     ImmutableArray<Location>.Empty));
             }
             Parameters = ps.ToImmutable();
         }
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> tps)
             => _typeParameters = tps.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : tps;
-
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
     internal sealed class ExternalFieldSymbol : FieldSymbol
     {
+        private readonly List<AttributeData> _attributes = new();
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -1770,9 +1915,12 @@ namespace Cnidaria.Cs
             DeclaredAccessibility = declaredAccessibility;
             ConstantValueOpt = isConst ? constantValueOpt : Optional<object>.None;
         }
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
     internal sealed class ExternalPropertySymbol : PropertySymbol
     {
+        private readonly List<AttributeData> _attributes = new();
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -1809,6 +1957,8 @@ namespace Cnidaria.Cs
             SetMethod = setMethod;
             _parameters = parameters;
         }
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
     internal sealed class IntrinsicMethodSymbol : MethodSymbol
     {

@@ -39,7 +39,7 @@ namespace Cnidaria.Cs
         }
         public override bool Equals(object? obj)
         {
-            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length;
+            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length ;
         }
         public override int GetHashCode()
         {
@@ -1588,7 +1588,7 @@ namespace Cnidaria.Cs
             else
                 ReadIntegerSuffixIfAny();
 
-        ComputeTokenValue:
+            ComputeTokenValue:
 
             var span = new TextSpan(start, _pos - start);
             var text = _text.AsSpan(span.Start, span.Length);
@@ -1915,10 +1915,10 @@ namespace Cnidaria.Cs
                         bool isU8 = TryConsumeU8Suffix();
                         SyntaxKind kind;
                         if (isU8)
-                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken
+                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken 
                                 : SyntaxKind.Utf8SingleLineRawStringLiteralToken;
                         else
-                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken
+                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken 
                                 : SyntaxKind.SingleLineRawStringLiteralToken;
 
                         var span = new TextSpan(start, _pos - start);

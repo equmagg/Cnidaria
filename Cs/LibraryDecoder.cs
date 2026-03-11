@@ -195,8 +195,8 @@ namespace Cnidaria.Cs
             }
         }
         public NamedTypeSymbol AddType(
-            string @namespace,
-            string name,
+            string @namespace, 
+            string name, 
             TypeKind kind,
             int arity = 0,
             Accessibility declaredAccessibility = Accessibility.Public,
@@ -287,6 +287,7 @@ namespace Cnidaria.Cs
             bool isAbstract,
             bool isOverride,
             bool isSealed,
+            bool isExtensionMethod,
             ImmutableArray<TypeParameterSymbol> typeParameters)
         {
             var m = new ExternalMethodSymbol(
@@ -300,7 +301,8 @@ namespace Cnidaria.Cs
                 isVirtual: isVirtual,
                 isAbstract: isAbstract,
                 isOverride: isOverride,
-                isSealed: isSealed);
+                isSealed: isSealed,
+                isExtensionMethod: isExtensionMethod);
 
             if (!typeParameters.IsDefaultOrEmpty && m is ExternalMethodSymbol em)
                 em.SetTypeParameters(typeParameters);
@@ -315,7 +317,7 @@ namespace Cnidaria.Cs
         private readonly IMetadataView _md;
         internal MetadataCoreLibProvider(MetadataImage md)
         : this(new MetadataImageView(md))
-        { }
+        {  }
         internal MetadataCoreLibProvider(IMetadataView md)
             => _md = md ?? throw new ArgumentNullException(nameof(md));
         public void Populate(CoreLibraryBuilder core)
@@ -360,8 +362,8 @@ namespace Cnidaria.Cs
                     continue; // special types already have BaseType fixed
 
                 var baseType = ResolveTypeDefOrRef(
-                    unchecked((uint)td.ExtendsEncoded),
-                    typeByRid,
+                    unchecked((uint)td.ExtendsEncoded), 
+                    typeByRid, 
                     core,
                     declaringType: null,
                     methodTypeParameters: ImmutableArray<TypeParameterSymbol>.Empty);
@@ -373,9 +375,12 @@ namespace Cnidaria.Cs
 
             // Import
             var methodByRid = AddMethods(core, typeByRid);
-            AddFields(core, typeByRid);
-            AddPropertiesFromTable(core, typeByRid, methodByRid);
+            var fieldByRid = AddFields(core, typeByRid);
+            var propertyByRid = AddPropertiesFromTable(core, typeByRid, methodByRid);
             AddPropertiesFromAccessors(core, typeByRid);
+
+            var paramByRid = BuildParamMap(methodByRid);
+            ApplyCustomAttributes(core, typeByRid, fieldByRid, methodByRid, paramByRid, propertyByRid);
         }
         private static Accessibility DecodeMethodAccessibility(ushort flags)
         {
@@ -514,6 +519,272 @@ namespace Cnidaria.Cs
                     p.SetDefaultValue(cval);
             }
         }
+        private void ApplyCustomAttributes(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            Dictionary<int, FieldSymbol> fieldByRid,
+            Dictionary<int, MethodSymbol> methodByRid,
+            Dictionary<int, ParameterSymbol> paramByRid,
+            Dictionary<int, PropertySymbol> propertyByRid)
+        {
+            int count = _md.GetRowCount(MetadataTableKind.CustomAttribute);
+            if (count == 0)
+                return;
+
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = _md.GetCustomAttribute(rid);
+
+                var owner = ResolveAttributeOwner(
+                    row.ParentToken,
+                    typeByRid,
+                    fieldByRid,
+                    methodByRid,
+                    paramByRid,
+                    propertyByRid);
+
+                if (owner is null)
+                    continue;
+
+                var data = DecodeCustomAttribute(core, typeByRid, row);
+                if (data is null)
+                    continue;
+
+                AddImportedAttribute(owner, data);
+            }
+        }
+        private Symbol? ResolveAttributeOwner(
+            int parentToken,
+            NamedTypeSymbol[] typeByRid,
+            Dictionary<int, FieldSymbol> fieldByRid,
+            Dictionary<int, MethodSymbol> methodByRid,
+            Dictionary<int, ParameterSymbol> paramByRid,
+            Dictionary<int, PropertySymbol> propertyByRid)
+        {
+            int table = MetadataToken.Table(parentToken);
+            int rid = MetadataToken.Rid(parentToken);
+
+            return table switch
+            {
+                MetadataToken.TypeDef => (rid > 0 && rid < typeByRid.Length) ? typeByRid[rid] : null,
+                MetadataToken.FieldDef => fieldByRid.TryGetValue(rid, out var f) ? f : null,
+                MetadataToken.MethodDef => methodByRid.TryGetValue(rid, out var m) ? m : null,
+                MetadataToken.ParamDef => paramByRid.TryGetValue(rid, out var p) ? p : null,
+                MetadataToken.PropertyDef => propertyByRid.TryGetValue(rid, out var prop) ? prop : null,
+                _ => null
+            };
+        }
+
+        private static void AddImportedAttribute(Symbol owner, AttributeData data)
+        {
+            switch (owner)
+            {
+                case SourceNamedTypeSymbol t: t.AddAttribute(data); break;
+                case SourceMethodSymbol m: m.AddAttribute(data); break;
+                case SourceFieldSymbol f: f.AddAttribute(data); break;
+                case SourcePropertySymbol p: p.AddAttribute(data); break;
+
+                case ExternalMethodSymbol m: m.AddAttribute(data); break;
+                case ExternalFieldSymbol f: f.AddAttribute(data); break;
+                case ExternalPropertySymbol p: p.AddAttribute(data); break;
+
+                case ParameterSymbol p: p.AddAttribute(data); break;
+                case TypeParameterSymbol tp: tp.AddAttribute(data); break;
+            }
+        }
+        private AttributeData? DecodeCustomAttribute(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            CustomAttributeRow row)
+        {
+            var attrTypeSym = ResolveTypeToken(core, typeByRid, row.AttributeTypeToken) as NamedTypeSymbol;
+            if (attrTypeSym is null)
+                return null;
+
+            var blob = _md.GetBlob(row.Value);
+            var r = new AttrBlobReader(blob);
+
+            int ctorParamCount = r.ReadInt32();
+            var ctorParamTypes = ImmutableArray.CreateBuilder<TypeSymbol>(ctorParamCount);
+            for (int i = 0; i < ctorParamCount; i++)
+                ctorParamTypes.Add(ResolveTypeToken(core, typeByRid, r.ReadInt32()));
+
+            var ctor = FindMatchingAttributeConstructor(attrTypeSym, ctorParamTypes.ToImmutable());
+            if (ctor is null)
+                return null;
+
+            int ctorArgCount = r.ReadInt32();
+            var ctorArgs = ImmutableArray.CreateBuilder<TypedConstant>(ctorArgCount);
+            for (int i = 0; i < ctorArgCount; i++)
+                ctorArgs.Add(ReadTypedConstant(core, typeByRid, ref r));
+
+            int namedCount = r.ReadInt32();
+            var namedArgs = ImmutableArray.CreateBuilder<AttributeNamedArgumentData>(namedCount);
+
+            for (int i = 0; i < namedCount; i++)
+            {
+                byte memberKind = r.ReadByte(); // 1 = field, 2 = property
+                string memberName = _md.GetString(r.ReadInt32());
+                var value = ReadTypedConstant(core, typeByRid, ref r);
+
+                var member = FindAttributeNamedMember(attrTypeSym, memberKind, memberName);
+                if (member is null)
+                    continue;
+
+                namedArgs.Add(new AttributeNamedArgumentData(memberName, member, value));
+            }
+
+            return new AttributeData(
+                attributeClass: attrTypeSym,
+                constructor: ctor,
+                constructorArguments: ctorArgs.ToImmutable(),
+                namedArguments: namedArgs.ToImmutable(),
+                target: (AttributeApplicationTarget)row.Target);
+        }
+        private TypeSymbol ResolveTypeToken(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid, int token)
+        {
+            int table = MetadataToken.Table(token);
+            int rid = MetadataToken.Rid(token);
+
+            return table switch
+            {
+                MetadataToken.TypeDef => (rid > 0 && rid < typeByRid.Length && typeByRid[rid] is not null)
+                    ? typeByRid[rid]
+                    : new ErrorTypeSymbol($"typedef:{rid}", null, ImmutableArray<Location>.Empty),
+
+                MetadataToken.TypeRef => ResolveTypeRef(rid, core),
+                MetadataToken.TypeSpec => ResolveTypeSpec(rid, typeByRid, core, null, ImmutableArray<TypeParameterSymbol>.Empty),
+
+                _ => new ErrorTypeSymbol($"bad-type-token:0x{token:X8}", null, ImmutableArray<Location>.Empty)
+            };
+        }
+
+        private MethodSymbol? FindMatchingAttributeConstructor(
+            NamedTypeSymbol attributeType,
+            ImmutableArray<TypeSymbol> parameterTypes)
+        {
+            for (NamedTypeSymbol? t = attributeType; t is not null; t = t.BaseType as NamedTypeSymbol)
+            {
+                var members = t.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol m || !m.IsConstructor)
+                        continue;
+
+                    var ps = m.Parameters;
+                    if (ps.Length != parameterTypes.Length)
+                        continue;
+
+                    bool same = true;
+                    for (int p = 0; p < ps.Length; p++)
+                    {
+                        if (!AreSameType(ps[p].Type, parameterTypes[p]))
+                        {
+                            same = false;
+                            break;
+                        }
+                    }
+
+                    if (same)
+                        return m;
+                }
+            }
+
+            return null;
+        }
+
+        private Symbol? FindAttributeNamedMember(NamedTypeSymbol attrType, byte memberKind, string name)
+        {
+            for (NamedTypeSymbol? t = attrType; t is not null; t = t.BaseType as NamedTypeSymbol)
+            {
+                var members = t.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    var m = members[i];
+                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                        continue;
+
+                    if (memberKind == 1 && m is FieldSymbol f && !f.IsStatic && !f.IsConst)
+                        return f;
+
+                    if (memberKind == 2 && m is PropertySymbol p && !p.IsStatic && p.Parameters.Length == 0)
+                        return p;
+                }
+            }
+
+            return null;
+        }
+
+        private TypedConstant ReadTypedConstant(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            ref AttrBlobReader r)
+        {
+            var type = ResolveTypeToken(core, typeByRid, r.ReadInt32());
+            byte kind = r.ReadByte();
+
+            object? value = kind switch
+            {
+                0 => null,
+                1 => r.ReadByte() != 0,
+                2 => (char)r.ReadUInt16(),
+                3 => r.ReadSByte(),
+                4 => r.ReadByte(),
+                5 => r.ReadInt16(),
+                6 => r.ReadUInt16(),
+                7 => r.ReadInt32(),
+                8 => r.ReadUInt32(),
+                9 => r.ReadInt64(),
+                10 => r.ReadUInt64(),
+                11 => r.ReadSingle(),
+                12 => r.ReadDouble(),
+                13 => _md.GetString(r.ReadInt32()),
+                14 => ResolveTypeToken(core, typeByRid, r.ReadInt32()),
+                _ => throw new InvalidOperationException($"Unsupported attribute constant kind: {kind}")
+            };
+
+            return new TypedConstant(type, value);
+        }
+
+        private static bool AreSameType(TypeSymbol a, TypeSymbol b)
+        {
+            if (ReferenceEquals(a, b))
+                return true;
+
+            if (a.SpecialType != SpecialType.None || b.SpecialType != SpecialType.None)
+                return a.SpecialType == b.SpecialType;
+
+            if (a is ArrayTypeSymbol aa && b is ArrayTypeSymbol ab)
+                return aa.Rank == ab.Rank && AreSameType(aa.ElementType, ab.ElementType);
+
+            if (a is PointerTypeSymbol pa && b is PointerTypeSymbol pb)
+                return AreSameType(pa.PointedAtType, pb.PointedAtType);
+
+            if (a is ByRefTypeSymbol ra && b is ByRefTypeSymbol rb)
+                return AreSameType(ra.ElementType, rb.ElementType);
+
+            if (a is NamedTypeSymbol na && b is NamedTypeSymbol nb)
+            {
+                if (!ReferenceEquals(na.OriginalDefinition, nb.OriginalDefinition))
+                    return false;
+
+                var aa2 = na.TypeArguments;
+                var bb2 = nb.TypeArguments;
+                if (aa2.Length != bb2.Length)
+                    return false;
+
+                for (int i = 0; i < aa2.Length; i++)
+                    if (!AreSameType(aa2[i], bb2[i]))
+                        return false;
+
+                return true;
+            }
+
+            if (a is TypeParameterSymbol ta && b is TypeParameterSymbol tb)
+                return ta.Ordinal == tb.Ordinal && ReferenceEquals(ta.ContainingSymbol, tb.ContainingSymbol);
+
+            return false;
+        }
         private Dictionary<int, MethodSymbol> AddMethods(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid)
         {
             var methodByRid = new Dictionary<int, MethodSymbol>();
@@ -596,6 +867,7 @@ namespace Cnidaria.Cs
                     bool isFinal = (mdRow.Flags & (ushort)System.Reflection.MethodAttributes.Final) != 0;
                     bool isOverride = isVirtual && !isNewSlot;
                     bool isSealed = isFinal;
+                    bool isExtensionMethod = (mdRow.Flags & MetadataFlagBits.Extension) != 0;
 
                     var ms = core.AddExternalMethod(
                         containingType: declaringType,
@@ -609,6 +881,7 @@ namespace Cnidaria.Cs
                         isAbstract: isAbstract,
                         isOverride: isOverride,
                         isSealed: isSealed,
+                        isExtensionMethod: isExtensionMethod,
                         typeParameters: mtps);
 
                     ApplyParamRefKinds(ms, mdRow.ParamList, (int)paramCount);
@@ -620,11 +893,12 @@ namespace Cnidaria.Cs
             return methodByRid;
         }
 
-        private void AddFields(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid)
+        private Dictionary<int, FieldSymbol> AddFields(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid)
         {
+            var fieldByRid = new Dictionary<int, FieldSymbol>();
             var constByParent = new Dictionary<int, ConstantRow>();
             for (int i = 0; i < _md.GetRowCount(MetadataTableKind.Constant); i++)
-                constByParent[_md.GetConstant(i + 1).ParentToken] = _md.GetConstant(i + 1);
+                constByParent[_md.GetConstant(i+1).ParentToken] = _md.GetConstant(i+1);
             for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
             {
                 var declaringType = typeByRid[rid];
@@ -663,16 +937,19 @@ namespace Cnidaria.Cs
                         if (constByParent.TryGetValue(parentTok, out var crow))
                             cval = DecodeConstant(ftype, crow);
                     }
-                    core.AddExternalField(
-                        declaringType,
-                        fname,
-                        ftype,
-                        isStatic,
+                    var field = core.AddExternalField(
+                        declaringType, 
+                        fname, 
+                        ftype, 
+                        isStatic, 
                         isConst,
-                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags),
+                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags), 
                         cval);
+
+                    fieldByRid[frid] = field;
                 }
             }
+            return fieldByRid;
         }
         private Optional<object> DecodeConstant(TypeSymbol fieldType, ConstantRow row)
         {
@@ -699,13 +976,15 @@ namespace Cnidaria.Cs
                 default: return Optional<object>.None;
             }
         }
-        private void AddPropertiesFromTable(
+        private Dictionary<int, PropertySymbol> AddPropertiesFromTable(
             CoreLibraryBuilder core,
             NamedTypeSymbol[] typeByRid,
             Dictionary<int, MethodSymbol> methodByRid)
         {
+            var propertyByRid = new Dictionary<int, PropertySymbol>();
+
             if (_md.GetRowCount(MetadataTableKind.Property) == 0)
-                return;
+                return propertyByRid;
 
             // Avoid duplicates
             var existingNames = new Dictionary<NamedTypeSymbol, HashSet<string>>();
@@ -801,7 +1080,7 @@ namespace Cnidaria.Cs
                     propType = get?.ReturnType ?? set!.Parameters[0].Type;
                 }
 
-                core.AddExternalProperty(
+                var prop = core.AddExternalProperty(
                     containingType: declaring,
                     name: pname,
                     type: propType,
@@ -811,8 +1090,43 @@ namespace Cnidaria.Cs
                     setMethod: set,
                     parameters: propParameters);
 
+                propertyByRid[prid] = prop;
                 existing.Add(pname);
             }
+
+            return propertyByRid;
+        }
+        private Dictionary<int, ParameterSymbol> BuildParamMap(Dictionary<int, MethodSymbol> methodByRid)
+        {
+            var map = new Dictionary<int, ParameterSymbol>();
+            int totalParams = _md.GetRowCount(MetadataTableKind.Param);
+
+            if (totalParams == 0)
+                return map;
+
+            for (int mrid = 1; mrid <= _md.GetRowCount(MetadataTableKind.MethodDef); mrid++)
+            {
+                if (!methodByRid.TryGetValue(mrid, out var method))
+                    continue;
+
+                var mrow = _md.GetMethodDef(mrid);
+                if (mrow.ParamList <= 0 || mrow.ParamList > totalParams)
+                    continue;
+
+                var ps = method.Parameters;
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    int prid = mrow.ParamList + i;
+                    if (prid > totalParams)
+                        break;
+
+                    var prow = _md.GetParam(prid);
+                    if (prow.Sequence == (ushort)(i + 1))
+                        map[prid] = ps[i];
+                }
+            }
+
+            return map;
         }
         private void AddPropertiesFromAccessors(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid)
         {
@@ -1069,20 +1383,20 @@ namespace Cnidaria.Cs
             var elem = ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
 
             uint rank = reader.ReadCompressedUInt();
-            uint numSizes = reader.ReadCompressedUInt();
-            for (int i = 0; i < numSizes; i++)
+            uint numSizes = reader.ReadCompressedUInt(); 
+            for (int i = 0; i < numSizes; i++) 
                 _ = reader.ReadCompressedUInt();
 
             uint numLoBounds = reader.ReadCompressedUInt();
-            for (int i = 0; i < numLoBounds; i++)
+            for (int i = 0; i < numLoBounds; i++) 
                 _ = reader.ReadCompressedUInt();
             if (rank == 0)
                 return new ErrorTypeSymbol("array-rank-0", containing: null, locations: ImmutableArray<Location>.Empty);
             return core.CreateArrayType(elem, checked((int)rank));
         }
         private TypeSymbol ResolveTypeDefOrRef(
-            uint encoded,
-            NamedTypeSymbol[] typeByRid,
+            uint encoded, 
+            NamedTypeSymbol[] typeByRid, 
             CoreLibraryBuilder core,
             NamedTypeSymbol? declaringType,
             ImmutableArray<TypeParameterSymbol> methodTypeParameters)
@@ -1238,36 +1552,6 @@ namespace Cnidaria.Cs
 
                 throw new InvalidOperationException("Bad compressed uint.");
             }
-        }
-    }
-    public sealed class MinimalCoreLibProvider : ICoreLibraryProvider
-    {
-        public void Populate(CoreLibraryBuilder core)
-        {
-            core.EnsureNamespace("System");
-
-            core.AddParameterlessInstanceConstructor(core.GetSpecialType(SpecialType.System_Object));
-
-            var console = core.AddClass("System", "Console");
-
-            var @void = core.GetSpecialType(SpecialType.System_Void);
-            var str = core.GetSpecialType(SpecialType.System_String);
-            var @int = core.GetSpecialType(SpecialType.System_Int32);
-
-            core.AddIntrinsicStaticMethod(
-                containingType: console,
-                name: "WriteLine",
-                returnType: @void,
-                parameters: ImmutableArray.Create<(string, TypeSymbol)>(("value", str)),
-                intrinsicName: "System.Console.WriteLine(string)");
-
-            core.AddIntrinsicStaticMethod(
-                containingType: console,
-                name: "WriteLine",
-                returnType: @void,
-                parameters: ImmutableArray.Create<(string, TypeSymbol)>(("value", @int)),
-                intrinsicName: "System.Console.WriteLine(int)");
-
         }
     }
 

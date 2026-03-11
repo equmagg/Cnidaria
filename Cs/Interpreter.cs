@@ -2599,6 +2599,11 @@ namespace Cnidaria.Cs
         }
         private int AllocFrameScratch(int bytes, int align)
         {
+            if (bytes < 0)
+                throw new InvalidOperationException("Negative frame scratch size.");
+            if (align <= 0)
+                throw new InvalidOperationException($"Invalid frame scratch alignment: {align}.");
+
             int baseAbs = ReadI32(_frameBase + 60);
             int spBytes = ReadI32(_frameBase + 64);
 
@@ -2632,7 +2637,7 @@ namespace Cnidaria.Cs
             if (receiver.Kind == SlotKind.Ref || receiver.Kind == SlotKind.Null)
             {
                 if (receiver.Kind == SlotKind.Null)
-                    throw new NullReferenceException();
+                    throw new NullReferenceException($"receiver.Kind for field '{field.Name}' is Null");
 
                 int objAbs = checked((int)receiver.Payload);
                 var actualType = GetObjectTypeFromRef(receiver);
@@ -2661,7 +2666,6 @@ namespace Cnidaria.Cs
                 CheckHeapAccess(fieldAbs, sz, writable);
                 return fieldAbs;
             }
-
             // Value type receiver by address
             if (receiver.Kind == SlotKind.ByRef || receiver.Kind == SlotKind.Ptr)
             {
@@ -3954,8 +3958,8 @@ namespace Cnidaria.Cs
             {
                 ulong ra = unchecked((ulong)a.AsI8Checked());
                 ulong rb = unchecked((ulong)b.AsI8Checked());
-                int res = unchecked((int)(ra / rb));
-                PushSlot(new Slot(SlotKind.I8, res));
+                ulong res = ra / rb;
+                PushSlot(new Slot(SlotKind.I8, unchecked((long)res)));
                 return;
             }
 
@@ -3979,8 +3983,8 @@ namespace Cnidaria.Cs
             {
                 ulong ra = unchecked((ulong)a.AsI8Checked());
                 ulong rb = unchecked((ulong)b.AsI8Checked());
-                int res = unchecked((int)(ra % rb));
-                PushSlot(new Slot(SlotKind.I8, res));
+                ulong res = ra % rb;
+                PushSlot(new Slot(SlotKind.I8, unchecked((long)res)));
                 return;
             }
 
@@ -4590,10 +4594,7 @@ namespace Cnidaria.Cs
         }
         private (int size, int align) GetStorageSizeAlign(RuntimeType t)
         {
-            if (t.IsReferenceType || t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
-                return (RuntimeTypeSystem.PointerSize, RuntimeTypeSystem.PointerSize);
-
-            return (t.SizeOf, t.AlignOf);
+            return _rts.GetStorageSizeAlign(t);
         }
         private RuntimeMethod ResolveVirtualDispatch(RuntimeType receiverType, RuntimeMethod declared)
         {
@@ -5653,13 +5654,13 @@ namespace Cnidaria.Cs
 
                         return true;
                     }
-                    if (p0.Name.Equals("Span`1<Char>", StringComparison.Ordinal))
+                    if (p0.Name.Equals("ReadOnlySpan`1<Char>", StringComparison.Ordinal))
                     {
                         ct.ThrowIfCancellationRequested();
                         var span = PopSlot();
                         if (span.Kind != SlotKind.Value)
                             throw new NotSupportedException(
-                                "Intrinsic System.Console._Write(Span<char>) expects a value type slot.");
+                                "Intrinsic System.Console._Write(ReadOnlySpan<char>) expects a value type slot.");
 
                         var spanType = GetValueSlotType(span);
                         int spanAbs = checked((int)span.Payload);
@@ -5675,14 +5676,14 @@ namespace Cnidaria.Cs
                         if (refField is null || lenField is null)
                         {
                             throw new NotSupportedException(
-                                "Intrinsic System.Console._Write(Span<char>) cannot locate Span fields (_reference/_length).");
+                                "Intrinsic System.Console._Write(ReadOnlySpan<char>) cannot locate Span fields (_reference/_length).");
                         }
                         var byref = LoadValueAsSlot(spanAbs, refField.Offset, refField.FieldType);
                         int len = LoadValueAsSlot(spanAbs, lenField.Offset, lenField.FieldType).AsI4Checked();
                         if (len <= 0)
                             return true;
                         if (byref.Kind == SlotKind.Null)
-                            throw new InvalidOperationException("Span<char> has non-zero length but null reference.");
+                            throw new InvalidOperationException("ReadOnlySpan<char> has non-zero length but null reference.");
                         int charsAbs = GetAddressAbsOrThrow(byref);
                         int bytes = checked(len * 2);
                         if (charsAbs >= _heapBase && charsAbs + bytes <= _heapPtr)

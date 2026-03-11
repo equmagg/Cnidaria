@@ -1,37 +1,4 @@
-﻿namespace CliTools
-{
-    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
-    public sealed class CommandAttribute : Attribute
-    {
-        public CommandAttribute(string value)
-        {
-            Value = value;
-        }
-        public string Value { get; }
-    }
-    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
-    public sealed class ButtonAttribute : Attribute
-    {
-        public ButtonAttribute(string value)
-        {
-            Value = value;
-        }
-        public string Value { get; }
-    }
-    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
-    public sealed class RemainderAttribute : Attribute
-    {
-        public RemainderAttribute() { }
-    }
-}
-namespace System.Text.Json
-{
-    public static class JsonSerializer
-    {
-
-    }
-}
-namespace System.Collections
+﻿namespace System.Collections
 {
     public interface IList : ICollection
     {
@@ -381,7 +348,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator +(Vector2 left, Vector2 right)
@@ -492,7 +459,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator +(Vector3 left, Vector3 right)
@@ -627,7 +594,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}, {W.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}, { W.ToString()}>";
         }
     }
     public struct Matrix3x2

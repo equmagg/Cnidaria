@@ -395,6 +395,35 @@
             ref char r = ref GetPinnableReference();
             return new ReadOnlySpan<char>(ref r, Length);
         }
+        public ReadOnlySpan<char> AsSpan(int start)
+        {
+            int len = Length;
+            if ((uint)start > (uint)len)
+                throw new ArgumentOutOfRangeException("start");
+
+            ref char r = ref GetPinnableReference();
+            return new ReadOnlySpan<char>(
+                ref System.Runtime.CompilerServices.Unsafe.Add<char>(ref r, start),
+                len - start);
+        }
+        public ReadOnlySpan<char> AsSpan(int start, int length)
+        {
+            int len = Length;
+            if ((uint)start > (uint)len)
+                throw new ArgumentOutOfRangeException("start");
+            if ((uint)length > (uint)(len - start))
+                throw new ArgumentOutOfRangeException("length");
+
+            ref char r = ref GetPinnableReference();
+            return new ReadOnlySpan<char>(
+                ref System.Runtime.CompilerServices.Unsafe.Add<char>(ref r, start),
+                length);
+        }
+        public static implicit operator ReadOnlySpan<char>(String? value)
+        {
+            ref char r = ref value.GetPinnableReference();
+            return new ReadOnlySpan<char>(ref r, value.Length);
+        }
         public string Substring(int startIndex) => Substring(startIndex, Length - startIndex);
         public string Substring(int startIndex, int length)
         {
@@ -839,6 +868,12 @@
         public static string Concat(string a, string b, string c, string d)
             => Concat(Concat(a, b), Concat(c, d));
 
+        public static string Join(char separator, string[] value)
+            => Join(separator.ToString(), value);
+
+        public static string Join(char separator, object[] values)
+            => Join(separator.ToString(), values);
+
         public static string Join(string separator, string[] value)
         {
             if ((object)value == null) throw new ArgumentNullException("value");
@@ -934,12 +969,8 @@
             return dstStr;
         }
 
-        public string[] Split(char separator)
-        {
-            return SplitInternal(new ReadOnlySpan<char>(in separator), int.MaxValue, StringSplitOptions.None);
-        }
-
-        public string[] Split(char separator, StringSplitOptions options)
+        
+        public string[] Split(char separator, StringSplitOptions options = StringSplitOptions.None)
         {
             return SplitInternal(new ReadOnlySpan<char>(in separator), int.MaxValue, options);
         }
@@ -952,10 +983,33 @@
         {
             return SplitInternal(new ReadOnlySpan<char>(separator), count, options);
         }
-
         public string[] Split(char[] separator, StringSplitOptions options)
         {
             return SplitInternal(new ReadOnlySpan<char>(separator), int.MaxValue, options);
+        }
+        public string[] Split(char[] separator, int count)
+        {
+            return SplitInternal(separator, count, StringSplitOptions.None);
+        }
+
+        public string[] Split(string? separator, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitInternal(separator ?? Empty, null, int.MaxValue, options);
+        }
+
+        public string[] Split(string? separator, int count, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitInternal(separator ?? Empty, null, count, options);
+        }
+
+        public string[] Split(string[]? separator, StringSplitOptions options)
+        {
+            return SplitInternal(null, separator, int.MaxValue, options);
+        }
+
+        public string[] Split(string[]? separator, int count, StringSplitOptions options)
+        {
+            return SplitInternal(null, separator, count, options);
         }
 
         private static void CheckStringSplitOptions(StringSplitOptions options)
@@ -968,170 +1022,292 @@
             if ((options & ~All) != 0)
                 throw new ArgumentException("options");
         }
-
-        private string[] SplitInternal(ReadOnlySpan<char> separators, int count, StringSplitOptions options)
+        private string[] SplitInternal(string separator, int count, StringSplitOptions options)
         {
-            CheckStringSplitOptions(options);
+            if (count <= 1 || Length == 0)
+            {
+                return CreateSplitArrayOfThisAsSoleValue(options, count);
+            }
 
+            int[] sepListArray = MakeSeparatorList(this, separator, out int sepCount);
+            if (sepCount == 0)
+            {
+                return CreateSplitArrayOfThisAsSoleValue(options, count);
+            }
+
+            ReadOnlySpan<int> sepList = new ReadOnlySpan<int>(sepListArray).Slice(0, sepCount);
+
+            return (options != StringSplitOptions.None)
+                ? SplitWithPostProcessing(sepList, default, separator.Length, count, options)
+                : SplitWithoutPostProcessing(sepList, default, separator.Length, count);
+        }
+        private string[] SplitInternal(string? separator, string?[]? separators, int count, StringSplitOptions options)
+        {
             if (count < 0)
                 throw new ArgumentOutOfRangeException("count");
 
-            if (count == 0)
-                return Array.Empty<string>();
+            CheckStringSplitOptions(options);
 
-            if (count == 1 || Length == 0)
+            bool singleSeparator = separator != null;
+
+            if (!singleSeparator && (separators == null || separators.Length == 0))
+            {
+                // split on whitespace
+                return SplitInternal(default(ReadOnlySpan<char>), count, options);
+            }
+
+        ShortCircuit:
+            if (count <= 1 || Length == 0)
+            {
+                // Per the method's documentation, we'll short-circuit the search for separators.
+                // But we still need to post-process the results based on the caller-provided flags.
                 return CreateSplitArrayOfThisAsSoleValue(options, count);
+            }
 
-            bool trimEntries = (options & StringSplitOptions.TrimEntries) != 0;
-            bool removeEmpty = (options & StringSplitOptions.RemoveEmptyEntries) != 0;
-
-            int len = Length;
-
-            int maxPossible = len + 1;
-            int capacity = (count < maxPossible) ? count : maxPossible;
-
-            string[] results = new string[capacity];
-            int resultCount = 0;
-
-            int start = 0;
-
-            while (resultCount < count - 1)
+            if (singleSeparator)
             {
-                int sepIndex = IndexOfAnySeparator(separators, start);
-                if (sepIndex < 0)
-                    break;
-
-                int segStart = start;
-                int segEnd = sepIndex;
-
-                if (trimEntries)
-                    TrimRange(segStart, segEnd, out segStart, out segEnd);
-
-                if (!removeEmpty || segStart != segEnd)
+                if (separator.Length == 0)
                 {
-                    results[resultCount++] = Substring(segStart, segEnd - segStart);
+                    count = 1;
+                    goto ShortCircuit;
                 }
-
-                start = sepIndex + 1;
-
-                if (removeEmpty && resultCount == count - 1)
+                else
                 {
-                    start = SkipEmptyEntriesBeforeLast(separators, start, trimEntries);
-                    break;
+                    return SplitInternal(separator, count, options);
                 }
             }
 
-            // Last element is the remainder
-            int lastStart = start;
-            int lastEnd = len;
+            int[] sepListArray;
+            int[] lengthListArray;
+            int sepCount;
 
-            if (trimEntries)
-                TrimRange(lastStart, lastEnd, out lastStart, out lastEnd);
+            MakeSeparatorListAny(this, separators, out sepListArray, out lengthListArray, out sepCount);
 
-            if (!removeEmpty || lastStart != lastEnd)
+            ReadOnlySpan<int> sepList = new ReadOnlySpan<int>(sepListArray).Slice(0, sepCount);
+            ReadOnlySpan<int> lengthList = new ReadOnlySpan<int>(lengthListArray).Slice(0, sepCount);
+
+            if (sepList.Length == 0)
             {
-                results[resultCount++] = Substring(lastStart, lastEnd - lastStart);
+                return CreateSplitArrayOfThisAsSoleValue(options, count);
             }
 
-            if (resultCount == results.Length)
-                return results;
+            string[] result = (options != StringSplitOptions.None)
+                ? SplitWithPostProcessing(sepList, lengthList, 0, count, options)
+                : SplitWithoutPostProcessing(sepList, lengthList, 0, count);
 
-            // Shrink to actual length
-            string[] finalArr = new string[resultCount];
-            for (int i = 0; i < resultCount; i++)
-                finalArr[i] = results[i];
-            return finalArr;
+            return result;
         }
-        private int IndexOfAnySeparator(ReadOnlySpan<char> separators, int startIndex)
+        private string[] SplitInternal(ReadOnlySpan<char> separators, int count, StringSplitOptions options)
         {
-            int len = Length;
-            if ((uint)startIndex > (uint)len)
-                throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0)
+                throw new ArgumentOutOfRangeException("count");
 
-            ref char src = ref GetPinnableReference();
+            CheckStringSplitOptions(options);
 
+        ShortCircuit:
+            if (count <= 1 || Length == 0)
+            {
+                // Per the method's documentation, we'll short-circuit the search for separators.
+                // But we still need to post-process the results based on the caller-provided flags.
+                return CreateSplitArrayOfThisAsSoleValue(options, count);
+            }
+
+            if (separators.IsEmpty && count > Length)
+            {
+                // Caller is already splitting on whitespace; no need for separate trim step if the count is sufficient
+                // to examine the whole input.
+                options &= ~StringSplitOptions.TrimEntries;
+            }
+
+            int[] sepListArray = MakeSeparatorListAny(this, separators, out int sepCount);
+            if (sepCount == 0)
+            {
+                count = 1;
+                goto ShortCircuit;
+            }
+
+            ReadOnlySpan<int> sepList = new ReadOnlySpan<int>(sepListArray).Slice(0, sepCount);
+
+            string[] result = (options != StringSplitOptions.None)
+                ? SplitWithPostProcessing(sepList, default, 1, count, options)
+                : SplitWithoutPostProcessing(sepList, default, 1, count);
+
+            return result;
+        }
+        private static bool IsMatchSeparator(char c, ReadOnlySpan<char> separators)
+        {
             if (separators.IsEmpty)
+                return Char.IsWhiteSpace(c);
+
+            for (int i = 0; i < separators.Length; i++)
             {
-                for (int i = startIndex; i < len; i++)
-                {
-                    if (Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i)))
-                        return i;
-                }
-                return -1;
+                if (c == separators[i])
+                    return true;
             }
 
-            if (separators.Length == 1)
-            {
-                return IndexOf(separators[0], startIndex);
-            }
+            return false;
+        }
+        private static int[] MakeSeparatorListAny(string source, ReadOnlySpan<char> separators, out int count)
+        {
+            int len = source.Length;
+            count = 0;
 
-            for (int i = startIndex; i < len; i++)
+            if (len == 0)
+                return Array.Empty<int>();
+
+            ref char src = ref source.GetPinnableReference();
+
+            // count separators
+            for (int i = 0; i < len; i++)
             {
                 char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
-                for (int j = 0; j < separators.Length; j++)
+                if (IsMatchSeparator(c, separators))
+                    count++;
+            }
+
+            if (count == 0)
+                return Array.Empty<int>();
+
+            int[] result = new int[count];
+            int pos = 0;
+
+            // write separator indices
+            for (int i = 0; i < len; i++)
+            {
+                char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
+                if (IsMatchSeparator(c, separators))
+                    result[pos++] = i;
+            }
+
+            return result;
+        }
+        private static bool MatchStringSeparatorAt(string source, int index, string separator)
+        {
+            int sepLen = separator.Length;
+            if (sepLen == 0)
+                return false;
+
+            if (index > source.Length - sepLen)
+                return false;
+
+            for (int i = 0; i < sepLen; i++)
+            {
+                if (source[index + i] != separator[i])
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static int[] MakeSeparatorList(string source, string separator, out int count)
+        {
+            count = 0;
+
+            int sourceLength = source.Length;
+            int sepLen = separator.Length;
+
+            if (sourceLength == 0 || sepLen == 0 || sepLen > sourceLength)
+                return Array.Empty<int>();
+
+            // count non overlapping matches
+            for (int i = 0; i <= sourceLength - sepLen; i++)
+            {
+                if (MatchStringSeparatorAt(source, i, separator))
                 {
-                    if (c == separators[j])
-                        return i;
+                    count++;
+                    i += sepLen - 1;
                 }
             }
 
-            return -1;
-        }
-        private void TrimRange(int start, int end, out int trimmedStart, out int trimmedEnd)
-        {
-            trimmedStart = start;
-            trimmedEnd = end;
+            if (count == 0)
+                return Array.Empty<int>();
 
-            if (start >= end)
+            int[] sepList = new int[count];
+            int pos = 0;
+
+            // record match positions
+            for (int i = 0; i <= sourceLength - sepLen; i++)
+            {
+                if (MatchStringSeparatorAt(source, i, separator))
+                {
+                    sepList[pos++] = i;
+                    i += sepLen - 1;
+                }
+            }
+
+            return sepList;
+        }
+
+        private static bool TryMatchAnySeparatorAt(string source, int index, string?[] separators, out int matchedLength)
+        {
+            for (int s = 0; s < separators.Length; s++)
+            {
+                string sep = separators[s];
+                if ((object)sep == null || sep.Length == 0)
+                    continue;
+
+                if (MatchStringSeparatorAt(source, index, sep))
+                {
+                    matchedLength = sep.Length;
+                    return true;
+                }
+            }
+
+            matchedLength = 0;
+            return false;
+        }
+
+        private static void MakeSeparatorListAny(
+            string source,
+            string?[] separators,
+            out int[] sepList,
+            out int[] lengthList,
+            out int count)
+        {
+            count = 0;
+
+            int sourceLength = source.Length;
+            if (sourceLength == 0)
+            {
+                sepList = Array.Empty<int>();
+                lengthList = Array.Empty<int>();
                 return;
-
-            ref char src = ref GetPinnableReference();
-
-            while (trimmedStart < trimmedEnd &&
-                   Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, trimmedStart)))
-            {
-                trimmedStart++;
             }
 
-            while (trimmedEnd > trimmedStart &&
-                   Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, trimmedEnd - 1)))
+            // count matches
+            for (int i = 0; i < sourceLength; i++)
             {
-                trimmedEnd--;
-            }
-        }
-        private int SkipEmptyEntriesBeforeLast(ReadOnlySpan<char> separators, int startIndex, bool trimEntries)
-        {
-            int len = Length;
-            int start = startIndex;
-
-            while (start < len)
-            {
-                int sepIndex = IndexOfAnySeparator(separators, start);
-                int end = (sepIndex >= 0) ? sepIndex : len;
-
-                int segStart = start;
-                int segEnd = end;
-
-                if (trimEntries)
-                    TrimRange(segStart, segEnd, out segStart, out segEnd);
-
-                if (segStart != segEnd)
-                    break;
-
-                if (sepIndex < 0)
+                if (TryMatchAnySeparatorAt(source, i, separators, out int matchedLength))
                 {
-                    // Only empty till end
-                    start = len;
-                    break;
+                    count++;
+                    i += matchedLength - 1;
                 }
-
-                // Skip this empty entry by moving past the separator
-                start = sepIndex + 1;
             }
 
-            return start;
-        }
+            if (count == 0)
+            {
+                sepList = Array.Empty<int>();
+                lengthList = Array.Empty<int>();
+                return;
+            }
 
+            sepList = new int[count];
+            lengthList = new int[count];
+
+            int pos = 0;
+
+            // record positions and lengths
+            for (int i = 0; i < sourceLength; i++)
+            {
+                if (TryMatchAnySeparatorAt(source, i, separators, out int matchedLength))
+                {
+                    sepList[pos] = i;
+                    lengthList[pos] = matchedLength;
+                    pos++;
+                    i += matchedLength - 1;
+                }
+            }
+        }
         private string[] CreateSplitArrayOfThisAsSoleValue(StringSplitOptions options, int count)
         {
             if (count != 0)
@@ -1150,6 +1326,75 @@
             }
 
             return Array.Empty<string>();
+        }
+        // This function may trim entries or omit empty entries
+        private string[] SplitWithPostProcessing(ReadOnlySpan<int> sepList, ReadOnlySpan<int> lengthList, int defaultLength, int count, StringSplitOptions options)
+        {
+            int numReplaces = sepList.Length;
+
+            // Allocate array to hold items. This array may not be
+            // filled completely in this function, we will create a
+            // new array and copy string references to that new array.
+            int maxItems = (numReplaces < count) ? (numReplaces + 1) : count;
+            string[] splitStrings = new string[maxItems];
+
+            int currIndex = 0;
+            int arrIndex = 0;
+
+            ReadOnlySpan<char> thisEntry;
+
+            for (int i = 0; i < numReplaces; i++)
+            {
+                thisEntry = this.AsSpan(currIndex, sepList[i] - currIndex);
+                if ((options & StringSplitOptions.TrimEntries) != 0)
+                {
+                    thisEntry = thisEntry.Trim();
+                }
+                if (!thisEntry.IsEmpty || ((options & StringSplitOptions.RemoveEmptyEntries) == 0))
+                {
+                    splitStrings[arrIndex++] = thisEntry.ToString();
+                }
+                currIndex = sepList[i] + (lengthList.IsEmpty ? defaultLength : lengthList[i]);
+                if (arrIndex == count - 1)
+                {
+                    // The next iteration of the loop will provide the final entry into the
+                    // results array. If needed, skip over all empty entries before that
+                    // point.
+                    if ((options & StringSplitOptions.RemoveEmptyEntries) != 0)
+                    {
+                        while (++i < numReplaces)
+                        {
+                            thisEntry = this.AsSpan(currIndex, sepList[i] - currIndex);
+                            if ((options & StringSplitOptions.TrimEntries) != 0)
+                            {
+                                thisEntry = thisEntry.Trim();
+                            }
+                            if (!thisEntry.IsEmpty)
+                            {
+                                break; // there's useful data here
+                            }
+                            currIndex = sepList[i] + (lengthList.IsEmpty ? defaultLength : lengthList[i]);
+                        }
+                    }
+                    break;
+                }
+            }
+
+
+            // Handle the last substring at the end of the array
+            // (could be empty if separator appeared at the end of the input string)
+            thisEntry = this.AsSpan(currIndex);
+            if ((options & StringSplitOptions.TrimEntries) != 0)
+            {
+                thisEntry = thisEntry.Trim();
+            }
+            if (!thisEntry.IsEmpty || ((options & StringSplitOptions.RemoveEmptyEntries) == 0))
+            {
+                splitStrings[arrIndex++] = thisEntry.ToString();
+            }
+
+            Array.Resize<string>(ref splitStrings, arrIndex);
+            return splitStrings;
         }
         // This function will not trim entries or special-case empty entries
         private string[] SplitWithoutPostProcessing(ReadOnlySpan<int> sepList, ReadOnlySpan<int> lengthList, int defaultLength, int count)
@@ -1404,20 +1649,33 @@
             }
             return m_value == ((sbyte)obj).m_value;
         }
-        public static sbyte Parse(String str)
+
+        public static sbyte Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             sbyte r;
-            var st = System.Number.TryParseSByte(str, out r);
+            var st = System.Number.TryParseSByte(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out sbyte result)
+        {
+            return System.Number.TryParseSByte(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static sbyte Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out sbyte result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseSByte(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.Int32ToString((int)m_value);
@@ -1445,20 +1703,33 @@
             }
             return m_value == ((byte)obj).m_value;
         }
-        public static byte Parse(String str)
+
+        public static byte Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             byte r;
-            var st = System.Number.TryParseByte(str, out r);
+            var st = System.Number.TryParseByte(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out byte result)
+        {
+            return System.Number.TryParseByte(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static byte Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out byte result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseByte(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.UInt32ToString((uint)m_value);
@@ -1486,20 +1757,33 @@
             }
             return m_value == ((short)obj).m_value;
         }
-        public static short Parse(String str)
+
+        public static short Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             short r;
-            var st = System.Number.TryParseInt16(str, out r);
+            var st = System.Number.TryParseInt16(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out short result)
+        {
+            return System.Number.TryParseInt16(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static short Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out short result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseInt16(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.Int32ToString((int)m_value);
@@ -1527,20 +1811,33 @@
             }
             return m_value == ((ushort)obj).m_value;
         }
-        public static ushort Parse(String str)
+
+        public static ushort Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             ushort r;
-            var st = System.Number.TryParseUInt16(str, out r);
+            var st = System.Number.TryParseUInt16(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out ushort result)
+        {
+            return System.Number.TryParseUInt16(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static ushort Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out ushort result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseUInt16(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.UInt32ToString((uint)m_value);
@@ -1568,20 +1865,33 @@
             }
             return m_value == ((int)obj).m_value;
         }
-        public static int Parse(String str)
+
+        public static int Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             int r;
-            var st = System.Number.TryParseInt32(str, out r);
+            var st = System.Number.TryParseInt32(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out int result)
+        {
+            return System.Number.TryParseInt32(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static int Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out int result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseInt32(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.Int32ToString(m_value);
@@ -1609,20 +1919,33 @@
             }
             return m_value == ((uint)obj).m_value;
         }
-        public static uint Parse(String str)
+
+        public static uint Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             uint r;
-            var st = System.Number.TryParseUInt32(str, out r);
+            var st = System.Number.TryParseUInt32(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out uint result)
+        {
+            return System.Number.TryParseUInt32(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static uint Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out uint result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseUInt32(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.UInt32ToString(m_value);
@@ -1651,20 +1974,33 @@
             }
             return m_value == ((long)obj).m_value;
         }
-        public static long Parse(String str)
+
+        public static long Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             long r;
-            var st = System.Number.TryParseInt64(str, out r);
+            var st = System.Number.TryParseInt64(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out long result)
+        {
+            return System.Number.TryParseInt64(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static long Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out long result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseInt64(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.Int64ToString(m_value);
@@ -1686,20 +2022,32 @@
             return ((int)m_value) ^ (int)(m_value >> 32);
         }
 
-        public static ulong Parse(String str)
+        public static ulong Parse(ReadOnlySpan<char> s)
         {
-            if ((object)str == null) throw new ArgumentNullException("str");
             ulong r;
-            var st = System.Number.TryParseUInt64(str, out r);
+            var st = System.Number.TryParseUInt64(s, out r);
             if (st == System.Number.ParseStatus.OK) return r;
             if (st == System.Number.ParseStatus.Overflow) throw new OverflowException();
             throw new FormatException();
         }
+
+        public static bool TryParse(ReadOnlySpan<char> s, out ulong result)
+        {
+            return System.Number.TryParseUInt64(s, out result) == System.Number.ParseStatus.OK;
+        }
+
+        public static ulong Parse(String str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return Parse(str.AsSpan());
+        }
+
         public static bool TryParse(String str, out ulong result)
         {
             if ((object)str == null) { result = 0; return false; }
-            return System.Number.TryParseUInt64(str, out result) == System.Number.ParseStatus.OK;
+            return TryParse(str.AsSpan(), out result);
         }
+
         public override string ToString()
         {
             return System.Number.UInt64ToString(m_value);
@@ -2141,21 +2489,83 @@
                 i++;
             return i;
         }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int SkipWhiteSpace(ReadOnlySpan<char> s, int i)
+        {
+            int len = s.Length;
+            while (i < len && Char.IsWhiteSpace(s[i]))
+                i++;
+            return i;
+        }
 
         internal static ParseStatus TryParseInt32(string s, out int result)
         {
             result = 0;
             if ((object)s == null) return ParseStatus.Format;
+            return TryParseInt32(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseUInt32(string s, out uint result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseUInt32(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseInt64(string s, out long result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseInt64(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseUInt64(string s, out ulong result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseUInt64(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseInt16(string s, out short result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseInt16(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseUInt16(string s, out ushort result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseUInt16(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseSByte(string s, out sbyte result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseSByte(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseByte(string s, out byte result)
+        {
+            result = 0;
+            if ((object)s == null) return ParseStatus.Format;
+            return TryParseByte(s.AsSpan(), out result);
+        }
+
+        internal static ParseStatus TryParseInt32(ReadOnlySpan<char> s, out int result)
+        {
+            result = 0;
 
             int len = s.Length;
             if (len == 0) return ParseStatus.Format;
 
-            ref char p = ref s.GetPinnableReference();
-            int i = SkipWhiteSpace(ref p, 0, len);
+            int i = SkipWhiteSpace(s, 0);
             if (i >= len) return ParseStatus.Format;
 
             bool neg = false;
-            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            char c = s[i];
             if (c == '+' || c == '-')
             {
                 neg = (c == '-');
@@ -2169,13 +2579,12 @@
 
             while (i < len)
             {
-                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                c = s[i];
                 uint digit = (uint)(c - '0');
                 if (digit > 9u) break;
 
                 any = true;
 
-                // acc = acc * 10 + digit
                 if (acc > (limit - digit) / 10u)
                     return ParseStatus.Overflow;
 
@@ -2185,7 +2594,7 @@
 
             if (!any) return ParseStatus.Format;
 
-            i = SkipWhiteSpace(ref p, i, len);
+            i = SkipWhiteSpace(s, i);
             if (i != len) return ParseStatus.Format;
 
             if (neg)
@@ -2202,19 +2611,18 @@
 
             return ParseStatus.OK;
         }
-        internal static ParseStatus TryParseUInt32(string s, out uint result)
+
+        internal static ParseStatus TryParseUInt32(ReadOnlySpan<char> s, out uint result)
         {
             result = 0;
-            if ((object)s == null) return ParseStatus.Format;
 
             int len = s.Length;
             if (len == 0) return ParseStatus.Format;
 
-            ref char p = ref s.GetPinnableReference();
-            int i = SkipWhiteSpace(ref p, 0, len);
+            int i = SkipWhiteSpace(s, 0);
             if (i >= len) return ParseStatus.Format;
 
-            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            char c = s[i];
             if (c == '+')
             {
                 i++;
@@ -2230,7 +2638,7 @@
 
             while (i < len)
             {
-                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                c = s[i];
                 uint digit = (uint)(c - '0');
                 if (digit > 9u) break;
 
@@ -2245,26 +2653,25 @@
 
             if (!any) return ParseStatus.Format;
 
-            i = SkipWhiteSpace(ref p, i, len);
+            i = SkipWhiteSpace(s, i);
             if (i != len) return ParseStatus.Format;
 
             result = acc;
             return ParseStatus.OK;
         }
-        internal static ParseStatus TryParseInt64(string s, out long result)
+
+        internal static ParseStatus TryParseInt64(ReadOnlySpan<char> s, out long result)
         {
             result = 0;
-            if ((object)s == null) return ParseStatus.Format;
 
             int len = s.Length;
             if (len == 0) return ParseStatus.Format;
 
-            ref char p = ref s.GetPinnableReference();
-            int i = SkipWhiteSpace(ref p, 0, len);
+            int i = SkipWhiteSpace(s, 0);
             if (i >= len) return ParseStatus.Format;
 
             bool neg = false;
-            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            char c = s[i];
             if (c == '+' || c == '-')
             {
                 neg = (c == '-');
@@ -2278,7 +2685,7 @@
 
             while (i < len)
             {
-                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                c = s[i];
                 ulong digit = (ulong)(c - '0');
                 if (digit > 9UL) break;
 
@@ -2293,7 +2700,7 @@
 
             if (!any) return ParseStatus.Format;
 
-            i = SkipWhiteSpace(ref p, i, len);
+            i = SkipWhiteSpace(s, i);
             if (i != len) return ParseStatus.Format;
 
             if (neg)
@@ -2311,19 +2718,17 @@
             return ParseStatus.OK;
         }
 
-        internal static ParseStatus TryParseUInt64(string s, out ulong result)
+        internal static ParseStatus TryParseUInt64(ReadOnlySpan<char> s, out ulong result)
         {
             result = 0;
-            if ((object)s == null) return ParseStatus.Format;
 
             int len = s.Length;
             if (len == 0) return ParseStatus.Format;
 
-            ref char p = ref s.GetPinnableReference();
-            int i = SkipWhiteSpace(ref p, 0, len);
+            int i = SkipWhiteSpace(s, 0);
             if (i >= len) return ParseStatus.Format;
 
-            char c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+            char c = s[i];
             if (c == '+')
             {
                 i++;
@@ -2339,7 +2744,7 @@
 
             while (i < len)
             {
-                c = System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
+                c = s[i];
                 ulong digit = (ulong)(c - '0');
                 if (digit > 9UL) break;
 
@@ -2354,15 +2759,14 @@
 
             if (!any) return ParseStatus.Format;
 
-            i = SkipWhiteSpace(ref p, i, len);
+            i = SkipWhiteSpace(s, i);
             if (i != len) return ParseStatus.Format;
 
             result = acc;
             return ParseStatus.OK;
         }
 
-
-        internal static ParseStatus TryParseInt16(string s, out short result)
+        internal static ParseStatus TryParseInt16(ReadOnlySpan<char> s, out short result)
         {
             result = 0;
             int tmp;
@@ -2372,7 +2776,8 @@
             result = (short)tmp;
             return ParseStatus.OK;
         }
-        internal static ParseStatus TryParseUInt16(string s, out ushort result)
+
+        internal static ParseStatus TryParseUInt16(ReadOnlySpan<char> s, out ushort result)
         {
             result = 0;
             uint tmp;
@@ -2382,7 +2787,8 @@
             result = (ushort)tmp;
             return ParseStatus.OK;
         }
-        internal static ParseStatus TryParseSByte(string s, out sbyte result)
+
+        internal static ParseStatus TryParseSByte(ReadOnlySpan<char> s, out sbyte result)
         {
             result = 0;
             int tmp;
@@ -2392,7 +2798,8 @@
             result = (sbyte)tmp;
             return ParseStatus.OK;
         }
-        internal static ParseStatus TryParseByte(string s, out byte result)
+
+        internal static ParseStatus TryParseByte(ReadOnlySpan<char> s, out byte result)
         {
             result = 0;
             uint tmp;
@@ -2705,7 +3112,7 @@
         public override bool Equals([NotNullWhen(true)] object? obj) => (obj is nint other) && Equals(other);
         public override int GetHashCode()
         {
-            if (Environment.Target64)
+            if (Environment.Target64) 
             {
                 long value = _value;
                 return value.GetHashCode();
@@ -2951,6 +3358,43 @@
             _object = obj;
             _index = start;
             _length = length;
+        }
+    }
+    public static class MemoryExtensions
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ReadOnlySpan<char> Trim(this ReadOnlySpan<char> span)
+        {
+            // Assume that in most cases input doesn't need trimming
+            if (span.Length == 0 ||
+                (!char.IsWhiteSpace(span[0]) && !char.IsWhiteSpace(span[^1])))
+            {
+                return span;
+            }
+            return TrimFallback(span);
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            static ReadOnlySpan<char> TrimFallback(ReadOnlySpan<char> span)
+            {
+                int start = 0;
+                for (; start < span.Length; start++)
+                {
+                    if (!char.IsWhiteSpace(span[start]))
+                    {
+                        break;
+                    }
+                }
+
+                int end = span.Length - 1;
+                for (; end > start; end--)
+                {
+                    if (!char.IsWhiteSpace(span[end]))
+                    {
+                        break;
+                    }
+                }
+                return span.Slice(start, end - start + 1);
+            }
         }
     }
 
@@ -4552,7 +4996,7 @@
             }
         }
         public static unsafe void Write(char* value) { _Write(value); }
-        public static void Write(Span<char> value) { _Write(value); }
+        public static void Write(ReadOnlySpan<char> value) { _Write(value); }
         public static void Write(string value) { _Write(value); }
         public static void Write(object value) { _Write(value.ToString()); }
 
@@ -4569,7 +5013,7 @@
         public static void WriteLine(float value) { Write(value); Write('\n'); }
         public static void WriteLine(double value) { Write(value); Write('\n'); }
         public static void WriteLine(string value) { Write(value); Write('\n'); }
-        public static void WriteLine(Span<char> value) { Write(value); Write('\n'); }
+        public static void WriteLine(ReadOnlySpan<char> value) { Write(value); Write('\n'); }
         public static unsafe void WriteLine(char* value) { Write(value); Write('\n'); }
         public static void WriteLine(object value)
         {
@@ -4596,7 +5040,7 @@
         private static void _Write(string value) { }
         [RuntimeIntrinsic]
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void _Write(Span<char> value) { }
+        private static void _Write(ReadOnlySpan<char> value) { }
     }
 
     public unsafe class Buffer
