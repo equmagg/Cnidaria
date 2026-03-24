@@ -987,6 +987,14 @@ namespace Cnidaria.Cs
             if (IsTypeDeclarationKeyword(_tokens.CurrentKind))
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
 
+            // destructor
+            if (IsDestructorDeclarationStart(classNameToken))
+            {
+                var tilde = MatchToken(SyntaxKind.TildeToken);
+                var id2 = MatchToken(SyntaxKind.IdentifierToken);
+                return ParseDestructorDeclarationAfterHeader(attrs, modifiers, tilde, id2);
+            }
+
             // constructor
             if (IsConstructorDeclarationStart(classNameToken))
             {
@@ -1319,6 +1327,26 @@ namespace Cnidaria.Cs
             ParseMemberBody(out body, out exprBody, out semi);
 
             return new ConstructorDeclarationSyntax(attributeLists, modifiers, id, parameters, init, body, exprBody, semi);
+        }
+
+        private DestructorDeclarationSyntax ParseDestructorDeclarationAfterHeader(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken tildeToken,
+            SyntaxToken id)
+        {
+            var parameters = ParseParameterList();
+
+            BlockSyntax? body = null;
+            ArrowExpressionClauseSyntax? exprBody = null;
+            SyntaxToken semi = default;
+
+            var features = GetMethodLikeBodyParseContext(modifiers, allowAsync: false);
+            using var __ = _ctx.Push(features);
+
+            ParseMemberBody(out body, out exprBody, out semi);
+
+            return new DestructorDeclarationSyntax(attributeLists, modifiers, tildeToken, id, parameters, body, exprBody, semi);
         }
         private void ParseMemberBody(
             out BlockSyntax? body,
@@ -2775,11 +2803,25 @@ namespace Cnidaria.Cs
 
             EqualsValueClauseSyntax? init = null;
             if (_tokens.CurrentKind == SyntaxKind.EqualsToken)
-                init = ParseEqualsValueClause();
+                init = ParseVariableEqualsValueClause();
 
             return new VariableDeclaratorSyntax(id, args, init);
         }
+        private EqualsValueClauseSyntax ParseVariableEqualsValueClause()
+        {
+            var eq = MatchToken(SyntaxKind.EqualsToken);
 
+            ExpressionSyntax value;
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+            {
+                value = ParseInitializerExpression(SyntaxKind.ArrayInitializerExpression);
+            }
+            else
+            {
+                value = ParseExpression();
+            }
+            return new EqualsValueClauseSyntax(eq, value);
+        }
         private EqualsValueClauseSyntax ParseEqualsValueClause()
         {
             var eq = MatchToken(SyntaxKind.EqualsToken);
@@ -2841,6 +2883,144 @@ namespace Cnidaria.Cs
             }
             var gt = EatGreaterThanTokenForTypeArgs(); // handles >, >>, >>>
             return new TypeArgumentListSyntax(lt, new SeparatedSyntaxList<TypeSyntax>(args.ToArray()), gt);
+        }
+
+        private FunctionPointerTypeSyntax ParseFunctionPointerType()
+        {
+            var delegateKeyword = MatchToken(SyntaxKind.DelegateKeyword);
+            var asteriskToken = MatchToken(SyntaxKind.AsteriskToken);
+
+            FunctionPointerCallingConventionSyntax? callingConvention = null;
+            if (IsCurrentContextual(SyntaxKind.ManagedKeyword) || IsCurrentContextual(SyntaxKind.UnmanagedKeyword))
+                callingConvention = ParseFunctionPointerCallingConvention();
+
+            var parameterList = ParseFunctionPointerParameterList();
+            return new FunctionPointerTypeSyntax(delegateKeyword, asteriskToken, callingConvention, parameterList);
+        }
+
+        private FunctionPointerParameterListSyntax ParseFunctionPointerParameterList()
+        {
+            var lessThanToken = MatchToken(SyntaxKind.LessThanToken);
+            var parameters = ParseSeparatedFunctionPointerParameters();
+            var greaterThanToken = EatGreaterThanTokenForTypeArgs();
+            return new FunctionPointerParameterListSyntax(lessThanToken, parameters, greaterThanToken);
+        }
+
+        private SeparatedSyntaxList<FunctionPointerParameterSyntax> ParseSeparatedFunctionPointerParameters()
+        {
+            var list = new List<SyntaxNodeOrToken>();
+
+            if (_tokens.CurrentKind == SyntaxKind.GreaterThanToken ||
+                _tokens.CurrentKind == SyntaxKind.GreaterThanGreaterThanToken ||
+                _tokens.CurrentKind == SyntaxKind.GreaterThanGreaterThanGreaterThanToken)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start, "Function pointer parameter list cannot be empty."));
+                var missingType = (TypeSyntax)CreateMissingIdentifierName(_tokens.Current.Span.Start);
+                list.Add(new SyntaxNodeOrToken(new FunctionPointerParameterSyntax(
+                    SyntaxList<AttributeListSyntax>.Empty,
+                    SyntaxTokenList.Empty,
+                    missingType)));
+                return new SeparatedSyntaxList<FunctionPointerParameterSyntax>(list.ToArray());
+            }
+
+            while (_tokens.CurrentKind != SyntaxKind.GreaterThanToken &&
+                   _tokens.CurrentKind != SyntaxKind.GreaterThanGreaterThanToken &&
+                   _tokens.CurrentKind != SyntaxKind.GreaterThanGreaterThanGreaterThanToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                var start = _tokens.Position;
+
+                var parameter = ParseFunctionPointerParameter();
+                list.Add(new SyntaxNodeOrToken(parameter));
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    continue;
+                }
+
+                if (_tokens.Position == start)
+                    EatAsSkippedToken("Parser made no progress in function pointer parameter parsing.");
+
+                break;
+            }
+
+            return new SeparatedSyntaxList<FunctionPointerParameterSyntax>(list.ToArray());
+        }
+
+        private FunctionPointerParameterSyntax ParseFunctionPointerParameter()
+        {
+            var attributeLists = ParseAttributeLists();
+            var modifiers = ParseModifiers(ModifierContext.Parameter);
+            var type = ParseType();
+            return new FunctionPointerParameterSyntax(attributeLists, modifiers, type);
+        }
+
+        private FunctionPointerCallingConventionSyntax ParseFunctionPointerCallingConvention()
+        {
+            SyntaxToken managedOrUnmanagedKeyword;
+            FunctionPointerUnmanagedCallingConventionListSyntax? unmanagedCallingConventionList = null;
+
+            if (IsCurrentContextual(SyntaxKind.ManagedKeyword))
+            {
+                managedOrUnmanagedKeyword = MatchContextualKeyword(SyntaxKind.ManagedKeyword);
+            }
+            else
+            {
+                managedOrUnmanagedKeyword = MatchContextualKeyword(SyntaxKind.UnmanagedKeyword);
+                if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+                    unmanagedCallingConventionList = ParseFunctionPointerUnmanagedCallingConventionList();
+            }
+
+            return new FunctionPointerCallingConventionSyntax(managedOrUnmanagedKeyword, unmanagedCallingConventionList);
+        }
+
+        private FunctionPointerUnmanagedCallingConventionListSyntax ParseFunctionPointerUnmanagedCallingConventionList()
+        {
+            var openBracketToken = MatchToken(SyntaxKind.OpenBracketToken);
+            var callingConventions = ParseSeparatedFunctionPointerUnmanagedCallingConventions();
+            var closeBracketToken = MatchToken(SyntaxKind.CloseBracketToken);
+            return new FunctionPointerUnmanagedCallingConventionListSyntax(openBracketToken, callingConventions, closeBracketToken);
+        }
+
+        private SeparatedSyntaxList<FunctionPointerUnmanagedCallingConventionSyntax> ParseSeparatedFunctionPointerUnmanagedCallingConventions()
+        {
+            var list = new List<SyntaxNodeOrToken>();
+
+            if (_tokens.CurrentKind == SyntaxKind.CloseBracketToken)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start, "Function pointer unmanaged calling convention list cannot be empty."));
+                list.Add(new SyntaxNodeOrToken(new FunctionPointerUnmanagedCallingConventionSyntax(
+                    CreateMissingToken(SyntaxKind.IdentifierToken, _tokens.Current.Span.Start))));
+                return new SeparatedSyntaxList<FunctionPointerUnmanagedCallingConventionSyntax>(list.ToArray());
+            }
+
+            while (_tokens.CurrentKind != SyntaxKind.CloseBracketToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                var start = _tokens.Position;
+
+                list.Add(new SyntaxNodeOrToken(ParseFunctionPointerUnmanagedCallingConvention()));
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    continue;
+                }
+
+                if (_tokens.Position == start)
+                    EatAsSkippedToken("Parser made no progress in function pointer unmanaged calling convention parsing.");
+
+                break;
+            }
+
+            return new SeparatedSyntaxList<FunctionPointerUnmanagedCallingConventionSyntax>(list.ToArray());
+        }
+
+        private FunctionPointerUnmanagedCallingConventionSyntax ParseFunctionPointerUnmanagedCallingConvention()
+        {
+            var name = MatchToken(SyntaxKind.IdentifierToken);
+            return new FunctionPointerUnmanagedCallingConventionSyntax(name);
         }
         private bool TryEatGreaterThanTokenForTypeArgs()
         {
@@ -3018,6 +3198,9 @@ namespace Cnidaria.Cs
         }
         private bool ScanType()
         {
+            if (_tokens.Current.Kind == SyntaxKind.DelegateKeyword && _tokens.Peek(1).Kind == SyntaxKind.AsteriskToken)
+                return ScanFunctionPointerType();
+
             // ref type
             if (_tokens.Current.Kind == SyntaxKind.RefKeyword)
             {
@@ -3081,6 +3264,73 @@ namespace Cnidaria.Cs
 
             return true;
         }
+
+        private bool ScanFunctionPointerType()
+        {
+            if (_tokens.Current.Kind != SyntaxKind.DelegateKeyword || _tokens.Peek(1).Kind != SyntaxKind.AsteriskToken)
+                return false;
+
+            _tokens.EatToken(); // delegate
+            _tokens.EatToken(); // *
+
+            if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
+                (_tokens.Current.ContextualKind == SyntaxKind.ManagedKeyword ||
+                 _tokens.Current.ContextualKind == SyntaxKind.UnmanagedKeyword))
+            {
+                var callingConventionKind = _tokens.Current.ContextualKind;
+                _tokens.EatToken();
+
+                if (callingConventionKind == SyntaxKind.UnmanagedKeyword && _tokens.Current.Kind == SyntaxKind.OpenBracketToken)
+                {
+                    _tokens.EatToken(); // '['
+
+                    if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
+                        return false;
+
+                    _tokens.EatToken();
+
+                    while (_tokens.Current.Kind == SyntaxKind.CommaToken)
+                    {
+                        _tokens.EatToken();
+                        if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
+                            return false;
+
+                        _tokens.EatToken();
+                    }
+
+                    if (_tokens.Current.Kind != SyntaxKind.CloseBracketToken)
+                        return false;
+
+                    _tokens.EatToken(); // ']'
+                }
+            }
+
+            if (_tokens.Current.Kind != SyntaxKind.LessThanToken)
+                return false;
+
+            _tokens.EatToken(); // '<'
+
+            if (!ScanFunctionPointerParameter())
+                return false;
+
+            while (_tokens.Current.Kind == SyntaxKind.CommaToken)
+            {
+                _tokens.EatToken();
+                if (!ScanFunctionPointerParameter())
+                    return false;
+            }
+
+            return TryEatGreaterThanTokenForTypeArgs();
+        }
+
+        private bool ScanFunctionPointerParameter()
+        {
+            while (IsModifierToken(_tokens.Current, ModifierContext.Parameter))
+                _tokens.EatToken();
+
+            return ScanType();
+        }
+
         private bool ScanTupleTypeCore()
         {
             if (_tokens.Current.Kind != SyntaxKind.OpenParenToken)
@@ -3160,6 +3410,9 @@ namespace Cnidaria.Cs
         }
         private TypeSyntax ParseTypeCore()
         {
+            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword && _tokens.Peek(1).Kind == SyntaxKind.AsteriskToken)
+                return ParseFunctionPointerType();
+
             if (_tokens.CurrentKind == SyntaxKind.RefKeyword)
             {
                 var refKeyword = _tokens.EatToken();
@@ -3365,6 +3618,8 @@ namespace Cnidaria.Cs
                 var operand = ParseUnaryExpression();
                 return new AwaitExpressionSyntax(awaitKeyword, operand);
             }
+            if (_tokens.CurrentKind == SyntaxKind.RefKeyword)
+                return ParseRefExpression();
 
             if (TryParseCastExpression(out var castExpr))
                 return castExpr;
@@ -3380,7 +3635,12 @@ namespace Cnidaria.Cs
             }
             // postfix unary
             return ParsePostfixExpression();
-
+        }
+        private RefExpressionSyntax ParseRefExpression()
+        {
+            var refKeyword = MatchToken(SyntaxKind.RefKeyword);
+            var expression = ParseUnaryExpression();
+            return new RefExpressionSyntax(refKeyword, expression);
         }
         private ThrowExpressionSyntax ParseThrowExpression()
         {
@@ -4059,13 +4319,27 @@ namespace Cnidaria.Cs
 
             var list = new List<SyntaxNodeOrToken>();
             while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
-           _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+                _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
             {
-                list.Add(new SyntaxNodeOrToken(ParseExpression()));
+                ExpressionSyntax element;
+
+                if (kind == SyntaxKind.ArrayInitializerExpression &&
+                    _tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                {
+                    element = ParseInitializerExpression(SyntaxKind.ArrayInitializerExpression);
+                }
+                else
+                {
+                    element = ParseExpression();
+                }
+
+                list.Add(new SyntaxNodeOrToken(element));
 
                 if (_tokens.CurrentKind == SyntaxKind.CommaToken)
                 {
                     list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
+                        break;
                     continue;
                 }
 
@@ -4669,6 +4943,21 @@ namespace Cnidaria.Cs
             return _tokens.Peek(1).Kind == SyntaxKind.OpenParenToken;
         }
 
+        private bool IsDestructorDeclarationStart(SyntaxToken typeNameToken)
+        {
+            if (_tokens.CurrentKind != SyntaxKind.TildeToken)
+                return false;
+
+            var t1 = _tokens.Peek(1);
+            if (t1.Kind != SyntaxKind.IdentifierToken)
+                return false;
+
+            if (!string.Equals(t1.ValueText, typeNameToken.ValueText, StringComparison.Ordinal))
+                return false;
+
+            return _tokens.Peek(2).Kind == SyntaxKind.OpenParenToken;
+        }
+
         private static bool ContainsGenericName(SyntaxNode node)
         {
             if (node is GenericNameSyntax) return true;
@@ -4680,6 +4969,7 @@ namespace Cnidaria.Cs
                 ArrayTypeSyntax a => ContainsGenericName(a.ElementType),
                 PointerTypeSyntax p => ContainsGenericName(p.ElementType),
                 RefTypeSyntax r => ContainsGenericName(r.Type),
+                FunctionPointerTypeSyntax f => ContainsGenericNameInFunctionPointerType(f),
                 TupleTypeSyntax t => ContainsGenericNameInTupleType(t),
                 _ => false
             };
@@ -4693,6 +4983,17 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+
+        private static bool ContainsGenericNameInFunctionPointerType(FunctionPointerTypeSyntax t)
+        {
+            for (int i = 0; i < t.ParameterList.Parameters.Count; i++)
+            {
+                if (ContainsGenericName(t.ParameterList.Parameters[i].Type))
+                    return true;
+            }
+
+            return false;
+        }
         private static bool TypeDefinitelyNotExpression(TypeSyntax t)
         {
             if (t is PredefinedTypeSyntax) return true;
@@ -4700,6 +5001,7 @@ namespace Cnidaria.Cs
             if (t is ArrayTypeSyntax) return true;
             if (t is RefTypeSyntax) return true;
             if (t is PointerTypeSyntax) return true;
+            if (t is FunctionPointerTypeSyntax) return true;
 
             if (ContainsGenericName(t)) return true;
 
@@ -4982,7 +5284,6 @@ namespace Cnidaria.Cs
             SyntaxKind.CaretToken => SyntaxKind.IndexExpression,
             SyntaxKind.AmpersandToken => SyntaxKind.AddressOfExpression,
             SyntaxKind.AsteriskToken => SyntaxKind.PointerIndirectionExpression,
-            SyntaxKind.RefKeyword => SyntaxKind.RefExpression,
             _ => SyntaxKind.UnaryPlusExpression
         };
 

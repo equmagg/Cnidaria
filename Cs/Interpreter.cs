@@ -70,7 +70,7 @@ namespace Cnidaria.Cs
         private readonly struct PendingCtorResult
         {
             public readonly PendingCtorResultKind Kind;
-            public readonly long Payload;
+            public readonly long Payload;      
             public readonly RuntimeType? Type;
 
             public PendingCtorResult(PendingCtorResultKind kind, long payload, RuntimeType? type)
@@ -371,10 +371,10 @@ namespace Cnidaria.Cs
         // 72: runtimeMethodId (0 if unresolved)
         private const int FrameHeaderSize = 76;
         public void Execute(
-            RuntimeModule entryModule,
-            BytecodeFunction entry,
-            CancellationToken ct,
-            ExecutionLimits limits,
+            RuntimeModule entryModule, 
+            BytecodeFunction entry, 
+            CancellationToken ct, 
+            ExecutionLimits limits, 
             ReadOnlySpan<Slot> initialArgs = default)
         {
             if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
@@ -1288,11 +1288,11 @@ namespace Cnidaria.Cs
             }
 
             _gcRunning = true;
-            SpillCurrentFrameHotState();
-            CollectGarbage();
-            _allocDebtBytes = 0;
-            _gcRequested = false;
-            RecomputeGcThresholds();
+                SpillCurrentFrameHotState();
+                CollectGarbage();
+                _allocDebtBytes = 0;
+                _gcRequested = false;
+                RecomputeGcThresholds();
             // no try finally for better inlining, since GC failure is fatal
             _gcRunning = false;
         }
@@ -2060,21 +2060,38 @@ namespace Cnidaria.Cs
         }
         private void ExecBox(RuntimeModule mod, int typeToken)
         {
-            var valueType = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            var boxedType = ResolveTypeTokenInCurrentMethod(mod, typeToken);
             var value = PopSlot();
 
-            if (!valueType.IsValueType)
-                throw new InvalidOperationException($"box expects value type, got '{valueType.Namespace}.{valueType.Name}'.");
+            if (!boxedType.IsValueType)
+            {
+                // Generic instantiation case
+                if (boxedType.IsReferenceType)
+                {
+                    if (value.Kind is SlotKind.Ref or SlotKind.Null)
+                    {
+                        PushSlot(value);
+                        return;
+                    }
 
-            // C# nullable boxing semantics
-            if (TryGetNullableInfo(valueType, out var nullableUnderlying, out var hasValueField, out var nullableValueField))
+                    throw new InvalidOperationException(
+                        $"box of reference type expects ref/null slot, got {value.Kind} for '{boxedType.Namespace}.{boxedType.Name}'.");
+                }
+
+                throw new InvalidOperationException(
+                    $"box expects value type or instantiated reference type, got '{boxedType.Namespace}.{boxedType.Name}'.");
+            }
+
+            // nullable boxing
+            if (TryGetNullableInfo(boxedType, out var nullableUnderlying, out var hasValueField, out var nullableValueField))
             {
                 if (value.Kind != SlotKind.Value)
                     throw new InvalidOperationException($"Nullable boxing expects struct value slot, got {value.Kind}.");
 
                 var slotType = GetValueSlotType(value);
-                if (slotType.TypeId != valueType.TypeId)
-                    throw new InvalidOperationException($"Nullable boxing type mismatch: slot={slotType.Name}, token={valueType.Name}.");
+                if (slotType.TypeId != boxedType.TypeId)
+                    throw new InvalidOperationException(
+                        $"Nullable boxing type mismatch: slot={slotType.Name}, token={boxedType.Name}.");
 
                 int srcAbs = checked((int)value.Payload);
 
@@ -2094,10 +2111,11 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            int boxedAbs = AllocBoxedValueObject(valueType);
+            int boxedAbs = AllocBoxedValueObject(boxedType);
             int payloadAbs = GetBoxedValuePayloadAbs(boxedAbs);
-            StoreSlotAsValue(payloadAbs, 0, valueType, value);
+            StoreSlotAsValue(payloadAbs, 0, boxedType, value);
             PushSlot(new Slot(SlotKind.Ref, boxedAbs));
+
         }
         private void ExecUnboxAny(RuntimeModule mod, int typeToken)
         {
@@ -2408,7 +2426,7 @@ namespace Cnidaria.Cs
             else
                 PushSlot(new Slot(SlotKind.I4, unchecked((int)diffElems)));
         }
-
+       
         private void ExecLdobj(RuntimeModule mod, int typeToken)
         {
             var a = PopSlot();
@@ -2595,7 +2613,7 @@ namespace Cnidaria.Cs
 
                 _pendingCtorResults[_frameBase] = PendingCtorResult.ForValue(vt, tempAbs);
             }
-
+            
         }
         private int AllocFrameScratch(int bytes, int align)
         {
@@ -3336,7 +3354,7 @@ namespace Cnidaria.Cs
 
             if (hostEx is OverflowException)
                 return TryCreateCoreException("System", "DivideByZeroException", msg, out vmEx)
-                    || TryCreateCoreException("System", "ArithmeticException", msg, out vmEx)
+                    || TryCreateCoreException("System", "ArithmeticException", msg,out vmEx)
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
             return false;
@@ -3896,7 +3914,7 @@ namespace Cnidaria.Cs
             CheckActiveStackAccess(abs, size, writable);
         }
         private static int AlignUp(int v, int a) => (v + (a - 1)) & ~(a - 1);
-
+        
         private void ExecNeg()
         {
             var v = PopSlot();
@@ -4636,7 +4654,7 @@ namespace Cnidaria.Cs
             static bool SameSig(RuntimeMethod a, RuntimeMethod b)
             {
                 if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
-                if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
+                if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false; 
                 if (a.GenericArity != b.GenericArity) return false;
                 for (int i = 0; i < a.ParameterTypes.Length; i++)
                     if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
@@ -4912,7 +4930,7 @@ namespace Cnidaria.Cs
                 "Int32" or "UInt32" => FastCellKind.I4,
                 "Int64" or "UInt64" => FastCellKind.I8,
                 "Double" => FastCellKind.R8,
-                "IntPtr" or "UIntPtr" => RuntimeTypeSystem.PointerSize == 8
+                "IntPtr" or "UIntPtr" => RuntimeTypeSystem.PointerSize == 8 
                                             ? FastCellKind.I8 : FastCellKind.I4,
                 _ => FastCellKind.None
             };
@@ -5023,7 +5041,7 @@ namespace Cnidaria.Cs
 
             return t.InstanceFields.Length > 0 ? t.InstanceFields[0].FieldType : null;
         }
-        private static bool IsVoidReturn(RuntimeType t)
+        private static bool IsVoidReturn(RuntimeType t) 
             => t.Namespace == "System" && t.Name == "Void";
 
         private Slot NormalizeReturnValue(RuntimeType t, VmValue v)
@@ -5253,17 +5271,17 @@ namespace Cnidaria.Cs
 
                     return true;
                 }
-                // private static bool _CopyImpl(Array, int, Array, int, int)
-                if (!rm.HasThis &&
-                rm.Name == "CopyInternal" &&
-                rm.ParameterTypes.Length == 5 &&
-                totalArgs == 5 &&
-                rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
-                rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
-                rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
-                rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
-                rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
-                rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
+                    // private static bool _CopyImpl(Array, int, Array, int, int)
+                    if (!rm.HasThis &&
+                    rm.Name == "CopyInternal" &&
+                    rm.ParameterTypes.Length == 5 &&
+                    totalArgs == 5 &&
+                    rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
+                    rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
+                    rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
+                    rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
+                    rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
+                    rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
                 {
                     int length = PopSlot().AsI4Checked();
                     int dstIndex = PopSlot().AsI4Checked();

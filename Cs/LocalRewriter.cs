@@ -632,7 +632,8 @@ namespace Cnidaria.Cs
             var value = RewriteExpression(node.Value);
 
             if (!ReferenceEquals(left, node.Left) || !ReferenceEquals(value, node.Value))
-                return new BoundCompoundAssignmentExpression(node.Syntax, left, node.OperatorKind, value, node.IsChecked);
+                return new BoundCompoundAssignmentExpression(node.Syntax, left, node.OperatorKind, value,
+                    node.OperatorMethodOpt, node.UsesDirectOperator, node.IsChecked);
 
             return node;
         }
@@ -663,6 +664,8 @@ namespace Cnidaria.Cs
                     value,
                     node.IsIncrement,
                     node.IsPostfix,
+                    node.OperatorMethodOpt,
+                    node.UsesDirectOperator,
                     node.IsChecked);
             }
 
@@ -1584,25 +1587,6 @@ namespace Cnidaria.Cs
                 }
                 throw new InvalidOperationException($"Field '{fieldName}' not found in '{type.Name}'.");
             }
-            private BoundExpression MakeFieldAccess(
-                ExpressionSyntax syntax,
-                BoundExpression receiver,
-                NamedTypeSymbol receiverType,
-                string fieldName,
-                bool isLValue,
-                TypeSymbol? viewTypeOverride = null)
-            {
-                var members = receiverType.GetMembers();
-                for (int i = 0; i < members.Length; i++)
-                {
-                    if (members[i] is FieldSymbol f && string.Equals(f.Name, fieldName, StringComparison.Ordinal))
-                    {
-                        var viewType = viewTypeOverride ?? f.Type;
-                        return new BoundMemberAccessExpression(syntax, receiver, f, viewType, isLValue);
-                    }
-                }
-                throw new InvalidOperationException($"Field '{fieldName}' not found in '{receiverType.Name}'.");
-            }
             protected override BoundStatement RewriteExpressionStatement(BoundExpressionStatement node)
             {
                 if (node.Expression is BoundIncrementDecrementExpression ide && ide.IsPostfix)
@@ -1614,6 +1598,8 @@ namespace Cnidaria.Cs
                         ide.Value,
                         ide.IsIncrement,
                         isPostfix: false,
+                        ide.OperatorMethodOpt,
+                        ide.UsesDirectOperator,
                         ide.IsChecked);
 
                     var rewritten = RewriteExpression(noResult);
@@ -3046,6 +3032,15 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteIncrementDecrementExpression(BoundIncrementDecrementExpression node)
             {
+                if (node.UsesDirectOperator)
+                {
+                    var rewrittenTarget = RewriteExpression(node.Target);
+
+                    if (rewrittenTarget is BoundLocalExpression || rewrittenTarget is BoundParameterExpression)
+                        return LowerSimpleDirectIncrementDecrement(node, rewrittenTarget);
+
+                    return LowerDirectIncrementDecrementWithSpill(node, rewrittenTarget);
+                }
                 if (node.Target is BoundIndexerAccessExpression leftIndexer &&
                     leftIndexer.Indexer.GetMethod is MethodSymbol indexerGetMethod &&
                     leftIndexer.Indexer.SetMethod is MethodSymbol indexerSetMethod)
@@ -3061,15 +3056,153 @@ namespace Cnidaria.Cs
                     return LowerPropertyIncrementDecrement(node, leftProp, getMethod, setMethod);
                 }
 
-                var rewrittenTarget = RewriteExpression(node.Target);
+                {
+                    var rewrittenTarget = RewriteExpression(node.Target);
 
-                if (rewrittenTarget is BoundLocalExpression || rewrittenTarget is BoundParameterExpression)
-                    return LowerSimpleIncrementDecrement(node, rewrittenTarget);
+                    if (rewrittenTarget is BoundLocalExpression || rewrittenTarget is BoundParameterExpression)
+                        return LowerSimpleIncrementDecrement(node, rewrittenTarget);
 
-                return LowerIncrementDecrementWithSpill(node, rewrittenTarget);
+                    return LowerIncrementDecrementWithSpill(node, rewrittenTarget);
+                }
+
+            }
+            private BoundExpression LowerSimpleDirectIncrementDecrement(
+                BoundIncrementDecrementExpression node,
+                BoundExpression rewrittenTarget)
+            {
+                if (node.IsPostfix)
+                    throw new NotSupportedException("Postfix direct increment/decrement should have been rewritten to discarded form.");
+
+                var directCall = RewriteExpression(ReplaceExpressionByReference(node.Value, node.Target, rewrittenTarget));
+
+                return new BoundSequenceExpression(
+                    node.Syntax,
+                    ImmutableArray<LocalSymbol>.Empty,
+                    ImmutableArray.Create<BoundStatement>(
+                        new BoundExpressionStatement(node.Syntax, directCall)),
+                    rewrittenTarget);
+            }
+            private BoundExpression LowerDirectIncrementDecrementWithSpill(
+                BoundIncrementDecrementExpression node,
+                BoundExpression rewrittenTarget)
+            {
+                if (node.IsPostfix)
+                    throw new NotSupportedException("Postfix direct increment/decrement should have been rewritten to discarded form.");
+
+                var localsBuilder = ImmutableArray.CreateBuilder<LocalSymbol>();
+                var sideEffectsBuilder = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                BoundExpression lvalue;
+
+                switch (rewrittenTarget)
+                {
+                    case BoundPointerIndirectionExpression ind:
+                        {
+                            var ptrTemp = CreateTempLocal(ind.Operand.Type);
+                            localsBuilder.Add(ptrTemp);
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, ptrTemp),
+                                        ind.Operand)));
+
+                            lvalue = new BoundPointerIndirectionExpression(
+                                node.Syntax,
+                                ind.Type,
+                                new BoundLocalExpression(node.Syntax, ptrTemp));
+                            break;
+                        }
+
+                    case BoundPointerElementAccessExpression pea:
+                        {
+                            var ptrTemp = CreateTempLocal(pea.Expression.Type);
+                            var idxTemp = CreateTempLocal(pea.Index.Type);
+
+                            localsBuilder.Add(ptrTemp);
+                            localsBuilder.Add(idxTemp);
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, ptrTemp),
+                                        pea.Expression)));
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, idxTemp),
+                                        pea.Index)));
+
+                            lvalue = new BoundPointerElementAccessExpression(
+                                node.Syntax,
+                                pea.Type,
+                                new BoundLocalExpression(node.Syntax, ptrTemp),
+                                new BoundLocalExpression(node.Syntax, idxTemp));
+                            break;
+                        }
+
+                    case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
+                        {
+                            BoundExpression? receiver = ma.ReceiverOpt;
+                            if (receiver is not null && !IsSimpleReceiver(receiver))
+                            {
+                                var receiverTemp = CreateTempLocal(receiver.Type);
+                                localsBuilder.Add(receiverTemp);
+
+                                sideEffectsBuilder.Add(
+                                    new BoundExpressionStatement(
+                                        node.Syntax,
+                                        new BoundAssignmentExpression(
+                                            node.Syntax,
+                                            new BoundLocalExpression(node.Syntax, receiverTemp),
+                                            receiver)));
+
+                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
+                            }
+
+                            lvalue = new BoundMemberAccessExpression(
+                                (ExpressionSyntax)node.Syntax,
+                                receiver,
+                                fs,
+                                fs.Type,
+                                isLValue: true,
+                                constantValueOpt: Optional<object>.None);
+                            break;
+                        }
+
+                    default:
+                        throw new NotSupportedException(
+                            $"Direct increment/decrement lowering for lvalue '{rewrittenTarget.GetType().Name}' is not implemented.");
+                }
+
+                var directCall = RewriteExpression(ReplaceExpressionByReference(node.Value, node.Target, lvalue));
+                sideEffectsBuilder.Add(new BoundExpressionStatement(node.Syntax, directCall));
+
+                return new BoundSequenceExpression(
+                    node.Syntax,
+                    localsBuilder.ToImmutable(),
+                    sideEffectsBuilder.ToImmutable(),
+                    lvalue);
             }
             protected override BoundExpression RewriteCompoundAssignmentExpression(BoundCompoundAssignmentExpression node)
             {
+                if (node.UsesDirectOperator)
+                {
+                    var rewrittenLeft = RewriteExpression(node.Left);
+
+                    if (rewrittenLeft is BoundLocalExpression || rewrittenLeft is BoundParameterExpression)
+                        return LowerSimpleDirectCompoundAssignment(node, rewrittenLeft);
+
+                    return LowerDirectCompoundAssignmentWithSpill(node, rewrittenLeft);
+                }
+
                 if (node.Left is BoundIndexerAccessExpression leftIndexer &&
                     leftIndexer.Indexer.GetMethod is MethodSymbol indexerGetMethod &&
                     leftIndexer.Indexer.SetMethod is MethodSymbol indexerSetMethod)
@@ -3077,7 +3210,6 @@ namespace Cnidaria.Cs
                     return LowerIndexerCompoundAssignment(node, leftIndexer, indexerGetMethod, indexerSetMethod);
                 }
 
-                // Regular property compound assignment
                 if (node.Left is BoundMemberAccessExpression { Member: PropertySymbol prop } leftProp &&
                     !TryGetAutoPropertyBackingField(prop, out _) &&
                     prop.GetMethod is MethodSymbol getMethod &&
@@ -3086,16 +3218,138 @@ namespace Cnidaria.Cs
                     return LowerPropertyCompoundAssignment(node, leftProp, getMethod, setMethod);
                 }
 
-                var left = RewriteExpression(node.Left);
+                var rewrittenLeft2 = RewriteExpression(node.Left);
 
-                if (left is BoundLocalExpression || left is BoundParameterExpression)
+                if (rewrittenLeft2 is BoundLocalExpression || rewrittenLeft2 is BoundParameterExpression)
                 {
-                    var value = RewriteExpression(node.Value);
-                    return new BoundAssignmentExpression(node.Syntax, left, value);
+                    var valueWithRewrittenLeft = ReplaceExpressionByReference(node.Value, node.Left, rewrittenLeft2);
+                    var rewrittenValue = RewriteExpression(valueWithRewrittenLeft);
+                    return new BoundAssignmentExpression(node.Syntax, rewrittenLeft2, rewrittenValue);
                 }
 
-                // Fields
-                return LowerCompoundAssignmentWithSpill(node, left);
+                //Fields
+                return LowerCompoundAssignmentWithSpill(node, rewrittenLeft2);
+            }
+            private BoundExpression LowerSimpleDirectCompoundAssignment(
+    BoundCompoundAssignmentExpression node,
+    BoundExpression rewrittenLeft)
+            {
+                var directCall = RewriteExpression(ReplaceExpressionByReference(node.Value, node.Left, rewrittenLeft));
+
+                return new BoundSequenceExpression(
+                    node.Syntax,
+                    ImmutableArray<LocalSymbol>.Empty,
+                    ImmutableArray.Create<BoundStatement>(
+                        new BoundExpressionStatement(node.Syntax, directCall)),
+                    rewrittenLeft);
+            }
+
+            private BoundExpression LowerDirectCompoundAssignmentWithSpill(
+                BoundCompoundAssignmentExpression node,
+                BoundExpression rewrittenLeft)
+            {
+                var localsBuilder = ImmutableArray.CreateBuilder<LocalSymbol>();
+                var sideEffectsBuilder = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                BoundExpression lvalue;
+
+                switch (rewrittenLeft)
+                {
+                    case BoundPointerIndirectionExpression ind:
+                        {
+                            var ptrTemp = CreateTempLocal(ind.Operand.Type);
+                            localsBuilder.Add(ptrTemp);
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, ptrTemp),
+                                        ind.Operand)));
+
+                            lvalue = new BoundPointerIndirectionExpression(
+                                node.Syntax,
+                                ind.Type,
+                                new BoundLocalExpression(node.Syntax, ptrTemp));
+                            break;
+                        }
+
+                    case BoundPointerElementAccessExpression pea:
+                        {
+                            var ptrTemp = CreateTempLocal(pea.Expression.Type);
+                            var idxTemp = CreateTempLocal(pea.Index.Type);
+
+                            localsBuilder.Add(ptrTemp);
+                            localsBuilder.Add(idxTemp);
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, ptrTemp),
+                                        pea.Expression)));
+
+                            sideEffectsBuilder.Add(
+                                new BoundExpressionStatement(
+                                    node.Syntax,
+                                    new BoundAssignmentExpression(
+                                        node.Syntax,
+                                        new BoundLocalExpression(node.Syntax, idxTemp),
+                                        pea.Index)));
+
+                            lvalue = new BoundPointerElementAccessExpression(
+                                node.Syntax,
+                                pea.Type,
+                                new BoundLocalExpression(node.Syntax, ptrTemp),
+                                new BoundLocalExpression(node.Syntax, idxTemp));
+                            break;
+                        }
+
+                    case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
+                        {
+                            BoundExpression? receiver = ma.ReceiverOpt;
+                            if (receiver is not null && !IsSimpleReceiver(receiver))
+                            {
+                                var receiverTemp = CreateTempLocal(receiver.Type);
+                                localsBuilder.Add(receiverTemp);
+
+                                sideEffectsBuilder.Add(
+                                    new BoundExpressionStatement(
+                                        node.Syntax,
+                                        new BoundAssignmentExpression(
+                                            node.Syntax,
+                                            new BoundLocalExpression(node.Syntax, receiverTemp),
+                                            receiver)));
+
+                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
+                            }
+
+                            lvalue = new BoundMemberAccessExpression(
+                                (ExpressionSyntax)node.Syntax,
+                                receiver,
+                                fs,
+                                fs.Type,
+                                isLValue: true,
+                                constantValueOpt: Optional<object>.None);
+                            break;
+                        }
+
+                    default:
+                        throw new NotSupportedException(
+                            $"Direct compound assignment lowering for lvalue '{rewrittenLeft.GetType().Name}' is not implemented.");
+                }
+
+                var directCall = RewriteExpression(ReplaceExpressionByReference(node.Value, node.Left, lvalue));
+
+                sideEffectsBuilder.Add(new BoundExpressionStatement(node.Syntax, directCall));
+
+                return new BoundSequenceExpression(
+                    node.Syntax,
+                    localsBuilder.ToImmutable(),
+                    sideEffectsBuilder.ToImmutable(),
+                    lvalue);
             }
             protected override BoundExpression RewriteNullCoalescingAssignmentExpression(BoundNullCoalescingAssignmentExpression node)
             {
@@ -4068,12 +4322,32 @@ namespace Cnidaria.Cs
 
         private sealed class LocalFlowOptimizer : BoundTreeRewriterWithStackGuard
         {
+            private int _exceptionRegionDepth;
+            protected override BoundStatement RewriteTryStatement(BoundTryStatement node)
+            {
+                _exceptionRegionDepth++;
+                try
+                {
+                    return base.RewriteTryStatement(node);
+                }
+                finally
+                {
+                    _exceptionRegionDepth--;
+                }
+            }
             protected override BoundStatement RewriteBlockStatement(BoundBlockStatement node)
             {
                 if (node.Statements.IsDefaultOrEmpty)
                     return node;
 
                 var rewritten = RewriteStatements(node.Statements, out var changed);
+                if (_exceptionRegionDepth != 0)
+                {
+                    if (changed)
+                        return new BoundBlockStatement(node.Syntax, rewritten);
+
+                    return node;
+                }
                 if (CanOptimizeStraightLineStatements(rewritten))
                 {
                     var optimized = OptimizeStraightLineStatements(rewritten, out var optimizedChanged);
@@ -4100,7 +4374,13 @@ namespace Cnidaria.Cs
                 var sideEffects = RewriteStatements(node.SideEffects, out var sideEffectsChanged);
                 var value = RewriteExpression(node.Value);
                 var locals = node.Locals;
+                if (_exceptionRegionDepth != 0)
+                {
+                    if (sideEffectsChanged || !ReferenceEquals(value, node.Value))
+                        return new BoundSequenceExpression(node.Syntax, locals, sideEffects, value);
 
+                    return node;
+                }
                 if (!CanOptimizeStraightLineStatements(sideEffects))
                 {
                     var prunedLocals = PruneUnusedSequenceLocals(locals, sideEffects, value, out var localsChanged);
@@ -5337,7 +5617,9 @@ namespace Cnidaria.Cs
                 {
                     var value = RewriteExpression(node.Value);
                     if (!ReferenceEquals(value, node.Value))
-                        return new BoundCompoundAssignmentExpression(node.Syntax, node.Left, node.OperatorKind, value, node.IsChecked);
+                        return new BoundCompoundAssignmentExpression(
+                            node.Syntax, node.Left, node.OperatorKind, value,
+                            node.OperatorMethodOpt, node.UsesDirectOperator, node.IsChecked);
                     return node;
                 }
 
@@ -5362,6 +5644,8 @@ namespace Cnidaria.Cs
                             value,
                             node.IsIncrement,
                             node.IsPostfix,
+                            node.OperatorMethodOpt,
+                            node.UsesDirectOperator,
                             node.IsChecked);
                     }
                     return node;

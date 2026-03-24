@@ -3532,17 +3532,36 @@ namespace Cnidaria.Cs
                     break;
 
                 case "++":
-                    if (arity == 0 || arity == 1)
+                    if (arity == 1)
                     {
                         name = isChecked
-                            ? $"{OpetatorPrefix}CheckedIncrement" : $"{OpetatorPrefix}Increment"; return true;
+                            ? $"{OpetatorPrefix}CheckedIncrement"
+                            : $"{OpetatorPrefix}Increment";
+                        return true;
+                    }
+                    if (arity == 0)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedIncrementAssignment"
+                            : $"{OpetatorPrefix}IncrementAssignment";
+                        return true;
                     }
                     break;
+
                 case "--":
-                    if (arity == 0 || arity == 1)
+                    if (arity == 1)
                     {
                         name = isChecked
-                            ? $"{OpetatorPrefix}CheckedDecrement" : $"{OpetatorPrefix}Decrement"; return true;
+                            ? $"{OpetatorPrefix}CheckedDecrement"
+                            : $"{OpetatorPrefix}Decrement";
+                        return true;
+                    }
+                    if (arity == 0)
+                    {
+                        name = isChecked
+                            ? $"{OpetatorPrefix}CheckedDecrementAssignment"
+                            : $"{OpetatorPrefix}DecrementAssignment";
+                        return true;
                     }
                     break;
 
@@ -6041,7 +6060,7 @@ namespace Cnidaria.Cs
                         if (es.Expression is ImplicitObjectCreationExpressionSyntax ioc)
                             expr = BindImplicitObjectCreation(ioc, context, diagnostics);
                         else
-                            expr = BindExpression(es.Expression, context, diagnostics);
+                            expr = BindDiscardedExpression(es.Expression, context, diagnostics);
                         result = new BoundExpressionStatement(es, expr);
                     }
                     break;
@@ -6228,6 +6247,9 @@ namespace Cnidaria.Cs
                     break;
                 case SwitchExpressionSyntax sw:
                     result = BindSwitchExpression(sw, context, diagnostics);
+                    break;
+                case RefExpressionSyntax re:
+                    result = BindRefExpression(re, context, diagnostics);
                     break;
 
                 case RangeExpressionSyntax r:
@@ -7061,31 +7083,36 @@ namespace Cnidaria.Cs
             return true;
         }
         private BoundExpression BindRefExpression(
-            PrefixUnaryExpressionSyntax node,
-            BoundExpression operand,
+            RefExpressionSyntax node,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
+            var operand = BindAssignableValue(node.Expression, context, diagnostics);
+            if (operand.HasErrors)
+                return operand;
+
             if (!operand.IsLValue)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF000",
                     DiagnosticSeverity.Error,
                     "The operand of 'ref' must be an assignable variable.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
 
                 return new BoundBadExpression(node);
             }
+
             if (operand is BoundLocalExpression bl && bl.Local.IsConst)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF001",
                     DiagnosticSeverity.Error,
                     "Cannot create a ref to a const local.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
 
                 return new BoundBadExpression(node);
             }
+
             if (operand is BoundMemberAccessExpression { Member: PropertySymbol } ||
                 operand is BoundIndexerAccessExpression)
             {
@@ -7093,24 +7120,29 @@ namespace Cnidaria.Cs
                     "CN_REF002",
                     DiagnosticSeverity.Error,
                     "A property cannot be used as a ref value here.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
 
                 return new BoundBadExpression(node);
             }
-            if (operand is BoundParameterExpression pe && pe.Parameter.IsReadOnlyRef && !IsInsideIntrinsicMethod(context))
+
+            if (operand is BoundParameterExpression pe &&
+                pe.Parameter.IsReadOnlyRef &&
+                !IsInsideIntrinsicMethod(context))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF003",
                     DiagnosticSeverity.Error,
                     "Cannot use a readonly by-ref parameter as a writable ref.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
 
                 return new BoundBadExpression(node);
             }
+
             var refElementType = operand.Type is ByRefTypeSymbol br ? br.ElementType : operand.Type;
             var byRefType = context.Compilation.CreateByRefType(refElementType);
             return new BoundRefExpression(node, byRefType, operand);
         }
+
         private BoundExpression BindAddressOf(
             PrefixUnaryExpressionSyntax node, BoundExpression operand, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -7294,6 +7326,31 @@ namespace Cnidaria.Cs
 
             var leftRead = lv.Read;
 
+            if (IsDirectOperatorTarget(leftTarget) &&
+                TryBindDirectCompoundAssignmentOperator(
+                    node,
+                    opKind,
+                    leftTarget,
+                    right,
+                    context,
+                    diagnostics,
+                    out var directCall,
+                    out var directMethod))
+            {
+                if (directCall.HasErrors)
+                    return new BoundBadExpression(node);
+
+                return new BoundCompoundAssignmentExpression(
+                    node,
+                    leftTarget,
+                    opKind,
+                    directCall,
+                    operatorMethodOpt: directMethod,
+                    usesDirectOperator: true,
+                    isChecked: directMethod is not null &&
+                               directMethod.Name.StartsWith("op_Checked", StringComparison.Ordinal));
+            }
+
             var opResult = BindCompoundOperatorBinary(node, opKind, leftRead, right, context, diagnostics);
             if (opResult.HasErrors)
                 return new BoundBadExpression(node);
@@ -7307,7 +7364,29 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics);
 
             bool isChecked = opResult is BoundBinaryExpression compoundOp && compoundOp.IsChecked;
-            return new BoundCompoundAssignmentExpression(node, leftTarget, opKind, valueToAssign, isChecked);
+            return new BoundCompoundAssignmentExpression(
+                node,
+                leftTarget,
+                opKind,
+                valueToAssign,
+                operatorMethodOpt: null,
+                usesDirectOperator: false,
+                isChecked: isChecked);
+        }
+
+        private static bool IsDirectOperatorTarget(BoundExpression target)
+        {
+            return target switch
+            {
+                BoundLocalExpression => true,
+                BoundParameterExpression => true,
+                BoundArrayElementAccessExpression => true,
+                BoundPointerIndirectionExpression => true,
+                BoundPointerElementAccessExpression => true,
+                BoundMemberAccessExpression { Member: FieldSymbol } => true,
+                BoundCallExpression call when call.IsLValue => true,
+                _ => false
+            };
         }
         private BoundExpression BindInterpolatedString(
             InterpolatedStringExpressionSyntax node,
@@ -9999,7 +10078,78 @@ namespace Cnidaria.Cs
             result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs);
             return true;
         }
+        private bool TryBindDirectCompoundAssignmentOperator(
+            AssignmentExpressionSyntax node,
+            BoundBinaryOperatorKind op,
+            BoundExpression leftTarget,
+            BoundExpression right,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out BoundExpression result,
+            out MethodSymbol? method)
+        {
+            result = new BoundBadExpression(node);
+            method = null;
 
+            var names = GetCompoundAssignmentOperatorMetadataNames(op, IsCheckedOverflowContext);
+            if (names.IsDefaultOrEmpty)
+                return false;
+
+            var candidates = LookupInstanceUserDefinedOperatorMethods(
+                receiverType: leftTarget.Type,
+                metadataNames: names,
+                parameterCount: 1,
+                context: context);
+
+            if (candidates.IsDefaultOrEmpty)
+                return false;
+
+            var overloadDiags = new DiagnosticBag();
+            if (!TryResolveOverload(
+                candidates: candidates,
+                args: ImmutableArray.Create(right),
+                getArgExprSyntax: _ => node.Right,
+                chosen: out var chosen,
+                convertedArgs: out var convertedArgs,
+                context: context,
+                diagnostics: overloadDiags,
+                diagnosticNode: node))
+            {
+                if (IsOnlyNoApplicableOverload(overloadDiags))
+                    return false;
+
+                foreach (var d in overloadDiags.ToImmutable())
+                    diagnostics.Add(d);
+                return true;
+            }
+
+            if (chosen!.ReturnType.SpecialType != SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CASG_OP002",
+                    DiagnosticSeverity.Error,
+                    $"Direct compound operator '{chosen.Name}' must return void.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return true;
+            }
+
+            method = chosen;
+            result = new BoundCallExpression(node, receiverOpt: leftTarget, chosen, convertedArgs);
+            return true;
+
+        }
+        private static bool IsOnlyNoApplicableOverload(DiagnosticBag diagnostics)
+        {
+            var items = diagnostics.ToImmutable();
+            if (items.IsDefaultOrEmpty)
+                return false;
+
+            for (int i = 0; i < items.Length; i++)
+                if (!string.Equals(items[i].Id, "CN_OVL001", StringComparison.Ordinal))
+                    return false;
+
+            return true;
+        }
         private bool TryBindUserDefinedCompoundAssignmentOperator(
             AssignmentExpressionSyntax node,
             BoundBinaryOperatorKind op,
@@ -10052,7 +10202,67 @@ namespace Cnidaria.Cs
             result = new BoundCallExpression(node, receiverOpt: null, chosen, convertedArgs);
             return true;
         }
+        private bool TryBindDirectIncrementDecrementOperator(
+            ExpressionSyntax operatorSyntax,
+            BoundExpression target,
+            bool isIncrement,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out BoundExpression result,
+            out MethodSymbol? method)
+        {
+            result = new BoundBadExpression(operatorSyntax);
+            method = null;
 
+            var names = IsCheckedOverflowContext
+                ? ImmutableArray.Create(
+                    isIncrement ? "op_CheckedIncrementAssignment" : "op_CheckedDecrementAssignment",
+                    isIncrement ? "op_IncrementAssignment" : "op_DecrementAssignment")
+                : ImmutableArray.Create(
+                    isIncrement ? "op_IncrementAssignment" : "op_DecrementAssignment");
+
+            var candidates = LookupInstanceUserDefinedOperatorMethods(
+                receiverType: target.Type,
+                metadataNames: names,
+                parameterCount: 0,
+                context: context);
+
+            if (candidates.IsDefaultOrEmpty)
+                return false;
+
+            var overloadDiags = new DiagnosticBag();
+            if (!TryResolveOverload(
+                candidates: candidates,
+                args: ImmutableArray<BoundExpression>.Empty,
+                getArgExprSyntax: _ => operatorSyntax,
+                chosen: out var chosen,
+                convertedArgs: out var convertedArgs,
+                context: context,
+                diagnostics: overloadDiags,
+                diagnosticNode: operatorSyntax))
+            {
+                if (IsOnlyNoApplicableOverload(overloadDiags))
+                    return false;
+
+                foreach (var d in overloadDiags.ToImmutable())
+                    diagnostics.Add(d);
+                return true;
+            }
+
+            if (chosen!.ReturnType.SpecialType != SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_INCDEC002",
+                    DiagnosticSeverity.Error,
+                    $"Direct increment/decrement operator '{chosen.Name}' must return void.",
+                    new Location(context.SemanticModel.SyntaxTree, operatorSyntax.Span)));
+                return true;
+            }
+
+            method = chosen;
+            result = new BoundCallExpression(operatorSyntax, receiverOpt: target, chosen, convertedArgs);
+            return true;
+        }
         private bool TryBindUserDefinedIncrementDecrementOperator(
             ExpressionSyntax operatorSyntax,
             ExpressionSyntax operandSyntax,
@@ -10108,7 +10318,54 @@ namespace Cnidaria.Cs
             result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs);
             return true;
         }
+        private ImmutableArray<MethodSymbol> LookupInstanceUserDefinedOperatorMethods(
+    TypeSymbol receiverType,
+    ImmutableArray<string> metadataNames,
+    int parameterCount,
+    BindingContext context)
+        {
+            var types = new List<NamedTypeSymbol>();
+            var seenTypes = new HashSet<NamedTypeSymbol>();
 
+            if (receiverType is NamedTypeSymbol nt)
+            {
+                for (NamedTypeSymbol? cur = nt; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+                {
+                    if (seenTypes.Add(cur))
+                        types.Add(cur);
+                }
+            }
+
+            var methods = ImmutableArray.CreateBuilder<MethodSymbol>();
+            foreach (var t in types)
+            {
+                foreach (var m in t.GetMembers())
+                {
+                    if (m is not MethodSymbol ms)
+                        continue;
+                    if (ms.IsStatic || ms.IsConstructor)
+                        continue;
+                    if (ms.Parameters.Length != parameterCount)
+                        continue;
+                    if (!ContainsName(ms.Name, metadataNames))
+                        continue;
+                    if (!AccessibilityHelper.IsAccessible(ms, context))
+                        continue;
+
+                    methods.Add(ms);
+                }
+            }
+
+            return methods.ToImmutable();
+
+            static bool ContainsName(string name, ImmutableArray<string> names)
+            {
+                for (int i = 0; i < names.Length; i++)
+                    if (string.Equals(name, names[i], StringComparison.Ordinal))
+                        return true;
+                return false;
+            }
+        }
         private ImmutableArray<MethodSymbol> LookupUserDefinedOperatorMethods(
             TypeSymbol leftType,
             TypeSymbol? rightType,
@@ -10191,7 +10448,7 @@ namespace Cnidaria.Cs
                     ? ImmutableArray.Create($"{OperatorPrefix}CheckedSubtraction", $"{OperatorPrefix}Subtraction")
                     : ImmutableArray.Create($"{OperatorPrefix}Subtraction"),
                 BoundBinaryOperatorKind.Multiply => isChecked
-                    ? ImmutableArray.Create($"{OperatorPrefix}CheckedMultiply", "{OperatorPrefix}Multiply")
+                    ? ImmutableArray.Create($"{OperatorPrefix}CheckedMultiply", $"{OperatorPrefix}Multiply")
                     : ImmutableArray.Create($"{OperatorPrefix}Multiply"),
                 BoundBinaryOperatorKind.Divide => isChecked
                     ? ImmutableArray.Create($"{OperatorPrefix}CheckedDivision", $"{OperatorPrefix}Division")
@@ -10228,7 +10485,7 @@ namespace Cnidaria.Cs
                     : ImmutableArray.Create($"{OperatorPrefix}MultiplyAssignment"),
                 BoundBinaryOperatorKind.Divide => isChecked
                     ? ImmutableArray.Create($"{OperatorPrefix}CheckedDivisionAssignment", $"{OperatorPrefix}DivisionAssignment")
-                    : ImmutableArray.Create("${OperatorPrefix}DivisionAssignment"),
+                    : ImmutableArray.Create($"{OperatorPrefix}DivisionAssignment"),
                 BoundBinaryOperatorKind.Modulo => ImmutableArray.Create($"{OperatorPrefix}ModulusAssignment"),
                 BoundBinaryOperatorKind.BitwiseAnd => ImmutableArray.Create($"{OperatorPrefix}BitwiseAndAssignment"),
                 BoundBinaryOperatorKind.BitwiseOr => ImmutableArray.Create($"{OperatorPrefix}BitwiseOrAssignment"),
@@ -10269,8 +10526,6 @@ namespace Cnidaria.Cs
                     break;
                 case SyntaxKind.AddressOfExpression:
                     return BindAddressOf(node, operand, context, diagnostics);
-                case SyntaxKind.RefExpression:
-                    return BindRefExpression(node, operand, context, diagnostics);
                 case SyntaxKind.PointerIndirectionExpression:
                     return BindPointerIndirection(node, operand, context, diagnostics);
 
@@ -10319,10 +10574,10 @@ namespace Cnidaria.Cs
             switch (node.Kind)
             {
                 case SyntaxKind.PostIncrementExpression:
-                    return BindPostfixIncrementOrDecrement(node, isIncrement: true, context, diagnostics);
+                    return BindPostfixIncrementOrDecrement(node, isIncrement: true, resultUsed: true, context, diagnostics);
 
                 case SyntaxKind.PostDecrementExpression:
-                    return BindPostfixIncrementOrDecrement(node, isIncrement: false, context, diagnostics);
+                    return BindPostfixIncrementOrDecrement(node, isIncrement: false, resultUsed: true, context, diagnostics);
 
                 default:
                     diagnostics.Add(new Diagnostic("CN_UNARY001", DiagnosticSeverity.Error,
@@ -10342,12 +10597,14 @@ namespace Cnidaria.Cs
                 operandSyntax: node.Operand,
                 isIncrement: isIncrement,
                 isPostfix: false,
+                resultUsed: true,
                 context: context,
                 diagnostics: diagnostics);
         }
         private BoundExpression BindPostfixIncrementOrDecrement(
             PostfixUnaryExpressionSyntax node,
             bool isIncrement,
+            bool resultUsed,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -10356,6 +10613,7 @@ namespace Cnidaria.Cs
                 operandSyntax: node.Operand,
                 isIncrement: isIncrement,
                 isPostfix: true,
+                resultUsed: resultUsed,
                 context: context,
                 diagnostics: diagnostics);
         }
@@ -10364,6 +10622,7 @@ namespace Cnidaria.Cs
             ExpressionSyntax operandSyntax,
             bool isIncrement,
             bool isPostfix,
+            bool resultUsed,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -10389,6 +10648,34 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, operandSyntax.Span)));
                 return new BoundBadExpression(operatorSyntax);
             }
+
+            if (IsDirectOperatorTarget(leftTarget) &&
+                (!isPostfix || !resultUsed) &&
+                TryBindDirectIncrementDecrementOperator(
+                    operatorSyntax,
+                    leftTarget,
+                    isIncrement,
+                    context,
+                    diagnostics,
+                    out var directCall,
+                    out var directMethod))
+            {
+                if (directCall.HasErrors)
+                    return new BoundBadExpression(operatorSyntax);
+
+                return new BoundIncrementDecrementExpression(
+                    operatorSyntax,
+                    target: leftTarget,
+                    read: lv.Read,
+                    value: directCall,
+                    isIncrement: isIncrement,
+                    isPostfix: isPostfix,
+                    operatorMethodOpt: directMethod,
+                    usesDirectOperator: true,
+                    isChecked: directMethod is not null &&
+                               directMethod.Name.StartsWith("op_Checked", StringComparison.Ordinal));
+            }
+
             var opKind = isIncrement ? BoundBinaryOperatorKind.Add : BoundBinaryOperatorKind.Subtract;
 
             var opResult = BindIncrementDecrementOperatorBinary(
@@ -12728,10 +13015,8 @@ namespace Cnidaria.Cs
 
                 if (v.Initializer != null)
                 {
-                    var rhs = BindExpression(v.Initializer.Value, context, diagnostics);
-                    init = ApplyConversion(
+                    init = BindExpressionWithTargetType(
                         exprSyntax: v.Initializer.Value,
-                        expr: rhs,
                         targetType: localType,
                         diagnosticNode: v.Initializer,
                         context: context,
@@ -13987,6 +14272,80 @@ namespace Cnidaria.Cs
 
             return new BoundArrayCreationExpression(node, arrayType, elemType, count, init);
         }
+        internal BoundExpression BindExpressionWithTargetType(
+            ExpressionSyntax exprSyntax,
+            TypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            bool requireImplicit = true)
+        {
+            if (exprSyntax is InitializerExpressionSyntax initSyntax &&
+                initSyntax.Kind == SyntaxKind.ArrayInitializerExpression &&
+                targetType is ArrayTypeSymbol arrayType)
+            {
+                var boundInit = BindManagedArrayInitializer(
+                    initSyntax,
+                    arrayType.ElementType,
+                    arrayType.Rank,
+                    context,
+                    diagnostics);
+
+                if (boundInit is null)
+                {
+                    var bad = new BoundBadExpression(exprSyntax);
+                    bad.SetType(targetType);
+                    context.Recorder.RecordBound(exprSyntax, bad);
+                    return bad;
+                }
+
+                var inferredShape = InferRectangularInitializerShape(
+                    boundInit,
+                    arrayType.Rank,
+                    context,
+                    diagnostics);
+
+                if (arrayType.Rank > 1 && inferredShape.Length < arrayType.Rank)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ARRNEW003",
+                        DiagnosticSeverity.Error,
+                        "Cannot infer all array dimensions from the initializer.",
+                        new Location(context.SemanticModel.SyntaxTree, initSyntax.Span)));
+
+                    var bad = new BoundBadExpression(exprSyntax);
+                    bad.SetType(targetType);
+                    context.Recorder.RecordBound(exprSyntax, bad);
+                    return bad;
+                }
+
+                var int32 = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                var sizes = ImmutableArray.CreateBuilder<BoundExpression>(arrayType.Rank);
+
+                for (int i = 0; i < arrayType.Rank; i++)
+                    sizes.Add(new BoundLiteralExpression(initSyntax, int32, inferredShape[i]));
+
+                var arrayCreation = new BoundArrayCreationExpression(
+                    exprSyntax,
+                    arrayType,
+                    arrayType.ElementType,
+                    sizes.ToImmutable(),
+                    boundInit);
+
+                context.Recorder.RecordBound(exprSyntax, arrayCreation);
+                return arrayCreation;
+            }
+
+            var bound = BindExpression(exprSyntax, context, diagnostics);
+            return ApplyConversion(
+                exprSyntax,
+                bound,
+                targetType,
+                diagnosticNode,
+                context,
+                diagnostics,
+                requireImplicit);
+        }
         private BoundArrayInitializerExpression? BindManagedArrayInitializer(
             InitializerExpressionSyntax? init,
             TypeSymbol elemType,
@@ -14356,6 +14715,18 @@ namespace Cnidaria.Cs
                 return new BoundReturnStatement(rs, null);
 
             var expr = BindExpression(rs.Expression, context, diagnostics);
+            if (returnType is ByRefTypeSymbol byRefReturnType)
+            {
+                expr = BindRefReturningExpression(
+                    rs.Expression,
+                    expr,
+                    byRefReturnType,
+                    rs,
+                    context,
+                    diagnostics);
+
+                return new BoundReturnStatement(rs, expr);
+            }
             expr = ApplyConversion(
                 exprSyntax: rs.Expression,
                 expr: expr,
@@ -14365,6 +14736,38 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics,
                 requireImplicit: true);
             return new BoundReturnStatement(rs, expr);
+        }
+        private BoundExpression BindRefReturningExpression(
+            ExpressionSyntax syntax,
+            BoundExpression expr,
+            ByRefTypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (expr is not BoundRefExpression br || br.Type is not ByRefTypeSymbol sourceByRef)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_REFRET001",
+                    DiagnosticSeverity.Error,
+                    "A ref return expression must be a ref expression.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+
+                return new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+            }
+
+            if (!ReferenceEquals(sourceByRef.ElementType, targetType.ElementType))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_REFRET001",
+                    DiagnosticSeverity.Error,
+                    $"Ref type mismatch: expected ref '{targetType.ElementType.Name}', got ref '{sourceByRef.ElementType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+
+                return new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+            }
+
+            return br;
         }
         private BoundStatement BindThrow(ThrowStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -16362,7 +16765,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < node.Initializers.Count; i++)
             {
                 var initSyntax = node.Initializers[i];
-                var initExpr = scope.BindExpression(initSyntax, context, diagnostics);
+                var initExpr = scope.BindDiscardedExpression(initSyntax, context, diagnostics);
                 initializers.Add(new BoundExpressionStatement(initSyntax, initExpr));
             }
 
@@ -16385,7 +16788,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < node.Incrementors.Count; i++)
             {
                 var incSyntax = node.Incrementors[i];
-                var incExpr = scope.BindExpression(incSyntax, context, diagnostics);
+                var incExpr = scope.BindDiscardedExpression(incSyntax, context, diagnostics);
                 incrementors.Add(new BoundExpressionStatement(incSyntax, incExpr));
             }
             _flow.PushLoop(breakLabel, continueLabel);
@@ -16400,6 +16803,25 @@ namespace Cnidaria.Cs
             }
 
             return new BoundForStatement(node, initializers.ToImmutable(), conditionOpt, incrementors.ToImmutable(), body, breakLabel, continueLabel);
+        }
+        private BoundExpression BindDiscardedExpression(
+            ExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (node is PostfixUnaryExpressionSyntax post)
+            {
+                if (post.Kind == SyntaxKind.PostIncrementExpression)
+                    return BindPostfixIncrementOrDecrement(post, isIncrement: true, resultUsed: false, context, diagnostics);
+
+                if (post.Kind == SyntaxKind.PostDecrementExpression)
+                    return BindPostfixIncrementOrDecrement(post, isIncrement: false, resultUsed: false, context, diagnostics);
+            }
+
+            if (node is ImplicitObjectCreationExpressionSyntax ioc)
+                return BindImplicitObjectCreation(ioc, context, diagnostics);
+
+            return BindExpression(node, context, diagnostics);
         }
         private BoundStatement BindGoto(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {

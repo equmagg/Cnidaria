@@ -472,6 +472,110 @@ namespace Cnidaria.Cs
             AsteriskToken = asteriskToken;
         }
     }
+    public sealed class FunctionPointerTypeSyntax : TypeSyntax
+    {
+        public SyntaxToken DelegateKeyword { get; }
+        public SyntaxToken AsteriskToken { get; }
+        public FunctionPointerCallingConventionSyntax? CallingConvention { get; }
+        public FunctionPointerParameterListSyntax ParameterList { get; }
+
+        public FunctionPointerTypeSyntax(
+            SyntaxToken delegateKeyword,
+            SyntaxToken asteriskToken,
+            FunctionPointerCallingConventionSyntax? callingConvention,
+            FunctionPointerParameterListSyntax parameterList)
+            : base(
+                SyntaxKind.FunctionPointerType,
+                NodeSpan.FromNonNull(delegateKeyword.Span, asteriskToken.Span, callingConvention?.Span, parameterList.Span))
+        {
+            DelegateKeyword = delegateKeyword;
+            AsteriskToken = asteriskToken;
+            CallingConvention = callingConvention;
+            ParameterList = parameterList;
+        }
+    }
+    public sealed class FunctionPointerParameterListSyntax : SyntaxNode
+    {
+        public SyntaxToken LessThanToken { get; }
+        public SeparatedSyntaxList<FunctionPointerParameterSyntax> Parameters { get; }
+        public SyntaxToken GreaterThanToken { get; }
+
+        public FunctionPointerParameterListSyntax(
+            SyntaxToken lessThanToken,
+            SeparatedSyntaxList<FunctionPointerParameterSyntax> parameters,
+            SyntaxToken greaterThanToken)
+            : base(SyntaxKind.FunctionPointerParameterList, NodeSpan.From(lessThanToken.Span, greaterThanToken.Span))
+        {
+            LessThanToken = lessThanToken;
+            Parameters = parameters;
+            GreaterThanToken = greaterThanToken;
+        }
+    }
+    public sealed class FunctionPointerParameterSyntax : SyntaxNode
+    {
+        public SyntaxList<AttributeListSyntax> AttributeLists { get; }
+        public SyntaxTokenList Modifiers { get; }
+        public TypeSyntax Type { get; }
+
+        public FunctionPointerParameterSyntax(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            TypeSyntax type)
+            : base(
+                SyntaxKind.FunctionPointerParameter,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    type.Span))
+        {
+            AttributeLists = attributeLists;
+            Modifiers = modifiers;
+            Type = type;
+        }
+    }
+    public sealed class FunctionPointerCallingConventionSyntax : SyntaxNode
+    {
+        public SyntaxToken ManagedOrUnmanagedKeyword { get; }
+        public FunctionPointerUnmanagedCallingConventionListSyntax? UnmanagedCallingConventionList { get; }
+
+        public FunctionPointerCallingConventionSyntax(
+            SyntaxToken managedOrUnmanagedKeyword,
+            FunctionPointerUnmanagedCallingConventionListSyntax? unmanagedCallingConventionList)
+            : base(
+                SyntaxKind.FunctionPointerCallingConvention,
+                NodeSpan.FromNonNull(managedOrUnmanagedKeyword.Span, unmanagedCallingConventionList?.Span))
+        {
+            ManagedOrUnmanagedKeyword = managedOrUnmanagedKeyword;
+            UnmanagedCallingConventionList = unmanagedCallingConventionList;
+        }
+    }
+    public sealed class FunctionPointerUnmanagedCallingConventionListSyntax : SyntaxNode
+    {
+        public SyntaxToken OpenBracketToken { get; }
+        public SeparatedSyntaxList<FunctionPointerUnmanagedCallingConventionSyntax> CallingConventions { get; }
+        public SyntaxToken CloseBracketToken { get; }
+
+        public FunctionPointerUnmanagedCallingConventionListSyntax(
+            SyntaxToken openBracketToken,
+            SeparatedSyntaxList<FunctionPointerUnmanagedCallingConventionSyntax> callingConventions,
+            SyntaxToken closeBracketToken)
+            : base(SyntaxKind.FunctionPointerUnmanagedCallingConventionList, NodeSpan.From(openBracketToken.Span, closeBracketToken.Span))
+        {
+            OpenBracketToken = openBracketToken;
+            CallingConventions = callingConventions;
+            CloseBracketToken = closeBracketToken;
+        }
+    }
+    public sealed class FunctionPointerUnmanagedCallingConventionSyntax : SyntaxNode
+    {
+        public SyntaxToken Name { get; }
+
+        public FunctionPointerUnmanagedCallingConventionSyntax(SyntaxToken name)
+            : base(SyntaxKind.FunctionPointerUnmanagedCallingConvention, name.Span)
+        {
+            Name = name;
+        }
+    }
     public sealed class NullableTypeSyntax : TypeSyntax
     {
         public TypeSyntax ElementType { get; }
@@ -2267,6 +2371,45 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    public sealed class DestructorDeclarationSyntax : MemberDeclarationSyntax
+    {
+        public SyntaxTokenList Modifiers { get; }
+        public SyntaxToken TildeToken { get; }
+        public SyntaxToken Identifier { get; }
+        public ParameterListSyntax ParameterList { get; }
+
+        public BlockSyntax? Body { get; }
+        public ArrowExpressionClauseSyntax? ExpressionBody { get; }
+        public SyntaxToken SemicolonToken { get; }
+
+        public DestructorDeclarationSyntax(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken tildeToken,
+            SyntaxToken identifier,
+            ParameterListSyntax parameterList,
+            BlockSyntax? body,
+            ArrowExpressionClauseSyntax? expressionBody,
+            SyntaxToken semicolonToken)
+            : base(
+                SyntaxKind.DestructorDeclaration,
+                attributeLists,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    tildeToken.Span,
+                    identifier.Span,
+                    (body != null ? body.Span : (expressionBody != null ? expressionBody.Span : semicolonToken.Span))))
+        {
+            Modifiers = modifiers;
+            TildeToken = tildeToken;
+            Identifier = identifier;
+            ParameterList = parameterList;
+            Body = body;
+            ExpressionBody = expressionBody;
+            SemicolonToken = semicolonToken;
+        }
+    }
     public sealed class FieldDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -3271,6 +3414,18 @@ namespace Cnidaria.Cs
                     body.Span))
         {
             ParameterList = parameterList;
+        }
+    }
+    public sealed class RefExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken RefKeyword { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public RefExpressionSyntax(SyntaxToken refKeyword, ExpressionSyntax expression)
+            : base(SyntaxKind.RefExpression, NodeSpan.From(refKeyword.Span, expression.Span))
+        {
+            RefKeyword = refKeyword;
+            Expression = expression;
         }
     }
 }

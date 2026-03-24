@@ -348,7 +348,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{ X.ToString()}, { Y.ToString()}>";
+            return $"<{X.ToString()}, {Y.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator +(Vector2 left, Vector2 right)
@@ -409,6 +409,13 @@ namespace System.Numerics
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator -(Vector2 left, Vector2 right)
         {
             var result = new Vector2(left.X, left.Y);
@@ -459,7 +466,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}>";
+            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator +(Vector3 left, Vector3 right)
@@ -523,6 +530,14 @@ namespace System.Numerics
             result.Y *= left;
             result.Z *= left;
             return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+            this.Z *= value;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -594,8 +609,101 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}, { W.ToString()}>";
+            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}, {W.ToString()}>";
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator +(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X += right.X;
+            result.Y += right.Y;
+            result.Z += right.Z;
+            result.W += right.W;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator /(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X /= right.X;
+            result.Y /= right.Y;
+            result.Z /= right.Z;
+            result.W /= right.W;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator /(Vector4 value1, float value2)
+        {
+            Vector4 result = new Vector4(value1.X, value1.Y, value1.Z, value1.W);
+            value1.X /= value2;
+            value1.Y /= value2;
+            value1.Z /= value2;
+            value1.W /= value2;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool operator ==(Vector4 left, Vector4 right)
+            => left.X == right.X && left.Y == right.Y && left.Z == right.Z && left.W == right.W;
+
+        public static bool operator !=(Vector4 left, Vector4 right) => !(left == right);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X *= right.X;
+            result.Y *= right.Y;
+            result.Z *= right.Z;
+            result.W *= right.W;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(Vector4 left, float right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X *= right;
+            result.Y *= right;
+            result.Z *= right;
+            result.W *= right;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(float left, Vector4 right)
+        {
+            Vector4 result = new Vector4(right.X, right.Y, right.Z, right.W);
+            result.X *= left;
+            result.Y *= left;
+            result.Z *= left;
+            result.W *= left;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+            this.Z *= value;
+            this.W *= value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator -(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X -= right.X;
+            result.Y -= right.Y;
+            result.Z -= right.Z;
+            result.W -= right.W;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator -(Vector4 value) => new Vector4(-(value.X), -(value.Y), -(value.Z), -(value.W));
     }
     public struct Matrix3x2
     {

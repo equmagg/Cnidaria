@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    
+
     public abstract class BoundNode
     {
         public abstract BoundNodeKind Kind { get; }
@@ -82,7 +82,7 @@ namespace Cnidaria.Cs
         {
             Type = type;
             Value = value;
-            ConstantValueOpt = new Optional<object>(value!); 
+            ConstantValueOpt = new Optional<object>(value!);
         }
     }
     internal sealed class BoundThrowExpression : BoundExpression
@@ -596,7 +596,7 @@ namespace Cnidaria.Cs
         : base(syntax)
         {
             Type = resultType; // always int
-            OperandType = operandType; 
+            OperandType = operandType;
             ConstantValueOpt = Optional<object>.None;
         }
     }
@@ -1173,6 +1173,8 @@ namespace Cnidaria.Cs
         public BoundExpression Target { get; }
         public BoundExpression Read { get; }
         public BoundExpression Value { get; }
+        public MethodSymbol? OperatorMethodOpt { get; }
+        public bool UsesDirectOperator { get; }
 
         public BoundIncrementDecrementExpression(
             SyntaxNode syntax,
@@ -1181,16 +1183,19 @@ namespace Cnidaria.Cs
             BoundExpression value,
             bool isIncrement,
             bool isPostfix,
+            MethodSymbol? operatorMethodOpt = null,
+            bool usesDirectOperator = false,
             bool isChecked = false)
             : base(syntax)
         {
             Target = target;
             Read = read;
             Value = value;
+            OperatorMethodOpt = operatorMethodOpt;
+            UsesDirectOperator = usesDirectOperator;
             IsIncrement = isIncrement;
             IsPostfix = isPostfix;
             IsChecked = isChecked;
-
             Type = target.Type;
             ConstantValueOpt = Optional<object>.None;
             HasErrors = target.HasErrors || read.HasErrors || value.HasErrors;
@@ -1204,11 +1209,15 @@ namespace Cnidaria.Cs
         public BoundExpression Left { get; }
         public BoundBinaryOperatorKind OperatorKind { get; }
         public BoundExpression Value { get; }
+        public MethodSymbol? OperatorMethodOpt { get; }
+        public bool UsesDirectOperator { get; }
         public BoundCompoundAssignmentExpression(
             SyntaxNode syntax,
             BoundExpression left,
             BoundBinaryOperatorKind operatorKind,
             BoundExpression value,
+            MethodSymbol? operatorMethodOpt = null,
+            bool usesDirectOperator = false,
             bool isChecked = false)
             : base(syntax)
         {
@@ -1220,6 +1229,8 @@ namespace Cnidaria.Cs
             ConstantValueOpt = Optional<object>.None;
             IsChecked = isChecked;
             HasErrors = left.HasErrors || value.HasErrors;
+            OperatorMethodOpt = operatorMethodOpt;
+            UsesDirectOperator = usesDirectOperator;
         }
     }
     internal sealed class BoundNullCoalescingAssignmentExpression : BoundExpression
@@ -1288,10 +1299,10 @@ namespace Cnidaria.Cs
         public ImmutableArray<BoundExpression> Arguments { get; }
         public BoundObjectCreationExpression(
             SyntaxNode syntax,
-            NamedTypeSymbol type, 
+            NamedTypeSymbol type,
             MethodSymbol? constructorOpt,
-            ImmutableArray<BoundExpression> arguments, 
-            bool hasErrors = false) 
+            ImmutableArray<BoundExpression> arguments,
+            bool hasErrors = false)
             : base(syntax)
         {
             Type = type;

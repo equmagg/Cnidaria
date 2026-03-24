@@ -855,13 +855,10 @@ namespace Cnidaria.Cs
                     continue;
 
                 var rhsSyntax = vd.Initializer.Value;
-                var rhsBound = exprBinder.BindExpression(rhsSyntax, ctx, bag);
-
-                rhsBound = exprBinder.ApplyConversion(
+                var rhsBound = exprBinder.BindExpressionWithTargetType(
                     exprSyntax: rhsSyntax,
-                    expr: rhsBound,
                     targetType: fs.Type,
-                    diagnosticNode: rhsSyntax,
+                    diagnosticNode: vd.Initializer,
                     context: ctx,
                     diagnostics: bag,
                     requireImplicit: true);
