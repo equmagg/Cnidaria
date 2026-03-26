@@ -836,6 +836,7 @@ namespace Cnidaria.Cs
                     BoundIfStatement => "BoundIfStatement",
                     BoundWhileStatement => "BoundWhileStatement",
                     BoundForStatement => "BoundForStatement",
+                    BoundForEachStatement => "BoundForEachStatement",
                     BoundDoWhileStatement => "BoundDoWhileStatement",
 
                     BoundLabelStatement => "BoundLabelStatement",
@@ -848,6 +849,7 @@ namespace Cnidaria.Cs
 
                     BoundLiteralExpression => "BoundLiteralExpression",
                     BoundThisExpression => "BoundThisExpression",
+                    BoundBaseExpression => "BoundBaseExpression",
                     BoundLocalExpression => "BoundLocalExpression",
                     BoundParameterExpression => "BoundParameterExpression",
                     BoundLabelExpression => "BoundLabelExpression",
@@ -886,6 +888,8 @@ namespace Cnidaria.Cs
                     BoundUncheckedExpression => "BoundUncheckedExpression",
                     BoundSizeOfExpression => "BoundSizeOfExpression",
                     BoundThrowExpression => "BoundThrowExpression",
+                    BoundFixedStatement => "BoundFixedStatement",
+                    BoundFixedInitializerExpression => "BoundFixedInitializerExpression",
                     _ => node.GetType().Name
                 };
             }

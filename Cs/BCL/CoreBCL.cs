@@ -58,8 +58,7 @@
         public static int MaxLength => 0X7FFFFFC7;
         public int Length
         {
-            [RuntimeIntrinsic]
-            [MethodImpl(MethodImplOptions.NoInlining)]
+            [MethodImpl(MethodImplOptions.InternalCall)]
             get { return 0; }
         }
         public System.Collections.IEnumerator GetEnumerator()
@@ -138,8 +137,7 @@
             ClearInternal(array, index, length);
         }
 
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static void ClearInternal(Array array, int index, int length)
         {
             // handled in runtime
@@ -242,14 +240,18 @@
             if (!CopyInternal(sourceArray, sourceIndex, destinationArray, destinationIndex, length))
                 throw new ArrayTypeMismatchException();
         }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static bool CopyInternal(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
             => false;
     }
     public abstract unsafe class Delegate
     {
 
+    }
+    public abstract class MulticastDelegate : Delegate
+    {
+        private object? _invocationList;
+        private nint _invocationCount;
     }
 
     public enum StringComparison
@@ -273,18 +275,14 @@
         public const string Empty = "";
         public int Length
         {
-            [RuntimeIntrinsic]
-            [MethodImpl(MethodImplOptions.NoInlining)]
+            [MethodImpl(MethodImplOptions.InternalCall)]
             get { return 0; }
         }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         internal ref char GetRawStringData() { throw new NullReferenceException(); }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         public ref char GetPinnableReference() { throw new NullReferenceException(); }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         internal static string FastAllocateString(int length) { return null; }
         internal String() { }
         public String(Char ch, Int32 Length) { }
@@ -2475,8 +2473,7 @@
             return _DoubleToStringImpl(value);
         }
 
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static string _DoubleToStringImpl(double value)
         {
             return string.Empty;
@@ -2847,7 +2844,10 @@
 
     public struct ValueTuple
     {
-
+        public override string ToString()
+        {
+            return "()";
+        }
     }
     public struct ValueTuple<T1> : ITuple
     {
@@ -4868,11 +4868,6 @@
         public IntrinsicAttribute() { }
     }
     [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
-    public sealed class RuntimeIntrinsicAttribute : Attribute
-    {
-        public RuntimeIntrinsicAttribute() { }
-    }
-    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
     public sealed class NonVersionableAttribute : Attribute
     {
         public NonVersionableAttribute() { }
@@ -4888,8 +4883,7 @@
         public virtual int Next() => Next(0, 0x7fffffff);
         public virtual int Next(int maxValue) => Next(0, maxValue);
 
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         public virtual int Next(int minValue, int maxValue)
         {
             if (minValue > maxValue)
@@ -5000,6 +4994,7 @@
         public static void Write(string value) { _Write(value); }
         public static void Write(object value) { _Write(value.ToString()); }
 
+        public static void WriteLine() { Write('\n'); }
         public static void WriteLine(sbyte value) { Write(value); Write('\n'); }
         public static void WriteLine(byte value) { Write(value); Write('\n'); }
         public static void WriteLine(short value) { Write(value); Write('\n'); }
@@ -5032,14 +5027,11 @@
         public static void print(string value) { WriteLine(value); }
         public static void print(object value) { WriteLine(value); }
         // intrinsics
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static unsafe void _Write(char* value) { }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static void _Write(string value) { }
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         private static void _Write(ReadOnlySpan<char> value) { }
     }
 
@@ -5109,8 +5101,7 @@ namespace System.Runtime.CompilerServices
 {
     public static class RuntimeHelpers
     {
-        [RuntimeIntrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         public static bool IsReferenceOrContainsReferences<T>() where T : allows ref struct => IsReferenceOrContainsReferences<T>();
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -5150,6 +5141,36 @@ namespace System.Runtime.CompilerServices
         }
 
         public MethodImplOptions Value { get; }
+    }
+    public sealed class SwitchExpressionException : InvalidOperationException
+    {
+        public SwitchExpressionException()
+            : base() { }
+
+        public SwitchExpressionException(object? unmatchedValue) : this()
+        {
+            UnmatchedValue = unmatchedValue;
+        }
+
+        public SwitchExpressionException(string? message) : base(message) { }
+
+        public SwitchExpressionException(string? message, Exception? innerException)
+            : base(message, innerException) { }
+
+        public object? UnmatchedValue { get; }
+
+        public override string Message
+        {
+            get
+            {
+                if (UnmatchedValue is null)
+                {
+                    return base.Message;
+                }
+
+                return base.Message + Environment.NewLine;
+            }
+        }
     }
     public static unsafe class Unsafe
     {
@@ -5551,6 +5572,18 @@ namespace System.Collections
     {
         bool MoveNext();
         void Reset();
+        object Current
+        {
+            get;
+        }
+    }
+
+    public interface ICollection : IEnumerable
+    {
+        int Count { get; }
+        bool IsSynchronized { get; }
+        object SyncRoot { get; }
+        void CopyTo(Array array, int index);
     }
 }
 namespace System.Collections.Generic

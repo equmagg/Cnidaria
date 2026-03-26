@@ -640,6 +640,9 @@ namespace Cnidaria.Cs
             BindPendingConstFields(compilation, pendingConstFields, diagnostics);
             BindPendingOptionalParameters(compilation, pendingOptionalParameters, diagnostics);
         }
+        
+
+        
         private readonly struct PendingConstField
         {
             public readonly SyntaxTree Tree;
@@ -2284,6 +2287,883 @@ namespace Cnidaria.Cs
             }
         }
     }
+    internal static class ExplicitInterfaceImplementationBinder
+    {
+        private sealed class SemanticModelStub : SemanticModel
+        {
+            public SemanticModelStub(Compilation c, SyntaxTree t)
+            : base(c, t, ignoresAccessibility: true) { }
+
+            public override ImmutableArray<Diagnostic> GetDiagnostics(TextSpan? span = null, CancellationToken cancellationToken = default)
+                => ImmutableArray<Diagnostic>.Empty;
+
+            public override Symbol? GetDeclaredSymbol(SyntaxNode declaration, CancellationToken cancellationToken = default) => null;
+            public override SymbolInfo GetSymbolInfo(SyntaxNode node, CancellationToken cancellationToken = default) => SymbolInfo.None;
+            public override Symbol? GetAliasInfo(NameSyntax nameSyntax, CancellationToken cancellationToken = default) => null;
+            public override TypeInfo GetTypeInfo(ExpressionSyntax expr, CancellationToken cancellationToken = default)
+                => new TypeInfo(null, null);
+            public override Optional<object> GetConstantValue(ExpressionSyntax expr, CancellationToken cancellationToken = default)
+                => Optional<object>.None;
+            public override Conversion GetConversion(ExpressionSyntax expr, CancellationToken cancellationToken = default)
+                => new Conversion(ConversionKind.None);
+            public override Symbol? GetEnclosingSymbol(int position, CancellationToken cancellationToken = default) => null;
+            public override ImmutableArray<Symbol> LookupSymbols(int position, string? name = null, CancellationToken cancellationToken = default)
+                => ImmutableArray<Symbol>.Empty;
+
+            internal override BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default)
+                => throw new NotSupportedException();
+        }
+        public static void BindAll(
+            Compilation compilation,
+            ImmutableArray<SyntaxTree> trees,
+            DiagnosticBag diagnostics)
+        {
+            BindExplicitInterfaceImplementations(compilation, trees, diagnostics);
+            ValidateInterfaceImplementations(compilation, trees, diagnostics);
+        }
+        private static void BindExplicitInterfaceImplementations(
+            Compilation compilation,
+            ImmutableArray<SyntaxTree> trees,
+            DiagnosticBag diagnostics)
+        {
+            foreach (var tree in trees)
+            {
+                if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
+                    continue;
+
+                var stubModel = new SemanticModelStub(compilation, tree);
+                var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, NullRecorder.Instance, diagnostics);
+
+                var safeTypeBinder = new TypeBinder(
+                    parent: null,
+                    flags: BinderFlags.None,
+                    compilation: compilation,
+                    importScopeMap: importScopeMap);
+
+                var unsafeTypeBinder = new TypeBinder(
+                    parent: null,
+                    flags: BinderFlags.UnsafeRegion,
+                    compilation: compilation,
+                    importScopeMap: importScopeMap);
+
+                foreach (var kv in declMap)
+                {
+                    switch (kv.Key)
+                    {
+                        case MethodDeclarationSyntax md
+                            when kv.Value is SourceMethodSymbol sm && md.ExplicitInterfaceSpecifier is not null:
+                            {
+                                var binder = HasModifier(md.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceMethod(compilation, tree, stubModel, binder, md, sm, diagnostics);
+                                break;
+                            }
+
+                        case PropertyDeclarationSyntax pd
+                            when kv.Value is SourcePropertySymbol sp && pd.ExplicitInterfaceSpecifier is not null:
+                            {
+                                var binder = HasModifier(pd.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceProperty(compilation, tree, stubModel, binder, pd, sp, diagnostics, isIndexer: false);
+                                break;
+                            }
+
+                        case IndexerDeclarationSyntax id
+                            when kv.Value is SourcePropertySymbol sp && id.ExplicitInterfaceSpecifier is not null:
+                            {
+                                var binder = HasModifier(id.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceIndexer(compilation, tree, stubModel, binder, id, sp, diagnostics);
+                                break;
+                            }
+                    }
+                }
+            }
+        }
+        private static void ValidateInterfaceImplementations(
+            Compilation compilation,
+            ImmutableArray<SyntaxTree> trees,
+            DiagnosticBag diagnostics)
+        {
+            var seenTypes = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+
+            foreach (var tree in trees)
+            {
+                if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
+                    continue;
+
+                foreach (var kv in declMap)
+                {
+                    if (kv.Key is not TypeDeclarationSyntax typeSyntax)
+                        continue;
+
+                    if (kv.Value is not SourceNamedTypeSymbol type)
+                        continue;
+
+                    if (!seenTypes.Add(type))
+                        continue;
+
+                    if (type.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+                        continue;
+
+                    ValidateInterfaceImplementationsForType(type, tree, typeSyntax.Span, diagnostics);
+                }
+            }
+        }
+        private static void ValidateInterfaceImplementationsForType(
+    SourceNamedTypeSymbol type,
+    SyntaxTree tree,
+    TextSpan diagnosticSpan,
+    DiagnosticBag diagnostics)
+        {
+            var interfaces = GetEffectiveInterfaceSet(type);
+            if (interfaces.IsDefaultOrEmpty)
+                return;
+
+            var seenMembers = new HashSet<Symbol>(ReferenceEqualityComparer<Symbol>.Instance);
+
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                foreach (var iface in EnumerateInterfaceClosure(interfaces[i]))
+                {
+                    var members = iface.GetMembers();
+                    for (int m = 0; m < members.Length; m++)
+                    {
+                        var member = members[m];
+                        if (!seenMembers.Add(member))
+                            continue;
+
+                        switch (member)
+                        {
+                            case MethodSymbol method when ShouldValidateInterfaceMethod(method):
+                                if (!HasMethodImplementation(type, method))
+                                {
+                                    diagnostics.Add(new Diagnostic(
+                                        "CN_IFACEIMPL001",
+                                        DiagnosticSeverity.Error,
+                                        $"'{type.Name}' does not implement interface member '{FormatInterfaceMethod(method)}'.",
+                                        new Location(tree, diagnosticSpan)));
+                                }
+                                break;
+
+                            case PropertySymbol property:
+                                if (!HasPropertyImplementation(type, property))
+                                {
+                                    diagnostics.Add(new Diagnostic(
+                                        "CN_IFACEIMPL002",
+                                        DiagnosticSeverity.Error,
+                                        $"'{type.Name}' does not implement interface member '{FormatInterfaceProperty(property)}'.",
+                                        new Location(tree, diagnosticSpan)));
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+
+        private static ImmutableArray<NamedTypeSymbol> GetEffectiveInterfaceSet(NamedTypeSymbol type)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var ifaces = cur.Interfaces;
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
+
+            var builder = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
+            while (queue.Count != 0)
+            {
+                var cur = queue.Dequeue();
+                if (!seen.Add(cur))
+                    continue;
+
+                builder.Add(cur);
+
+                var nested = cur.Interfaces;
+                for (int i = 0; i < nested.Length; i++)
+                {
+                    if (nested[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
+
+            return builder.ToImmutable();
+        }
+        private static bool ShouldValidateInterfaceMethod(MethodSymbol method)
+        {
+            if (method.IsConstructor || method.IsStatic)
+                return false;
+
+            // Property accessors are validated via PropertySymbol
+            if (method.Name.StartsWith("get_", StringComparison.Ordinal) ||
+                method.Name.StartsWith("set_", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return true;
+        }
+        private static bool HasMethodImplementation(NamedTypeSymbol type, MethodSymbol ifaceMethod)
+        {
+            return FindExplicitMethodImplementation(type, ifaceMethod) is not null
+                || FindImplicitMethodImplementation(type, ifaceMethod) is not null;
+        }
+
+        private static MethodSymbol? FindExplicitMethodImplementation(NamedTypeSymbol type, MethodSymbol ifaceMethod)
+        {
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var members = cur.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is MethodSymbol candidate &&
+                        ReferenceEquals(candidate.ExplicitInterfaceImplementation, ifaceMethod))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static MethodSymbol? FindImplicitMethodImplementation(NamedTypeSymbol type, MethodSymbol ifaceMethod)
+        {
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var members = cur.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol candidate)
+                        continue;
+
+                    if (candidate.IsStatic || candidate.IsConstructor)
+                        continue;
+
+                    if (candidate.ExplicitInterfaceImplementation is not null)
+                        continue;
+
+                    if (candidate.DeclaredAccessibility != Accessibility.Public)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(candidate.Name, ifaceMethod.Name))
+                        continue;
+
+                    if (!SameExplicitMethodSignature(candidate, ifaceMethod))
+                        continue;
+
+                    if (!ReferenceEquals(candidate.ReturnType, ifaceMethod.ReturnType))
+                        continue;
+
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool HasPropertyImplementation(NamedTypeSymbol type, PropertySymbol ifaceProperty)
+        {
+            return FindExplicitPropertyImplementation(type, ifaceProperty) is not null
+                || FindImplicitPropertyImplementation(type, ifaceProperty) is not null;
+        }
+
+        private static PropertySymbol? FindExplicitPropertyImplementation(NamedTypeSymbol type, PropertySymbol ifaceProperty)
+        {
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var members = cur.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol candidate &&
+                        ReferenceEquals(candidate.ExplicitInterfaceImplementation, ifaceProperty))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static PropertySymbol? FindImplicitPropertyImplementation(NamedTypeSymbol type, PropertySymbol ifaceProperty)
+        {
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var members = cur.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not PropertySymbol candidate)
+                        continue;
+
+                    if (candidate.IsStatic)
+                        continue;
+
+                    if (candidate.ExplicitInterfaceImplementation is not null)
+                        continue;
+
+                    if (candidate.DeclaredAccessibility != Accessibility.Public)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(candidate.Name, ifaceProperty.Name))
+                        continue;
+
+                    if (!SameExplicitPropertySignature(candidate, ifaceProperty))
+                        continue;
+
+                    if (!ReferenceEquals(candidate.Type, ifaceProperty.Type))
+                        continue;
+
+                    if (ifaceProperty.HasGet && !candidate.HasGet)
+                        continue;
+
+                    if (ifaceProperty.HasSet && !candidate.HasSet)
+                        continue;
+
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static string FormatInterfaceMethod(MethodSymbol method)
+        {
+            var sb = new StringBuilder();
+            var iface = method.ContainingSymbol as NamedTypeSymbol;
+
+            sb.Append(iface?.Name ?? "?");
+            sb.Append('.');
+            sb.Append(method.Name);
+            sb.Append('(');
+
+            var ps = method.Parameters;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (i != 0)
+                    sb.Append(", ");
+
+                switch (ps[i].RefKind)
+                {
+                    case ParameterRefKind.Ref: sb.Append("ref "); break;
+                    case ParameterRefKind.Out: sb.Append("out "); break;
+                    case ParameterRefKind.In: sb.Append("in "); break;
+                }
+
+                sb.Append(ps[i].Type.Name);
+            }
+
+            sb.Append(')');
+            return sb.ToString();
+        }
+
+        private static string FormatInterfaceProperty(PropertySymbol property)
+        {
+            var iface = property.ContainingSymbol as NamedTypeSymbol;
+            if (property.Parameters.Length == 0)
+                return $"{iface?.Name ?? "?"}.{property.Name}";
+
+            var sb = new StringBuilder();
+            sb.Append(iface?.Name ?? "?");
+            sb.Append(".this[");
+
+            var ps = property.Parameters;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (i != 0)
+                    sb.Append(", ");
+
+                switch (ps[i].RefKind)
+                {
+                    case ParameterRefKind.Ref: sb.Append("ref "); break;
+                    case ParameterRefKind.Out: sb.Append("out "); break;
+                    case ParameterRefKind.In: sb.Append("in "); break;
+                }
+
+                sb.Append(ps[i].Type.Name);
+            }
+
+            sb.Append(']');
+            return sb.ToString();
+        }
+        private static void BindExplicitInterfaceMethod(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            MethodDeclarationSyntax syntax,
+            SourceMethodSymbol method,
+            DiagnosticBag diagnostics)
+        {
+            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+                return;
+
+            ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
+
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE001",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementations are only valid in classes or structs.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
+                return;
+            }
+
+            if (method.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE002",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementation cannot be static.",
+                    new Location(tree, syntax.Modifiers.Count > 0 ? syntax.Modifiers[0].Span : syntax.Span)));
+                return;
+            }
+
+            var iface = BindExplicitInterfaceType(
+                compilation, tree, stubModel, typeBinder, method,
+                syntax.ExplicitInterfaceSpecifier!.Name, diagnostics);
+
+            if (iface is null)
+                return;
+
+            if (!ImplementsInterface(containingType, iface))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE003",
+                    DiagnosticSeverity.Error,
+                    $"Type '{containingType.Name}' does not implement interface '{iface.Name}'.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier.Span)));
+                return;
+            }
+
+            MethodSymbol? match = null;
+            bool ambiguous = false;
+            string sourceName = syntax.Identifier.ValueText ?? string.Empty;
+
+            foreach (var curIface in EnumerateInterfaceClosure(iface))
+            {
+                var members = curIface.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol candidate)
+                        continue;
+
+                    if (candidate.IsConstructor)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(candidate.Name, sourceName))
+                        continue;
+
+                    if (!SameExplicitMethodSignature(method, candidate))
+                        continue;
+
+                    if (!ReferenceEquals(method.ReturnType, candidate.ReturnType))
+                        continue;
+
+                    if (match is null)
+                        match = candidate;
+                    else if (!ReferenceEquals(match, candidate))
+                        ambiguous = true;
+                }
+            }
+
+            if (ambiguous)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE004",
+                    DiagnosticSeverity.Error,
+                    $"Explicit interface implementation '{iface.Name}.{sourceName}' is ambiguous.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            if (match is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE005",
+                    DiagnosticSeverity.Error,
+                    $"No interface method '{iface.Name}.{sourceName}' matches the implementing method signature.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            method.SetExplicitInterfaceImplementation(match);
+        }
+
+        private static void BindExplicitInterfaceProperty(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            PropertyDeclarationSyntax syntax,
+            SourcePropertySymbol property,
+            DiagnosticBag diagnostics,
+            bool isIndexer)
+        {
+            if (property.ContainingSymbol is not NamedTypeSymbol containingType)
+                return;
+
+            ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
+
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE001",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementations are only valid in classes or structs.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
+                return;
+            }
+
+            if (property.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE002",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementation cannot be static.",
+                    new Location(tree, syntax.Modifiers.Count > 0 ? syntax.Modifiers[0].Span : syntax.Span)));
+                return;
+            }
+
+            var iface = BindExplicitInterfaceType(
+                compilation, tree, stubModel, typeBinder, property,
+                syntax.ExplicitInterfaceSpecifier!.Name, diagnostics);
+
+            if (iface is null)
+                return;
+
+            if (!ImplementsInterface(containingType, iface))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE003",
+                    DiagnosticSeverity.Error,
+                    $"Type '{containingType.Name}' does not implement interface '{iface.Name}'.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier.Span)));
+                return;
+            }
+
+            var sourceName = syntax.Identifier.ValueText ?? string.Empty;
+            var match = FindMatchingInterfaceProperty(iface, sourceName, property, diagnostics, tree, syntax.Span);
+
+            if (match is null)
+                return;
+
+            property.SetExplicitInterfaceImplementation(match);
+
+            if (property.GetMethod is SourceMethodSymbol getImpl && match.GetMethod is MethodSymbol getIface)
+                getImpl.SetExplicitInterfaceImplementation(getIface);
+
+            if (property.SetMethod is SourceMethodSymbol setImpl && match.SetMethod is MethodSymbol setIface)
+                setImpl.SetExplicitInterfaceImplementation(setIface);
+        }
+
+        private static void BindExplicitInterfaceIndexer(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            IndexerDeclarationSyntax syntax,
+            SourcePropertySymbol property,
+            DiagnosticBag diagnostics)
+        {
+            if (property.ContainingSymbol is not NamedTypeSymbol containingType)
+                return;
+
+            ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
+
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE001",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementations are only valid in classes or structs.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
+                return;
+            }
+
+            if (property.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE002",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementation cannot be static.",
+                    new Location(tree, syntax.Modifiers.Count > 0 ? syntax.Modifiers[0].Span : syntax.Span)));
+                return;
+            }
+
+            var iface = BindExplicitInterfaceType(
+                compilation, tree, stubModel, typeBinder, property,
+                syntax.ExplicitInterfaceSpecifier!.Name, diagnostics);
+
+            if (iface is null)
+                return;
+
+            if (!ImplementsInterface(containingType, iface))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE003",
+                    DiagnosticSeverity.Error,
+                    $"Type '{containingType.Name}' does not implement interface '{iface.Name}'.",
+                    new Location(tree, syntax.ExplicitInterfaceSpecifier.Span)));
+                return;
+            }
+
+            var match = FindMatchingInterfaceProperty(iface, "Item", property, diagnostics, tree, syntax.Span);
+
+            if (match is null)
+                return;
+
+            property.SetExplicitInterfaceImplementation(match);
+
+            if (property.GetMethod is SourceMethodSymbol getImpl && match.GetMethod is MethodSymbol getIface)
+                getImpl.SetExplicitInterfaceImplementation(getIface);
+
+            if (property.SetMethod is SourceMethodSymbol setImpl && match.SetMethod is MethodSymbol setIface)
+                setImpl.SetExplicitInterfaceImplementation(setIface);
+        }
+
+        private static NamedTypeSymbol? BindExplicitInterfaceType(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            Symbol containingSymbol,
+            NameSyntax ifaceName,
+            DiagnosticBag diagnostics)
+        {
+            var ctx = new BindingContext(compilation, stubModel, containingSymbol, NullRecorder.Instance);
+            var t = typeBinder.BindType(ifaceName, ctx, diagnostics);
+
+            if (t is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                return nt;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_EXPLIFACE006",
+                DiagnosticSeverity.Error,
+                $"'{t.Name}' is not an interface type.",
+                new Location(tree, ifaceName.Span)));
+
+            return null;
+        }
+
+        private static PropertySymbol? FindMatchingInterfaceProperty(
+            NamedTypeSymbol iface,
+            string name,
+            SourcePropertySymbol property,
+            DiagnosticBag diagnostics,
+            SyntaxTree tree,
+            TextSpan diagnosticSpan)
+        {
+            PropertySymbol? match = null;
+            bool ambiguous = false;
+
+            foreach (var curIface in EnumerateInterfaceClosure(iface))
+            {
+                var members = curIface.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not PropertySymbol candidate)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(candidate.Name, name))
+                        continue;
+
+                    if (!SameExplicitPropertySignature(property, candidate))
+                        continue;
+
+                    if (!ReferenceEquals(property.Type, candidate.Type))
+                        continue;
+
+                    if (candidate.HasGet && !property.HasGet)
+                        continue;
+
+                    if (candidate.HasSet && !property.HasSet)
+                        continue;
+
+                    if (match is null)
+                        match = candidate;
+                    else if (!ReferenceEquals(match, candidate))
+                        ambiguous = true;
+                }
+            }
+
+            if (ambiguous)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE007",
+                    DiagnosticSeverity.Error,
+                    $"Explicit interface property implementation '{iface.Name}.{name}' is ambiguous.",
+                    new Location(tree, diagnosticSpan)));
+                return null;
+            }
+
+            if (match is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE008",
+                    DiagnosticSeverity.Error,
+                    $"No interface property '{iface.Name}.{name}' matches the implementing member signature.",
+                    new Location(tree, diagnosticSpan)));
+                return null;
+            }
+
+            return match;
+        }
+
+        private static bool SameExplicitMethodSignature(MethodSymbol impl, MethodSymbol candidate)
+        {
+            if (impl.TypeParameters.Length != candidate.TypeParameters.Length)
+                return false;
+
+            var ap = impl.Parameters;
+            var bp = candidate.Parameters;
+
+            if (ap.Length != bp.Length)
+                return false;
+
+            for (int i = 0; i < ap.Length; i++)
+            {
+                if (ap[i].RefKind != bp[i].RefKind)
+                    return false;
+
+                if (ap[i].IsReadOnlyRef != bp[i].IsReadOnlyRef)
+                    return false;
+
+                if (!ReferenceEquals(ap[i].Type, bp[i].Type))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool SameExplicitPropertySignature(PropertySymbol impl, PropertySymbol candidate)
+        {
+            var ap = impl.Parameters;
+            var bp = candidate.Parameters;
+
+            if (ap.Length != bp.Length)
+                return false;
+
+            for (int i = 0; i < ap.Length; i++)
+            {
+                if (ap[i].RefKind != bp[i].RefKind)
+                    return false;
+
+                if (ap[i].IsReadOnlyRef != bp[i].IsReadOnlyRef)
+                    return false;
+
+                if (!ReferenceEquals(ap[i].Type, bp[i].Type))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static IEnumerable<NamedTypeSymbol> EnumerateInterfaceClosure(NamedTypeSymbol root)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+            queue.Enqueue(root);
+
+            while (queue.Count != 0)
+            {
+                var cur = queue.Dequeue();
+                if (!seen.Add(cur))
+                    continue;
+
+                yield return cur;
+
+                var ifaces = cur.Interfaces;
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
+        }
+        private static bool ImplementsInterface(NamedTypeSymbol type, NamedTypeSymbol target)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+
+            for (NamedTypeSymbol? cur = type; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
+            {
+                var ifaces = cur.Interfaces;
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
+
+            while (queue.Count != 0)
+            {
+                var cur = queue.Dequeue();
+                if (!seen.Add(cur))
+                    continue;
+
+                if (ReferenceEquals(cur, target))
+                    return true;
+
+                var ifaces = cur.Interfaces;
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
+
+            return false;
+        }
+
+        private static void ValidateExplicitInterfaceMemberModifiers(
+            SyntaxTree tree,
+            SyntaxTokenList modifiers,
+            SyntaxNode syntax,
+            DiagnosticBag diagnostics)
+        {
+            if (HasModifier(modifiers, SyntaxKind.PublicKeyword) ||
+                HasModifier(modifiers, SyntaxKind.PrivateKeyword) ||
+                HasModifier(modifiers, SyntaxKind.ProtectedKeyword) ||
+                HasModifier(modifiers, SyntaxKind.InternalKeyword))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE009",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementation cannot declare an accessibility modifier.",
+                    new Location(tree, syntax.Span)));
+            }
+
+            if (HasModifier(modifiers, SyntaxKind.AbstractKeyword) ||
+                HasModifier(modifiers, SyntaxKind.VirtualKeyword) ||
+                HasModifier(modifiers, SyntaxKind.OverrideKeyword))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE010",
+                    DiagnosticSeverity.Error,
+                    "Explicit interface implementation cannot be abstract, virtual, or override.",
+                    new Location(tree, syntax.Span)));
+            }
+        }
+
+        private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
+        {
+            for (int i = 0; i < mods.Count; i++)
+            {
+                var m = mods[i];
+                if (m.Kind == kind)
+                    return true;
+                if (m.Kind == SyntaxKind.IdentifierToken && m.ContextualKind == kind)
+                    return true;
+            }
+            return false;
+        }
+    }
     internal static class BaseTypeBinder
     {
         private sealed class NullRecorder : IBindingRecorder
@@ -2323,7 +3203,12 @@ namespace Cnidaria.Cs
         }
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
-            var desiredBase = new Dictionary<SourceNamedTypeSymbol, BaseClassInfo>();
+            var desiredBase = new Dictionary<SourceNamedTypeSymbol, BaseClassInfo>(
+                ReferenceEqualityComparer<SourceNamedTypeSymbol>.Instance);
+
+            var desiredInterfaces = new Dictionary<SourceNamedTypeSymbol, HashSet<NamedTypeSymbol>>(
+                ReferenceEqualityComparer<SourceNamedTypeSymbol>.Instance);
+
             for (int ti = 0; ti < trees.Length; ti++)
             {
                 var tree = trees[ti];
@@ -2331,6 +3216,7 @@ namespace Cnidaria.Cs
                 var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, NullRecorder.Instance, diagnostics);
                 var safeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
                 var unsafeTypeBinder = new TypeBinder(parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, importScopeMap: importScopeMap);
+
                 if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
                     continue;
 
@@ -2340,43 +3226,62 @@ namespace Cnidaria.Cs
                         continue;
                     if (kv.Value is not SourceNamedTypeSymbol typeSymbol)
                         continue;
+
                     var baseList = GetBaseList(typeSyntax);
                     if (baseList is null || baseList.Types.Count == 0)
                         continue;
 
-                    if (typeSymbol.TypeKind != TypeKind.Class)
-                        continue;
-
                     var binder = HasModifier(typeSyntax.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
                     var ctx = new BindingContext(
-                         compilation: compilation,
-                         semanticModel: stubModel,
-                         containingSymbol: typeSymbol,
-                         recorder: NullRecorder.Instance);
+                        compilation: compilation,
+                        semanticModel: stubModel,
+                        containingSymbol: typeSymbol,
+                        recorder: NullRecorder.Instance);
 
-                    if (!TryResolveDeclaredBaseClass(typeSymbol, baseList, binder, ctx, diagnostics, out var baseClass))
-                        continue;
-
-                    if (baseClass is null)
-                        continue; // only interfaces in the base list 
-
-                    var loc = new Location(tree, baseList.Span);
-
-                    if (!desiredBase.TryGetValue(typeSymbol, out var existing))
+                    // Interfaces for class / struct / interface
+                    var ifaces = ResolveDeclaredInterfaces(typeSymbol, baseList, binder, ctx, diagnostics);
+                    if (!ifaces.IsDefaultOrEmpty)
                     {
-                        desiredBase[typeSymbol] = new BaseClassInfo(baseClass, loc);
+                        if (!desiredInterfaces.TryGetValue(typeSymbol, out var set))
+                        {
+                            set = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+                            desiredInterfaces.Add(typeSymbol, set);
+                        }
+
+                        for (int i = 0; i < ifaces.Length; i++)
+                            set.Add(ifaces[i]);
                     }
-                    else if (!ReferenceEquals(existing.BaseType, baseClass))
+
+                    // Base class only for class
+                    if (typeSymbol.TypeKind == TypeKind.Class)
                     {
-                        diagnostics.Add(new Diagnostic(
-                            "CN_BASE001",
-                            DiagnosticSeverity.Error,
-                            $"Partial declarations of '{typeSymbol.Name}' specify different base classes ('{existing.BaseType.Name}' vs '{baseClass.Name}').",
-                            loc));
+                        if (!TryResolveDeclaredBaseClass(typeSymbol, baseList, binder, ctx, diagnostics, out var baseClass))
+                            continue;
+
+                        if (baseClass is null)
+                            continue;
+
+                        var loc = new Location(tree, baseList.Span);
+                        if (!desiredBase.TryGetValue(typeSymbol, out var existing))
+                        {
+                            desiredBase[typeSymbol] = new BaseClassInfo(baseClass, loc);
+                        }
+                        else if (!ReferenceEquals(existing.BaseType, baseClass))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_BASE001",
+                                DiagnosticSeverity.Error,
+                                $"Partial declarations of '{typeSymbol.Name}' specify different base classes ('{existing.BaseType.Name}' vs '{baseClass.Name}').",
+                                loc));
+                        }
+                    }
+                    else
+                    {
+                        ValidateOnlyInterfacesInBaseList(typeSymbol, baseList, binder, ctx, diagnostics);
                     }
                 }
             }
-            // Break cycles before applying
+
             var keys = new List<SourceNamedTypeSymbol>(desiredBase.Keys);
             for (int i = 0; i < keys.Count; i++)
             {
@@ -2395,12 +3300,48 @@ namespace Cnidaria.Cs
                     desiredBase.Remove(t);
                 }
             }
-            // apply
+
             foreach (var kv in desiredBase)
-            {
                 kv.Key.SetDeclaredBaseType(kv.Value.BaseType);
+
+            foreach (var kv in desiredInterfaces)
+            {
+                var b = ImmutableArray.CreateBuilder<TypeSymbol>(kv.Value.Count);
+                foreach (var iface in kv.Value)
+                    b.Add(iface);
+
+                kv.Key.SetDeclaredInterfaces(b.ToImmutable());
             }
+
             BindOverrides(compilation, trees, diagnostics);
+        }
+
+        private static void ValidateOnlyInterfacesInBaseList(
+            SourceNamedTypeSymbol declaringType,
+            BaseListSyntax baseList,
+            TypeBinder binder,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            for (int i = 0; i < baseList.Types.Count; i++)
+            {
+                var baseTypeSyntax = baseList.Types[i].Type;
+                var t = binder.BindType(baseTypeSyntax, context, diagnostics);
+
+                if (t is not NamedTypeSymbol nt || nt is ErrorTypeSymbol)
+                    continue;
+
+                if (nt.TypeKind == TypeKind.Interface)
+                    continue;
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE006",
+                    DiagnosticSeverity.Error,
+                    declaringType.TypeKind == TypeKind.Struct
+                        ? $"Struct '{declaringType.Name}' cannot have base class '{nt.Name}'; only interfaces are allowed."
+                        : $"Interface '{declaringType.Name}' cannot inherit from non-interface type '{nt.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, baseTypeSyntax.Span)));
+            }
         }
 
         private static BaseListSyntax? GetBaseList(TypeDeclarationSyntax syntax) => syntax switch
@@ -2566,12 +3507,52 @@ namespace Cnidaria.Cs
             }
             return true;
         }
+        private static ImmutableArray<NamedTypeSymbol> ResolveDeclaredInterfaces(
+            SourceNamedTypeSymbol declaringType,
+            BaseListSyntax? baseList,
+            TypeBinder binder,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (baseList is null || baseList.Types.Count == 0)
+                return ImmutableArray<NamedTypeSymbol>.Empty;
+
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var result = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
+
+            for (int i = 0; i < baseList.Types.Count; i++)
+            {
+                var baseTypeSyntax = baseList.Types[i].Type;
+                var t = binder.BindType(baseTypeSyntax, context, diagnostics);
+
+                if (t is not NamedTypeSymbol nt || nt is ErrorTypeSymbol)
+                    continue;
+
+                if (ReferenceEquals(nt, declaringType))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_IFACE_SELF001",
+                        DiagnosticSeverity.Error,
+                        $"Type '{declaringType.Name}' cannot implement itself.",
+                        new Location(context.SemanticModel.SyntaxTree, baseTypeSyntax.Span)));
+                    continue;
+                }
+
+                if (nt.TypeKind != TypeKind.Interface)
+                    continue;
+
+                if (seen.Add(nt))
+                    result.Add(nt);
+            }
+
+            return result.ToImmutable();
+        }
+
         private static bool CreatesBaseTypeCycle(
              SourceNamedTypeSymbol start,
              NamedTypeSymbol baseCandidate,
              Dictionary<SourceNamedTypeSymbol, BaseClassInfo> desiredBase)
         {
-            // Only SourceNamedTypeSymbol nodes can participate in a source cycle
             var seen = new HashSet<SourceNamedTypeSymbol>();
 
             NamedTypeSymbol? cur = baseCandidate;
@@ -3213,6 +4194,10 @@ namespace Cnidaria.Cs
 
             return @default;
         }
+        private static Accessibility GetDefaultTypeMemberAccessibility(NamedTypeSymbol container)
+            => container.TypeKind == TypeKind.Interface
+                ? Accessibility.Public
+                : Accessibility.Private;
         private void DeclareMethodDeclaration(SyntaxTree tree, MethodDeclarationSyntax syntax, NamedTypeSymbol container)
         {
             var name = syntax.Identifier.ValueText ?? "";
@@ -3222,16 +4207,32 @@ namespace Cnidaria.Cs
             var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var isVirtualKeyword = HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
             var isSealed = HasModifier(syntax.Modifiers, SyntaxKind.SealedKeyword);
-            var typeDefaultAcc = container is NamedTypeSymbol
-                ? Accessibility.Private
-                : Accessibility.Internal;
+
+            var typeDefaultAcc = GetDefaultTypeMemberAccessibility(container);
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container is NamedTypeSymbol,
+                allowProtected: container.TypeKind != TypeKind.Interface,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
+
             bool isVirtual = isVirtualKeyword || isOverride || isAbstract;
+            if (container.TypeKind == TypeKind.Interface && !isStatic)
+            {
+                if (syntax.Body is not null || syntax.ExpressionBody is not null)
+                {
+                    _diagnostics.Add(new Diagnostic(
+                        "CN_IFACE_DEFAULT001",
+                        DiagnosticSeverity.Error,
+                        "Default interface method implementations are not supported.",
+                        new Location(tree, syntax.Span)));
+                }
+
+                isAbstract = true;
+                isVirtual = true;
+                isOverride = false;
+                isSealed = false;
+            }
             // placeholder types
             var placeholderReturn = new ErrorTypeSymbol("unbound-return", containing: null, ImmutableArray<Location>.Empty);
 
@@ -3247,6 +4248,7 @@ namespace Cnidaria.Cs
                 declaredAccessibility: declaredAcc,
                 isExtensionMethod: syntax.ParameterList.Parameters.Count != 0
                     && HasModifier(syntax.ParameterList.Parameters[0].Modifiers, SyntaxKind.ThisKeyword));
+
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);
             method.SetTypeParameters(tps);
@@ -5460,6 +6462,12 @@ namespace Cnidaria.Cs
                 SpecialType.System_Int64 or
                 SpecialType.System_UInt64;
         }
+
+        private void DeclareLocal(LocalSymbol local, SyntaxNode syntax, BindingContext context)
+        {
+            _locals[local.Name] = local;
+            context.Recorder.RecordDeclared(syntax, local);
+        }
         private void ImportFlowingLocal(LocalSymbol local)
             => _locals[local.Name] = local;
         private static void AddUniqueLocal(ImmutableArray<LocalSymbol>.Builder builder, LocalSymbol local)
@@ -6118,6 +7126,12 @@ namespace Cnidaria.Cs
                 case ForStatementSyntax @for:
                     result = BindFor(@for, context, diagnostics);
                     break;
+                case ForEachStatementSyntax @foreach:
+                    result = BindForEach(@foreach, context, diagnostics);
+                    break;
+                case ForEachVariableStatementSyntax @foreachVariable:
+                    result = BindForEachVariable(@foreachVariable, context, diagnostics);
+                    break;
                 case GotoStatementSyntax @goto:
                     result = BindGoto(@goto, context, diagnostics);
                     break;
@@ -6132,6 +7146,9 @@ namespace Cnidaria.Cs
                     break;
                 case SwitchStatementSyntax sw:
                     result = BindSwitchStatement(sw, context, diagnostics);
+                    break;
+                case FixedStatementSyntax fs:
+                    result = BindFixedStatement(fs, context, diagnostics);
                     break;
 
                 default:
@@ -6187,6 +7204,9 @@ namespace Cnidaria.Cs
                     break;
                 case ThisExpressionSyntax @this:
                     result = BindThis(@this, context, diagnostics);
+                    break;
+                case BaseExpressionSyntax @base:
+                    result = BindBase(@base, context, diagnostics);
                     break;
                 case ParenthesizedExpressionSyntax paren:
                     result = BindExpression(paren.Expression, context, diagnostics);
@@ -6251,6 +7271,7 @@ namespace Cnidaria.Cs
                 case RefExpressionSyntax re:
                     result = BindRefExpression(re, context, diagnostics);
                     break;
+
 
                 case RangeExpressionSyntax r:
                     diagnostics.Add(new Diagnostic(
@@ -6508,6 +7529,388 @@ namespace Cnidaria.Cs
                 ? new BoundCheckedStatement(node, statement)
                 : new BoundUncheckedStatement(node, statement);
         }
+        private BoundStatement BindFixedStatement(
+            FixedStatementSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            EnsureUnsafe(node, context, diagnostics);
+
+            var decl = node.Declaration;
+
+            if (IsVar(decl.Type))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIXED_VAR",
+                    DiagnosticSeverity.Error,
+                    "Implicitly typed locals cannot be fixed.",
+                    new Location(context.SemanticModel.SyntaxTree, decl.Type.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            var declaredPtrType = BindType(decl.Type, context, diagnostics) as PointerTypeSymbol;
+            if (declaredPtrType is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIXED001",
+                    DiagnosticSeverity.Error,
+                    "A fixed local must have a pointer type.",
+                    new Location(context.SemanticModel.SyntaxTree, decl.Type.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            var decls = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(decl.Variables.Count);
+
+            for (int i = 0; i < decl.Variables.Count; i++)
+            {
+                var v = decl.Variables[i];
+                var name = v.Identifier.ValueText ?? string.Empty;
+
+                if (name.Length == 0)
+                    continue;
+
+                if (scope.IsNameDeclaredInEnclosingScopes(name))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LOCAL001",
+                        DiagnosticSeverity.Error,
+                        $"A local named '{name}' is already declared in this scope.",
+                        new Location(context.SemanticModel.SyntaxTree, v.Span)));
+                }
+
+                if (v.Initializer is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED002",
+                        DiagnosticSeverity.Error,
+                        "A fixed local must be initialized.",
+                        new Location(context.SemanticModel.SyntaxTree, v.Span)));
+
+                    continue;
+                }
+
+                var local = new LocalSymbol(
+                    name: name,
+                    containing: _containing,
+                    type: declaredPtrType,
+                    locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, v.Span)),
+                    isByRef: false,
+                    isConst: false,
+                    isReadOnly: true);
+
+                scope.DeclareLocal(local, v, context);
+
+                var init = scope.BindFixedInitializer(
+                    exprSyntax: v.Initializer.Value,
+                    declaredPointerType: declaredPtrType,
+                    diagnosticNode: v,
+                    context: context,
+                    diagnostics: diagnostics);
+
+                decls.Add(new BoundLocalDeclarationStatement(v, local, init));
+            }
+
+            var body = scope.BindStatement(node.Statement, context, diagnostics);
+            return new BoundFixedStatement(node, decls.ToImmutable(), body);
+        }
+        private BoundExpression BindFixedInitializer(
+            ExpressionSyntax exprSyntax,
+            PointerTypeSymbol declaredPointerType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            BoundExpression result;
+
+            if (exprSyntax is PrefixUnaryExpressionSyntax { OperatorToken.Kind: SyntaxKind.AmpersandToken } addr)
+            {
+                result = BindFixedAddressOfInitializer(addr, declaredPointerType, context, diagnostics);
+                context.Recorder.RecordBound(exprSyntax, result);
+                return result;
+            }
+
+            var expr = BindExpression(exprSyntax, context, diagnostics);
+
+            // array
+            if (expr.Type is ArrayTypeSymbol arrayType)
+            {
+                if (!GenericConstraintFacts.IsUnmanagedType(arrayType.ElementType))
+                {
+                    result = new BoundBadExpression(exprSyntax);
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED_INIT002",
+                        DiagnosticSeverity.Error,
+                        "fixed targed type must be unmanaged.",
+                        new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+                    context.Recorder.RecordBound(exprSyntax, result);
+                    return result;
+                }
+
+                var elementPtr = context.Compilation.CreatePointerType(arrayType.ElementType);
+                var conv = ClassifyConversion(new BoundTypeOnlyExpression(exprSyntax, elementPtr), declaredPointerType);
+                if (!conv.IsImplicit)
+                {
+                    result = new BoundBadExpression(exprSyntax);
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED_INIT003",
+                        DiagnosticSeverity.Error,
+                        "fixed targed type has no implicit conversion from an element type.",
+                        new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+                    context.Recorder.RecordBound(exprSyntax, result);
+                    return result;
+                }
+
+                result = new BoundFixedInitializerExpression(
+                    exprSyntax,
+                    declaredPointerType,
+                    BoundFixedInitializerKind.Array,
+                    expr,
+                    arrayType.ElementType,
+                    conv);
+
+                context.Recorder.RecordBound(exprSyntax, result);
+                return result;
+            }
+
+            // string
+            if (expr.Type.SpecialType == SpecialType.System_String)
+            {
+                var charType = context.Compilation.GetSpecialType(SpecialType.System_Char);
+                var charPtr = context.Compilation.CreatePointerType(charType);
+                var conv = ClassifyConversion(new BoundTypeOnlyExpression(exprSyntax, charPtr), declaredPointerType);
+                if (!conv.IsImplicit)
+                {
+                    result = new BoundBadExpression(exprSyntax);
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED_INIT003",
+                        DiagnosticSeverity.Error,
+                        "fixed targed type has no implicit conversion from an element type.",
+                        new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+                    context.Recorder.RecordBound(exprSyntax, result);
+                    return result;
+                }
+
+                result = new BoundFixedInitializerExpression(
+                    exprSyntax,
+                    declaredPointerType,
+                    BoundFixedInitializerKind.String,
+                    expr,
+                    charType,
+                    conv);
+
+                context.Recorder.RecordBound(exprSyntax, result);
+                return result;
+            }
+
+            // GetPinnableReference
+            if (TryBindFixedGetPinnableReference(exprSyntax, expr, declaredPointerType, context, diagnostics, out var fixedInit))
+            {
+                context.Recorder.RecordBound(exprSyntax, fixedInit);
+                return fixedInit;
+            }
+
+            result = new BoundBadExpression(exprSyntax);
+            diagnostics.Add(new Diagnostic(
+                "CN_FIXED_INIT004",
+                DiagnosticSeverity.Error,
+                "Unknown fixed expression.",
+                new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+            context.Recorder.RecordBound(exprSyntax, result);
+            return result;
+        }
+        private BoundExpression BindFixedAddressOfInitializer(
+            PrefixUnaryExpressionSyntax node,
+            PointerTypeSymbol declaredPointerType,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            EnsureUnsafe(node, context, diagnostics);
+
+            var operand = BindAssignableValue(node.Operand, context, diagnostics);
+            if (operand.HasErrors)
+                return operand;
+
+            if (operand is BoundLocalExpression bl && bl.Local.IsConst)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ADDR001",
+                    DiagnosticSeverity.Error,
+                    "Cannot take the address of a const local.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(declaredPointerType);
+                return bad;
+            }
+
+            if (operand.Type.IsReferenceType || operand.Type is ArrayTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ADDR002",
+                    DiagnosticSeverity.Error,
+                    $"Cannot take the address of managed type '{operand.Type.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(declaredPointerType);
+                return bad;
+            }
+
+            var actualPtrType = context.Compilation.CreatePointerType(operand.Type);
+            var conv = ClassifyConversion(new BoundTypeOnlyExpression(node, actualPtrType), declaredPointerType);
+
+            if (!conv.IsImplicit)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIXED_INIT003",
+                    DiagnosticSeverity.Error,
+                    "fixed target type has no implicit conversion from an element type.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(declaredPointerType);
+                return bad;
+            }
+
+            var addr = new BoundAddressOfExpression(node, actualPtrType, operand);
+
+            return new BoundFixedInitializerExpression(
+                node,
+                declaredPointerType,
+                BoundFixedInitializerKind.AddressOf,
+                addr,
+                operand.Type,
+                conv);
+        }
+        private bool TryBindFixedGetPinnableReference(
+            ExpressionSyntax exprSyntax,
+            BoundExpression receiver,
+            PointerTypeSymbol declaredPointerType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out BoundExpression result)
+        {
+            result = null!;
+
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverType is null)
+                return false;
+
+            var instanceCandidates = ImmutableArray.CreateBuilder<MethodSymbol>();
+            var extensionCandidates = ImmutableArray.CreateBuilder<MethodSymbol>();
+
+            static bool IsSuitableFixedPinnable(
+                MethodSymbol method,
+                bool expectStatic,
+                bool expectSingleReceiverParam,
+                BindingContext context)
+            {
+                if (method.IsStatic != expectStatic)
+                    return false;
+                if (method.TypeParameters.Length != 0)
+                    return false;
+
+                if (expectSingleReceiverParam)
+                {
+                    if (method.Parameters.Length != 1)
+                        return false;
+                }
+                else if (method.Parameters.Length != 0)
+                {
+                    return false;
+                }
+
+                if (!expectStatic && !AccessibilityHelper.IsAccessible(method, context))
+                    return false;
+
+                if (method.ReturnType is not ByRefTypeSymbol byRef)
+                    return false;
+
+                return GenericConstraintFacts.IsUnmanagedType(byRef.ElementType);
+            }
+
+            var methods = LookupMethods(receiverType, "GetPinnableReference");
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var m = methods[i];
+                if (IsSuitableFixedPinnable(m, expectStatic: false, expectSingleReceiverParam: false, context))
+                    instanceCandidates.Add(m);
+            }
+
+            MethodSymbol? chosenMethod = null;
+
+            if (instanceCandidates.Count != 0)
+            {
+                if (instanceCandidates.Count != 1)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED_INIT005",
+                        DiagnosticSeverity.Error,
+                        "Ambiguous GetPinnableReference() for fixed initializer.",
+                        new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+
+                    result = new BoundBadExpression(exprSyntax);
+                    return true;
+                }
+
+                chosenMethod = instanceCandidates[0];
+            }
+            else
+            {
+                var ext = LookupExtensionMethods("GetPinnableReference", receiver, context);
+                for (int i = 0; i < ext.Length; i++)
+                {
+                    var m = ext[i];
+                    if (IsSuitableFixedPinnable(m, expectStatic: true, expectSingleReceiverParam: true, context))
+                        extensionCandidates.Add(m);
+                }
+
+                if (extensionCandidates.Count == 0)
+                    return false;
+
+                if (extensionCandidates.Count != 1)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIXED_INIT005",
+                        DiagnosticSeverity.Error,
+                        "Ambiguous GetPinnableReference() for fixed initializer.",
+                        new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+
+                    result = new BoundBadExpression(exprSyntax);
+                    return true;
+                }
+
+                chosenMethod = extensionCandidates[0];
+            }
+
+            var elementType = ((ByRefTypeSymbol)chosenMethod.ReturnType).ElementType;
+            var elementPtr = context.Compilation.CreatePointerType(elementType);
+            var conv = ClassifyConversion(new BoundTypeOnlyExpression(exprSyntax, elementPtr), declaredPointerType);
+
+            if (!conv.IsImplicit)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIXED_INIT003",
+                    DiagnosticSeverity.Error,
+                    "fixed target type has no implicit conversion from an element type.",
+                    new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+
+                result = new BoundBadExpression(exprSyntax);
+                return true;
+            }
+
+            result = new BoundFixedInitializerExpression(
+                exprSyntax,
+                declaredPointerType,
+                BoundFixedInitializerKind.GetPinnableReference,
+                receiver,
+                elementType,
+                conv,
+                getPinnableReferenceMethodOpt: chosenMethod);
+
+            return true;
+        }
         private BoundExpression BindIsPatternExpression(IsPatternExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var operand = BindExpression(node.Expression, context, diagnostics);
@@ -6569,19 +7972,19 @@ namespace Cnidaria.Cs
                             diagnostics);
                     }
 
-                case ConstantPatternSyntax:
-                    diagnostics.Add(new Diagnostic(
-                    "CN_PAT_IS001",
-                    DiagnosticSeverity.Error,
-                    "Constant patterns in 'is' expressions are not supported yet.",
-                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
-                    return new BoundBadExpression(wholeSyntax);
+                case ConstantPatternSyntax constantPattern:
+                    return BindConstantPatternInIs(
+                        wholeSyntax,
+                        operand,
+                        constantPattern,
+                        context,
+                        diagnostics);
 
                 case VarPatternSyntax:
                     diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS002",
                     DiagnosticSeverity.Error,
-                    "'var' patterns are not supported yet.",
+                    "'var' patterns are not supported.",
                     new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
                     return new BoundBadExpression(wholeSyntax);
 
@@ -6589,7 +7992,7 @@ namespace Cnidaria.Cs
                     diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS003",
                     DiagnosticSeverity.Error,
-                    "Discard-only patterns in 'is' expressions are not supported yet.",
+                    "Discard-only patterns in 'is' expressions are not supported.",
                     new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
                     return new BoundBadExpression(wholeSyntax);
 
@@ -6601,6 +8004,66 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
                     return new BoundBadExpression(wholeSyntax);
             }
+        }
+        private BoundExpression BindConstantPatternInIs(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            ConstantPatternSyntax pattern,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var constant = BindExpression(pattern.Expression, context, diagnostics);
+            if (constant.HasErrors)
+                return new BoundBadExpression(wholeSyntax);
+
+            if (!IsNullConstantPattern(constant))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS001",
+                    DiagnosticSeverity.Error,
+                    "Only the 'null' constant pattern is supported in 'is' expressions.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            return BindIsNullPattern(wholeSyntax, operand, pattern, context);
+        }
+        private BoundExpression BindIsNullPattern(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            ConstantPatternSyntax pattern,
+            BindingContext context)
+        {
+            var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            var nullExpr = new BoundLiteralExpression(pattern.Expression, NullTypeSymbol.Instance, null);
+
+            BoundExpression left = operand;
+            if (operand.Type.IsValueType)
+            {
+                var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object);
+                left = new BoundConversionExpression(
+                    syntax: pattern.Expression,
+                    type: objectType,
+                    operand: operand,
+                    conversion: new Conversion(ConversionKind.Boxing),
+                    isChecked: false);
+            }
+
+            var cv = FoldBooleanBinaryConstant(BoundBinaryOperatorKind.Equals, left, nullExpr);
+
+            return new BoundBinaryExpression(
+                syntax: wholeSyntax,
+                op: BoundBinaryOperatorKind.Equals,
+                type: boolType,
+                left: left,
+                right: nullExpr,
+                constantValueOpt: cv);
+        }
+        private static bool IsNullConstantPattern(BoundExpression expr)
+        {
+            return expr.Type is NullTypeSymbol
+                || (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is null);
         }
         private bool TryBindPatternDesignation(
             VariableDesignationSyntax designation,
@@ -7142,7 +8605,7 @@ namespace Cnidaria.Cs
             var byRefType = context.Compilation.CreateByRefType(refElementType);
             return new BoundRefExpression(node, byRefType, operand);
         }
-
+        
         private BoundExpression BindAddressOf(
             PrefixUnaryExpressionSyntax node, BoundExpression operand, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -7159,18 +8622,35 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (operand is BoundLocalExpression bl && bl.Local.IsConst)
+            if(operand is BoundLocalExpression bl)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_ADDR001",
-                    DiagnosticSeverity.Error,
-                    "Cannot take the address of a const local.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                if (bl.Local.IsConst)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ADDR001",
+                        DiagnosticSeverity.Error,
+                        "Cannot take the address of a const local.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
 
-                var bad = new BoundBadExpression(node);
-                bad.SetType(context.Compilation.CreatePointerType(operand.Type));
-                return bad;
+                    var bad = new BoundBadExpression(node);
+                    bad.SetType(context.Compilation.CreatePointerType(operand.Type));
+                    return bad;
+                }
+                else if(bl.Local.IsReadOnly)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ADDR_READONLYLOCAL",
+                        DiagnosticSeverity.Error,
+                        "Cannot take the address of a readonly local.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+
+                    var bad = new BoundBadExpression(node);
+                    bad.SetType(context.Compilation.CreatePointerType(operand.Type));
+                    return bad;
+                }
             }
+            
+
 
             if (operand.Type.IsReferenceType || operand.Type is ArrayTypeSymbol)
             {
@@ -7209,6 +8689,9 @@ namespace Cnidaria.Cs
         }
         private BoundExpression BindAssignment(AssignmentExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
+            if (node.Kind == SyntaxKind.SimpleAssignmentExpression && IsDeconstructionTargetSyntax(node.Left))
+                return BindDeconstructionAssignment(node, context, diagnostics);
+
             var lv = BindLValue(node.Left, context, diagnostics, requireReadable: node.Kind != SyntaxKind.SimpleAssignmentExpression);
             var leftTarget = lv.Target;
 
@@ -7223,6 +8706,15 @@ namespace Cnidaria.Cs
             {
                 diagnostics.Add(new Diagnostic("CN_ASG001", DiagnosticSeverity.Error,
                     "Cannot assign to a const local.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
+                hasErrors = true;
+            }
+            if (!leftTarget.HasErrors && IsReadOnlyLocalTarget(leftTarget))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_READONLYLOCAL",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to a readonly local.",
                     new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
                 hasErrors = true;
             }
@@ -7373,7 +8865,517 @@ namespace Cnidaria.Cs
                 usesDirectOperator: false,
                 isChecked: isChecked);
         }
+        private BoundExpression BindDeconstructionAssignment(
+            AssignmentExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var right = BindExpression(node.Right, context, diagnostics);
+            if (right.HasErrors)
+                return new BoundBadExpression(node);
 
+            if (!TryGetTupleElementTypes(right.Type, out _))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DECONSTR000",
+                    DiagnosticSeverity.Error,
+                    $"Cannot deconstruct an expression of type '{right.Type.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Right.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
+            var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
+
+            var rhsTemp = NewTemp("$deconstruct_tmp", right.Type);
+            locals.Add(rhsTemp);
+            sideEffects.Add(new BoundLocalDeclarationStatement(node, rhsTemp, right));
+
+            var rhsTempExpr = new BoundLocalExpression(node, rhsTemp);
+            BindDeconstructionTarget(
+                targetSyntax: node.Left,
+                source: rhsTempExpr,
+                sourceType: right.Type,
+                context: context,
+                diagnostics: diagnostics,
+                locals: locals,
+                sideEffects: sideEffects);
+
+            return new BoundSequenceExpression(
+                node,
+                locals.ToImmutable(),
+                sideEffects.ToImmutable(),
+                rhsTempExpr);
+        }
+        private void BindDeconstructionTarget(
+            ExpressionSyntax targetSyntax,
+            BoundExpression source,
+            TypeSymbol sourceType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            ImmutableArray<LocalSymbol>.Builder locals,
+            ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            switch (targetSyntax)
+            {
+                case ParenthesizedExpressionSyntax paren:
+                    BindDeconstructionTarget(paren.Expression, source, sourceType, context, diagnostics, locals, sideEffects);
+                    return;
+
+                case TupleExpressionSyntax tuple:
+                    BindTupleDeconstructionTarget(tuple, source, sourceType, context, diagnostics, locals, sideEffects);
+                    return;
+
+                case DeclarationExpressionSyntax declaration:
+                    BindDeclarationDeconstructionTarget(declaration, source, sourceType, context, diagnostics, locals, sideEffects);
+                    return;
+
+                default:
+                    BindLeafDeconstructionAssignment(targetSyntax, source, context, diagnostics, sideEffects);
+                    return;
+            }
+        }
+        private void BindTupleDeconstructionTarget(
+    TupleExpressionSyntax tuple,
+    BoundExpression source,
+    TypeSymbol sourceType,
+    BindingContext context,
+    DiagnosticBag diagnostics,
+    ImmutableArray<LocalSymbol>.Builder locals,
+    ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            if (!TryGetTupleElementTypes(sourceType, out var sourceElements))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DECONSTR001",
+                    DiagnosticSeverity.Error,
+                    $"Cannot deconstruct source of type '{sourceType.Name}' as a tuple.",
+                    new Location(context.SemanticModel.SyntaxTree, tuple.Span)));
+                return;
+            }
+
+            if (tuple.Arguments.Count != sourceElements.Length)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DECONSTR002",
+                    DiagnosticSeverity.Error,
+                    $"Tuple deconstruction expects {tuple.Arguments.Count} element(s), but source has {sourceElements.Length}.",
+                    new Location(context.SemanticModel.SyntaxTree, tuple.Span)));
+            }
+
+            int n = Math.Min(tuple.Arguments.Count, sourceElements.Length);
+            for (int i = 0; i < n; i++)
+            {
+                var arg = tuple.Arguments[i];
+                if (arg.NameColon is not null || arg.RefKindKeyword is not null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_DECONSTR003",
+                        DiagnosticSeverity.Error,
+                        "Named and ref tuple elements are not supported on the left-hand side of deconstruction.",
+                        new Location(context.SemanticModel.SyntaxTree, arg.Span)));
+                    continue;
+                }
+
+                var sourceElement = MakeTupleElementRead(arg.Expression, source, sourceType, i, sourceElements[i]);
+                BindDeconstructionTarget(arg.Expression, sourceElement, sourceElements[i], context, diagnostics, locals, sideEffects);
+            }
+        }
+
+        private void BindDeclarationDeconstructionTarget(
+            DeclarationExpressionSyntax declaration,
+            BoundExpression source,
+            TypeSymbol sourceType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            ImmutableArray<LocalSymbol>.Builder locals,
+            ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            if (declaration.Designation is SingleVariableDesignationSyntax single)
+            {
+                TypeSymbol localType;
+                if (IsVar(declaration.Type))
+                {
+                    if (sourceType is NullTypeSymbol ||
+                        sourceType.SpecialType == SpecialType.System_Void ||
+                        sourceType is ErrorTypeSymbol)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_DECONSTR004",
+                            DiagnosticSeverity.Error,
+                            "Cannot infer the type of a deconstruction variable from this source element.",
+                            new Location(context.SemanticModel.SyntaxTree, declaration.Span)));
+                        localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
+                    }
+                    else
+                    {
+                        localType = sourceType;
+                    }
+                }
+                else
+                {
+                    localType = BindType(declaration.Type, context, diagnostics);
+                }
+
+                BindSingleDeconstructionLocal(single, declaration, localType, source, context, diagnostics, locals, sideEffects);
+                return;
+            }
+
+            if (declaration.Designation is ParenthesizedVariableDesignationSyntax paren)
+            {
+                TypeSymbol declaredTupleType = IsVar(declaration.Type)
+                    ? sourceType
+                    : BindType(declaration.Type, context, diagnostics);
+
+                BindDeconstructionDesignation(
+                    paren,
+                    declaredTupleType,
+                    source,
+                    sourceType,
+                    context,
+                    diagnostics,
+                    locals,
+                    sideEffects);
+                return;
+            }
+
+            if (declaration.Designation is DiscardDesignationSyntax)
+                return;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_DECONSTR005",
+                DiagnosticSeverity.Error,
+                "Unsupported declaration form in deconstruction target.",
+                new Location(context.SemanticModel.SyntaxTree, declaration.Span)));
+        }
+
+        private void BindDeconstructionDesignation(
+            VariableDesignationSyntax designation,
+            TypeSymbol targetType,
+            BoundExpression source,
+            TypeSymbol sourceType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            ImmutableArray<LocalSymbol>.Builder locals,
+            ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            switch (designation)
+            {
+                case DiscardDesignationSyntax:
+                    return;
+
+                case SingleVariableDesignationSyntax single:
+                    BindSingleDeconstructionLocal(single, designation, targetType, source, context, diagnostics, locals, sideEffects);
+                    return;
+
+                case ParenthesizedVariableDesignationSyntax paren:
+                    if (!TryGetTupleElementTypes(targetType, out var targetElements))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_DECONSTR006",
+                            DiagnosticSeverity.Error,
+                            $"Type '{targetType.Name}' is not a tuple type and cannot be used with a parenthesized designation.",
+                            new Location(context.SemanticModel.SyntaxTree, paren.Span)));
+                        return;
+                    }
+
+                    if (!TryGetTupleElementTypes(sourceType, out var sourceElements))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_DECONSTR007",
+                            DiagnosticSeverity.Error,
+                            $"Cannot deconstruct source of type '{sourceType.Name}' as a tuple.",
+                            new Location(context.SemanticModel.SyntaxTree, paren.Span)));
+                        return;
+                    }
+
+                    if (paren.Variables.Count != targetElements.Length || paren.Variables.Count != sourceElements.Length)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_DECONSTR008",
+                            DiagnosticSeverity.Error,
+                            "Tuple deconstruction arity does not match the target designation.",
+                            new Location(context.SemanticModel.SyntaxTree, paren.Span)));
+                    }
+
+                    int n = Math.Min(paren.Variables.Count, Math.Min(targetElements.Length, sourceElements.Length));
+                    for (int i = 0; i < n; i++)
+                    {
+                        var sourceElement = MakeTupleElementRead(SyntheticExpression(source.Syntax), source, sourceType, i, sourceElements[i]);
+                        BindDeconstructionDesignation(
+                            paren.Variables[i],
+                            targetElements[i],
+                            sourceElement,
+                            sourceElements[i],
+                            context,
+                            diagnostics,
+                            locals,
+                            sideEffects);
+                    }
+                    return;
+
+                default:
+                    diagnostics.Add(new Diagnostic(
+                        "CN_DECONSTR009",
+                        DiagnosticSeverity.Error,
+                        "Unsupported variable designation in deconstruction.",
+                        new Location(context.SemanticModel.SyntaxTree, designation.Span)));
+                    return;
+            }
+        }
+
+        private void BindSingleDeconstructionLocal(
+            SingleVariableDesignationSyntax single,
+            SyntaxNode ownerSyntax,
+            TypeSymbol localType,
+            BoundExpression source,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            ImmutableArray<LocalSymbol>.Builder locals,
+            ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            var name = single.Identifier.ValueText ?? string.Empty;
+            if (name.Length == 0)
+                return;
+
+            if (IsNameDeclaredInEnclosingScopes(name))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DECONSTR010",
+                    DiagnosticSeverity.Error,
+                    $"A local named '{name}' is already declared in this scope.",
+                    new Location(context.SemanticModel.SyntaxTree, single.Span)));
+            }
+
+            var local = new LocalSymbol(
+                name: name,
+                containing: _containing,
+                type: localType,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, single.Span)),
+                isConst: false,
+                constantValueOpt: Optional<object>.None,
+                isByRef: false);
+
+            _locals[name] = local;
+
+            context.Recorder.RecordDeclared(single, local);
+
+            var initializer = ApplyConversion(
+                exprSyntax: source.Syntax as ExpressionSyntax ?? SyntheticExpression(ownerSyntax),
+                expr: source,
+                targetType: localType,
+                diagnosticNode: ownerSyntax,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            sideEffects.Add(new BoundLocalDeclarationStatement(ownerSyntax, local, initializer));
+        }
+
+        private void BindLeafDeconstructionAssignment(
+            ExpressionSyntax targetSyntax,
+            BoundExpression source,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            ImmutableArray<BoundStatement>.Builder sideEffects)
+        {
+            var lv = BindLValue(targetSyntax, context, diagnostics, requireReadable: false);
+            var target = lv.Target;
+            bool hasErrors = target.HasErrors || source.HasErrors;
+
+            if (!target.HasErrors && target is BoundLocalExpression le && le.Local.IsConst)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG001",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to a const local.",
+                    new Location(context.SemanticModel.SyntaxTree, targetSyntax.Span)));
+                hasErrors = true;
+            }
+            if (!target.HasErrors && IsReadOnlyLocalTarget(target))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_READONLYLOCAL",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to a readonly local.",
+                    new Location(context.SemanticModel.SyntaxTree, targetSyntax.Span)));
+                hasErrors = true;
+            }
+            if (!target.HasErrors && IsReadOnlyByRefParameterTarget(target))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_READONLYREF001",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to a readonly by-ref parameter.",
+                    new Location(context.SemanticModel.SyntaxTree, targetSyntax.Span)));
+                hasErrors = true;
+            }
+
+            var converted = target.HasErrors
+                ? source
+                : ApplyConversion(
+                    exprSyntax: source.Syntax as ExpressionSyntax ?? SyntheticExpression(targetSyntax),
+                    expr: source,
+                    targetType: target.Type,
+                    diagnosticNode: targetSyntax,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+            hasErrors |= converted.HasErrors;
+
+            var assignment = new BoundAssignmentExpression(targetSyntax, target, converted);
+            if (hasErrors)
+                assignment.SetHasErrors();
+
+            sideEffects.Add(new BoundExpressionStatement(targetSyntax, assignment));
+        }
+        private BoundExpression MakeTupleElementRead(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            TypeSymbol receiverType,
+            int elementIndex,
+            TypeSymbol elementType)
+        {
+            if (receiverType is TupleTypeSymbol tuple)
+            {
+                var field = new TupleElementFieldSymbol("Item" + (elementIndex + 1).ToString(), tuple, elementIndex, elementType);
+                return new BoundMemberAccessExpression(syntax, receiver, field, elementType, isLValue: false);
+            }
+
+            if (receiverType is NamedTypeSymbol valueTupleType && IsSystemValueTupleType(valueTupleType))
+            {
+                BoundExpression current = receiver;
+                NamedTypeSymbol currentType = valueTupleType;
+                int index = elementIndex;
+
+                while (currentType.Arity == 8 && index >= 7)
+                {
+                    var restField = FindInstanceField(currentType, "Rest");
+                    if (restField is null || restField.Type is not NamedTypeSymbol nextType)
+                        return new BoundBadExpression(syntax);
+
+                    current = new BoundMemberAccessExpression(syntax, current, restField, restField.Type, isLValue: false);
+                    currentType = nextType;
+                    index -= 7;
+                }
+
+                var itemField = FindInstanceField(currentType, "Item" + (index + 1).ToString());
+                if (itemField is null)
+                    return new BoundBadExpression(syntax);
+
+                return new BoundMemberAccessExpression(syntax, current, itemField, elementType, isLValue: false);
+            }
+
+            return new BoundBadExpression(syntax);
+        }
+
+        private static bool TryGetTupleElementTypes(TypeSymbol type, out ImmutableArray<TypeSymbol> elementTypes)
+        {
+            if (type is TupleTypeSymbol tuple)
+            {
+                elementTypes = tuple.ElementTypes;
+                return true;
+            }
+
+            if (type is NamedTypeSymbol named && IsSystemValueTupleType(named))
+            {
+                var builder = ImmutableArray.CreateBuilder<TypeSymbol>();
+                if (TryAppendValueTupleElementTypes(named, builder))
+                {
+                    elementTypes = builder.ToImmutable();
+                    return true;
+                }
+            }
+
+            elementTypes = ImmutableArray<TypeSymbol>.Empty;
+            return false;
+        }
+
+        private static bool TryAppendValueTupleElementTypes(NamedTypeSymbol named, ImmutableArray<TypeSymbol>.Builder builder)
+        {
+            if (!IsSystemValueTupleType(named))
+                return false;
+
+            var args = named.TypeArguments;
+            int arity = args.Length;
+
+            if (arity <= 7)
+            {
+                for (int i = 0; i < arity; i++)
+                    builder.Add(args[i]);
+                return true;
+            }
+
+            if (arity != 8)
+                return false;
+
+            for (int i = 0; i < 7; i++)
+                builder.Add(args[i]);
+
+            return args[7] is NamedTypeSymbol rest && TryAppendValueTupleElementTypes(rest, builder);
+        }
+
+        private static bool IsSystemValueTupleType(NamedTypeSymbol named)
+        {
+            var def = named.OriginalDefinition;
+            return StringComparer.Ordinal.Equals(def.Name, "ValueTuple") &&
+                   IsNamespaceFullName(def.ContainingSymbol, "System");
+        }
+        private static bool IsNamespaceFullName(Symbol? symbol, string fullName)
+        {
+            if (symbol is not NamespaceSymbol ns)
+                return false;
+
+            if (ns.IsGlobalNamespace)
+                return fullName.Length == 0;
+
+            var parts = new Stack<string>();
+            for (Symbol? cur = ns; cur is NamespaceSymbol n && !n.IsGlobalNamespace; cur = n.ContainingSymbol)
+                parts.Push(n.Name);
+
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (var part in parts)
+            {
+                if (!first)
+                    sb.Append('.');
+                sb.Append(part);
+                first = false;
+            }
+
+            return StringComparer.Ordinal.Equals(sb.ToString(), fullName);
+        }
+        private static FieldSymbol? FindInstanceField(NamedTypeSymbol type, string name)
+        {
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is FieldSymbol field &&
+                    !field.IsStatic &&
+                    StringComparer.Ordinal.Equals(field.Name, name))
+                {
+                    return field;
+                }
+            }
+
+            return null;
+        }
+        private static ExpressionSyntax SyntheticExpression(SyntaxNode syntax)
+            => syntax as ExpressionSyntax ?? new IdentifierNameSyntax(default);
+        private static bool IsDeconstructionTargetSyntax(ExpressionSyntax syntax)
+        {
+            if (syntax is null)
+                return false;
+
+            return syntax switch
+            {
+                TupleExpressionSyntax => true,
+                DeclarationExpressionSyntax de when de.Designation is ParenthesizedVariableDesignationSyntax => true,
+                ParenthesizedExpressionSyntax p => IsDeconstructionTargetSyntax(p.Expression),
+                _ => false
+            };
+        }
         private static bool IsDirectOperatorTarget(BoundExpression target)
         {
             return target switch
@@ -8028,6 +10030,11 @@ namespace Cnidaria.Cs
         {
             return expr is BoundParameterExpression p && p.Parameter.IsReadOnlyRef;
         }
+        private static bool IsReadOnlyLocalTarget(BoundExpression expr)
+            => expr is BoundLocalExpression l && l.Local.IsReadOnly;
+
+        private static bool IsReadOnlyTarget(BoundExpression expr)
+            => IsReadOnlyLocalTarget(expr) || IsReadOnlyByRefParameterTarget(expr);
         private static bool IsInsideIntrinsicMethod(BindingContext context)
         {
             if (context.ContainingSymbol is not MethodSymbol method)
@@ -8175,7 +10182,15 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, argSyntax.Expression.Span)));
                 return new BoundBadExpression(argSyntax);
             }
-
+            if (!isReadOnlyPass && IsReadOnlyLocalTarget(operand))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_REF_READONLYLOCAL",
+                    DiagnosticSeverity.Error,
+                    "Cannot use a readonly local as a writable ref.",
+                    new Location(context.SemanticModel.SyntaxTree, argSyntax.Expression.Span)));
+                return new BoundBadExpression(argSyntax);
+            }
             if (!isReadOnlyPass &&
                 operand is BoundParameterExpression pe &&
                 pe.Parameter.IsReadOnlyRef &&
@@ -8713,6 +10728,19 @@ namespace Cnidaria.Cs
                 receiverType = BindType(pts, context, diagnostics) as NamedTypeSymbol;
                 return true;
             }
+            if (receiverSyntax is BaseExpressionSyntax bs)
+            {
+                receiverValue = BindBase(bs, context, diagnostics);
+
+                if (receiverValue is BoundBaseExpression bb)
+                {
+                    receiverType = bb.BaseType;
+                    return true;
+                }
+
+                receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type);
+                return true;
+            }
 
             receiverValue = BindExpression(receiverSyntax, context, diagnostics);
             receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type);
@@ -9076,24 +11104,111 @@ namespace Cnidaria.Cs
         }
         private static ImmutableArray<Symbol> LookupMembers(NamedTypeSymbol type, string name)
         {
+            var b = ImmutableArray.CreateBuilder<Symbol>();
+
+            if (type.TypeKind == TypeKind.Interface)
+            {
+                foreach (var t in EnumerateInterfaceClosure(type))
+                {
+                    var all = t.GetMembers();
+                    for (int i = 0; i < all.Length; i++)
+                    {
+                        var m = all[i];
+                        if (!StringComparer.Ordinal.Equals(m.Name, name))
+                            continue;
+
+                        if (m is MethodSymbol ms && ms.ExplicitInterfaceImplementation is not null)
+                            continue;
+                        if (m is PropertySymbol ps && ps.ExplicitInterfaceImplementation is not null)
+                            continue;
+
+                        b.Add(m);
+                    }
+                }
+
+                return b.ToImmutable();
+            }
+
             for (NamedTypeSymbol? t = type; t != null; t = t.BaseType as NamedTypeSymbol)
             {
                 var all = t.GetMembers();
-                var b = ImmutableArray.CreateBuilder<Symbol>();
                 for (int i = 0; i < all.Length; i++)
                 {
                     var m = all[i];
-                    if (StringComparer.Ordinal.Equals(m.Name, name))
-                        b.Add(m);
+                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                        continue;
+
+                    if (m is MethodSymbol ms && ms.ExplicitInterfaceImplementation is not null)
+                        continue;
+                    if (m is PropertySymbol ps && ps.ExplicitInterfaceImplementation is not null)
+                        continue;
+
+                    b.Add(m);
                 }
+
                 if (b.Count != 0)
                     return b.ToImmutable();
             }
+
             return ImmutableArray<Symbol>.Empty;
+        }
+        private static IEnumerable<NamedTypeSymbol> EnumerateInterfaceClosure(NamedTypeSymbol root)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+            queue.Enqueue(root);
+
+            while (queue.Count != 0)
+            {
+                var cur = queue.Dequeue();
+                if (!seen.Add(cur))
+                    continue;
+
+                yield return cur;
+
+                var ifaces = cur.Interfaces;
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface)
+                        queue.Enqueue(nt);
+                }
+            }
         }
         private static ImmutableArray<MethodSymbol> LookupMethods(NamedTypeSymbol type, string name)
         {
             var b = ImmutableArray.CreateBuilder<MethodSymbol>();
+
+            if (type.TypeKind == TypeKind.Interface)
+            {
+                foreach (var t in EnumerateInterfaceClosure(type))
+                {
+                    var members = t.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is MethodSymbol ms &&
+                            !ms.IsConstructor &&
+                            ms.ExplicitInterfaceImplementation is null &&
+                            StringComparer.Ordinal.Equals(ms.Name, name))
+                        {
+                            bool dup = false;
+                            for (int j = 0; j < b.Count; j++)
+                            {
+                                if (SameSignature(b[j], ms))
+                                {
+                                    dup = true;
+                                    break;
+                                }
+                            }
+
+                            if (!dup)
+                                b.Add(ms);
+                        }
+                    }
+                }
+
+                return b.ToImmutable();
+            }
+
             for (NamedTypeSymbol? t = type; t != null; t = t.BaseType as NamedTypeSymbol)
             {
                 var members = t.GetMembers();
@@ -9101,6 +11216,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is MethodSymbol ms &&
                         !ms.IsConstructor &&
+                        ms.ExplicitInterfaceImplementation is null &&
                         StringComparer.Ordinal.Equals(ms.Name, name))
                     {
                         bool dup = false;
@@ -9112,11 +11228,13 @@ namespace Cnidaria.Cs
                                 break;
                             }
                         }
+
                         if (!dup)
                             b.Add(ms);
                     }
                 }
             }
+
             return b.ToImmutable();
         }
         private static bool SameSignature(MethodSymbol a, MethodSymbol b)
@@ -9145,7 +11263,9 @@ namespace Cnidaria.Cs
                 var members = t.GetMembers();
                 for (int i = 0; i < members.Length; i++)
                 {
-                    if (members[i] is PropertySymbol p && p.Parameters.Length != 0)
+                    if (members[i] is PropertySymbol p && 
+                        p.ExplicitInterfaceImplementation is null 
+                        && p.Parameters.Length != 0)
                         builder.Add(p);
                 }
 
@@ -10136,7 +12256,7 @@ namespace Cnidaria.Cs
             method = chosen;
             result = new BoundCallExpression(node, receiverOpt: leftTarget, chosen, convertedArgs);
             return true;
-
+            
         }
         private static bool IsOnlyNoApplicableOverload(DiagnosticBag diagnostics)
         {
@@ -10588,7 +12708,7 @@ namespace Cnidaria.Cs
         }
         private BoundExpression BindPrefixIncrementOrDecrement(
             PrefixUnaryExpressionSyntax node,
-            bool isIncrement,
+            bool isIncrement, 
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -10636,6 +12756,15 @@ namespace Cnidaria.Cs
             {
                 diagnostics.Add(new Diagnostic("CN_ASG001", DiagnosticSeverity.Error,
                     "Cannot assign to a const local.",
+                    new Location(context.SemanticModel.SyntaxTree, operandSyntax.Span)));
+                return new BoundBadExpression(operatorSyntax);
+            }
+            if (IsReadOnlyLocalTarget(leftTarget))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_READONLYLOCAL_INCDEC",
+                    DiagnosticSeverity.Error,
+                    "Cannot modify a readonly local.",
                     new Location(context.SemanticModel.SyntaxTree, operandSyntax.Span)));
                 return new BoundBadExpression(operatorSyntax);
             }
@@ -11569,14 +13698,6 @@ namespace Cnidaria.Cs
             }
 
             return false;
-
-            static bool HasImplicitReferenceConversion(TypeSymbol from, TypeSymbol to)
-            {
-                if (!from.IsReferenceType || !to.IsReferenceType) return false;
-                for (var t = from; t != null; t = t.BaseType)
-                    if (ReferenceEquals(t, to)) return true;
-                return false;
-            }
         }
         private BoundExpression BindRelationalBinary(
             BinaryExpressionSyntax bin,
@@ -14871,6 +16992,63 @@ namespace Cnidaria.Cs
 
             return new BoundThisExpression(node, containingType);
         }
+        private BoundExpression BindBase(
+            BaseExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (context.ContainingSymbol is not MethodSymbol method)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE001",
+                    DiagnosticSeverity.Error,
+                    "The 'base' keyword is only valid in instance members.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (method.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE002",
+                    DiagnosticSeverity.Error,
+                    "Cannot use 'base' in a static method.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE003",
+                    DiagnosticSeverity.Error,
+                    "Cannot resolve containing type for 'base'.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (containingType.TypeKind != TypeKind.Class)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE004",
+                    DiagnosticSeverity.Error,
+                    "The 'base' keyword is only valid in classes.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (containingType.BaseType is not NamedTypeSymbol baseType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_BASE005",
+                    DiagnosticSeverity.Error,
+                    $"Type '{containingType.Name}' does not have a base type.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            return new BoundBaseExpression(node, containingType, baseType);
+        }
         public override TypeSymbol BindType(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics)
         {
             if (syntax is PointerTypeSyntax p)
@@ -15061,7 +17239,10 @@ namespace Cnidaria.Cs
                 ? new BaseExpressionSyntax(initSyntax.ThisOrBaseKeyword)
                 : new ThisExpressionSyntax(initSyntax.ThisOrBaseKeyword);
 
-            var receiver = new BoundThisExpression(receiverSyntax, containingType);
+            BoundExpression receiver = isBaseInitializer
+                ? new BoundBaseExpression(receiverSyntax, containingType, targetType)
+                : new BoundThisExpression(receiverSyntax, containingType);
+
             var call = new BoundCallExpression(initSyntax, receiver, chosen!, convertedArgs);
             var stmt = new BoundExpressionStatement(initSyntax, call);
 
@@ -15589,9 +17770,64 @@ namespace Cnidaria.Cs
                     $"{OperatorPrefix}Implicit",
                     $"{OperatorPrefix}Explicit");
         }
+        public static bool AreSameType(TypeSymbol? a, TypeSymbol? b)
+        {
+            if (ReferenceEquals(a, b))
+                return true;
+
+            if (a is null || b is null)
+                return false;
+
+            if (a.Kind != b.Kind)
+                return false;
+
+            switch (a, b)
+            {
+                case (ArrayTypeSymbol aa, ArrayTypeSymbol bb):
+                    return aa.Rank == bb.Rank &&
+                           AreSameType(aa.ElementType, bb.ElementType);
+
+                case (PointerTypeSymbol aa, PointerTypeSymbol bb):
+                    return AreSameType(aa.PointedAtType, bb.PointedAtType);
+
+                case (ByRefTypeSymbol aa, ByRefTypeSymbol bb):
+                    return AreSameType(aa.ElementType, bb.ElementType);
+
+                case (TupleTypeSymbol aa, TupleTypeSymbol bb):
+                    if (aa.ElementTypes.Length != bb.ElementTypes.Length)
+                        return false;
+                    for (int i = 0; i < aa.ElementTypes.Length; i++)
+                    {
+                        if (!AreSameType(aa.ElementTypes[i], bb.ElementTypes[i]))
+                            return false;
+                    }
+                    return true;
+
+                case (NamedTypeSymbol aa, NamedTypeSymbol bb):
+                    if (!ReferenceEquals(aa.OriginalDefinition, bb.OriginalDefinition))
+                        return false;
+
+                    var aaArgs = aa.TypeArguments;
+                    var bbArgs = bb.TypeArguments;
+
+                    if (aaArgs.Length != bbArgs.Length)
+                        return false;
+
+                    for (int i = 0; i < aaArgs.Length; i++)
+                    {
+                        if (!AreSameType(aaArgs[i], bbArgs[i]))
+                            return false;
+                    }
+
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
         internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target)
         {
-            if (ReferenceEquals(expr.Type, target))
+            if (AreSameType(expr.Type, target))
                 return new Conversion(ConversionKind.Identity);
 
             if (expr is BoundThrowExpression || expr.Type is ThrowTypeSymbol)
@@ -15715,28 +17951,15 @@ namespace Cnidaria.Cs
                 if ((tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
                     return new Conversion(ConversionKind.None);
 
-                // T -> object
                 if (target.SpecialType == SpecialType.System_Object)
                     return new Conversion(ConversionKind.Boxing);
             }
 
-            // boxing
-            if (expr.Type.IsValueType && target.SpecialType == SpecialType.System_Object)
-            {
-                if (exprHasRefLike)
-                    return new Conversion(ConversionKind.None);
-
+            if (HasImplicitBoxingConversion(expr.Type, target))
                 return new Conversion(ConversionKind.Boxing);
-            }
 
-            // unboxing explicit
-            if (expr.Type.SpecialType == SpecialType.System_Object && target.IsValueType)
-            {
-                if (targetHasRefLike)
-                    return new Conversion(ConversionKind.None);
-
+            if (HasExplicitUnboxingConversion(expr.Type, target))
                 return new Conversion(ConversionKind.Unboxing);
-            }
 
             // enum conversions
             bool exprIsEnum = IsEnumType(expr.Type);
@@ -15937,16 +18160,108 @@ namespace Cnidaria.Cs
                 };
             }
         }
+
+        private static bool ImplementsInterface(TypeSymbol source, TypeSymbol destinationInterface)
+        {
+            var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+            return ImplementsInterfaceCore(source, destinationInterface, seen);
+
+            static bool ImplementsInterfaceCore(
+                TypeSymbol current,
+                TypeSymbol destinationInterface,
+                HashSet<TypeSymbol> seen)
+            {
+                if (!seen.Add(current))
+                    return false;
+
+                var interfaces = current.Interfaces;
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    var iface = interfaces[i];
+                    if (ReferenceEquals(iface, destinationInterface))
+                        return true;
+
+                    if (ImplementsInterfaceCore(iface, destinationInterface, seen))
+                        return true;
+                }
+
+                if (current.BaseType is TypeSymbol bt)
+                    return ImplementsInterfaceCore(bt, destinationInterface, seen);
+
+                return false;
+            }
+        }
+        private static bool IsInterfaceType(TypeSymbol t)
+            => t is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface;
+        private static bool HasImplicitBoxingConversion(TypeSymbol source, TypeSymbol destination)
+        {
+            if (!source.IsValueType)
+                return false;
+
+            if (RefLikeRestrictionFacts.ContainsRefLike(source))
+                return false;
+
+            if (!destination.IsReferenceType)
+                return false;
+
+            // to object
+            if (destination.SpecialType == SpecialType.System_Object)
+                return true;
+
+            // struct to ValueType
+            if (destination.SpecialType == SpecialType.System_ValueType)
+                return !IsEnumType(source);
+
+            // enum to System.Enum
+            if (destination.SpecialType == SpecialType.System_Enum)
+                return IsEnumType(source);
+
+            // to any implemented interface
+            if (IsInterfaceType(destination) && ImplementsInterface(source, destination))
+                return true;
+
+            return false;
+        }
+        private static bool HasExplicitUnboxingConversion(TypeSymbol source, TypeSymbol destination)
+        {
+            if (!destination.IsValueType)
+                return false;
+
+            if (RefLikeRestrictionFacts.ContainsRefLike(destination))
+                return false;
+
+            if (!source.IsReferenceType)
+                return false;
+
+            // object/valueType/enum/interface to valuetype
+            if (source.SpecialType is SpecialType.System_Object
+                or SpecialType.System_ValueType
+                or SpecialType.System_Enum)
+                return true;
+
+            if (IsInterfaceType(source))
+                return true;
+
+            return false;
+        }
         private static bool HasImplicitReferenceConversion(TypeSymbol source, TypeSymbol destination)
         {
             if (!source.IsReferenceType || !destination.IsReferenceType)
                 return false;
 
-            if (ReferenceEquals(source, destination))
+            if (AreSameType(source, destination))
                 return true;
 
-            // Normal upcast
+            // class/interface/delegate to base class
             if (IsBaseTypeOf(destination, source))
+                return true;
+
+            // reference type to implemented interface
+            if (IsInterfaceType(destination) && ImplementsInterface(source, destination))
+                return true;
+
+            // interface to object
+            if (IsInterfaceType(source) && destination.SpecialType == SpecialType.System_Object)
                 return true;
 
             // Array covariance
@@ -15962,19 +18277,40 @@ namespace Cnidaria.Cs
             }
 
             return false;
-        }
 
+        }
         private static bool HasExplicitReferenceConversion(TypeSymbol source, TypeSymbol destination)
         {
             if (!source.IsReferenceType || !destination.IsReferenceType)
                 return false;
 
-            if (ReferenceEquals(source, destination))
+            if (AreSameType(source, destination))
+                return true;
+
+            if (HasImplicitReferenceConversion(source, destination))
                 return true;
 
             // Normal downcast
             if (IsBaseTypeOf(source, destination))
                 return true;
+
+            bool srcIface = IsInterfaceType(source);
+            bool dstIface = IsInterfaceType(destination);
+
+            if (!srcIface && dstIface)
+            {
+                if (ImplementsInterface(source, destination))
+                    return true;
+
+                return false;
+            }
+            if (srcIface && !dstIface)
+            {
+                if (destination is NamedTypeSymbol ntDest && ImplementsInterface(ntDest, source))
+                    return true;
+
+                return false;
+            }
 
             // Array covariance
             if (source is ArrayTypeSymbol srcArr && destination is ArrayTypeSymbol dstArr)
@@ -16803,6 +19139,757 @@ namespace Cnidaria.Cs
             }
 
             return new BoundForStatement(node, initializers.ToImmutable(), conditionOpt, incrementors.ToImmutable(), body, breakLabel, continueLabel);
+        }
+        private enum ForEachResolutionStatus : byte
+        {
+            NotApplicable,
+            Success,
+            Error
+        }
+        private readonly struct ForEachResolution
+        {
+            public readonly BoundForEachEnumeratorKind Kind;
+            public readonly TypeSymbol CollectionType;
+            public readonly TypeSymbol EnumeratorType;
+            public readonly TypeSymbol ElementType;
+            public readonly Conversion CollectionConversion;
+            public readonly MethodSymbol? GetEnumeratorMethodOpt;
+            public readonly bool GetEnumeratorIsExtensionMethod;
+            public readonly PropertySymbol? CurrentPropertyOpt;
+            public readonly MethodSymbol? MoveNextMethodOpt;
+
+            public ForEachResolution(
+                BoundForEachEnumeratorKind kind,
+                TypeSymbol collectionType,
+                TypeSymbol enumeratorType,
+                TypeSymbol elementType,
+                Conversion collectionConversion,
+                MethodSymbol? getEnumeratorMethodOpt,
+                bool getEnumeratorIsExtensionMethod,
+                PropertySymbol? currentPropertyOpt,
+                MethodSymbol? moveNextMethodOpt)
+            {
+                Kind = kind;
+                CollectionType = collectionType;
+                EnumeratorType = enumeratorType;
+                ElementType = elementType;
+                CollectionConversion = collectionConversion;
+                GetEnumeratorMethodOpt = getEnumeratorMethodOpt;
+                GetEnumeratorIsExtensionMethod = getEnumeratorIsExtensionMethod;
+                CurrentPropertyOpt = currentPropertyOpt;
+                MoveNextMethodOpt = moveNextMethodOpt;
+            }
+        }
+
+        private BoundStatement BindForEachVariable(
+            ForEachVariableStatementSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            diagnostics.Add(new Diagnostic(
+                "CN_FOREACH_VAR001",
+                DiagnosticSeverity.Error,
+                "foreach deconstruction is not supported.",
+                new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+            return new BoundBadStatement(node);
+        }
+        private BoundStatement BindForEach(
+            ForEachStatementSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (node.AwaitKeyword.Span.Length != 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH_AWAIT001",
+                    DiagnosticSeverity.Error,
+                    "await foreach is not supported.",
+                    new Location(context.SemanticModel.SyntaxTree, node.AwaitKeyword.Span)));
+
+                return new BoundBadStatement(node);
+            }
+
+            var collection = BindExpression(node.Expression, context, diagnostics);
+            if (collection.HasErrors)
+                return new BoundBadStatement(node);
+
+            if (!TryResolveForEach(node, collection, context, diagnostics, out var foreachInfo))
+                return new BoundBadStatement(node);
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+
+            var name = node.Identifier.ValueText ?? string.Empty;
+            if (name.Length == 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH_LOCAL001",
+                    DiagnosticSeverity.Error,
+                    "Invalid foreach iteration variable name.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Identifier.Span)));
+
+                return new BoundBadStatement(node);
+            }
+
+            if (scope.IsNameDeclaredInEnclosingScopes(name))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LOCAL001",
+                    DiagnosticSeverity.Error,
+                    $"A local named '{name}' is already declared in this scope.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Identifier.Span)));
+            }
+
+            var elementType = foreachInfo.ElementType is ByRefTypeSymbol byRefElement
+                ? byRefElement.ElementType
+                : foreachInfo.ElementType;
+
+            TypeSymbol iterationType;
+            Conversion iterationConversion;
+
+            if (IsVar(node.Type))
+            {
+                if (elementType is NullTypeSymbol || elementType.SpecialType == SpecialType.System_Void)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FOREACH_VAR002",
+                        DiagnosticSeverity.Error,
+                        "Cannot infer the type of the foreach iteration variable.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+
+                    iterationType = new ErrorTypeSymbol("foreach", containing: null, ImmutableArray<Location>.Empty);
+                    iterationConversion = new Conversion(ConversionKind.None);
+                }
+                else
+                {
+                    iterationType = elementType;
+                    iterationConversion = new Conversion(ConversionKind.Identity);
+                }
+            }
+            else
+            {
+                iterationType = scope.BindType(node.Type, context, diagnostics);
+
+                var dummyElement = new BoundTypeOnlyExpression(node.Expression, elementType);
+                iterationConversion = scope.ClassifyConversion(dummyElement, iterationType, context);
+
+                if (!iterationConversion.Exists)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FOREACH_CONV001",
+                        DiagnosticSeverity.Error,
+                        $"Cannot convert foreach element of type '{elementType.Name}' to iteration variable type '{iterationType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+                }
+            }
+
+            var iterationLocal = new LocalSymbol(
+                name: name,
+                containing: _containing,
+                type: iterationType,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, node.Identifier.Span)),
+                isReadOnly: true);
+
+            scope.DeclareLocal(iterationLocal, node, context);
+
+            var breakLabel = _flow.NewGeneratedLabel("break");
+            var continueLabel = _flow.NewGeneratedLabel("continue");
+
+            _flow.PushLoop(breakLabel, continueLabel);
+            BoundStatement body;
+            try
+            {
+                body = scope.BindStatement(node.Statement, context, diagnostics);
+            }
+            finally
+            {
+                _flow.PopLoop();
+            }
+
+            return new BoundForEachStatement(
+                syntax: node,
+                enumeratorKind: foreachInfo.Kind,
+                iterationVariable: iterationLocal,
+                collection: collection,
+                collectionType: foreachInfo.CollectionType,
+                enumeratorType: foreachInfo.EnumeratorType,
+                elementType: elementType,
+                collectionConversion: foreachInfo.CollectionConversion,
+                getEnumeratorMethodOpt: foreachInfo.GetEnumeratorMethodOpt,
+                getEnumeratorIsExtensionMethod: foreachInfo.GetEnumeratorIsExtensionMethod,
+                currentPropertyOpt: foreachInfo.CurrentPropertyOpt,
+                moveNextMethodOpt: foreachInfo.MoveNextMethodOpt,
+                iterationConversion: iterationConversion,
+                body: body,
+                breakLabel: breakLabel,
+                continueLabel: continueLabel);
+        }
+        private bool TryResolveForEach(
+            ForEachStatementSyntax node,
+            BoundExpression collection,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out ForEachResolution result)
+        {
+            if (TryResolveArrayForEach(collection, context, out result))
+                return true;
+            if (TryResolveStringForEach(collection, context, out result))
+                return true;
+
+            var patternStatus = TryResolvePatternForEach(node, collection, context, diagnostics, out result);
+            if (patternStatus == ForEachResolutionStatus.Success)
+                return true;
+            if (patternStatus == ForEachResolutionStatus.Error)
+                return false;
+
+            if (TryResolveEnumerableInterfaceForEach(node, collection, context, diagnostics, out result))
+                return true;
+
+            var extensionStatus = TryResolveExtensionForEach(node, collection, context, diagnostics, out result);
+            if (extensionStatus == ForEachResolutionStatus.Success)
+                return true;
+            if (extensionStatus == ForEachResolutionStatus.Error)
+                return false;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_FOREACH001",
+                DiagnosticSeverity.Error,
+                $"foreach statement cannot operate on variables of type '{collection.Type.Name}' because no suitable public 'GetEnumerator' was found.",
+                new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+
+            result = default;
+            return false;
+        }
+        private bool TryResolveArrayForEach(
+            BoundExpression collection,
+            BindingContext context,
+            out ForEachResolution result)
+        {
+            if (collection.Type is not ArrayTypeSymbol arrayType)
+            {
+                result = default;
+                return false;
+            }
+
+            var ienumerable = GetWellKnownType(context.Compilation, "System", "Collections", "IEnumerable", 0) ?? collection.Type;
+            var ienumerator = GetWellKnownType(context.Compilation, "System", "Collections", "IEnumerator", 0) ?? collection.Type;
+            var conv = ClassifyConversion(collection, ienumerable, context);
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.Array,
+                collectionType: ienumerable,
+                enumeratorType: ienumerator,
+                elementType: arrayType.ElementType,
+                collectionConversion: conv.Exists ? conv : new Conversion(ConversionKind.Identity),
+                getEnumeratorMethodOpt: null,
+                getEnumeratorIsExtensionMethod: false,
+                currentPropertyOpt: null,
+                moveNextMethodOpt: null);
+
+            return true;
+        }
+        private bool TryResolveStringForEach(
+            BoundExpression collection,
+            BindingContext context,
+            out ForEachResolution result)
+        {
+            if (collection.Type.SpecialType != SpecialType.System_String)
+            {
+                result = default;
+                return false;
+            }
+
+            var charType = context.Compilation.GetSpecialType(SpecialType.System_Char);
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.String,
+                collectionType: collection.Type,
+                enumeratorType: collection.Type,
+                elementType: charType,
+                collectionConversion: new Conversion(ConversionKind.Identity),
+                getEnumeratorMethodOpt: null,
+                getEnumeratorIsExtensionMethod: false,
+                currentPropertyOpt: null,
+                moveNextMethodOpt: null);
+
+            return true;
+        }
+        private ForEachResolutionStatus TryResolvePatternForEach(
+            ForEachStatementSyntax node,
+            BoundExpression collection,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out ForEachResolution result)
+        {
+            result = default;
+
+            var receiverType = GetReceiverTypeForMemberLookup(collection.Type);
+            if (receiverType is null)
+                return ForEachResolutionStatus.NotApplicable;
+
+            var candidates = GetApplicableGetEnumeratorInstanceCandidates(receiverType, context);
+            if (candidates.Length != 1)
+                return ForEachResolutionStatus.NotApplicable;
+
+            var getEnumerator = candidates[0];
+            if (!TryValidateEnumeratorShape(
+                diagnosticNode: node.Expression,
+                enumeratorTypeSymbol: getEnumerator.ReturnType,
+                context: context,
+                diagnostics: diagnostics,
+                elementType: out var elementType,
+                currentProperty: out var currentProperty,
+                moveNextMethod: out var moveNextMethod))
+            {
+                return ForEachResolutionStatus.Error;
+            }
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.Pattern,
+                collectionType: collection.Type,
+                enumeratorType: getEnumerator.ReturnType,
+                elementType: elementType,
+                collectionConversion: new Conversion(ConversionKind.Identity),
+                getEnumeratorMethodOpt: getEnumerator,
+                getEnumeratorIsExtensionMethod: false,
+                currentPropertyOpt: currentProperty,
+                moveNextMethodOpt: moveNextMethod);
+
+            return ForEachResolutionStatus.Success;
+        }
+
+        private bool TryResolveEnumerableInterfaceForEach(
+            ForEachStatementSyntax node,
+            BoundExpression collection,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out ForEachResolution result)
+        {
+            result = default;
+
+            var genericIEnumerableDef = GetWellKnownType(context.Compilation, "System", "Collections", "Generic", "IEnumerable", 1);
+            var genericIEnumeratorDef = GetWellKnownType(context.Compilation, "System", "Collections", "Generic", "IEnumerator", 1);
+            var nongenericIEnumerable = GetWellKnownType(context.Compilation, "System", "Collections", "IEnumerable", 0);
+            var nongenericIEnumerator = GetWellKnownType(context.Compilation, "System", "Collections", "IEnumerator", 0);
+            var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object);
+
+            if (genericIEnumerableDef is not null && genericIEnumeratorDef is not null)
+            {
+                var genericCandidates = GetImplementedInterfaces(collection.Type, genericIEnumerableDef);
+
+                if (genericCandidates.Length > 1)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FOREACH_ENUM001",
+                        DiagnosticSeverity.Error,
+                        $"foreach statement is ambiguous for type '{collection.Type.Name}' because it converts to multiple 'IEnumerable<T>' interfaces.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+
+                    return false;
+                }
+
+                if (genericCandidates.Length == 1)
+                {
+                    var enumerableType = genericCandidates[0];
+                    var conv = ClassifyConversion(collection, enumerableType, context);
+                    if (conv.Exists && conv.IsImplicit)
+                    {
+                        var elementType = enumerableType.TypeArguments[0];
+                        var enumeratorType = context.Compilation.ConstructNamedType(
+                            genericIEnumeratorDef,
+                            ImmutableArray.Create(elementType));
+
+                        if (!TryValidateEnumeratorShape(
+                            diagnosticNode: node.Expression,
+                            enumeratorTypeSymbol: enumeratorType,
+                            context: context,
+                            diagnostics: diagnostics,
+                            elementType: out var validatedElementType,
+                            currentProperty: out var currentProperty,
+                            moveNextMethod: out var moveNextMethod))
+                        {
+                            return false;
+                        }
+
+                        var getEnumerator = GetSinglePublicParameterlessInstanceMethod(enumerableType, "GetEnumerator", context);
+
+                        result = new ForEachResolution(
+                            kind: BoundForEachEnumeratorKind.Interface,
+                            collectionType: enumerableType,
+                            enumeratorType: enumeratorType,
+                            elementType: validatedElementType,
+                            collectionConversion: conv,
+                            getEnumeratorMethodOpt: getEnumerator,
+                            getEnumeratorIsExtensionMethod: false,
+                            currentPropertyOpt: currentProperty,
+                            moveNextMethodOpt: moveNextMethod);
+
+                        return true;
+                    }
+                }
+            }
+
+            if (nongenericIEnumerable is not null && nongenericIEnumerator is not null)
+            {
+                var conv = ClassifyConversion(collection, nongenericIEnumerable, context);
+                if (conv.Exists && conv.IsImplicit)
+                {
+                    if (!TryValidateEnumeratorShape(
+                        diagnosticNode: node.Expression,
+                        enumeratorTypeSymbol: nongenericIEnumerator,
+                        context: context,
+                        diagnostics: diagnostics,
+                        elementType: out _,
+                        currentProperty: out var currentProperty,
+                        moveNextMethod: out var moveNextMethod))
+                    {
+                        return false;
+                    }
+
+                    var getEnumerator = GetSinglePublicParameterlessInstanceMethod(nongenericIEnumerable, "GetEnumerator", context);
+
+                    result = new ForEachResolution(
+                        kind: BoundForEachEnumeratorKind.Interface,
+                        collectionType: nongenericIEnumerable,
+                        enumeratorType: nongenericIEnumerator,
+                        elementType: objectType,
+                        collectionConversion: conv,
+                        getEnumeratorMethodOpt: getEnumerator,
+                        getEnumeratorIsExtensionMethod: false,
+                        currentPropertyOpt: currentProperty,
+                        moveNextMethodOpt: moveNextMethod);
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private ForEachResolutionStatus TryResolveExtensionForEach(
+            ForEachStatementSyntax node,
+            BoundExpression collection,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out ForEachResolution result)
+        {
+            result = default;
+
+            var candidates = GetApplicableGetEnumeratorExtensionCandidates(collection, context);
+            if (candidates.Length == 0)
+                return ForEachResolutionStatus.NotApplicable;
+
+            if (candidates.Length != 1)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH_EXT001",
+                    DiagnosticSeverity.Error,
+                    "Ambiguous extension GetEnumerator() for foreach.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+
+                return ForEachResolutionStatus.Error;
+            }
+
+            var getEnumerator = candidates[0];
+            if (!TryValidateEnumeratorShape(
+                diagnosticNode: node.Expression,
+                enumeratorTypeSymbol: getEnumerator.ReturnType,
+                context: context,
+                diagnostics: diagnostics,
+                elementType: out var elementType,
+                currentProperty: out var currentProperty,
+                moveNextMethod: out var moveNextMethod))
+            {
+                return ForEachResolutionStatus.Error;
+            }
+
+            var receiverConv = ClassifyConversion(collection, getEnumerator.Parameters[0].Type, context);
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.Pattern,
+                collectionType: collection.Type,
+                enumeratorType: getEnumerator.ReturnType,
+                elementType: elementType,
+                collectionConversion: receiverConv,
+                getEnumeratorMethodOpt: getEnumerator,
+                getEnumeratorIsExtensionMethod: true,
+                currentPropertyOpt: currentProperty,
+                moveNextMethodOpt: moveNextMethod);
+
+            return ForEachResolutionStatus.Success;
+        }
+        private bool TryValidateEnumeratorShape(
+    SyntaxNode diagnosticNode,
+    TypeSymbol enumeratorTypeSymbol,
+    BindingContext context,
+    DiagnosticBag diagnostics,
+    out TypeSymbol elementType,
+    out PropertySymbol currentProperty,
+    out MethodSymbol moveNextMethod)
+        {
+            elementType = new ErrorTypeSymbol("foreach", containing: null, ImmutableArray<Location>.Empty);
+            currentProperty = null!;
+            moveNextMethod = null!;
+
+            if (enumeratorTypeSymbol is not NamedTypeSymbol enumeratorType ||
+                (enumeratorType.TypeKind != TypeKind.Class &&
+                 enumeratorType.TypeKind != TypeKind.Struct &&
+                 enumeratorType.TypeKind != TypeKind.Interface))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH002",
+                    DiagnosticSeverity.Error,
+                    "GetEnumerator() must return a class, struct, or interface type.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                return false;
+            }
+
+            var currentCandidates = ImmutableArray.CreateBuilder<PropertySymbol>();
+            var currentMembers = FilterAccessibleMembers(LookupMembers(enumeratorType, "Current"), context);
+            for (int i = 0; i < currentMembers.Length; i++)
+            {
+                if (currentMembers[i] is PropertySymbol property &&
+                    !property.IsStatic &&
+                    property.HasGet)
+                {
+                    currentCandidates.Add(property);
+                }
+            }
+
+            if (currentCandidates.Count != 1)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH003",
+                    DiagnosticSeverity.Error,
+                    "Enumerator type must contain a readable public instance property named 'Current'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                return false;
+            }
+
+            currentProperty = currentCandidates[0];
+            elementType = currentProperty.Type is ByRefTypeSymbol byRef
+                ? byRef.ElementType
+                : currentProperty.Type;
+
+            var moveNextCandidates = ImmutableArray.CreateBuilder<MethodSymbol>();
+            var moveNextMethods = LookupMethods(enumeratorType, "MoveNext");
+            for (int i = 0; i < moveNextMethods.Length; i++)
+            {
+                var method = moveNextMethods[i];
+                if (method.IsStatic)
+                    continue;
+                if (method.TypeParameters.Length != 0)
+                    continue;
+                if (method.Parameters.Length != 0)
+                    continue;
+                if (!AccessibilityHelper.IsAccessible(method, context))
+                    continue;
+                if (method.ReturnType.SpecialType != SpecialType.System_Boolean)
+                    continue;
+
+                moveNextCandidates.Add(method);
+            }
+
+            if (moveNextCandidates.Count != 1)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH004",
+                    DiagnosticSeverity.Error,
+                    "Enumerator type must contain a public instance parameterless method named 'MoveNext' returning 'bool'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                return false;
+            }
+
+            moveNextMethod = moveNextCandidates[0];
+            return true;
+        }
+
+        private ImmutableArray<MethodSymbol> GetApplicableGetEnumeratorInstanceCandidates(
+            NamedTypeSymbol receiverType,
+            BindingContext context)
+        {
+            var methods = LookupMethods(receiverType, "GetEnumerator");
+            var builder = ImmutableArray.CreateBuilder<MethodSymbol>();
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var method = methods[i];
+                if (method.IsStatic)
+                    continue;
+                if (method.TypeParameters.Length != 0)
+                    continue;
+                if (method.Parameters.Length != 0)
+                    continue;
+                if (!AccessibilityHelper.IsAccessible(method, context))
+                    continue;
+
+                builder.Add(method);
+            }
+
+            return builder.ToImmutable();
+        }
+
+        private ImmutableArray<MethodSymbol> GetApplicableGetEnumeratorExtensionCandidates(
+            BoundExpression collection,
+            BindingContext context)
+        {
+            var methods = LookupExtensionMethods("GetEnumerator", collection, context);
+            var builder = ImmutableArray.CreateBuilder<MethodSymbol>();
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var method = methods[i];
+                if (!IsExtensionMethod(method))
+                    continue;
+                if (method.TypeParameters.Length != 0)
+                    continue;
+                if (method.Parameters.Length != 1)
+                    continue;
+                if (!AccessibilityHelper.IsAccessible(method, context))
+                    continue;
+
+                builder.Add(method);
+            }
+
+            return builder.ToImmutable();
+        }
+
+        private static MethodSymbol? GetSinglePublicParameterlessInstanceMethod(
+            NamedTypeSymbol type,
+            string name,
+            BindingContext context)
+        {
+            var methods = LookupMethods(type, name);
+            MethodSymbol? found = null;
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var method = methods[i];
+                if (method.IsStatic)
+                    continue;
+                if (method.TypeParameters.Length != 0)
+                    continue;
+                if (method.Parameters.Length != 0)
+                    continue;
+                if (!AccessibilityHelper.IsAccessible(method, context))
+                    continue;
+
+                if (found is not null)
+                    return null;
+
+                found = method;
+            }
+
+            return found;
+        }
+        private static ImmutableArray<NamedTypeSymbol> GetImplementedInterfaces(
+    TypeSymbol type,
+    NamedTypeSymbol interfaceDefinition)
+        {
+            var builder = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
+            var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+
+            void Visit(TypeSymbol current)
+            {
+                if (!seen.Add(current))
+                    return;
+
+                if (current is not NamedTypeSymbol nt)
+                    return;
+
+                if (nt.TypeKind == TypeKind.Interface &&
+                    ReferenceEquals(nt.OriginalDefinition, interfaceDefinition))
+                {
+                    bool duplicate = false;
+                    for (int i = 0; i < builder.Count; i++)
+                    {
+                        if (ReferenceEquals(builder[i], nt))
+                        {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+
+                    if (!duplicate)
+                        builder.Add(nt);
+                }
+
+                var interfaces = nt.Interfaces;
+                for (int i = 0; i < interfaces.Length; i++)
+                    Visit(interfaces[i]);
+
+                if (nt.BaseType is TypeSymbol baseType)
+                    Visit(baseType);
+            }
+
+            Visit(type);
+            return builder.ToImmutable();
+        }
+
+        private static NamedTypeSymbol? GetWellKnownType(
+            Compilation compilation,
+            string ns0,
+            string typeName,
+            int arity)
+        {
+            return GetWellKnownType(compilation, new[] { ns0 }, typeName, arity);
+        }
+        private static NamedTypeSymbol? GetWellKnownType(
+            Compilation compilation,
+            string ns0,
+            string ns1,
+            string typeName,
+            int arity)
+        {
+            return GetWellKnownType(compilation, new[] { ns0, ns1 }, typeName, arity);
+        }
+        private static NamedTypeSymbol? GetWellKnownType(
+            Compilation compilation,
+            string ns0,
+            string ns1,
+            string ns2,
+            string typeName,
+            int arity)
+        {
+            return GetWellKnownType(compilation, new[] { ns0, ns1, ns2 }, typeName, arity);
+        }
+
+        private static NamedTypeSymbol? GetWellKnownType(
+            Compilation compilation,
+            string[] namespaceParts,
+            string typeName,
+            int arity)
+        {
+            NamespaceSymbol current = compilation.GlobalNamespace;
+
+            for (int p = 0; p < namespaceParts.Length; p++)
+            {
+                var next = current.GetNamespaceMembers();
+                NamespaceSymbol? found = null;
+
+                for (int i = 0; i < next.Length; i++)
+                {
+                    if (string.Equals(next[i].Name, namespaceParts[p], StringComparison.Ordinal))
+                    {
+                        found = next[i];
+                        break;
+                    }
+                }
+
+                if (found is null)
+                    return null;
+
+                current = found;
+            }
+
+            var types = current.GetTypeMembers(typeName, arity);
+            if (types.IsDefaultOrEmpty)
+                return null;
+
+            return types[0].OriginalDefinition;
         }
         private BoundExpression BindDiscardedExpression(
             ExpressionSyntax node,

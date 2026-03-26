@@ -914,6 +914,11 @@ namespace Cnidaria.Cs
                             _il.Emit(BytecodeOp.Ldthis, pop: 0, push: 1);
                         return;
 
+                    case BoundBaseExpression:
+                        if (mode == EmitMode.Value)
+                            _il.Emit(BytecodeOp.Ldthis, pop: 0, push: 1);
+                        return;
+
                     case BoundUnaryExpression un:
                         EmitUnary(un, mode);
                         return;
@@ -1779,8 +1784,10 @@ namespace Cnidaria.Cs
                 short pop = checked((short)(argCount + hasThis));
                 short push = (short)(IsVoid(call.Method.ReturnType) ? 0 : 1);
 
+                bool isBaseReceiver = call.ReceiverOpt is BoundBaseExpression;
+
                 BytecodeOp op =
-                    thisIsManagedByRef
+                    thisIsManagedByRef || isBaseReceiver
                         ? BytecodeOp.Call
                         : (!call.Method.IsStatic && (call.Method.IsVirtual || call.Method.IsAbstract || call.Method.IsOverride))
                             ? BytecodeOp.CallVirt
@@ -2371,6 +2378,10 @@ namespace Cnidaria.Cs
                         return;
 
                     case BoundThisExpression:
+                        _il.Emit(BytecodeOp.Ldthis, pop: 0, push: 1);
+                        return;
+
+                    case BoundBaseExpression:
                         _il.Emit(BytecodeOp.Ldthis, pop: 0, push: 1);
                         return;
 

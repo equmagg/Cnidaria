@@ -131,6 +131,7 @@ namespace Cnidaria.Cs
                 BoundWhileStatement s => RewriteWhileStatement(s),
                 BoundDoWhileStatement s => RewriteDoWhileStatement(s),
                 BoundForStatement s => RewriteForStatement(s),
+                BoundForEachStatement s => RewriteForEachStatement(s),
                 BoundLabelStatement s => s,
                 BoundGotoStatement s => s,
                 BoundConditionalGotoStatement s => RewriteConditionalGotoStatement(s),
@@ -139,6 +140,7 @@ namespace Cnidaria.Cs
                 BoundCheckedStatement s => RewriteCheckedStatement(s),
                 BoundUncheckedStatement s => RewriteUncheckedStatement(s),
                 BoundLocalFunctionStatement s => RewriteLocalFunctionStatement(s),
+                BoundFixedStatement s => RewriteFixedStatement(s),
                 _ => throw new NotSupportedException($"Unexpected bound statement: {node.GetType().Name}")
             };
         }
@@ -154,6 +156,7 @@ namespace Cnidaria.Cs
                 BoundLocalExpression e => e,
                 BoundParameterExpression e => e,
                 BoundThisExpression e => e,
+                BoundBaseExpression e => e,
                 BoundLabelExpression e => e,
                 BoundSizeOfExpression e => e,
 
@@ -187,7 +190,7 @@ namespace Cnidaria.Cs
                 BoundMemberAccessExpression e => RewriteMemberAccessExpression(e),
                 BoundCheckedExpression e => RewriteCheckedExpression(e),
                 BoundUncheckedExpression e => RewriteUncheckedExpression(e),
-
+                BoundFixedInitializerExpression e => RewriteFixedInitializerExpression(e),
                 BoundIsPatternExpression e => RewriteIsPatternExpression(e),
 
                 _ => throw new NotSupportedException($"Unexpected bound expression: {node.GetType().Name}")
@@ -338,6 +341,44 @@ namespace Cnidaria.Cs
                 return new BoundUncheckedExpression((CheckedExpressionSyntax)node.Syntax, expr);
             return node;
         }
+        protected virtual BoundStatement RewriteFixedStatement(BoundFixedStatement node)
+        {
+            var changed = false;
+            var decls = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(node.Declarations.Length);
+
+            for (int i = 0; i < node.Declarations.Length; i++)
+            {
+                var d = (BoundLocalDeclarationStatement)RewriteLocalDeclarationStatement(node.Declarations[i]);
+                if (!ReferenceEquals(d, node.Declarations[i]))
+                    changed = true;
+                decls.Add(d);
+            }
+
+            var body = RewriteStatement(node.Body);
+            if (!ReferenceEquals(body, node.Body))
+                changed = true;
+
+            return changed
+                ? new BoundFixedStatement((FixedStatementSyntax)node.Syntax, decls.ToImmutable(), body)
+                : node;
+        }
+        protected virtual BoundExpression RewriteFixedInitializerExpression(BoundFixedInitializerExpression node)
+        {
+            var expr = RewriteExpression(node.Expression);
+            if (!ReferenceEquals(expr, node.Expression))
+            {
+                return new BoundFixedInitializerExpression(
+                    syntax: node.Syntax,
+                    declaredPointerType: (PointerTypeSymbol)node.Type,
+                    initializerKind: node.InitializerKind,
+                    expression: expr,
+                    elementType: node.ElementType,
+                    elementPointerConversion: node.ElementPointerConversion,
+                    getPinnableReferenceMethodOpt: node.GetPinnableReferenceMethodOpt);
+            }
+
+            return node;
+        }
         protected virtual BoundExpression RewriteIsPatternExpression(BoundIsPatternExpression node)
         {
             var operand = RewriteExpression(node.Operand);
@@ -436,6 +477,35 @@ namespace Cnidaria.Cs
                     inits,
                     cond,
                     incs,
+                    body,
+                    node.BreakLabel,
+                    node.ContinueLabel);
+            }
+
+            return node;
+        }
+        protected virtual BoundStatement RewriteForEachStatement(BoundForEachStatement node)
+        {
+            var collection = RewriteExpression(node.Collection);
+            var body = RewriteStatement(node.Body);
+
+            if (!ReferenceEquals(collection, node.Collection) ||
+                !ReferenceEquals(body, node.Body))
+            {
+                return new BoundForEachStatement(
+                    (ForEachStatementSyntax)node.Syntax,
+                    node.EnumeratorKind,
+                    node.IterationVariable,
+                    collection,
+                    node.CollectionType,
+                    node.EnumeratorType,
+                    node.ElementType,
+                    node.CollectionConversion,
+                    node.GetEnumeratorMethodOpt,
+                    node.GetEnumeratorIsExtensionMethod,
+                    node.CurrentPropertyOpt,
+                    node.MoveNextMethodOpt,
+                    node.IterationConversion,
                     body,
                     node.BreakLabel,
                     node.ContinueLabel);
@@ -1108,17 +1178,6 @@ namespace Cnidaria.Cs
                     b.Add(src[start + i]);
                 return b.ToImmutable();
             }
-
-            private static MethodSymbol FindCtorOrThrow(NamedTypeSymbol vt, int argCount)
-            {
-                var members = vt.GetMembers();
-                for (int i = 0; i < members.Length; i++)
-                {
-                    if (members[i] is MethodSymbol m && m.IsConstructor && !m.IsStatic && m.Parameters.Length == argCount)
-                        return m;
-                }
-                throw new InvalidOperationException($"No suitable ValueTuple ctor found for '{vt.Name}' with {argCount} args.");
-            }
             private BoundExpression CreateValueTupleValue(
                 SyntaxNode syntax,
                 ImmutableArray<TypeSymbol> tupleElemTypes,
@@ -1296,7 +1355,7 @@ namespace Cnidaria.Cs
                 var thenNoOp = IsNoOpStatement(thenStmt);
                 var elseNoOp = elseStmt is not null && IsNoOpStatement(elseStmt);
 
-                // if (cond) { }  => evaluate cond for side-effects only
+                // if (cond) { }  => evaluate cond for side effects only
                 if (elseStmt is null && thenNoOp)
                     return new BoundExpressionStatement(node.Syntax, condition);
 
@@ -1439,6 +1498,550 @@ namespace Cnidaria.Cs
                 return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
             }
 
+            protected override BoundStatement RewriteForEachStatement(BoundForEachStatement node)
+            {
+                var collection = RewriteExpression(node.Collection);
+                var body = RewriteStatement(node.Body);
+
+                return node.EnumeratorKind switch
+                {
+                    BoundForEachEnumeratorKind.Array => LowerArrayForEach(node, collection, body),
+                    BoundForEachEnumeratorKind.String => LowerStringForEach(node, collection, body),
+                    BoundForEachEnumeratorKind.Pattern or BoundForEachEnumeratorKind.Interface => LowerEnumeratorForEach(node, collection, body),
+                    _ => throw new NotSupportedException($"Unexpected foreach enumerator kind: {node.EnumeratorKind}")
+                };
+            }
+
+            private BoundStatement LowerArrayForEach(
+                BoundForEachStatement node,
+                BoundExpression collection,
+                BoundStatement body)
+            {
+                if (collection.Type is not ArrayTypeSymbol arrayType || arrayType.Rank != 1)
+                    throw new NotSupportedException("foreach lowering for multidimensional arrays is not implemented.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var boolType = _compilation.GetSpecialType(SpecialType.System_Boolean);
+
+                var collectionTemp = CreateTempLocal(collection.Type);
+                var indexTemp = CreateTempLocal(intType);
+
+                var collectionExpr = new BoundLocalExpression(node.Syntax, collectionTemp);
+                var indexExpr = new BoundLocalExpression(node.Syntax, indexTemp);
+                var zero = new BoundLiteralExpression(node.Syntax, intType, 0);
+                var one = new BoundLiteralExpression(node.Syntax, intType, 1);
+
+                var lengthExpr = RewriteExpression(MakeArrayLengthRead(node.Syntax, collectionExpr));
+                var condition = new BoundBinaryExpression(
+                    node.Syntax,
+                    BoundBinaryOperatorKind.LessThan,
+                    boolType,
+                    indexExpr,
+                    lengthExpr,
+                    Optional<object>.None);
+
+                BoundExpression current = new BoundArrayElementAccessExpression(
+                    node.Syntax,
+                    node.ElementType,
+                    collectionExpr,
+                    indexExpr);
+                current = ApplyConversionIfNeeded(node.Syntax, current, node.IterationVariable.Type, node.IterationConversion);
+                current = RewriteExpression(current);
+
+                var increment = new BoundAssignmentExpression(
+                    node.Syntax,
+                    indexExpr,
+                    new BoundBinaryExpression(
+                        node.Syntax,
+                        BoundBinaryOperatorKind.Add,
+                        intType,
+                        indexExpr,
+                        one,
+                        Optional<object>.None,
+                        isChecked: GetEffectiveIsChecked(false)));
+
+                var builder = ImmutableArray.CreateBuilder<BoundStatement>();
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, collectionTemp, collection));
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, indexTemp, zero));
+                builder.Add(new BoundLabelStatement(node.Syntax, GenerateLabel("foreach_array_check")));
+
+                var checkLabel = ((BoundLabelStatement)builder[2]).Label;
+                var branch = MakeConditionalGoto(node.Syntax, condition, node.BreakLabel, jumpIfTrue: false);
+                if (branch is not BoundEmptyStatement)
+                    builder.Add(branch);
+
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, node.IterationVariable, current));
+                builder.Add(body);
+                builder.Add(new BoundLabelStatement(node.Syntax, node.ContinueLabel));
+                builder.Add(new BoundExpressionStatement(node.Syntax, RewriteExpression(increment)));
+                builder.Add(new BoundGotoStatement(node.Syntax, checkLabel));
+                builder.Add(new BoundLabelStatement(node.Syntax, node.BreakLabel));
+
+                return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
+            }
+            private BoundStatement LowerStringForEach(
+                BoundForEachStatement node,
+                BoundExpression collection,
+                BoundStatement body)
+            {
+                if (collection.Type.SpecialType != SpecialType.System_String)
+                    throw new InvalidOperationException("Expected string expression for foreach string lowering.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var boolType = _compilation.GetSpecialType(SpecialType.System_Boolean);
+
+                var collectionTemp = CreateTempLocal(collection.Type);
+                var indexTemp = CreateTempLocal(intType);
+
+                var collectionExpr = new BoundLocalExpression(node.Syntax, collectionTemp);
+                var indexExpr = new BoundLocalExpression(node.Syntax, indexTemp);
+                var zero = new BoundLiteralExpression(node.Syntax, intType, 0);
+                var one = new BoundLiteralExpression(node.Syntax, intType, 1);
+
+                var lengthExpr = RewriteExpression(MakeStringLengthRead(node.Syntax, collectionExpr));
+                var condition = new BoundBinaryExpression(
+                    node.Syntax,
+                    BoundBinaryOperatorKind.LessThan,
+                    boolType,
+                    indexExpr,
+                    lengthExpr,
+                    Optional<object>.None);
+
+                BoundExpression current = MakeStringCharRead(node.Syntax, collectionExpr, indexExpr);
+                current = ApplyConversionIfNeeded(node.Syntax, current, node.IterationVariable.Type, node.IterationConversion);
+                current = RewriteExpression(current);
+
+                var increment = new BoundAssignmentExpression(
+                    node.Syntax,
+                    indexExpr,
+                    new BoundBinaryExpression(
+                        node.Syntax,
+                        BoundBinaryOperatorKind.Add,
+                        intType,
+                        indexExpr,
+                        one,
+                        Optional<object>.None,
+                        isChecked: GetEffectiveIsChecked(false)));
+
+                var builder = ImmutableArray.CreateBuilder<BoundStatement>();
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, collectionTemp, collection));
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, indexTemp, zero));
+                builder.Add(new BoundLabelStatement(node.Syntax, GenerateLabel("foreach_string_check")));
+
+                var checkLabel = ((BoundLabelStatement)builder[2]).Label;
+                var branch = MakeConditionalGoto(node.Syntax, condition, node.BreakLabel, jumpIfTrue: false);
+                if (branch is not BoundEmptyStatement)
+                    builder.Add(branch);
+
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, node.IterationVariable, current));
+                builder.Add(body);
+                builder.Add(new BoundLabelStatement(node.Syntax, node.ContinueLabel));
+                builder.Add(new BoundExpressionStatement(node.Syntax, RewriteExpression(increment)));
+                builder.Add(new BoundGotoStatement(node.Syntax, checkLabel));
+                builder.Add(new BoundLabelStatement(node.Syntax, node.BreakLabel));
+
+                return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
+            }
+            private BoundStatement LowerEnumeratorForEach(
+                BoundForEachStatement node,
+                BoundExpression collection,
+                BoundStatement body)
+            {
+                var getEnumerator = node.GetEnumeratorMethodOpt
+                    ?? throw new InvalidOperationException("foreach enumerator GetEnumerator method was not captured by binder.");
+                var currentProperty = node.CurrentPropertyOpt
+                    ?? throw new InvalidOperationException("foreach enumerator Current property was not captured by binder.");
+                var moveNextMethod = node.MoveNextMethodOpt
+                    ?? throw new InvalidOperationException("foreach enumerator MoveNext method was not captured by binder.");
+
+                var collectionTemp = CreateTempLocal(collection.Type);
+                var enumeratorTemp = CreateTempLocal(node.EnumeratorType);
+
+                var collectionExpr = new BoundLocalExpression(node.Syntax, collectionTemp);
+                var enumeratorExpr = new BoundLocalExpression(node.Syntax, enumeratorTemp);
+
+                BoundExpression receiver = ApplyConversionIfNeeded(node.Syntax, collectionExpr, node.CollectionType, node.CollectionConversion);
+                receiver = RewriteExpression(receiver);
+
+                BoundExpression getEnumeratorCall;
+                if (node.GetEnumeratorIsExtensionMethod)
+                {
+                    getEnumeratorCall = new BoundCallExpression(
+                        node.Syntax,
+                        receiverOpt: null,
+                        method: getEnumerator,
+                        arguments: ImmutableArray.Create(receiver));
+                }
+                else
+                {
+                    getEnumeratorCall = new BoundCallExpression(
+                        node.Syntax,
+                        receiverOpt: receiver,
+                        method: getEnumerator,
+                        arguments: ImmutableArray<BoundExpression>.Empty);
+                }
+                getEnumeratorCall = RewriteExpression(getEnumeratorCall);
+
+                var moveNextCall = RewriteExpression(new BoundCallExpression(
+                    node.Syntax,
+                    enumeratorExpr,
+                    moveNextMethod,
+                    ImmutableArray<BoundExpression>.Empty));
+
+                BoundExpression currentRead;
+                if (currentProperty.GetMethod is MethodSymbol currentGetter)
+                {
+                    currentRead = new BoundCallExpression(
+                        node.Syntax,
+                        enumeratorExpr,
+                        currentGetter,
+                        ImmutableArray<BoundExpression>.Empty);
+                }
+                else
+                {
+                    throw new InvalidOperationException("foreach enumerator Current getter was not captured by binder.");
+                }
+
+                currentRead = ApplyConversionIfNeeded(node.Syntax, currentRead, node.IterationVariable.Type, node.IterationConversion);
+                currentRead = RewriteExpression(currentRead);
+
+                var loopBuilder = ImmutableArray.CreateBuilder<BoundStatement>();
+                loopBuilder.Add(new BoundLabelStatement(node.Syntax, node.ContinueLabel));
+
+                var branch = MakeConditionalGoto(node.Syntax, moveNextCall, node.BreakLabel, jumpIfTrue: false);
+                if (branch is not BoundEmptyStatement)
+                    loopBuilder.Add(branch);
+
+                loopBuilder.Add(new BoundLocalDeclarationStatement(node.Syntax, node.IterationVariable, currentRead));
+                loopBuilder.Add(body);
+                loopBuilder.Add(new BoundGotoStatement(node.Syntax, node.ContinueLabel));
+                loopBuilder.Add(new BoundLabelStatement(node.Syntax, node.BreakLabel));
+
+                BoundStatement loopBody = new BoundBlockStatement(node.Syntax, loopBuilder.ToImmutable());
+                if (TryCreateForEachFinally(node.Syntax, enumeratorTemp, out var finallyBlock))
+                {
+                    loopBody = new BoundTryStatement(
+                        CreateSyntheticTryStatementSyntax(),
+                        new BoundBlockStatement(node.Syntax, ImmutableArray.Create(loopBody)),
+                        ImmutableArray<BoundCatchBlock>.Empty,
+                        finallyBlock);
+                }
+
+                return new BoundBlockStatement(
+                    node.Syntax,
+                    ImmutableArray.Create<BoundStatement>(
+                        new BoundLocalDeclarationStatement(node.Syntax, collectionTemp, collection),
+                        new BoundLocalDeclarationStatement(node.Syntax, enumeratorTemp, getEnumeratorCall),
+                        loopBody));
+            }
+
+            private BoundExpression ApplyConversionIfNeeded(
+                SyntaxNode syntax,
+                BoundExpression expression,
+                TypeSymbol targetType,
+                Conversion conversion)
+            {
+                if (!conversion.Exists)
+                    throw new InvalidOperationException($"Missing conversion from '{expression.Type.Name}' to '{targetType.Name}'.");
+
+                if (conversion.Kind == ConversionKind.Identity && ReferenceEquals(expression.Type, targetType))
+                    return expression;
+
+                return new BoundConversionExpression(
+                    syntax,
+                    targetType,
+                    expression,
+                    conversion,
+                    isChecked: GetEffectiveIsChecked(false));
+            }
+
+            private BoundExpression MakeArrayLengthRead(SyntaxNode syntax, BoundExpression arrayExpr)
+            {
+                if (arrayExpr.Type is not ArrayTypeSymbol arrayType || arrayType.BaseType is not NamedTypeSymbol arrayBase)
+                    throw new InvalidOperationException("Expected array expression for Length lowering.");
+
+                var members = arrayBase.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol prop &&
+                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        prop.GetMethod is MethodSymbol getter)
+                    {
+                        return new BoundCallExpression(syntax, arrayExpr, getter, ImmutableArray<BoundExpression>.Empty);
+                    }
+                }
+
+                throw new InvalidOperationException("System.Array.Length getter not found.");
+            }
+            private BoundExpression MakeStringLengthRead(SyntaxNode syntax, BoundExpression stringExpr)
+            {
+                if (stringExpr.Type.SpecialType != SpecialType.System_String)
+                    throw new InvalidOperationException("Expected string expression for Length lowering.");
+
+                var stringType = _compilation.GetSpecialType(SpecialType.System_String);
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+
+                var members = stringType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol prop &&
+                        !prop.IsStatic &&
+                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        ReferenceEquals(prop.Type, intType) &&
+                        prop.GetMethod is MethodSymbol getter)
+                    {
+                        return new BoundCallExpression(syntax, stringExpr, getter, ImmutableArray<BoundExpression>.Empty);
+                    }
+                }
+
+                throw new InvalidOperationException("System.String.Length getter not found.");
+            }
+            private BoundExpression MakeStringCharRead(SyntaxNode syntax, BoundExpression stringExpr, BoundExpression indexExpr)
+            {
+                if (stringExpr.Type.SpecialType != SpecialType.System_String)
+                    throw new InvalidOperationException("Expected string expression for indexer lowering.");
+
+                var stringType = _compilation.GetSpecialType(SpecialType.System_String);
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var charType = _compilation.GetSpecialType(SpecialType.System_Char);
+
+                var members = stringType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol prop &&
+                        !prop.IsStatic &&
+                        ReferenceEquals(prop.Type, charType) &&
+                        prop.Parameters.Length == 1 &&
+                        ReferenceEquals(prop.Parameters[0].Type, intType) &&
+                        prop.GetMethod is MethodSymbol getter)
+                    {
+                        return new BoundCallExpression(
+                            syntax,
+                            stringExpr,
+                            getter,
+                            ImmutableArray.Create(indexExpr));
+                    }
+                }
+
+                throw new InvalidOperationException("System.String indexer getter not found.");
+            }
+            private bool TryCreateForEachFinally(
+                SyntaxNode syntax,
+                LocalSymbol enumeratorLocal,
+                out BoundBlockStatement finallyBlock)
+            {
+                var enumeratorExpr = new BoundLocalExpression(syntax, enumeratorLocal);
+                var enumeratorType = enumeratorLocal.Type;
+                var nullLiteral = new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null);
+
+                var directDispose = FindAccessibleDisposeMethod(enumeratorType);
+                if (directDispose is not null)
+                {
+                    var call = RewriteExpression(new BoundCallExpression(
+                        syntax,
+                        enumeratorExpr,
+                        directDispose,
+                        ImmutableArray<BoundExpression>.Empty));
+
+                    if (enumeratorType.IsValueType)
+                    {
+                        finallyBlock = new BoundBlockStatement(
+                            syntax,
+                            ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(syntax, call)));
+                        return true;
+                    }
+
+                    var notNull = new BoundBinaryExpression(
+                        syntax,
+                        BoundBinaryOperatorKind.NotEquals,
+                        _compilation.GetSpecialType(SpecialType.System_Boolean),
+                        enumeratorExpr,
+                        nullLiteral,
+                        Optional<object>.None);
+
+                    var endLabel = LabelSymbol.CreateGenerated("<foreach_dispose_end>", _method);
+                    var statements = ImmutableArray.CreateBuilder<BoundStatement>(3);
+                    var skip = MakeConditionalGoto(syntax, notNull, endLabel, jumpIfTrue: false);
+                    if (skip is not BoundEmptyStatement)
+                        statements.Add(skip);
+                    statements.Add(new BoundExpressionStatement(syntax, call));
+                    statements.Add(new BoundLabelStatement(syntax, endLabel));
+
+                    finallyBlock = new BoundBlockStatement(syntax, statements.ToImmutable());
+                    return true;
+                }
+
+                var disposableType = GetWellKnownType(_compilation, new[] { "System" }, "IDisposable", 0);
+                if (disposableType is null)
+                {
+                    finallyBlock = null!;
+                    return false;
+                }
+
+                var disposeMethod = FindParameterlessInstanceMethod(disposableType, "Dispose", _compilation.GetSpecialType(SpecialType.System_Void));
+                if (disposeMethod is null)
+                {
+                    finallyBlock = null!;
+                    return false;
+                }
+
+                var conv = LocalScopeBinder.ClassifyConversion(enumeratorExpr, disposableType);
+                if (!conv.Exists || !conv.IsImplicit)
+                {
+                    finallyBlock = null!;
+                    return false;
+                }
+
+                if (enumeratorType.IsValueType)
+                {
+                    var boxed = RewriteExpression(new BoundConversionExpression(
+                        syntax,
+                        disposableType,
+                        enumeratorExpr,
+                        conv,
+                        isChecked: false));
+                    var call = RewriteExpression(new BoundCallExpression(
+                        syntax,
+                        boxed,
+                        disposeMethod,
+                        ImmutableArray<BoundExpression>.Empty));
+
+                    finallyBlock = new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(syntax, call)));
+                    return true;
+                }
+
+                {
+                    var disposableTemp = CreateTempLocal(disposableType);
+                    var disposableExpr = new BoundLocalExpression(syntax, disposableTemp);
+                    var notNull = new BoundBinaryExpression(
+                        syntax,
+                        BoundBinaryOperatorKind.NotEquals,
+                        _compilation.GetSpecialType(SpecialType.System_Boolean),
+                        disposableExpr,
+                        nullLiteral,
+                        Optional<object>.None);
+
+                    var asExpr = RewriteExpression(new BoundAsExpression(syntax, disposableType, enumeratorExpr, conv));
+                    var disposeCall = RewriteExpression(new BoundCallExpression(
+                        syntax,
+                        disposableExpr,
+                        disposeMethod,
+                        ImmutableArray<BoundExpression>.Empty));
+
+                    var endLabel = LabelSymbol.CreateGenerated("<foreach_dispose_end>", _method);
+                    var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+                    statements.Add(new BoundLocalDeclarationStatement(syntax, disposableTemp, asExpr));
+                    var skip = MakeConditionalGoto(syntax, notNull, endLabel, jumpIfTrue: false);
+                    if (skip is not BoundEmptyStatement)
+                        statements.Add(skip);
+                    statements.Add(new BoundExpressionStatement(syntax, disposeCall));
+                    statements.Add(new BoundLabelStatement(syntax, endLabel));
+
+                    finallyBlock = new BoundBlockStatement(syntax, statements.ToImmutable());
+                    return true;
+                }
+                
+            }
+
+            private static MethodSymbol? FindAccessibleDisposeMethod(TypeSymbol type)
+            {
+                var method = FindParameterlessInstanceMethod(type, "Dispose", null);
+                return method is not null && method.ReturnType.SpecialType == SpecialType.System_Void
+                    ? method
+                    : null;
+            }
+
+            private static MethodSymbol? FindParameterlessInstanceMethod(TypeSymbol type, string name, TypeSymbol? returnType)
+            {
+                var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+
+                MethodSymbol? Visit(TypeSymbol current)
+                {
+                    if (!seen.Add(current))
+                        return null;
+
+                    if (current is not NamedTypeSymbol nt)
+                        return null;
+
+                    var members = nt.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is not MethodSymbol method)
+                            continue;
+                        if (method.IsStatic)
+                            continue;
+                        if (!string.Equals(method.Name, name, StringComparison.Ordinal))
+                            continue;
+                        if (method.TypeParameters.Length != 0)
+                            continue;
+                        if (method.Parameters.Length != 0)
+                            continue;
+                        if (returnType is not null && !ReferenceEquals(method.ReturnType, returnType))
+                            continue;
+                        return method;
+                    }
+
+                    var interfaces = nt.Interfaces;
+                    for (int i = 0; i < interfaces.Length; i++)
+                    {
+                        var m = Visit(interfaces[i]);
+                        if (m is not null)
+                            return m;
+                    }
+
+                    if (nt.BaseType is TypeSymbol baseType)
+                        return Visit(baseType);
+
+                    return null;
+                }
+
+                return Visit(type);
+            }
+
+            private static NamedTypeSymbol? GetWellKnownType(
+                Compilation compilation,
+                string[] namespaceParts,
+                string typeName,
+                int arity)
+            {
+                NamespaceSymbol current = compilation.GlobalNamespace;
+
+                for (int p = 0; p < namespaceParts.Length; p++)
+                {
+                    var next = current.GetNamespaceMembers();
+                    NamespaceSymbol? found = null;
+
+                    for (int i = 0; i < next.Length; i++)
+                    {
+                        if (string.Equals(next[i].Name, namespaceParts[p], StringComparison.Ordinal))
+                        {
+                            found = next[i];
+                            break;
+                        }
+                    }
+
+                    if (found is null)
+                        return null;
+
+                    current = found;
+                }
+
+                var types = current.GetTypeMembers(typeName, arity);
+                if (types.IsDefaultOrEmpty)
+                    return null;
+
+                return types[0].OriginalDefinition;
+            }
+
+            private static TryStatementSyntax CreateSyntheticTryStatementSyntax()
+            {
+                var emptyBlock = new BlockSyntax(default, SyntaxList<StatementSyntax>.Empty, default);
+                var finallyClause = new FinallyClauseSyntax(default, emptyBlock);
+                return new TryStatementSyntax(default, emptyBlock, SyntaxList<CatchClauseSyntax>.Empty, finallyClause);
+            }
+
             protected override BoundStatement RewriteBreakStatement(BoundBreakStatement node)
             {
                 return new BoundGotoStatement(node.Syntax, node.TargetLabel);
@@ -1471,6 +2074,346 @@ namespace Cnidaria.Cs
                 using (PushCheckedContext(false))
                     return RewriteExpression(node.Expression);
             }
+            protected override BoundStatement RewriteFixedStatement(BoundFixedStatement node)
+            {
+                var body = RewriteStatement(node.Body);
+                var statements = ImmutableArray.CreateBuilder<BoundStatement>(node.Declarations.Length * 3 + 1);
+
+                for (int i = 0; i < node.Declarations.Length; i++)
+                    LowerFixedDeclaration(node.Declarations[i], statements);
+
+                statements.Add(body);
+                return new BoundBlockStatement(node.Syntax, statements.ToImmutable());
+            }
+            private void LowerFixedDeclaration(BoundLocalDeclarationStatement decl, ImmutableArray<BoundStatement>.Builder statements)
+            {
+                if (decl.Initializer is not BoundFixedInitializerExpression fixedInit)
+                {
+                    statements.Add((BoundLocalDeclarationStatement)RewriteLocalDeclarationStatement(decl));
+                    return;
+                }
+
+                fixedInit = (BoundFixedInitializerExpression)RewriteFixedInitializerExpression(fixedInit);
+
+                var ptrType = (PointerTypeSymbol)decl.Local.Type;
+                BoundExpression loweredInit = fixedInit.InitializerKind switch
+                {
+                    BoundFixedInitializerKind.Array => LowerFixedArrayInitializer(fixedInit.Syntax, ptrType, fixedInit, statements),
+                    BoundFixedInitializerKind.String => LowerFixedStringInitializer(fixedInit.Syntax, ptrType, fixedInit, statements),
+                    BoundFixedInitializerKind.GetPinnableReference => LowerFixedGetPinnableInitializer(fixedInit.Syntax, ptrType, fixedInit, statements),
+                    BoundFixedInitializerKind.AddressOf => LowerFixedAddressOfInitializer(fixedInit.Syntax, ptrType, fixedInit, statements),
+                    _ => throw new NotSupportedException($"Unexpected fixed initializer kind: {fixedInit.InitializerKind}")
+                };
+
+                statements.Add(new BoundLocalDeclarationStatement(decl.Syntax, decl.Local, loweredInit));
+            }
+            private BoundExpression LowerFixedArrayInitializer(
+                SyntaxNode syntax,
+                PointerTypeSymbol declaredPtrType,
+                BoundFixedInitializerExpression fixedInit,
+                ImmutableArray<BoundStatement>.Builder statements)
+            {
+                var arrTemp = CreateTempLocal(fixedInit.Expression.Type);
+                var arrExpr = new BoundLocalExpression(syntax, arrTemp);
+
+                statements.Add(new BoundLocalDeclarationStatement(syntax, arrTemp, fixedInit.Expression));
+
+                var int32Type = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var zeroInt = new BoundLiteralExpression(syntax, int32Type, 0);
+                var nullPtr = new BoundConversionExpression(
+                    syntax: syntax,
+                    type: declaredPtrType,
+                    operand: new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                    conversion: new Conversion(ConversionKind.NullLiteral),
+                    isChecked: false);
+
+                var notNull = new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.NotEquals,
+                    _compilation.GetSpecialType(SpecialType.System_Boolean),
+                    arrExpr,
+                    new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                    Optional<object>.None);
+
+                var len = MakeArrayLengthRead(syntax, arrExpr);
+                var nonEmpty = new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.NotEquals,
+                    _compilation.GetSpecialType(SpecialType.System_Boolean),
+                    len,
+                    zeroInt,
+                    Optional<object>.None);
+
+                var firstElem = new BoundArrayElementAccessExpression(
+                    syntax,
+                    fixedInit.ElementType,
+                    arrExpr,
+                    zeroInt);
+
+                var addrSyntax = new PrefixUnaryExpressionSyntax(
+                    SyntaxKind.AddressOfExpression,
+                    default,
+                    (ExpressionSyntax)firstElem.Syntax);
+
+                BoundExpression ptrValue = new BoundAddressOfExpression(
+                    addrSyntax,
+                    _compilation.CreatePointerType(fixedInit.ElementType),
+                    firstElem);
+
+                if (fixedInit.ElementPointerConversion.Kind != ConversionKind.Identity || !ReferenceEquals(ptrValue.Type, declaredPtrType))
+                {
+                    ptrValue = new BoundConversionExpression(syntax, declaredPtrType, ptrValue, fixedInit.ElementPointerConversion, isChecked: false);
+                }
+
+                // arr != null ? (arr.Length != 0 ? &arr[0] : (T*)null) : (T*)null
+                var innerSyntax = new ConditionalExpressionSyntax(
+                    (ExpressionSyntax)nonEmpty.Syntax, default, (ExpressionSyntax)ptrValue.Syntax, default, (ExpressionSyntax)nullPtr.Syntax);
+
+                var inner = new BoundConditionalExpression(
+                    innerSyntax,
+                    declaredPtrType,
+                    nonEmpty,
+                    ptrValue,
+                    nullPtr,
+                    Optional<object>.None);
+
+                var outerSyntax = new ConditionalExpressionSyntax(
+                    (ExpressionSyntax)notNull.Syntax, default, (ExpressionSyntax)inner.Syntax, default, (ExpressionSyntax)nullPtr.Syntax);
+
+                return new BoundConditionalExpression(
+                    outerSyntax,
+                    declaredPtrType,
+                    notNull,
+                    inner,
+                    nullPtr,
+                    Optional<object>.None);
+
+                BoundExpression MakeArrayLengthRead(SyntaxNode syntax, BoundExpression arrayExpr)
+                {
+                    if (arrayExpr.Type is not ArrayTypeSymbol arrayType || arrayType.BaseType is not NamedTypeSymbol arrayBase)
+                        throw new InvalidOperationException("Expected array expression in fixed initializer lowering.");
+
+                    var members = arrayBase.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is PropertySymbol prop &&
+                            string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                            prop.GetMethod is MethodSymbol getter)
+                        {
+                            return new BoundCallExpression(syntax, arrayExpr, getter, ImmutableArray<BoundExpression>.Empty);
+                        }
+                    }
+
+                    throw new InvalidOperationException("System.Array.Length getter not found.");
+                }
+
+            }
+            private BoundExpression LowerFixedStringInitializer(
+                SyntaxNode syntax,
+                PointerTypeSymbol declaredPtrType,
+                BoundFixedInitializerExpression fixedInit,
+                ImmutableArray<BoundStatement>.Builder statements)
+            {
+                var strTemp = CreateTempLocal(fixedInit.Expression.Type);
+                var strExpr = new BoundLocalExpression(syntax, strTemp);
+                statements.Add(new BoundLocalDeclarationStatement(syntax, strTemp, fixedInit.Expression));
+
+                var nullPtr = new BoundConversionExpression(
+                    syntax: syntax,
+                    type: declaredPtrType,
+                    operand: new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                    conversion: new Conversion(ConversionKind.NullLiteral),
+                    isChecked: false);
+
+                var notNull = new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.NotEquals,
+                    _compilation.GetSpecialType(SpecialType.System_Boolean),
+                    strExpr,
+                    new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                    Optional<object>.None);
+
+                var getPinnable = FindStringGetPinnableReference()
+                    ?? throw new InvalidOperationException("System.String.GetPinnableReference not found.");
+
+                var byrefCall = new BoundCallExpression(
+                    syntax,
+                    strExpr,
+                    getPinnable,
+                    ImmutableArray<BoundExpression>.Empty);
+
+                var addrSyntax = new PrefixUnaryExpressionSyntax(
+                    SyntaxKind.AddressOfExpression,
+                    default,
+                    (ExpressionSyntax)byrefCall.Syntax);
+
+                BoundExpression ptrValue = new BoundAddressOfExpression(
+                    addrSyntax,
+                    _compilation.CreatePointerType(fixedInit.ElementType),
+                    byrefCall);
+
+                if (fixedInit.ElementPointerConversion.Kind != ConversionKind.Identity || !ReferenceEquals(ptrValue.Type, declaredPtrType))
+                {
+                    ptrValue = new BoundConversionExpression(syntax, declaredPtrType, ptrValue, fixedInit.ElementPointerConversion, isChecked: false);
+                }
+
+                var condSyntax = new ConditionalExpressionSyntax(
+                    (ExpressionSyntax)notNull.Syntax, default, (ExpressionSyntax)ptrValue.Syntax, default, (ExpressionSyntax)nullPtr.Syntax);
+
+                return new BoundConditionalExpression(
+                    condSyntax,
+                    declaredPtrType,
+                    notNull,
+                    ptrValue,
+                    nullPtr,
+                    Optional<object>.None);
+
+                MethodSymbol? FindStringGetPinnableReference()
+                {
+                    var stringType = _compilation.GetSpecialType(SpecialType.System_String);
+                    var charType = _compilation.GetSpecialType(SpecialType.System_Char);
+
+                    var members = stringType.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is MethodSymbol method &&
+                            string.Equals(method.Name, "GetPinnableReference", StringComparison.Ordinal) &&
+                            !method.IsStatic &&
+                            method.TypeParameters.Length == 0 &&
+                            method.Parameters.Length == 0 &&
+                            method.ReturnType is ByRefTypeSymbol byRef &&
+                            ReferenceEquals(byRef.ElementType, charType))
+                        {
+                            return method;
+                        }
+                    }
+
+                    return null;
+                }
+            }
+            private BoundExpression LowerFixedGetPinnableInitializer(
+                SyntaxNode syntax,
+                PointerTypeSymbol declaredPtrType,
+                BoundFixedInitializerExpression fixedInit,
+                ImmutableArray<BoundStatement>.Builder statements)
+            {
+                var method = fixedInit.GetPinnableReferenceMethodOpt
+                    ?? throw new InvalidOperationException("GetPinnableReference method was not captured by binder.");
+
+                var receiverTemp = CreateTempLocal(fixedInit.Expression.Type);
+                var receiverExpr = new BoundLocalExpression(syntax, receiverTemp);
+                statements.Add(new BoundLocalDeclarationStatement(syntax, receiverTemp, fixedInit.Expression));
+
+                BoundExpression call;
+                if (method.IsExtensionMethod)
+                {
+                    BoundExpression receiverArg = receiverExpr;
+
+                    var firstParamType = method.Parameters[0].Type;
+                    var receiverConv = LocalScopeBinder.ClassifyConversion(receiverArg, firstParamType);
+                    if (!receiverConv.Exists || !receiverConv.IsImplicit)
+                        throw new InvalidOperationException("Bound fixed extension receiver is no longer applicable.");
+
+                    if (receiverConv.Kind != ConversionKind.Identity || !ReferenceEquals(receiverArg.Type, firstParamType))
+                    {
+                        receiverArg = new BoundConversionExpression(
+                            syntax,
+                            firstParamType,
+                            receiverArg,
+                            receiverConv,
+                            isChecked: false);
+                    }
+
+                    call = new BoundCallExpression(
+                        syntax,
+                        receiverOpt: null,
+                        method,
+                        ImmutableArray.Create<BoundExpression>(receiverArg));
+                }
+                else
+                {
+                    call = new BoundCallExpression(
+                        syntax,
+                        receiverExpr,
+                        method,
+                        ImmutableArray<BoundExpression>.Empty);
+                }
+
+                var addrSyntax = new PrefixUnaryExpressionSyntax(
+                    SyntaxKind.AddressOfExpression,
+                    default,
+                    (ExpressionSyntax)call.Syntax);
+
+                BoundExpression ptrValue = new BoundAddressOfExpression(
+                    addrSyntax,
+                    _compilation.CreatePointerType(fixedInit.ElementType),
+                    call);
+
+                if (fixedInit.ElementPointerConversion.Kind != ConversionKind.Identity ||
+                    !ReferenceEquals(ptrValue.Type, declaredPtrType))
+                {
+                    ptrValue = new BoundConversionExpression(
+                        syntax,
+                        declaredPtrType,
+                        ptrValue,
+                        fixedInit.ElementPointerConversion,
+                        isChecked: false);
+                }
+
+                if (fixedInit.Expression.Type.IsReferenceType)
+                {
+                    var nullPtr = new BoundConversionExpression(
+                        syntax: syntax,
+                        type: declaredPtrType,
+                        operand: new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                        conversion: new Conversion(ConversionKind.NullLiteral),
+                        isChecked: false);
+
+                    var notNull = new BoundBinaryExpression(
+                        syntax,
+                        BoundBinaryOperatorKind.NotEquals,
+                        _compilation.GetSpecialType(SpecialType.System_Boolean),
+                        receiverExpr,
+                        new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                        Optional<object>.None);
+
+                    var condSyntax = new ConditionalExpressionSyntax(
+                        (ExpressionSyntax)notNull.Syntax,
+                        default,
+                        (ExpressionSyntax)ptrValue.Syntax,
+                        default,
+                        (ExpressionSyntax)nullPtr.Syntax);
+
+                    return new BoundConditionalExpression(
+                        condSyntax,
+                        declaredPtrType,
+                        notNull,
+                        ptrValue,
+                        nullPtr,
+                        Optional<object>.None);
+                }
+
+                return ptrValue;
+            }
+            private BoundExpression LowerFixedAddressOfInitializer(
+                SyntaxNode syntax,
+                PointerTypeSymbol declaredPtrType,
+                BoundFixedInitializerExpression fixedInit,
+                ImmutableArray<BoundStatement>.Builder statements)
+            {
+                BoundExpression ptrValue = fixedInit.Expression;
+
+                if (fixedInit.ElementPointerConversion.Kind != ConversionKind.Identity || !ReferenceEquals(ptrValue.Type, declaredPtrType))
+                    ptrValue = new BoundConversionExpression(
+                        syntax,
+                        declaredPtrType,
+                        ptrValue,
+                        fixedInit.ElementPointerConversion,
+                        isChecked: false);
+
+                return ptrValue;
+            }
+
             protected override BoundExpression RewriteConversionExpression(BoundConversionExpression node)
             {
                 var effectiveChecked = GetEffectiveIsChecked(node.IsChecked);
@@ -2049,7 +2992,7 @@ namespace Cnidaria.Cs
                     || definition.IsConstructor
                     || definition.TypeParameters.Length != 0
                     || MethodAttributeFacts.HasNoInlining(definition)
-                    || MethodAttributeFacts.HasRuntimeIntrinsic(definition)
+                    || MethodAttributeFacts.HasInternalCall(definition)
                     || MethodAttributeFacts.HasIntrinsic(definition)
                     || definition.ReturnType is ByRefTypeSymbol)
                 {
@@ -2796,7 +3739,10 @@ namespace Cnidaria.Cs
                     valueExpr);
             }
             private static bool IsSimpleReceiver(BoundExpression expr)
-                => expr is BoundLocalExpression or BoundParameterExpression or BoundThisExpression;
+                => expr is BoundLocalExpression
+                    or BoundParameterExpression
+                    or BoundThisExpression
+                    or BoundBaseExpression;
             private BoundExpression LowerIncrementDecrementWithSpill(
                 BoundIncrementDecrementExpression node,
                 BoundExpression rewrittenTarget)

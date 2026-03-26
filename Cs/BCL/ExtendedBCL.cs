@@ -38,7 +38,7 @@ namespace System.Collections.Generic
             get;
         }
     }
-    public class List<T>
+    public class List<T> : IEnumerable<T>, IEnumerable
     {
         private const int DefaultCapacity = 4;
 
@@ -116,7 +116,76 @@ namespace System.Collections.Generic
             }
         }
 
-        //public Enumerator GetEnumerator() => new Enumerator(this);
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<T>)this).GetEnumerator();
+
+        public struct Enumerator : IEnumerator<T>, IEnumerator
+        {
+            private readonly List<T> _list;
+            private readonly int _version;
+
+            private int _index;
+            private T _current;
+
+            internal Enumerator(List<T> list)
+            {
+                _list = list;
+                _version = list._version;
+            }
+
+            public void Dispose()
+            {
+            }
+
+            public bool MoveNext()
+            {
+                List<T> localList = _list;
+
+                if (_version != _list._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                if ((uint)_index < (uint)localList._size)
+                {
+                    _current = localList._items[_index];
+                    _index++;
+                    return true;
+                }
+
+                _current = default;
+                _index = -1;
+                return false;
+            }
+            public T Current => _current;
+
+            object? IEnumerator.Current
+            {
+                get
+                {
+                    if (_index <= 0)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    return _current;
+                }
+            }
+
+            void IEnumerator.Reset()
+            {
+                if (_version != _list._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                _index = 0;
+                _current = default;
+            }
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Add(T item)
@@ -348,7 +417,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator +(Vector2 left, Vector2 right)
@@ -466,7 +535,7 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}>";
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator +(Vector3 left, Vector3 right)
@@ -609,9 +678,9 @@ namespace System.Numerics
         }
         public override string ToString()
         {
-            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}, {W.ToString()}>";
+            return $"<{ X.ToString()}, { Y.ToString()}, { Z.ToString()}, { W.ToString()}>";
         }
-
+        
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector4 operator +(Vector4 left, Vector4 right)
         {

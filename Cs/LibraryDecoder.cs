@@ -194,19 +194,33 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("Containing type must be a mutable core type.");
             }
         }
-        public NamedTypeSymbol AddType(
-            string @namespace, 
-            string name, 
-            TypeKind kind,
-            int arity = 0,
-            Accessibility declaredAccessibility = Accessibility.Public,
-            bool isFromMetadata = false)
+        private static void AddNestedTypeToType(NamedTypeSymbol containingType, NamedTypeSymbol nested)
         {
-            var ns = (SyntheticNamespaceSymbol)EnsureNamespace(@namespace);
+            switch (containingType)
+            {
+                case SourceNamedTypeSymbol s:
+                    s.AddNestedType(nested);
+                    return;
 
+                case SpecialNamedTypeSymbol sp:
+                    sp.AddNestedType(nested);
+                    return;
+
+                default:
+                    throw new InvalidOperationException("Containing type must be a mutable core type.");
+            }
+        }
+        private NamedTypeSymbol CreateTypeCore(
+            Symbol containing,
+            string name,
+            TypeKind kind,
+            int arity,
+            Accessibility declaredAccessibility,
+            bool isFromMetadata)
+        {
             var t = new SourceNamedTypeSymbol(
                 name,
-                ns,
+                containing,
                 kind,
                 arity: arity,
                 declaredAccessibility: declaredAccessibility,
@@ -217,6 +231,7 @@ namespace Cnidaria.Cs
                 TypeKind.Class => _types.GetSpecialType(SpecialType.System_Object),
                 TypeKind.Struct => _types.GetSpecialType(SpecialType.System_ValueType),
                 TypeKind.Enum => _types.GetSpecialType(SpecialType.System_Enum),
+                TypeKind.Interface => null,
                 _ => _types.GetSpecialType(SpecialType.System_Object),
             };
 
@@ -237,8 +252,57 @@ namespace Cnidaria.Cs
                 t.SetTypeParameters(tps.ToImmutable());
             }
 
-            ns.AddType(t);
+            switch (containing)
+            {
+                case SyntheticNamespaceSymbol ns:
+                    ns.AddType(t);
+                    break;
+
+                case NamedTypeSymbol nt:
+                    AddNestedTypeToType(nt, t);
+                    break;
+
+                default:
+                    throw new InvalidOperationException("Unsupported containing symbol for imported type.");
+            }
+
             return t;
+        }
+        public NamedTypeSymbol AddType(
+            string @namespace,
+            string name,
+            TypeKind kind,
+            int arity = 0,
+            Accessibility declaredAccessibility = Accessibility.Public,
+            bool isFromMetadata = false)
+        {
+            var ns = (SyntheticNamespaceSymbol)EnsureNamespace(@namespace);
+            return CreateTypeCore(
+                ns,
+                name,
+                kind,
+                arity,
+                declaredAccessibility,
+                isFromMetadata);
+        }
+
+        public NamedTypeSymbol AddNestedType(
+            NamedTypeSymbol containingType,
+            string name,
+            TypeKind kind,
+            int arity = 0,
+            Accessibility declaredAccessibility = Accessibility.Public,
+            bool isFromMetadata = false)
+        {
+            if (containingType is null) throw new ArgumentNullException(nameof(containingType));
+
+            return CreateTypeCore(
+                containingType,
+                name,
+                kind,
+                arity,
+                declaredAccessibility,
+                isFromMetadata);
         }
         public NamedTypeSymbol AddClass(string @namespace, string name)
             => AddType(@namespace, name, TypeKind.Class);
@@ -322,35 +386,73 @@ namespace Cnidaria.Cs
             => _md = md ?? throw new ArgumentNullException(nameof(md));
         public void Populate(CoreLibraryBuilder core)
         {
-            // map types by RID
-            var typeByRid = new NamedTypeSymbol[_md.GetRowCount(MetadataTableKind.TypeDef) + 1]; // 1 based
-            // create/map types
-            for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
+            var typeCount = _md.GetRowCount(MetadataTableKind.TypeDef);
+            var typeByRid = new NamedTypeSymbol[typeCount + 1]; // 1 based
+
+            var enclosingByRid = new Dictionary<int, int>();
+            for (int i = 1; i <= _md.GetRowCount(MetadataTableKind.NestedClass); i++)
             {
+                var row = _md.GetNestedClass(i);
+                enclosingByRid[row.NestedTypeRid] = row.EnclosingTypeRid;
+            }
+
+            NamedTypeSymbol EnsureType(int rid)
+            {
+                if ((uint)rid >= (uint)typeByRid.Length || rid <= 0)
+                    throw new BadImageFormatException($"Invalid TypeDef rid: {rid}");
+
+                if (typeByRid[rid] is { } existing)
+                    return existing;
+
                 var td = _md.GetTypeDef(rid);
                 var ns = _md.GetString(td.Namespace);
                 var mdName = _md.GetString(td.Name);
                 var (name, arity) = SplitArity(mdName);
 
                 if (string.IsNullOrEmpty(name))
-                    continue;
+                    throw new BadImageFormatException($"TypeDef #{rid} has empty name.");
 
-                // Special types
-                if (TryMapSpecialType(ns, name, out var st))
+                if (TryMapSpecialType(ns, name, out var st) && !enclosingByRid.ContainsKey(rid))
                 {
-                    typeByRid[rid] = core.GetSpecialType(st);
-                    continue;
+                    var special = core.GetSpecialType(st);
+                    typeByRid[rid] = special;
+                    return special;
                 }
-                var kind = InferKindFromExtends(td.ExtendsEncoded);
-                var t = core.AddType(
-                    ns, name, kind,
-                    arity: arity,
-                    declaredAccessibility: DecodeTypeAccessibility(td.Flags),
-                    isFromMetadata: true);
-                typeByRid[rid] = t;
+
+                var kind = InferKind(td);
+                NamedTypeSymbol created;
+
+                if (enclosingByRid.TryGetValue(rid, out int enclosingRid))
+                {
+                    var enclosing = EnsureType(enclosingRid);
+                    created = core.AddNestedType(
+                        enclosing,
+                        name,
+                        kind,
+                        arity: arity,
+                        declaredAccessibility: DecodeTypeAccessibility(td.Flags),
+                        isFromMetadata: true);
+                }
+                else
+                {
+                    created = core.AddType(
+                        ns,
+                        name,
+                        kind,
+                        arity: arity,
+                        declaredAccessibility: DecodeTypeAccessibility(td.Flags),
+                        isFromMetadata: true);
+                }
+
+                typeByRid[rid] = created;
+                return created;
             }
+
+            for (int rid = 1; rid <= typeCount; rid++)
+                _ = EnsureType(rid);
+
             // apply declared base types from ExtendsEncoded
-            for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
+            for (int rid = 1; rid <= typeCount; rid++)
             {
                 var td = _md.GetTypeDef(rid);
                 var declaring = typeByRid[rid];
@@ -362,22 +464,63 @@ namespace Cnidaria.Cs
                     continue; // special types already have BaseType fixed
 
                 var baseType = ResolveTypeDefOrRef(
-                    unchecked((uint)td.ExtendsEncoded), 
-                    typeByRid, 
+                    unchecked((uint)td.ExtendsEncoded),
+                    typeByRid,
                     core,
-                    declaringType: null,
+                    declaringType: declaring,
                     methodTypeParameters: ImmutableArray<TypeParameterSymbol>.Empty);
+
                 if (baseType is NamedTypeSymbol bt)
-                {
                     src.SetDeclaredBaseType(bt);
-                }
             }
 
-            // Import
+            // Import interfaces
+            var ifaceSets = new Dictionary<SourceNamedTypeSymbol, HashSet<TypeSymbol>>(
+                ReferenceEqualityComparer<SourceNamedTypeSymbol>.Instance);
+
+            for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.InterfaceImpl); rid++)
+            {
+                var row = _md.GetInterfaceImpl(rid);
+
+                if ((uint)row.ClassTypeDefRid >= (uint)typeByRid.Length)
+                    continue;
+
+                if (typeByRid[row.ClassTypeDefRid] is not SourceNamedTypeSymbol owner)
+                    continue;
+
+                var ifaceType = ResolveTypeDefOrRef(
+                    unchecked((uint)row.InterfaceEncoded),
+                    typeByRid,
+                    core,
+                    declaringType: owner,
+                    methodTypeParameters: ImmutableArray<TypeParameterSymbol>.Empty);
+
+                if (ifaceType is not NamedTypeSymbol iface || iface.TypeKind != TypeKind.Interface)
+                    continue;
+
+                if (!ifaceSets.TryGetValue(owner, out var set))
+                {
+                    set = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+                    ifaceSets.Add(owner, set);
+                }
+
+                set.Add(iface.OriginalDefinition);
+            }
+
+            foreach (var kv in ifaceSets)
+            {
+                var b = ImmutableArray.CreateBuilder<TypeSymbol>(kv.Value.Count);
+                foreach (var iface in kv.Value)
+                    b.Add(iface);
+
+                kv.Key.SetDeclaredInterfaces(b.ToImmutable());
+            }
+
             var methodByRid = AddMethods(core, typeByRid);
             var fieldByRid = AddFields(core, typeByRid);
             var propertyByRid = AddPropertiesFromTable(core, typeByRid, methodByRid);
             AddPropertiesFromAccessors(core, typeByRid);
+            ApplyMethodImpls(core, typeByRid, methodByRid);
 
             var paramByRid = BuildParamMap(methodByRid);
             ApplyCustomAttributes(core, typeByRid, fieldByRid, methodByRid, paramByRid, propertyByRid);
@@ -518,6 +661,275 @@ namespace Cnidaria.Cs
                 if (cval.HasValue)
                     p.SetDefaultValue(cval);
             }
+        }
+        private void ApplyMethodImpls(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            Dictionary<int, MethodSymbol> methodByRid)
+        {
+            int count = _md.GetRowCount(MetadataTableKind.MethodImpl);
+            if (count == 0)
+                return;
+
+            var accessorToProperty = new Dictionary<MethodSymbol, PropertySymbol>(
+                ReferenceEqualityComparer<MethodSymbol>.Instance);
+
+            for (int i = 1; i < typeByRid.Length; i++)
+            {
+                var type = typeByRid[i];
+                if (type is null)
+                    continue;
+
+                var members = type.GetMembers();
+                for (int m = 0; m < members.Length; m++)
+                {
+                    if (members[m] is not PropertySymbol p)
+                        continue;
+                    if (p.GetMethod is not null)
+                        accessorToProperty[p.GetMethod] = p;
+                    if (p.SetMethod is not null)
+                        accessorToProperty[p.SetMethod] = p;
+                }
+            }
+
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = _md.GetMethodImpl(rid);
+
+                if ((uint)row.ClassTypeDefRid >= (uint)typeByRid.Length)
+                    continue;
+
+                var body = ResolveMethodToken(core, typeByRid, methodByRid, row.BodyMethodToken);
+                var decl = ResolveMethodToken(core, typeByRid, methodByRid, row.DeclarationMethodToken);
+
+                if (body is null || decl is null)
+                    continue;
+                switch (body)
+                {
+                    case ExternalMethodSymbol em:
+                        em.SetExplicitInterfaceImplementation(decl);
+                        break;
+                    case SourceMethodSymbol sm:
+                        sm.SetExplicitInterfaceImplementation(decl);
+                        break;
+                }
+
+                if (accessorToProperty.TryGetValue(body, out var bodyProp) &&
+                    accessorToProperty.TryGetValue(decl, out var declProp))
+                {
+                    switch (bodyProp)
+                    {
+                        case ExternalPropertySymbol ep:
+                            ep.SetExplicitInterfaceImplementation(declProp);
+                            break;
+                        case SourcePropertySymbol sp:
+                            sp.SetExplicitInterfaceImplementation(declProp);
+                            break;
+                    }
+                }
+            }
+        }
+        private MethodSymbol? ResolveMethodToken(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            Dictionary<int, MethodSymbol> methodByRid,
+            int token)
+        {
+            int table = MetadataToken.Table(token);
+            int rid = MetadataToken.Rid(token);
+            return table switch
+            {
+                MetadataToken.MethodDef => methodByRid.TryGetValue(rid, out var m) ? m : null,
+                MetadataToken.MemberRef => ResolveMemberRefMethod(core, typeByRid, rid),
+                _ => null
+            };
+        }
+        private MethodSymbol? ResolveMemberRefMethod(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid, int memberRefRid)
+        {
+            if (memberRefRid <= 0 || memberRefRid > _md.GetRowCount(MetadataTableKind.MemberRef))
+                return null;
+
+            var row = _md.GetMemberRef(memberRefRid);
+            string name = _md.GetString(row.Name);
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            NamedTypeSymbol? ownerType = ResolveTypeToken(core, typeByRid, row.ClassToken) as NamedTypeSymbol;
+            if (ownerType is null)
+                return null;
+
+            var sig = _md.GetBlob(row.Signature);
+            if (sig.Length == 0)
+                return null;
+
+            var reader = new SigReader(sig);
+
+            byte cc = reader.ReadByte();
+
+            uint genArity = 0;
+            if ((cc & 0x10) != 0)
+                genArity = reader.ReadCompressedUInt();
+
+            uint paramCount = reader.ReadCompressedUInt();
+
+            bool hasThis = (cc & 0x20) != 0;
+            bool isStatic = !hasThis;
+
+            ImmutableArray<TypeParameterSymbol> methodTypeParameters = ImmutableArray<TypeParameterSymbol>.Empty;
+            if (genArity != 0)
+            {
+                var tb = ImmutableArray.CreateBuilder<TypeParameterSymbol>((int)genArity);
+                for (int i = 0; i < (int)genArity; i++)
+                {
+                    string tpName = (i == 0) ? "T" : $"T{i}";
+                    tb.Add(new TypeParameterSymbol(
+                        tpName,
+                        containing: null,
+                        ordinal: i,
+                        locations: ImmutableArray<Location>.Empty));
+                }
+                methodTypeParameters = tb.ToImmutable();
+            }
+
+            var returnType = ReadType(core, typeByRid, ref reader, ownerType, methodTypeParameters);
+
+            var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>((int)paramCount);
+            for (int i = 0; i < (int)paramCount; i++)
+                parameterTypes.Add(ReadType(core, typeByRid, ref reader, ownerType, methodTypeParameters));
+
+            return FindMethodBySignature(
+                ownerType,
+                name,
+                returnType,
+                parameterTypes.ToImmutable(),
+                checked((int)genArity),
+                isStatic);
+        }
+        private MethodSymbol? FindMethodBySignature(
+            NamedTypeSymbol ownerType,
+            string name,
+            TypeSymbol returnType,
+            ImmutableArray<TypeSymbol> parameterTypes,
+            int genericArity,
+            bool isStatic)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var stack = new Stack<NamedTypeSymbol>();
+            stack.Push(ownerType);
+
+            while (stack.Count != 0)
+            {
+                var type = stack.Pop();
+                if (!seen.Add(type))
+                    continue;
+
+                var members = type.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol m)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                        continue;
+
+                    if (m.IsStatic != isStatic)
+                        continue;
+
+                    if (m.TypeParameters.Length != genericArity)
+                        continue;
+
+                    var ps = m.Parameters;
+                    if (ps.Length != parameterTypes.Length)
+                        continue;
+
+                    bool same = AreEquivalentSignatureType(m.ReturnType, returnType);
+                    if (!same)
+                        continue;
+
+                    for (int p = 0; p < ps.Length; p++)
+                    {
+                        if (!AreEquivalentSignatureType(ps[p].Type, parameterTypes[p]))
+                        {
+                            same = false;
+                            break;
+                        }
+                    }
+
+                    if (same)
+                        return m;
+                }
+
+                if (type.TypeKind == TypeKind.Interface)
+                {
+                    var ifaces = type.Interfaces;
+                    for (int i = 0; i < ifaces.Length; i++)
+                    {
+                        if (ifaces[i] is NamedTypeSymbol iface)
+                            stack.Push(iface);
+                    }
+                }
+                else if (type.BaseType is NamedTypeSymbol bt)
+                {
+                    stack.Push(bt);
+                }
+            }
+
+            return null;
+        }
+        private static bool AreEquivalentSignatureType(TypeSymbol a, TypeSymbol b)
+        {
+            if (ReferenceEquals(a, b))
+                return true;
+
+            if (a.SpecialType != SpecialType.None || b.SpecialType != SpecialType.None)
+                return a.SpecialType == b.SpecialType;
+
+            if (a is ArrayTypeSymbol aa && b is ArrayTypeSymbol ab)
+                return aa.Rank == ab.Rank && AreEquivalentSignatureType(aa.ElementType, ab.ElementType);
+
+            if (a is PointerTypeSymbol pa && b is PointerTypeSymbol pb)
+                return AreEquivalentSignatureType(pa.PointedAtType, pb.PointedAtType);
+
+            if (a is ByRefTypeSymbol ra && b is ByRefTypeSymbol rb)
+                return AreEquivalentSignatureType(ra.ElementType, rb.ElementType);
+
+            if (a is NamedTypeSymbol na && b is NamedTypeSymbol nb)
+            {
+                if (!ReferenceEquals(na.OriginalDefinition, nb.OriginalDefinition))
+                    return false;
+
+                var aa2 = na.TypeArguments;
+                var bb2 = nb.TypeArguments;
+                if (aa2.Length != bb2.Length)
+                    return false;
+
+                for (int i = 0; i < aa2.Length; i++)
+                {
+                    if (!AreEquivalentSignatureType(aa2[i], bb2[i]))
+                        return false;
+                }
+
+                return true;
+            }
+
+            if (a is TypeParameterSymbol ta && b is TypeParameterSymbol tb)
+            {
+                if (ta.Ordinal != tb.Ordinal)
+                    return false;
+
+                static int OwnerKind(TypeParameterSymbol tp) => tp.ContainingSymbol switch
+                {
+                    MethodSymbol => 2,
+                    NamedTypeSymbol => 1,
+                    _ => 0
+                };
+
+                int ak = OwnerKind(ta);
+                int bk = OwnerKind(tb);
+                return ak == bk || ak == 0 || bk == 0;
+            }
+
+            return false;
         }
         private void ApplyCustomAttributes(
             CoreLibraryBuilder core,
@@ -1193,8 +1605,14 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        private TypeKind InferKindFromExtends(int extendsEncoded)
+        private TypeKind InferKind(TypeDefRow td)
         {
+            var attrs = (System.Reflection.TypeAttributes)td.Flags;
+            if ((attrs & System.Reflection.TypeAttributes.Interface) != 0)
+                return TypeKind.Interface;
+
+            int extendsEncoded = td.ExtendsEncoded;
+
             if (extendsEncoded == 0)
                 return TypeKind.Class;
 
@@ -1215,9 +1633,9 @@ namespace Cnidaria.Cs
                         if (rid > _md.GetRowCount(MetadataTableKind.TypeDef))
                             return TypeKind.Class;
 
-                        var td = _md.GetTypeDef(rid);
-                        baseNs = _md.GetString(td.Namespace);
-                        baseName = _md.GetString(td.Name);
+                        var typedef = _md.GetTypeDef(rid);
+                        baseNs = _md.GetString(typedef.Namespace);
+                        baseName = _md.GetString(typedef.Name);
                         break;
                     }
 
@@ -1337,13 +1755,33 @@ namespace Cnidaria.Cs
         private static TypeSymbol ReadVar(NamedTypeSymbol? declaringType, ref SigReader reader)
         {
             uint ordinal = reader.ReadCompressedUInt();
+
             if (declaringType is not null)
             {
-                var tps = declaringType.TypeParameters;
-                if ((uint)tps.Length > ordinal)
-                    return tps[(int)ordinal];
+                var allTypeParameters = GetTypeParametersInMetadataOrder(declaringType);
+                if ((uint)allTypeParameters.Length > ordinal)
+                    return allTypeParameters[(int)ordinal];
             }
+
             return new ErrorTypeSymbol($"var:{ordinal}", containing: null, locations: ImmutableArray<Location>.Empty);
+        }
+        private static ImmutableArray<TypeParameterSymbol> GetTypeParametersInMetadataOrder(NamedTypeSymbol type)
+        {
+            var chain = new List<NamedTypeSymbol>();
+
+            for (Symbol? cur = type; cur is NamedTypeSymbol nt; cur = nt.ContainingSymbol)
+                chain.Add(nt);
+
+            var b = ImmutableArray.CreateBuilder<TypeParameterSymbol>();
+
+            for (int i = chain.Count - 1; i >= 0; i--)
+            {
+                var tps = chain[i].TypeParameters;
+                for (int j = 0; j < tps.Length; j++)
+                    b.Add(tps[j]);
+            }
+
+            return b.ToImmutable();
         }
         private static TypeSymbol ReadMVar(ImmutableArray<TypeParameterSymbol> methodTypeParameters, ref SigReader reader)
         {

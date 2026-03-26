@@ -405,7 +405,7 @@ namespace Cnidaria.Cs
             // type decl
             var modifiers = ParseModifiers(ModifierContext.Type);
 
-            if (IsTypeDeclarationKeyword(_tokens.CurrentKind))
+            if (IsCurrentTypeDeclarationKeyword())
             {
                 seenNonGlobalMember = true;
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
@@ -445,7 +445,7 @@ namespace Cnidaria.Cs
 
             var modifiers = ParseModifiers(ModifierContext.Type);
 
-            if (IsTypeDeclarationKeyword(_tokens.CurrentKind))
+            if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
 
             _tokens.Reset(mark);
@@ -472,7 +472,7 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
                 return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
 
-            if (IsTypeDeclarationKeyword(_tokens.CurrentKind))
+            if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
 
             _tokens.Reset(mark);
@@ -750,6 +750,9 @@ namespace Cnidaria.Cs
         private MemberDeclarationSyntax ParseTypeDeclarationAfterModifiers(
             SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
+            if (IsCurrentContextual(SyntaxKind.RecordKeyword))
+                return ParseRecordDeclaration(attributeLists, modifiers);
+
             return _tokens.CurrentKind switch
             {
                 SyntaxKind.ClassKeyword => ParseClassDeclaration(attributeLists, modifiers),
@@ -923,6 +926,91 @@ namespace Cnidaria.Cs
                 close,
                 semi);
         }
+        private RecordDeclarationSyntax ParseRecordDeclaration(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
+        {
+            if (modifiers.Count == 0)
+                modifiers = ParseModifiers(ModifierContext.Type);
+
+            var recordKeyword = MatchContextualKeyword(SyntaxKind.RecordKeyword);
+
+            SyntaxToken classOrStructKeyword = default;
+            SyntaxKind kind = SyntaxKind.RecordDeclaration;
+
+            if (_tokens.CurrentKind == SyntaxKind.ClassKeyword)
+            {
+                classOrStructKeyword = _tokens.EatToken();
+            }
+            else if (_tokens.CurrentKind == SyntaxKind.StructKeyword)
+            {
+                classOrStructKeyword = _tokens.EatToken();
+                kind = SyntaxKind.RecordStructDeclaration;
+            }
+
+            var id = MatchToken(SyntaxKind.IdentifierToken);
+
+            TypeParameterListSyntax? typeParams = null;
+            if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
+                typeParams = ParseTypeParameterList();
+
+            ParameterListSyntax? parameterList = null;
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                parameterList = ParseParameterList();
+
+            BaseListSyntax? baseList = null;
+            if (_tokens.CurrentKind == SyntaxKind.ColonToken)
+                baseList = ParseBaseList(allowPrimaryConstructorBaseType: true);
+
+            var constraintClauses = ParseTypeParameterConstraintClauses();
+
+            var members = new List<MemberDeclarationSyntax>();
+
+            SyntaxToken open;
+            SyntaxToken close;
+            SyntaxToken semi;
+
+            if (_tokens.CurrentKind == SyntaxKind.SemicolonToken)
+            {
+                semi = _tokens.EatToken();
+                open = CreateMissingToken(SyntaxKind.OpenBraceToken, semi.Span.Start);
+                close = CreateMissingToken(SyntaxKind.CloseBraceToken, semi.Span.Start);
+            }
+            else
+            {
+                open = MatchToken(SyntaxKind.OpenBraceToken);
+
+                using var __ = _ctx.Push(ParseContext.TypeMembers);
+
+                while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                       _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+                {
+                    var start = _tokens.Position;
+                    var m = ParseClassMemberDeclaration(classNameToken: id);
+                    members.Add(m);
+
+                    if (_tokens.Position == start && _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+                        EatAsSkippedToken("Parser made no progress in record member parsing.");
+                }
+
+                close = MatchToken(SyntaxKind.CloseBraceToken);
+                semi = EatOptionalToken(SyntaxKind.SemicolonToken);
+            }
+
+            return new RecordDeclarationSyntax(
+                kind,
+                attributeLists,
+                modifiers,
+                recordKeyword,
+                classOrStructKeyword,
+                id,
+                typeParams,
+                parameterList,
+                baseList,
+                constraintClauses,
+                open,
+                new SyntaxList<MemberDeclarationSyntax>(members.ToArray()),
+                close,
+                semi);
+        }
         //classes
         private ClassDeclarationSyntax ParseClassDeclaration(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
@@ -984,7 +1072,7 @@ namespace Cnidaria.Cs
                 return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
 
             // nested type
-            if (IsTypeDeclarationKeyword(_tokens.CurrentKind))
+            if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
 
             // destructor
@@ -1418,10 +1506,19 @@ namespace Cnidaria.Cs
             memberIdentifier = default;
             thisKeyword = default;
 
-            if (_tokens.CurrentKind != SyntaxKind.IdentifierToken || _tokens.Peek(1).Kind != SyntaxKind.DotToken)
+            if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
                 return false;
 
+            var rp = GetResetPoint();
+            
             NameSyntax name = ParseSimpleName();
+
+            if (_tokens.CurrentKind != SyntaxKind.DotToken)
+            {
+                Reset(rp);
+                return false;
+            }
+
             while (_tokens.CurrentKind == SyntaxKind.DotToken)
             {
                 if (_tokens.Peek(1).Kind == SyntaxKind.ThisKeyword)
@@ -1431,13 +1528,17 @@ namespace Cnidaria.Cs
                     explicitInterfaceSpecifier = new ExplicitInterfaceSpecifierSyntax(name, dot);
                     return true;
                 }
+
                 if (_tokens.Peek(1).Kind != SyntaxKind.IdentifierToken)
+                {
+                    Reset(rp);
                     return false;
+                }
 
                 bool isQualifierDot = Probe(
                     scan: () =>
                     {
-                        _tokens.EatToken(); // dot
+                        _tokens.EatToken();
                         ParseSimpleName();
                         return _tokens.CurrentKind == SyntaxKind.DotToken;
                     },
@@ -1456,6 +1557,8 @@ namespace Cnidaria.Cs
                 explicitInterfaceSpecifier = new ExplicitInterfaceSpecifierSyntax(name, explicitDot);
                 return true;
             }
+
+            Reset(rp);
             return false;
         }
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
@@ -1842,12 +1945,12 @@ namespace Cnidaria.Cs
             return new TypeParameterSyntax(attrs, variance, id);
         }
 
-        private BaseListSyntax ParseBaseList()
+        private BaseListSyntax ParseBaseList(bool allowPrimaryConstructorBaseType = false)
         {
             var colon = MatchToken(SyntaxKind.ColonToken);
 
             var items = new List<SyntaxNodeOrToken>();
-            items.Add(new SyntaxNodeOrToken(ParseBaseType()));
+            items.Add(new SyntaxNodeOrToken(ParseBaseType(allowPrimaryConstructorBaseType)));
 
             while (_tokens.CurrentKind == SyntaxKind.CommaToken)
             {
@@ -1858,7 +1961,7 @@ namespace Cnidaria.Cs
             return new BaseListSyntax(colon, new SeparatedSyntaxList<BaseTypeSyntax>(items.ToArray()));
         }
 
-        private BaseTypeSyntax ParseBaseType()
+        private BaseTypeSyntax ParseBaseType(bool allowPrimaryConstructorBaseType = false)
         {
             var t = ParseType();
             return new SimpleBaseTypeSyntax(t);
@@ -5213,7 +5316,8 @@ namespace Cnidaria.Cs
             SyntaxKind.CharacterLiteralToken => true,
             _ => false
         };
-        private static bool IsTypeDeclarationKeyword(SyntaxKind kind) => kind switch
+        private bool IsCurrentTypeDeclarationKeyword()
+            => IsCurrentContextual(SyntaxKind.RecordKeyword) || _tokens.CurrentKind switch
         {
             SyntaxKind.ClassKeyword => true,
             SyntaxKind.StructKeyword => true,
@@ -5221,8 +5325,7 @@ namespace Cnidaria.Cs
             SyntaxKind.EnumKeyword => true,
             _ => false
         };
-
-        private static SyntaxKind GetAssignmentExpressionKind(SyntaxKind tokenKind) => tokenKind switch
+    private static SyntaxKind GetAssignmentExpressionKind(SyntaxKind tokenKind) => tokenKind switch
         {
             SyntaxKind.EqualsToken => SyntaxKind.SimpleAssignmentExpression,
             SyntaxKind.PlusEqualsToken => SyntaxKind.AddAssignmentExpression,

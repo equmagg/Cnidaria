@@ -1735,6 +1735,13 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(actual, target))
                 return true;
 
+            if (target.Kind == RuntimeTypeKind.Interface)
+            {
+                var seen = new HashSet<int>();
+                if (ImplementsInterface(actual, target, seen))
+                    return true;
+            }
+
             if (actual.Kind == RuntimeTypeKind.Array &&
                 target.Kind == RuntimeTypeKind.Array)
             {
@@ -1756,6 +1763,25 @@ namespace Cnidaria.Cs
             }
 
             return false;
+
+            static bool ImplementsInterface(RuntimeType current, RuntimeType target, HashSet<int> seen)
+            {
+                if (!seen.Add(current.TypeId))
+                    return false;
+
+                var interfaces = current.Interfaces;
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    var iface = interfaces[i];
+                    if (ReferenceEquals(iface, target))
+                        return true;
+
+                    if (ImplementsInterface(iface, target, seen))
+                        return true;
+                }
+
+                return current.BaseType is not null && ImplementsInterface(current.BaseType, target, seen);
+            }
         }
 
         private void CheckHeapAccess(int abs, int size, bool writable)
@@ -1838,20 +1864,22 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Newobj:
                         {
-                            var (tmOpt, tfn) = _domain.ResolveCall(module, ins.Operand0);
-                            var tm = tmOpt ?? module;
-                            var ctor = ResolveRuntimeMethodOrThrow(tm, tfn.MethodToken);
+                            var ctor = ResolveRuntimeMethodOrThrow(module, ins.Operand0, rm);
                             Consider(ctor.DeclaringType);
+                            for (int i = 0; i < ctor.ParameterTypes.Length; i++)
+                                Consider(ctor.ParameterTypes[i]);
                             break;
                         }
 
                     case BytecodeOp.Call:
                     case BytecodeOp.CallVirt:
                         {
-                            var (tmOpt, tfn) = _domain.ResolveCall(module, ins.Operand0);
-                            var tm = tmOpt ?? module;
-                            var callee = ResolveRuntimeMethodOrThrow(tm, tfn.MethodToken);
+                            var callee = ResolveRuntimeMethodOrThrow(module, ins.Operand0, rm);
                             Consider(callee.ReturnType);
+                            if (callee.HasThis)
+                                Consider(callee.DeclaringType);
+                            for (int i = 0; i < callee.ParameterTypes.Length; i++)
+                                Consider(callee.ParameterTypes[i]);
                             break;
                         }
 
@@ -2660,6 +2688,8 @@ namespace Cnidaria.Cs
                 int objAbs = checked((int)receiver.Payload);
                 var actualType = GetObjectTypeFromRef(receiver);
 
+                field = _rts.BindFieldToReceiver(field, actualType);
+
                 if (field.DeclaringType.IsValueType)
                 {
                     if (actualType.TypeId != field.DeclaringType.TypeId)
@@ -2705,37 +2735,36 @@ namespace Cnidaria.Cs
 
         private void ExecLdfld(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             var receiver = PopSlot();
 
             int fieldAbs = GetInstanceFieldAddress(field, receiver, writable: false);
             var value = LoadValueAsSlot(fieldAbs, 0, field.FieldType);
             PushSlot(value);
         }
+
         private void ExecLdflda(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             var receiver = PopSlot();
             int fieldAbs = GetInstanceFieldAddress(field, receiver, writable: false);
             var (sz, _) = GetStorageSizeAlign(field.FieldType);
             PushSlot(new Slot(SlotKind.ByRef, fieldAbs, aux: sz));
         }
+
         private void ExecStfld(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             var value = PopSlot();
             var receiver = PopSlot();
 
             int fieldAbs = GetInstanceFieldAddress(field, receiver, writable: true);
             StoreSlotAsValue(fieldAbs, 0, field.FieldType, value);
         }
+
         private void ExecLdsfld(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             if (!field.IsStatic)
                 throw new InvalidOperationException($"Field '{field.DeclaringType.Namespace}.{field.DeclaringType.Name}.{field.Name}' is not static.");
 
@@ -2743,10 +2772,10 @@ namespace Cnidaria.Cs
             var value = LoadValueAsSlot(fieldAbs, 0, field.FieldType);
             PushSlot(value);
         }
+
         private void ExecLdsflda(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             if (!field.IsStatic)
                 throw new InvalidOperationException($"Field '{field.DeclaringType.Namespace}.{field.DeclaringType.Name}.{field.Name}' is not static.");
 
@@ -2754,10 +2783,10 @@ namespace Cnidaria.Cs
             var (sz, _) = GetStorageSizeAlign(field.FieldType);
             PushSlot(new Slot(SlotKind.ByRef, fieldAbs, aux: sz));
         }
+
         private void ExecStsfld(RuntimeModule mod, int fieldToken)
         {
-            var field = _rts.ResolveField(mod, fieldToken);
-            field = RemapFieldForGenericContext(field);
+            var field = _rts.ResolveFieldInMethodContext(mod, fieldToken, _curLayout?.Method);
             if (!field.IsStatic)
                 throw new InvalidOperationException($"Field '{field.DeclaringType.Namespace}.{field.DeclaringType.Name}.{field.Name}' is not static.");
 
@@ -2808,8 +2837,8 @@ namespace Cnidaria.Cs
             CancellationToken ct,
             ExecutionLimits limits)
         {
-            var f = _rts.ResolveField(contextModule, fieldToken);
-            f = RemapFieldForGenericContext(f);
+            var f = _rts.ResolveFieldInMethodContext(contextModule, fieldToken, _curLayout?.Method);
+
             if (!f.IsStatic)
                 return false;
 
@@ -2876,32 +2905,6 @@ namespace Cnidaria.Cs
             _pendingTypeInitFrames[_frameBase] = t.TypeId;
             return true;
         }
-        private RuntimeField RemapFieldForGenericContext(RuntimeField field)
-        {
-            var rm = _curLayout?.Method;
-            if (rm is null)
-                return field;
-
-            var decl = rm.DeclaringType;
-            var gdef = decl.GenericTypeDefinition;
-            if (gdef is null)
-                return field;
-
-            if (!ReferenceEquals(field.DeclaringType, gdef))
-                return field;
-
-            var list = field.IsStatic ? decl.StaticFields : decl.InstanceFields;
-            for (int i = 0; i < list.Length; i++)
-            {
-                var cand = list[i];
-                if (cand.IsStatic != field.IsStatic)
-                    continue;
-                if (!StringComparer.Ordinal.Equals(cand.Name, field.Name))
-                    continue;
-                return cand;
-            }
-            return field;
-        }
         private static int AlignForSize(int size)
         {
             if (size <= 1) return 1;
@@ -2909,7 +2912,6 @@ namespace Cnidaria.Cs
             if (size == 4) return 4;
             return 8;
         }
-        private int GetModuleId(RuntimeModule m) => _moduleIdByName[m.Name];
         private void PushFrame(
             RuntimeModule module,
             BytecodeFunction fn,
@@ -2977,7 +2979,7 @@ namespace Cnidaria.Cs
             WriteI32(newBase + 8, returnMethodToken);
             WriteI32(newBase + 12, returnModuleId);
             WriteI32(newBase + 16, fn.MethodToken);
-            WriteI32(newBase + 20, GetModuleId(module));
+            WriteI32(newBase + 20, _moduleIdByName[module.Name]);
             WriteI32(newBase + 24, 0);               // pc
             WriteI32(newBase + 28, newBase + evalBase);
             WriteI32(newBase + 32, 0);               // evalSp
@@ -3767,7 +3769,7 @@ namespace Cnidaria.Cs
 
             if (t.Kind == RuntimeTypeKind.Pointer)
             {
-                if (v.Kind is not (SlotKind.Ptr or SlotKind.Null))
+                if (v.Kind is not (SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null))
                     throw new InvalidOperationException($"Storing {v.Kind} into pointer.");
 
                 long p = v.Kind == SlotKind.Null ? 0 : v.Payload;
@@ -4621,6 +4623,13 @@ namespace Cnidaria.Cs
 
             if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
             {
+                for (var t = receiverType; t != null; t = t.BaseType)
+                {
+                    var map = t.ExplicitInterfaceMethodImpls;
+                    if (map is not null && map.TryGetValue(declared.MethodId, out var explicitImpl))
+                        return explicitImpl;
+                }
+
                 var m = FindMostDerivedMethodByNameAndSig(receiverType, declared);
                 if (m is null)
                     throw new MissingMethodException(
@@ -4645,16 +4654,19 @@ namespace Cnidaria.Cs
                 {
                     var cand = ms[i];
                     if (cand.IsStatic) continue;
+                    if (cand.IsPrivate) continue;
                     if (!StringComparer.Ordinal.Equals(cand.Name, declared.Name)) continue;
                     if (!SameSig(cand, declared)) continue;
                     return cand;
                 }
             }
+
             return null;
+
             static bool SameSig(RuntimeMethod a, RuntimeMethod b)
             {
                 if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
-                if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false; 
+                if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
                 if (a.GenericArity != b.GenericArity) return false;
                 for (int i = 0; i < a.ParameterTypes.Length; i++)
                     if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
@@ -5601,8 +5613,9 @@ namespace Cnidaria.Cs
                     return true;
                 }
             }
-            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Console")
+            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Console" && rm.Name == "_Write")
             {
+                ct.ThrowIfCancellationRequested();
 
                 if (rm.HasThis)
                     throw new NotSupportedException("Intrinsic System.Console.Write with 'this' is not supported.");
@@ -5611,112 +5624,106 @@ namespace Cnidaria.Cs
                     throw new NotSupportedException("Intrinsic System.Console.Write overload is not supported (arity mismatch).");
 
                 ct.ThrowIfCancellationRequested();
-                if (rm.Name == "_Write")
+
+                var p0 = rm.ParameterTypes[0];
+
+                if (IsSystemStringType(p0))
                 {
-                    if (rm.ParameterTypes.Length != 1 || totalArgs != 1)
-                        throw new NotSupportedException("Intrinsic System.Console.Write overload is not supported (arity mismatch).");
-
-                    ct.ThrowIfCancellationRequested();
-
-                    var p0 = rm.ParameterTypes[0];
-
-                    if (IsSystemStringType(p0))
+                    var s = PopSlot();
+                    if (s.Kind != SlotKind.Null)
                     {
-                        var s = PopSlot();
-                        if (s.Kind != SlotKind.Null)
-                        {
-                            ValidateStringRef(s, out int strObjAbs);
+                        ValidateStringRef(s, out int strObjAbs);
 
-                            int len = GetStringLengthFromObject(strObjAbs);
-                            int charsAbs = GetStringCharsAbs(strObjAbs);
-                            CheckHeapAccess(charsAbs, checked(len * 2), writable: false);
+                        int len = GetStringLengthFromObject(strObjAbs);
+                        int charsAbs = GetStringCharsAbs(strObjAbs);
+                        CheckHeapAccess(charsAbs, checked(len * 2), writable: false);
 
-                            for (int i = 0; i < len; i++)
-                            {
-                                if ((i & 0xFF) == 0)
-                                    ct.ThrowIfCancellationRequested();
-
-                                _textWriter.Write((char)ReadU16(charsAbs + (i * 2)));
-                            }
-                        }
-                        return true;
-                    }
-                    if (p0.Kind == RuntimeTypeKind.Pointer &&
-                        p0.ElementType is { Namespace: "System", Name: "Char" })
-                    {
-                        ct.ThrowIfCancellationRequested();
-
-                        var s = PopSlot();
-                        if (s.Kind == SlotKind.Null)
-                        {
-                            return true;
-                        }
-
-                        int abs = GetAddressAbsOrThrow(s);
-
-                        const int MaxChars = 8 * 1024;
-                        for (int i = 0; i < MaxChars; i++)
-                        {
-                            if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
-
-                            int pos = abs + (i * 2);
-                            if (pos < _stackBase || pos + 2 > _sp)
-                                throw new InvalidOperationException("Unterminated or out of range char* for Console.Write(char*).");
-
-                            ushort ch = BinaryPrimitives.ReadUInt16LittleEndian(_mem.AsSpan(pos, 2));
-                            if (ch == 0)
-                                break;
-
-                            _textWriter.Write((char)ch);
-                        }
-
-                        return true;
-                    }
-                    if (p0.Name.Equals("ReadOnlySpan`1<Char>", StringComparison.Ordinal))
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        var span = PopSlot();
-                        if (span.Kind != SlotKind.Value)
-                            throw new NotSupportedException(
-                                "Intrinsic System.Console._Write(ReadOnlySpan<char>) expects a value type slot.");
-
-                        var spanType = GetValueSlotType(span);
-                        int spanAbs = checked((int)span.Payload);
-
-                        RuntimeField? refField = null;
-                        RuntimeField? lenField = null;
-                        for (int i = 0; i < spanType.InstanceFields.Length; i++)
-                        {
-                            var f = spanType.InstanceFields[i];
-                            if (StringComparer.Ordinal.Equals(f.Name, "_reference")) refField = f;
-                            else if (StringComparer.Ordinal.Equals(f.Name, "_length")) lenField = f;
-                        }
-                        if (refField is null || lenField is null)
-                        {
-                            throw new NotSupportedException(
-                                "Intrinsic System.Console._Write(ReadOnlySpan<char>) cannot locate Span fields (_reference/_length).");
-                        }
-                        var byref = LoadValueAsSlot(spanAbs, refField.Offset, refField.FieldType);
-                        int len = LoadValueAsSlot(spanAbs, lenField.Offset, lenField.FieldType).AsI4Checked();
-                        if (len <= 0)
-                            return true;
-                        if (byref.Kind == SlotKind.Null)
-                            throw new InvalidOperationException("ReadOnlySpan<char> has non-zero length but null reference.");
-                        int charsAbs = GetAddressAbsOrThrow(byref);
-                        int bytes = checked(len * 2);
-                        if (charsAbs >= _heapBase && charsAbs + bytes <= _heapPtr)
-                            CheckHeapAccess(charsAbs, bytes, writable: false);
-                        else
-                            CheckActiveStackAccess(charsAbs, bytes, writable: false);
                         for (int i = 0; i < len; i++)
                         {
-                            if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+                            if ((i & 0xFF) == 0)
+                                ct.ThrowIfCancellationRequested();
+
                             _textWriter.Write((char)ReadU16(charsAbs + (i * 2)));
                         }
+                    }
+                    return true;
+                }
+                if (p0.Kind == RuntimeTypeKind.Pointer &&
+                    p0.ElementType is { Namespace: "System", Name: "Char" })
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var s = PopSlot();
+                    if (s.Kind == SlotKind.Null)
+                    {
                         return true;
                     }
-                    throw new NotSupportedException($"Intrinsic System.Console._Write({p0.Namespace}.{p0.Name}) is not supported.");
+
+                    int abs = GetAddressAbsOrThrow(s);
+
+                    const int MaxChars = 8 * 1024;
+                    for (int i = 0; i < MaxChars; i++)
+                    {
+                        if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+
+                        int pos = abs + (i * 2);
+                        if (pos < _stackBase || pos + 2 > _sp)
+                            throw new InvalidOperationException("Unterminated or out of range char* for Console.Write(char*).");
+
+                        ushort ch = BinaryPrimitives.ReadUInt16LittleEndian(_mem.AsSpan(pos, 2));
+                        if (ch == 0)
+                            break;
+
+                        _textWriter.Write((char)ch);
+                    }
+
+                    return true;
                 }
+                if (p0.Name.Equals("ReadOnlySpan`1<Char>", StringComparison.Ordinal))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var span = PopSlot();
+                    if (span.Kind != SlotKind.Value)
+                        throw new NotSupportedException(
+                            "Intrinsic System.Console._Write(ReadOnlySpan<char>) expects a value type slot.");
+
+                    var spanType = GetValueSlotType(span);
+                    int spanAbs = checked((int)span.Payload);
+
+                    RuntimeField? refField = null;
+                    RuntimeField? lenField = null;
+                    for (int i = 0; i < spanType.InstanceFields.Length; i++)
+                    {
+                        var f = spanType.InstanceFields[i];
+                        if (StringComparer.Ordinal.Equals(f.Name, "_reference")) refField = f;
+                        else if (StringComparer.Ordinal.Equals(f.Name, "_length")) lenField = f;
+                    }
+                    if (refField is null || lenField is null)
+                    {
+                        throw new NotSupportedException(
+                            "Intrinsic System.Console._Write(ReadOnlySpan<char>) cannot locate Span fields (_reference/_length).");
+                    }
+                    var byref = LoadValueAsSlot(spanAbs, refField.Offset, refField.FieldType);
+                    int len = LoadValueAsSlot(spanAbs, lenField.Offset, lenField.FieldType).AsI4Checked();
+                    if (len <= 0)
+                        return true;
+                    if (byref.Kind == SlotKind.Null)
+                        throw new InvalidOperationException("ReadOnlySpan<char> has non-zero length but null reference.");
+                    int charsAbs = GetAddressAbsOrThrow(byref);
+                    int bytes = checked(len * 2);
+                    if (charsAbs >= _heapBase && charsAbs + bytes <= _heapPtr)
+                        CheckHeapAccess(charsAbs, bytes, writable: false);
+                    else
+                        CheckActiveStackAccess(charsAbs, bytes, writable: false);
+                    for (int i = 0; i < len; i++)
+                    {
+                        if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+                        _textWriter.Write((char)ReadU16(charsAbs + (i * 2)));
+                    }
+                    return true;
+                }
+                throw new NotSupportedException($"Intrinsic System.Console._Write({p0.Namespace}.{p0.Name}) is not supported.");
+
             }
 
             return false;

@@ -86,6 +86,7 @@ namespace Cnidaria.Cs
     {
         public const ushort NoInlining = 0x0008;
         public const ushort AggressiveInlining = 0x0100;
+        public const ushort InternalCall = 0x1000;
         public const ushort Extension = 0x8000;
         public const int CustomAttribute = 0x0C000000;
     }
@@ -109,14 +110,13 @@ namespace Cnidaria.Cs
 
             return 0;
         }
+        public static bool HasInternalCall(MethodSymbol method)
+            => (GetMethodImplFlags(method) & MetadataFlagBits.InternalCall) != 0;
         public static bool HasNoInlining(MethodSymbol method)
             => (GetMethodImplFlags(method) & MetadataFlagBits.NoInlining) != 0;
-
         public static bool HasAggressiveInlining(MethodSymbol method)
             => (GetMethodImplFlags(method) & MetadataFlagBits.AggressiveInlining) != 0;
 
-        public static bool HasRuntimeIntrinsic(MethodSymbol method)
-            => HasAttribute(method, "System", "RuntimeIntrinsicAttribute");
         public static bool HasIntrinsic(MethodSymbol method)
             => HasAttribute(method, "System", "IntrinsicAttribute");
         public static bool HasAttribute(MethodSymbol method, string @namespace, string name)
@@ -357,7 +357,7 @@ namespace Cnidaria.Cs
     public sealed class ArrayTypeSymbol : TypeSymbol
     {
         private readonly NamedTypeSymbol _arrayBase;
-
+        private ImmutableArray<TypeSymbol> _interfaces;
         public override SymbolKind Kind => SymbolKind.ArrayType;
         public override string Name
             => Rank == 1
@@ -369,15 +369,22 @@ namespace Cnidaria.Cs
 
         public override bool IsReferenceType => true;
         public override TypeSymbol? BaseType => _arrayBase;
-
+        public override ImmutableArray<TypeSymbol> Interfaces
+            => _interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : _interfaces;
         public TypeSymbol ElementType { get; }
         public int Rank { get; }
 
-        public ArrayTypeSymbol(TypeSymbol elementType, int rank, NamedTypeSymbol arrayBase)
+        public ArrayTypeSymbol(
+            TypeSymbol elementType, int rank, NamedTypeSymbol arrayBase, ImmutableArray<TypeSymbol> interfaces)
         {
             ElementType = elementType;
             Rank = rank;
             _arrayBase = arrayBase;
+            _interfaces = interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : interfaces;
+        }
+        internal void SetInterfaces(ImmutableArray<TypeSymbol> interfaces)
+        {
+            _interfaces = interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : interfaces;
         }
     }
     public sealed class PointerTypeSymbol : TypeSymbol
@@ -550,6 +557,7 @@ namespace Cnidaria.Cs
         public abstract bool HasSet { get; }
         public abstract MethodSymbol? GetMethod { get; }
         public abstract MethodSymbol? SetMethod { get; }
+        public virtual PropertySymbol? ExplicitInterfaceImplementation => null;
         public virtual ImmutableArray<ParameterSymbol> Parameters => ImmutableArray<ParameterSymbol>.Empty;
     }
     public abstract class MethodSymbol : Symbol
@@ -568,6 +576,7 @@ namespace Cnidaria.Cs
         public virtual bool IsSealed => false;
         public virtual MethodSymbol? OverriddenMethod => null;
         public virtual MethodSymbol OriginalDefinition => this;
+        public virtual MethodSymbol? ExplicitInterfaceImplementation => null;
         public virtual ImmutableArray<TypeSymbol> TypeArguments
         {
             get
@@ -711,6 +720,7 @@ namespace Cnidaria.Cs
         public TypeSymbol Type { get; }
         public bool IsConst { get; }
         public bool IsByRef { get; }
+        public bool IsReadOnly { get; }
         public Optional<object> ConstantValueOpt { get; }
         public LocalSymbol(
             string name,
@@ -719,6 +729,7 @@ namespace Cnidaria.Cs
             ImmutableArray<Location> locations,
             bool isByRef = false,
             bool isConst = false,
+            bool isReadOnly = false,
             Optional<object> constantValueOpt = default)
         {
             Name = name;
@@ -728,6 +739,7 @@ namespace Cnidaria.Cs
 
             IsByRef = isByRef;
             IsConst = isConst;
+            IsReadOnly = isConst || isReadOnly;
             ConstantValueOpt = isConst ? constantValueOpt : Optional<object>.None;
         }
     }
@@ -890,6 +902,7 @@ namespace Cnidaria.Cs
     internal sealed class SourcePropertySymbol : PropertySymbol
     {
         private TypeSymbol _type;
+        private PropertySymbol? _explicitInterfaceImplementation;
         private readonly List<AttributeData> _attributes = new();
         private readonly List<Location> _locations = new();
         private readonly List<SyntaxReference> _declRefs = new();
@@ -898,6 +911,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<Location> Locations => _locations.ToImmutableArray();
         public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => _declRefs.ToImmutableArray();
         public override TypeSymbol Type => _type;
+        public override PropertySymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
         public override bool IsStatic { get; }
         public override bool HasGet { get; }
         public override bool HasSet { get; }
@@ -941,6 +955,8 @@ namespace Cnidaria.Cs
             _declRefs.Add(declarationRef);
         }
         internal void SetType(TypeSymbol type) => _type = type;
+        internal void SetExplicitInterfaceImplementation(PropertySymbol property)
+            => _explicitInterfaceImplementation = property ?? throw new ArgumentNullException(nameof(property));
         internal void SetParameters(ImmutableArray<ParameterSymbol> parameters)
             => _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
         internal void AddDeclaration(Location location, SyntaxReference declarationRef)
@@ -972,6 +988,9 @@ namespace Cnidaria.Cs
         private TypeSymbol? _declaredBaseType;
         private bool _declaredBaseTypeSet;
 
+        private ImmutableArray<TypeSymbol> _declaredInterfaces;
+        private bool _declaredInterfacesSet;
+
         private TypeSymbol? _enumUnderlyingType;
         private bool _enumUnderlyingTypeSet;
 
@@ -991,6 +1010,11 @@ namespace Cnidaria.Cs
             => _declaredBaseTypeSet ? _declaredBaseType
                 : _defaultBaseTypeSet ? _defaultBaseType
                 : null;
+
+        public override ImmutableArray<TypeSymbol> Interfaces
+            => _declaredInterfacesSet
+                ? _declaredInterfaces
+                : ImmutableArray<TypeSymbol>.Empty;
 
         public override bool IsReferenceType =>
             TypeKind is TypeKind.Class or TypeKind.Interface or TypeKind.Delegate;
@@ -1019,12 +1043,21 @@ namespace Cnidaria.Cs
             _defaultBaseTypeSet = true;
             _defaultBaseType = baseType;
         }
-
         internal void SetDeclaredBaseType(TypeSymbol? baseType)
         {
             if (_declaredBaseTypeSet) throw new InvalidOperationException("Declared base type already set.");
             _declaredBaseTypeSet = true;
             _declaredBaseType = baseType;
+        }
+        internal void SetDeclaredInterfaces(ImmutableArray<TypeSymbol> interfaces)
+        {
+            if (_declaredInterfacesSet)
+                throw new InvalidOperationException("Declared interfaces already set.");
+
+            _declaredInterfacesSet = true;
+            _declaredInterfaces = interfaces.IsDefault
+                ? ImmutableArray<TypeSymbol>.Empty
+                : interfaces;
         }
         public void SetTypeParameters(ImmutableArray<TypeParameterSymbol> tps)
         {
@@ -1160,6 +1193,9 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters
             => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
+        private MethodSymbol? _explicitInterfaceImplementation;
+        public override MethodSymbol? ExplicitInterfaceImplementation
+            => _explicitInterfaceImplementation;
         public override Accessibility DeclaredAccessibility { get; }
         public override bool IsStatic { get; }
         public override bool IsConstructor { get; }
@@ -1209,6 +1245,11 @@ namespace Cnidaria.Cs
             _isAbstract = isAbstract;
             _isOverride = isOverride;
             _isSealed = isSealed;
+        }
+        internal void SetExplicitInterfaceImplementation(MethodSymbol method)
+        {
+            _explicitInterfaceImplementation = method
+                ?? throw new ArgumentNullException(nameof(method));
         }
         internal void SetOverriddenMethod(MethodSymbol overridden) => _overridden = overridden;
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
@@ -1266,20 +1307,43 @@ namespace Cnidaria.Cs
                         var e = Substitute(br.ElementType, types, map);
                         return ReferenceEquals(e, br.ElementType) ? br : types.GetByRefType(e);
                     }
-                case SubstitutedNamedTypeSymbol snt:
+                case NamedTypeSymbol nt:
                     {
-                        if (snt.TypeArguments.IsDefaultOrEmpty)
-                            return snt;
-
+                        NamedTypeSymbol? newContaining = null;
                         bool changed = false;
-                        var b = ImmutableArray.CreateBuilder<TypeSymbol>(snt.TypeArguments.Length);
-                        for (int i = 0; i < snt.TypeArguments.Length; i++)
+
+                        if (nt.ContainingSymbol is NamedTypeSymbol containingNt)
                         {
-                            var a = Substitute(snt.TypeArguments[i], types, map);
-                            if (!ReferenceEquals(a, snt.TypeArguments[i])) changed = true;
-                            b.Add(a);
+                            var containingSub = Substitute(containingNt, types, map);
+                            if (containingSub is NamedTypeSymbol containingNamed)
+                            {
+                                newContaining = containingNamed;
+                                if (!ReferenceEquals(containingNamed, containingNt))
+                                    changed = true;
+                            }
                         }
-                        return changed ? types.ConstructNamedType(snt, b.ToImmutable()) : snt;
+
+                        var srcArgs = nt.TypeArguments;
+                        ImmutableArray<TypeSymbol> newArgs =
+                            srcArgs.IsDefault ? ImmutableArray<TypeSymbol>.Empty : srcArgs;
+
+                        if (!srcArgs.IsDefaultOrEmpty)
+                        {
+                            var b = ImmutableArray.CreateBuilder<TypeSymbol>(srcArgs.Length);
+                            for (int i = 0; i < srcArgs.Length; i++)
+                            {
+                                var a = Substitute(srcArgs[i], types, map);
+                                if (!ReferenceEquals(a, srcArgs[i]))
+                                    changed = true;
+                                b.Add(a);
+                            }
+                            newArgs = b.ToImmutable();
+                        }
+
+                        if (!changed)
+                            return nt;
+
+                        return types.ConstructNamedType(nt.OriginalDefinition, newContaining, newArgs);
                     }
 
 
@@ -1306,6 +1370,9 @@ namespace Cnidaria.Cs
 
         private bool _baseInitialized;
         private TypeSymbol? _baseType;
+
+        private ImmutableArray<TypeSymbol> _lazyInterfaces;
+        private bool _lazyInterfacesInitialized;
         public override Accessibility DeclaredAccessibility => _originalDefinition.DeclaredAccessibility;
         public override bool IsFromMetadata => _originalDefinition.IsFromMetadata;
         public override bool IsRefLikeType => _originalDefinition.IsRefLikeType;
@@ -1349,6 +1416,26 @@ namespace Cnidaria.Cs
             {
                 var ut = _originalDefinition.EnumUnderlyingType;
                 return ut is null ? null : TypeSubstituter.Substitute(ut, _types, SubstitutionMap);
+            }
+        }
+        public override ImmutableArray<TypeSymbol> Interfaces
+        {
+            get
+            {
+                if (_lazyInterfacesInitialized)
+                    return _lazyInterfaces;
+
+                _lazyInterfacesInitialized = true;
+
+                var src = _originalDefinition.Interfaces;
+                if (src.IsDefaultOrEmpty)
+                    return _lazyInterfaces = ImmutableArray<TypeSymbol>.Empty;
+
+                var b = ImmutableArray.CreateBuilder<TypeSymbol>(src.Length);
+                for (int i = 0; i < src.Length; i++)
+                    b.Add(TypeSubstituter.Substitute(src[i], _types, SubstitutionMap));
+
+                return _lazyInterfaces = b.ToImmutable();
             }
         }
         public override Symbol? ContainingSymbol => ContainingTypeOpt ?? _originalDefinition.ContainingSymbol;
@@ -1823,12 +1910,13 @@ namespace Cnidaria.Cs
         private readonly bool _isOverride;
         private readonly bool _isSealed;
         private readonly bool _isExtensionMethod;
+        private MethodSymbol? _explicitInterfaceImplementation;
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         private readonly List<AttributeData> _attributes = new();
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
-
+        public override MethodSymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
         public override TypeSymbol ReturnType { get; }
         public override ImmutableArray<ParameterSymbol> Parameters { get; }
         public override ImmutableArray<TypeParameterSymbol> TypeParameters
@@ -1882,6 +1970,8 @@ namespace Cnidaria.Cs
         }
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> tps)
             => _typeParameters = tps.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : tps;
+        internal void SetExplicitInterfaceImplementation(MethodSymbol method)
+            => _explicitInterfaceImplementation = method ?? throw new ArgumentNullException(nameof(method));
         public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
@@ -1938,6 +2028,8 @@ namespace Cnidaria.Cs
         private readonly ImmutableArray<ParameterSymbol> _parameters;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
 
+        private PropertySymbol? _explicitInterfaceImplementation;
+        public override PropertySymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
         public ExternalPropertySymbol(
             string name,
             Symbol containing,
@@ -1958,6 +2050,8 @@ namespace Cnidaria.Cs
             _parameters = parameters;
         }
         public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void SetExplicitInterfaceImplementation(PropertySymbol property)
+            => _explicitInterfaceImplementation = property ?? throw new ArgumentNullException(nameof(property));
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
     internal sealed class IntrinsicMethodSymbol : MethodSymbol

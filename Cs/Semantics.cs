@@ -306,7 +306,16 @@ namespace Cnidaria.Cs
         private readonly Dictionary<TupleTypeKey, TupleTypeSymbol> _tupleTypes = new();
         private readonly Dictionary<TypeSymbol, ByRefTypeSymbol> _byRefTypes = new();
         private readonly Dictionary<SubstitutedNamedTypeKey, SubstitutedNamedTypeSymbol> _namedTypeInstantiations = new();
+        private NamedTypeSymbol? _arrayIEnumerable;
+        private NamedTypeSymbol? _arrayICollection;
+        private NamedTypeSymbol? _arrayIList;
+        private NamedTypeSymbol? _arrayGenericIEnumerableDef;
+        private NamedTypeSymbol? _arrayGenericICollectionDef;
+        private NamedTypeSymbol? _arrayGenericIReadOnlyCollectionDef;
+        private NamedTypeSymbol? _arrayGenericIReadOnlyListDef;
+        private NamedTypeSymbol? _arrayGenericIListDef;
 
+        private bool _arrayInterfacesBound;
         public NamespaceSymbol CoreGlobalNamespace { get; }
 
         public TypeManager(ICoreLibraryProvider? provider = null)
@@ -317,7 +326,19 @@ namespace Cnidaria.Cs
         }
         internal NamedTypeSymbol SubstituteNamedType(NamedTypeSymbol originalDefinition, NamedTypeSymbol containingType)
             => GetOrCreateNamedType(originalDefinition, containingType, ImmutableArray<TypeSymbol>.Empty);
+        internal NamedTypeSymbol ConstructNamedType(
+            NamedTypeSymbol definition,
+            NamedTypeSymbol? containingTypeOpt,
+            ImmutableArray<TypeSymbol> typeArguments)
+        {
+            if (typeArguments.IsDefault)
+                typeArguments = ImmutableArray<TypeSymbol>.Empty;
 
+            if (definition is SubstitutedNamedTypeSymbol snt)
+                definition = snt.OriginalDefinition;
+
+            return GetOrCreateNamedType(definition, containingTypeOpt, typeArguments);
+        }
         internal NamedTypeSymbol ConstructNamedType(NamedTypeSymbol type, ImmutableArray<TypeSymbol> typeArguments)
         {
             if (typeArguments.IsDefault)
@@ -402,7 +423,12 @@ namespace Cnidaria.Cs
             if (!_arrayTypes.TryGetValue((elementType, rank), out var at))
             {
                 var arrayBase = GetSpecialType(SpecialType.System_Array);
-                _arrayTypes[(elementType, rank)] = at = new ArrayTypeSymbol(elementType, rank, arrayBase);
+                var ifaces = _arrayInterfacesBound
+                    ? BuildArrayInterfaces(elementType, rank)
+                    : ImmutableArray<TypeSymbol>.Empty;
+
+                _arrayTypes[(elementType, rank)] = at =
+                    new ArrayTypeSymbol(elementType, rank, arrayBase, ifaces);
             }
 
             return at;
@@ -548,6 +574,121 @@ namespace Cnidaria.Cs
 
             return global;
         }
+        internal void BindWellKnownArrayInterfaces(NamespaceSymbol globalNamespace)
+        {
+            _arrayIEnumerable = FindType(globalNamespace, "System.Collections", "IEnumerable", 0);
+            _arrayICollection = FindType(globalNamespace, "System.Collections", "ICollection", 0);
+            _arrayIList = FindType(globalNamespace, "System.Collections", "IList", 0);
+
+            _arrayGenericIEnumerableDef = FindType(globalNamespace, "System.Collections.Generic", "IEnumerable", 1);
+            _arrayGenericICollectionDef = FindType(globalNamespace, "System.Collections.Generic", "ICollection", 1);
+            _arrayGenericIReadOnlyCollectionDef = FindType(globalNamespace, "System.Collections.Generic", "IReadOnlyCollection", 1);
+            _arrayGenericIReadOnlyListDef = FindType(globalNamespace, "System.Collections.Generic", "IReadOnlyList", 1);
+            _arrayGenericIListDef = FindType(globalNamespace, "System.Collections.Generic", "IList", 1);
+
+            _arrayInterfacesBound = true;
+
+            foreach (var arr in _arrayTypes.Values)
+                arr.SetInterfaces(BuildArrayInterfaces(arr.ElementType, arr.Rank));
+        }
+        private ImmutableArray<TypeSymbol> BuildArrayInterfaces(TypeSymbol elementType, int rank)
+        {
+            var b = ImmutableArray.CreateBuilder<TypeSymbol>(8);
+
+            AddIfPresent(_arrayIEnumerable);
+            AddIfPresent(_arrayICollection);
+            AddIfPresent(_arrayIList);
+
+            if (rank == 1)
+            {
+                AddConstructedIfPresent(_arrayGenericIEnumerableDef, elementType);
+                AddConstructedIfPresent(_arrayGenericICollectionDef, elementType);
+                AddConstructedIfPresent(_arrayGenericIReadOnlyCollectionDef, elementType);
+                AddConstructedIfPresent(_arrayGenericIReadOnlyListDef, elementType);
+                AddConstructedIfPresent(_arrayGenericIListDef, elementType);
+            }
+
+            return b.Count == 0 ? ImmutableArray<TypeSymbol>.Empty : b.ToImmutable();
+
+            void AddIfPresent(NamedTypeSymbol? t)
+            {
+                if (t is null)
+                    return;
+
+                for (int i = 0; i < b.Count; i++)
+                    if (ReferenceEquals(b[i], t))
+                        return;
+
+                b.Add(t);
+            }
+
+            void AddConstructedIfPresent(NamedTypeSymbol? def, TypeSymbol arg)
+            {
+                if (def is null)
+                    return;
+
+                var constructed = ConstructNamedType(def, ImmutableArray.Create(arg));
+
+                for (int i = 0; i < b.Count; i++)
+                    if (ReferenceEquals(b[i], constructed))
+                        return;
+
+                b.Add(constructed);
+            }
+        }
+        private static NamedTypeSymbol? FindType(
+    NamespaceSymbol root,
+    string fullNamespace,
+    string name,
+    int arity)
+        {
+            var ns = FindNamespace(root, fullNamespace);
+            if (ns is null)
+                return null;
+
+            var types = ns.GetTypeMembers(name, arity);
+            if (types.IsDefaultOrEmpty)
+                return null;
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                if (types[i].TypeKind == TypeKind.Interface)
+                    return types[i];
+            }
+
+            return null;
+        }
+
+        private static NamespaceSymbol? FindNamespace(NamespaceSymbol root, string fullNamespace)
+        {
+            if (string.IsNullOrEmpty(fullNamespace))
+                return root;
+
+            NamespaceSymbol current = root;
+            var parts = fullNamespace.Split('.', StringSplitOptions.RemoveEmptyEntries);
+
+            for (int i = 0; i < parts.Length; i++)
+            {
+                var members = current.GetNamespaceMembers();
+                NamespaceSymbol? next = null;
+
+                for (int j = 0; j < members.Length; j++)
+                {
+                    if (StringComparer.Ordinal.Equals(members[j].Name, parts[i]))
+                    {
+                        next = members[j];
+                        break;
+                    }
+                }
+
+                if (next is null)
+                    return null;
+
+                current = next;
+            }
+
+            return current;
+        }
     }
     public static class CompilationFactory
     {
@@ -574,6 +715,7 @@ namespace Cnidaria.Cs
             GenericConstraintBinder.BindAll(compilation, trees, bag);
             MemberSignatureBinder.BindAll(compilation, trees, bag);
             BaseTypeBinder.BindAll(compilation, trees, bag);
+            ExplicitInterfaceImplementationBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
 
             diagnostics = bag.ToImmutable();
@@ -628,6 +770,7 @@ namespace Cnidaria.Cs
             DeclaredSymbolsByTree = declaredSymbolsByTree;
 
             GlobalNamespace = new MergedNamespaceSymbol((NamespaceSymbol)SourceGlobalNamespace, types.CoreGlobalNamespace);
+            _types.BindWellKnownArrayInterfaces(GlobalNamespace);
         }
         internal NamedTypeSymbol ConstructNamedType(NamedTypeSymbol type, ImmutableArray<TypeSymbol> typeArguments)
             => _types.ConstructNamedType(type, typeArguments);
@@ -1228,6 +1371,9 @@ namespace Cnidaria.Cs
             if (be is BoundConversionExpression conv)
                 return new TypeInfo(type: conv.Operand.Type, convertedType: conv.Type);
 
+            if (be is BoundFixedInitializerExpression fixedInit)
+                return new TypeInfo(type: fixedInit.Expression.Type, convertedType: fixedInit.Type);
+
             return new TypeInfo(type: be.Type, convertedType: be.Type);
         }
 
@@ -1250,6 +1396,9 @@ namespace Cnidaria.Cs
             var b = GetBoundNode(expr, cancellationToken);
             if (b is BoundConversionExpression conv)
                 return conv.Conversion;
+
+            if (b is BoundFixedInitializerExpression fixedInit)
+                return fixedInit.ElementPointerConversion;
 
             if (b is BoundExpression be && be.Type is not null)
                 return new Conversion(ConversionKind.Identity);
@@ -2313,6 +2462,7 @@ namespace Cnidaria.Cs
         Local,
         Parameter,
         This,
+        Base,
         Call,
         MemberAccess,
         IndexerAccess,
@@ -2342,7 +2492,7 @@ namespace Cnidaria.Cs
         CheckedExpression,
         UncheckedExpression,
         ThrowExpression,
-        IsPatternExpression,
+        IsPatternExpression, 
         // Statements
         BadStatement,
         Block,
@@ -2359,13 +2509,16 @@ namespace Cnidaria.Cs
         While,
         DoWhile,
         For,
+        ForEach,
         Goto,
         ConditionalGoto,
         LabelStatement,
         TryStatement,
         CatchBlock,
         CheckedStatement,
-        UncheckedStatement,
+        UncheckedStatement, 
+        FixedStatement,
+        FixedInitializer,
     }
     public sealed class BindingContext
     {

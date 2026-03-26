@@ -647,6 +647,39 @@ string str = ""aa,b,,c"";
 string[] strs = str.Split(',');
 Console.WriteLine(strs[0]);
 ", "aa");
+            // 67 foreach
+            RunTest(@"
+int[] arr = { 1, 2, 3 };
+foreach(var item in arr)
+{
+    Console.Write(item);
+}
+var list = new List<int>(); list.Add(1); list.Add(2);
+foreach(var item in list) 
+{
+    Console.Write(item);
+}
+string str = ""1234"";
+foreach(var item in str) 
+{
+     Console.Write(item);
+}
+", "123121234");
+            //68
+            RunTest(@"
+(int a, int b) t = (1, 2);
+
+int x, y;
+(x, y) = t;
+
+var (p, q) = (3, 4);
+((x, y), p) = ((10, 20), 30);
+
+Console.Write(x);
+Console.Write(y);
+Console.Write(p);
+Console.Write(q);
+", "1020304");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)

@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-
+    
     public abstract class BoundNode
     {
         public abstract BoundNodeKind Kind { get; }
@@ -82,7 +82,7 @@ namespace Cnidaria.Cs
         {
             Type = type;
             Value = value;
-            ConstantValueOpt = new Optional<object>(value!);
+            ConstantValueOpt = new Optional<object>(value!); 
         }
     }
     internal sealed class BoundThrowExpression : BoundExpression
@@ -596,7 +596,7 @@ namespace Cnidaria.Cs
         : base(syntax)
         {
             Type = resultType; // always int
-            OperandType = operandType;
+            OperandType = operandType; 
             ConstantValueOpt = Optional<object>.None;
         }
     }
@@ -719,6 +719,24 @@ namespace Cnidaria.Cs
         {
             ContainingType = containingType;
             Type = containingType;
+        }
+    }
+    internal sealed class BoundBaseExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.Base;
+
+        public NamedTypeSymbol ContainingType { get; }
+        public NamedTypeSymbol BaseType { get; }
+
+        public BoundBaseExpression(
+            ExpressionSyntax syntax,
+            NamedTypeSymbol containingType,
+            NamedTypeSymbol baseType)
+            : base(syntax)
+        {
+            ContainingType = containingType;
+            BaseType = baseType;
+            Type = baseType;
         }
     }
     internal sealed class BoundMemberAccessExpression : BoundExpression
@@ -992,6 +1010,86 @@ namespace Cnidaria.Cs
                 if (statements[i].HasErrors)
                     return true;
             return false;
+        }
+    }
+    internal enum BoundForEachEnumeratorKind : byte
+    {
+        Array,
+        String,
+        Pattern,
+        Interface
+    }
+    /// <summary> Will disappear after lowering </summary>
+    internal sealed class BoundForEachStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ForEach;
+
+        public BoundForEachEnumeratorKind EnumeratorKind { get; }
+        public LocalSymbol IterationVariable { get; }
+        public BoundExpression Collection { get; }
+        public TypeSymbol CollectionType { get; }
+
+        public TypeSymbol EnumeratorType { get; }
+        public TypeSymbol ElementType { get; }
+        public Conversion CollectionConversion { get; }
+
+        public MethodSymbol? GetEnumeratorMethodOpt { get; }
+        public bool GetEnumeratorIsExtensionMethod { get; }
+        public PropertySymbol? CurrentPropertyOpt { get; }
+        public MethodSymbol? MoveNextMethodOpt { get; }
+        public Conversion IterationConversion { get; }
+
+        public BoundStatement Body { get; }
+        public LabelSymbol BreakLabel { get; }
+        public LabelSymbol ContinueLabel { get; }
+
+        public BoundForEachStatement(
+            ForEachStatementSyntax syntax,
+            BoundForEachEnumeratorKind enumeratorKind,
+            LocalSymbol iterationVariable,
+            BoundExpression collection,
+            TypeSymbol collectionType,
+            TypeSymbol enumeratorType,
+            TypeSymbol elementType,
+            Conversion collectionConversion,
+            MethodSymbol? getEnumeratorMethodOpt,
+            bool getEnumeratorIsExtensionMethod,
+            PropertySymbol? currentPropertyOpt,
+            MethodSymbol? moveNextMethodOpt,
+            Conversion iterationConversion,
+            BoundStatement body,
+            LabelSymbol breakLabel,
+            LabelSymbol continueLabel)
+            : base(syntax)
+        {
+            EnumeratorKind = enumeratorKind;
+            IterationVariable = iterationVariable;
+            Collection = collection;
+            CollectionType = collectionType;
+            EnumeratorType = enumeratorType;
+            ElementType = elementType;
+            CollectionConversion = collectionConversion;
+            GetEnumeratorMethodOpt = getEnumeratorMethodOpt;
+            GetEnumeratorIsExtensionMethod = getEnumeratorIsExtensionMethod;
+            CurrentPropertyOpt = currentPropertyOpt;
+            MoveNextMethodOpt = moveNextMethodOpt;
+            IterationConversion = iterationConversion;
+            Body = body;
+            BreakLabel = breakLabel;
+            ContinueLabel = continueLabel;
+
+            HasErrors =
+                collection.HasErrors ||
+                body.HasErrors ||
+                !collectionConversion.Exists ||
+                !iterationConversion.Exists;
+
+            if (enumeratorKind != BoundForEachEnumeratorKind.Array &&
+                enumeratorKind != BoundForEachEnumeratorKind.String)
+            {
+                if (GetEnumeratorMethodOpt is null || CurrentPropertyOpt is null || MoveNextMethodOpt is null)
+                    HasErrors = true;
+            }
         }
     }
     internal sealed class BoundTryStatement : BoundStatement
@@ -1299,10 +1397,10 @@ namespace Cnidaria.Cs
         public ImmutableArray<BoundExpression> Arguments { get; }
         public BoundObjectCreationExpression(
             SyntaxNode syntax,
-            NamedTypeSymbol type,
+            NamedTypeSymbol type, 
             MethodSymbol? constructorOpt,
-            ImmutableArray<BoundExpression> arguments,
-            bool hasErrors = false)
+            ImmutableArray<BoundExpression> arguments, 
+            bool hasErrors = false) 
             : base(syntax)
         {
             Type = type;
@@ -1334,6 +1432,77 @@ namespace Cnidaria.Cs
                 hasArgErrors |= arguments[i].HasErrors;
             HasErrors = hasArgErrors;
             ConstantValueOpt = Optional<object>.None;
+        }
+    }
+    internal enum BoundFixedInitializerKind : byte
+    {
+        AddressOf,    // fixed (int* p = &x)
+        Array,               // fixed (int* p = arr)
+        String,              // fixed (char* p = str)
+        GetPinnableReference // fixed (int* p = span)
+    }
+    internal sealed class BoundFixedInitializerExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.FixedInitializer;
+
+        public BoundFixedInitializerKind InitializerKind { get; }
+        public BoundExpression Expression { get; }
+        public MethodSymbol? GetPinnableReferenceMethodOpt { get; }
+
+        /// <summary> Pointed element type before final pointer conversion. </summary>
+        public TypeSymbol ElementType { get; }
+
+        /// <summary> Conversion from ElementType* to declared pointer type. </summary>
+        public Conversion ElementPointerConversion { get; }
+
+        public BoundFixedInitializerExpression(
+            SyntaxNode syntax,
+            PointerTypeSymbol declaredPointerType,
+            BoundFixedInitializerKind initializerKind,
+            BoundExpression expression,
+            TypeSymbol elementType,
+            Conversion elementPointerConversion,
+            MethodSymbol? getPinnableReferenceMethodOpt = null)
+            : base(syntax)
+        {
+            Type = declaredPointerType;
+            InitializerKind = initializerKind;
+            Expression = expression;
+            ElementType = elementType;
+            ElementPointerConversion = elementPointerConversion;
+            GetPinnableReferenceMethodOpt = getPinnableReferenceMethodOpt;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = expression.HasErrors || !elementPointerConversion.Exists;
+        }
+    }
+
+    internal sealed class BoundFixedStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.FixedStatement;
+
+        public ImmutableArray<BoundLocalDeclarationStatement> Declarations { get; }
+        public BoundStatement Body { get; }
+
+        public BoundFixedStatement(
+            FixedStatementSyntax syntax,
+            ImmutableArray<BoundLocalDeclarationStatement> declarations,
+            BoundStatement body)
+            : base(syntax)
+        {
+            Declarations = declarations;
+            Body = body;
+
+            if (body.HasErrors)
+                HasErrors = true;
+
+            for (int i = 0; i < declarations.Length; i++)
+            {
+                if (declarations[i].HasErrors)
+                {
+                    HasErrors = true;
+                    break;
+                }
+            }
         }
     }
     // =rewriter nodes=

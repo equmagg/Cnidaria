@@ -35,6 +35,8 @@ namespace Cnidaria.Cs
         TypeRef,
         TypeDef,
         NestedClass,
+        InterfaceImpl,
+        MethodImpl,
         Field,
         MethodDef,
         Param,
@@ -63,6 +65,8 @@ namespace Cnidaria.Cs
         TypeRefRow GetTypeRef(int rid);
         TypeDefRow GetTypeDef(int rid);
         NestedClassRow GetNestedClass(int rid);
+        InterfaceImplRow GetInterfaceImpl(int rid);
+        MethodImplRow GetMethodImpl(int rid);
         FieldRow GetField(int rid);
         MethodDefRow GetMethodDef(int rid);
         ParamRow GetParam(int rid);
@@ -93,6 +97,8 @@ namespace Cnidaria.Cs
             MetadataTableKind.TypeRef => Section(FlatMdSection.TypeRefTable).Count,
             MetadataTableKind.TypeDef => Section(FlatMdSection.TypeDefTable).Count,
             MetadataTableKind.NestedClass => Section(FlatMdSection.NestedClassTable).Count,
+            MetadataTableKind.InterfaceImpl => Section(FlatMdSection.InterfaceImplTable).Count,
+            MetadataTableKind.MethodImpl => Section(FlatMdSection.MethodImplTable).Count,
             MetadataTableKind.Field => Section(FlatMdSection.FieldTable).Count,
             MetadataTableKind.MethodDef => Section(FlatMdSection.MethodDefTable).Count,
             MetadataTableKind.Param => Section(FlatMdSection.ParamTable).Count,
@@ -165,7 +171,21 @@ namespace Cnidaria.Cs
             byte target = _data.Span[p];
             return new CustomAttributeRow(parentToken, attributeTypeToken, value, target);
         }
-
+        public InterfaceImplRow GetInterfaceImpl(int rid)
+        {
+            int p = GetRowOffset(FlatMdSection.InterfaceImplTable, rid, 8);
+            int classTypeDefRid = ReadI32(_data.Span, p); p += 4;
+            int interfaceEncoded = ReadI32(_data.Span, p);
+            return new InterfaceImplRow(classTypeDefRid, interfaceEncoded);
+        }
+        public MethodImplRow GetMethodImpl(int rid)
+        {
+            int p = GetRowOffset(FlatMdSection.MethodImplTable, rid, 12);
+            int classTypeDefRid = ReadI32(_data.Span, p); p += 4;
+            int bodyMethodToken = ReadI32(_data.Span, p); p += 4;
+            int declarationMethodToken = ReadI32(_data.Span, p);
+            return new MethodImplRow(classTypeDefRid, bodyMethodToken, declarationMethodToken);
+        }
         public AssemblyRefRow GetAssemblyRef(int rid)
         {
             int p = GetRowOffset(FlatMdSection.AssemblyRefTable, rid, 4);
@@ -433,6 +453,8 @@ namespace Cnidaria.Cs
             MetadataTableKind.TypeRef => _md.TypeRefs.Count,
             MetadataTableKind.TypeDef => _md.TypeDefs.Count,
             MetadataTableKind.NestedClass => _md.NestedClasses.Count,
+            MetadataTableKind.InterfaceImpl => _md.InterfaceImpls.Count,
+            MetadataTableKind.MethodImpl => _md.MethodImpls.Count,
             MetadataTableKind.Field => _md.Fields.Count,
             MetadataTableKind.MethodDef => _md.Methods.Count,
             MetadataTableKind.Param => _md.Params.Count,
@@ -474,6 +496,8 @@ namespace Cnidaria.Cs
         public TypeRefRow GetTypeRef(int rid) => _md.TypeRefs[rid - 1];
         public TypeDefRow GetTypeDef(int rid) => _md.TypeDefs[rid - 1];
         public NestedClassRow GetNestedClass(int rid) => _md.NestedClasses[rid - 1];
+        public InterfaceImplRow GetInterfaceImpl(int rid) => _md.InterfaceImpls[rid - 1];
+        public MethodImplRow GetMethodImpl(int rid) => _md.MethodImpls[rid - 1];
         public FieldRow GetField(int rid) => _md.Fields[rid - 1];
         public MethodDefRow GetMethodDef(int rid) => _md.Methods[rid - 1];
         public ParamRow GetParam(int rid) => _md.Params[rid - 1];
@@ -502,15 +526,17 @@ namespace Cnidaria.Cs
         TypeRefTable = 101,
         TypeDefTable = 102,
         NestedClassTable = 103,
-        FieldTable = 104,
-        MethodDefTable = 105,
-        ParamTable = 106,
-        MemberRefTable = 107,
-        TypeSpecTable = 108,
-        ConstantTable = 109,
-        PropertyTable = 110,
-        MethodSpecTable = 111,
-        CustomAttributeTable = 112,
+        InterfaceImplTable = 104, 
+        MethodImplTable = 105,
+        FieldTable = 106,
+        MethodDefTable = 107,
+        ParamTable = 108,
+        MemberRefTable = 109,
+        TypeSpecTable = 110,
+        ConstantTable = 111,
+        PropertyTable = 112,
+        MethodSpecTable = 113,
+        CustomAttributeTable = 114,
     }
     internal sealed class AttrBlobWriter
     {
@@ -717,6 +743,9 @@ namespace Cnidaria.Cs
             WriteTypeRefs(md.TypeRefs, plan.Get(FlatMdSection.TypeRefTable), dest);
             WriteTypeDefs(md.TypeDefs, plan.Get(FlatMdSection.TypeDefTable), dest);
             WriteNestedClasses(md.NestedClasses, plan.Get(FlatMdSection.NestedClassTable), dest);
+            WriteInterfaceImpls(md.InterfaceImpls, plan.Get(FlatMdSection.InterfaceImplTable), dest);
+            WriteMethodImpls(md.MethodImpls, plan.Get(FlatMdSection.MethodImplTable), dest);
+
             WriteFields(md.Fields, plan.Get(FlatMdSection.FieldTable), dest);
             WriteMethods(md.Methods, plan.Get(FlatMdSection.MethodDefTable), dest);
             WriteParams(md.Params, plan.Get(FlatMdSection.ParamTable), dest);
@@ -760,6 +789,8 @@ namespace Cnidaria.Cs
             Add(ref i, FlatMdSection.TypeRefTable, elemSize: 12, count: md.TypeRefs.Count, size: checked(md.TypeRefs.Count * 12), ref cursor, sections);
             Add(ref i, FlatMdSection.TypeDefTable, elemSize: 24, count: md.TypeDefs.Count, size: checked(md.TypeDefs.Count * 24), ref cursor, sections);
             Add(ref i, FlatMdSection.NestedClassTable, elemSize: 8, count: md.NestedClasses.Count, size: checked(md.NestedClasses.Count * 8), ref cursor, sections);
+            Add(ref i, FlatMdSection.InterfaceImplTable, elemSize: 8, count: md.InterfaceImpls.Count, size: checked(md.InterfaceImpls.Count * 8), ref cursor, sections);
+            Add(ref i, FlatMdSection.MethodImplTable, elemSize: 12, count: md.MethodImpls.Count, size: checked(md.MethodImpls.Count * 12), ref cursor, sections);
 
             Add(ref i, FlatMdSection.FieldTable, elemSize: 10, count: md.Fields.Count, size: checked(md.Fields.Count * 10), ref cursor, sections);
             Add(ref i, FlatMdSection.MethodDefTable, elemSize: 16, count: md.Methods.Count, size: checked(md.Methods.Count * 16), ref cursor, sections);
@@ -913,7 +944,27 @@ namespace Cnidaria.Cs
                 WriteU8(dest, ref p, 0);
             }
         }
-
+        private static void WriteInterfaceImpls(List<InterfaceImplRow> rows, SectionDesc s, Span<byte> dest)
+        {
+            int p = s.Offset;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                WriteI32(dest, ref p, r.ClassTypeDefRid);
+                WriteI32(dest, ref p, r.InterfaceEncoded);
+            }
+        }
+        private static void WriteMethodImpls(List<MethodImplRow> rows, SectionDesc s, Span<byte> dest)
+        {
+            int p = s.Offset;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                WriteI32(dest, ref p, r.ClassTypeDefRid);
+                WriteI32(dest, ref p, r.BodyMethodToken);
+                WriteI32(dest, ref p, r.DeclarationMethodToken);
+            }
+        }
         private static void WriteAssemblyRefs(List<AssemblyRefRow> rows, SectionDesc s, Span<byte> dest)
         {
             int p = s.Offset;
@@ -1162,6 +1213,8 @@ namespace Cnidaria.Cs
         public List<TypeRefRow> TypeRefs { get; } = new();
         public List<TypeDefRow> TypeDefs { get; } = new();
         public List<NestedClassRow> NestedClasses { get; } = new();
+        public List<InterfaceImplRow> InterfaceImpls { get; } = new();
+        public List<MethodImplRow> MethodImpls { get; } = new();
         public List<FieldRow> Fields { get; } = new();
         public List<MethodDefRow> Methods { get; } = new();
         public List<ParamRow> Params { get; } = new();
@@ -1288,7 +1341,30 @@ namespace Cnidaria.Cs
             EnclosingTypeRid = enclosingRid;
         }
     }
+    public struct InterfaceImplRow
+    {
+        public int ClassTypeDefRid;
+        public int InterfaceEncoded; // TypeDefOrRef coded index
 
+        public InterfaceImplRow(int classTypeDefRid, int interfaceEncoded)
+        {
+            ClassTypeDefRid = classTypeDefRid;
+            InterfaceEncoded = interfaceEncoded;
+        }
+    }
+    public struct MethodImplRow
+    {
+        public int ClassTypeDefRid;
+        public int BodyMethodToken;         // MethodDef
+        public int DeclarationMethodToken;  // MethodDefOrMemberRef
+
+        public MethodImplRow(int classTypeDefRid, int bodyMethodToken, int declarationMethodToken)
+        {
+            ClassTypeDefRid = classTypeDefRid;
+            BodyMethodToken = bodyMethodToken;
+            DeclarationMethodToken = declarationMethodToken;
+        }
+    }
     public struct FieldRow
     {
         public ushort Flags;
@@ -1793,6 +1869,27 @@ namespace Cnidaria.Cs
                 extendsEncoded = unchecked((int)SigEncoding.EncodeTypeDefOrRef(btTok));
             }
 
+            // InterfaceImpl
+            var ifaces = type.Interfaces;
+            if (!ifaces.IsDefaultOrEmpty)
+            {
+                var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+
+                for (int i = 0; i < ifaces.Length; i++)
+                {
+                    if (ifaces[i] is not NamedTypeSymbol iface)
+                        continue;
+                    if (iface.TypeKind != TypeKind.Interface)
+                        continue;
+                    if (!seen.Add(iface.OriginalDefinition))
+                        continue;
+
+                    int ifaceTok = GetTypeToken(iface);
+                    int ifaceEncoded = unchecked((int)SigEncoding.EncodeTypeDefOrRef(ifaceTok));
+                    Image.InterfaceImpls.Add(new InterfaceImplRow(typeDefRid, ifaceEncoded));
+                }
+            }
+
             int fieldListRid = Image.Fields.Count + 1;
 
             // Fields
@@ -1828,7 +1925,7 @@ namespace Cnidaria.Cs
                     int methodRid = Image.Methods.Count + 1;
                     _methodDefTokens[m] = MetadataToken.Make(MetadataToken.MethodDef, methodRid);
 
-                    int mNameIdx = Image.Strings.Add(m.Name);
+                    int mNameIdx = Image.Strings.Add(GetMetadataMethodName(m));
                     int sigIdx = BuildMethodSig(m);
 
                     int paramListRid = Image.Params.Count + 1;
@@ -1846,24 +1943,43 @@ namespace Cnidaria.Cs
                         }
                     }
                     ushort mflags = 0;
-                    mflags |= (ushort)MapMethodAccessibility(m.DeclaredAccessibility);
+                    bool isExplicitInterfaceImpl = m.ExplicitInterfaceImplementation is not null;
+                    if (isExplicitInterfaceImpl)
+                    {
+                        mflags |= (ushort)System.Reflection.MethodAttributes.Private;
+                        mflags |= (ushort)System.Reflection.MethodAttributes.Virtual;
+                        mflags |= (ushort)System.Reflection.MethodAttributes.Final;
+                        mflags |= (ushort)System.Reflection.MethodAttributes.HideBySig;
+                        mflags |= (ushort)System.Reflection.MethodAttributes.NewSlot;
+                    }
+                    else
+                    {
+                        mflags |= (ushort)MapMethodAccessibility(m.DeclaredAccessibility);
+                        if (!m.IsStatic && !m.IsConstructor && (m.IsVirtual || m.IsAbstract || m.IsOverride))
+                        {
+                            mflags |= (ushort)System.Reflection.MethodAttributes.Virtual;
+                            mflags |= (ushort)System.Reflection.MethodAttributes.HideBySig;
+                            if (m.IsAbstract)
+                                mflags |= (ushort)System.Reflection.MethodAttributes.Abstract;
+                            if (!m.IsOverride)
+                                mflags |= (ushort)System.Reflection.MethodAttributes.NewSlot;
+                            if (m.IsOverride && m.IsSealed)
+                                mflags |= (ushort)System.Reflection.MethodAttributes.Final;
+                        }
+                    }
                     if (m.IsStatic)
                         mflags |= (ushort)System.Reflection.MethodAttributes.Static;
                     if (m.IsExtensionMethod)
                         mflags |= MetadataFlagBits.Extension;
-                    if (!m.IsStatic && !m.IsConstructor && (m.IsVirtual || m.IsAbstract || m.IsOverride))
-                    {
-                        mflags |= (ushort)System.Reflection.MethodAttributes.Virtual;
-                        mflags |= (ushort)System.Reflection.MethodAttributes.HideBySig;
-                        if (m.IsAbstract)
-                            mflags |= (ushort)System.Reflection.MethodAttributes.Abstract;
-                        if (!m.IsOverride)
-                            mflags |= (ushort)System.Reflection.MethodAttributes.NewSlot;
-                        if (m.IsOverride && m.IsSealed)
-                            mflags |= (ushort)System.Reflection.MethodAttributes.Final;
-                    }
+                    
                     ushort implFlags = MethodAttributeFacts.GetMethodImplFlags(m);
                     Image.Methods.Add(new MethodDefRow(implFlags: implFlags, flags: mflags, name: mNameIdx, signature: sigIdx, paramList: paramListRid));
+                    if (isExplicitInterfaceImpl)
+                    {
+                        int bodyMethodToken = _methodDefTokens[m];
+                        int declarationMethodToken = GetMethodToken(m.ExplicitInterfaceImplementation!);
+                        Image.MethodImpls.Add(new MethodImplRow(typeDefRid, bodyMethodToken, declarationMethodToken));
+                    }
                 }
             }
 
@@ -1875,7 +1991,7 @@ namespace Cnidaria.Cs
                     int propRid = Image.Properties.Count + 1;
                     _propertyDefTokens[p] = MetadataToken.Make(MetadataToken.PropertyDef, propRid);
 
-                    int pNameIdx = Image.Strings.Add(p.Name);
+                    int pNameIdx = Image.Strings.Add(GetMetadataPropertyName(p));
                     int sigIdx = BuildPropertySig(p);
 
                     int getTok = 0;
@@ -1900,6 +2016,75 @@ namespace Cnidaria.Cs
                 extendsEncoded: extendsEncoded,
                 fieldList: fieldListRid,
                 methodList: methodListRid);
+        }
+        private static string GetMetadataMethodName(MethodSymbol method)
+        {
+            if (method.ExplicitInterfaceImplementation is MethodSymbol ifaceMethod)
+            {
+                if (ifaceMethod.ContainingSymbol is not NamedTypeSymbol ifaceType)
+                    return ifaceMethod.Name;
+
+                return BuildTypeMetadataQualification(ifaceType) + "." + ifaceMethod.Name;
+            }
+
+            return method.Name;
+        }
+
+        private static string GetMetadataPropertyName(PropertySymbol property)
+        {
+            if (property.ExplicitInterfaceImplementation is PropertySymbol ifaceProperty)
+            {
+                if (ifaceProperty.ContainingSymbol is not NamedTypeSymbol ifaceType)
+                    return ifaceProperty.Name;
+
+                return BuildTypeMetadataQualification(ifaceType) + "." + ifaceProperty.Name;
+            }
+
+            return property.Name;
+        }
+        private static string BuildTypeMetadataQualification(NamedTypeSymbol type)
+        {
+            var parts = new Stack<string>();
+
+            Symbol? cur = type;
+            while (cur is NamedTypeSymbol nt)
+            {
+                string part = nt.Arity > 0
+                    ? nt.Name + "`" + nt.Arity.ToString()
+                    : nt.Name;
+
+                parts.Push(part);
+                cur = nt.ContainingSymbol;
+            }
+
+            var sb = new StringBuilder();
+
+            if (cur is NamespaceSymbol ns && !ns.IsGlobalNamespace)
+            {
+                var nsParts = new Stack<string>();
+                Symbol? ncur = ns;
+                while (ncur is NamespaceSymbol n && !n.IsGlobalNamespace)
+                {
+                    nsParts.Push(n.Name);
+                    ncur = n.ContainingSymbol;
+                }
+
+                while (nsParts.Count != 0)
+                {
+                    if (sb.Length != 0)
+                        sb.Append('.');
+                    sb.Append(nsParts.Pop());
+                }
+            }
+
+            while (parts.Count != 0)
+            {
+                if (sb.Length != 0)
+                    sb.Append('.');
+                sb.Append(parts.Pop());
+            }
+
+            return sb.ToString();
         }
         private void TryAddFieldConstant(FieldSymbol f, int fieldDefToken)
         {
@@ -2240,8 +2425,7 @@ namespace Cnidaria.Cs
                     w.CompressedUInt(0); // numlobounds
                     return;
                 case TypeParameterSymbol tp:
-                    bool isMethodTp = tp.ContainingSymbol is MethodSymbol;
-                    w.Byte((byte)(isMethodTp ? SigElementType.MVAR : SigElementType.VAR));
+                    w.Byte((byte)(tp.ContainingSymbol is MethodSymbol ? SigElementType.MVAR : SigElementType.VAR));
                     w.CompressedUInt((uint)tp.Ordinal);
                     return;
                 case ByRefTypeSymbol br:
@@ -2253,32 +2437,64 @@ namespace Cnidaria.Cs
                     return;
 
                 case SubstitutedNamedTypeSymbol snt:
-                    // Generic instantiation type signature
-                    w.Byte((byte)SigElementType.GENERICINST);
-                    w.Byte((byte)(snt.IsValueType ? SigElementType.VALUETYPE : SigElementType.CLASS));
+                    {
+                        int defTok = GetTypeToken(snt.OriginalDefinition);
 
-                    int defTok = GetTypeToken(snt.OriginalDefinition);
-                    w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(defTok));
+                        var effectiveArgs = new List<TypeSymbol>();
+                        CollectEffectiveTypeArguments(snt, effectiveArgs);
 
-                    var args = snt.TypeArguments;
-                    w.CompressedUInt((uint)args.Length);
-                    for (int i = 0; i < args.Length; i++)
-                        WriteTypeSig(w, args[i]);
-                    return;
+                        if (effectiveArgs.Count == 0)
+                        {
+                            w.Byte((byte)(snt.IsValueType ? SigElementType.VALUETYPE : SigElementType.CLASS));
+                            w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(defTok));
+                            return;
+                        }
+
+                        w.Byte((byte)SigElementType.GENERICINST);
+                        w.Byte((byte)(snt.IsValueType ? SigElementType.VALUETYPE : SigElementType.CLASS));
+                        w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(defTok));
+                        w.CompressedUInt((uint)effectiveArgs.Count);
+
+                        for (int i = 0; i < effectiveArgs.Count; i++)
+                            WriteTypeSig(w, effectiveArgs[i]);
+
+                        return;
+                    }
+
 
                 case NamedTypeSymbol nt:
-                    // primitives
-                    if (TryWritePrimitive(w, nt.SpecialType))
-                        return;
+                    {
+                        // primitives
+                        if (TryWritePrimitive(w, nt.SpecialType))
+                            return;
 
-                    w.Byte((byte)(nt.IsValueType ? SigElementType.VALUETYPE : SigElementType.CLASS));
-                    int tok = GetTypeToken(nt); // TypeDef/TypeRef
-                    w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(tok));
-                    return;
+                        w.Byte((byte)(nt.IsValueType ? SigElementType.VALUETYPE : SigElementType.CLASS));
+                        int tok = GetTypeToken(nt); // TypeDef/TypeRef
+                        w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(tok));
+                        return;
+                    }
+                    
 
                 default:
                     throw new NotSupportedException($"TypeSig not supported: {type.GetType().Name}");
             }
+        }
+        private static void CollectEffectiveTypeArguments(NamedTypeSymbol type, List<TypeSymbol> dest)
+        {
+            if (type is SubstitutedNamedTypeSymbol snt)
+            {
+                if (snt.ContainingTypeOpt is not null)
+                    CollectEffectiveTypeArguments(snt.ContainingTypeOpt, dest);
+
+                var args = snt.TypeArguments;
+                for (int i = 0; i < args.Length; i++)
+                    dest.Add(args[i]);
+
+                return;
+            }
+
+            if (type.ContainingSymbol is NamedTypeSymbol containing)
+                CollectEffectiveTypeArguments(containing, dest);
         }
         private static bool TryWritePrimitive(SigWriter w, SpecialType st)
         {

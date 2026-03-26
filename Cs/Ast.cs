@@ -2028,6 +2028,59 @@ namespace Cnidaria.Cs
             ConstraintClauses = constraintClauses;
         }
     }
+    public sealed class RecordDeclarationSyntax : TypeDeclarationSyntax
+    {
+        public SyntaxToken Keyword { get; }
+        public SyntaxToken ClassOrStructKeyword { get; } // optional
+        public TypeParameterListSyntax? TypeParameterList { get; }
+        public ParameterListSyntax? ParameterList { get; }
+        public BaseListSyntax? BaseList { get; }
+        public SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+
+        public RecordDeclarationSyntax(
+            SyntaxKind kind,
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken recordKeyword,
+            SyntaxToken classOrStructKeyword,
+            SyntaxToken identifier,
+            TypeParameterListSyntax? typeParameterList,
+            ParameterListSyntax? parameterList,
+            BaseListSyntax? baseList,
+            SyntaxList<TypeParameterConstraintClauseSyntax> constraintClauses,
+            SyntaxToken openBraceToken,
+            SyntaxList<MemberDeclarationSyntax> members,
+            SyntaxToken closeBraceToken,
+            SyntaxToken semicolonToken)
+            : base(
+                attributeLists,
+                kind,
+                modifiers,
+                identifier,
+                openBraceToken,
+                members,
+                closeBraceToken,
+                semicolonToken,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    recordKeyword.Span,
+                    (classOrStructKeyword.Span.Length != 0 ? classOrStructKeyword.Span : (TextSpan?)null),
+                    identifier.Span,
+                    typeParameterList?.Span,
+                    parameterList?.Span,
+                    baseList?.Span,
+                    constraintClauses.Count > 0 ? constraintClauses[constraintClauses.Count - 1].Span : (TextSpan?)null,
+                    (semicolonToken.Span.Length != 0 ? semicolonToken.Span : closeBraceToken.Span)))
+        {
+            Keyword = recordKeyword;
+            ClassOrStructKeyword = classOrStructKeyword;
+            TypeParameterList = typeParameterList;
+            ParameterList = parameterList;
+            BaseList = baseList;
+            ConstraintClauses = constraintClauses;
+        }
+    }
     public sealed class EnumMemberDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxToken Identifier { get; }
@@ -2408,6 +2461,18 @@ namespace Cnidaria.Cs
             Body = body;
             ExpressionBody = expressionBody;
             SemicolonToken = semicolonToken;
+        }
+    }
+    public sealed class PrimaryConstructorBaseTypeSyntax : BaseTypeSyntax
+    {
+        public override TypeSyntax Type { get; }
+        public ArgumentListSyntax ArgumentList { get; }
+
+        public PrimaryConstructorBaseTypeSyntax(TypeSyntax type, ArgumentListSyntax argumentList)
+            : base(SyntaxKind.PrimaryConstructorBaseType, NodeSpan.From(type.Span, argumentList.Span))
+        {
+            Type = type;
+            ArgumentList = argumentList;
         }
     }
     public sealed class FieldDeclarationSyntax : MemberDeclarationSyntax
