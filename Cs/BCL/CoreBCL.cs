@@ -5095,6 +5095,38 @@ namespace System.Runtime.InteropServices
             //    (nuint)RuntimeHelpers.GetMethodTable(array)->BaseSize - (nuint)(2 * sizeof(IntPtr)));
             return ref *(byte*)0;
         }
+
+        public static ref T GetReference<T>(Span<T> span) => ref span._reference;
+        public static ref T GetReference<T>(ReadOnlySpan<T> span) => ref span._reference;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void Write<T>(Span<byte> destination, in T value)
+            where T : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                throw new NotSupportedException();
+            }
+            if ((uint)sizeof(T) > (uint)destination.Length)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            Unsafe.WriteUnaligned<T>(ref GetReference<byte>(destination), value);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe bool TryWrite<T>(Span<byte> destination, in T value)
+            where T : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                throw new NotSupportedException();
+            }
+            if (sizeof(T) > (uint)destination.Length)
+            {
+                return false;
+            }
+            Unsafe.WriteUnaligned<T>(ref GetReference<byte>(destination), value);
+            return true;
+        }
     }
 }
 namespace System.Runtime.CompilerServices
@@ -5194,6 +5226,18 @@ namespace System.Runtime.CompilerServices
             // ldarg.0
             // unaligned. 0x1
             // ldobj !!T
+            // ret
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static void WriteUnaligned<T>(ref byte destination, T value)
+            where T : allows ref struct
+        {
+            As<byte, T>(ref destination) = value;
+            // ldarg .0
+            // ldarg .1
+            // unaligned. 0x01
+            // stobj !!T
             // ret
         }
         [Intrinsic]
@@ -5560,6 +5604,116 @@ namespace System.Buffers
     public class ConfigurableArrayPool<T> : ArrayPool<T>
     {
 
+    }
+}
+namespace System.Buffers.Binary
+{
+    public static class BinaryPrimitives
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteSingleLittleEndian(Span<byte> destination, float value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //int tmp = ReverseEndianness(BitConverter.SingleToInt32Bits(value));
+                System.Runtime.InteropServices.MemoryMarshal.Write<float>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<float>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteDoubleLittleEndian(Span<byte> destination, double value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //long tmp = ReverseEndianness(BitConverter.DoubleToInt64Bits(value));
+                System.Runtime.InteropServices.MemoryMarshal.Write<double>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<double>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteInt16LittleEndian(Span<byte> destination, short value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //short tmp = ReverseEndianness(value);
+                System.Runtime.InteropServices.MemoryMarshal.Write<short>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<short>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteInt32LittleEndian(Span<byte> destination, int value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //int tmp = ReverseEndianness(value); 
+                System.Runtime.InteropServices.MemoryMarshal.Write<int>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<int>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteInt64LittleEndian(Span<byte> destination, long value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //long tmp = ReverseEndianness(value);
+                System.Runtime.InteropServices.MemoryMarshal.Write<long>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<long>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteUInt16LittleEndian(Span<byte> destination, ushort value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //ushort tmp = ReverseEndianness(value);
+                System.Runtime.InteropServices.MemoryMarshal.Write<ushort>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<ushort>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteUInt32LittleEndian(Span<byte> destination, uint value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //uint tmp = ReverseEndianness(value);
+                System.Runtime.InteropServices.MemoryMarshal.Write<uint>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<uint>(destination, in value);
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteUInt64LittleEndian(Span<byte> destination, ulong value)
+        {
+            if (!BitConverter.IsLittleEndian)
+            {
+                //ulong tmp = ReverseEndianness(value);
+                System.Runtime.InteropServices.MemoryMarshal.Write<ulong>(destination, in value);
+            }
+            else
+            {
+                System.Runtime.InteropServices.MemoryMarshal.Write<ulong>(destination, in value);
+            }
+        }
     }
 }
 namespace System.Collections

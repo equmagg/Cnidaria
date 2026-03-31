@@ -820,6 +820,365 @@ namespace Cnidaria.Cs
     }
 
 
+    internal sealed class LocalFunctionClosureRewriter : BoundTreeRewriterWithStackGuard
+    {
+        private readonly Compilation _compilation;
+        private readonly List<Dictionary<LocalFunctionSymbol, CaptureInfo>> _localFunctionScopes = new();
+        private readonly Dictionary<Symbol, ParameterSymbol> _captureParameterMap =
+            new(ReferenceEqualityComparer<Symbol>.Instance);
+
+        private readonly struct CaptureInfo
+        {
+            public readonly LocalFunctionSymbol Original;
+            public readonly LocalFunctionSymbol Lowered;
+            public readonly ImmutableArray<Symbol> CapturedSymbols;
+            public readonly ImmutableArray<ParameterSymbol> HiddenParameters;
+
+            public CaptureInfo(
+                LocalFunctionSymbol original,
+                LocalFunctionSymbol lowered,
+                ImmutableArray<Symbol> capturedSymbols,
+                ImmutableArray<ParameterSymbol> hiddenParameters)
+            {
+                Original = original;
+                Lowered = lowered;
+                CapturedSymbols = capturedSymbols.IsDefault ? ImmutableArray<Symbol>.Empty : capturedSymbols;
+                HiddenParameters = hiddenParameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : hiddenParameters;
+            }
+        }
+
+        private readonly struct SavedCaptureParameter
+        {
+            public readonly Symbol Symbol;
+            public readonly bool HadOldValue;
+            public readonly ParameterSymbol OldValue;
+
+            public SavedCaptureParameter(Symbol symbol, bool hadOldValue, ParameterSymbol oldValue)
+            {
+                Symbol = symbol;
+                HadOldValue = hadOldValue;
+                OldValue = oldValue;
+            }
+        }
+
+        private sealed class CaptureCollector : BoundTreeRewriter
+        {
+            private readonly MethodSymbol _owner;
+            private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
+            private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
+
+            private CaptureCollector(MethodSymbol owner)
+            {
+                _owner = owner;
+            }
+
+            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            {
+                var collector = new CaptureCollector(owner);
+                collector.RewriteStatement(body);
+                return collector._captures.ToImmutable();
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => node;
+
+            protected override BoundExpression RewriteExpression(BoundExpression node)
+            {
+                switch (node)
+                {
+                    case BoundLocalExpression local when !ReferenceEquals(local.Local.ContainingSymbol, _owner):
+                        Add(local.Local);
+                        return node;
+
+                    case BoundParameterExpression parameter when !ReferenceEquals(parameter.Parameter.ContainingSymbol, _owner):
+                        Add(parameter.Parameter);
+                        return node;
+
+                    default:
+                        return base.RewriteExpression(node);
+                }
+            }
+
+            private void Add(Symbol symbol)
+            {
+                if (_seen.Add(symbol))
+                    _captures.Add(symbol);
+            }
+        }
+
+        public LocalFunctionClosureRewriter(Compilation compilation)
+        {
+            _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
+        }
+
+        protected override BoundStatement RewriteBlockStatement(BoundBlockStatement node)
+        {
+            var statements = RewriteScopedStatements(node.Statements, out var changed);
+            if (changed)
+                return new BoundBlockStatement(node.Syntax, statements);
+
+            return node;
+        }
+
+        protected override BoundStatement RewriteStatementList(BoundStatementList node)
+        {
+            var statements = RewriteScopedStatements(node.Statements, out var changed);
+            if (changed)
+                return new BoundStatementList(node.Syntax, statements);
+
+            return node;
+        }
+
+        protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+        {
+            if (!TryGetCaptureInfo(node.LocalFunction, out var info))
+                return base.RewriteLocalFunctionStatement(node);
+
+            var saved = PushCaptureParameters(node.Syntax, info);
+            try
+            {
+                var body = RewriteStatement(node.Body);
+                if (!ReferenceEquals(body, node.Body) || !ReferenceEquals(info.Lowered, node.LocalFunction))
+                {
+                    return new BoundLocalFunctionStatement(
+                        (LocalFunctionStatementSyntax)node.Syntax,
+                        info.Lowered,
+                        body);
+                }
+
+                return node;
+            }
+            finally
+            {
+                PopCaptureParameters(saved);
+            }
+        }
+
+        protected override BoundExpression RewriteExpression(BoundExpression node)
+        {
+            switch (node)
+            {
+                case BoundLocalExpression local when _captureParameterMap.TryGetValue(local.Local, out var localCapture):
+                    return new BoundParameterExpression(local.Syntax, localCapture);
+
+                case BoundParameterExpression parameter when _captureParameterMap.TryGetValue(parameter.Parameter, out var parameterCapture):
+                    return new BoundParameterExpression(parameter.Syntax, parameterCapture);
+
+                case BoundCallExpression call:
+                    return RewriteCallExpressionWithCaptures(call);
+
+                default:
+                    return base.RewriteExpression(node);
+            }
+        }
+
+        private BoundExpression RewriteCallExpressionWithCaptures(BoundCallExpression node)
+        {
+            var receiver = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
+            var arguments = RewriteExpressions(node.Arguments, out var argsChanged);
+
+            if (node.Method is LocalFunctionSymbol localFunction && TryGetCaptureInfo(localFunction, out var info))
+            {
+                ImmutableArray<BoundExpression> rewrittenArguments = arguments;
+
+                if (!info.HiddenParameters.IsDefaultOrEmpty)
+                {
+                    var builder = ImmutableArray.CreateBuilder<BoundExpression>(arguments.Length + info.HiddenParameters.Length);
+                    builder.AddRange(arguments);
+
+                    for (int i = 0; i < info.HiddenParameters.Length; i++)
+                    {
+                        var hiddenParameter = info.HiddenParameters[i];
+                        var capturedValue = MakeCurrentCaptureValueExpression(node.Syntax, info.CapturedSymbols[i]);
+
+                        builder.Add(new BoundRefExpression(
+                            node.Syntax,
+                            hiddenParameter.Type,
+                            capturedValue));
+                    }
+
+                    rewrittenArguments = builder.ToImmutable();
+                }
+
+                if (!ReferenceEquals(receiver, node.ReceiverOpt) ||
+                    argsChanged ||
+                    !ReferenceEquals(info.Lowered, node.Method) ||
+                    rewrittenArguments.Length != node.Arguments.Length)
+                {
+                    return new BoundCallExpression(node.Syntax, receiver, info.Lowered, rewrittenArguments);
+                }
+
+                return node;
+            }
+
+            if (!ReferenceEquals(receiver, node.ReceiverOpt) || argsChanged)
+                return new BoundCallExpression(node.Syntax, receiver, node.Method, arguments);
+
+            return node;
+        }
+
+        private ImmutableArray<BoundStatement> RewriteScopedStatements(
+            ImmutableArray<BoundStatement> statements,
+            out bool changed)
+        {
+            changed = false;
+            if (statements.IsDefaultOrEmpty)
+                return statements;
+
+            var localFunctions = CollectCaptureInfos(statements);
+            _localFunctionScopes.Add(localFunctions);
+
+            try
+            {
+                var builder = ImmutableArray.CreateBuilder<BoundStatement>(statements.Length);
+                for (int i = 0; i < statements.Length; i++)
+                {
+                    var statement = statements[i];
+                    var rewritten = RewriteStatement(statement);
+                    if (!ReferenceEquals(rewritten, statement))
+                        changed = true;
+                    builder.Add(rewritten);
+                }
+
+                return changed ? builder.ToImmutable() : statements;
+            }
+            finally
+            {
+                _localFunctionScopes.RemoveAt(_localFunctionScopes.Count - 1);
+            }
+        }
+
+        private Dictionary<LocalFunctionSymbol, CaptureInfo> CollectCaptureInfos(ImmutableArray<BoundStatement> statements)
+        {
+            var map = new Dictionary<LocalFunctionSymbol, CaptureInfo>(ReferenceEqualityComparer<LocalFunctionSymbol>.Instance);
+
+            for (int i = 0; i < statements.Length; i++)
+            {
+                if (statements[i] is not BoundLocalFunctionStatement localFunction)
+                    continue;
+
+                map[localFunction.LocalFunction] = CreateCaptureInfo(localFunction);
+            }
+
+            return map;
+        }
+
+        private CaptureInfo CreateCaptureInfo(BoundLocalFunctionStatement statement)
+        {
+            var original = statement.LocalFunction;
+            var capturedSymbols = CaptureCollector.Collect(original, statement.Body);
+
+            if (capturedSymbols.IsDefaultOrEmpty)
+                return new CaptureInfo(original, original, capturedSymbols, ImmutableArray<ParameterSymbol>.Empty);
+
+            var declaration = original.Declaration;
+            var tree = original.DeclaringSyntaxReferences.Length != 0
+                ? original.DeclaringSyntaxReferences[0].SyntaxTree
+                : throw new InvalidOperationException("Local function syntax reference is missing.");
+
+            var lowered = new LocalFunctionSymbol(
+                original.Name,
+                original.ContainingSymbol ?? throw new InvalidOperationException("Local function containing symbol is missing."),
+                declaration,
+                tree,
+                original.Locations,
+                original.IsStatic,
+                original.IsAsync);
+
+            var allParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(original.Parameters.Length + capturedSymbols.Length);
+            allParameters.AddRange(original.Parameters);
+
+            var hiddenParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(capturedSymbols.Length);
+            for (int i = 0; i < capturedSymbols.Length; i++)
+            {
+                var symbol = capturedSymbols[i];
+                var hiddenType = GetHiddenCaptureParameterType(symbol);
+                var hiddenParameter = new ParameterSymbol(
+                    name: $"<>capture{i}_{symbol.Name}",
+                    containing: lowered,
+                    type: hiddenType,
+                    locations: ImmutableArray<Location>.Empty);
+
+                allParameters.Add(hiddenParameter);
+                hiddenParameters.Add(hiddenParameter);
+            }
+
+            lowered.SetSignature(original.ReturnType, allParameters.ToImmutable());
+
+            return new CaptureInfo(
+                original,
+                lowered,
+                capturedSymbols,
+                hiddenParameters.ToImmutable());
+        }
+
+        private TypeSymbol GetHiddenCaptureParameterType(Symbol symbol)
+        {
+            return symbol switch
+            {
+                LocalSymbol local => _compilation.CreateByRefType(local.Type),
+                ParameterSymbol parameter when parameter.Type is ByRefTypeSymbol => parameter.Type,
+                ParameterSymbol parameter => _compilation.CreateByRefType(parameter.Type),
+                _ => throw new NotSupportedException($"Unsupported captured symbol '{symbol.Kind}'.")
+            };
+        }
+
+        private BoundExpression MakeCurrentCaptureValueExpression(SyntaxNode syntax, Symbol capturedSymbol)
+        {
+            if (_captureParameterMap.TryGetValue(capturedSymbol, out var parameter))
+                return new BoundParameterExpression(syntax, parameter);
+
+            return capturedSymbol switch
+            {
+                LocalSymbol local => new BoundLocalExpression(syntax, local),
+                ParameterSymbol originalParameter => new BoundParameterExpression(syntax, originalParameter),
+                _ => throw new NotSupportedException($"Unsupported captured symbol '{capturedSymbol.Kind}'.")
+            };
+        }
+
+        private SavedCaptureParameter[] PushCaptureParameters(SyntaxNode syntax, CaptureInfo info)
+        {
+            if (info.HiddenParameters.IsDefaultOrEmpty)
+                return Array.Empty<SavedCaptureParameter>();
+
+            var saved = new SavedCaptureParameter[info.HiddenParameters.Length];
+            for (int i = 0; i < info.HiddenParameters.Length; i++)
+            {
+                var symbol = info.CapturedSymbols[i];
+                bool hadOldValue = _captureParameterMap.TryGetValue(symbol, out var oldValue);
+                saved[i] = new SavedCaptureParameter(symbol, hadOldValue, oldValue!);
+                _captureParameterMap[symbol] = info.HiddenParameters[i];
+            }
+
+            return saved;
+        }
+
+        private void PopCaptureParameters(SavedCaptureParameter[] saved)
+        {
+            for (int i = saved.Length - 1; i >= 0; i--)
+            {
+                var item = saved[i];
+                if (item.HadOldValue)
+                    _captureParameterMap[item.Symbol] = item.OldValue;
+                else
+                    _captureParameterMap.Remove(item.Symbol);
+            }
+        }
+
+        private bool TryGetCaptureInfo(LocalFunctionSymbol symbol, out CaptureInfo info)
+        {
+            for (int i = _localFunctionScopes.Count - 1; i >= 0; i--)
+            {
+                if (_localFunctionScopes[i].TryGetValue(symbol, out info))
+                    return true;
+            }
+
+            info = default;
+            return false;
+        }
+    }
+
+
     internal static class IRLowering
     {
         public static BoundMethodBody Rewrite(
@@ -847,9 +1206,13 @@ namespace Cnidaria.Cs
             if (compilation is null) throw new ArgumentNullException(nameof(compilation));
             if (methodBody is null) throw new ArgumentNullException(nameof(methodBody));
 
+            var closureRewriter = new LocalFunctionClosureRewriter(compilation);
+            var closureLoweredBody = closureRewriter.RewriteNode(methodBody) as BoundMethodBody
+                ?? throw new InvalidOperationException("Unexpected closure conversion result.");
+
             var rewriter = new LocalRewriter(
-                compilation, methodBody.Method, allowInlining, inlineDepth, inlineChain, inlineBodyCache);
-            var loweredBody = rewriter.RewriteNode(methodBody) as BoundMethodBody
+                compilation, closureLoweredBody.Method, allowInlining, inlineDepth, inlineChain, inlineBodyCache);
+            var loweredBody = rewriter.RewriteNode(closureLoweredBody) as BoundMethodBody
                 ?? throw new InvalidOperationException("Unexpected rewrite result.");
 
             loweredBody = EnsureBlockBody(loweredBody);
@@ -1942,7 +2305,7 @@ namespace Cnidaria.Cs
                     finallyBlock = new BoundBlockStatement(syntax, statements.ToImmutable());
                     return true;
                 }
-                
+
             }
 
             private static MethodSymbol? FindAccessibleDisposeMethod(TypeSymbol type)

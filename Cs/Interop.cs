@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -178,12 +179,12 @@ namespace Cnidaria.Cs
         public void OverrideStatic(string assemblyName, string typeFullName, string methodName, Delegate handler)
         {
             if (handler is null) throw new ArgumentNullException(nameof(handler));
+
             var sig = ExtractSignature(handler);
+            var method = ResolveStaticMethod(assemblyName, typeFullName, methodName, sig.ParamTypes, sig.ReturnType);
+            var wrapper = BuildWrapper(handler, sig, method);
 
-            var m = ResolveStaticMethod(assemblyName, typeFullName, methodName, sig.ParamTypes, sig.ReturnType);
-            var wrapper = BuildWrapper(handler, sig);
-
-            _vm.RegisterHostOverride(new HostOverride(m, wrapper));
+            _vm.RegisterHostOverride(new HostOverride(method, wrapper));
         }
         public void OverrideStaticRaw(string assemblyName, string typeFullName, string methodName, Type returnType, Type[] paramTypes, HostMethod handler)
         {
@@ -225,16 +226,21 @@ namespace Cnidaria.Cs
 
             return (hasCtx, retClr, retVm, paramClr, paramVm);
         }
-        private HostMethod BuildWrapper
-            (Delegate handler, (bool HasContext, Type ReturnClr, RuntimeType ReturnType, Type[] ParamClr, RuntimeType[] ParamTypes) sig)
+        private HostMethod BuildWrapper(
+            Delegate handler,
+            (bool HasContext, Type ReturnClr, RuntimeType ReturnType, Type[] ParamClr, RuntimeType[] ParamTypes) sig,
+            RuntimeMethod targetMethod)
         {
             for (int i = 0; i < sig.ParamClr.Length; i++)
             {
                 if (sig.ParamClr[i].IsByRefLike)
-                    throw new NotSupportedException($"Delegate parameter '{sig.ParamClr[i]}' is byref-like. Use OverrideStaticRaw + VmHostMethod instead.");
+                    throw new NotSupportedException(
+                        $"Delegate parameter '{sig.ParamClr[i]}' is byref-like. Use OverrideStaticRaw + HostMethod instead.");
             }
+
             if (sig.ReturnClr.IsByRefLike)
-                throw new NotSupportedException($"Delegate return '{sig.ReturnClr}' is byref-like. Use OverrideStaticRaw + VmHostMethod instead.");
+                throw new NotSupportedException(
+                    $"Delegate return '{sig.ReturnClr}' is byref-like. Use OverrideStaticRaw + HostMethod instead.");
 
             var invokeArgs = new object?[sig.ParamClr.Length + (sig.HasContext ? 1 : 0)];
 
@@ -257,11 +263,111 @@ namespace Cnidaria.Cs
                 if (sig.ReturnClr == typeof(void))
                     return VmValue.Null;
 
-                return ConvertRet(ctx, retObj, sig.ReturnClr);
+                return ConvertRet(ctx, retObj, sig.ReturnClr, targetMethod.ReturnType);
             };
+        }
+        private static RuntimeType? TryGetEnumUnderlyingType(RuntimeType t)
+        {
+            if (t.Kind != RuntimeTypeKind.Enum)
+                return null;
+
+            if (t.ElementType != null)
+                return t.ElementType;
+
+            for (int i = 0; i < t.InstanceFields.Length; i++)
+            {
+                if (t.InstanceFields[i].Name == "value__")
+                    return t.InstanceFields[i].FieldType;
+            }
+
+            return t.InstanceFields.Length > 0 ? t.InstanceFields[0].FieldType : null;
+        }
+        private static bool TryGetHostTypeMatchCost(RuntimeType actualVmType, RuntimeType hostType, out int cost)
+        {
+            if (actualVmType.TypeId == hostType.TypeId)
+            {
+                cost = 0;
+                return true;
+            }
+
+            if (actualVmType.Kind == RuntimeTypeKind.Array && hostType.Kind == RuntimeTypeKind.Array)
+            {
+                if (actualVmType.ArrayRank != hostType.ArrayRank ||
+                    actualVmType.ElementType is null ||
+                    hostType.ElementType is null)
+                {
+                    cost = int.MaxValue;
+                    return false;
+                }
+
+                if (TryGetHostTypeMatchCost(actualVmType.ElementType, hostType.ElementType, out var nested))
+                {
+                    cost = nested;
+                    return true;
+                }
+
+                cost = int.MaxValue;
+                return false;
+            }
+
+            if (actualVmType.Kind == RuntimeTypeKind.ByRef && hostType.Kind == RuntimeTypeKind.ByRef &&
+                actualVmType.ElementType is not null && hostType.ElementType is not null &&
+                TryGetHostTypeMatchCost(actualVmType.ElementType, hostType.ElementType, out var byRefNested))
+            {
+                cost = byRefNested;
+                return true;
+            }
+
+            if (actualVmType.Kind == RuntimeTypeKind.Pointer && hostType.Kind == RuntimeTypeKind.Pointer &&
+                actualVmType.ElementType is not null && hostType.ElementType is not null &&
+                TryGetHostTypeMatchCost(actualVmType.ElementType, hostType.ElementType, out var ptrNested))
+            {
+                cost = ptrNested;
+                return true;
+            }
+
+            if (actualVmType.Kind == RuntimeTypeKind.Enum)
+            {
+                var underlying = TryGetEnumUnderlyingType(actualVmType);
+                if (underlying is not null && TryGetHostTypeMatchCost(underlying, hostType, out var nested))
+                {
+                    cost = nested + 10;
+                    return true;
+                }
+            }
+
+            cost = int.MaxValue;
+            return false;
         }
         private object? ConvertArg(VmCallContext ctx, VmValue v, Type clr)
         {
+            if (clr.IsEnum)
+            {
+                var underlying = Enum.GetUnderlyingType(clr);
+                var raw = ConvertArg(ctx, v, underlying) ?? Activator.CreateInstance(underlying)!;
+                return Enum.ToObject(clr, raw);
+            }
+
+            if (clr.IsArray)
+            {
+                if (clr.GetArrayRank() != 1)
+                    throw new NotSupportedException("Only SZARRAY supported in host marshaling.");
+
+                if (v.Kind == VmValueKind.Null)
+                    return null;
+
+                var elementClr = clr.GetElementType()
+                    ?? throw new InvalidOperationException("Array without element type.");
+
+                int length = _vm.HostGetArrayLength(v);
+                var result = Array.CreateInstance(elementClr, length);
+
+                for (int i = 0; i < length; i++)
+                    result.SetValue(ConvertArg(ctx, _vm.HostGetArrayElement(v, i), elementClr), i);
+
+                return result;
+            }
+
             if (clr == typeof(string)) return ctx.ReadString(v);
             if (clr == typeof(int)) return v.AsInt32();
             if (clr == typeof(uint)) return unchecked((uint)v.AsInt32());
@@ -275,11 +381,13 @@ namespace Cnidaria.Cs
             if (clr == typeof(ulong)) return unchecked((ulong)v.AsInt64());
             if (clr == typeof(double)) return v.AsDouble();
             if (clr == typeof(float)) return (float)v.AsDouble();
+
             if (clr == typeof(IntPtr))
             {
                 long raw = (RuntimeTypeSystem.PointerSize == 8) ? v.AsInt64() : v.AsInt32();
                 return new IntPtr((nint)raw);
             }
+
             if (clr == typeof(UIntPtr))
             {
                 ulong raw = (RuntimeTypeSystem.PointerSize == 8) ? (ulong)v.AsInt64() : (uint)v.AsInt32();
@@ -289,8 +397,48 @@ namespace Cnidaria.Cs
             throw new NotSupportedException($"Host arg type not supported: {clr.FullName}");
         }
 
-        private VmValue ConvertRet(VmCallContext ctx, object? retObj, Type clr)
+        private VmValue ConvertRet(VmCallContext ctx, object? retObj, Type clr, RuntimeType actualVmType)
         {
+            if (clr.IsEnum)
+            {
+                var underlying = Enum.GetUnderlyingType(clr);
+                object raw = retObj ?? Activator.CreateInstance(underlying)!;
+
+                if (raw.GetType() != underlying)
+                    raw = Convert.ChangeType(raw, underlying, CultureInfo.InvariantCulture)!;
+
+                return ConvertRet(ctx, raw, underlying, actualVmType);
+            }
+
+            if (clr.IsArray)
+            {
+                if (clr.GetArrayRank() != 1)
+                    throw new NotSupportedException("Only SZARRAY supported in host marshaling.");
+
+                if (retObj is null)
+                    return VmValue.Null;
+
+                if (retObj is not Array arr)
+                    throw new InvalidOperationException($"Expected array return value for '{clr.FullName}'.");
+
+                if (actualVmType.Kind != RuntimeTypeKind.Array || actualVmType.ElementType is null)
+                    throw new InvalidOperationException(
+                        $"VM return type '{actualVmType.Namespace}.{actualVmType.Name}' is not an array.");
+
+                var elementClr = clr.GetElementType()
+                    ?? throw new InvalidOperationException("Array without element type.");
+
+                var vmArr = _vm.HostAllocArray(actualVmType, arr.Length);
+
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var vmElem = ConvertRet(ctx, arr.GetValue(i), elementClr, actualVmType.ElementType);
+                    _vm.HostSetArrayElement(vmArr, i, vmElem);
+                }
+
+                return vmArr;
+            }
+
             if (clr == typeof(string)) return ctx.NewString((string?)retObj);
             if (clr == typeof(int)) return VmValue.FromInt32((int)(retObj ?? 0));
             if (clr == typeof(uint)) return VmValue.FromInt32(unchecked((int)(uint)(retObj ?? 0u)));
@@ -304,22 +452,33 @@ namespace Cnidaria.Cs
             if (clr == typeof(ulong)) return VmValue.FromInt64(unchecked((long)(ulong)(retObj ?? 0UL)));
             if (clr == typeof(double)) return VmValue.FromDouble((double)(retObj ?? 0.0));
             if (clr == typeof(float)) return VmValue.FromDouble((float)(retObj ?? 0.0f));
+
             if (clr == typeof(IntPtr))
             {
                 var ip = (IntPtr)(retObj ?? IntPtr.Zero);
                 long raw = (RuntimeTypeSystem.PointerSize == 8) ? ip.ToInt64() : ip.ToInt32();
-                return (RuntimeTypeSystem.PointerSize == 8) ? VmValue.FromInt64(raw) : VmValue.FromInt32((int)raw);
+                return (RuntimeTypeSystem.PointerSize == 8)
+                    ? VmValue.FromInt64(raw)
+                    : VmValue.FromInt32((int)raw);
             }
+
             if (clr == typeof(UIntPtr))
             {
                 var up = (UIntPtr)(retObj ?? UIntPtr.Zero);
                 ulong raw = up.ToUInt64();
-                return (RuntimeTypeSystem.PointerSize == 8) ? VmValue.FromInt64(unchecked((long)raw)) : VmValue.FromInt32(unchecked((int)(uint)raw));
+                return (RuntimeTypeSystem.PointerSize == 8)
+                    ? VmValue.FromInt64(unchecked((long)raw))
+                    : VmValue.FromInt32(unchecked((int)(uint)raw));
             }
 
             throw new NotSupportedException($"Host return type not supported: {clr.FullName}");
         }
-        private RuntimeMethod ResolveStaticMethod(string assemblyName, string typeFullName, string methodName, RuntimeType[] ps, RuntimeType ret)
+        private RuntimeMethod ResolveStaticMethod(
+            string assemblyName,
+            string typeFullName,
+            string methodName,
+            RuntimeType[] ps,
+            RuntimeType ret)
         {
             if (!_modules.TryGetValue(assemblyName, out var mod))
                 throw new TypeLoadException($"Module '{assemblyName}' not loaded.");
@@ -332,33 +491,48 @@ namespace Cnidaria.Cs
             var owner = _rts.ResolveType(mod, typeDefTok);
 
             RuntimeMethod? match = null;
+            int bestScore = int.MaxValue;
+
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
                 if (!m.IsStatic || m.HasThis) continue;
                 if (!StringComparer.Ordinal.Equals(m.Name, methodName)) continue;
                 if (m.ParameterTypes.Length != ps.Length) continue;
-                if (m.ReturnType.TypeId != ret.TypeId) continue;
+
+                if (!TryGetHostTypeMatchCost(m.ReturnType, ret, out int score))
+                    continue;
 
                 bool ok = true;
                 for (int p = 0; p < ps.Length; p++)
                 {
-                    if (m.ParameterTypes[p].TypeId != ps[p].TypeId)
+                    if (!TryGetHostTypeMatchCost(m.ParameterTypes[p], ps[p], out int part))
                     {
                         ok = false;
                         break;
                     }
+
+                    score += part;
                 }
 
                 if (!ok) continue;
 
-                if (match != null)
-                    throw new AmbiguousMatchException($"Multiple overloads match: {typeFullName}.{methodName} in '{assemblyName}'.");
+                if (score < bestScore)
+                {
+                    match = m;
+                    bestScore = score;
+                    continue;
+                }
 
-                match = m;
+                if (score == bestScore)
+                {
+                    throw new AmbiguousMatchException(
+                        $"Multiple overloads match: {typeFullName}.{methodName} in '{assemblyName}'.");
+                }
             }
 
-            return match ?? throw new MissingMethodException($"{assemblyName}:{typeFullName}.{methodName} not found.");
+            return match ?? throw new MissingMethodException(
+                $"{assemblyName}:{typeFullName}.{methodName} not found.");
         }
 
         private RuntimeType MapClrTypeToVm(Type t)
@@ -366,6 +540,9 @@ namespace Cnidaria.Cs
             if (t == typeof(void)) return ResolveStd("System", "Void");
             if (t == typeof(string)) return ResolveStd("System", "String");
             if (t == typeof(object)) return ResolveStd("System", "Object");
+
+            if (t.IsEnum)
+                return MapClrTypeToVm(Enum.GetUnderlyingType(t));
 
             if (t.IsByRef)
             {
@@ -377,11 +554,11 @@ namespace Cnidaria.Cs
             {
                 if (t.GetArrayRank() != 1)
                     throw new NotSupportedException("Only SZARRAY supported in host mapping.");
+
                 var elem = t.GetElementType() ?? throw new InvalidOperationException("Array without element type.");
                 return _rts.GetArrayType(MapClrTypeToVm(elem));
             }
 
-            // primitives
             if (t == typeof(bool)) return ResolveStd("System", "Boolean");
             if (t == typeof(char)) return ResolveStd("System", "Char");
             if (t == typeof(byte)) return ResolveStd("System", "Byte");

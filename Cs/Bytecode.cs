@@ -1874,13 +1874,30 @@ namespace Cnidaria.Cs
                         ps[0].Type is ByRefTypeSymbol br0 &&
                         br0.ElementType.SpecialType == SpecialType.System_UInt8)
                     {
-                        EmitExpression(call.Arguments[0], EmitMode.Value); // -> byref
+                        EmitExpression(call.Arguments[0], EmitMode.Value); // byref
 
                         int tTok = _tokens.GetTypeToken(call.Type); // !!T
                         _il.Emit(BytecodeOp.Ldobj, operand0: tTok, pop: 1, push: 1);
 
                         if (mode == EmitMode.Discard)
                             _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                        return true;
+                    }
+                    // Unsafe.WriteUnaligned<T>(ref byte destination, T value)
+                    if (def.Name == "WriteUnaligned" && ps.Length == 2 &&
+                        ps[0].Type is ByRefTypeSymbol brDst &&
+                        brDst.ElementType.SpecialType == SpecialType.System_UInt8)
+                    {
+                        var tas = call.Method.TypeArguments;
+                        if (tas.Length != 1)
+                            return false;
+
+                        EmitExpression(call.Arguments[0], EmitMode.Value); // byref destination
+                        EmitExpression(call.Arguments[1], EmitMode.Value); // value
+
+                        int tTok = _tokens.GetTypeToken(tas[0]); // !!T
+                        _il.Emit(BytecodeOp.Stobj, operand0: tTok, pop: 2, push: 0);
+
                         return true;
                     }
 

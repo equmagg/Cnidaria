@@ -665,7 +665,7 @@ foreach(var item in str)
      Console.Write(item);
 }
 ", "123121234");
-            //68
+            //68 tuple deconstruction
             RunTest(@"
 (int a, int b) t = (1, 2);
 
@@ -680,6 +680,59 @@ Console.Write(y);
 Console.Write(p);
 Console.Write(q);
 ", "1020304");
+            // 69 tuple swap parallel assignment
+            RunTest(@"
+int x = 1, y = 2;
+(x, y) = (y, x);
+Console.WriteLine(x * 10 + y);
+", "21");
+            // 70 local function captures outer variable
+            RunTest(@"
+int sum = 0;
+void Add(int x) { sum += x; }
+Add(1);
+Add(20);
+Console.WriteLine(sum);
+", "21");
+            // 71 argument evaluation order
+            RunTest(@"
+int x = 1;
+int Next() { return x++; }
+int Pack(int a, int b, int c) { return a * 100 + b * 10 + c; }
+Console.WriteLine(Pack(Next(), Next(), Next()) * 10 + x);
+", "1234");
+            // 72 ternary evaluates only selected branch
+            RunTest(@"
+int calls = 0;
+int A() { calls++; return 1; }
+int B() { calls += 10; return 2; }
+int x = true ? A() : B();
+Console.WriteLine(x * 100 + calls);
+", "101");
+            // 73 switch basic dispatch
+            RunTest(@"
+int F(int x)
+{
+    switch (x)
+    {
+        case 0: return 1;
+        case 1: return 2;
+        default: return 3;
+    }
+}
+Console.WriteLine(F(0) * 100 + F(1) * 10 + F(9));
+", "123");
+            // 74 params with zero arguments
+            RunTest(@"
+int Sum(params int[] items)
+{
+    int s = 0;
+    for (int i = 0; i < items.Length; i++) s += items[i];
+    return s;
+}
+Console.WriteLine(Sum());
+", "0");
+            
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)

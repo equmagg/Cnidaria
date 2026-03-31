@@ -5080,6 +5080,16 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Return type mismatch: expected byref, got {v.Kind}");
             }
 
+            // enum
+            if (t.Kind == RuntimeTypeKind.Enum)
+            {
+                var ut = TryGetEnumUnderlyingType(t)
+                    ?? throw new NotSupportedException(
+                        $"Enum '{t.Namespace}.{t.Name}' has no underlying type.");
+
+                return NormalizeReturnValue(ut, v);
+            }
+
             // scalar value types
             if (t.Namespace == "System")
             {
@@ -5131,6 +5141,68 @@ namespace Cnidaria.Cs
             return new string(chars);
         }
 
+        private void ValidateArrayRefAny(Slot arr, out int arrAbs, out int length, out RuntimeType arrayType)
+        {
+            if (arr.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+
+            if (arr.Kind != SlotKind.Ref)
+                throw new InvalidOperationException($"Expected array ref, got {arr.Kind}.");
+
+            arrayType = GetObjectTypeFromRef(arr);
+            if (arrayType.Kind != RuntimeTypeKind.Array)
+                throw new InvalidOperationException(
+                    $"Expected array instance, got '{arrayType.Namespace}.{arrayType.Name}'.");
+
+            arrAbs = checked((int)arr.Payload);
+            length = GetArrayLengthFromObject(arrAbs);
+        }
+        internal VmValue HostAllocArray(RuntimeType arrayType, int length)
+        {
+            if (arrayType.Kind != RuntimeTypeKind.Array)
+                throw new ArgumentException("Type is not an array.", nameof(arrayType));
+            if (length < 0)
+                throw new ArgumentOutOfRangeException(nameof(length));
+
+            int arrAbs = AllocArrayObject(arrayType, length);
+            return new VmValue(VmValueKind.Ref, arrAbs);
+        }
+        internal int HostGetArrayLength(VmValue array)
+        {
+            ValidateArrayRefAny(array.ToSlot(), out _, out int length, out _);
+            return length;
+        }
+        internal VmValue HostGetArrayElement(VmValue array, int index)
+        {
+            ValidateArrayRefAny(array.ToSlot(), out int arrAbs, out int length, out var arrayType);
+
+            if ((uint)index >= (uint)length)
+                throw new IndexOutOfRangeException();
+
+            var elemType = arrayType.ElementType
+                ?? throw new InvalidOperationException("Array type has no element type.");
+
+            var (elemSize, _) = GetStorageSizeAlign(elemType);
+            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+
+            return new VmValue(LoadValueAsSlot(elemAbs, 0, elemType));
+        }
+
+        internal void HostSetArrayElement(VmValue array, int index, VmValue value)
+        {
+            ValidateArrayRefAny(array.ToSlot(), out int arrAbs, out int length, out var arrayType);
+
+            if ((uint)index >= (uint)length)
+                throw new IndexOutOfRangeException();
+
+            var elemType = arrayType.ElementType
+                ?? throw new InvalidOperationException("Array type has no element type.");
+
+            var (elemSize, _) = GetStorageSizeAlign(elemType);
+            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+
+            StoreSlotAsValue(elemAbs, 0, elemType, value.ToSlot());
+        }
         internal VmValue HostAllocString(string? s)
         {
             if (s is null) return VmValue.Null;
@@ -5139,33 +5211,10 @@ namespace Cnidaria.Cs
         }
         internal VmValue HostAllocStringArray(RuntimeType arrayType, ReadOnlySpan<string?> values)
         {
-            if (arrayType.Kind != RuntimeTypeKind.Array)
-                throw new ArgumentException("Type is not an array.", nameof(arrayType));
-            if (arrayType.ElementType is null)
-                throw new ArgumentException("Array type has no element type.", nameof(arrayType));
-            if (arrayType.ElementType.TypeId != _rts.SystemString.TypeId)
-                throw new NotSupportedException("Only string[] is supported for host array allocation.");
-
-            int arrAbs = AllocArrayObject(arrayType, values.Length);
-
-            var elemType = arrayType.ElementType;
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-
+            var arr = HostAllocArray(arrayType, values.Length);
             for (int i = 0; i < values.Length; i++)
-            {
-                int elemAbs = checked(arrAbs + ArrayDataOffset + checked(i * elemSize));
-                if (values[i] is null)
-                {
-                    StoreSlotAsValue(elemAbs, 0, elemType, new Slot(SlotKind.Null, 0));
-                }
-                else
-                {
-                    int strAbs = AllocStringFromManaged(values[i]!);
-                    StoreSlotAsValue(elemAbs, 0, elemType, new Slot(SlotKind.Ref, strAbs));
-                }
-            }
-
-            return new VmValue(VmValueKind.Ref, arrAbs);
+                HostSetArrayElement(arr, i, HostAllocString(values[i]));
+            return arr;
         }
         internal int HostGetAddress(VmValue v)
         {
