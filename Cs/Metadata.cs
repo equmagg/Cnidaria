@@ -1596,6 +1596,7 @@ namespace Cnidaria.Cs
 
         private int _defaultExternalAssemblyRefToken; // AssemblyRef
         private int _localFunctionsHostTypeToken;     // TypeDef
+        private readonly NamespaceSymbol _moduleGlobalNamespace;
         private readonly NamedTypeSymbol _systemObject;
         private NamespaceSymbol? _sysNsCache;
         public MetadataTokenProvider(
@@ -1606,6 +1607,7 @@ namespace Cnidaria.Cs
             Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null)
         {
             if (moduleGlobalNamespace is null) throw new ArgumentNullException(nameof(moduleGlobalNamespace));
+            _moduleGlobalNamespace = moduleGlobalNamespace;
             _systemObject = systemObject ?? throw new ArgumentNullException(nameof(systemObject));
             _externalAssemblyResolver = externalAssemblyResolver;
 
@@ -1684,10 +1686,23 @@ namespace Cnidaria.Cs
         public int GetUserStringToken(string value) => Image.UserStrings.GetToken(value);
         private NamespaceSymbol GetSystemNamespaceOrThrow()
         {
-            if (_sysNsCache != null) return _sysNsCache;
-            if (_systemObject.ContainingSymbol is NamespaceSymbol ns && string.Equals(ns.Name, "System", StringComparison.Ordinal))
+            if (_sysNsCache != null)
+                return _sysNsCache;
+
+            var nss = _moduleGlobalNamespace.GetNamespaceMembers();
+            for (int i = 0; i < nss.Length; i++)
+            {
+                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                    return _sysNsCache = nss[i];
+            }
+
+            if (_systemObject.ContainingSymbol is NamespaceSymbol ns &&
+                string.Equals(ns.Name, "System", StringComparison.Ordinal))
+            {
                 return _sysNsCache = ns;
-            throw new InvalidOperationException("System.Object must be declared in namespace System.");
+            }
+
+            throw new InvalidOperationException("Namespace 'System' not found.");
         }
         private NamedTypeSymbol GetValueTupleDef(int arity)
         {

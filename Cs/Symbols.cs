@@ -1603,9 +1603,12 @@ namespace Cnidaria.Cs
     internal sealed class SubstitutedMethodSymbol : MethodSymbol
     {
         private readonly MethodSymbol _original;
+        private readonly TypeManager _types;
+        private readonly ImmutableDictionary<TypeParameterSymbol, TypeSymbol> _map;
         private readonly TypeSymbol _returnType;
         private readonly ImmutableArray<ParameterSymbol> _parameters;
-
+        private MethodSymbol? _explicitInterfaceImplementation;
+        private bool _explicitInterfaceImplementationInitialized;
         public override string Name => _original.Name;
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => _original.Locations;
@@ -1620,12 +1623,45 @@ namespace Cnidaria.Cs
         public override TypeSymbol ReturnType => _returnType;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override MethodSymbol OriginalDefinition => _original.OriginalDefinition;
+        public override MethodSymbol? ExplicitInterfaceImplementation
+        {
+            get
+            {
+                if (_explicitInterfaceImplementationInitialized)
+                    return _explicitInterfaceImplementation;
+
+                _explicitInterfaceImplementationInitialized = true;
+
+                var impl = _original.ExplicitInterfaceImplementation;
+                if (impl is null)
+                    return null;
+
+                if (impl.ContainingSymbol is NamedTypeSymbol owner)
+                {
+                    var substitutedOwner = (NamedTypeSymbol)TypeSubstituter.Substitute(owner, _types, _map);
+                    _explicitInterfaceImplementation =
+                        new SubstitutedMethodSymbol(impl, substitutedOwner, _types, _map);
+                }
+                else
+                {
+                    _explicitInterfaceImplementation = impl;
+                }
+
+                return _explicitInterfaceImplementation;
+            }
+        }
+
         public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
-        public SubstitutedMethodSymbol(MethodSymbol original, NamedTypeSymbol containing, TypeManager types, ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
+        public SubstitutedMethodSymbol(
+            MethodSymbol original,
+            NamedTypeSymbol containing,
+            TypeManager types,
+            ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
         {
             _original = original;
             ContainingSymbol = containing;
-
+            _types = types;
+            _map = map;
             _returnType = TypeSubstituter.Substitute(original.ReturnType, types, map);
 
             var ps = original.Parameters;

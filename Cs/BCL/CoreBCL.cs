@@ -1917,6 +1917,14 @@
             }
             return m_value == ((uint)obj).m_value;
         }
+        public int CompareTo(uint value)
+        {
+            // Need to use compare because subtraction will wrap
+            // to positive for very large neg numbers, etc.
+            if (m_value < value) return -1;
+            if (m_value > value) return 1;
+            return 0;
+        }
 
         public static uint Parse(ReadOnlySpan<char> s)
         {
@@ -1972,6 +1980,14 @@
             }
             return m_value == ((long)obj).m_value;
         }
+        public int CompareTo(long value)
+        {
+            // Need to use compare because subtraction will wrap
+            // to positive for very large neg numbers, etc.
+            if (m_value < value) return -1;
+            if (m_value > value) return 1;
+            return 0;
+        }
 
         public static long Parse(ReadOnlySpan<char> s)
         {
@@ -2013,6 +2029,20 @@
         public bool Equals(ulong obj)
         {
             return m_value == obj;
+        }
+        public int CompareTo(ulong value)
+        {
+            if (this < value)
+            {
+                return -1;
+            }
+
+            if (this > value)
+            {
+                return 1;
+            }
+
+            return 0;
         }
         // The value of the lower 32 bits XORed with the uppper 32 bits.
         public override int GetHashCode()
@@ -3397,22 +3427,342 @@
             }
         }
     }
+    public enum DateTimeKind
+    {
+        Unspecified = 0,
+        Utc = 1,
+        Local = 2,
+    }
+    public enum DayOfWeek
+    {
+        Sunday = 0,
+        Monday = 1,
+        Tuesday = 2,
+        Wednesday = 3,
+        Thursday = 4,
+        Friday = 5,
+        Saturday = 6,
+    }
+    public readonly struct TimeOnly
+    {
+        // represent the number of ticks map to the time of the day. 1 ticks = 100-nanosecond in time measurements.
+        private readonly ulong _ticks;
 
+        // MinTimeTicks is the ticks for the midnight time 00:00:00.000 AM
+        private const long MinTimeTicks = 0;
+
+        // MaxTimeTicks is the max tick value for the time in the day.
+        private const long MaxTimeTicks = TimeSpan.TicksPerDay - 1;
+
+        public static TimeOnly MinValue => new TimeOnly((ulong)MinTimeTicks);
+
+        public static TimeOnly MaxValue => new TimeOnly((ulong)MaxTimeTicks);
+
+        public TimeOnly(int hour, int minute) : this(DateTime.TimeToTicks(hour, minute, 0, 0)) { }
+
+        public TimeOnly(int hour, int minute, int second) : this(DateTime.TimeToTicks(hour, minute, second, 0)) { }
+
+        public TimeOnly(int hour, int minute, int second, int millisecond) : this(DateTime.TimeToTicks(hour, minute, second, millisecond)) { }
+
+        public TimeOnly(int hour, int minute, int second, int millisecond, int microsecond) : this(DateTime.TimeToTicks(hour, minute, second, millisecond, microsecond)) { }
+
+        public TimeOnly(long ticks)
+        {
+            if ((ulong)ticks > MaxTimeTicks)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            _ticks = (ulong)ticks;
+        }
+
+        // exist to bypass the check in the public constructor.
+        internal TimeOnly(ulong ticks) => _ticks = ticks;
+
+        public int Hour => (int)(_ticks / TimeSpan.TicksPerHour);
+
+        public int Minute => (int)((uint)(_ticks / TimeSpan.TicksPerMinute) % (uint)TimeSpan.MinutesPerHour);
+
+        public int Second => (int)((uint)(_ticks / TimeSpan.TicksPerSecond) % (uint)TimeSpan.SecondsPerMinute);
+
+        public int Millisecond => (int)((uint)(_ticks / TimeSpan.TicksPerMillisecond) % (uint)TimeSpan.MillisecondsPerSecond);
+
+        public int Microsecond => (int)(_ticks / TimeSpan.TicksPerMicrosecond % (uint)TimeSpan.MicrosecondsPerMillisecond);
+
+        public int Nanosecond => (int)(_ticks % TimeSpan.TicksPerMicrosecond * TimeSpan.NanosecondsPerTick);
+
+        public long Ticks => (long)_ticks;
+
+        private TimeOnly AddTicks(long ticks) 
+            => new TimeOnly((_ticks + TimeSpan.TicksPerDay + (ulong)(ticks % TimeSpan.TicksPerDay)) % TimeSpan.TicksPerDay);
+
+        private TimeOnly AddTicks(long ticks, out int wrappedDays)
+        {
+            (long days, long newTicks) = Math.DivRem(ticks, TimeSpan.TicksPerDay);
+            newTicks += (long)_ticks;
+            if (newTicks < 0)
+            {
+                days--;
+                newTicks += TimeSpan.TicksPerDay;
+            }
+            else if (newTicks >= TimeSpan.TicksPerDay)
+            {
+                days++;
+                newTicks -= TimeSpan.TicksPerDay;
+            }
+
+            wrappedDays = (int)days;
+            return new TimeOnly((ulong)newTicks);
+        }
+
+        public TimeOnly Add(TimeSpan value) => AddTicks(value.Ticks);
+
+        public TimeOnly Add(TimeSpan value, out int wrappedDays) => AddTicks(value.Ticks, out wrappedDays);
+
+        public TimeOnly AddHours(double value) => AddTicks((long)(value * TimeSpan.TicksPerHour));
+
+        public TimeOnly AddHours(double value, out int wrappedDays) => AddTicks((long)(value * TimeSpan.TicksPerHour), out wrappedDays);
+
+        public TimeOnly AddMinutes(double value) => AddTicks((long)(value * TimeSpan.TicksPerMinute));
+
+        public TimeOnly AddMinutes(double value, out int wrappedDays) => AddTicks((long)(value * TimeSpan.TicksPerMinute), out wrappedDays);
+
+        public bool IsBetween(TimeOnly start, TimeOnly end)
+        {
+            ulong time = _ticks;
+            ulong startTicks = start._ticks;
+            ulong endTicks = end._ticks;
+
+            return startTicks <= endTicks
+                ? (time - startTicks < endTicks - startTicks)
+                : (time - endTicks >= startTicks - endTicks);
+        }
+
+        public static bool operator ==(TimeOnly left, TimeOnly right) => left._ticks == right._ticks;
+
+        public static bool operator !=(TimeOnly left, TimeOnly right) => left._ticks != right._ticks;
+
+        public static bool operator >(TimeOnly left, TimeOnly right) => left._ticks > right._ticks;
+
+        public static bool operator >=(TimeOnly left, TimeOnly right) => left._ticks >= right._ticks;
+
+        public static bool operator <(TimeOnly left, TimeOnly right) => left._ticks < right._ticks;
+
+        public static bool operator <=(TimeOnly left, TimeOnly right) => left._ticks <= right._ticks;
+
+        public static TimeSpan operator -(TimeOnly t1, TimeOnly t2)
+        {
+            long diff = (long)(t1._ticks - t2._ticks);
+            // If the result is negative, add 24h to make it positive again using the sign bit.
+            return new TimeSpan(diff + ((diff >> 63) & TimeSpan.TicksPerDay));
+        }
+
+        public void Deconstruct(out int hour, out int minute)
+        {
+            hour = Hour;
+            minute = Minute;
+        }
+
+        public void Deconstruct(out int hour, out int minute, out int second)
+        {
+            ToDateTime().GetTime(out hour, out minute, out second);
+        }
+
+        public void Deconstruct(out int hour, out int minute, out int second, out int millisecond)
+        {
+            ToDateTime().GetTime(out hour, out minute, out second, out millisecond);
+        }
+
+
+        public static TimeOnly FromTimeSpan(TimeSpan timeSpan) => new TimeOnly(timeSpan._ticks);
+
+        public static TimeOnly FromDateTime(DateTime dateTime) => new TimeOnly((ulong)dateTime.TimeOfDay.Ticks);
+
+        public TimeSpan ToTimeSpan() => new TimeSpan((long)_ticks);
+
+        internal DateTime ToDateTime() => DateTime.CreateUnchecked((long)_ticks);
+
+        public int CompareTo(TimeOnly value) => _ticks.CompareTo(value._ticks);
+
+        public int CompareTo(object? value)
+        {
+            if (value == null) return 1;
+            if (value is not TimeOnly timeOnly)
+            {
+                throw new ArgumentException();
+            }
+
+            return CompareTo(timeOnly);
+        }
+
+        public bool Equals(TimeOnly value) => _ticks == value._ticks;
+
+        public override bool Equals([NotNullWhen(true)] object? value) => value is TimeOnly timeOnly && _ticks == timeOnly._ticks;
+
+        public override int GetHashCode()
+        {
+            ulong ticks = _ticks;
+            return unchecked((int)ticks) ^ (int)(ticks >> 32);
+        }
+    }
+    public readonly struct DateOnly
+    {
+        private readonly uint _dayNumber;
+
+        // Maps to Jan 1st year 1
+        private const int MinDayNumber = 0;
+
+        // Maps to December 31 year 9999.
+        private const int MaxDayNumber = DateTime.DaysTo10000 - 1;
+
+        private static uint DayNumberFromDateTime(DateTime dt) => (uint)((ulong)dt.Ticks / TimeSpan.TicksPerDay);
+
+        internal DateTime GetEquivalentDateTime() => DateTime.CreateUnchecked(_dayNumber * TimeSpan.TicksPerDay);
+
+        private DateOnly(uint dayNumber)
+        {
+            //Debug.Assert(dayNumber <= MaxDayNumber);
+            _dayNumber = dayNumber;
+        }
+        
+        public static DateOnly MinValue => new DateOnly(MinDayNumber);
+
+        public static DateOnly MaxValue => new DateOnly(MaxDayNumber);
+
+        public DateOnly(int year, int month, int day) => _dayNumber = DayNumberFromDateTime(new DateTime(year, month, day));
+        public DateOnly(int year, int month, int day, System.Globalization.Calendar calendar) 
+            => _dayNumber = DayNumberFromDateTime(new DateTime(year, month, day, calendar));
+        public static DateOnly FromDayNumber(int dayNumber)
+        {
+            if ((uint)dayNumber > MaxDayNumber)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            return new DateOnly((uint)dayNumber);
+        }
+
+        public int Year => GetEquivalentDateTime().Year;
+
+        public int Month => GetEquivalentDateTime().Month;
+
+        public int Day => GetEquivalentDateTime().Day;
+
+        public DayOfWeek DayOfWeek => (DayOfWeek)((_dayNumber + 1) % 7);
+
+        public int DayOfYear => GetEquivalentDateTime().DayOfYear;
+
+        public int DayNumber => (int)_dayNumber;
+
+        public DateOnly AddDays(int value)
+        {
+            uint newDayNumber = _dayNumber + (uint)value;
+            if (newDayNumber > MaxDayNumber)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            return new DateOnly(newDayNumber);
+        }
+
+        public DateOnly AddMonths(int value) => new DateOnly(DayNumberFromDateTime(GetEquivalentDateTime().AddMonths(value)));
+
+        public DateOnly AddYears(int value) => new DateOnly(DayNumberFromDateTime(GetEquivalentDateTime().AddYears(value)));
+
+        public static bool operator ==(DateOnly left, DateOnly right) => left._dayNumber == right._dayNumber;
+        public static bool operator !=(DateOnly left, DateOnly right) => left._dayNumber != right._dayNumber;
+        public static bool operator >(DateOnly left, DateOnly right) => left._dayNumber > right._dayNumber;
+        public static bool operator >=(DateOnly left, DateOnly right) => left._dayNumber >= right._dayNumber;
+        public static bool operator <(DateOnly left, DateOnly right) => left._dayNumber < right._dayNumber;
+        public static bool operator <=(DateOnly left, DateOnly right) => left._dayNumber <= right._dayNumber;
+
+        public void Deconstruct(out int year, out int month, out int day)
+            => GetEquivalentDateTime().GetDate(out year, out month, out day);
+
+        public DateTime ToDateTime(TimeOnly time) => DateTime.CreateUnchecked(_dayNumber * TimeSpan.TicksPerDay + time.Ticks);
+        public DateTime ToDateTime(TimeOnly time, DateTimeKind kind) => DateTime.SpecifyKind(ToDateTime(time), kind);
+        public static DateOnly FromDateTime(DateTime dateTime) => new DateOnly(DayNumberFromDateTime(dateTime));
+        public int CompareTo(DateOnly value) => _dayNumber.CompareTo(value._dayNumber);
+        public int CompareTo(object? value)
+        {
+            if (value == null) return 1;
+            if (value is not DateOnly dateOnly)
+            {
+                throw new ArgumentException();
+            }
+
+            return CompareTo(dateOnly);
+        }
+
+        public bool Equals(DateOnly value) => _dayNumber == value._dayNumber;
+
+        public override bool Equals([NotNullWhen(true)] object? value) => value is DateOnly dateOnly && _dayNumber == dateOnly._dayNumber;
+
+        public override int GetHashCode() => (int)_dayNumber;
+    }
     public readonly partial struct DateTime
     {
-        internal readonly ulong _dateData;
+        internal static bool SystemSupportsLeapSeconds => true;
+        private static unsafe bool IsValidTimeWithLeapSeconds(DateTime value) => true;
 
+        // Number of days in a non-leap year
         private const int DaysPerYear = 365;
+        // Number of days in 4 years
         private const int DaysPer4Years = DaysPerYear * 4 + 1;       // 1461
+        // Number of days in 100 years
         private const int DaysPer100Years = DaysPer4Years * 25 - 1;  // 36524
+        // Number of days in 400 years
         private const int DaysPer400Years = DaysPer100Years * 4 + 1; // 146097
 
+        // Number of days from 1/1/0001 to 12/31/1600
         private const int DaysTo1601 = DaysPer400Years * 4;          // 584388
+        // Number of days from 1/1/0001 to 12/30/1899
         private const int DaysTo1899 = DaysPer400Years * 4 + DaysPer100Years * 3 - 367;
+        // Number of days from 1/1/0001 to 12/31/1969
         internal const int DaysTo1970 = DaysPer400Years * 4 + DaysPer100Years * 3 + DaysPer4Years * 17 + DaysPerYear; // 719,162
+        // Number of days from 1/1/0001 to 12/31/9999
         internal const int DaysTo10000 = DaysPer400Years * 25 - 366;  // 3652059
 
         internal const long MinTicks = 0;
+        internal const long MaxTicks = DaysTo10000 * TimeSpan.TicksPerDay - 1;
+        private const long MaxMicroseconds = MaxTicks / TimeSpan.TicksPerMicrosecond;
+        private const long MaxMillis = MaxTicks / TimeSpan.TicksPerMillisecond;
+        private const long MaxSeconds = MaxTicks / TimeSpan.TicksPerSecond;
+        private const long MaxMinutes = MaxTicks / TimeSpan.TicksPerMinute;
+        private const long MaxHours = MaxTicks / TimeSpan.TicksPerHour;
+        private const long MaxDays = (long)DaysTo10000 - 1;
+
+        internal const long UnixEpochTicks = DaysTo1970 * TimeSpan.TicksPerDay;
+        private const long FileTimeOffset = DaysTo1601 * TimeSpan.TicksPerDay;
+        private const long DoubleDateOffset = DaysTo1899 * TimeSpan.TicksPerDay;
+        // The minimum OA date is 0100/01/01 (Note it's year 100).
+        // The maximum OA date is 9999/12/31
+        private const long OADateMinAsTicks = (DaysPer100Years - DaysPerYear) * TimeSpan.TicksPerDay;
+        // All OA dates must be greater than (not >=) OADateMinAsDouble
+        private const double OADateMinAsDouble = -657435.0;
+        // All OA dates must be less than (not <=) OADateMaxAsDouble
+        private const double OADateMaxAsDouble = 2958466.0;
+
+        // Euclidean Affine Functions Algorithm (EAF) constants
+
+        // Constants used for fast calculation of following subexpressions
+        //      x / DaysPer4Years
+        //      x % DaysPer4Years / 4
+        private const uint EafMultiplier = (uint)(((1UL << 32) + DaysPer4Years - 1) / DaysPer4Years);   // 2,939,745
+        private const uint EafDivider = EafMultiplier * 4;                                              // 11,758,980
+
+        private const ulong TicksPer6Hours = TimeSpan.TicksPerHour * 6;
+        private const int March1BasedDayOfNewYear = 306;              // Days between March 1 and January 1
+
+        internal static ReadOnlySpan<uint> DaysToMonth365 => [ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365 ];
+        internal static ReadOnlySpan<uint> DaysToMonth366 => [ 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366 ];
+
+        private static ReadOnlySpan<byte> DaysInMonth365 => [ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
+        private static ReadOnlySpan<byte> DaysInMonth366 => [ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
+
+        public static readonly DateTime MinValue;
+        public static readonly DateTime MaxValue = new DateTime(MaxTicks, DateTimeKind.Unspecified);
+        public static readonly DateTime UnixEpoch = new DateTime(UnixEpochTicks, DateTimeKind.Utc);
 
         private const ulong TicksMask = 0x3FFFFFFFFFFFFFFF;
         private const ulong FlagsMask = 0xC000000000000000;
@@ -3422,9 +3772,14 @@
         private const ulong KindLocalAmbiguousDst = 0xC000000000000000;
         private const int KindShift = 62;
 
+        private const string TicksField = "ticks"; // Do not rename (binary serialization)
+        private const string DateDataField = "dateData"; // Do not rename (binary serialization)
+
+        internal readonly ulong _dateData;
+
         public DateTime(long ticks)
         {
-            //if ((ulong)ticks > MaxTicks) ThrowTicksOutOfRange();
+            if ((ulong)ticks > MaxTicks) ThrowTicksOutOfRange();
             _dateData = (ulong)ticks;
         }
 
@@ -3433,6 +3788,667 @@
             //Debug.Assert((dateData & TicksMask) <= MaxTicks);
             _dateData = dateData;
         }
+
+        internal static DateTime CreateUnchecked(long ticks) => new DateTime((ulong)ticks);
+
+        public DateTime(long ticks, DateTimeKind kind)
+        {
+            if ((ulong)ticks > MaxTicks) ThrowTicksOutOfRange();
+            if ((uint)kind > (uint)DateTimeKind.Local) ThrowInvalidKind();
+            _dateData = (ulong)ticks | ((ulong)(uint)kind << KindShift);
+        }
+        public DateTime(DateOnly date, TimeOnly time)
+        {
+            _dateData = (ulong)(date.DayNumber * TimeSpan.TicksPerDay + time.Ticks);
+        }
+        public DateTime(DateOnly date, TimeOnly time, DateTimeKind kind)
+        {
+            if ((uint)kind > (uint)DateTimeKind.Local) ThrowInvalidKind();
+            _dateData = (ulong)(date.DayNumber * TimeSpan.TicksPerDay + time.Ticks) | ((ulong)(uint)kind << KindShift);
+        }
+
+        internal DateTime(long ticks, DateTimeKind kind, bool isAmbiguousDst)
+        {
+            if ((ulong)ticks > MaxTicks) ThrowTicksOutOfRange();
+            //Debug.Assert(kind == DateTimeKind.Local, "Internal Constructor is for local times only");
+            _dateData = ((ulong)ticks | (isAmbiguousDst ? KindLocalAmbiguousDst : KindLocal));
+        }
+
+        private static void ThrowTicksOutOfRange() => throw new ArgumentOutOfRangeException("ticks");
+        private static void ThrowInvalidKind() => throw new ArgumentException("kind");
+        internal static void ThrowMillisecondOutOfRange() => throw new ArgumentOutOfRangeException("millisecond");
+        internal static void ThrowMicrosecondOutOfRange() => throw new ArgumentOutOfRangeException("microsecond");
+        private static void ThrowDateArithmetic(int param) => throw new ArgumentOutOfRangeException();
+        private static void ThrowAddOutOfRange() => throw new ArgumentOutOfRangeException("value");
+
+        public DateTime(int year, int month, int day)
+        {
+            _dateData = DateToTicks(year, month, day);
+        }
+
+        public DateTime(int year, int month, int day, System.Globalization.Calendar calendar)
+            : this(year, month, day, 0, 0, 0, calendar)
+        {
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, System.Globalization.Calendar calendar, DateTimeKind kind)
+        {
+            if (calendar == null) throw new ArgumentNullException();
+
+            if ((uint)millisecond >= TimeSpan.MillisecondsPerSecond) ThrowMillisecondOutOfRange();
+            if ((uint)kind > (uint)DateTimeKind.Local) ThrowInvalidKind();
+
+            if (second != 60 || !SystemSupportsLeapSeconds)
+            {
+                ulong ticks = calendar.ToDateTime(year, month, day, hour, minute, second, millisecond).UTicks;
+                _dateData = ticks | ((ulong)(uint)kind << KindShift);
+            }
+            else
+            {
+                _dateData = WithLeapSecond(calendar, year, month, day, hour, minute, millisecond, kind);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static ulong WithLeapSecond(
+            System.Globalization.Calendar calendar, int year, int month, int day, int hour, int minute, int millisecond, DateTimeKind kind)
+        {
+            // if we have a leap second, then we adjust it to 59 so that DateTime will consider it the last in the specified minute.
+            return ValidateLeapSecond(new DateTime(year, month, day, hour, minute, 59, millisecond, calendar, kind));
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second)
+        {
+            ulong ticks = DateToTicks(year, month, day);
+            if (second != 60 || !SystemSupportsLeapSeconds)
+            {
+                _dateData = ticks + TimeToTicks(hour, minute, second);
+            }
+            else
+            {
+                _dateData = WithLeapSecond(ticks, hour, minute);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static ulong WithLeapSecond(ulong ticks, int hour, int minute)
+        {
+            // if we have a leap second, then we adjust it to 59 so that DateTime will consider it the last in the specified minute.
+            return ValidateLeapSecond(new DateTime(ticks + TimeToTicks(hour, minute, 59)));
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, DateTimeKind kind)
+        {
+            if ((uint)kind > (uint)DateTimeKind.Local) ThrowInvalidKind();
+
+            ulong ticks = DateToTicks(year, month, day) | ((ulong)(uint)kind << KindShift);
+            if (second != 60 || !SystemSupportsLeapSeconds)
+            {
+                _dateData = ticks + TimeToTicks(hour, minute, second);
+            }
+            else
+            {
+                _dateData = WithLeapSecond(ticks, hour, minute);
+            }
+        }
+
+        // Constructs a DateTime from a given year, month, day, hour,
+        // minute, and second for the specified calendar.
+        //
+        public DateTime(int year, int month, int day, int hour, int minute, int second, System.Globalization.Calendar calendar)
+        {
+            if (calendar == null) throw new ArgumentNullException();
+
+            if (second != 60 || !SystemSupportsLeapSeconds)
+            {
+                _dateData = calendar.ToDateTime(year, month, day, hour, minute, second, 0).UTicks;
+            }
+            else
+            {
+                _dateData = WithLeapSecond(calendar, year, month, day, hour, minute);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static ulong WithLeapSecond(System.Globalization.Calendar calendar, int year, int month, int day, int hour, int minute)
+        {
+            // if we have a leap second, then we adjust it to 59 so that DateTime will consider it the last in the specified minute.
+            return ValidateLeapSecond(new DateTime(year, month, day, hour, minute, 59, calendar));
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond)
+            : this(year, month, day, hour, minute, second)
+        {
+            if ((uint)millisecond >= TimeSpan.MillisecondsPerSecond) ThrowMillisecondOutOfRange();
+            _dateData += (uint)millisecond * (uint)TimeSpan.TicksPerMillisecond;
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, DateTimeKind kind)
+            : this(year, month, day, hour, minute, second, kind)
+        {
+            if ((uint)millisecond >= TimeSpan.MillisecondsPerSecond) ThrowMillisecondOutOfRange();
+            _dateData += (uint)millisecond * (uint)TimeSpan.TicksPerMillisecond;
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, System.Globalization.Calendar calendar)
+        {
+            if (calendar == null) throw new ArgumentNullException();
+
+            if (second != 60 || !SystemSupportsLeapSeconds)
+            {
+                _dateData = calendar.ToDateTime(year, month, day, hour, minute, second, millisecond).UTicks;
+            }
+            else
+            {
+                _dateData = WithLeapSecond(calendar, year, month, day, hour, minute, millisecond);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static ulong WithLeapSecond(System.Globalization.Calendar calendar, 
+            int year, int month, int day, int hour, int minute, int millisecond)
+        {
+            // if we have a leap second, then we adjust it to 59 so that DateTime will consider it the last in the specified minute.
+            return ValidateLeapSecond(new DateTime(year, month, day, hour, minute, 59, millisecond, calendar));
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, int microsecond)
+            : this(year, month, day, hour, minute, second, millisecond, microsecond, DateTimeKind.Unspecified)
+        {
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, int microsecond, DateTimeKind kind)
+            : this(year, month, day, hour, minute, second, millisecond, kind)
+        {
+            if ((uint)microsecond >= TimeSpan.MicrosecondsPerMillisecond) ThrowMicrosecondOutOfRange();
+            _dateData += (uint)microsecond * (uint)TimeSpan.TicksPerMicrosecond;
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, 
+            int millisecond, int microsecond, System.Globalization.Calendar calendar)
+           : this(year, month, day, hour, minute, second, millisecond, microsecond, calendar, DateTimeKind.Unspecified)
+        {
+        }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, 
+            int millisecond, int microsecond, System.Globalization.Calendar calendar, DateTimeKind kind)
+            : this(year, month, day, hour, minute, second, millisecond, calendar, kind)
+        {
+            if ((uint)microsecond >= TimeSpan.MicrosecondsPerMillisecond) ThrowMicrosecondOutOfRange();
+            _dateData += (uint)microsecond * (uint)TimeSpan.TicksPerMicrosecond;
+        }
+
+        internal static ulong ValidateLeapSecond(DateTime value)
+        {
+            if (!IsValidTimeWithLeapSeconds(value))
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            return value._dateData;
+        }
+
+        private ulong UTicks => _dateData & TicksMask;
+
+        private ulong InternalKind => _dateData & FlagsMask;
+
+        // Returns the DateTime resulting from adding the given
+        // TimeSpan to this DateTime.
+        //
+        public DateTime Add(TimeSpan value)
+        {
+            return AddTicks(value._ticks);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private DateTime AddUnits(double value, long maxUnitCount, long ticksPerUnit)
+        {
+            if (Math.Abs(value) > maxUnitCount)
+            {
+                ThrowAddOutOfRange();
+            }
+
+            double integralPart = Math.Truncate(value);
+            double fractionalPart = value - integralPart;
+            long ticks = (long)(integralPart) * ticksPerUnit;
+            ticks += (long)(fractionalPart * ticksPerUnit);
+
+            return AddTicks(ticks);
+        }
+
+        public DateTime AddDays(double value) => AddUnits(value, MaxDays, TimeSpan.TicksPerDay);
+
+        public DateTime AddHours(double value) => AddUnits(value, MaxHours, TimeSpan.TicksPerHour);
+
+        public DateTime AddMilliseconds(double value) => AddUnits(value, MaxMillis, TimeSpan.TicksPerMillisecond);
+
+        public DateTime AddMicroseconds(double value) => AddUnits(value, MaxMicroseconds, TimeSpan.TicksPerMicrosecond);
+
+        public DateTime AddMinutes(double value) => AddUnits(value, MaxMinutes, TimeSpan.TicksPerMinute);
+
+        public DateTime AddMonths(int months) => AddMonths(this, months);
+        private static DateTime AddMonths(DateTime date, int months)
+        {
+            if (months < -120000 || months > 120000) throw new ArgumentOutOfRangeException();
+            date.GetDate(out int year, out int month, out int day);
+            int y = year, d = day;
+            int m = month + months;
+            int q = m > 0 ? (int)((uint)(m - 1) / 12) : m / 12 - 1;
+            y += q;
+            m -= q * 12;
+            if (y < 1 || y > 9999) ThrowDateArithmetic(2);
+            ReadOnlySpan<uint> daysTo = IsLeapYear(y) ? DaysToMonth366 : DaysToMonth365;
+            uint daysToMonth = daysTo[m - 1];
+            int days = (int)(daysTo[m] - daysToMonth);
+            if (d > days) d = days;
+            uint n = DaysToYear((uint)y) + daysToMonth + (uint)d - 1;
+            return new DateTime(n * (ulong)TimeSpan.TicksPerDay + date.UTicks % TimeSpan.TicksPerDay | date.InternalKind);
+        }
+
+        public DateTime AddSeconds(double value) => AddUnits(value, MaxSeconds, TimeSpan.TicksPerSecond);
+
+        // Returns the DateTime resulting from adding the given number of
+        // 100-nanosecond ticks to this DateTime. The value argument
+        // is permitted to be negative.
+        //
+        public DateTime AddTicks(long value)
+        {
+            ulong ticks = (ulong)(Ticks + value);
+            if (ticks > MaxTicks) ThrowDateArithmetic(0);
+            return new DateTime(ticks | InternalKind);
+        }
+
+        internal bool TryAddTicks(long value, out DateTime result)
+        {
+            ulong ticks = (ulong)(Ticks + value);
+            if (ticks > MaxTicks)
+            {
+                result = default;
+                return false;
+            }
+            result = new DateTime(ticks | InternalKind);
+            return true;
+        }
+
+        public DateTime AddYears(int value) => AddYears(this, value);
+        private static DateTime AddYears(DateTime date, int value)
+        {
+            if (value < -10000 || value > 10000)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            date.GetDate(out int year, out int month, out int day);
+            int y = year + value;
+            if (y < 1 || y > 9999) ThrowDateArithmetic(0);
+            uint n = DaysToYear((uint)y);
+
+            int m = month - 1, d = day - 1;
+            if (IsLeapYear(y))
+            {
+                n += DaysToMonth366[m];
+            }
+            else
+            {
+                if (d == 28 && m == 1) d--;
+                n += DaysToMonth365[m];
+            }
+            n += (uint)d;
+            return new DateTime(n * (ulong)TimeSpan.TicksPerDay + date.UTicks % TimeSpan.TicksPerDay | date.InternalKind);
+        }
+
+        public static int Compare(DateTime t1, DateTime t2)
+        {
+            long ticks1 = t1.Ticks;
+            long ticks2 = t2.Ticks;
+            if (ticks1 > ticks2) return 1;
+            if (ticks1 < ticks2) return -1;
+            return 0;
+        }
+        public int CompareTo(object? value)
+        {
+            if (value == null) return 1;
+            if (!(value is DateTime))
+            {
+                throw new ArgumentException();
+            }
+
+            return Compare(this, (DateTime)value);
+        }
+
+        public int CompareTo(DateTime value)
+        {
+            return Compare(this, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong DateToTicks(int year, int month, int day)
+        {
+            if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            ReadOnlySpan<uint> days = RuntimeHelpers.IsKnownConstant(month) && month == 1 || IsLeapYear(year) ? DaysToMonth366 : DaysToMonth365;
+            if ((uint)day > days[month] - days[month - 1])
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            uint n = DaysToYear((uint)year) + days[month - 1] + (uint)day - 1;
+            return n * (ulong)TimeSpan.TicksPerDay;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint DaysToYear(uint year)
+        {
+            uint y = year - 1;
+            uint cent = y / 100;
+            return y * (365 * 4 + 1) / 4 - cent + cent / 4;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong TimeToTicks(int hour, int minute, int second)
+        {
+            if ((uint)hour >= 24 || (uint)minute >= 60 || (uint)second >= 60)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            int totalSeconds = hour * 3600 + minute * 60 + second;
+            return (uint)totalSeconds * (ulong)TimeSpan.TicksPerSecond;
+        }
+
+        internal static ulong TimeToTicks(int hour, int minute, int second, int millisecond)
+        {
+            ulong ticks = TimeToTicks(hour, minute, second);
+
+            if ((uint)millisecond >= TimeSpan.MillisecondsPerSecond) ThrowMillisecondOutOfRange();
+
+            ticks += (uint)millisecond * (uint)TimeSpan.TicksPerMillisecond;
+
+            ///Debug.Assert(ticks <= MaxTicks, "Input parameters validated already");
+
+            return ticks;
+        }
+
+        internal static ulong TimeToTicks(int hour, int minute, int second, int millisecond, int microsecond)
+        {
+            ulong ticks = TimeToTicks(hour, minute, second, millisecond);
+
+            if ((uint)microsecond >= TimeSpan.MicrosecondsPerMillisecond) ThrowMicrosecondOutOfRange();
+
+            ticks += (uint)microsecond * (uint)TimeSpan.TicksPerMicrosecond;
+
+            //Debug.Assert(ticks <= MaxTicks, "Input parameters validated already");
+
+            return ticks;
+        }
+
+        public static DateTime SpecifyKind(DateTime value, DateTimeKind kind)
+        {
+            if ((uint)kind > (uint)DateTimeKind.Local) ThrowInvalidKind();
+            return new DateTime(value.UTicks | ((ulong)(uint)kind << KindShift));
+        }
+
+        public DateTime Date => new((UTicks / TimeSpan.TicksPerDay * TimeSpan.TicksPerDay) | InternalKind);
+
+        internal void GetDate(out int year, out int month, out int day) => GetDate(_dateData, out year, out month, out day);
+        private static void GetDate(ulong dateData, out int year, out int month, out int day)
+        {
+            // y100 = number of whole 100-year periods since 3/1/0000
+            // r1 = (day number within 100-year period) * 4
+            (uint y100, uint r1) = Math.DivRem(((uint)((dateData & TicksMask) / TicksPer6Hours) | 3U) + 1224, DaysPer400Years);
+            ulong u2 = Math.BigMul(EafMultiplier, r1 | 3U);
+            uint daySinceMarch1 = (uint)u2 / EafDivider;
+            uint n3 = 2141 * daySinceMarch1 + 197913;
+            year = (int)(100 * y100 + (uint)(u2 >> 32));
+            // compute month and day
+            month = (int)(n3 >> 16);
+            day = (ushort)n3 / 2141 + 1;
+
+            // rollover December 31
+            if (daySinceMarch1 >= March1BasedDayOfNewYear)
+            {
+                ++year;
+                month -= 12;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void GetTime(out int hour, out int minute, out int second)
+        {
+            ulong seconds = UTicks / TimeSpan.TicksPerSecond;
+            ulong minutes = seconds / 60;
+            second = (int)(seconds - (minutes * 60));
+            ulong hours = minutes / 60;
+            minute = (int)(minutes - (hours * 60));
+            hour = (int)((uint)hours % 24);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void GetTime(out int hour, out int minute, out int second, out int millisecond)
+        {
+            ulong milliseconds = UTicks / TimeSpan.TicksPerMillisecond;
+            ulong seconds = milliseconds / 1000;
+            millisecond = (int)(milliseconds - (seconds * 1000));
+            ulong minutes = seconds / 60;
+            second = (int)(seconds - (minutes * 60));
+            ulong hours = minutes / 60;
+            minute = (int)(minutes - (hours * 60));
+            hour = (int)((uint)hours % 24);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void GetTimePrecise(out int hour, out int minute, out int second, out int tick)
+        {
+            ulong ticks = UTicks;
+            ulong seconds = ticks / TimeSpan.TicksPerSecond;
+            tick = (int)(ticks - (seconds * TimeSpan.TicksPerSecond));
+            ulong minutes = seconds / 60;
+            second = (int)(seconds - (minutes * 60));
+            ulong hours = minutes / 60;
+            minute = (int)(minutes - (hours * 60));
+            hour = (int)((uint)hours % 24);
+        }
+
+        public int Day
+        {
+            get
+            {
+                // r1 = (day number within 100-year period) * 4
+                uint r1 = (((uint)(UTicks / TicksPer6Hours) | 3U) + 1224) % DaysPer400Years;
+                ulong u2 = Math.BigMul(EafMultiplier, r1 | 3U);
+                ushort daySinceMarch1 = (ushort)((uint)u2 / EafDivider);
+                int n3 = 2141 * daySinceMarch1 + 197913;
+                // Return 1-based day-of-month
+                return (ushort)n3 / 2141 + 1;
+            }
+        }
+
+        public DayOfWeek DayOfWeek => (DayOfWeek)(((uint)(UTicks / TimeSpan.TicksPerDay) + 1) % 7);
+
+        // Returns the day-of-year part of this DateTime. The returned value
+        // is an integer between 1 and 366.
+        //
+        public int DayOfYear =>
+            1 + (int)(((((uint)(UTicks / TicksPer6Hours) | 3U) % (uint)DaysPer400Years) | 3U) * EafMultiplier / EafDivider);
+
+        // Returns the hash code for this DateTime.
+        //
+        public override int GetHashCode()
+        {
+            long ticks = Ticks;
+            return unchecked((int)ticks) ^ (int)(ticks >> 32);
+        }
+
+        // Returns the hour part of this DateTime. The returned value is an
+        // integer between 0 and 23.
+        //
+        public int Hour => (int)((uint)(UTicks / TimeSpan.TicksPerHour) % 24);
+
+        internal bool IsAmbiguousDaylightSavingTime() => _dateData >= KindLocalAmbiguousDst;
+
+        public DateTimeKind Kind
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
+                uint kind = (uint)(_dateData >> KindShift);
+                // values 0-2 map directly to DateTimeKind, 3 (LocalAmbiguousDst) needs to be mapped to 2 (Local) using bit0 NAND bit1
+                return (DateTimeKind)(kind & ~(kind >> 1));
+            }
+        }
+
+        // Returns the millisecond part of this DateTime. The returned value
+        // is an integer between 0 and 999.
+        //
+        public int Millisecond => (int)((UTicks / TimeSpan.TicksPerMillisecond) % 1000);
+
+        /// <summary>
+        /// The microseconds component, expressed as a value between 0 and 999.
+        /// </summary>
+        public int Microsecond => (int)((UTicks / TimeSpan.TicksPerMicrosecond) % 1000);
+
+        /// <summary>
+        /// The nanoseconds component, expressed as a value between 0 and 900 (in increments of 100 nanoseconds).
+        /// </summary>
+        public int Nanosecond => (int)(UTicks % TimeSpan.TicksPerMicrosecond) * 100;
+
+        // Returns the minute part of this DateTime. The returned value is
+        // an integer between 0 and 59.
+        //
+        public int Minute => (int)((UTicks / TimeSpan.TicksPerMinute) % 60);
+
+        // Returns the month part of this DateTime. The returned value is an
+        // integer between 1 and 12.
+        //
+        public int Month
+        {
+            get
+            {
+                // r1 = (day number within 100-year period) * 4
+                uint r1 = (((uint)(UTicks / TicksPer6Hours) | 3U) + 1224) % DaysPer400Years;
+                ulong u2 = Math.BigMul(EafMultiplier, r1 | 3U);
+                ushort daySinceMarch1 = (ushort)((uint)u2 / EafDivider);
+                int n3 = 2141 * daySinceMarch1 + 197913;
+                return (ushort)(n3 >> 16) - (daySinceMarch1 >= March1BasedDayOfNewYear ? 12 : 0);
+            }
+        }
+
+        // Returns the second part of this DateTime. The returned value is
+        // an integer between 0 and 59.
+        //
+        public int Second => (int)((UTicks / TimeSpan.TicksPerSecond) % 60);
+
+        // Returns the tick count for this DateTime. The returned value is
+        // the number of 100-nanosecond intervals that have elapsed since 1/1/0001
+        // 12:00am.
+        //
+        public long Ticks => (long)(_dateData & TicksMask);
+
+        // Returns the time-of-day part of this DateTime. The returned value
+        // is a TimeSpan that indicates the time elapsed since midnight.
+        //
+        public TimeSpan TimeOfDay => new TimeSpan((long)(UTicks % TimeSpan.TicksPerDay));
+
+        public int Year => GetYear(_dateData);
+        private static int GetYear(ulong dateData)
+        {
+            // y100 = number of whole 100-year periods since 1/1/0001
+            // r1 = (day number within 100-year period) * 4
+            (uint y100, uint r1) = Math.DivRem(((uint)((dateData & TicksMask) / TicksPer6Hours) | 3U), DaysPer400Years);
+            return 1 + (int)(100 * y100 + (r1 | 3) / DaysPer4Years);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsLeapYear(int year)
+        {
+            if (year < 1 || year > 9999)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            if ((year & 3) != 0) return false;
+            if ((year & 15) == 0) return true;
+            return (uint)year % 25 != 0;
+        }
+
+        public TimeSpan Subtract(DateTime value)
+        {
+            return new TimeSpan(Ticks - value.Ticks);
+        }
+
+        public DateTime Subtract(TimeSpan value)
+        {
+            ulong ticks = (ulong)(Ticks - value._ticks);
+            if (ticks > MaxTicks) ThrowDateArithmetic(0);
+            return new DateTime(ticks | InternalKind);
+        }
+
+        private static double TicksToOADate(long value)
+        {
+            if (value == 0)
+                return 0.0;  // Returns OleAut's zero'ed date value.
+            if (value < TimeSpan.TicksPerDay) // This is a fix for VB. They want the default day to be 1/1/0001 rather than 12/30/1899.
+                value += DoubleDateOffset; // We could have moved this fix down but we would like to keep the bounds check.
+            if (value < OADateMinAsTicks)
+                throw new OverflowException();
+            // Currently, our max date == OA's max date (12/31/9999), so we don't
+            // need an overflow check in that direction.
+            long millis = (value - DoubleDateOffset) / TimeSpan.TicksPerMillisecond;
+            if (millis < 0)
+            {
+                long frac = millis % TimeSpan.MillisecondsPerDay;
+                if (frac != 0) millis -= (TimeSpan.MillisecondsPerDay + frac) * 2;
+            }
+            return (double)millis / TimeSpan.MillisecondsPerDay;
+        }
+
+        // Converts the DateTime instance into an OLE Automation compatible
+        // double date.
+        public double ToOADate()
+        {
+            return TicksToOADate(Ticks);
+        }
+
+        public static DateTime operator +(DateTime d, TimeSpan t)
+        {
+            ulong ticks = (ulong)(d.Ticks + t._ticks);
+            if (ticks > MaxTicks) ThrowDateArithmetic(1);
+            return new DateTime(ticks | d.InternalKind);
+        }
+
+        public static DateTime operator -(DateTime d, TimeSpan t)
+        {
+            ulong ticks = (ulong)(d.Ticks - t._ticks);
+            if (ticks > MaxTicks) ThrowDateArithmetic(1);
+            return new DateTime(ticks | d.InternalKind);
+        }
+
+        public static TimeSpan operator -(DateTime d1, DateTime d2) => new TimeSpan(d1.Ticks - d2.Ticks);
+
+        public static bool operator ==(DateTime d1, DateTime d2) => ((d1._dateData ^ d2._dateData) << 2) == 0;
+
+        public static bool operator !=(DateTime d1, DateTime d2) => !(d1 == d2);
+
+        public static bool operator <(DateTime t1, DateTime t2) => t1.Ticks < t2.Ticks;
+
+        public static bool operator <=(DateTime t1, DateTime t2) => t1.Ticks <= t2.Ticks;
+
+        public static bool operator >(DateTime t1, DateTime t2) => t1.Ticks > t2.Ticks;
+
+        public static bool operator >=(DateTime t1, DateTime t2) => t1.Ticks >= t2.Ticks;
+
+        public void Deconstruct(out DateOnly date, out TimeOnly time)
+        {
+            date = DateOnly.FromDateTime(this);
+            time = TimeOnly.FromDateTime(this);
+        }
+
+        public void Deconstruct(out int year, out int month, out int day)
+        {
+            GetDate(out year, out month, out day);
+        }
+
+        public TypeCode GetTypeCode() => TypeCode.DateTime;
     }
     public readonly struct TimeSpan
     {
@@ -3514,6 +4530,278 @@
         {
             _ticks = ticks;
         }
+        public TimeSpan(int hours, int minutes, int seconds)
+        {
+            _ticks = TimeToTicks(hours, minutes, seconds);
+        }
+
+        public TimeSpan(int days, int hours, int minutes, int seconds)
+            : this(days, hours, minutes, seconds, 0)
+        {
+        }
+        public TimeSpan(int days, int hours, int minutes, int seconds, int milliseconds) :
+            this(days, hours, minutes, seconds, milliseconds, 0)
+        {
+        }
+        public TimeSpan(int days, int hours, int minutes, int seconds, int milliseconds, int microseconds)
+        {
+            long totalMicroseconds = (days * MicrosecondsPerDay)
+                                   + (hours * MicrosecondsPerHour)
+                                   + (minutes * MicrosecondsPerMinute)
+                                   + (seconds * MicrosecondsPerSecond)
+                                   + (milliseconds * MicrosecondsPerMillisecond)
+                                   + microseconds;
+
+            if ((totalMicroseconds > MaxMicroseconds) || (totalMicroseconds < MinMicroseconds))
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            _ticks = totalMicroseconds * TicksPerMicrosecond;
+        }
+
+        public long Ticks => _ticks;
+
+        public int Days => (int)(_ticks / TicksPerDay);
+
+        public int Hours => (int)(_ticks / TicksPerHour % HoursPerDay);
+
+        public int Milliseconds => (int)(_ticks / TicksPerMillisecond % MillisecondsPerSecond);
+
+        public int Microseconds => (int)(_ticks / TicksPerMicrosecond % MicrosecondsPerMillisecond);
+
+        public int Nanoseconds => (int)(_ticks % TicksPerMicrosecond * NanosecondsPerTick);
+
+        public int Minutes => (int)(_ticks / TicksPerMinute % MinutesPerHour);
+
+        public int Seconds => (int)(_ticks / TicksPerSecond % SecondsPerMinute);
+
+        public double TotalDays => (double)_ticks / TicksPerDay;
+
+        public double TotalHours => (double)_ticks / TicksPerHour;
+
+        public double TotalMilliseconds
+        {
+            get
+            {
+                double temp = (double)_ticks / TicksPerMillisecond;
+
+                if (temp > MaxMilliseconds)
+                {
+                    return MaxMilliseconds;
+                }
+
+                if (temp < MinMilliseconds)
+                {
+                    return MinMilliseconds;
+                }
+                return temp;
+            }
+        }
+        public double TotalMicroseconds => (double)_ticks / TicksPerMicrosecond;
+
+        public double TotalNanoseconds => (double)_ticks * NanosecondsPerTick;
+
+        public double TotalMinutes => (double)_ticks / TicksPerMinute;
+
+        public double TotalSeconds => (double)_ticks / TicksPerSecond;
+
+        public TimeSpan Add(TimeSpan ts) => this + ts; 
+        public static int Compare(TimeSpan t1, TimeSpan t2) => t1._ticks.CompareTo(t2._ticks);
+        public int CompareTo(object? value)
+        {
+            if (value is null)
+            {
+                return 1;
+            }
+
+            if (value is TimeSpan other)
+            {
+                return CompareTo(other);
+            }
+
+            throw new ArgumentException();
+        }
+        public int CompareTo(TimeSpan value) => Compare(this, value);
+
+        public static TimeSpan FromDays(double value) => Interval(value, TicksPerDay);
+
+        public TimeSpan Duration()
+        {
+            if (_ticks == MinTicks)
+            {
+                throw new OverflowException();
+            }
+            return new TimeSpan(_ticks >= 0 ? _ticks : -_ticks);
+        }
+
+        public override bool Equals([NotNullWhen(true)] object? value) => (value is TimeSpan other) && Equals(other);
+
+        public bool Equals(TimeSpan obj) => Equals(this, obj);
+
+        public static bool Equals(TimeSpan t1, TimeSpan t2) => t1 == t2;
+
+        public override int GetHashCode() => _ticks.GetHashCode();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static TimeSpan FromUnits(long units, long ticksPerUnit, long minUnits, long maxUnits)
+        {
+            if (units > maxUnits || units < minUnits)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            return TimeSpan.FromTicks(units * ticksPerUnit);
+        }
+
+        public static TimeSpan FromDays(int days) => FromUnits(days, TicksPerDay, MinDays, MaxDays);
+
+        public static TimeSpan FromHours(int hours) => FromUnits(hours, TicksPerHour, MinHours, MaxHours);
+
+        public static TimeSpan FromMinutes(long minutes) => FromUnits(minutes, TicksPerMinute, MinMinutes, MaxMinutes);
+
+        public static TimeSpan FromSeconds(long seconds) => FromUnits(seconds, TicksPerSecond, MinSeconds, MaxSeconds);
+
+        public static TimeSpan FromMilliseconds(long milliseconds)
+            => FromUnits(milliseconds, TicksPerMillisecond, MinMilliseconds, MaxMilliseconds);
+
+        public static TimeSpan FromMicroseconds(long microseconds) => FromUnits(microseconds, TicksPerMicrosecond, MinMicroseconds, MaxMicroseconds);
+
+        public static TimeSpan FromHours(double value) => Interval(value, TicksPerHour);
+
+        private static TimeSpan Interval(double value, double scale)
+        {
+            if (double.IsNaN(value))
+            {
+                throw new ArgumentException();
+            }
+            return IntervalFromDoubleTicks(value * scale);
+        }
+
+        private static TimeSpan IntervalFromDoubleTicks(double ticks)
+        {
+            if ((ticks > MaxTicks) || (ticks < MinTicks) || double.IsNaN(ticks))
+            {
+                throw new OverflowException();
+            }
+            if (ticks == MaxTicks)
+            {
+                return MaxValue;
+            }
+            return new TimeSpan((long)ticks);
+        }
+        public static TimeSpan FromMilliseconds(double value) => Interval(value, TicksPerMillisecond);
+
+        public static TimeSpan FromMicroseconds(double value) => Interval(value, TicksPerMicrosecond);
+
+        public static TimeSpan FromMinutes(double value) => Interval(value, TicksPerMinute);
+
+        public TimeSpan Negate() => -this;
+
+        public static TimeSpan FromSeconds(double value) => Interval(value, TicksPerSecond);
+
+        public TimeSpan Subtract(TimeSpan ts) => this - ts;
+
+        public TimeSpan Multiply(double factor) => this * factor;
+
+        public TimeSpan Divide(double divisor) => this / divisor;
+
+        public double Divide(TimeSpan ts) => this / ts;
+
+        public static TimeSpan FromTicks(long value) => new TimeSpan(value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static long TimeToTicks(int hour, int minute, int second)
+        {
+            // totalSeconds is bounded by 2^31 * 2^12 + 2^31 * 2^8 + 2^31,
+            // which is less than 2^44, meaning we won't overflow totalSeconds.
+            long totalSeconds = (hour * SecondsPerHour)
+                              + (minute * SecondsPerMinute)
+                              + second;
+
+            if ((totalSeconds > MaxSeconds) || (totalSeconds < MinSeconds))
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            return totalSeconds * TicksPerSecond;
+        }
+
+        public static TimeSpan operator -(TimeSpan t)
+        {
+            if (t._ticks == MinTicks)
+            {
+                throw new OverflowException();
+            }
+            return new TimeSpan(-t._ticks);
+        }
+
+        public static TimeSpan operator -(TimeSpan t1, TimeSpan t2)
+        {
+            long result = t1._ticks - t2._ticks;
+            long t1Sign = t1._ticks >> 63;
+
+            if ((t1Sign != (t2._ticks >> 63)) && (t1Sign != (result >> 63)))
+            {
+                // Overflow if signs of operands was different and result's sign was opposite.
+                // >> 63 gives the sign bit (either 64 1's or 64 0's).
+                throw new OverflowException();
+            }
+            return new TimeSpan(result);
+        }
+
+        public static TimeSpan operator +(TimeSpan t) => t;
+
+        public static TimeSpan operator +(TimeSpan t1, TimeSpan t2)
+        {
+            long result = t1._ticks + t2._ticks;
+            long t1Sign = t1._ticks >> 63;
+
+            if ((t1Sign == (t2._ticks >> 63)) && (t1Sign != (result >> 63)))
+            {
+                // Overflow if signs of operands was identical and result's sign was opposite.
+                // >> 63 gives the sign bit (either 64 1's or 64 0's).
+                throw new OverflowException();
+            }
+            return new TimeSpan(result);
+        }
+
+        public static TimeSpan operator *(TimeSpan timeSpan, double factor)
+        {
+            if (double.IsNaN(factor))
+            {
+                throw new ArgumentException();
+            }
+
+            // Rounding to the nearest tick is as close to the result we would have with unlimited
+            // precision as possible, and so likely to have the least potential to surprise.
+            double ticks = Math.Round(timeSpan.Ticks * factor);
+            return IntervalFromDoubleTicks(ticks);
+        }
+
+        public static TimeSpan operator *(double factor, TimeSpan timeSpan) => timeSpan * factor;
+
+        public static TimeSpan operator /(TimeSpan timeSpan, double divisor)
+        {
+            if (double.IsNaN(divisor))
+            {
+                throw new ArgumentException();
+            }
+
+            double ticks = Math.Round(timeSpan.Ticks / divisor);
+            return IntervalFromDoubleTicks(ticks);
+        }
+
+        public static double operator /(TimeSpan t1, TimeSpan t2) => t1.Ticks / (double)t2.Ticks;
+
+        public static bool operator ==(TimeSpan t1, TimeSpan t2) => t1._ticks == t2._ticks;
+
+        public static bool operator !=(TimeSpan t1, TimeSpan t2) => t1._ticks != t2._ticks;
+
+        public static bool operator <(TimeSpan t1, TimeSpan t2) => t1._ticks < t2._ticks;
+
+        public static bool operator <=(TimeSpan t1, TimeSpan t2) => t1._ticks <= t2._ticks;
+
+        public static bool operator >(TimeSpan t1, TimeSpan t2) => t1._ticks > t2._ticks;
+
+        public static bool operator >=(TimeSpan t1, TimeSpan t2) => t1._ticks >= t2._ticks;
     }
     // interfaces
     public interface ITuple
@@ -3529,6 +4817,10 @@
     public interface IFormatProvider
     {
         object GetFormat(Type formatType);
+    }
+    public interface IConvertible
+    {
+        TypeCode GetTypeCode();
     }
     // math
     public enum MidpointRounding
@@ -3697,6 +4989,73 @@
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (sbyte Quotient, sbyte Remainder) DivRem(sbyte left, sbyte right)
+        {
+            sbyte quotient = (sbyte)(left / right);
+            return (quotient, (sbyte)(left - (quotient * right)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (byte Quotient, byte Remainder) DivRem(byte left, byte right)
+        {
+            byte quotient = (byte)(left / right);
+            return (quotient, (byte)(left - (quotient * right)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (short Quotient, short Remainder) DivRem(short left, short right)
+        {
+            short quotient = (short)(left / right);
+            return (quotient, (short)(left - (quotient * right)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (ushort Quotient, ushort Remainder) DivRem(ushort left, ushort right)
+        {
+            ushort quotient = (ushort)(left / right);
+            return (quotient, (ushort)(left - (quotient * right)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (int Quotient, int Remainder) DivRem(int left, int right)
+        {
+            int quotient = left / right;
+            return (quotient, left - (quotient * right));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (uint Quotient, uint Remainder) DivRem(uint left, uint right)
+        {
+            uint quotient = left / right;
+            return (quotient, left - (quotient * right));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (long Quotient, long Remainder) DivRem(long left, long right)
+        {
+            long quotient = left / right;
+            return (quotient, left - (quotient * right));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (ulong Quotient, ulong Remainder) DivRem(ulong left, ulong right)
+        {
+            ulong quotient = left / right;
+            return (quotient, left - (quotient * right));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong BigMul(uint a, uint b)
+        {
+            return ((ulong)a) * b;
+        }
+
+        public static long BigMul(int a, int b)
+        {
+            return ((long)a) * b;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static short Abs(short value)
         {
             if (value < 0)
@@ -3833,6 +5192,31 @@
             return BitConverter.UInt32BitsToSingle(bits);
         }
 
+        public static double Round(double a)
+        {
+            const double IntegerBoundary = 4503599627370496.0; // 2^52
+            if (Abs(a) >= IntegerBoundary)
+            {
+                // Values above this boundary don't have a fractional
+                // portion and so we can simply return them as-is.
+                return a;
+            }
+
+            double temp = CopySign(IntegerBoundary, a);
+            return CopySign((a + temp) - temp, a);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double CopySign(double x, double y)
+        {
+            // This method is required to work for all inputs,
+            // including NaN, so we operate on the raw bits.
+            ulong xbits = BitConverter.DoubleToUInt64Bits(x);
+            ulong ybits = BitConverter.DoubleToUInt64Bits(y);
+
+            // Remove the sign from x, and remove everything but the sign from y
+            // Then, simply OR them to get the correct sign
+            return BitConverter.UInt64BitsToDouble((xbits & ~double.SignMask) | (ybits & double.SignMask));
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static double Pow(double x, double y)
@@ -4489,6 +5873,27 @@
         where T16 : allows ref struct;
 
 
+    public enum TypeCode
+    {
+        Empty = 0,          // Null reference
+        Object = 1,         // Instance that isn't a value
+        DBNull = 2,         // Database null value
+        Boolean = 3,        // Boolean
+        Char = 4,           // Unicode character
+        SByte = 5,          // Signed 8-bit integer
+        Byte = 6,           // Unsigned 8-bit integer
+        Int16 = 7,          // Signed 16-bit integer
+        UInt16 = 8,         // Unsigned 16-bit integer
+        Int32 = 9,          // Signed 32-bit integer
+        UInt32 = 10,        // Unsigned 32-bit integer
+        Int64 = 11,         // Signed 64-bit integer
+        UInt64 = 12,        // Unsigned 64-bit integer
+        Single = 13,        // IEEE 32-bit float
+        Double = 14,        // IEEE 64-bit double
+        Decimal = 15,       // Decimal
+        DateTime = 16,      // DateTime
+        String = 18,        // Unicode character string
+    }
 
     public abstract class Type : System.Reflection.MemberInfo, System.Reflection.IReflect
     {
@@ -4563,6 +5968,19 @@
 
         public SystemException(string message, Exception innerException)
             : base(message, innerException)
+        { }
+    }
+    public class SerializationException : SystemException
+    {
+        private static string _nullMessage = "Arg_SerializationException";
+        public SerializationException()
+        : base(_nullMessage)
+        { }
+        public SerializationException(string message)
+        : base(message)
+        { }
+        public SerializationException(string message, Exception innerException)
+       : base(message, innerException)
         { }
     }
     public class InvalidCastException : SystemException
@@ -5158,6 +6576,51 @@ namespace System.Runtime.InteropServices
             return true;
         }
     }
+    public static class CollectionsMarshal
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Span<T> AsSpan<T>(List<T>? list)
+        {
+            Span<T> span = default;
+            if (list is not null)
+            {
+                int size = list._size;
+                T[] items = list._items;
+                //Debug.Assert(items is not null, ""Implementation depends on List<T> always having an array."");
+
+                if ((uint)size > (uint)items.Length)
+                {
+                    // List<T> was erroneously mutated concurrently with this call, leading to a count larger than its array.
+                    throw new InvalidOperationException();
+                }
+
+                span = new Span<T>(ref MemoryMarshal.GetArrayDataReference<T>(items), size);
+            }
+
+            return span;
+        }
+
+        public static void SetCount<T>(List<T> list, int count)
+        {
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            list._version++;
+
+            if (count > list.Capacity)
+            {
+                list.Grow(count);
+            }
+            else if (count < list._size && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                Array.Clear(list._items, count, list._size - count);
+            }
+
+            list._size = count;
+        }
+    }
 }
 namespace System.Runtime.CompilerServices
 {
@@ -5165,6 +6628,12 @@ namespace System.Runtime.CompilerServices
     {
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static bool IsReferenceOrContainsReferences<T>() where T : allows ref struct => IsReferenceOrContainsReferences<T>();
+        
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static bool IsKnownConstant(int value)
+        {
+            return false; // to do
+        }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static int GetHashCode(object o)
@@ -5203,6 +6672,17 @@ namespace System.Runtime.CompilerServices
         }
 
         public MethodImplOptions Value { get; }
+    }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Interface, Inherited = false)]
+    public sealed class CollectionBuilderAttribute : Attribute
+    {
+        public CollectionBuilderAttribute(Type builderType, string methodName)
+        {
+            BuilderType = builderType;
+            MethodName = methodName;
+        }
+        public Type BuilderType { get; }
+        public string MethodName { get; }
     }
     public sealed class SwitchExpressionException : InvalidOperationException
     {
@@ -5524,6 +7004,46 @@ namespace System.Globalization
             }
         }
     }
+    public enum CalendarAlgorithmType
+    {
+        Unknown = 0,            // This is the default value to return in the Calendar base class.
+        SolarCalendar = 1,      // Solar-base calendar, such as GregorianCalendar, jaoaneseCalendar, JulianCalendar, etc.
+                                // Solar calendars are based on the solar year and seasons.
+        LunarCalendar = 2,      // Lunar-based calendar, such as Hijri and UmAlQuraCalendar.
+                                // Lunar calendars are based on the path of the moon.  The seasons are not accurately represented.
+        LunisolarCalendar = 3   // Lunisolar-based calendar which use leap month rule, such as HebrewCalendar and Asian Lunisolar calendars.
+                                // Lunisolar calendars are based on the cycle of the moon, but consider the seasons as a secondary consideration,
+                                // so they align with the seasons as well as lunar events.
+    }
+    public abstract class Calendar
+    {
+        internal const long MaxMillis = (long)DateTime.DaysTo10000 * TimeSpan.MillisecondsPerDay;
+
+        private int _currentEraValue = -1;
+
+        private bool _isReadOnly;
+
+        public virtual DateTime MinSupportedDateTime => DateTime.MinValue;
+
+        public virtual DateTime MaxSupportedDateTime => DateTime.MaxValue;
+
+        public virtual CalendarAlgorithmType AlgorithmType => CalendarAlgorithmType.Unknown;
+
+        protected Calendar()
+        {
+        }
+
+        public const int CurrentEra = 0;
+
+        public abstract bool IsLeapYear(int year, int era);
+
+        public virtual DateTime ToDateTime(int year, int month, int day, int hour, int minute, int second, int millisecond)
+        {
+            return ToDateTime(year, month, day, hour, minute, second, millisecond, CurrentEra);
+        }
+
+        public abstract DateTime ToDateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, int era);
+    }
 }
 namespace System.Text
 {
@@ -5642,11 +7162,6 @@ namespace System.Buffers.Binary
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static byte ReverseEndianness(byte value) => value;
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static ushort ReverseEndianness(ushort value)
-        {
-            return (ushort)((value >> 8) + (value << 8));
-        }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ushort ReverseEndianness(ushort value)
         {
@@ -5838,6 +7353,245 @@ namespace System.Buffers.Binary
         }
     }
 }
+namespace System.Drawing
+{
+    /// <summary>
+    /// Represents the size of a rectangular region with an ordered pair of width and height.
+    /// </summary>
+    public struct Size
+    {
+        public static readonly Size Empty;
+
+        private int width; // Do not rename
+        private int height; // Do not rename
+
+        public Size(Point pt)
+        {
+            width = pt.X;
+            height = pt.Y;
+        }
+
+        public Size(int width, int height)
+        {
+            this.width = width;
+            this.height = height;
+        }
+
+        public static Size operator +(Size sz1, Size sz2) => Add(sz1, sz2);
+
+        public static Size operator -(Size sz1, Size sz2) => Subtract(sz1, sz2);
+
+        public static explicit operator Point(Size size) => new Point(size.Width, size.Height);
+
+        public readonly bool IsEmpty => width == 0 && height == 0;
+
+        public int Width
+        {
+            readonly get => width;
+            set => width = value;
+        }
+
+        public int Height
+        {
+            readonly get => height;
+            set => height = value;
+        }
+
+        public static Size Add(Size sz1, Size sz2) =>
+            new Size(unchecked(sz1.Width + sz2.Width), unchecked(sz1.Height + sz2.Height));
+
+        public static Size Subtract(Size sz1, Size sz2) =>
+            new Size(unchecked(sz1.Width - sz2.Width), unchecked(sz1.Height - sz2.Height));
+
+        /// <summary>
+        /// Converts a SizeF to a Size by performing a truncate operation on all the coordinates.
+        /// </summary>
+        public static Size Truncate(SizeF value) => new Size(unchecked((int)value.Width), unchecked((int)value.Height));
+
+        /// <summary>
+        /// Converts a SizeF to a Size by performing a round operation on all the coordinates.
+        /// </summary>
+        public static Size Round(SizeF value) =>
+            new Size(unchecked((int)Math.Round(value.Width)), unchecked((int)Math.Round(value.Height)));
+
+        public override readonly string ToString() => $"{{Width={width}, Height={height}}}";
+
+        private static Size Multiply(Size size, int multiplier) =>
+            new Size(unchecked(size.width * multiplier), unchecked(size.height * multiplier));
+
+        private static SizeF Multiply(Size size, float multiplier) =>
+            new SizeF(size.width * multiplier, size.height * multiplier);
+    }
+    /// <summary>
+    /// Represents an ordered pair of x and y coordinates that define a point in a two-dimensional plane.
+    /// </summary>
+    public struct Point
+    {
+        public static readonly Point Empty;
+
+        private int x; // Do not rename
+        private int y; // Do not rename
+
+        public Point(int x, int y)
+        {
+            this.x = x;
+            this.y = y;
+        }
+        public Point(Size sz)
+        {
+            x = sz.Width;
+            y = sz.Height;
+        }
+        /// <summary>
+        /// Initializes a new instance of the Point class using coordinates specified by an integer value.
+        /// </summary>
+        public Point(int dw)
+        {
+            x = LowInt16(dw);
+            y = HighInt16(dw);
+        }
+
+        public readonly bool IsEmpty => x == 0 && y == 0;
+
+        public int X
+        {
+            readonly get => x;
+            set => x = value;
+        }
+
+        public int Y
+        {
+            readonly get => y;
+            set => y = value;
+        }
+
+        public static explicit operator Size(Point p) => new Size(p.X, p.Y);
+
+        public static Point operator +(Point pt, Size sz) => Add(pt, sz);
+
+        public static Point operator -(Point pt, Size sz) => Subtract(pt, sz);
+
+        public static bool operator ==(Point left, Point right) => left.X == right.X && left.Y == right.Y;
+
+        public static bool operator !=(Point left, Point right) => !(left == right);
+
+        public static Point Add(Point pt, Size sz) => new Point(unchecked(pt.X + sz.Width), unchecked(pt.Y + sz.Height));
+
+        public static Point Subtract(Point pt, Size sz) => new Point(unchecked(pt.X - sz.Width), unchecked(pt.Y - sz.Height));
+
+        public static Point Truncate(PointF value) => new Point(unchecked((int)value.X), unchecked((int)value.Y));
+
+        public static Point Round(PointF value) => new Point(unchecked((int)Math.Round(value.X)), unchecked((int)Math.Round(value.Y)));
+
+        public void Offset(int dx, int dy)
+        {
+            unchecked
+            {
+                X += dx;
+                Y += dy;
+            }
+        }
+
+        public void Offset(Point p) => Offset(p.X, p.Y);
+
+        public override readonly string ToString() => $"{{X={X},Y={Y}}}";
+
+        private static short HighInt16(int n) => unchecked((short)((n >> 16) & 0xffff));
+
+        private static short LowInt16(int n) => unchecked((short)(n & 0xffff));
+    }
+    /// <summary>
+    /// Represents the size of a rectangular region with an ordered pair of width and height.
+    /// </summary>
+    public struct SizeF
+    {
+        public static readonly SizeF Empty;
+        private float width; // Do not rename
+        private float height; // Do not rename
+
+        public SizeF(SizeF size)
+        {
+            width = size.width;
+            height = size.height;
+        }
+
+        public SizeF(PointF pt)
+        {
+            width = pt.X;
+            height = pt.Y;
+        }
+        public SizeF(System.Numerics.Vector2 vector)
+        {
+            width = vector.X;
+            height = vector.Y;
+        }
+        public System.Numerics.Vector2 ToVector2() => new System.Numerics.Vector2(width, height);
+        public SizeF(float width, float height)
+        {
+            this.width = width;
+            this.height = height;
+        }
+
+        public static explicit operator System.Numerics.Vector2(SizeF size) => size.ToVector2();
+
+        public static explicit operator SizeF(System.Numerics.Vector2 vector) => new SizeF(vector);
+
+
+
+        public readonly bool IsEmpty => width == 0 && height == 0;
+
+        public float Width
+        {
+            readonly get => width;
+            set => width = value;
+        }
+
+        public float Height
+        {
+            readonly get => height;
+            set => height = value;
+        }
+    }
+    /// <summary>
+    /// Represents an ordered pair of x and y coordinates that define a point in a two-dimensional plane.
+    /// </summary>
+    public struct PointF
+    {
+        public static readonly PointF Empty;
+        private float x; // Do not rename
+        private float y; // Do not rename
+
+        public PointF(float x, float y)
+        {
+            this.x = x;
+            this.y = y;
+        }
+
+        public PointF(System.Numerics.Vector2 vector)
+        {
+            x = vector.X;
+            y = vector.Y;
+        }
+
+        public System.Numerics.Vector2 ToVector2() => new System.Numerics.Vector2(x, y);
+        public readonly bool IsEmpty => x == 0f && y == 0f;
+
+        public float X
+        {
+            readonly get => x;
+            set => x = value;
+        }
+        public float Y
+        {
+            readonly get => y;
+            set => y = value;
+        }
+
+        public static explicit operator System.Numerics.Vector2(PointF point) => point.ToVector2();
+        public static explicit operator PointF(System.Numerics.Vector2 vector) => new PointF(vector);
+
+    }
+}
 namespace System.Numerics
 {
     public static class BitOperations
@@ -5855,6 +7609,399 @@ namespace System.Numerics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ulong RotateRight(ulong value, int offset)
             => (value >> offset) | (value << (64 - offset));
+    }
+
+    public struct Vector2
+    {
+        internal const int Alignment = 8;
+        internal const int ElementCount = 2;
+
+        public float X;
+        public float Y;
+
+        public Vector2(float value)
+        {
+            X = value; Y = value;
+        }
+
+        public Vector2(float x, float y)
+        {
+            X = x; Y = y;
+        }
+        public static Vector2 One
+        {
+            get => new Vector2(1.0f);
+        }
+        public static Vector2 Zero
+        {
+            get => new Vector2(0.0f);
+        }
+        public static Vector2 UnitX
+        {
+            get => new Vector2(1.0f, 0.0f);
+        }
+        public static Vector2 UnitY
+        {
+            get => new Vector2(0.0f, 1.0f);
+        }
+        public override string ToString()
+        {
+            return $"<{X.ToString()}, {Y.ToString()}>";
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator +(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X += right.X;
+            result.Y += right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator /(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X /= right.X;
+            result.Y /= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator /(Vector2 value1, float value2)
+        {
+            var result = new Vector2(value1.X, value1.Y);
+            result.X /= value2;
+            result.Y /= value2;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool operator ==(Vector2 left, Vector2 right) => left.X == right.X && left.Y == right.Y;
+
+        public static bool operator !=(Vector2 left, Vector2 right) => !(left == right);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator *(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X *= right.X;
+            result.Y *= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator *(Vector2 left, float right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X *= right;
+            result.Y *= right;
+            return result;
+        }
+
+        public static Vector2 operator *(float left, Vector2 right)
+        {
+            var result = new Vector2(right.X, right.Y);
+            result.X *= left;
+            result.Y *= left;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator -(Vector2 left, Vector2 right)
+        {
+            var result = new Vector2(left.X, left.Y);
+            result.X -= right.X;
+            result.Y -= right.Y;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator -(Vector2 value) => new Vector2(-(value.X), -(value.Y));
+    }
+    public struct Vector3
+    {
+        internal const int Alignment = 8;
+        internal const int ElementCount = 3;
+
+        public float X = 0;
+        public float Y = 0;
+        public float Z = 0;
+
+        public Vector3(float value)
+        {
+            X = value; Y = value; Z = value;
+        }
+        public Vector3(float x, float y, float z)
+        {
+            X = x; Y = y; Z = z;
+        }
+        public static Vector3 One
+        {
+            get => new Vector3(1.0f);
+        }
+        public static Vector3 Zero
+        {
+            get => new Vector3(0f);
+        }
+        public static Vector3 UnitX
+        {
+            get => new Vector3(1.0f, 0f, 0f);
+        }
+        public static Vector3 UnitY
+        {
+            get => new Vector3(0.0f, 1.0f, 0f);
+        }
+        public static Vector3 UnitZ
+        {
+            get => new Vector3(0f, 0f, 1.0f);
+        }
+        public override string ToString()
+        {
+            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}>";
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator +(Vector3 left, Vector3 right)
+        {
+            Vector3 result = new Vector3(left.X, left.Y, left.Z);
+            result.X += right.X;
+            result.Y += right.Y;
+            result.Z += right.Z;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator /(Vector3 left, Vector3 right)
+        {
+            Vector3 result = new Vector3(left.X, left.Y, left.Z);
+            result.X /= right.X;
+            result.Y /= right.Y;
+            result.Z /= right.Z;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator /(Vector3 value1, float value2)
+        {
+            Vector3 result = new Vector3(value1.X, value1.Y, value1.Z);
+            value1.X /= value2;
+            value1.Y /= value2;
+            value1.Z /= value2;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool operator ==(Vector3 left, Vector3 right)
+            => left.X == right.X && left.Y == right.Y && left.Z == right.Z;
+
+        public static bool operator !=(Vector3 left, Vector3 right) => !(left == right);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator *(Vector3 left, Vector3 right)
+        {
+            Vector3 result = new Vector3(left.X, left.Y, left.Z);
+            result.X *= right.X;
+            result.Y *= right.Y;
+            result.Z *= right.Z;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator *(Vector3 left, float right)
+        {
+            Vector3 result = new Vector3(left.X, left.Y, left.Z);
+            result.X *= right;
+            result.Y *= right;
+            result.Z *= right;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator *(float left, Vector3 right)
+        {
+            Vector3 result = new Vector3(right.X, right.Y, right.Z);
+            result.X *= left;
+            result.Y *= left;
+            result.Z *= left;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+            this.Z *= value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator -(Vector3 left, Vector3 right)
+        {
+            Vector3 result = new Vector3(left.X, left.Y, left.Z);
+            result.X -= right.X;
+            result.Y -= right.Y;
+            result.Z -= right.Z;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator -(Vector3 value) => new Vector3(-(value.X), -(value.Y), -(value.Z));
+    }
+    public struct Vector4
+    {
+        internal const int Alignment = 16;
+        internal const int ElementCount = 4;
+
+        public float X;
+        public float Y;
+        public float Z;
+        public float W;
+
+
+        public Vector4(float value)
+        {
+            X = value; Y = value; Z = value; W = value;
+        }
+
+        public Vector4(Vector2 value, float z, float w)
+        {
+            X = value.X; Y = value.Y; Z = z; W = w;
+        }
+
+        public Vector4(Vector3 value, float w)
+        {
+            X = value.X; Y = value.Y; Z = value.Z; W = w;
+        }
+
+        public Vector4(float x, float y, float z, float w)
+        {
+            X = x; Y = y; Z = z; W = w;
+        }
+        public static Vector4 One
+        {
+            get => new Vector4(1.0f);
+        }
+        public static Vector4 Zero
+        {
+            get => new Vector4(0.0f);
+        }
+        public static Vector4 UnitX
+        {
+            get => new Vector4(1.0f, 0f, 0f, 0f);
+        }
+        public static Vector4 UnitY
+        {
+            get => new Vector4(0.0f, 1.0f, 0f, 0f);
+        }
+        public static Vector4 UnitZ
+        {
+            get => new Vector4(0f, 0f, 1.0f, 0f);
+        }
+        public static Vector4 UnitW
+        {
+            get => new Vector4(0f, 0f, 0f, 1.0f);
+        }
+        public override string ToString()
+        {
+            return $"<{X.ToString()}, {Y.ToString()}, {Z.ToString()}, {W.ToString()}>";
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator +(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X += right.X;
+            result.Y += right.Y;
+            result.Z += right.Z;
+            result.W += right.W;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator /(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X /= right.X;
+            result.Y /= right.Y;
+            result.Z /= right.Z;
+            result.W /= right.W;
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator /(Vector4 value1, float value2)
+        {
+            Vector4 result = new Vector4(value1.X, value1.Y, value1.Z, value1.W);
+            value1.X /= value2;
+            value1.Y /= value2;
+            value1.Z /= value2;
+            value1.W /= value2;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool operator ==(Vector4 left, Vector4 right)
+            => left.X == right.X && left.Y == right.Y && left.Z == right.Z && left.W == right.W;
+
+        public static bool operator !=(Vector4 left, Vector4 right) => !(left == right);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X *= right.X;
+            result.Y *= right.Y;
+            result.Z *= right.Z;
+            result.W *= right.W;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(Vector4 left, float right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X *= right;
+            result.Y *= right;
+            result.Z *= right;
+            result.W *= right;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator *(float left, Vector4 right)
+        {
+            Vector4 result = new Vector4(right.X, right.Y, right.Z, right.W);
+            result.X *= left;
+            result.Y *= left;
+            result.Z *= left;
+            result.W *= left;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(float value)
+        {
+            this.X *= value;
+            this.Y *= value;
+            this.Z *= value;
+            this.W *= value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator -(Vector4 left, Vector4 right)
+        {
+            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
+            result.X -= right.X;
+            result.Y -= right.Y;
+            result.Z -= right.Z;
+            result.W -= right.W;
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator -(Vector4 value) => new Vector4(-(value.X), -(value.Y), -(value.Z), -(value.W));
     }
 }
 namespace System.Collections
@@ -5880,6 +8027,35 @@ namespace System.Collections
         object SyncRoot { get; }
         void CopyTo(Array array, int index);
     }
+
+    public interface IList : ICollection
+    {
+        object this[int index]
+        {
+            get;
+            set;
+        }
+
+        int Add(object value);
+
+        bool Contains(object value);
+
+        void Clear();
+
+        bool IsReadOnly
+        { get; }
+
+
+        bool IsFixedSize
+        {
+            get;
+        }
+
+        void Insert(int index, object value);
+
+        void Remove(object value);
+        void RemoveAt(int index);
+    }
 }
 namespace System.Collections.Generic
 {
@@ -5903,6 +8079,13 @@ namespace System.Collections.Generic
             get;
         }
     }
+    public interface IReadOnlyList<out T> : IReadOnlyCollection<T>
+    {
+        T this[int index]
+        {
+            get;
+        }
+    }
     public interface ICollection<T> : IEnumerable<T>
     {
         int Count
@@ -5919,5 +8102,345 @@ namespace System.Collections.Generic
         bool Contains(T item);
         void CopyTo(T[] array, int arrayIndex);
         bool Remove(T item);
+    }
+
+    public class List<T> : IEnumerable<T>, IEnumerable, IReadOnlyList<T>
+    {
+        private const int DefaultCapacity = 4;
+
+        internal T[] _items; // Do not rename
+        internal int _size; // Do not rename
+        internal int _version; // Do not rename
+
+        private static readonly T[] s_emptyArray = new T[0];
+
+        public List()
+        {
+            _items = s_emptyArray;
+        }
+        public List(int capacity)
+        {
+            if (capacity < 0)
+                throw new ArgumentOutOfRangeException();
+
+            if (capacity == 0)
+                _items = s_emptyArray;
+            else
+                _items = new T[capacity];
+        }
+
+        public int Capacity
+        {
+            get => _items.Length;
+            set
+            {
+                if (value < _size)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+
+                if (value != _items.Length)
+                {
+                    if (value > 0)
+                    {
+                        T[] newItems = new T[value];
+                        if (_size > 0)
+                        {
+                            Array.Copy(_items, newItems, _size);
+                        }
+                        _items = newItems;
+                    }
+                    else
+                    {
+                        _items = s_emptyArray;
+                    }
+                }
+            }
+        }
+        public int Count => _size;
+
+        public T this[int index]
+        {
+            get
+            {
+                if ((uint)index >= (uint)_size)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+                return _items[index];
+            }
+
+            set
+            {
+                if ((uint)index >= (uint)_size)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+                _items[index] = value;
+                _version++;
+            }
+        }
+
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() => GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<T>)this).GetEnumerator();
+
+        public struct Enumerator : IEnumerator<T>, IEnumerator
+        {
+            private readonly List<T> _list;
+            private readonly int _version;
+
+            private int _index;
+            private T _current;
+
+            internal Enumerator(List<T> list)
+            {
+                _list = list;
+                _version = list._version;
+            }
+
+            public void Dispose()
+            {
+            }
+
+            public bool MoveNext()
+            {
+                List<T> localList = _list;
+
+                if (_version != _list._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                if ((uint)_index < (uint)localList._size)
+                {
+                    _current = localList._items[_index];
+                    _index++;
+                    return true;
+                }
+
+                _current = default;
+                _index = -1;
+                return false;
+            }
+            public T Current => _current;
+
+            object? IEnumerator.Current
+            {
+                get
+                {
+                    if (_index <= 0)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    return _current;
+                }
+            }
+
+            void IEnumerator.Reset()
+            {
+                if (_version != _list._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                _index = 0;
+                _current = default;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item)
+        {
+            _version++;
+            T[] array = _items;
+            int size = _size;
+            if ((uint)size < (uint)array.Length)
+            {
+                _size = size + 1;
+                array[size] = item;
+            }
+            else
+            {
+                AddWithResize(item);
+            }
+        }
+
+        // Non-inline from List.Add to improve its code quality as uncommon path
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AddWithResize(T item)
+        {
+            int size = _size;
+            Grow(size + 1);
+            _size = size + 1;
+            _items[size] = item;
+        }
+
+        internal void Grow(int capacity)
+        {
+            Capacity = GetNewCapacity(capacity);
+        }
+        internal void GrowForInsertion(int indexToInsert, int insertionCount = 1)
+        {
+            int requiredCapacity = checked(_size + insertionCount);
+            int newCapacity = GetNewCapacity(requiredCapacity);
+
+            // Inline and adapt logic from set_Capacity
+
+            T[] newItems = new T[newCapacity];
+            if (indexToInsert != 0)
+            {
+                Array.Copy(_items, newItems, indexToInsert);
+            }
+
+            if (_size != indexToInsert)
+            {
+                Array.Copy(_items, indexToInsert, newItems, indexToInsert + insertionCount, _size - indexToInsert);
+            }
+
+            _items = newItems;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int GetNewCapacity(int capacity)
+        {
+            int newCapacity = _items.Length == 0 ? DefaultCapacity : 2 * _items.Length;
+
+            if ((uint)newCapacity > Array.MaxLength) newCapacity = Array.MaxLength;
+
+            if (newCapacity < capacity) newCapacity = capacity;
+
+            return newCapacity;
+        }
+        public void Insert(int index, T item)
+        {
+            // Note that insertions at the end are legal.
+            if ((uint)index > (uint)_size)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            if (_size == _items.Length)
+            {
+                GrowForInsertion(index, 1);
+            }
+            else if (index < _size)
+            {
+                Array.Copy(_items, index, _items, index + 1, _size - index);
+            }
+            _items[index] = item;
+            _size++;
+            _version++;
+        }
+
+        public int IndexOf(T item)
+            => Array.IndexOf<T>(_items, item, 0, _size);
+
+        public bool Contains(T item)
+        {
+            return _size != 0 && IndexOf(item) >= 0;
+        }
+
+        public void CopyTo(T[] array)
+            => CopyTo(array, 0);
+
+        public void CopyTo(int index, T[] array, int arrayIndex, int count)
+        {
+            if (_size - index < count)
+            {
+                throw new ArgumentException();
+            }
+
+            // Delegate rest of error checking to Array.Copy.
+            Array.Copy(_items, index, array, arrayIndex, count);
+        }
+
+        public void CopyTo(T[] array, int arrayIndex)
+        {
+            // Delegate rest of error checking to Array.Copy.
+            Array.Copy(_items, 0, array, arrayIndex, _size);
+        }
+
+        // Clears the contents of List.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Clear()
+        {
+            _version++;
+            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                int size = _size;
+                _size = 0;
+                if (size > 0)
+                {
+                    Array.Clear(_items, 0, size); // Clear the elements so that the gc can reclaim the references.
+                }
+            }
+            else
+            {
+                _size = 0;
+            }
+        }
+
+        public bool Remove(T item)
+        {
+            int index = IndexOf(item);
+            if (index >= 0)
+            {
+                RemoveAt(index);
+                return true;
+            }
+
+            return false;
+        }
+
+        public void RemoveAt(int index)
+        {
+            if ((uint)index >= (uint)_size)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            _size--;
+            if (index < _size)
+            {
+                Array.Copy(_items, index + 1, _items, index, _size - index);
+            }
+            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                _items[_size] = default;
+            }
+            _version++;
+        }
+
+        public void RemoveRange(int index, int count)
+        {
+            if (index < 0)
+            {
+                throw new IndexOutOfRangeException();
+            }
+
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            if (_size - index < count)
+                throw new ArgumentOutOfRangeException();
+
+            if (count > 0)
+            {
+                _size -= count;
+                if (index < _size)
+                {
+                    Array.Copy(_items, index + count, _items, index, _size - index);
+                }
+
+                _version++;
+                if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    Array.Clear(_items, _size, count);
+                }
+            }
+        }
     }
 }

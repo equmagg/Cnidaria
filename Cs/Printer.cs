@@ -1,5 +1,7 @@
-﻿using System;
+﻿using Cnidaria.Cs.Stack;
+using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using System.Text;
 
@@ -8,15 +10,15 @@ namespace Cnidaria.Cs
     internal static class BytecodeDump
     {
         public static void DumpReachable(
-            IReadOnlyDictionary<string, RuntimeModule> modules,
-            RuntimeModule entryModule,
+            IReadOnlyDictionary<string, Cnidaria.Cs.Stack.RuntimeModule> modules,
+            Cnidaria.Cs.Stack.RuntimeModule entryModule,
             int entryMethodDefToken)
         {
             if (!entryModule.MethodsByDefToken.TryGetValue(entryMethodDefToken, out var entryFn))
                 throw new MissingMethodException(
                     $"No bytecode body for entry token 0x{entryMethodDefToken:X8} in '{entryModule.Name}'.");
 
-            var q = new Queue<(RuntimeModule mod, BytecodeFunction fn)>();
+            var q = new Queue<(Cnidaria.Cs.Stack.RuntimeModule mod, Cnidaria.Cs.Stack.BytecodeFunction fn)>();
             var seen = new HashSet<(string mod, int tok)>();
 
             Enqueue(entryModule, entryFn);
@@ -60,20 +62,410 @@ namespace Cnidaria.Cs
 
                 Console.WriteLine();
 
-                
+
             }
-            void Enqueue(RuntimeModule m, BytecodeFunction f)
+            void Enqueue(Cnidaria.Cs.Stack.RuntimeModule m, Cnidaria.Cs.Stack.BytecodeFunction f)
             {
                 var key = (m.Name, f.MethodToken);
                 if (seen.Add(key))
                     q.Enqueue((m, f));
             }
         }
+        public static void DumpFlat(Cnidaria.Cs.RuntimeModule module)
+        {
+            DumpFlat(module, module.MethodsByDefToken);
+        }
 
+        public static void DumpFlat(Cnidaria.Cs.RuntimeModule module, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> methods)
+        {
+            var keys = new List<int>(methods.Keys);
+            keys.Sort();
+
+            foreach (int token in keys)
+            {
+                DumpFlatFunction(
+                    new Dictionary<string, Cnidaria.Cs.RuntimeModule>(StringComparer.Ordinal) { [module.Name] = module },
+                    new Dictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>>(StringComparer.Ordinal) { [module.Name] = methods },
+                    module,
+                    methods[token]);
+
+                Console.WriteLine();
+            }
+        }
+        public static void DumpFlatReachable(
+            Cnidaria.Cs.RuntimeModule entryModule,
+            IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> methods,
+            int entryMethodDefToken)
+        {
+            DumpFlatReachable(
+                new Dictionary<string, Cnidaria.Cs.RuntimeModule>(StringComparer.Ordinal) { [entryModule.Name] = entryModule },
+                new Dictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>>(StringComparer.Ordinal) { [entryModule.Name] = methods },
+                entryModule,
+                entryMethodDefToken);
+        }
+
+        public static void DumpFlatReachable(
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            Cnidaria.Cs.RuntimeModule entryModule,
+            int entryMethodDefToken)
+        {
+            var flatMethodsByModule = new Dictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>>(StringComparer.Ordinal);
+            foreach (var kv in modules)
+                flatMethodsByModule[kv.Key] = kv.Value.MethodsByDefToken;
+
+            DumpFlatReachable(modules, flatMethodsByModule, entryModule, entryMethodDefToken);
+        }
+        public static void DumpFlatReachable(
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            IReadOnlyDictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>> flatMethodsByModule,
+            Cnidaria.Cs.RuntimeModule entryModule,
+            int entryMethodDefToken)
+        {
+            if (!TryGetFlatMethodMap(flatMethodsByModule, entryModule, out var entryMethods) ||
+                !entryMethods.TryGetValue(entryMethodDefToken, out var entryFn))
+            {
+                throw new MissingMethodException(
+                    $"No flat bytecode body for entry token 0x{entryMethodDefToken:X8} in '{entryModule.Name}'.");
+            }
+            var q = new Queue<(Cnidaria.Cs.RuntimeModule mod, Cnidaria.Cs.BytecodeFunction fn)>();
+            var seen = new HashSet<(string mod, int tok)>();
+
+            Enqueue(entryModule, entryFn);
+
+            while (q.Count != 0)
+            {
+                var (mod, fn) = q.Dequeue();
+                DumpFlatFunction(modules, flatMethodsByModule, mod, fn);
+                Console.WriteLine();
+
+                var insns = fn.Instructions;
+                for (int pc = 0; pc < insns.Length; pc++)
+                {
+                    var ins = insns[pc];
+                    if (ins.Op is Cnidaria.Cs.Op.Call or Cnidaria.Cs.Op.CallVirt or Cnidaria.Cs.Op.Newobj)
+                    {
+                        try
+                        {
+                            var (tmod, tfn) = ResolveFlatCallWithModule(flatMethodsByModule, modules, mod, ins.Operand0);
+                            Enqueue(tmod, tfn);
+                        }
+                        catch (MissingMethodException) { }
+                    }
+                }
+            }
+            void Enqueue(Cnidaria.Cs.RuntimeModule m, Cnidaria.Cs.BytecodeFunction f)
+            {
+                var key = (m.Name, f.MethodToken);
+                if (seen.Add(key))
+                    q.Enqueue((m, f));
+            }
+        }
+        private static void DumpFlatFunction(
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            IReadOnlyDictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>> flatMethodsByModule,
+            Cnidaria.Cs.RuntimeModule module,
+            Cnidaria.Cs.BytecodeFunction fn)
+        {
+            Console.WriteLine($"== {FormatMethodDef(module, fn.MethodToken)}");
+            Console.WriteLine($"   token=0x{fn.MethodToken:X8} locals={fn.LocalTypeTokens.Length} values={fn.ValueTypeTokens.Length}");
+
+            if (fn.LocalTypeTokens.Length != 0)
+            {
+                Console.WriteLine("   locals:");
+                for (int i = 0; i < fn.LocalTypeTokens.Length; i++)
+                    Console.WriteLine($"     [{i}] {FormatTypeToken(module, fn.LocalTypeTokens[i])}");
+            }
+            if (fn.ValueTypeTokens.Length != 0)
+            {
+                Console.WriteLine("   values:");
+                for (int i = 0; i < fn.ValueTypeTokens.Length; i++)
+                    Console.WriteLine($"     %{i} {FormatTypeToken(module, fn.ValueTypeTokens[i])}");
+            }
+
+            if (fn.ExceptionHandlers.Length != 0)
+            {
+                Console.WriteLine("   exception-handlers:");
+                for (int i = 0; i < fn.ExceptionHandlers.Length; i++)
+                {
+                    var eh = fn.ExceptionHandlers[i];
+                    string catchType = eh.CatchTypeToken == -1
+                        ? "finally"
+                        : eh.CatchTypeToken == 0
+                            ? "catch-all"
+                            : FormatTypeToken(module, eh.CatchTypeToken);
+                    Console.WriteLine($"     [{i}] try=[{eh.TryStartPc},{eh.TryEndPc}) handler=[{eh.HandlerStartPc},{eh.HandlerEndPc}) {catchType}");
+                }
+            }
+
+            var insns = fn.Instructions;
+            for (int pc = 0; pc < insns.Length; pc++)
+            {
+                var ins = insns[pc];
+                string extra = FormatFlatOperandComment(modules, flatMethodsByModule, module, fn, ins);
+                Console.WriteLine($"{pc:D4}: {FormatFlatInstruction(ins),-48}{extra}");
+            }
+        }
+        private static string FormatFlatInstruction(Cnidaria.Cs.Instruction ins)
+        {
+            var sb = new StringBuilder();
+
+            if (ins.Result >= 0)
+                sb.Append('%').Append(ins.Result).Append(" = ");
+            sb.Append(ins.Op);
+
+            if (ins.ValueCount > 0)
+            {
+                sb.Append(' ');
+                for (int i = 0; i < ins.ValueCount; i++)
+                {
+                    if (i != 0)
+                        sb.Append(", ");
+                    sb.Append('%').Append(ins.GetValue(i));
+                }
+            }
+            AppendFlatOperands(sb, ins);
+            return sb.ToString();
+        }
+        private static void AppendFlatOperands(StringBuilder sb, Cnidaria.Cs.Instruction ins)
+        {
+            switch (ins.Op)
+            {
+                case Cnidaria.Cs.Op.Ldc_I4:
+                    sb.Append(" i4=").Append(ins.Operand0);
+                    return;
+
+                case Cnidaria.Cs.Op.Ldc_I8:
+                    sb.Append(" i8=").Append(ins.Operand2);
+                    return;
+
+                case Cnidaria.Cs.Op.Ldc_R8:
+                    sb.Append(" r8=").Append(BitConverter.Int64BitsToDouble(ins.Operand2).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    return;
+
+                case Cnidaria.Cs.Op.Ldloc:
+                case Cnidaria.Cs.Op.Stloc:
+                case Cnidaria.Cs.Op.Ldloca:
+                    sb.Append(" loc=").Append(ins.Operand0);
+                    return;
+
+                case Cnidaria.Cs.Op.Ldarg:
+                case Cnidaria.Cs.Op.Starg:
+                case Cnidaria.Cs.Op.Ldarga:
+                    sb.Append(" arg=").Append(ins.Operand0);
+                    return;
+
+                case Cnidaria.Cs.Op.Br:
+                case Cnidaria.Cs.Op.Brtrue:
+                case Cnidaria.Cs.Op.Brfalse:
+                    sb.Append(" target=").Append(ins.Operand0);
+                    return;
+
+                case Cnidaria.Cs.Op.Call:
+                case Cnidaria.Cs.Op.CallVirt:
+                case Cnidaria.Cs.Op.Newobj:
+                    sb.Append(" method=0x").Append(ins.Operand0.ToString("X8"));
+                    sb.Append(" packed=").Append(ins.Operand1);
+                    return;
+
+                case Cnidaria.Cs.Op.Conv:
+                    sb.Append(" kind=").Append(FormatFlatConvKind(ins.Operand0));
+                    if (ins.Operand1 != 0)
+                        sb.Append(" flags=").Append(FormatFlatConvFlags(ins.Operand1));
+                    return;
+
+                case Cnidaria.Cs.Op.StackAlloc:
+                    sb.Append(" elemSize=").Append(ins.Operand0);
+                    return;
+
+                case Cnidaria.Cs.Op.PtrElemAddr:
+                case Cnidaria.Cs.Op.PtrDiff:
+                    sb.Append(" elemSize=").Append(ins.Operand0);
+                    return;
+            }
+
+            if (ins.Operand0 != 0 || ins.Operand1 != 0 || ins.Operand2 != 0)
+                sb.Append(" op0=").Append(ins.Operand0).Append(" op1=").Append(ins.Operand1).Append(" op2=").Append(ins.Operand2);
+        }
+        private static string FormatFlatOperandComment(
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            IReadOnlyDictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>> flatMethodsByModule,
+            Cnidaria.Cs.RuntimeModule currentModule,
+            Cnidaria.Cs.BytecodeFunction fn,
+            Cnidaria.Cs.Instruction ins)
+        {
+            var parts = new List<string>();
+            if (ins.Result >= 0 && ins.Result < fn.ValueTypeTokens.Length)
+                parts.Add("type=" + FormatTypeToken(currentModule, fn.ValueTypeTokens[ins.Result]));
+
+            switch (ins.Op)
+            {
+                case Cnidaria.Cs.Op.Call:
+                case Cnidaria.Cs.Op.CallVirt:
+                case Cnidaria.Cs.Op.Newobj:
+                    {
+                        string callSite = FormatMethodToken(currentModule, ins.Operand0);
+                        try
+                        {
+                            var (tmod, tfn) = ResolveFlatCallWithModule(flatMethodsByModule, modules, currentModule, ins.Operand0);
+                            string resolved = FormatMethodDef(tmod, tfn.MethodToken);
+                            parts.Add(callSite + " -> " + resolved);
+                        }
+                        catch (MissingMethodException)
+                        {
+                            parts.Add(callSite + " -> <no body>");
+                        }
+                        break;
+                    }
+
+                case Cnidaria.Cs.Op.CastClass:
+                case Cnidaria.Cs.Op.Box:
+                case Cnidaria.Cs.Op.UnboxAny:
+                case Cnidaria.Cs.Op.DefaultValue:
+                case Cnidaria.Cs.Op.Newarr:
+                case Cnidaria.Cs.Op.Ldelem:
+                case Cnidaria.Cs.Op.Ldelema:
+                case Cnidaria.Cs.Op.Stelem:
+                case Cnidaria.Cs.Op.LdArrayDataRef:
+                case Cnidaria.Cs.Op.Ldobj:
+                case Cnidaria.Cs.Op.Stobj:
+                case Cnidaria.Cs.Op.Sizeof:
+                case Cnidaria.Cs.Op.Isinst:
+                    if (ins.Operand0 != 0)
+                        parts.Add(FormatTypeToken(currentModule, ins.Operand0));
+                    break;
+
+                case Cnidaria.Cs.Op.Ldfld:
+                case Cnidaria.Cs.Op.Stfld:
+                case Cnidaria.Cs.Op.Ldsfld:
+                case Cnidaria.Cs.Op.Stsfld:
+                case Cnidaria.Cs.Op.Ldflda:
+                case Cnidaria.Cs.Op.Ldsflda:
+                    parts.Add(FormatFieldToken(currentModule, ins.Operand0));
+                    break;
+
+                case Cnidaria.Cs.Op.Ldstr:
+                    parts.Add($"userstr#0x{ins.Operand0:X8}");
+                    break;
+
+                case Cnidaria.Cs.Op.Ldloc:
+                case Cnidaria.Cs.Op.Stloc:
+                case Cnidaria.Cs.Op.Ldloca:
+                    if ((uint)ins.Operand0 < (uint)fn.LocalTypeTokens.Length)
+                        parts.Add("local=" + FormatTypeToken(currentModule, fn.LocalTypeTokens[ins.Operand0]));
+                    break;
+            }
+
+            if (parts.Count == 0)
+                return string.Empty;
+
+            return "   // " + string.Join("; ", parts);
+        }
+        private static string FormatFlatConvKind(int value)
+        {
+            switch ((Cnidaria.Cs.NumericConvKind)value)
+            {
+                case Cnidaria.Cs.NumericConvKind.I1:
+                case Cnidaria.Cs.NumericConvKind.U1:
+                case Cnidaria.Cs.NumericConvKind.I2:
+                case Cnidaria.Cs.NumericConvKind.U2:
+                case Cnidaria.Cs.NumericConvKind.I4:
+                case Cnidaria.Cs.NumericConvKind.U4:
+                case Cnidaria.Cs.NumericConvKind.I8:
+                case Cnidaria.Cs.NumericConvKind.U8:
+                case Cnidaria.Cs.NumericConvKind.R4:
+                case Cnidaria.Cs.NumericConvKind.R8:
+                case Cnidaria.Cs.NumericConvKind.Char:
+                case Cnidaria.Cs.NumericConvKind.Bool:
+                case Cnidaria.Cs.NumericConvKind.NativeInt:
+                case Cnidaria.Cs.NumericConvKind.NativeUInt:
+                    return ((Cnidaria.Cs.NumericConvKind)value).ToString();
+                default:
+                    return value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+        private static string FormatFlatConvFlags(int value)
+        {
+            if (value == 0)
+                return Cnidaria.Cs.NumericConvFlags.None.ToString();
+
+            return ((Cnidaria.Cs.NumericConvFlags)value).ToString();
+        }
+        private static bool TryGetFlatMethodMap(
+            IReadOnlyDictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>> flatMethodsByModule,
+            Cnidaria.Cs.RuntimeModule module,
+            out IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> methods)
+        {
+            if (flatMethodsByModule.TryGetValue(module.Name, out var found))
+            {
+                methods = found;
+                return true;
+            }
+            methods = null!;
+            return false;
+        }
+        private static (Cnidaria.Cs.RuntimeModule targetModule, Cnidaria.Cs.BytecodeFunction fn) ResolveFlatCallWithModule(
+            IReadOnlyDictionary<string, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction>> flatMethodsByModule,
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            Cnidaria.Cs.RuntimeModule caller,
+            int methodToken)
+        {
+            int table = MetadataToken.Table(methodToken);
+            int rid = MetadataToken.Rid(methodToken);
+
+            if (table == MetadataToken.MethodDef)
+            {
+                if (!TryGetFlatMethodMap(flatMethodsByModule, caller, out var callerMethods) ||
+                    !callerMethods.TryGetValue(methodToken, out var fn))
+                {
+                    throw new MissingMethodException($"No flat body for MethodDef 0x{methodToken:X8} in '{caller.Name}'");
+                }
+                return (caller, fn);
+            }
+            if (table == MetadataToken.MethodSpec)
+            {
+                var ms = caller.Md.GetMethodSpec(rid);
+                return ResolveFlatCallWithModule(flatMethodsByModule, modules, caller, ms.Method);
+            }
+            if (table != MetadataToken.MemberRef)
+                throw new NotSupportedException($"Call token table not supported: 0x{methodToken:X8}");
+
+            var mr = caller.Md.GetMemberRef(rid);
+            string methodName = caller.Md.GetString(mr.Name);
+            string sigKey = caller.GetSignatureKeyFromThisModule(mr.Signature);
+
+            var (asmName, ns, typeName) = ResolveMemberRefClass(caller, mr.ClassToken);
+
+            if (!modules.TryGetValue(asmName, out var targetModule))
+                throw new TypeLoadException($"Assembly '{asmName}' not loaded");
+
+            if (!targetModule.TypeDefByFullName.TryGetValue((ns, typeName), out var typeDefTok))
+                throw new TypeLoadException($"Type '{ns}.{typeName}' not found in '{asmName}'");
+
+            if (!targetModule.MethodDefIndex.TryGetValue((typeDefTok, methodName, sigKey), out var methodDefTok))
+            {
+                if (!TryResolveMethodDefByCompatibleSignature(
+                    memberRefModule: caller,
+                    targetModule: targetModule,
+                    ownerTypeDefToken: typeDefTok,
+                    methodName: methodName,
+                    memberRefSigBlob: mr.Signature,
+                    methodDefToken: out methodDefTok))
+                {
+                    throw new MissingMethodException(
+                        $"{ns}.{typeName}.{methodName} (sigKey={sigKey}) not found in '{asmName}'");
+                }
+            }
+            if (!TryGetFlatMethodMap(flatMethodsByModule, targetModule, out var targetMethods) ||
+                !targetMethods.TryGetValue(methodDefTok, out var fn2))
+            {
+                throw new MissingMethodException($"No flat body for resolved MethodDef 0x{methodDefTok:X8} in '{asmName}'");
+            }
+            return (targetModule, fn2);
+        }
         private static string FormatOperandComment(
-            IReadOnlyDictionary<string, RuntimeModule> modules,
-            RuntimeModule currentModule,
-            Instruction ins)
+            IReadOnlyDictionary<string, Cnidaria.Cs.Stack.RuntimeModule> modules,
+            Cnidaria.Cs.Stack.RuntimeModule currentModule,
+            Cnidaria.Cs.Stack.Instruction ins)
         {
             switch (ins.Op)
             {
@@ -116,9 +508,9 @@ namespace Cnidaria.Cs
                     return "";
             }
         }
-        private static (RuntimeModule targetModule, BytecodeFunction fn) ResolveCallWithModule(
-            IReadOnlyDictionary<string, RuntimeModule> modules,
-            RuntimeModule caller,
+        private static (Cnidaria.Cs.Stack.RuntimeModule targetModule, Cnidaria.Cs.Stack.BytecodeFunction fn) ResolveCallWithModule(
+            IReadOnlyDictionary<string, Cnidaria.Cs.Stack.RuntimeModule> modules,
+            Cnidaria.Cs.Stack.RuntimeModule caller,
             int methodToken)
         {
             int table = MetadataToken.Table(methodToken);
@@ -173,7 +565,7 @@ namespace Cnidaria.Cs
             return (targetModule, fn2);
         }
 
-        private static (string asm, string ns, string name) ResolveMemberRefClass(RuntimeModule caller, int classToken)
+        private static (string asm, string ns, string name) ResolveMemberRefClass(Cnidaria.Cs.IRuntimeMetadataModule caller, int classToken)
         {
             int table = MetadataToken.Table(classToken);
             int rid = MetadataToken.Rid(classToken);
@@ -198,8 +590,8 @@ namespace Cnidaria.Cs
             throw new NotSupportedException($"MemberRef.Class token not supported: 0x{classToken:X8}");
         }
         private static bool TryResolveMethodDefByCompatibleSignature(
-            RuntimeModule memberRefModule,
-            RuntimeModule targetModule,
+            Cnidaria.Cs.IRuntimeMetadataModule memberRefModule,
+            Cnidaria.Cs.IRuntimeMetadataModule targetModule,
             int ownerTypeDefToken,
             string methodName,
             int memberRefSigBlob,
@@ -233,9 +625,9 @@ namespace Cnidaria.Cs
             return false;
         }
         private static bool IsSignatureCompatible(
-            RuntimeModule defModule,
+            Cnidaria.Cs.IRuntimeMetadataModule defModule,
             int defSigBlob,
-            RuntimeModule memberRefModule,
+            Cnidaria.Cs.IRuntimeMetadataModule memberRefModule,
             int memberRefSigBlob)
         {
             var defSig = defModule.Md.GetBlob(defSigBlob);
@@ -274,9 +666,9 @@ namespace Cnidaria.Cs
             return true;
         }
         private static bool MatchType(
-            RuntimeModule defModule,
+            Cnidaria.Cs.IRuntimeMetadataModule defModule,
             ref SigReader def,
-            RuntimeModule memberRefModule,
+            Cnidaria.Cs.IRuntimeMetadataModule memberRefModule,
             ref SigReader mr)
         {
             var dEt = (SigElementType)def.ReadByte();
@@ -409,7 +801,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static (string asm, string ns, string name) ResolveTypeRefFullName(RuntimeModule caller, int typeRefRid)
+        private static (string asm, string ns, string name) ResolveTypeRefFullName(Cnidaria.Cs.IRuntimeMetadataModule caller, int typeRefRid)
         {
             var tr = caller.Md.GetTypeRef(typeRefRid);
             string name = caller.Md.GetString(tr.Name);
@@ -440,7 +832,7 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"Unsupported TypeRef scope token: 0x{scopeTok:X8}");
         }
-        private static (string ns, string name) GetTypeDefFullNameByRid(RuntimeModule m, int rid)
+        private static (string ns, string name) GetTypeDefFullNameByRid(Cnidaria.Cs.IRuntimeMetadataModule m, int rid)
         {
             var enclosingByNestedRid = new Dictionary<int, int>();
             for (int i = 0; i < m.Md.GetRowCount(MetadataTableKind.NestedClass); i++)
@@ -458,7 +850,7 @@ namespace Cnidaria.Cs
 
             return (ns, name);
         }
-        private static (string asm, string ns, string name) ResolveTypeSpecOwner(RuntimeModule caller, ref SigReader sr)
+        private static (string asm, string ns, string name) ResolveTypeSpecOwner(Cnidaria.Cs.IRuntimeMetadataModule caller, ref SigReader sr)
         {
             var et = (SigElementType)sr.ReadByte();
 
@@ -481,7 +873,7 @@ namespace Cnidaria.Cs
             throw new NotSupportedException($"Unsupported TypeSpec as MemberRef owner: {et}");
         }
 
-        private static (string asm, string ns, string name) ResolveTypeTokenFullName(RuntimeModule caller, int tok)
+        private static (string asm, string ns, string name) ResolveTypeTokenFullName(Cnidaria.Cs.IRuntimeMetadataModule caller, int tok)
         {
             int table = MetadataToken.Table(tok);
             int rid = MetadataToken.Rid(tok);
@@ -518,7 +910,7 @@ namespace Cnidaria.Cs
                 _ => throw new InvalidOperationException("Bad TypeDefOrRef coded index")
             };
         }
-        private static string FormatMethodToken(RuntimeModule caller, int methodToken)
+        private static string FormatMethodToken(Cnidaria.Cs.IRuntimeMetadataModule caller, int methodToken)
         {
             int table = MetadataToken.Table(methodToken);
             int rid = MetadataToken.Rid(methodToken);
@@ -538,7 +930,7 @@ namespace Cnidaria.Cs
             return $"<methodTok 0x{methodToken:X8}>";
         }
 
-        private static string FormatMethodDef(RuntimeModule module, int methodDefToken)
+        private static string FormatMethodDef(Cnidaria.Cs.IRuntimeMetadataModule module, int methodDefToken)
         {
             int rid = MetadataToken.Rid(methodDefToken);
             var md = module.Md;
@@ -559,15 +951,15 @@ namespace Cnidaria.Cs
             for (int tdIndex = 0; tdIndex < md.GetRowCount(MetadataTableKind.TypeDef); tdIndex++)
             {
                 int start = md.GetTypeDef(tdIndex + 1).MethodList;
-                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef)) 
-                    ? md.GetTypeDef(tdIndex+2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
+                int end = (tdIndex + 1 < md.GetRowCount(MetadataTableKind.TypeDef))
+                    ? md.GetTypeDef(tdIndex + 2).MethodList : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
                 if (methodRid >= start && methodRid < end)
                     return tdIndex + 1;
             }
             return 0;
         }
 
-        private static string FormatTypeToken(RuntimeModule ctx, int typeToken)
+        private static string FormatTypeToken(Cnidaria.Cs.IRuntimeMetadataModule ctx, int typeToken)
         {
             int table = MetadataToken.Table(typeToken);
             int rid = MetadataToken.Rid(typeToken);
@@ -606,7 +998,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static string FormatFieldToken(RuntimeModule caller, int fieldToken)
+        private static string FormatFieldToken(Cnidaria.Cs.IRuntimeMetadataModule caller, int fieldToken)
         {
             int table = MetadataToken.Table(fieldToken);
             int rid = MetadataToken.Rid(fieldToken);
@@ -630,7 +1022,7 @@ namespace Cnidaria.Cs
             return $"<fieldTok 0x{fieldToken:X8}>";
         }
 
-        private static string FormatTypeDefFullName(RuntimeModule module, int typeDefRid)
+        private static string FormatTypeDefFullName(Cnidaria.Cs.IRuntimeMetadataModule module, int typeDefRid)
         {
             var md = module.Md;
             var td = md.GetTypeDef(typeDefRid);
@@ -890,6 +1282,7 @@ namespace Cnidaria.Cs
                     BoundThrowExpression => "BoundThrowExpression",
                     BoundFixedStatement => "BoundFixedStatement",
                     BoundFixedInitializerExpression => "BoundFixedInitializerExpression",
+                    BoundUnboundCollectionExpression => "BoundUnboundCollectionExpression",
                     _ => node.GetType().Name
                 };
             }
@@ -1354,10 +1747,10 @@ namespace Cnidaria.Cs
                     case BoundArrayInitializerExpression ai:
                         return $"Length={ai.Elements.Length}";
 
-                    case BoundArrayCreationExpression ac: 
+                    case BoundArrayCreationExpression ac:
                         return $"ElementType={FormatType(ac.ElementType)}, Rank={ac.DimensionSizes.Length}, HasInitializer={(ac.InitializerOpt != null ? "true" : "false")}";
 
-                    case BoundArrayElementAccessExpression aea: 
+                    case BoundArrayElementAccessExpression aea:
                         return $"Rank={aea.Indices.Length}, IsLValue={(aea.IsLValue ? "true" : "false")}";
 
                     case BoundNullCoalescingAssignmentExpression:
@@ -1366,7 +1759,7 @@ namespace Cnidaria.Cs
                     case BoundStackAllocArrayCreationExpression sa:
                         return $"ElementType={FormatType(sa.ElementType)}";
 
-                    case BoundRefExpression: 
+                    case BoundRefExpression:
                         return "Kind=ref";
 
                     case BoundSizeOfExpression so:
@@ -1392,7 +1785,7 @@ namespace Cnidaria.Cs
                             var declaredLocal = ip.DeclaredLocalOpt is null
                                 ? "<none>"
                                 : FormatLocal(ip.DeclaredLocalOpt);
-                            return $"PatternType={FormatType(ip.PatternType)}, DeclaredLocal={declaredLocal}, IsDiscard={(ip.IsDiscard ? "true" : "false")}";
+                            return $"PatternType={ip.PatternKind}, DeclaredLocal={declaredLocal}, IsDiscard={(ip.IsDiscard ? "true" : "false")}";
                         }
 
                     case BoundLocalFunctionStatement lfs:

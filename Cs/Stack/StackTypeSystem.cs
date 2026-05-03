@@ -4,57 +4,29 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 
-namespace Cnidaria.Cs
+namespace Cnidaria.Cs.Stack
 {
-    internal sealed class ReferenceEqualityComparer<T> : IEqualityComparer<T> where T : class
+    sealed class RuntimeModule : Cnidaria.Cs.IRuntimeMetadataModule
     {
-        public static readonly ReferenceEqualityComparer<T> Instance = new();
+        public string Name { get; }
+        public IMetadataView Md { get; }
+        public Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction> MethodsByDefToken { get; }
 
-        private ReferenceEqualityComparer() { }
+        public Dictionary<(string ns, string name), int> TypeDefByFullName { get; } = new();
 
-        public bool Equals(T? x, T? y) => ReferenceEquals(x, y);
-
-        public int GetHashCode(T obj) => RuntimeHelpers.GetHashCode(obj);
-    }
-
-    internal interface IRuntimeMetadataModule
-    {
-        string Name { get; }
-        IMetadataView Md { get; }
-        Dictionary<(string ns, string name), int> TypeDefByFullName { get; }
-        Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; }
-        string GetSignatureKeyFromThisModule(int sigBlobIdx);
-        (string ns, string name) GetTypeDefFullNameByRid(int rid);
-    }
-
-    internal sealed class RuntimeModule : IRuntimeMetadataModule
-    {
-        private readonly Dictionary<int, BytecodeFunction> _flatMethods;
+        public Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; } = new();
         private readonly Dictionary<int, string> _sigKeyCache = new();
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
-
-        public string Name { get; }
-        public IMetadataView Md { get; }
-        public IReadOnlyDictionary<int, BytecodeFunction> MethodsByDefToken => _flatMethods;
-        public Dictionary<(string ns, string name), int> TypeDefByFullName { get; } = new();
-        public Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; } = new();
-
-        public RuntimeModule(string name, IMetadataView md, IReadOnlyDictionary<int, BytecodeFunction> methodsByDefToken)
+        public RuntimeModule(string name, IMetadataView md, Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction> methodsByDefToken)
         {
-            Name = name ?? throw new ArgumentNullException(nameof(name));
+            Name = name;
             Md = md ?? throw new ArgumentNullException(nameof(md));
-            if (methodsByDefToken is null) throw new ArgumentNullException(nameof(methodsByDefToken));
-
-            _flatMethods = methodsByDefToken is Dictionary<int, BytecodeFunction> d
-                ? new Dictionary<int, BytecodeFunction>(d)
-                : new Dictionary<int, BytecodeFunction>(methodsByDefToken);
+            MethodsByDefToken = methodsByDefToken;
 
             BuildTypeIndex();
             BuildMethodIndex();
         }
-
-        public string GetSignatureKeyFromThisModule(int sigBlobIdx) => GetSigKey(sigBlobIdx);
 
         private string GetSigKey(int sigBlobIdx)
         {
@@ -70,7 +42,7 @@ namespace Cnidaria.Cs
             byte cc = r.ReadByte();
             sb.Append("cc=").Append(cc).Append(';');
 
-            if ((cc & 0x10) != 0)
+            if ((cc & 0x10) != 0) // GENERIC
             {
                 uint genArity = r.ReadCompressedUInt();
                 sb.Append("ga=").Append(genArity).Append(';');
@@ -79,7 +51,7 @@ namespace Cnidaria.Cs
             uint paramCount = r.ReadCompressedUInt();
             sb.Append("pc=").Append(paramCount).Append(';');
 
-            AppendTypeKey(sb, ref r);
+            AppendTypeKey(sb, ref r); // ret
             for (int i = 0; i < paramCount; i++)
                 AppendTypeKey(sb, ref r);
 
@@ -87,7 +59,6 @@ namespace Cnidaria.Cs
             _sigKeyCache[sigBlobIdx] = k;
             return k;
         }
-
         private void AppendTypeKey(StringBuilder sb, ref SigReader r)
         {
             var et = (SigElementType)r.ReadByte();
@@ -112,12 +83,12 @@ namespace Cnidaria.Cs
                 case SigElementType.ARRAY:
                     {
                         sb.Append("[,]<");
-                        AppendTypeKey(sb, ref r);
+                        AppendTypeKey(sb, ref r); // elem
                         uint rank = r.ReadCompressedUInt();
                         uint nsizes = r.ReadCompressedUInt();
-                        for (int i = 0; i < nsizes; i++) _ = r.ReadCompressedUInt();
+                        for (int i = 0; i < nsizes; i++) _ = r.ReadCompressedUInt(); // sizes
                         uint nlb = r.ReadCompressedUInt();
-                        for (int i = 0; i < nlb; i++) _ = r.ReadCompressedUInt();
+                        for (int i = 0; i < nlb; i++) _ = r.ReadCompressedUInt(); // low bounds
                         sb.Append(":r=").Append(rank).Append('>');
                         break;
                     }
@@ -138,7 +109,7 @@ namespace Cnidaria.Cs
                 case SigElementType.MVAR:
                     {
                         uint ord = r.ReadCompressedUInt();
-                        sb.Append('#').Append(ord);
+                        sb.Append("#").Append(ord);
                         break;
                     }
 
@@ -161,23 +132,23 @@ namespace Cnidaria.Cs
 
             sb.Append(';');
         }
-
         private void AppendTypeDefOrRefKey(StringBuilder sb, uint encoded)
         {
             int tag = (int)(encoded & 0x3u);
             int rid = (int)(encoded >> 2);
 
+            // tag: 0=TypeDef, 1=TypeRef, 2=TypeSpec
             if (tag == 0)
             {
-                var (ns, name) = GetTypeDefFullNameByRid(rid);
-                sb.Append(':').Append(Name).Append(':').Append(ns).Append('.').Append(name);
+                var (ns, name) = GetTypeDefFullNameByRid(rid); // nested aware
+                sb.Append(":").Append(Name).Append(':').Append(ns).Append('.').Append(name);
                 return;
             }
 
             if (tag == 1)
             {
-                var (asm, ns, name) = Domain.ResolveTypeRefFullName(this, rid);
-                sb.Append(':').Append(asm).Append(':').Append(ns).Append('.').Append(name);
+                var (asm, ns, name) = Domain.ResolveTypeRefFullName(this, rid); // nested aware
+                sb.Append(":").Append(asm).Append(':').Append(ns).Append('.').Append(name);
                 return;
             }
 
@@ -186,7 +157,7 @@ namespace Cnidaria.Cs
                 var ts = Md.GetTypeSpec(rid);
                 var sig = Md.GetBlob(ts.Signature);
                 var r2 = new SigReader(sig);
-                sb.Append(':').Append(Name).Append(":typespec<");
+                sb.Append(":").Append(Name).Append(":typespec<");
                 AppendTypeKey(sb, ref r2);
                 sb.Append('>');
                 return;
@@ -194,7 +165,6 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException("Bad TypeDefOrRef tag.");
         }
-
         public (string ns, string name) GetTypeDefFullNameByRid(int rid)
         {
             if (_fullTypeNameCache.TryGetValue(rid, out var v))
@@ -208,15 +178,14 @@ namespace Cnidaria.Cs
             {
                 var enc = GetTypeDefFullNameByRid(encRid);
                 ns = enc.ns;
-                name = enc.name + "+" + name;
+                name = enc.name + "+" + name; // stable nesting separator
             }
 
             v = (ns, name);
             _fullTypeNameCache[rid] = v;
             return v;
         }
-
-        private void BuildTypeIndex()
+        void BuildTypeIndex()
         {
             _enclosingByNestedRid.Clear();
             for (int i = 0; i < Md.GetRowCount(MetadataTableKind.NestedClass); i++)
@@ -231,7 +200,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private void BuildMethodIndex()
+        void BuildMethodIndex()
         {
             for (int td = 0; td < Md.GetRowCount(MetadataTableKind.TypeDef); td++)
             {
@@ -246,23 +215,21 @@ namespace Cnidaria.Cs
                     int methodTok = MetadataToken.Make(MetadataToken.MethodDef, rid);
                     var mrow = Md.GetMethodDef(rid);
                     var name = Md.GetString(mrow.Name);
+
                     string sigKey = GetSigKey(mrow.Signature);
+
                     MethodDefIndex[(typeTok, name, sigKey)] = methodTok;
                 }
             }
         }
-    }
 
+        public string GetSignatureKeyFromThisModule(int sigBlobIdx) => GetSigKey(sigBlobIdx);
+    }
     internal ref struct SigReader
     {
         private readonly ReadOnlySpan<byte> _s;
         private int _i;
-
-        public SigReader(ReadOnlySpan<byte> s)
-        {
-            _s = s;
-            _i = 0;
-        }
+        public SigReader(ReadOnlySpan<byte> s) { _s = s; _i = 0; }
 
         public byte ReadByte()
         {
@@ -292,25 +259,13 @@ namespace Cnidaria.Cs
             throw new InvalidOperationException("Bad compressed uint.");
         }
     }
-
-    internal sealed class Domain
+    sealed class Domain
     {
         private readonly Dictionary<string, RuntimeModule> _modulesByName = new(StringComparer.Ordinal);
 
+        public void Add(RuntimeModule m) => _modulesByName[m.Name] = m;
 
-        public void Add(RuntimeModule module)
-        {
-            if (module is null) throw new ArgumentNullException(nameof(module));
-            if (!_modulesByName.TryAdd(module.Name, module))
-                throw new InvalidOperationException($"Duplicate module loaded: '{module.Name}'");
-        }
-        public static (string ns, string name) GetTypeDefFullNameByRid(IRuntimeMetadataModule module, int rid)
-            => module.GetTypeDefFullNameByRid(rid);
-        public bool TryGetModule(string name, out RuntimeModule module)
-            => _modulesByName.TryGetValue(name, out module!);
-
-
-        public (RuntimeModule? module, Cnidaria.Cs.BytecodeFunction fn) ResolveCall(RuntimeModule caller, int methodToken)
+        public (RuntimeModule? module, Cnidaria.Cs.Stack.BytecodeFunction fn) ResolveCall(RuntimeModule caller, int methodToken)
         {
             int table = MetadataToken.Table(methodToken);
             int rid = MetadataToken.Rid(methodToken);
@@ -598,7 +553,7 @@ namespace Cnidaria.Cs
                     return;
             }
         }
-        public static (string asm, string ns, string name) ResolveTypeRefFullName(IRuntimeMetadataModule caller, int typeRefRid)
+        public static (string asm, string ns, string name) ResolveTypeRefFullName(RuntimeModule caller, int typeRefRid)
         {
             var tr = caller.Md.GetTypeRef(typeRefRid);
             string name = caller.Md.GetString(tr.Name);
@@ -623,7 +578,7 @@ namespace Cnidaria.Cs
 
             if (scopeTable == MetadataToken.TypeDef)
             {
-                var (encNs, encName) = caller.GetTypeDefFullNameByRid(scopeRid);
+                var (encNs, encName) = GetTypeDefFullNameByRid(caller, scopeRid);
                 return (caller.Name, encNs, encName + "+" + name);
             }
 
@@ -638,18 +593,37 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"Unsupported TypeRef scope token: 0x{scopeTok:X8}");
         }
+        public static (string ns, string name) GetTypeDefFullNameByRid(RuntimeModule m, int rid)
+        {
+            var enclosingByNestedRid = new Dictionary<int, int>();
+            for (int i = 0; i < m.Md.GetRowCount(MetadataTableKind.NestedClass); i++)
+                enclosingByNestedRid[m.Md.GetNestedClass(i + 1).NestedTypeRid] = m.Md.GetNestedClass(i + 1).EnclosingTypeRid;
 
-        public static (string asm, string ns, string name) ResolveMemberRefClass(IRuntimeMetadataModule caller, int classToken)
+            var td = m.Md.GetTypeDef(rid);
+            string name = m.Md.GetString(td.Name);
+            string ns = m.Md.GetString(td.Namespace);
+
+            if (enclosingByNestedRid.TryGetValue(rid, out int encRid))
+            {
+                var enc = GetTypeDefFullNameByRid(m, encRid);
+                return (enc.ns, enc.name + "+" + name);
+            }
+
+            return (ns, name);
+        }
+        static (string asm, string ns, string name) ResolveMemberRefClass(RuntimeModule caller, int classToken)
         {
             int table = MetadataToken.Table(classToken);
             int rid = MetadataToken.Rid(classToken);
 
             if (table == MetadataToken.TypeRef)
+            {
                 return ResolveTypeRefFullName(caller, rid);
+            }
 
             if (table == MetadataToken.TypeDef)
             {
-                var (ns, name) = caller.GetTypeDefFullNameByRid(rid);
+                var (ns, name) = GetTypeDefFullNameByRid(caller, rid);
                 return (caller.Name, ns, name);
             }
 
@@ -663,8 +637,7 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"MemberRef.Class token not supported: 0x{classToken:X8}");
         }
-
-        public static (string asm, string ns, string name) ResolveTypeSpecOwner(IRuntimeMetadataModule caller, ref SigReader sr)
+        private static (string asm, string ns, string name) ResolveTypeSpecOwner(RuntimeModule caller, ref SigReader sr)
         {
             var et = (SigElementType)sr.ReadByte();
 
@@ -688,8 +661,7 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"Unsupported TypeSpec as MemberRef owner: {et}");
         }
-
-        public static (string asm, string ns, string name) ResolveTypeTokenFullName(IRuntimeMetadataModule caller, int tok)
+        private static (string asm, string ns, string name) ResolveTypeTokenFullName(RuntimeModule caller, int tok)
         {
             int table = MetadataToken.Table(tok);
             int rid = MetadataToken.Rid(tok);
@@ -699,7 +671,7 @@ namespace Cnidaria.Cs
 
             if (table == MetadataToken.TypeDef)
             {
-                var (ns, name) = caller.GetTypeDefFullNameByRid(rid);
+                var (ns, name) = GetTypeDefFullNameByRid(caller, rid);
                 return (caller.Name, ns, name);
             }
 
@@ -713,8 +685,7 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"Unsupported type token in TypeSpec owner: 0x{tok:X8}");
         }
-
-        public static int DecodeTypeDefOrRefEncodedToToken(int encoded)
+        private static int DecodeTypeDefOrRefEncodedToToken(int encoded)
         {
             int tag = encoded & 0x3;
             int rid = encoded >> 2;
@@ -727,6 +698,7 @@ namespace Cnidaria.Cs
             };
         }
     }
+
 
     internal sealed class RuntimeTypeSystem
     {
@@ -754,7 +726,7 @@ namespace Cnidaria.Cs
         public RuntimeType SystemEnum { get; private set; } = null!;
         private readonly Dictionary<string, RuntimeType> _constructedTypes = new(StringComparer.Ordinal);
         private readonly Dictionary<string, RuntimeMethod> _constructedMethods = new(StringComparer.Ordinal);
-        public const int PointerSize = 4;
+        public const int PointerSize = 4; //save on memory
         public RuntimeTypeSystem(IReadOnlyDictionary<string, RuntimeModule> modules)
         {
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
@@ -951,7 +923,7 @@ namespace Cnidaria.Cs
                 var sig = module.Md.GetBlob(ms.Instantiation);
                 var sr = new SigReader(sig);
                 byte kind = sr.ReadByte();
-                if (kind != 0x0A)
+                if (kind != 0x0A) // METHODSPEC
                     throw new InvalidOperationException($"Bad MethodSpec signature kind: 0x{kind:X2}");
 
                 uint argcU = sr.ReadCompressedUInt();
@@ -1126,7 +1098,7 @@ namespace Cnidaria.Cs
             var constructedOwner = GetOrCreateGenericInstanceType(targetOwnerDef, ownerArgs);
             EnsureConstructedMembers(constructedOwner);
 
-
+            // fast path
             var defMethods = targetOwnerDef.Methods;
             for (int i = 0; i < defMethods.Length; i++)
             {
@@ -1134,7 +1106,7 @@ namespace Cnidaria.Cs
                     return constructedOwner.Methods[i];
             }
 
-
+            // fallback
             var expectedRet = SubstituteRuntimeType(method.ReturnType, ownerArgs);
             var expectedPs = new RuntimeType[method.ParameterTypes.Length];
             for (int i = 0; i < expectedPs.Length; i++)
@@ -1211,7 +1183,7 @@ namespace Cnidaria.Cs
             var sig = module.Md.GetBlob(ms.Instantiation);
             var sr = new SigReader(sig);
             byte kind = sr.ReadByte();
-            if (kind != 0x0A)
+            if (kind != 0x0A) // METHODSPEC
                 throw new InvalidOperationException($"Bad MethodSpec signature kind: 0x{kind:X2}");
 
             uint argcU = sr.ReadCompressedUInt();
@@ -1229,7 +1201,7 @@ namespace Cnidaria.Cs
                 var constructedOwner = GetOrCreateGenericInstanceType(genericMethod.DeclaringType, methodArgs);
                 EnsureConstructedMembers(constructedOwner);
 
-
+                // Find the corresponding method on the constructed owner type.
                 var expectedRet = SubstituteRuntimeType(genericMethod.ReturnType, methodArgs);
                 var expectedPs = new RuntimeType[genericMethod.ParameterTypes.Length];
                 for (int i = 0; i < expectedPs.Length; i++)
@@ -1457,7 +1429,7 @@ namespace Cnidaria.Cs
                 case RuntimeTypeKind.Interface:
                 case RuntimeTypeKind.Class:
                     {
-
+                        // reference storage
                         t.SizeOf = PointerSize;
                         t.AlignOf = PointerSize;
 
@@ -1469,7 +1441,7 @@ namespace Cnidaria.Cs
 
                         int maxAlign = PointerSize;
 
-
+                        // instance fields
                         for (int i = 0; i < t.InstanceFields.Length; i++)
                         {
                             var f = t.InstanceFields[i];
@@ -1556,7 +1528,7 @@ namespace Cnidaria.Cs
                 throw new TypeLoadException(
                     $"Primitive wrapper '{t.Namespace}.{t.Name}.{f.Name}' must have the same primitive type.");
 
-
+            // Primitive wrappers are canonical scalars
             f.Offset = 0;
         }
         internal RuntimeField BindFieldToReceiver(RuntimeField field, RuntimeType receiverType)
@@ -1646,14 +1618,14 @@ namespace Cnidaria.Cs
                 var sourceMethods = methodOwner.Methods;
                 var actualMethods = cur.Methods;
 
-
+                // fast path
                 for (int i = 0; i < sourceMethods.Length && i < actualMethods.Length; i++)
                 {
                     if (ReferenceEquals(sourceMethods[i], method))
                         return actualMethods[i];
                 }
 
-
+                // fallback
                 var ownerArgs = cur.GenericTypeArguments ?? Array.Empty<RuntimeType>();
                 var expectedRet = SubstituteRuntimeType(method.ReturnType, ownerArgs);
 
@@ -1705,7 +1677,7 @@ namespace Cnidaria.Cs
             if (fieldType.Kind == RuntimeTypeKind.TypeParam)
                 return (PointerSize, PointerSize);
 
-
+            // reference types stored as pointers
             if (fieldType.IsReferenceType)
                 return (PointerSize, PointerSize);
 
@@ -1860,7 +1832,7 @@ namespace Cnidaria.Cs
             var sig = contextModule.Md.GetBlob(mr.Signature);
             var sr = new SigReader(sig);
             byte prolog = sr.ReadByte();
-            if (prolog != 0x06)
+            if (prolog != 0x06)// MemberRef signature
                 throw new InvalidOperationException("MemberRef is not a field signature.");
 
             RuntimeType fieldType = ReadTypeSig(contextModule, ref sr);
@@ -1869,7 +1841,7 @@ namespace Cnidaria.Cs
 
             EnsureConstructedMembers(owner);
 
-
+            // Search both instance/static fields
             for (int i = 0; i < owner.InstanceFields.Length; i++)
             {
                 var f = owner.InstanceFields[i];
@@ -2114,7 +2086,7 @@ namespace Cnidaria.Cs
 
                 string name = m.Md.GetString(mr.Name);
 
-
+                // Decode method signature
                 var sig = m.Md.GetBlob(mr.Signature);
                 var sr = new SigReader(sig);
                 byte cc = sr.ReadByte();
@@ -2185,7 +2157,7 @@ namespace Cnidaria.Cs
             var vt = new List<RuntimeMethod>(baseVt.Length + 8);
             vt.AddRange(baseVt);
 
-
+            // assign base slots already exist
             for (int i = 0; i < t.Methods.Length; i++)
             {
                 var m = t.Methods[i];
@@ -2248,7 +2220,7 @@ namespace Cnidaria.Cs
             {
                 var ts = contextModule.Md.GetTypeSpec(rid);
                 var sig = contextModule.Md.GetBlob(ts.Signature);
-
+                // Stable key to intern constructed types
                 string key = contextModule.Name + ":ts:" + Convert.ToHexString(sig);
 
                 if (_constructedTypes.TryGetValue(key, out var cached))
@@ -2349,7 +2321,7 @@ namespace Cnidaria.Cs
         {
             var et = (SigElementType)r.ReadByte();
 
-
+            // Map ELEMENT_TYPE_* to your core types for primitives.
             switch (et)
             {
                 case SigElementType.VOID: return FindRequired("std", "System", "Void");
@@ -2391,11 +2363,11 @@ namespace Cnidaria.Cs
                         uint rank = r.ReadCompressedUInt();
                         uint nsizes = r.ReadCompressedUInt();
                         for (int i = 0; i < nsizes; i++)
-                            _ = r.ReadCompressedUInt();
+                            _ = r.ReadCompressedUInt(); // sizes
 
                         uint nlb = r.ReadCompressedUInt();
                         for (int i = 0; i < nlb; i++)
-                            _ = r.ReadCompressedUInt();
+                            _ = r.ReadCompressedUInt(); // low bounds
 
                         if (rank == 0)
                             throw new BadImageFormatException("ARRAY signature with rank=0 is invalid.");
@@ -2775,7 +2747,7 @@ namespace Cnidaria.Cs
 
             if (table == MetadataToken.TypeSpec)
             {
-
+                // Not expected for base type in your current emitter.
                 return (contextModule.Name, "", "typespec");
             }
 
@@ -2794,10 +2766,10 @@ namespace Cnidaria.Cs
         Struct,
         Interface,
         Enum,
-        Array,
-        Pointer,
-        ByRef,
-        TypeParam,
+        Array,      // SZARRAY / ARRAY
+        Pointer,    // PTR
+        ByRef,      // BYREF
+        TypeParam,  // VAR/MVAR
     }
     internal sealed class RuntimeType
     {
@@ -2817,7 +2789,7 @@ namespace Cnidaria.Cs
         public RuntimeType? GenericTypeDefinition { get; internal set; }
         public RuntimeType[] GenericTypeArguments { get; internal set; } = Array.Empty<RuntimeType>();
         internal bool ConstructedMembersInitialized { get; set; }
-
+        // Layout
         public int SizeOf { get; internal set; }
         public int AlignOf { get; internal set; }
         public int StaticSize { get; internal set; }
@@ -2874,7 +2846,7 @@ namespace Cnidaria.Cs
         public bool HasAggressiveInlining => (ImplFlags & MetadataFlagBits.AggressiveInlining) != 0;
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
-        public Cnidaria.Cs.BytecodeFunction? Body { get; internal set; }
+        public Cnidaria.Cs.Stack.BytecodeFunction? Body { get; internal set; }
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         public RuntimeType[] MethodGenericArguments { get; internal set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }
@@ -2915,4 +2887,3 @@ namespace Cnidaria.Cs
         }
     }
 }
-

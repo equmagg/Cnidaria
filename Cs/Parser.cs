@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -1510,7 +1511,7 @@ namespace Cnidaria.Cs
                 return false;
 
             var rp = GetResetPoint();
-            
+
             NameSyntax name = ParseSimpleName();
 
             if (_tokens.CurrentKind != SyntaxKind.DotToken)
@@ -4418,6 +4419,17 @@ namespace Cnidaria.Cs
         }
         private InitializerExpressionSyntax ParseInitializerExpression(SyntaxKind kind)
         {
+            return kind switch
+            {
+                SyntaxKind.ArrayInitializerExpression => ParseArrayInitializerExpression(),
+                SyntaxKind.ObjectInitializerExpression => ParseObjectOrCollectionInitializerExpression(defaultKind: kind),
+                SyntaxKind.CollectionInitializerExpression => ParseObjectOrCollectionInitializerExpression(defaultKind: kind),
+                SyntaxKind.ComplexElementInitializerExpression => ParseComplexElementInitializerExpression(),
+                _ => ParseArrayInitializerExpression(),
+            };
+        }
+        private InitializerExpressionSyntax ParseArrayInitializerExpression()
+        {
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
             var list = new List<SyntaxNodeOrToken>();
@@ -4426,8 +4438,7 @@ namespace Cnidaria.Cs
             {
                 ExpressionSyntax element;
 
-                if (kind == SyntaxKind.ArrayInitializerExpression &&
-                    _tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
                 {
                     element = ParseInitializerExpression(SyntaxKind.ArrayInitializerExpression);
                 }
@@ -4450,7 +4461,115 @@ namespace Cnidaria.Cs
             }
 
             var close = MatchToken(SyntaxKind.CloseBraceToken);
-            return new InitializerExpressionSyntax(kind, open, new SeparatedSyntaxList<ExpressionSyntax>(list.ToArray()), close);
+            return new InitializerExpressionSyntax(SyntaxKind.ArrayInitializerExpression, open, new SeparatedSyntaxList<ExpressionSyntax>(list.ToArray()), close);
+        }
+        private InitializerExpressionSyntax ParseObjectOrCollectionInitializerExpression(SyntaxKind defaultKind = SyntaxKind.ObjectInitializerExpression)
+        {
+            var open = MatchToken(SyntaxKind.OpenBraceToken);
+
+            var list = new List<SyntaxNodeOrToken>();
+            var inferredKind = defaultKind;
+            bool hasInference = false;
+
+            while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                var element = ParseObjectOrCollectionInitializerElement(out var elementKind);
+                list.Add(new SyntaxNodeOrToken(element));
+
+                if (!hasInference)
+                {
+                    inferredKind = elementKind;
+                    hasInference = true;
+                }
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
+                        break;
+                    continue;
+                }
+
+                break;
+            }
+
+            var close = MatchToken(SyntaxKind.CloseBraceToken);
+            return new InitializerExpressionSyntax(inferredKind, open, new SeparatedSyntaxList<ExpressionSyntax>(list.ToArray()), close);
+        }
+        private ExpressionSyntax ParseObjectOrCollectionInitializerElement(out SyntaxKind inferredKind)
+        {
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+            {
+                inferredKind = SyntaxKind.CollectionInitializerExpression;
+                return ParseComplexElementInitializerExpression();
+            }
+
+            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken &&
+                IsAssignmentOperator(_tokens.Peek(1).Kind))
+            {
+                var left = (ExpressionSyntax)ParseSimpleNameInExpressionContext();
+                inferredKind = SyntaxKind.ObjectInitializerExpression;
+                return ParseInitializerAssignmentAfterLeft(left);
+            }
+
+            if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken &&
+                IsImplicitElementInitializerStart())
+            {
+                var left = new ImplicitElementAccessSyntax(ParseBracketedArgumentList());
+                inferredKind = SyntaxKind.CollectionInitializerExpression;
+                return ParseInitializerAssignmentAfterLeft(left);
+            }
+
+            inferredKind = SyntaxKind.CollectionInitializerExpression;
+            return ParseExpression();
+        }
+        private bool IsImplicitElementInitializerStart()
+        {
+            return Probe(() =>
+            {
+                ParseBracketedArgumentList();
+                return IsAssignmentOperator(_tokens.CurrentKind);
+            }, requireProgress: true);
+        }
+        private AssignmentExpressionSyntax ParseInitializerAssignmentAfterLeft(ExpressionSyntax left)
+        {
+            var op = _tokens.EatToken();
+            var right = ParseInitializerValue();
+            var kind = GetAssignmentExpressionKind(op.Kind);
+            return new AssignmentExpressionSyntax(kind, left, op, right);
+        }
+        private ExpressionSyntax ParseInitializerValue()
+        {
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                return ParseObjectOrCollectionInitializerExpression();
+
+            return ParseExpression();
+        }
+        private InitializerExpressionSyntax ParseComplexElementInitializerExpression()
+        {
+            var open = MatchToken(SyntaxKind.OpenBraceToken);
+
+            var list = new List<SyntaxNodeOrToken>();
+            while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                var element = ParseInitializerValue();
+                list.Add(new SyntaxNodeOrToken(element));
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
+                        break;
+                    continue;
+                }
+
+                break;
+            }
+
+            var close = MatchToken(SyntaxKind.CloseBraceToken);
+            return new InitializerExpressionSyntax(SyntaxKind.ComplexElementInitializerExpression, open, new SeparatedSyntaxList<ExpressionSyntax>(list.ToArray()), close);
         }
         private MemberAccessExpressionSyntax ParseMemberAccess(ExpressionSyntax receiver)
         {
@@ -4710,8 +4829,18 @@ namespace Cnidaria.Cs
             return new ConstantPatternSyntax(expr2);
         }
         private bool CanStartPatternDesignation()
-            => _tokens.CurrentKind == SyntaxKind.IdentifierToken ||
-               _tokens.CurrentKind == SyntaxKind.OpenParenToken;
+        {
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                return true;
+
+            if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
+                return false;
+
+            return !IsCurrentContextual(SyntaxKind.AndKeyword) &&
+                   !IsCurrentContextual(SyntaxKind.OrKeyword) &&
+                   !IsCurrentContextual(SyntaxKind.NotKeyword) &&
+                   !IsCurrentContextual(SyntaxKind.WhenKeyword);
+        }
         private bool IsPatternTerminatorOrOperator()
         {
             switch (_tokens.CurrentKind)
@@ -4736,7 +4865,9 @@ namespace Cnidaria.Cs
             if (TypeDefinitelyNotExpression(type))
                 return true;
 
-            return type is GenericNameSyntax;
+            return type is IdentifierNameSyntax
+                || type is QualifiedNameSyntax
+                || type is GenericNameSyntax;
         }
         private static bool IsRelationalPatternOperator(SyntaxKind kind)
             => kind == SyntaxKind.LessThanToken ||
@@ -5318,14 +5449,14 @@ namespace Cnidaria.Cs
         };
         private bool IsCurrentTypeDeclarationKeyword()
             => IsCurrentContextual(SyntaxKind.RecordKeyword) || _tokens.CurrentKind switch
-        {
-            SyntaxKind.ClassKeyword => true,
-            SyntaxKind.StructKeyword => true,
-            SyntaxKind.InterfaceKeyword => true,
-            SyntaxKind.EnumKeyword => true,
-            _ => false
-        };
-    private static SyntaxKind GetAssignmentExpressionKind(SyntaxKind tokenKind) => tokenKind switch
+            {
+                SyntaxKind.ClassKeyword => true,
+                SyntaxKind.StructKeyword => true,
+                SyntaxKind.InterfaceKeyword => true,
+                SyntaxKind.EnumKeyword => true,
+                _ => false
+            };
+        private static SyntaxKind GetAssignmentExpressionKind(SyntaxKind tokenKind) => tokenKind switch
         {
             SyntaxKind.EqualsToken => SyntaxKind.SimpleAssignmentExpression,
             SyntaxKind.PlusEqualsToken => SyntaxKind.AddAssignmentExpression,

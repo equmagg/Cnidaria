@@ -178,6 +178,7 @@ namespace Cnidaria.Cs
                 BoundUnaryExpression e => RewriteUnaryExpression(e),
                 BoundBinaryExpression e => RewriteBinaryExpression(e),
                 BoundConditionalExpression e => RewriteConditionalExpression(e),
+                BoundUnboundCollectionExpression e => e,
                 BoundAssignmentExpression e => RewriteAssignmentExpression(e),
                 BoundCompoundAssignmentExpression e => RewriteCompoundAssignmentExpression(e),
                 BoundNullCoalescingAssignmentExpression e => RewriteNullCoalescingAssignmentExpression(e),
@@ -382,15 +383,22 @@ namespace Cnidaria.Cs
         protected virtual BoundExpression RewriteIsPatternExpression(BoundIsPatternExpression node)
         {
             var operand = RewriteExpression(node.Operand);
-            if (!ReferenceEquals(operand, node.Operand))
+            var constant = node.ConstantOpt is null ? null : RewriteExpression(node.ConstantOpt);
+
+            if (!ReferenceEquals(operand, node.Operand) ||
+                !ReferenceEquals(constant, node.ConstantOpt))
             {
                 return new BoundIsPatternExpression(
-                    node.Syntax,
-                    operand,
-                    node.PatternType,
-                    node.DeclaredLocalOpt,
-                    node.Type,
-                    node.IsDiscard);
+                    syntax: node.Syntax,
+                    operand: operand,
+                    boolType: node.Type,
+                    patternKind: node.PatternKind,
+                    patternTypeOpt: node.PatternTypeOpt,
+                    constantOpt: constant,
+                    comparisonTypeOpt: node.ComparisonTypeOpt,
+                    declaredLocalOpt: node.DeclaredLocalOpt,
+                    isDiscard: node.IsDiscard,
+                    isNegated: node.IsNegated);
             }
 
             return node;
@@ -6338,6 +6346,11 @@ namespace Cnidaria.Cs
                             CollectReadLocals(implicitObjectCreation.Arguments[i], locals);
                         return;
 
+                    case BoundUnboundCollectionExpression collectionExpression:
+                        for (int i = 0; i < collectionExpression.Elements.Length; i++)
+                            CollectReadLocals(collectionExpression.Elements[i].Expression, locals);
+                        return;
+
                     case BoundSequenceExpression sequence:
                         for (int i = 0; i < sequence.SideEffects.Length; i++)
                             CollectReadLocals(sequence.SideEffects[i], locals);
@@ -6570,6 +6583,11 @@ namespace Cnidaria.Cs
                             CollectWrittenLocals(implicitObjectCreation.Arguments[i], locals);
                         return;
 
+                    case BoundUnboundCollectionExpression collectionExpression:
+                        for (int i = 0; i < collectionExpression.Elements.Length; i++)
+                            CollectWrittenLocals(collectionExpression.Elements[i].Expression, locals);
+                        return;
+
                     case BoundIndexerAccessExpression indexerAccess:
                         CollectWrittenLocals(indexerAccess.Receiver, locals);
                         for (int i = 0; i < indexerAccess.Arguments.Length; i++)
@@ -6728,6 +6746,11 @@ namespace Cnidaria.Cs
                     case BoundUnboundImplicitObjectCreationExpression implicitObjectCreation:
                         for (int i = 0; i < implicitObjectCreation.Arguments.Length; i++)
                             CollectAddressExposedLocals(implicitObjectCreation.Arguments[i], locals);
+                        return;
+
+                    case BoundUnboundCollectionExpression collectionExpression:
+                        for (int i = 0; i < collectionExpression.Elements.Length; i++)
+                            CollectAddressExposedLocals(collectionExpression.Elements[i].Expression, locals);
                         return;
 
                     case BoundSequenceExpression sequence:

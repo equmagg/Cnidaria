@@ -27,7 +27,7 @@ namespace Cnidaria.Cs
         System_String,
         System_Single,
         System_Double,
-        System_Decimal, 
+        System_Decimal,
         System_IntPtr,
         System_UIntPtr,
         System_Exception,
@@ -128,7 +128,7 @@ namespace Cnidaria.Cs
             or ConversionKind.NullLiteral
             || (Kind == ConversionKind.UserDefined && UserDefinedIsImplicit);
 
-        public Conversion(ConversionKind kind) 
+        public Conversion(ConversionKind kind)
         {
             Kind = kind;
             UserDefinedMethod = null;
@@ -174,12 +174,12 @@ namespace Cnidaria.Cs
             Message = message;
             Location = location;
         }
-        public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span==default(TextSpan) ? "" : $"[{Location}])")}";
+        public override string ToString() => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location}])")}";
         public string GetMessage() => this.ToString();
-        public string GetMessage(string souce) 
+        public string GetMessage(string souce)
             => $"{Id} {Severity}: {Message} {(Location.Span == default(TextSpan) ? "" : $"[{Location.ToString(souce)}])")}";
         public DiagnosticSeverity GetSeverity() => this.Severity;
-        
+
     }
     public readonly struct Optional<T>
     {
@@ -863,7 +863,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        public (MetadataImage md, Dictionary<int, BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
+        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildStackModule(
             string moduleName,
             SyntaxTree tree,
             bool includeCoreTypesInTypeDefs,
@@ -892,13 +892,13 @@ namespace Cnidaria.Cs
                 defaultExternalAssemblyName,
                 externalAssemblyResolver);
 
-            var functions = new Dictionary<int, BytecodeFunction>();
+            var functions = new Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction>();
 
             try
             {
                 if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
                     return (tokens.Image, functions, diagnostics, null);
-                void AddFn(BytecodeFunction fn)
+                void AddFn(Cnidaria.Cs.Stack.BytecodeFunction fn)
                 {
                     if (!functions.TryAdd(fn.MethodToken, fn))
                         throw new InvalidOperationException($"Duplicate bytecode for token 0x{fn.MethodToken:X8}");
@@ -914,7 +914,7 @@ namespace Cnidaria.Cs
                     }
 
                     var lowered = IRLowering.Rewrite(compilation, body, allowInlining, sharedInlineBodyCache);
-                    var emit = BytecodeEmitter.Emit(lowered, tokens);
+                    var emit = Cnidaria.Cs.Stack.BytecodeEmitter.Emit(lowered, tokens);
 
                     AddFn(emit.Entry);
                     foreach (var lf in emit.AdditionalMethods)
@@ -958,6 +958,118 @@ namespace Cnidaria.Cs
                 return (tokens.Image, functions, diagnostics, ex);
             }
 
+        }
+        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
+            string moduleName,
+            SyntaxTree tree,
+            bool includeCoreTypesInTypeDefs,
+            string defaultExternalAssemblyName,
+            Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
+            bool allowInlining = true,
+            bool print = false)
+        {
+            Compilation compilation = this;
+            var model = compilation.GetSemanticModel(tree);
+            var diagnostics = model.GetDiagnostics();
+            if (print && diagnostics.Length > 0)
+            {
+                foreach (var diagnostic in diagnostics)
+                    Console.WriteLine(diagnostic);
+            }
+            var rootNs = includeCoreTypesInTypeDefs
+                ? compilation.GlobalNamespace
+                : compilation.SourceGlobalNamespace;
+            var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
+            var tokens = new MetadataTokenProvider(
+                moduleName,
+                rootNs,
+                systemObject,
+                defaultExternalAssemblyName,
+                externalAssemblyResolver);
+
+            var functions = new Dictionary<int, Cnidaria.Cs.BytecodeFunction>();
+
+            try
+            {
+                if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
+                    return (tokens.Image, functions, diagnostics, null);
+
+                void AddFn(Cnidaria.Cs.BytecodeFunction fn)
+                {
+                    if (!functions.TryAdd(fn.MethodToken, fn))
+                        throw new InvalidOperationException($"Duplicate flat bytecode for token 0x{fn.MethodToken:X8}");
+                }
+
+                var sharedInlineBodyCache =
+                    new Dictionary<MethodSymbol, BoundMethodBody>(ReferenceEqualityComparer<MethodSymbol>.Instance);
+                var emitExceptions = new List<Exception>();
+
+                void EmitBody(BoundMethodBody body)
+                {
+                    try
+                    {
+                        if (print)
+                        {
+                            string printedFull = Cnidaria.Cs.BoundTreePrinter.Print(body);
+                            Console.WriteLine(printedFull);
+                        }
+
+                        var lowered = IRLowering.Rewrite(compilation, body, allowInlining, sharedInlineBodyCache);
+                        var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens);
+
+                        AddFn(emit.Entry);
+                        foreach (var lf in emit.AdditionalMethods)
+                            AddFn(lf);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (print)
+                            Console.WriteLine($"flat emit failed for '{body.Method}': {ex}");
+                        emitExceptions.Add(new InvalidOperationException($"Flat bytecode emit failed for '{body.Method}'.", ex));
+                    }
+                }
+                if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
+                    cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
+                {
+                    EmitBody(topLevelBody);
+                }
+
+                foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
+                {
+                    var body = (BoundMethodBody)model.GetBoundNode(owner);
+                    EmitBody(body);
+                }
+
+                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(compilation, tree))
+                {
+                    int ctorTok = tokens.GetMethodToken(ctor);
+                    if (functions.ContainsKey(ctorTok))
+                        continue;
+
+                    var ret = new BoundReturnStatement(tree.Root, expression: null);
+                    var block = new BoundBlockStatement(tree.Root, ImmutableArray.Create<BoundStatement>(ret));
+                    var body = new BoundMethodBody(tree.Root, ctor, block);
+                    EmitBody(body);
+                }
+
+                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(compilation, tree))
+                {
+                    int cctorTok = tokens.GetMethodToken(cctor);
+                    if (functions.ContainsKey(cctorTok))
+                        continue;
+
+                    var body = BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor);
+                    EmitBody(body);
+                }
+
+                return (tokens.Image, functions, diagnostics, null);
+            }
+            catch (Exception ex)
+            {
+                if (print)
+                    Console.WriteLine(ex.Message);
+                return (tokens.Image, functions, diagnostics, ex);
+            }
         }
         private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
             Compilation compilation,
@@ -1121,7 +1233,7 @@ namespace Cnidaria.Cs
                         ms.IsStatic &&
                         ms.Parameters.Length == 0 &&
                         StringComparer.Ordinal.Equals(ms.Name, ".cctor") &&
-                        (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty)) 
+                        (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty))
                     {
                         yield return ms;
                     }
@@ -1248,7 +1360,7 @@ namespace Cnidaria.Cs
             ConvertedType = convertedType;
         }
     }
-    
+
 
 
 
@@ -1699,7 +1811,7 @@ namespace Cnidaria.Cs
 
             var valueExpr = new BoundParameterExpression(ownerSyntax, method.Parameters[0]);
             var assignExpr = new BoundAssignmentExpression(ownerSyntax, FieldAccess(isLValue: true), valueExpr);
-            var setBody = new BoundBlockStatement(ownerSyntax, 
+            var setBody = new BoundBlockStatement(ownerSyntax,
                 ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(ownerSyntax, assignExpr)));
             recorder.RecordBound(ownerSyntax, new BoundMethodBody(ownerSyntax, method, setBody));
         }
@@ -2000,7 +2112,7 @@ namespace Cnidaria.Cs
                         containers.Add(target);
                     }
                 }
-                
+
             }
 
             return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
@@ -2476,6 +2588,7 @@ namespace Cnidaria.Cs
         IncrementDecrement,
         Conditional,
         UnboundImplicitObjectCreation,
+        UnboundCollectionExpression,
         ObjectCreation,
         LabelExpression,
         ArrayInitializer,
@@ -2492,7 +2605,7 @@ namespace Cnidaria.Cs
         CheckedExpression,
         UncheckedExpression,
         ThrowExpression,
-        IsPatternExpression, 
+        IsPatternExpression,
         // Statements
         BadStatement,
         Block,
@@ -2516,7 +2629,7 @@ namespace Cnidaria.Cs
         TryStatement,
         CatchBlock,
         CheckedStatement,
-        UncheckedStatement, 
+        UncheckedStatement,
         FixedStatement,
         FixedInitializer,
     }
@@ -2527,8 +2640,8 @@ namespace Cnidaria.Cs
         public Symbol ContainingSymbol { get; }
         public IBindingRecorder Recorder { get; }
         public BindingContext(
-            Compilation compilation, 
-            SemanticModel semanticModel, 
+            Compilation compilation,
+            SemanticModel semanticModel,
             Symbol containingSymbol,
             IBindingRecorder recorder)
         {
@@ -2538,5 +2651,5 @@ namespace Cnidaria.Cs
             Recorder = recorder;
         }
     }
-    
+
 }

@@ -114,21 +114,23 @@ namespace Cnidaria.Cs
         public SeparatedSyntaxList(SyntaxNodeOrToken[] nodesAndSeparators)
             => _nodesAndSeparators = nodesAndSeparators ?? Array.Empty<SyntaxNodeOrToken>();
         public static SeparatedSyntaxList<T> Empty => new(Array.Empty<SyntaxNodeOrToken>());
+        private SyntaxNodeOrToken[] Items => _nodesAndSeparators ?? Array.Empty<SyntaxNodeOrToken>();
         public int Count
         {
             get
             {
-                int len = _nodesAndSeparators.Length;
+                var items = Items;
+                int len = items.Length;
                 if (len == 0) return 0;
 
-                if (_nodesAndSeparators[len - 1].IsToken)
+                if (items[len - 1].IsToken)
                     return len / 2;
 
                 return (len + 1) / 2;
             }
         }
 
-        public int SeparatorCount => _nodesAndSeparators.Length / 2;
+        public int SeparatorCount => Items.Length / 2;
 
         public T this[int index]
         {
@@ -137,8 +139,7 @@ namespace Cnidaria.Cs
                 if ((uint)index >= (uint)Count)
                     throw new ArgumentOutOfRangeException(nameof(index));
 
-                int i = index * 2;
-                return (T)_nodesAndSeparators[i].Node;
+                return (T)Items[index * 2].Node;
             }
         }
 
@@ -147,19 +148,18 @@ namespace Cnidaria.Cs
             if ((uint)index >= (uint)SeparatorCount)
                 throw new ArgumentOutOfRangeException(nameof(index));
 
-            int i = index * 2 + 1;
-            return _nodesAndSeparators[i].Token;
+            return Items[index * 2 + 1].Token;
         }
 
-        public SyntaxNodeOrToken[] GetWithSeparators() => _nodesAndSeparators;
+        public SyntaxNodeOrToken[] GetWithSeparators() => Items;
 
         public IEnumerator<T> GetEnumerator()
         {
-            // Only nodes are at even indices
-            for (int i = 0; i < _nodesAndSeparators.Length; i += 2)
+            var items = Items;
+            for (int i = 0; i < items.Length; i += 2)
             {
-                if (_nodesAndSeparators[i].IsNode)
-                    yield return (T)_nodesAndSeparators[i].Node;
+                if (items[i].IsNode)
+                    yield return (T)items[i].Node;
             }
         }
 
@@ -3092,6 +3092,17 @@ namespace Cnidaria.Cs
             : base(SyntaxKind.ElementAccessExpression, NodeSpan.From(expression.Span, argumentList.Span))
         {
             Expression = expression;
+            ArgumentList = argumentList;
+        }
+    }
+
+    public sealed class ImplicitElementAccessSyntax : ExpressionSyntax
+    {
+        public BracketedArgumentListSyntax ArgumentList { get; }
+
+        public ImplicitElementAccessSyntax(BracketedArgumentListSyntax argumentList)
+            : base(SyntaxKind.ImplicitElementAccess, argumentList.Span)
+        {
             ArgumentList = argumentList;
         }
     }

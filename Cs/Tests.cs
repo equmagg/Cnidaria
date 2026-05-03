@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -38,7 +39,6 @@ namespace Cnidaria.Cs
 
             return true;
         }
-
         internal static void RunTest(string source, string target)
         {
             using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
@@ -51,7 +51,20 @@ namespace Cnidaria.Cs
                 Assert(output, target);
             }
         }
-
+        internal static void RunTestExpectError(string source, string errorCode)
+        {
+            using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+            {
+                var (output, diagnostics, context) = Cnidaria.Cs.CSharp.Interpret(source, cts);
+                TestsRan++;
+                if (diagnostics.Count < 1 || diagnostics.Any((IDiagnostic x) => x is not Diagnostic) 
+                    || !diagnostics.Any(x => ((Diagnostic)x).Id == errorCode))
+                {
+                    TestsFailed++;
+                    FailedMessages.Add($"Test {TestsRan} failed: {output}, expected '{errorCode}'");
+                }
+            }
+        }
         internal static void RunAll()
         {
             // 1 arithmetic precedence
@@ -732,7 +745,26 @@ int Sum(params int[] items)
 }
 Console.WriteLine(Sum());
 ", "0");
-            
+            // 75 Postfix unary order
+            RunTest(@"
+int x = 1;
+x = x++;
+Console.WriteLine(x);
+", "1");
+            // 76 Prefix unary order
+            RunTest(@"
+int x = 1;
+x = ++x;
+Console.WriteLine(x);
+", "2");
+            // 77 assignment with side effect
+            RunTest(@"
+int i = 0;
+int[] a = new int[] { 10, 20 };
+a[i] = i++;
+Console.WriteLine(a[0] * 100 + a[1] * 10 + i);
+", "201");
+
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)
