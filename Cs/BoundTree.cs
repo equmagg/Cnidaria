@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace Cnidaria.Cs
@@ -713,12 +714,13 @@ namespace Cnidaria.Cs
     {
         public override BoundNodeKind Kind => BoundNodeKind.This;
         public NamedTypeSymbol ContainingType { get; }
-
-        public BoundThisExpression(ExpressionSyntax syntax, NamedTypeSymbol containingType)
+        public override bool IsLValue { get; }
+        public BoundThisExpression(ExpressionSyntax syntax, NamedTypeSymbol containingType, bool isLValue = false)
             : base(syntax)
         {
             ContainingType = containingType;
             Type = containingType;
+            IsLValue = isLValue;
         }
     }
     internal sealed class BoundBaseExpression : BoundExpression

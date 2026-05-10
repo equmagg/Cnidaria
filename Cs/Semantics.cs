@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -863,7 +863,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildStackModule(
+        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
             string moduleName,
             SyntaxTree tree,
             bool includeCoreTypesInTypeDefs,
@@ -892,19 +892,17 @@ namespace Cnidaria.Cs
                 defaultExternalAssemblyName,
                 externalAssemblyResolver);
 
-            var functions = new Dictionary<int, Cnidaria.Cs.Stack.BytecodeFunction>();
+            var functions = new Dictionary<int, Cnidaria.Cs.BytecodeFunction>();
 
             try
             {
                 if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
                     return (tokens.Image, functions, diagnostics, null);
-                void AddFn(Cnidaria.Cs.Stack.BytecodeFunction fn)
+                void AddFn(Cnidaria.Cs.BytecodeFunction fn)
                 {
                     if (!functions.TryAdd(fn.MethodToken, fn))
                         throw new InvalidOperationException($"Duplicate bytecode for token 0x{fn.MethodToken:X8}");
                 }
-                var sharedInlineBodyCache =
-                    new Dictionary<MethodSymbol, BoundMethodBody>(ReferenceEqualityComparer<MethodSymbol>.Instance);
                 void EmitBody(BoundMethodBody body)
                 {
                     if (print)
@@ -913,8 +911,8 @@ namespace Cnidaria.Cs
                         Console.WriteLine(printedFull);
                     }
 
-                    var lowered = IRLowering.Rewrite(compilation, body, allowInlining, sharedInlineBodyCache);
-                    var emit = Cnidaria.Cs.Stack.BytecodeEmitter.Emit(lowered, tokens);
+                    var lowered = IRLowering.Rewrite(compilation, body);
+                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens);
 
                     AddFn(emit.Entry);
                     foreach (var lf in emit.AdditionalMethods)
@@ -959,118 +957,7 @@ namespace Cnidaria.Cs
             }
 
         }
-        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
-            string moduleName,
-            SyntaxTree tree,
-            bool includeCoreTypesInTypeDefs,
-            string defaultExternalAssemblyName,
-            Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
-            bool allowInlining = true,
-            bool print = false)
-        {
-            Compilation compilation = this;
-            var model = compilation.GetSemanticModel(tree);
-            var diagnostics = model.GetDiagnostics();
-            if (print && diagnostics.Length > 0)
-            {
-                foreach (var diagnostic in diagnostics)
-                    Console.WriteLine(diagnostic);
-            }
-            var rootNs = includeCoreTypesInTypeDefs
-                ? compilation.GlobalNamespace
-                : compilation.SourceGlobalNamespace;
-            var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
-            var tokens = new MetadataTokenProvider(
-                moduleName,
-                rootNs,
-                systemObject,
-                defaultExternalAssemblyName,
-                externalAssemblyResolver);
-
-            var functions = new Dictionary<int, Cnidaria.Cs.BytecodeFunction>();
-
-            try
-            {
-                if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
-                    return (tokens.Image, functions, diagnostics, null);
-
-                void AddFn(Cnidaria.Cs.BytecodeFunction fn)
-                {
-                    if (!functions.TryAdd(fn.MethodToken, fn))
-                        throw new InvalidOperationException($"Duplicate flat bytecode for token 0x{fn.MethodToken:X8}");
-                }
-
-                var sharedInlineBodyCache =
-                    new Dictionary<MethodSymbol, BoundMethodBody>(ReferenceEqualityComparer<MethodSymbol>.Instance);
-                var emitExceptions = new List<Exception>();
-
-                void EmitBody(BoundMethodBody body)
-                {
-                    try
-                    {
-                        if (print)
-                        {
-                            string printedFull = Cnidaria.Cs.BoundTreePrinter.Print(body);
-                            Console.WriteLine(printedFull);
-                        }
-
-                        var lowered = IRLowering.Rewrite(compilation, body, allowInlining, sharedInlineBodyCache);
-                        var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens);
-
-                        AddFn(emit.Entry);
-                        foreach (var lf in emit.AdditionalMethods)
-                            AddFn(lf);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (print)
-                            Console.WriteLine($"flat emit failed for '{body.Method}': {ex}");
-                        emitExceptions.Add(new InvalidOperationException($"Flat bytecode emit failed for '{body.Method}'.", ex));
-                    }
-                }
-                if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
-                    cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
-                {
-                    EmitBody(topLevelBody);
-                }
-
-                foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
-                {
-                    var body = (BoundMethodBody)model.GetBoundNode(owner);
-                    EmitBody(body);
-                }
-
-                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(compilation, tree))
-                {
-                    int ctorTok = tokens.GetMethodToken(ctor);
-                    if (functions.ContainsKey(ctorTok))
-                        continue;
-
-                    var ret = new BoundReturnStatement(tree.Root, expression: null);
-                    var block = new BoundBlockStatement(tree.Root, ImmutableArray.Create<BoundStatement>(ret));
-                    var body = new BoundMethodBody(tree.Root, ctor, block);
-                    EmitBody(body);
-                }
-
-                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(compilation, tree))
-                {
-                    int cctorTok = tokens.GetMethodToken(cctor);
-                    if (functions.ContainsKey(cctorTok))
-                        continue;
-
-                    var body = BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor);
-                    EmitBody(body);
-                }
-
-                return (tokens.Image, functions, diagnostics, null);
-            }
-            catch (Exception ex)
-            {
-                if (print)
-                    Console.WriteLine(ex.Message);
-                return (tokens.Image, functions, diagnostics, ex);
-            }
-        }
+        
         private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
             Compilation compilation,
             SyntaxTree tree,
@@ -2042,6 +1929,7 @@ namespace Cnidaria.Cs
             var staticTypes = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
 
             AddImplicitUsing(compilation, containers, "System");
+            AddImplicitUsing(compilation, containers, "System.Numerics");
             AddImplicitUsing(compilation, containers, "System.Collections");
             AddImplicitUsing(compilation, containers, "System.Collections.Generic");
             AddImplicitUsing(compilation, containers, "System.Runtime.CompilerServices");

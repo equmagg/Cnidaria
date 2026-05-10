@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -5515,6 +5516,12 @@ namespace Cnidaria.Cs
             if (element.IsReferenceType)
                 return element;
 
+            if (element is TypeParameterSymbol tp)
+            {
+                if ((tp.GenericConstraint & GenericConstraintsFlags.StructConstraint) == 0)
+                    return element;
+            }
+
             if (!element.IsValueType)
             {
                 diagnostics.Add(new Diagnostic(
@@ -6472,6 +6479,23 @@ namespace Cnidaria.Cs
                 : base(syntax)
             {
                 Type = type;
+                ConstantValueOpt = Optional<object>.None;
+            }
+        }
+        private sealed class BoundOutDiscardExpression : BoundExpression
+        {
+            public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
+
+            public TypeSymbol? ExplicitElementTypeOpt { get; }
+
+            public BoundOutDiscardExpression(
+                ExpressionSyntax syntax,
+                TypeSymbol type,
+                TypeSymbol? explicitElementTypeOpt)
+                : base(syntax)
+            {
+                Type = type;
+                ExplicitElementTypeOpt = explicitElementTypeOpt;
                 ConstantValueOpt = Optional<object>.None;
             }
         }
@@ -7493,8 +7517,8 @@ namespace Cnidaria.Cs
 
             if (type.IsReferenceType || type is ArrayTypeSymbol || type is PointerTypeSymbol || type is ByRefTypeSymbol)
             {
-                size = Cnidaria.Cs.RuntimeTypeSystem.PointerSize;
-                align = Cnidaria.Cs.RuntimeTypeSystem.PointerSize;
+                size = Cnidaria.Cs.TargetArchitecture.PointerSize;
+                align = Cnidaria.Cs.TargetArchitecture.PointerSize;
                 return true;
             }
 
@@ -7589,8 +7613,8 @@ namespace Cnidaria.Cs
                     size = 16; align = 8; return true;
                 case SpecialType.System_IntPtr:
                 case SpecialType.System_UIntPtr:
-                    size = Cnidaria.Cs.RuntimeTypeSystem.PointerSize;
-                    align = Cnidaria.Cs.RuntimeTypeSystem.PointerSize;
+                    size = Cnidaria.Cs.TargetArchitecture.PointerSize;
+                    align = Cnidaria.Cs.TargetArchitecture.PointerSize;
                     return true;
             }
 
@@ -10549,6 +10573,11 @@ namespace Cnidaria.Cs
                 expr = BindOutDeclarationExpressionAsLValue(de, context, diagnostics);
                 expr = Record(de, expr, context);
             }
+            else if (node is ThisExpressionSyntax @this)
+            {
+                expr = BindThisAsLValue(@this, context, diagnostics);
+                expr = Record(@this, expr, context);
+            }
             else if (node is MemberAccessExpressionSyntax ma)
             {
                 expr = BindMemberAccess(ma, BindValueKind.LValue, context, diagnostics);
@@ -10598,6 +10627,9 @@ namespace Cnidaria.Cs
             if (expr.HasErrors)
                 return expr;
 
+            if (expr is BoundOutDiscardExpression)
+                return expr;
+
             if (expr.IsLValue)
                 return expr;
 
@@ -10608,6 +10640,57 @@ namespace Cnidaria.Cs
 
             return new BoundBadExpression(node);
         }
+        private BoundExpression BindThisAsLValue(
+            ThisExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (context.ContainingSymbol is not MethodSymbol method)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_THIS000",
+                    DiagnosticSeverity.Error,
+                    "The 'this' keyword is only valid in instance members.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                return new BoundBadExpression(node);
+            }
+
+            if (!method.IsConstructor || method.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_THIS001",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to 'this' outside an instance constructor.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                return new BoundBadExpression(node);
+            }
+
+            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_THIS002",
+                    DiagnosticSeverity.Error,
+                    "Cannot resolve containing type for 'this'.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                return new BoundBadExpression(node);
+            }
+
+            if (!containingType.IsValueType)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_ASG_THIS002",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to 'this' in a reference type constructor.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                return new BoundBadExpression(node);
+            }
+
+            return new BoundThisExpression(node, containingType, isLValue: true);
+        }
         private BoundExpression BindOutDeclarationExpressionAsLValue(
             DeclarationExpressionSyntax de,
             BindingContext context,
@@ -10615,13 +10698,21 @@ namespace Cnidaria.Cs
         {
             if (de.Designation is DiscardDesignationSyntax)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_OUTDECL000",
-                    DiagnosticSeverity.Error,
-                    "Discard designation in out-argument is not implemented.",
-                    new Location(context.SemanticModel.SyntaxTree, de.Span)));
+                if (IsVar(de.Type))
+                {
+                    return new BoundOutDiscardExpression(
+                        de,
+                        context.Compilation.GetSpecialType(SpecialType.System_Void),
+                        explicitElementTypeOpt: null);
+                }
 
-                return new BoundBadExpression(de);
+                var explicitElementType = BindType(de.Type, context, diagnostics);
+                var explicitByRefType = context.Compilation.CreateByRefType(explicitElementType);
+
+                return new BoundOutDiscardExpression(
+                    de,
+                    explicitByRefType,
+                    explicitElementTypeOpt: explicitElementType);
             }
 
             if (de.Designation is not SingleVariableDesignationSyntax sv)
@@ -10827,20 +10918,50 @@ namespace Cnidaria.Cs
                 return BindExpression(argSyntax.Expression, context, diagnostics);
             }
 
-            if (rk.Kind == SyntaxKind.RefKeyword || rk.Kind == SyntaxKind.OutKeyword || rk.Kind == SyntaxKind.InKeyword)
-                return BindByRefCallArgument(argSyntax, isReadOnlyPass: rk.Kind == SyntaxKind.InKeyword, context, diagnostics);
+            if (rk.Kind is SyntaxKind.RefKeyword or SyntaxKind.OutKeyword or SyntaxKind.InKeyword)
+            {
+                return BindByRefCallArgument(
+                    argSyntax,
+                    argRefKind: rk.Kind switch
+                    {
+                        SyntaxKind.RefKeyword => ParameterRefKind.Ref,
+                        SyntaxKind.OutKeyword => ParameterRefKind.Out,
+                        SyntaxKind.InKeyword => ParameterRefKind.In,
+                        _ => ParameterRefKind.None
+                    },
+                    context,
+                    diagnostics);
+            }    
+                
 
             return BindExpression(argSyntax.Expression, context, diagnostics);
         }
 
         private BoundExpression BindByRefCallArgument(
             ArgumentSyntax argSyntax,
-            bool isReadOnlyPass,
+            ParameterRefKind argRefKind,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
+            bool isOutArgument = argRefKind == ParameterRefKind.Out;
+            bool isReadOnlyPass = argRefKind == ParameterRefKind.In;
+
+            if (isOutArgument && argSyntax.Expression is IdentifierNameSyntax id 
+                && string.Equals(id.Identifier.ValueText, "_", StringComparison.Ordinal))
+            {
+                if (!IsNameDeclaredInEnclosingScopes("_"))
+                {
+                    return new BoundOutDiscardExpression(
+                        argSyntax.Expression,
+                        context.Compilation.GetSpecialType(SpecialType.System_Void),
+                        explicitElementTypeOpt: null);
+                }
+            }
+
             var operand = BindAssignableValue(argSyntax.Expression, context, diagnostics);
             if (operand.HasErrors)
+                return operand;
+            if (operand is BoundOutDiscardExpression)
                 return operand;
 
             if (operand is BoundLocalExpression bl && bl.Local.IsConst)
@@ -10863,6 +10984,7 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, argSyntax.Expression.Span)));
                 return new BoundBadExpression(argSyntax);
             }
+
             if (!isReadOnlyPass && IsReadOnlyLocalTarget(operand))
             {
                 diagnostics.Add(new Diagnostic(
@@ -10872,6 +10994,7 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, argSyntax.Expression.Span)));
                 return new BoundBadExpression(argSyntax);
             }
+
             if (!isReadOnlyPass &&
                 operand is BoundParameterExpression pe &&
                 pe.Parameter.IsReadOnlyRef &&
@@ -15126,7 +15249,7 @@ namespace Cnidaria.Cs
             {
                 SpecialType.System_Int32 or SpecialType.System_UInt32 => 0x1F,
                 SpecialType.System_Int64 or SpecialType.System_UInt64 => 0x3F,
-                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 ? 0x1F : 0x3F,
+                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? 0x1F : 0x3F,
                 _ => 0x1F
             };
             shift &= mask;
@@ -15177,7 +15300,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case SpecialType.System_IntPtr:
-                    if (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 && lv is int ni32)
+                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 && lv is int ni32)
                         return new Optional<object>(op switch
                         {
                             BoundBinaryOperatorKind.LeftShift => unchecked(ni32 << shift),
@@ -15185,7 +15308,7 @@ namespace Cnidaria.Cs
                             BoundBinaryOperatorKind.UnsignedRightShift => (int)((uint)ni32 >> shift),
                             _ => 0
                         });
-                    if (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 8 && (lv is long or int))
+                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 8 && (lv is long or int))
                     {
                         long ni64 = lv is long l ? l : (int)lv;
                         return new Optional<object>(op switch
@@ -15199,14 +15322,14 @@ namespace Cnidaria.Cs
                     break;
 
                 case SpecialType.System_UIntPtr:
-                    if (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 && lv is uint nu32)
+                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 && lv is uint nu32)
                         return new Optional<object>(op switch
                         {
                             BoundBinaryOperatorKind.LeftShift => unchecked(nu32 << shift),
                             BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => nu32 >> shift,
                             _ => 0u
                         });
-                    if (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 8 && (lv is ulong or uint))
+                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 8 && (lv is ulong or uint))
                     {
                         ulong nu64 = lv is ulong ul ? ul : (uint)lv;
                         return new Optional<object>(op switch
@@ -15369,6 +15492,27 @@ namespace Cnidaria.Cs
         {
             var ls = left.Type.SpecialType;
             var rs = right.Type.SpecialType;
+
+            bool IsNativeInt(SpecialType t) =>
+                t is SpecialType.System_IntPtr or SpecialType.System_UIntPtr;
+
+            if (IsNativeInt(ls) || IsNativeInt(rs))
+            {
+                var nativeExpr = IsNativeInt(ls) ? left : right;
+                var otherExpr = ReferenceEquals(nativeExpr, left) ? right : left;
+                var nativeType = nativeExpr.Type;
+
+                var conv = ClassifyConversion(otherExpr, nativeType);
+
+                if (conv.Kind == ConversionKind.ImplicitConstant)
+                    return nativeType;
+
+                if (nativeType.SpecialType == SpecialType.System_UIntPtr &&
+                    conv.Kind == ConversionKind.ImplicitNumeric)
+                {
+                    return nativeType;
+                }
+            }
 
             if (ls == SpecialType.System_UInt64 || rs == SpecialType.System_UInt64)
             {
@@ -18685,6 +18829,19 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
+            if (expr is BoundOutDiscardExpression discard)
+            {
+                var converted = MaterializeOutDiscard(
+                    exprSyntax,
+                    discard,
+                    targetType,
+                    diagnosticNode,
+                    context,
+                    diagnostics);
+
+                context.Recorder.RecordBound(exprSyntax, converted);
+                return converted;
+            }
             // Target typed new expression
             if (exprSyntax is ImplicitObjectCreationExpressionSyntax ioc)
             {
@@ -18859,6 +19016,55 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
+        }
+        private BoundExpression MaterializeOutDiscard(
+            ExpressionSyntax exprSyntax,
+            BoundOutDiscardExpression discard,
+            TypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (targetType is not ByRefTypeSymbol targetByRef)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OUTDISCARD001",
+                    DiagnosticSeverity.Error,
+                    "An out discard can only be converted to a by-ref parameter type.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                var bad = new BoundBadExpression(exprSyntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            var elementType = targetByRef.ElementType;
+
+            if (discard.ExplicitElementTypeOpt is not null &&
+                !AreSameType(discard.ExplicitElementTypeOpt, elementType))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OUTDISCARD002",
+                    DiagnosticSeverity.Error,
+                    $"Cannot pass discard of type '{discard.ExplicitElementTypeOpt.Name}' to an out parameter of type '{elementType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, exprSyntax.Span)));
+
+                var bad = new BoundBadExpression(exprSyntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            var temp = NewTemp("$out_discard", elementType);
+            var tempRef = new BoundRefExpression(
+                exprSyntax,
+                targetType,
+                new BoundLocalExpression(exprSyntax, temp));
+
+            return new BoundSequenceExpression(
+                exprSyntax,
+                locals: ImmutableArray.Create(temp),
+                sideEffects: ImmutableArray<BoundStatement>.Empty,
+                value: tempRef);
         }
         private BoundExpression LowerNullableConversion(
             ExpressionSyntax exprSyntax,
@@ -20300,6 +20506,8 @@ namespace Cnidaria.Cs
         }
         private Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, BindingContext context)
         {
+            if (expr is BoundOutDiscardExpression discard)
+                return ClassifyOutDiscardConversion(discard, target);
             if (expr is BoundUnboundImplicitObjectCreationExpression unbound)
                 return CanBindTargetTypedObjectCreation(unbound, target, context)
                     ? new Conversion(ConversionKind.Identity)
@@ -20498,6 +20706,9 @@ namespace Cnidaria.Cs
         }
         internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target)
         {
+            if (expr is BoundOutDiscardExpression discard)
+                return ClassifyOutDiscardConversion(discard, target);
+
             if (AreSameType(expr.Type, target))
                 return new Conversion(ConversionKind.Identity);
 
@@ -20751,11 +20962,11 @@ namespace Cnidaria.Cs
                 SpecialType.System_Int64 => (long.MinValue, long.MaxValue, true),
                 SpecialType.System_UInt64 => (0m, (decimal)ulong.MaxValue, true),
                 SpecialType.System_IntPtr =>
-                    (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 ? int.MinValue : long.MinValue,
-                    Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 ? int.MaxValue : long.MaxValue, true),
+                    (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? int.MinValue : long.MinValue,
+                    Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? int.MaxValue : long.MaxValue, true),
                 SpecialType.System_UIntPtr =>
-                    (Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 ? uint.MinValue : ulong.MinValue,
-                    Cnidaria.Cs.RuntimeTypeSystem.PointerSize == 4 ? uint.MaxValue : ulong.MaxValue, true),
+                    (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? uint.MinValue : ulong.MinValue,
+                    Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? uint.MaxValue : ulong.MaxValue, true),
                 _ => (0m, 0m, false)
             };
 
@@ -20831,7 +21042,18 @@ namespace Cnidaria.Cs
                 };
             }
         }
+        private static Conversion ClassifyOutDiscardConversion(BoundOutDiscardExpression discard, TypeSymbol target)
+        {
+            if (target is not ByRefTypeSymbol targetByRef)
+                return new Conversion(ConversionKind.None);
 
+            if (discard.ExplicitElementTypeOpt is null)
+                return new Conversion(ConversionKind.Identity);
+
+            return AreSameType(discard.ExplicitElementTypeOpt, targetByRef.ElementType)
+                ? new Conversion(ConversionKind.Identity)
+                : new Conversion(ConversionKind.None);
+        }
         private static bool ImplementsInterface(TypeSymbol source, TypeSymbol destinationInterface)
         {
             var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);

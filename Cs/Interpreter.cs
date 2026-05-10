@@ -2,222 +2,73 @@
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Cnidaria.Cs
 {
-    public sealed class ExecutionLimits
-    {
-        public int MaxCallDepth { get; init; } = 128;
-        public long MaxInstructions { get; init; } = 100_000_000;
-        public int TokenCheckPeriod { get; init; } = 256;
-    }
-
-    internal enum CellKind : byte
-    {
-        I4,
-        I8,
-        R8,
-        Ref,
-        Ptr,
-        ByRef,
-        Value,
-        Null
-    }
-
-    internal readonly struct Cell
-    {
-        public readonly CellKind Kind;
-        public readonly long Payload;
-        public readonly int Aux;
-
-        public Cell(CellKind kind, long payload, int aux = 0)
-        {
-            Kind = kind;
-            Payload = payload;
-            Aux = aux;
-        }
-
-        public int AsI4()
-        {
-            return Kind switch
-            {
-                CellKind.I4 => unchecked((int)Payload),
-                CellKind.I8 => checked((int)Payload),
-                CellKind.R8 => checked((int)BitConverter.Int64BitsToDouble(Payload)),
-                CellKind.Null => 0,
-                _ => throw new InvalidOperationException($"Expected integer cell, got {Kind}.")
-            };
-        }
-
-        public long AsI8()
-        {
-            return Kind switch
-            {
-                CellKind.I8 => Payload,
-                CellKind.I4 => unchecked((int)Payload),
-                CellKind.R8 => checked((long)BitConverter.Int64BitsToDouble(Payload)),
-                CellKind.Null => 0,
-                _ => throw new InvalidOperationException($"Expected integer cell, got {Kind}.")
-            };
-        }
-
-        public double AsR8()
-        {
-            return Kind switch
-            {
-                CellKind.R8 => BitConverter.Int64BitsToDouble(Payload),
-                CellKind.I4 => unchecked((int)Payload),
-                CellKind.I8 => Payload,
-                _ => throw new InvalidOperationException($"Expected numeric cell, got {Kind}.")
-            };
-        }
-
-        public bool AsBool()
-        {
-            return Kind switch
-            {
-                CellKind.Null => false,
-                CellKind.Ref or CellKind.Ptr or CellKind.ByRef => Payload != 0,
-                CellKind.R8 => BitConverter.Int64BitsToDouble(Payload) != 0.0,
-                CellKind.I8 => Payload != 0,
-                CellKind.I4 => unchecked((int)Payload) != 0,
-                CellKind.Value => true,
-                _ => false
-            };
-        }
-
-        public static Cell Null => new(CellKind.Null, 0);
-        public static Cell I4(int value) => new(CellKind.I4, value);
-        public static Cell I8(long value) => new(CellKind.I8, value);
-        public static Cell R8(double value) => new(CellKind.R8, BitConverter.DoubleToInt64Bits(value));
-        public static Cell Ref(int value) => value == 0 ? Null : new Cell(CellKind.Ref, value);
-        public static Cell Ptr(int value, int elementSize = 1) => new(CellKind.Ptr, value, elementSize);
-        public static Cell ByRef(int value, int size = 1) => new(CellKind.ByRef, value, size);
-    }
-
-    internal sealed class Vm
+    internal sealed class RegisterBasedVm
     {
         internal sealed class VmUnhandledException : Exception
         {
-            public VmUnhandledException(string message) : base(message) { }
-        }
-
-        private sealed class VmThrownException : Exception
-        {
-            public readonly Cell ExceptionObject;
-            public VmThrownException(Cell exceptionObject)
+            public string ManagedStackTrace { get; }
+            public VmUnhandledException(string message) : base(message)
             {
-                ExceptionObject = exceptionObject;
+                ManagedStackTrace = string.Empty;
+            }
+            public VmUnhandledException(string message, string managedStackTrace)
+                : base(string.IsNullOrEmpty(managedStackTrace) ? message : message + Environment.NewLine + managedStackTrace)
+            {
+                ManagedStackTrace = managedStackTrace ?? string.Empty;
             }
         }
 
-        private enum FastCellKind : byte
+        private enum PendingContinuationKind : byte
         {
             None,
-            I4,
-            I8,
-            R4,
-            R8,
-            NativeInt,
-            NativeUInt
-        }
-
-        private enum FinallyContinuationKind : byte
-        {
-            Jump,
+            Leave,
             Return,
-            Throw
+            Throw,
+            ReturnFloat,
         }
 
-        private readonly struct FinallyContext
-        {
-            public readonly Frame Frame;
-            public readonly int FinallyStartPc;
-            public readonly int FinallyEndPc;
-            public readonly int NextFromPc;
-            public readonly FinallyContinuationKind Kind;
-            public readonly int TargetPc;
-            public readonly bool HasReturnValue;
-            public readonly Cell ReturnValue;
-            public readonly Cell PendingException;
-
-            private FinallyContext(Frame frame, int finallyStartPc, int finallyEndPc, int nextFromPc, FinallyContinuationKind kind, int targetPc, bool hasReturnValue, Cell returnValue, Cell pendingException)
-            {
-                Frame = frame;
-                FinallyStartPc = finallyStartPc;
-                FinallyEndPc = finallyEndPc;
-                NextFromPc = nextFromPc;
-                Kind = kind;
-                TargetPc = targetPc;
-                HasReturnValue = hasReturnValue;
-                ReturnValue = returnValue;
-                PendingException = pendingException;
-            }
-
-            public static FinallyContext ForJump(Frame frame, ExceptionHandler h, int targetPc)
-                => new(frame, h.HandlerStartPc, h.HandlerEndPc, h.TryEndPc, FinallyContinuationKind.Jump, targetPc, false, default, default);
-
-            public static FinallyContext ForReturn(Frame frame, ExceptionHandler h, bool hasReturnValue, Cell returnValue)
-                => new(frame, h.HandlerStartPc, h.HandlerEndPc, h.TryEndPc, FinallyContinuationKind.Return, -1, hasReturnValue, returnValue, default);
-
-            public static FinallyContext ForThrow(Frame frame, ExceptionHandler h, Cell exception)
-                => new(frame, h.HandlerStartPc, h.HandlerEndPc, h.TryEndPc, FinallyContinuationKind.Throw, -1, false, default, exception);
-        }
-
-        private sealed class MethodExecLayout
-        {
-            public RuntimeMethod Method = null!;
-            public RuntimeType[] ArgTypes = Array.Empty<RuntimeType>();
-            public int[] ArgOffsets = Array.Empty<int>();
-            public int[] ArgSizes = Array.Empty<int>();
-            public FastCellKind[] ArgFastKinds = Array.Empty<FastCellKind>();
-            public bool[] ArgAddressTaken = Array.Empty<bool>();
-            public bool[] ArgCellCached = Array.Empty<bool>();
-            public bool HasArgCellCache;
-            public int ArgsAreaSize;
-            public RuntimeType[] LocalTypes = Array.Empty<RuntimeType>();
-            public int[] LocalOffsets = Array.Empty<int>();
-            public int[] LocalSizes = Array.Empty<int>();
-            public FastCellKind[] LocalFastKinds = Array.Empty<FastCellKind>();
-            public bool[] LocalAddressTaken = Array.Empty<bool>();
-            public bool[] LocalCellCached = Array.Empty<bool>();
-            public bool HasLocalCellCache;
-            public int LocalsAreaSize;
-        }
-
-        private sealed class Frame
-        {
-            public RuntimeModule Module = null!;
-            public BytecodeFunction Function = null!;
-            public RuntimeMethod Method = null!;
-            public RuntimeType[] ValueTypes = Array.Empty<RuntimeType>();
-            public MethodExecLayout Layout = null!;
-            public int ArgsBase;
-            public int LocalsBase;
-            public int FrameBase;
-            public int Pc;
-            public Cell[] ArgCells = Array.Empty<Cell>();
-            public Cell[] LocalCells = Array.Empty<Cell>();
-            public Cell[] Values = Array.Empty<Cell>();
-            public FastCellKind[] ValueFastKinds = Array.Empty<FastCellKind>();
-            public int ValuesBase;
-            public int[] ValueOffsets = Array.Empty<int>();
-            public int[] ValueSizes = Array.Empty<int>();
-            public Cell Exception;
-        }
-
+        private const int GprCount = 32;
+        private const int FprCount = 32;
+        private const int HeapBlockAlignment = 8;
+        private const int BlockHeaderSize = 8;
+        private const int BlockSizeOffset = 0;
+        private const int BlockMetaOffset = 4;
+        private const int BlockMetaObject = 1;
+        private const int BlockMetaRaw = 2;
         private const int ObjectHeaderSize = 8;
-        private const int ArrayLengthOffset = ObjectHeaderSize;
-        private const int ArrayDataOffset = 16;
-        private const int StringLengthOffset = ObjectHeaderSize;
-        private const int StringCharsOffset = 12;
-        private const int FinallyCatchTypeToken = -1;
+        private const int GcFlagMark = 1 << 0;
         private const int GcFlagAllocated = 1 << 1;
+        private const int ArrayLengthOffset = ObjectHeaderSize;
+        private const int ArrayDataOffset = ObjectHeaderSize + 8;
+        private const int StringLengthOffset = ObjectHeaderSize;
+        private const int StringCharsOffset = ObjectHeaderSize + 4;
+        private const int MaxCallFramesHard = 4096;
+
+        private const int ShadowFrameSize = 88;
+        private const int ShadowFrameCallerSp = 0;
+        private const int ShadowFrameCallerFp = 8;
+        private const int ShadowFrameContinuationI0 = 16;
+        private const int ShadowFrameContinuationF0 = 24;
+        private const int ShadowFrameAllocaSp = 32;
+        private const int ShadowFrameIncomingStackArgBase = 40;
+        private const int ShadowFramePostReturnObjectRef = 48;
+        private const int ShadowFrameMethodIndex = 56;
+        private const int ShadowFrameReturnPc = 60;
+        private const int ShadowFrameCallerMethodIndex = 64;
+        private const int ShadowFrameContinuationTargetPc = 68;
+        private const int ShadowFramePackedFlags = 72;
+        private const int ShadowFrameIncomingTargetMethodId = 76;
+        private const int ShadowFrameRegisterSnapshotIndex = 80;
+        private const int ShadowFrameSafePointPc = 84;
+        private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
+        private const int ShadowFrameContinuationKindShift = 16;
+        private const int ShadowFramePostReturnRegisterShift = 24;
 
         private readonly byte[] _mem;
         private readonly int _staticEnd;
@@ -225,3690 +76,4280 @@ namespace Cnidaria.Cs
         private readonly int _stackEnd;
         private readonly int _heapBase;
         private readonly int _heapEnd;
+        private readonly RuntimeTypeSystem _rts;
+        private readonly Dictionary<string, RuntimeModule> _modules;
+        private readonly TextWriter _textWriter;
+        private readonly CodeImage _image;
+        private readonly long[] _x = new long[GprCount];
+        private readonly long[] _f = new long[FprCount];
+        private int _frameStackTop;
+        private int _frameStackPeakTop;
+        private int _frameCount;
+        private readonly Dictionary<int, RuntimeField> _fieldById;
+        private readonly Dictionary<int, int> _staticBaseByTypeId = new Dictionary<int, int>();
+        private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly Dictionary<int, byte> _typeInitState = new Dictionary<int, byte>();
+        private readonly List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
+        private int _gcMarkHead;
+
         private int _heapPtr;
         private int _heapFloor;
-        private int _sp;
-        private int _stackPeakAbs;
-        private int _heapPeakAbs;
-        private readonly Domain _domain;
-        private readonly RuntimeTypeSystem _rts;
-        private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
-        private readonly TextWriter _textWriter;
-        private readonly Dictionary<int, int> _staticBaseByTypeId = new();
-        private readonly Dictionary<int, byte> _typeInitState = new();
-        private readonly Dictionary<string, int> _internPool = new(StringComparer.Ordinal);
-        private readonly Dictionary<int, HostOverride> _hostOverrides = new();
-        private readonly VmCallContext _hostCtx;
-        private readonly Dictionary<int, MethodExecLayout> _methodLayouts = new();
-        private readonly List<FinallyContext> _finallyStack = new();
-        private int _exceptionTranslationDepth;
-        private Frame? _currentFrame;
+        private int _allocDebtBytes;
+        private bool _gcRunning;
+        private int _pc;
+        private int _currentMethodIndex = -1;
+        private int _currentSafePointPc = -1;
         private long _fuel;
-        private long _instructionLimit;
         private int _tick;
-        private int _callDepth;
+        private long _instructionsElapsed;
+        private int _stackLowWatermark;
+        private int _heapPeakAbs;
+        private int _currentExceptionRef;
+        private int _currentExceptionThrowMethodIndex = -1;
+        private int _currentExceptionThrowPc = -1;
+        private CallFlags _activeCallFlags;
+        private RuntimeMethod? _activeCallTargetMethod;
 
-        public int StackPeakBytes => _stackPeakAbs - _stackBase;
+        private readonly struct RegisterSnapshot
+        {
+            public readonly long[] General;
+            public readonly long[] Float;
+
+            public RegisterSnapshot(long[] general, long[] @float)
+            {
+                General = general;
+                Float = @float;
+            }
+        }
+
+        private readonly struct GprStorageLocation
+        {
+            public const byte CurrentRegister = 0;
+            public const byte StackSlot = 1;
+            public const byte Snapshot = 2;
+
+            public readonly byte Kind;
+            public readonly int Address;
+            public readonly int SnapshotIndex;
+
+            public GprStorageLocation(byte kind, int address = 0, int snapshotIndex = -1)
+            {
+                Kind = kind;
+                Address = address;
+                SnapshotIndex = snapshotIndex;
+            }
+        }
+
+        public long InctructionsElapsed => _instructionsElapsed;
+        public long InstructionsElapsed => _instructionsElapsed;
+        public int StackPeakBytes => (_stackEnd - _stackLowWatermark) + (_frameStackPeakTop - _stackBase);
         public int HeapPeakBytes => _heapPeakAbs - _heapBase;
-        public long InctructionsElapsed => _instructionLimit - _fuel;
 
-        public Vm(
+        public RegisterBasedVm(
             byte[] memory,
             int staticEnd,
             int stackBase,
             int stackEnd,
-            Domain domain,
             RuntimeTypeSystem rts,
-            IReadOnlyDictionary<string, RuntimeModule> modules,
-            TextWriter textWriter)
+            Dictionary<string, RuntimeModule> modules,
+            CodeImage image,
+            TextWriter? textWriter = null)
         {
             _mem = memory ?? throw new ArgumentNullException(nameof(memory));
             _staticEnd = staticEnd;
             _stackBase = stackBase;
             _stackEnd = stackEnd;
-            _sp = stackBase;
-            _stackPeakAbs = _sp;
-            _heapBase = AlignUp(stackEnd, 8);
-            _heapEnd = _mem.Length;
-            _heapPtr = _heapBase;
-            _heapFloor = _heapPtr;
-            _heapPeakAbs = _heapPtr;
-            _domain = domain ?? throw new ArgumentNullException(nameof(domain));
             _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
+            _image = image ?? throw new ArgumentNullException(nameof(image));
             _textWriter = textWriter ?? TextWriter.Null;
-            _hostCtx = new VmCallContext(this);
 
-            if (!(0 <= _staticEnd && _staticEnd <= _stackBase && _stackBase <= _stackEnd && _stackEnd <= _mem.Length && _heapBase <= _heapEnd))
-                throw new ArgumentOutOfRangeException(nameof(memory), "Bad VM memory layout.");
+            if (!(0 <= staticEnd && staticEnd <= stackBase && stackBase < stackEnd && stackEnd <= memory.Length))
+                throw new ArgumentOutOfRangeException(nameof(stackEnd), "Bad VM memory layout.");
+
+            _heapBase = AlignBlockStart(stackEnd);
+            _heapEnd = memory.Length;
+            if (_heapBase > _heapEnd)
+                throw new ArgumentOutOfRangeException(nameof(memory), "Heap region is empty or invalid.");
+
+            _heapPtr = _heapBase;
+            _heapFloor = _heapBase;
+            _heapPeakAbs = _heapBase;
+            _stackLowWatermark = stackEnd;
+            _frameStackTop = stackBase;
+            _frameStackPeakTop = stackBase;
+            X(MachineRegister.X0, 0);
+            X(MachineRegisters.StackPointer, stackEnd);
+            X(MachineRegisters.FramePointer, stackEnd);
+            X(MachineRegisters.ThreadPointer, 0);
+            _fieldById = BuildFieldIdMap(rts);
         }
 
-        public void Execute(RuntimeModule entryModule, BytecodeFunction entry, CancellationToken ct, ExecutionLimits limits, ReadOnlySpan<Cell> initialArgs = default)
+        public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits)
         {
-            if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
-            if (entry is null) throw new ArgumentNullException(nameof(entry));
+            if (entryMethod is null) throw new ArgumentNullException(nameof(entryMethod));
             if (limits is null) throw new ArgumentNullException(nameof(limits));
 
-            _instructionLimit = limits.MaxInstructions;
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(entryMethod.MethodId, out int entryIndex))
+                throw new MissingMethodException("Entry method is not present in register code image: M" + entryMethod.MethodId);
+
             _fuel = limits.MaxInstructions;
             _tick = 0;
-            _callDepth = 0;
+            _instructionsElapsed = 0;
+            _stackLowWatermark = _stackEnd;
+            _frameStackPeakTop = _stackBase;
+            _heapPeakAbs = _heapPtr;
+            _currentExceptionRef = 0;
+            _currentExceptionThrowMethodIndex = -1;
+            _currentExceptionThrowPc = -1;
+            _currentSafePointPc = -1;
+            _frameCount = 0;
+            _frameStackTop = _stackBase;
+            _frameStackPeakTop = _stackBase;
+            _registerSnapshots.Clear();
+            _gcMarkHead = 0;
+            _allocDebtBytes = 0;
+            _gcRunning = false;
+            _pc = _image.Methods[entryIndex].EntryPc;
+            _currentMethodIndex = entryIndex;
+            PushFrame(
+                entryIndex,
+                -1,
+                -1,
+                X(MachineRegisters.StackPointer),
+                X(MachineRegisters.FramePointer),
+                CallFlags.None,
+                -1,
+                0);
+            X(MachineRegisters.ThreadPointer, 0);
 
-            var method = ResolveRuntimeMethod(entryModule, entry.MethodToken, null);
-            var args = initialArgs.IsEmpty ? Array.Empty<Cell>() : initialArgs.ToArray();
-            try
+            Run(ct, limits);
+        }
+
+        private void Run(CancellationToken ct, ExecutionLimits limits)
+        {
+            int tokenCheckPeriod = Math.Max(1, limits.TokenCheckPeriod);
+            var code = _image.Code;
+            int codeLength = code.Length;
+
+            while (_currentMethodIndex >= 0)
             {
-                _ = Invoke(entryModule, entry, method, args, ct, limits, allowMissingArgs: initialArgs.IsEmpty);
-            }
-            catch (VmThrownException ex)
-            {
-                throw new VmUnhandledException(FormatThrownException(ex.ExceptionObject));
+                if (--_fuel < 0)
+                    throw new OperationCanceledException("Instruction budget exceeded.");
+
+                _instructionsElapsed++;
+                if (++_tick >= tokenCheckPeriod)
+                {
+                    _tick = 0;
+                    ct.ThrowIfCancellationRequested();
+                }
+
+                if ((uint)_pc >= (uint)codeLength)
+                    throw new InvalidOperationException($"PC out of code range: {_pc}");
+
+                int executingPc = _pc;
+                InstrDesc ins = code[executingPc];
+                _pc = executingPc + 1;
+                _currentSafePointPc = executingPc;
+
+                if ((IsRegisterVmStaticFieldInstruction(ins.Op) || ins.Op == Op.NewObj) &&
+                    TryDeferRequiredTypeInitializationBeforeInstruction(ins, executingPc, ct, limits))
+                    continue;
+
+                try
+                {
+                    switch (ins.Op)
+                    {
+                        case Op.Nop:
+                            break;
+                        case Op.Break:
+                            break;
+                        case Op.Trap:
+                            throw new InvalidOperationException($"Register VM trap at PC {executingPc}");
+                        case Op.GcPoll:
+                            ct.ThrowIfCancellationRequested();
+                            MaybeCollectGarbage();
+                            break;
+
+                        case Op.J:
+                            _pc = CheckedTarget(ins.Imm);
+                            break;
+                        case Op.Leave:
+                            Leave(executingPc, CheckedTarget(ins.Imm));
+                            break;
+                        case Op.EndFinally:
+                            EndFinally();
+                            break;
+                        case Op.Throw:
+                            ThrowManaged(GetGpr(ins.Rs1), executingPc, preserveExistingThrowSite: false);
+                            break;
+                        case Op.Rethrow:
+                            ThrowManaged(_currentExceptionRef, executingPc, preserveExistingThrowSite: true);
+                            break;
+                        case Op.LdExceptionRef:
+                            SetGpr(ins.Rd, _currentExceptionRef);
+                            break;
+
+                        case Op.RetVoid:
+                            ReturnFromCurrentFrame(hasInteger: false, hasFloat: false, hasRef: false, hasValue: false, valueSize: 0);
+                            break;
+                        case Op.RetI:
+                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: false, hasValue: false, valueSize: 0);
+                            break;
+                        case Op.RetF:
+                            SetFpr(MachineRegisters.FloatReturnValue0, GetFprBits(ins.Rs1));
+                            ReturnFromCurrentFrame(hasInteger: false, hasFloat: true, hasRef: false, hasValue: false, valueSize: 0);
+                            break;
+                        case Op.RetRef:
+                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: true, hasValue: false, valueSize: 0);
+                            break;
+                        case Op.RetValue:
+                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: false, hasValue: true, valueSize: checked((int)ins.Imm));
+                            break;
+
+                        case Op.SwitchI32:
+                            Switch((int)GetGpr(ins.Rs1), ins);
+                            break;
+                        case Op.SwitchI64:
+                            Switch(GetGpr(ins.Rs1), ins);
+                            break;
+
+                        case Op.BrTrueI32:
+                            if ((int)GetGpr(ins.Rs1) != 0) _pc = CheckedTarget(ins.Imm);
+                            break;
+                        case Op.BrFalseI32:
+                            if ((int)GetGpr(ins.Rs1) == 0) _pc = CheckedTarget(ins.Imm);
+                            break;
+                        case Op.BrTrueI64:
+                        case Op.BrTrueRef:
+                            if (GetGpr(ins.Rs1) != 0) _pc = CheckedTarget(ins.Imm);
+                            break;
+                        case Op.BrFalseI64:
+                        case Op.BrFalseRef:
+                            if (GetGpr(ins.Rs1) == 0) _pc = CheckedTarget(ins.Imm);
+                            break;
+
+                        case Op.BrI32Eq: if ((int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI32Ne: if ((int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI32Lt: if ((int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI32Le: if ((int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI32Gt: if ((int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI32Ge: if ((int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU32Lt: if ((uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU32Le: if ((uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU32Gt: if ((uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU32Ge: if ((uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Eq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Ne: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Lt: if (GetGpr(ins.Rs1) < GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Le: if (GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Gt: if (GetGpr(ins.Rs1) > GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrI64Ge: if (GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU64Lt: if ((ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU64Le: if ((ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU64Gt: if ((ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrU64Ge: if ((ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrRefEq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrRefNe: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Eq: if (F32(ins.Rs1) == F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Ne: if (F32(ins.Rs1) != F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Lt: if (F32(ins.Rs1) < F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Le: if (F32(ins.Rs1) <= F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Gt: if (F32(ins.Rs1) > F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF32Ge: if (F32(ins.Rs1) >= F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Eq: if (F64(ins.Rs1) == F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Ne: if (F64(ins.Rs1) != F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Lt: if (F64(ins.Rs1) < F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Le: if (F64(ins.Rs1) <= F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Gt: if (F64(ins.Rs1) > F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                        case Op.BrF64Ge: if (F64(ins.Rs1) >= F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+
+                        case Op.MovI:
+                        case Op.MovRef:
+                        case Op.MovPtr:
+                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                            break;
+                        case Op.MovF:
+                            SetFpr(ins.Rd, GetFprBits(ins.Rs1));
+                            break;
+                        case Op.LiI32:
+                            SetGpr(ins.Rd, (int)ins.Imm);
+                            break;
+                        case Op.LiI64:
+                            SetGpr(ins.Rd, ins.Imm);
+                            break;
+                        case Op.LiF32Bits:
+                            SetFpr(ins.Rd, (uint)(int)ins.Imm);
+                            break;
+                        case Op.LiF64Bits:
+                            SetFpr(ins.Rd, ins.Imm);
+                            break;
+                        case Op.LiNull:
+                            SetGpr(ins.Rd, 0);
+                            break;
+                        case Op.LiString:
+                            SetGpr(ins.Rd, InternString(CurrentModule().Md.GetUserString(checked((int)ins.Imm))));
+                            break;
+                        case Op.LiTypeHandle:
+                        case Op.LiMethodHandle:
+                        case Op.LiFieldHandle:
+                            SetGpr(ins.Rd, ins.Imm);
+                            break;
+                        case Op.LiStaticBase:
+                            SetGpr(ins.Rd, EnsureStaticStorage(_rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+
+                        case Op.I32Add: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32Sub: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32Mul: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32Div: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) / (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Rem: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) % (int)GetGpr(ins.Rs2)); break;
+                        case Op.U32Div: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) / (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.U32Rem: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) % (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.I32Neg: SetI32(ins.Rd, unchecked(-(int)GetGpr(ins.Rs1))); break;
+                        case Op.I32AddOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32SubOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32MulOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
+                        case Op.U32AddOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) + (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.U32SubOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) - (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.U32MulOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) * (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.I32And: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Or: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Xor: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Not: SetI32(ins.Rd, ~(int)GetGpr(ins.Rs1)); break;
+                        case Op.I32Shl: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 31)); break;
+                        case Op.I32Shr: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)); break;
+                        case Op.U32Shr: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)))); break;
+                        case Op.I32Rol: SetI32(ins.Rd, BitOperationsRotateLeft((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
+                        case Op.I32Ror: SetI32(ins.Rd, BitOperationsRotateRight((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
+                        case Op.I32Eq: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Ne: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Lt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Le: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Gt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)); break;
+                        case Op.I32Ge: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)); break;
+                        case Op.U32Lt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)); break;
+                        case Op.U32Le: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)); break;
+                        case Op.U32Gt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)); break;
+                        case Op.U32Ge: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)); break;
+                        case Op.I32Min: SetI32(ins.Rd, Math.Min((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
+                        case Op.I32Max: SetI32(ins.Rd, Math.Max((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
+                        case Op.U32Min: SetI32(ins.Rd, unchecked((int)Math.Min((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
+                        case Op.U32Max: SetI32(ins.Rd, unchecked((int)Math.Max((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
+
+                        case Op.I32AddImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)ins.Imm)); break;
+                        case Op.I32SubImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)ins.Imm)); break;
+                        case Op.I32MulImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)ins.Imm)); break;
+                        case Op.I32AndImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)ins.Imm); break;
+                        case Op.I32OrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)ins.Imm); break;
+                        case Op.I32XorImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)ins.Imm); break;
+                        case Op.I32ShlImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)ins.Imm & 31)); break;
+                        case Op.I32ShrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)); break;
+                        case Op.U32ShrImm: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)))); break;
+                        case Op.I32EqImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)ins.Imm); break;
+                        case Op.I32NeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)ins.Imm); break;
+                        case Op.I32LtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)ins.Imm); break;
+                        case Op.I32LeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)ins.Imm); break;
+                        case Op.I32GtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)ins.Imm); break;
+                        case Op.I32GeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)ins.Imm); break;
+                        case Op.U32LtImm: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)(int)ins.Imm); break;
+
+                        case Op.I64Add: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
+                        case Op.I64Sub: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
+                        case Op.I64Mul: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
+                        case Op.I64Div: SetGpr(ins.Rd, GetGpr(ins.Rs1) / GetGpr(ins.Rs2)); break;
+                        case Op.I64Rem: SetGpr(ins.Rd, GetGpr(ins.Rs1) % GetGpr(ins.Rs2)); break;
+                        case Op.U64Div: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) / (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.U64Rem: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) % (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.I64Neg: SetGpr(ins.Rd, unchecked(-GetGpr(ins.Rs1))); break;
+                        case Op.I64AddOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
+                        case Op.I64SubOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
+                        case Op.I64MulOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
+                        case Op.U64AddOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) + (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.U64SubOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) - (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.U64MulOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) * (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.I64And: SetGpr(ins.Rd, GetGpr(ins.Rs1) & GetGpr(ins.Rs2)); break;
+                        case Op.I64Or: SetGpr(ins.Rd, GetGpr(ins.Rs1) | GetGpr(ins.Rs2)); break;
+                        case Op.I64Xor: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ GetGpr(ins.Rs2)); break;
+                        case Op.I64Not: SetGpr(ins.Rd, ~GetGpr(ins.Rs1)); break;
+                        case Op.I64Shl: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 63)); break;
+                        case Op.I64Shr: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)); break;
+                        case Op.U64Shr: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)))); break;
+                        case Op.I64Rol: SetGpr(ins.Rd, RotateLeft(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
+                        case Op.I64Ror: SetGpr(ins.Rd, RotateRight(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
+                        case Op.I64Eq: SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2)); break;
+                        case Op.I64Ne: SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2)); break;
+                        case Op.I64Lt: SetBool(ins.Rd, GetGpr(ins.Rs1) < GetGpr(ins.Rs2)); break;
+                        case Op.I64Le: SetBool(ins.Rd, GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)); break;
+                        case Op.I64Gt: SetBool(ins.Rd, GetGpr(ins.Rs1) > GetGpr(ins.Rs2)); break;
+                        case Op.I64Ge: SetBool(ins.Rd, GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)); break;
+                        case Op.U64Lt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)); break;
+                        case Op.U64Le: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)); break;
+                        case Op.U64Gt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)); break;
+                        case Op.U64Ge: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)); break;
+                        case Op.I64Min: SetGpr(ins.Rd, Math.Min(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
+                        case Op.I64Max: SetGpr(ins.Rd, Math.Max(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
+                        case Op.U64Min: SetGpr(ins.Rd, unchecked((long)Math.Min((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
+                        case Op.U64Max: SetGpr(ins.Rd, unchecked((long)Math.Max((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
+
+                        case Op.I64AddImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + ins.Imm)); break;
+                        case Op.I64SubImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - ins.Imm)); break;
+                        case Op.I64MulImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * ins.Imm)); break;
+                        case Op.I64AndImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) & ins.Imm); break;
+                        case Op.I64OrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) | ins.Imm); break;
+                        case Op.I64XorImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ ins.Imm); break;
+                        case Op.I64ShlImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)ins.Imm & 63)); break;
+                        case Op.I64ShrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)); break;
+                        case Op.U64ShrImm: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)))); break;
+                        case Op.I64EqImm: SetBool(ins.Rd, GetGpr(ins.Rs1) == ins.Imm); break;
+                        case Op.I64NeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) != ins.Imm); break;
+                        case Op.I64LtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) < ins.Imm); break;
+                        case Op.I64LeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) <= ins.Imm); break;
+                        case Op.I64GtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) > ins.Imm); break;
+                        case Op.I64GeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) >= ins.Imm); break;
+                        case Op.U64LtImm: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)ins.Imm); break;
+
+                        case Op.F32Add: SetF32(ins.Rd, F32(ins.Rs1) + F32(ins.Rs2)); break;
+                        case Op.F32Sub: SetF32(ins.Rd, F32(ins.Rs1) - F32(ins.Rs2)); break;
+                        case Op.F32Mul: SetF32(ins.Rd, F32(ins.Rs1) * F32(ins.Rs2)); break;
+                        case Op.F32Div: SetF32(ins.Rd, F32(ins.Rs1) / F32(ins.Rs2)); break;
+                        case Op.F32Rem: SetF32(ins.Rd, F32(ins.Rs1) % F32(ins.Rs2)); break;
+                        case Op.F32Neg: SetF32(ins.Rd, -F32(ins.Rs1)); break;
+                        case Op.F32Abs: SetF32(ins.Rd, MathF.Abs(F32(ins.Rs1))); break;
+                        case Op.F32Eq: SetBool(ins.Rd, F32(ins.Rs1) == F32(ins.Rs2)); break;
+                        case Op.F32Ne: SetBool(ins.Rd, F32(ins.Rs1) != F32(ins.Rs2)); break;
+                        case Op.F32Lt: SetBool(ins.Rd, F32(ins.Rs1) < F32(ins.Rs2)); break;
+                        case Op.F32Le: SetBool(ins.Rd, F32(ins.Rs1) <= F32(ins.Rs2)); break;
+                        case Op.F32Gt: SetBool(ins.Rd, F32(ins.Rs1) > F32(ins.Rs2)); break;
+                        case Op.F32Ge: SetBool(ins.Rd, F32(ins.Rs1) >= F32(ins.Rs2)); break;
+                        case Op.F32Min: SetF32(ins.Rd, MathF.Min(F32(ins.Rs1), F32(ins.Rs2))); break;
+                        case Op.F32Max: SetF32(ins.Rd, MathF.Max(F32(ins.Rs1), F32(ins.Rs2))); break;
+                        case Op.F32IsNaN: SetBool(ins.Rd, float.IsNaN(F32(ins.Rs1))); break;
+                        case Op.F32IsFinite: SetBool(ins.Rd, !float.IsNaN(F32(ins.Rs1)) && !float.IsInfinity(F32(ins.Rs1))); break;
+                        case Op.F64Add: SetF64(ins.Rd, F64(ins.Rs1) + F64(ins.Rs2)); break;
+                        case Op.F64Sub: SetF64(ins.Rd, F64(ins.Rs1) - F64(ins.Rs2)); break;
+                        case Op.F64Mul: SetF64(ins.Rd, F64(ins.Rs1) * F64(ins.Rs2)); break;
+                        case Op.F64Div: SetF64(ins.Rd, F64(ins.Rs1) / F64(ins.Rs2)); break;
+                        case Op.F64Rem: SetF64(ins.Rd, F64(ins.Rs1) % F64(ins.Rs2)); break;
+                        case Op.F64Neg: SetF64(ins.Rd, -F64(ins.Rs1)); break;
+                        case Op.F64Abs: SetF64(ins.Rd, Math.Abs(F64(ins.Rs1))); break;
+                        case Op.F64Eq: SetBool(ins.Rd, F64(ins.Rs1) == F64(ins.Rs2)); break;
+                        case Op.F64Ne: SetBool(ins.Rd, F64(ins.Rs1) != F64(ins.Rs2)); break;
+                        case Op.F64Lt: SetBool(ins.Rd, F64(ins.Rs1) < F64(ins.Rs2)); break;
+                        case Op.F64Le: SetBool(ins.Rd, F64(ins.Rs1) <= F64(ins.Rs2)); break;
+                        case Op.F64Gt: SetBool(ins.Rd, F64(ins.Rs1) > F64(ins.Rs2)); break;
+                        case Op.F64Ge: SetBool(ins.Rd, F64(ins.Rs1) >= F64(ins.Rs2)); break;
+                        case Op.F64Min: SetF64(ins.Rd, Math.Min(F64(ins.Rs1), F64(ins.Rs2))); break;
+                        case Op.F64Max: SetF64(ins.Rd, Math.Max(F64(ins.Rs1), F64(ins.Rs2))); break;
+                        case Op.F64IsNaN: SetBool(ins.Rd, double.IsNaN(F64(ins.Rs1))); break;
+                        case Op.F64IsFinite: SetBool(ins.Rd, !double.IsNaN(F64(ins.Rs1)) && !double.IsInfinity(F64(ins.Rs1))); break;
+
+                        case Op.I32ToI64: SetGpr(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                        case Op.U32ToI64: SetGpr(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                        case Op.I64ToI32: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1))); break;
+                        case Op.I64ToI32Ovf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1))); break;
+                        case Op.U64ToI32Ovf: SetI32(ins.Rd, checked((int)(ulong)GetGpr(ins.Rs1))); break;
+                        case Op.I32ToF32: SetF32(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                        case Op.I32ToF64: SetF64(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                        case Op.U32ToF32: SetF32(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                        case Op.U32ToF64: SetF64(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                        case Op.I64ToF32: SetF32(ins.Rd, GetGpr(ins.Rs1)); break;
+                        case Op.I64ToF64: SetF64(ins.Rd, GetGpr(ins.Rs1)); break;
+                        case Op.U64ToF32: SetF32(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
+                        case Op.U64ToF64: SetF64(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
+                        case Op.F32ToF64: SetF64(ins.Rd, F32(ins.Rs1)); break;
+                        case Op.F64ToF32: SetF32(ins.Rd, (float)F64(ins.Rs1)); break;
+                        case Op.F32ToI32: SetI32(ins.Rd, unchecked((int)F32(ins.Rs1))); break;
+                        case Op.F32ToI64: SetGpr(ins.Rd, unchecked((long)F32(ins.Rs1))); break;
+                        case Op.F64ToI32: SetI32(ins.Rd, unchecked((int)F64(ins.Rs1))); break;
+                        case Op.F64ToI64: SetGpr(ins.Rd, unchecked((long)F64(ins.Rs1))); break;
+                        case Op.F32ToI32Ovf: SetI32(ins.Rd, checked((int)F32(ins.Rs1))); break;
+                        case Op.F32ToI64Ovf: SetGpr(ins.Rd, checked((long)F32(ins.Rs1))); break;
+                        case Op.F64ToI32Ovf: SetI32(ins.Rd, checked((int)F64(ins.Rs1))); break;
+                        case Op.F64ToI64Ovf: SetGpr(ins.Rd, checked((long)F64(ins.Rs1))); break;
+                        case Op.BitcastI32F32: SetFpr(ins.Rd, (uint)(int)GetGpr(ins.Rs1)); break;
+                        case Op.BitcastF32I32: SetI32(ins.Rd, unchecked((int)(uint)GetFprBits(ins.Rs1))); break;
+                        case Op.BitcastI64F64: SetFpr(ins.Rd, GetGpr(ins.Rs1)); break;
+                        case Op.BitcastF64I64: SetGpr(ins.Rd, GetFprBits(ins.Rs1)); break;
+                        case Op.SignExtendI8ToI32: SetI32(ins.Rd, (sbyte)(int)GetGpr(ins.Rs1)); break;
+                        case Op.SignExtendI16ToI32: SetI32(ins.Rd, (short)(int)GetGpr(ins.Rs1)); break;
+                        case Op.ZeroExtendI8ToI32: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
+                        case Op.ZeroExtendI16ToI32: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
+                        case Op.TruncI32ToI8: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
+                        case Op.TruncI32ToI16: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
+
+                        case Op.LdI1: SetI32(ins.Rd, (sbyte)ReadU8(EA(ins))); break;
+                        case Op.LdU1: SetI32(ins.Rd, ReadU8(EA(ins))); break;
+                        case Op.LdI2: SetI32(ins.Rd, (short)ReadU16(EA(ins))); break;
+                        case Op.LdU2: SetI32(ins.Rd, ReadU16(EA(ins))); break;
+                        case Op.LdI4: SetI32(ins.Rd, ReadI32(EA(ins))); break;
+                        case Op.LdU4: SetGpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
+                        case Op.LdI8: SetGpr(ins.Rd, ReadI64(EA(ins))); break;
+                        case Op.LdN: SetGpr(ins.Rd, ReadNative(EA(ins))); break;
+                        case Op.LdF32: SetFpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
+                        case Op.LdF64: SetFpr(ins.Rd, ReadI64(EA(ins))); break;
+                        case Op.LdRef:
+                        case Op.LdPtr:
+                            SetGpr(ins.Rd, ReadNative(EA(ins)));
+                            break;
+                        case Op.LdAddr:
+                            SetGpr(ins.Rd, EA(ins));
+                            break;
+                        case Op.LdObj:
+                            throw new InvalidOperationException("LdObj requires a type/size-carrying opcode; use CpObj/CpBlk or typed field/array object load.");
+                        case Op.StI1: WriteU8(EA(ins), unchecked((byte)GetGpr(ins.Rd))); break;
+                        case Op.StI2: WriteU16(EA(ins), unchecked((ushort)GetGpr(ins.Rd))); break;
+                        case Op.StI4: WriteI32(EA(ins), (int)GetGpr(ins.Rd)); break;
+                        case Op.StI8: WriteI64(EA(ins), GetGpr(ins.Rd)); break;
+                        case Op.StN:
+                        case Op.StRef:
+                        case Op.StPtr:
+                            WriteNative(EA(ins), GetGpr(ins.Rd));
+                            break;
+                        case Op.StF32: WriteI32(EA(ins), unchecked((int)(uint)GetFprBits(ins.Rd))); break;
+                        case Op.StF64: WriteI64(EA(ins), GetFprBits(ins.Rd)); break;
+                        case Op.StObj:
+                            throw new InvalidOperationException("StObj requires a type/size-carrying opcode; use CpObj/CpBlk or typed field/array object store.");
+                        case Op.CpBlk:
+                            CopyBlock(GetAddress(ins.Rd), GetAddress(ins.Rs1), checked((int)ins.Imm));
+                            break;
+                        case Op.InitBlk:
+                            InitBlock(GetAddress(ins.Rd), checked((byte)GetGpr(ins.Rs1)), checked((int)ins.Imm));
+                            break;
+                        case Op.CpObj:
+                            CopyTypedObject(GetAddress(ins.Rd), GetAddress(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm)));
+                            break;
+                        case Op.NullCheck:
+                            if (GetGpr(ins.Rs1) == 0) throw new NullReferenceException();
+                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                            break;
+                        case Op.BoundsCheck:
+                            BoundsCheck((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2));
+                            break;
+                        case Op.WriteBarrier:
+                            break;
+                        case Op.LdFldAddr:
+                            SetGpr(ins.Rd, GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), writable: false));
+                            break;
+                        case Op.LdFldI1: LoadFieldInt(ins, 1, signed: true); break;
+                        case Op.LdFldU1: LoadFieldInt(ins, 1, signed: false); break;
+                        case Op.LdFldI2: LoadFieldInt(ins, 2, signed: true); break;
+                        case Op.LdFldU2: LoadFieldInt(ins, 2, signed: false); break;
+                        case Op.LdFldI4: SetI32(ins.Rd, ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                        case Op.LdFldU4: SetGpr(ins.Rd, (uint)ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                        case Op.LdFldI8:
+                        case Op.LdFldN:
+                        case Op.LdFldRef:
+                        case Op.LdFldPtr:
+                            SetGpr(ins.Rd, ReadSizedInteger(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false), FieldById(ins.Imm).FieldType));
+                            break;
+                        case Op.LdFldF32: SetFpr(ins.Rd, (uint)ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                        case Op.LdFldF64: SetFpr(ins.Rd, ReadI64(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                        case Op.LdFldObj:
+                            {
+                                RuntimeField field = FieldById(ins.Imm);
+                                CopyTypedObject(GetAddress(ins.Rd), GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false), field.FieldType);
+                                break;
+                            }
+                        case Op.StFldI1:
+                        case Op.StFldI2:
+                        case Op.StFldI4:
+                        case Op.StFldI8:
+                        case Op.StFldN:
+                        case Op.StFldRef:
+                        case Op.StFldPtr:
+                        case Op.StFldF32:
+                        case Op.StFldF64:
+                        case Op.StFldObj:
+                            StoreField(ins);
+                            break;
+
+                        case Op.LdSFldAddr:
+                            SetGpr(ins.Rd, GetStaticFieldAddress(FieldById(ins.Imm), false));
+                            break;
+                        case Op.LdSFldI1: LoadStaticFieldInt(ins, 1, signed: true); break;
+                        case Op.LdSFldU1: LoadStaticFieldInt(ins, 1, signed: false); break;
+                        case Op.LdSFldI2: LoadStaticFieldInt(ins, 2, signed: true); break;
+                        case Op.LdSFldU2: LoadStaticFieldInt(ins, 2, signed: false); break;
+                        case Op.LdSFldI4: SetI32(ins.Rd, ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
+                        case Op.LdSFldU4: SetGpr(ins.Rd, (uint)ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
+                        case Op.LdSFldI8:
+                        case Op.LdSFldN:
+                        case Op.LdSFldRef:
+                        case Op.LdSFldPtr:
+                            SetGpr(ins.Rd, ReadSizedInteger(GetStaticFieldAddress(FieldById(ins.Imm), false), FieldById(ins.Imm).FieldType));
+                            break;
+                        case Op.LdSFldF32: SetFpr(ins.Rd, (uint)ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
+                        case Op.LdSFldF64: SetFpr(ins.Rd, ReadI64(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
+                        case Op.LdSFldObj:
+                            {
+                                RuntimeField field = FieldById(ins.Imm);
+                                CopyTypedObject(GetAddress(ins.Rd), GetStaticFieldAddress(field, false), field.FieldType);
+                                break;
+                            }
+                        case Op.StSFldI1:
+                        case Op.StSFldI2:
+                        case Op.StSFldI4:
+                        case Op.StSFldI8:
+                        case Op.StSFldN:
+                        case Op.StSFldRef:
+                        case Op.StSFldPtr:
+                        case Op.StSFldF32:
+                        case Op.StSFldF64:
+                        case Op.StSFldObj:
+                            StoreStaticField(ins);
+                            break;
+
+                        case Op.LdLen:
+                            ValidateArrayRef(GetGpr(ins.Rs1), out int arrAbs, out _);
+                            SetI32(ins.Rd, ReadI32(arrAbs + ArrayLengthOffset));
+                            break;
+                        case Op.LdArrayDataAddr:
+                            ValidateArrayRef(GetGpr(ins.Rs1), out int dataArrAbs, out _);
+                            SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
+                            break;
+                        case Op.LdElemAddr:
+                            SetGpr(ins.Rd, GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), _rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+                        case Op.LdElemI1: LoadElemInt(ins, 1, true); break;
+                        case Op.LdElemU1: LoadElemInt(ins, 1, false); break;
+                        case Op.LdElemI2: LoadElemInt(ins, 2, true); break;
+                        case Op.LdElemU2: LoadElemInt(ins, 2, false); break;
+                        case Op.LdElemI4: SetI32(ins.Rd, ReadI32(ArrayEA(ins))); break;
+                        case Op.LdElemU4: SetGpr(ins.Rd, (uint)ReadI32(ArrayEA(ins))); break;
+                        case Op.LdElemI8:
+                        case Op.LdElemN:
+                        case Op.LdElemRef:
+                        case Op.LdElemPtr:
+                            SetGpr(ins.Rd, ReadNativeOrI64(ArrayEA(ins), ElementTypeOf(ins)));
+                            break;
+                        case Op.LdElemF32: SetFpr(ins.Rd, (uint)ReadI32(ArrayEA(ins))); break;
+                        case Op.LdElemF64: SetFpr(ins.Rd, ReadI64(ArrayEA(ins))); break;
+                        case Op.LdElemObj:
+                            {
+                                RuntimeType elem = ElementTypeOf(ins);
+                                CopyTypedObject(GetAddress(ins.Rd), ArrayEA(ins), elem);
+                                break;
+                            }
+                        case Op.StElemI1:
+                        case Op.StElemI2:
+                        case Op.StElemI4:
+                        case Op.StElemI8:
+                        case Op.StElemN:
+                        case Op.StElemRef:
+                        case Op.StElemPtr:
+                        case Op.StElemF32:
+                        case Op.StElemF64:
+                        case Op.StElemObj:
+                            StoreElement(ins);
+                            break;
+
+                        case Op.NewObj:
+                            ExecNewObj(ins, ct, limits);
+                            break;
+                        case Op.NewArr:
+                        case Op.NewSZArray:
+                            SetGpr(ins.Rd, AllocArray(_rts.GetTypeById(checked((int)ins.Imm)), (int)GetGpr(ins.Rs1)));
+                            break;
+                        case Op.FastAllocateString:
+                            SetGpr(ins.Rd, AllocStringUninitialized((int)GetGpr(ins.Rs1)));
+                            break;
+                        case Op.Box:
+                            SetGpr(ins.Rd, BoxValue(_rts.GetTypeById(checked((int)ins.Imm)), ins.Rs1));
+                            break;
+                        case Op.UnboxAddr:
+                            SetGpr(ins.Rd, UnboxAddress(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+                        case Op.UnboxAny:
+                            UnboxAny(ins);
+                            break;
+                        case Op.CastClass:
+                            SetGpr(ins.Rd, CastClass(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+                        case Op.IsInst:
+                            SetGpr(ins.Rd, IsInst(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+                        case Op.SizeOf:
+                            SetI32(ins.Rd, StorageSizeOf(_rts.GetTypeById(checked((int)ins.Imm))));
+                            break;
+                        case Op.InitObj:
+                            InitTypedObject(GetAddress(ins.Rd), _rts.GetTypeById(checked((int)ins.Imm)));
+                            break;
+                        case Op.DefaultValue:
+                            InitDefaultValue(ins);
+                            break;
+                        case Op.RefEq:
+                            SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2));
+                            break;
+                        case Op.RefNe:
+                            SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2));
+                            break;
+                        case Op.RuntimeTypeEquals:
+                            {
+                                long left = GetGpr(ins.Rs1);
+                                long right = GetGpr(ins.Rs2);
+                                SetBool(ins.Rd, left != 0 && right != 0 && GetObjectTypeFromRef(left).TypeId == GetObjectTypeFromRef(right).TypeId);
+                                break;
+                            }
+
+                        case Op.CallVoid:
+                        case Op.CallI:
+                        case Op.CallF:
+                        case Op.CallRef:
+                        case Op.CallValue:
+                        case Op.CallInternalVoid:
+                        case Op.CallInternalI:
+                        case Op.CallInternalF:
+                        case Op.CallInternalRef:
+                        case Op.CallInternalValue:
+                            ExecCall(ins, isVirtual: false, executingPc, ct, limits);
+                            break;
+                        case Op.CallVirtVoid:
+                        case Op.CallVirtI:
+                        case Op.CallVirtF:
+                        case Op.CallVirtRef:
+                        case Op.CallVirtValue:
+                        case Op.CallIfaceVoid:
+                        case Op.CallIfaceI:
+                        case Op.CallIfaceF:
+                        case Op.CallIfaceRef:
+                        case Op.CallIfaceValue:
+                            ExecCall(ins, isVirtual: true, executingPc, ct, limits);
+                            break;
+                        case Op.CallIndirectVoid:
+                        case Op.CallIndirectI:
+                        case Op.CallIndirectF:
+                        case Op.CallIndirectRef:
+                        case Op.CallIndirectValue:
+                        case Op.DelegateInvokeVoid:
+                        case Op.DelegateInvokeI:
+                        case Op.DelegateInvokeF:
+                        case Op.DelegateInvokeRef:
+                        case Op.DelegateInvokeValue:
+                            throw new NotSupportedException($"Indirect/delegate calls are not supported by this register VM backend yet at PC {executingPc}");
+
+                        case Op.StackAlloc:
+                            SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
+                            break;
+                        case Op.PtrAddI32:
+                        case Op.ByRefAddI32:
+                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + ((long)(int)GetGpr(ins.Rs2) * ins.Imm)));
+                            break;
+                        case Op.PtrAddI64:
+                        case Op.ByRefAddI64:
+                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + (GetGpr(ins.Rs2) * ins.Imm)));
+                            break;
+                        case Op.PtrSub:
+                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2)));
+                            break;
+                        case Op.PtrDiff:
+                            SetGpr(ins.Rd, (GetGpr(ins.Rs1) - GetGpr(ins.Rs2)) / Math.Max(1, ins.Imm));
+                            break;
+                        case Op.ByRefToPtr:
+                        case Op.PtrToByRef:
+                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                            break;
+                        default: throw new NotSupportedException($"Unsupported register VM opcode {ins.Op} at PC {executingPc}");
+                    }
+
+
+                }
+                catch (VmUnhandledException)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (!TryTranslateHostExceptionToManaged(ex, out int managedExceptionRef))
+                        throw;
+                    ThrowManaged(managedExceptionRef, executingPc, preserveExistingThrowSite: false);
+                }
             }
         }
 
-        private Cell Invoke(
-            RuntimeModule module,
-            BytecodeFunction fn,
-            RuntimeMethod method,
-            Cell[] args,
-            CancellationToken ct,
-            ExecutionLimits limits,
-            bool allowMissingArgs = false)
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopFrameOffset()
         {
-            if (++_callDepth > limits.MaxCallDepth)
-                throw new InvalidOperationException("Max call depth exceeded.");
+            if (_frameCount == 0) throw new InvalidOperationException("No current frame.");
+            return _frameStackTop - ShadowFrameSize;
+        }
 
-            var previousFrame = _currentFrame;
-            var frame = CreateFrame(module, fn, method, args, allowMissingArgs);
-            _currentFrame = frame;
-            Cell result = default;
-            byte[]? detachedValue = null;
-            RuntimeType? detachedType = null;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopMethodIndex()
+            => ReadI32(TopFrameOffset() + ShadowFrameMethodIndex);
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private RuntimeMethod MethodForIndex(int methodIndex)
+            => _rts.GetMethodById(_image.Methods[methodIndex].RuntimeMethodId);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private RuntimeMethod CurrentFrameMethod()
+            => MethodForIndex(TopMethodIndex());
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopReturnPc()
+            => ReadI32(TopFrameOffset() + ShadowFrameReturnPc);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopCallerMethodIndex()
+            => ReadI32(TopFrameOffset() + ShadowFrameCallerMethodIndex);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopCallerSp()
+            => ReadI64(TopFrameOffset() + ShadowFrameCallerSp);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopCallerFp()
+            => ReadI64(TopFrameOffset() + ShadowFrameCallerFp);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopPackedFlags()
+            => ReadI32(TopFrameOffset() + ShadowFramePackedFlags);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetTopPackedFlags(int value)
+            => WriteI32(TopFrameOffset() + ShadowFramePackedFlags, value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private CallFlags TopIncomingCallFlags()
+            => (CallFlags)(TopPackedFlags() & ShadowFrameCallFlagsMask);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopIncomingTargetMethodId()
+            => ReadI32(TopFrameOffset() + ShadowFrameIncomingTargetMethodId);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopIncomingStackArgBase()
+            => ReadI64(TopFrameOffset() + ShadowFrameIncomingStackArgBase);
+
+        private CallFlags CurrentInvocationCallFlags()
+        {
+            if (_activeCallTargetMethod is not null)
+                return _activeCallFlags;
+            if (_frameCount == 0)
+                return CallFlags.None;
+            return TopIncomingCallFlags();
+        }
+
+        private bool IsReadingCurrentManagedInvocation(RuntimeMethod method)
+        {
+            if (_activeCallTargetMethod is not null || _frameCount == 0)
+                return false;
+            return TopIncomingTargetMethodId() == method.MethodId;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopAllocaSp()
+            => ReadI64(TopFrameOffset() + ShadowFrameAllocaSp);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetTopAllocaSp(long value)
+            => WriteI64(TopFrameOffset() + ShadowFrameAllocaSp, value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long CurrentFrameStackLow()
+        {
+            long sp = X(MachineRegisters.StackPointer);
+            if (_frameCount == 0) return sp;
+
+            long allocaSp = TopAllocaSp();
+            return allocaSp != 0 && allocaSp < sp ? allocaSp : sp;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private PendingContinuationKind TopContinuationKind()
+            => (PendingContinuationKind)((TopPackedFlags() >> ShadowFrameContinuationKindShift) & 0xFF);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopContinuationTargetPc()
+            => ReadI32(TopFrameOffset() + ShadowFrameContinuationTargetPc);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopContinuationI0()
+            => ReadI64(TopFrameOffset() + ShadowFrameContinuationI0);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopContinuationF0()
+            => ReadI64(TopFrameOffset() + ShadowFrameContinuationF0);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TopContinuationIsFloat()
+            => TopContinuationKind() == PendingContinuationKind.ReturnFloat;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetTopContinuation(PendingContinuationKind kind, int targetPc, long i0, long f0, bool isFloat)
+        {
+            if (kind == PendingContinuationKind.Return && isFloat)
+                kind = PendingContinuationKind.ReturnFloat;
+
+            int frame = TopFrameOffset();
+            int packed = ReadI32(frame + ShadowFramePackedFlags);
+            packed = (packed & ~(0xFF << ShadowFrameContinuationKindShift)) | ((byte)kind << ShadowFrameContinuationKindShift);
+            WriteI32(frame + ShadowFramePackedFlags, packed);
+            WriteI32(frame + ShadowFrameContinuationTargetPc, targetPc);
+            WriteI64(frame + ShadowFrameContinuationI0, i0);
+            WriteI64(frame + ShadowFrameContinuationF0, f0);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PushFrame(
+            int methodIndex,
+            int returnPc,
+            int callerMethodIndex,
+            long callerSp,
+            long callerFp,
+            CallFlags incomingCallFlags,
+            int incomingTargetMethodId,
+            long incomingStackArgBase,
+            byte postReturnRegister = RegisterVmIsa.InvalidRegister,
+            long postReturnObjectRef = 0)
+        {
+            if ((uint)_frameCount >= (uint)MaxCallFramesHard)
+                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+
+            int frame = _frameStackTop;
+            int newTop = checked(frame + ShadowFrameSize);
+            if (newTop > (int)X(MachineRegisters.StackPointer))
+                throw new StackOverflowException();
+
+            Array.Clear(_mem, frame, ShadowFrameSize);
+            WriteI32(frame + ShadowFrameMethodIndex, methodIndex);
+            WriteI32(frame + ShadowFrameReturnPc, returnPc);
+            WriteI32(frame + ShadowFrameCallerMethodIndex, callerMethodIndex);
+            WriteI32(frame + ShadowFrameContinuationTargetPc, -1);
+            WriteI64(frame + ShadowFrameCallerSp, callerSp);
+            WriteI64(frame + ShadowFrameCallerFp, callerFp);
+            WriteI32(frame + ShadowFramePackedFlags, ((int)incomingCallFlags & ShadowFrameCallFlagsMask) | ((int)postReturnRegister << ShadowFramePostReturnRegisterShift));
+            WriteI32(frame + ShadowFrameIncomingTargetMethodId, incomingTargetMethodId);
+            WriteI64(frame + ShadowFrameIncomingStackArgBase, incomingStackArgBase);
+            WriteI32(frame + ShadowFrameRegisterSnapshotIndex, -1);
+            WriteI32(frame + ShadowFrameSafePointPc, -1);
+            WriteI64(frame + ShadowFramePostReturnObjectRef, postReturnObjectRef);
+            _frameStackTop = newTop;
+            if (newTop > _frameStackPeakTop) _frameStackPeakTop = newTop;
+            _frameCount++;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PopFrame()
+        {
+            if (_frameCount == 0) throw new InvalidOperationException("No current frame.");
+            _frameStackTop -= ShadowFrameSize;
+            Array.Clear(_mem, _frameStackTop, ShadowFrameSize);
+            _frameCount--;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int TopRegisterSnapshotIndex()
+            => ReadI32(TopFrameOffset() + ShadowFrameRegisterSnapshotIndex);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetTopRegisterSnapshotIndex(int value)
+            => WriteI32(TopFrameOffset() + ShadowFrameRegisterSnapshotIndex, value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private byte TopPostReturnRegister()
+            => unchecked((byte)(TopPackedFlags() >> ShadowFramePostReturnRegisterShift));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TopPostReturnObjectRef()
+            => ReadI64(TopFrameOffset() + ShadowFramePostReturnObjectRef);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int FrameSafePointPc(int frameOffset)
+            => ReadI32(frameOffset + ShadowFrameSafePointPc);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetFrameSafePointPc(int frameOffset, int pc)
+            => WriteI32(frameOffset + ShadowFrameSafePointPc, pc);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void StoreCurrentFrameSafePoint(int pc)
+        {
+            if (_frameCount != 0)
+                SetFrameSafePointPc(TopFrameOffset(), pc);
+        }
+
+        private long FrameStackPointer(int frameOffset)
+        {
+            int top = TopFrameOffset();
+            if (frameOffset == top)
+                return X(MachineRegisters.StackPointer);
+
+            int childFrame = checked(frameOffset + ShadowFrameSize);
+            if (childFrame > top)
+                throw new InvalidOperationException("Invalid shadow frame chain.");
+            return ReadI64(childFrame + ShadowFrameCallerSp);
+        }
+
+        private long FramePointer(int frameOffset)
+        {
+            int top = TopFrameOffset();
+            if (frameOffset == top)
+                return X(MachineRegisters.FramePointer);
+
+            int childFrame = checked(frameOffset + ShadowFrameSize);
+            if (childFrame > top)
+                throw new InvalidOperationException("Invalid shadow frame chain.");
+            return ReadI64(childFrame + ShadowFrameCallerFp);
+        }
+
+        private long FrameIncomingArgumentBase(int frameOffset)
+            => ReadI64(frameOffset + ShadowFrameIncomingStackArgBase);
+
+        private RuntimeModule CurrentModule()
+        {
+            if (_frameCount == 0) throw new InvalidOperationException("No current frame.");
+            RuntimeMethod method = CurrentFrameMethod();
+            if (method.BodyModule != null) return method.BodyModule;
+            if (_modules.TryGetValue(method.DeclaringType.AssemblyName, out RuntimeModule? module)) return module;
+            throw new InvalidOperationException("Unable to resolve current runtime module for method M" + method.MethodId.ToString());
+        }
+
+        private void EnterManagedFrame(
+            int targetMethodIndex,
+            int returnPc,
+            CallFlags incomingCallFlags,
+            RuntimeMethod? targetMethod,
+            byte postReturnRegister = RegisterVmIsa.InvalidRegister,
+            long postReturnObjectRef = 0)
+        {
+            long callerVisibleSp = X(MachineRegisters.StackPointer);
+            long incomingStackArgBase = _currentMethodIndex >= 0 ? GetCurrentOutgoingArgumentBase() : 0;
+            StoreCurrentFrameSafePoint(_currentSafePointPc);
+            long callSp = CurrentFrameStackLow();
+            X(MachineRegisters.StackPointer, callSp);
+
+            PushFrame(
+                targetMethodIndex,
+                returnPc,
+                _currentMethodIndex,
+                callerVisibleSp,
+                X(MachineRegisters.FramePointer),
+                incomingCallFlags,
+                targetMethod?.MethodId ?? -1,
+                incomingStackArgBase,
+                postReturnRegister,
+                postReturnObjectRef);
+
+            _currentMethodIndex = targetMethodIndex;
+            _pc = _image.Methods[targetMethodIndex].EntryPc;
+            X(MachineRegisters.ReturnAddress, returnPc);
+            X(MachineRegisters.ThreadPointer, incomingStackArgBase);
+        }
+
+        private RuntimeMethod ResolveCallTarget(InstrDesc ins, bool isVirtual)
+        {
+            if (!isVirtual)
+                return _rts.GetMethodById(checked((int)ins.Imm));
+
+            int callSiteIndex = checked((int)ins.Imm);
+            if ((uint)callSiteIndex >= (uint)_image.CallSites.Length)
+                throw new InvalidOperationException("Invalid register VM call-site index " + callSiteIndex.ToString());
+
+            CallSiteRecord site = _image.CallSites[callSiteIndex];
+            RuntimeMethod declared = _rts.GetMethodById(site.DeclaredRuntimeMethodId);
+            long receiverRef = ReadThisArgumentReference(declared);
+
+            if (receiverRef == 0)
+                throw new NullReferenceException();
+
+            RuntimeType receiverType;
+            bool receiverIsManagedObject = TryGetObjectTypeFromExactRef(receiverRef, out receiverType);
+
+            if (!receiverIsManagedObject)
+            {
+                if (declared.DeclaringType.IsValueType)
+                    return declared;
+
+                throw new AccessViolationException("Virtual dispatch receiver is not a managed object reference.");
+            }
+
+            if (site.DispatchSlot >= 0)
+            {
+                if ((uint)site.DispatchSlot >= (uint)receiverType.VTable.Length)
+                    throw new MissingMethodException("Invalid virtual dispatch slot " + site.DispatchSlot.ToString());
+                return receiverType.VTable[site.DispatchSlot];
+            }
+
+            return ResolveVirtualDispatch(receiverType, declared);
+        }
+
+        private RuntimeMethod ReadDeclaredCallMethod(InstrDesc ins, bool isVirtual)
+        {
+            if (!isVirtual)
+                return _rts.GetMethodById(checked((int)ins.Imm));
+
+            int callSiteIndex = checked((int)ins.Imm);
+            if ((uint)callSiteIndex >= (uint)_image.CallSites.Length)
+                throw new InvalidOperationException("Invalid register VM call-site index " + callSiteIndex.ToString());
+            return _rts.GetMethodById(_image.CallSites[callSiteIndex].DeclaredRuntimeMethodId);
+        }
+
+        private CallFlags ReadCallFlags(InstrDesc ins, bool isVirtual)
+        {
+            CallFlags flags = (CallFlags)ins.Aux;
+            if (isVirtual)
+            {
+                int callSiteIndex = checked((int)ins.Imm);
+                if ((uint)callSiteIndex < (uint)_image.CallSites.Length)
+                    flags |= (CallFlags)_image.CallSites[callSiteIndex].Flags;
+            }
+            return flags;
+        }
+
+        private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
+        {
+            if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                return false;
+
+            if (target.IsStatic)
+                return true;
+
+            return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
+        }
+
+        private void NormalizeValueTypeThisArgument(RuntimeMethod method)
+        {
+            if (!method.HasThis || !method.DeclaringType.IsValueType)
+                return;
+
+            long thisRef = ReadThisArgumentReference(method);
+            if (thisRef == 0)
+                throw new NullReferenceException();
+
+            if (!TryGetObjectTypeFromExactRef(thisRef, out RuntimeType actual))
+                return;
+            if (actual.TypeId != method.DeclaringType.TypeId)
+                return;
+
+            SetThisArgumentReference(method, checked(thisRef + ObjectHeaderSize));
+        }
+
+        private void ExecCall(InstrDesc ins, bool isVirtual, int callPc, CancellationToken ct, ExecutionLimits limits)
+        {
+            RuntimeMethod declared = ReadDeclaredCallMethod(ins, isVirtual);
+            RuntimeMethod target = ResolveCallTarget(ins, isVirtual);
+            CallFlags callFlags = ReadCallFlags(ins, isVirtual);
+
+            NormalizeValueTypeThisArgument(target);
+
+            if (RequiresTypeInitializationBeforeCall(target))
+            {
+                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
+                    return;
+            }
+
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+            _activeCallFlags = callFlags;
+            _activeCallTargetMethod = target;
             try
             {
-                while (true)
-                {
-                    if (--_fuel < 0)
-                        throw new OperationCanceledException("Instruction budget exceeded.");
-
-                    _tick++;
-                    if (_tick == limits.TokenCheckPeriod)
-                    {
-                        _tick = 0;
-                        ct.ThrowIfCancellationRequested();
-                    }
-
-                    if ((uint)frame.Pc >= (uint)fn.Instructions.Length)
-                        throw new InvalidOperationException($"PC out of range: {frame.Pc}");
-
-                    int pc = frame.Pc;
-                    var ins = fn.Instructions[pc];
-                    frame.Pc = pc + 1;
-
-                    int instructionStackMark = _sp;
-                    bool keepInstructionStack = ins.Op == Op.StackAlloc;
-                    try
-                    {
-
-                        Cell returned = default;
-                        var currentModule = frame.Module;
-
-                        switch (ins.Op)
-                        {
-                            case Op.Nop:
-                                goto InstructionFinished;
-                            case Op.Move:
-                                Set(frame, ins.Result, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Ldnull:
-                                Set(frame, ins.Result, Cell.Null);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4:
-                                SetI4(frame, ins.Result, ins.Operand0);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_M1:
-                                SetI4(frame, ins.Result, -1);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_0:
-                                SetI4(frame, ins.Result, 0);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_1:
-                                SetI4(frame, ins.Result, 1);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_2:
-                                SetI4(frame, ins.Result, 2);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_3:
-                                SetI4(frame, ins.Result, 3);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_4:
-                                SetI4(frame, ins.Result, 4);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_5:
-                                SetI4(frame, ins.Result, 5);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_6:
-                                SetI4(frame, ins.Result, 6);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_7:
-                                SetI4(frame, ins.Result, 7);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_8:
-                                SetI4(frame, ins.Result, 8);
-                                goto InstructionFinished;
-                            case Op.Ldc_I4_S:
-                                SetI4(frame, ins.Result, unchecked((sbyte)ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Ldc_I8:
-                                Set(frame, ins.Result, Cell.I8(ins.Operand2));
-                                goto InstructionFinished;
-                            case Op.Ldc_R8:
-                                Set(frame, ins.Result, new Cell(CellKind.R8, ins.Operand2));
-                                goto InstructionFinished;
-                            case Op.Ldstr:
-                                Set(frame, ins.Result, ExecLdstr(currentModule, ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.DefaultValue:
-                                Set(frame, ins.Result, DefaultValue(ResolveTypeToken(currentModule, ins.Operand0, frame.Method)));
-                                goto InstructionFinished;
-                            case Op.Ldloc:
-                                Set(frame, ins.Result, LoadLocal(frame, ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Stloc:
-                                StoreLocal(frame, ins.Operand0, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Ldloca:
-                                Set(frame, ins.Result, LocalAddress(frame, ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Ldarg:
-                                Set(frame, ins.Result, LoadArg(frame, ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Starg:
-                                StoreArg(frame, ins.Operand0, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Ldarga:
-                                Set(frame, ins.Result, ArgAddress(frame, ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Ldthis:
-                                Set(frame, ins.Result, LoadArg(frame, 0));
-                                goto InstructionFinished;
-                            case Op.Ldarg_0:
-                                Set(frame, ins.Result, LoadArg(frame, 0));
-                                goto InstructionFinished;
-                            case Op.Ldarg_1:
-                                Set(frame, ins.Result, LoadArg(frame, 1));
-                                goto InstructionFinished;
-                            case Op.Ldarg_2:
-                                Set(frame, ins.Result, LoadArg(frame, 2));
-                                goto InstructionFinished;
-                            case Op.Ldarg_3:
-                                Set(frame, ins.Result, LoadArg(frame, 3));
-                                goto InstructionFinished;
-                            case Op.Starg_0:
-                                StoreArg(frame, 0, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Starg_1:
-                                StoreArg(frame, 1, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Starg_2:
-                                StoreArg(frame, 2, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Starg_3:
-                                StoreArg(frame, 3, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Ldarga_0:
-                                Set(frame, ins.Result, ArgAddress(frame, 0));
-                                goto InstructionFinished;
-                            case Op.Ldarga_1:
-                                Set(frame, ins.Result, ArgAddress(frame, 1));
-                                goto InstructionFinished;
-                            case Op.Ldarga_2:
-                                Set(frame, ins.Result, ArgAddress(frame, 2));
-                                goto InstructionFinished;
-                            case Op.Ldarga_3:
-                                Set(frame, ins.Result, ArgAddress(frame, 3));
-                                goto InstructionFinished;
-                            case Op.Ldloc_0:
-                                Set(frame, ins.Result, LoadLocal(frame, 0));
-                                goto InstructionFinished;
-                            case Op.Ldloc_1:
-                                Set(frame, ins.Result, LoadLocal(frame, 1));
-                                goto InstructionFinished;
-                            case Op.Ldloc_2:
-                                Set(frame, ins.Result, LoadLocal(frame, 2));
-                                goto InstructionFinished;
-                            case Op.Ldloc_3:
-                                Set(frame, ins.Result, LoadLocal(frame, 3));
-                                goto InstructionFinished;
-                            case Op.Stloc_0:
-                                StoreLocal(frame, 0, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Stloc_1:
-                                StoreLocal(frame, 1, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Stloc_2:
-                                StoreLocal(frame, 2, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Stloc_3:
-                                StoreLocal(frame, 3, Get(frame, ins.Value0));
-                                goto InstructionFinished;
-                            case Op.Ldloca_0:
-                                Set(frame, ins.Result, LocalAddress(frame, 0));
-                                goto InstructionFinished;
-                            case Op.Ldloca_1:
-                                Set(frame, ins.Result, LocalAddress(frame, 1));
-                                goto InstructionFinished;
-                            case Op.Ldloca_2:
-                                Set(frame, ins.Result, LocalAddress(frame, 2));
-                                goto InstructionFinished;
-                            case Op.Ldloca_3:
-                                Set(frame, ins.Result, LocalAddress(frame, 3));
-                                goto InstructionFinished;
-                            case Op.Add:
-                                ExecAdd(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Sub:
-                                ExecSub(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Mul:
-                                ExecMul(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Div:
-                                ExecDiv(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Div_Un:
-                                ExecDivUn(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Rem:
-                                ExecRem(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Rem_Un:
-                                ExecRemUn(frame, ins);
-                                goto InstructionFinished;
-                            case Op.And:
-                                ExecAnd(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Or:
-                                ExecOr(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Xor:
-                                ExecXor(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Shl:
-                                ExecShl(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Shr:
-                                ExecShr(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Shr_Un:
-                                ExecShrUn(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Neg:
-                                ExecNeg(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Not:
-                                ExecNot(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Ceq:
-                                ExecCeq(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Clt:
-                                ExecClt(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Clt_Un:
-                                ExecCltUn(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Cgt:
-                                ExecCgt(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Cgt_Un:
-                                ExecCgtUn(frame, ins);
-                                goto InstructionFinished;
-
-                            case Op.Call:
-                                Set(frame, ins.Result, ExecCall(frame, ins, virtualDispatch: false, ct, limits));
-                                goto InstructionFinished;
-                            case Op.CallVirt:
-                                Set(frame, ins.Result, ExecCall(frame, ins, virtualDispatch: true, ct, limits));
-                                goto InstructionFinished;
-                            case Op.Newobj:
-                                Set(frame, ins.Result, ExecNewobj(frame, ins, ct, limits));
-                                goto InstructionFinished;
-                            case Op.Ldfld:
-                                Set(frame, ins.Result, ExecLdfld(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Stfld:
-                                ExecStfld(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Ldsfld:
-                                Set(frame, ins.Result, ExecLdsfld(frame, ins, ct, limits));
-                                goto InstructionFinished;
-                            case Op.Stsfld:
-                                ExecStsfld(frame, ins, ct, limits);
-                                goto InstructionFinished;
-                            case Op.Ldflda:
-                                Set(frame, ins.Result, ExecLdflda(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Ldsflda:
-                                Set(frame, ins.Result, ExecLdsflda(frame, ins, ct, limits));
-                                goto InstructionFinished;
-                            case Op.Conv:
-                                Set(frame, ins.Result, Conv(Get(frame, ins.Value0), (NumericConvKind)ins.Operand0, 
-                                    (NumericConvFlags)ins.Operand1, ins.Result >= 0 ? frame.ValueTypes[ins.Result] : null));
-                                goto InstructionFinished;
-                            case Op.CastClass:
-                                Set(frame, ins.Result, ExecCastClass(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Box:
-                                Set(frame, ins.Result, ExecBox(frame, ins));
-                                goto InstructionFinished;
-                            case Op.UnboxAny:
-                                Set(frame, ins.Result, ExecUnboxAny(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Br:
-                                if (!TryBeginFinallyForJump(frame, pc, ins.Operand0))
-                                    frame.Pc = ins.Operand0;
-                                goto InstructionFinished;
-                            case Op.Brtrue:
-                                if (GetBool(frame, ins.Value0) && !TryBeginFinallyForJump(frame, pc, ins.Operand0))
-                                    frame.Pc = ins.Operand0;
-                                goto InstructionFinished;
-                            case Op.Brfalse:
-                                if (!GetBool(frame, ins.Value0) && !TryBeginFinallyForJump(frame, pc, ins.Operand0))
-                                    frame.Pc = ins.Operand0;
-                                goto InstructionFinished;
-                            case Op.Ret:
-                                returned = ins.ValueCount == 0 ? default : Get(frame, ins.Value0);
-                                if (TryBeginFinallyForReturn(frame, pc, ins.ValueCount != 0, returned))
-                                    goto InstructionFinished;
-                                goto MethodReturned;
-                            case Op.Throw:
-                                throw new VmThrownException(NormalizeThrownException(Get(frame, ins.Value0)));
-                            case Op.Rethrow:
-                                throw new VmThrownException(NormalizeThrownException(frame.Exception));
-                            case Op.Ldexception:
-                                Set(frame, ins.Result, frame.Exception);
-                                goto InstructionFinished;
-                            case Op.Endfinally:
-                                if (ExecEndfinally(frame, out returned))
-                                    goto MethodReturned;
-                                goto InstructionFinished;
-                            case Op.StackAlloc:
-                                Set(frame, ins.Result, ExecStackAlloc(Get(frame, ins.Value0), ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.PtrElemAddr:
-                                Set(frame, ins.Result, PtrElemAddr(Get(frame, ins.Value0), Get(frame, ins.Value1), ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.PtrToByRef:
-                                Set(frame, ins.Result, PtrToByRef(Get(frame, ins.Value0)));
-                                goto InstructionFinished;
-                            case Op.Ldobj:
-                                Set(frame, ins.Result, ExecLdobj(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Stobj:
-                                ExecStobj(frame, ins);
-                                goto InstructionFinished;
-                            case Op.Newarr:
-                                Set(frame, ins.Result, ExecNewarr(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Ldelem:
-                                Set(frame, ins.Result, ExecLdelem(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Ldelema:
-                                Set(frame, ins.Result, ExecLdelema(frame, ins));
-                                goto InstructionFinished;
-                            case Op.Stelem:
-                                ExecStelem(frame, ins);
-                                goto InstructionFinished;
-                            case Op.LdArrayDataRef:
-                                Set(frame, ins.Result, ExecLdArrayDataRef(Get(frame, ins.Value0)));
-                                goto InstructionFinished;
-                            case Op.Sizeof:
-                                Set(frame, ins.Result, Cell.I4(GetStorageSizeAlign(ResolveTypeToken(currentModule, ins.Operand0, frame.Method)).size));
-                                goto InstructionFinished;
-                            case Op.PtrDiff:
-                                Set(frame, ins.Result, PtrDiff(Get(frame, ins.Value0), Get(frame, ins.Value1), ins.Operand0));
-                                goto InstructionFinished;
-                            case Op.Isinst:
-                                Set(frame, ins.Result, ExecIsinst(frame, ins));
-                                goto InstructionFinished;
-                            default:
-                                throw new NotSupportedException($"Flat opcode not supported: {ins.Op}");
-                        }
-
-
-                    InstructionFinished:
-                        if (!keepInstructionStack)
-                            _sp = instructionStackMark;
-                        continue;
-
-                    MethodReturned:
-                        result = returned;
-                        if (result.Kind == CellKind.Value)
-                        {
-                            detachedType = GetValueType(result);
-                            detachedValue = new byte[detachedType.SizeOf];
-                            Buffer.BlockCopy(_mem, checked((int)result.Payload), detachedValue, 0, detachedValue.Length);
-                        }
-                        if (!keepInstructionStack)
-                            _sp = instructionStackMark;
-                        break;
-                    }
-                    catch (VmThrownException ex)
-                    {
-                        if (!keepInstructionStack)
-                            _sp = instructionStackMark;
-                        if (!TryEnterExceptionHandler(frame, pc, ex.ExceptionObject))
-                            throw;
-                    }
-                    catch (Exception ex) when (ex is DivideByZeroException or OverflowException)
-                    {
-                        if (!keepInstructionStack)
-                            _sp = instructionStackMark;
-                        if (_exceptionTranslationDepth != 0)
-                            throw;
-
-                        _exceptionTranslationDepth++;
-                        try
-                        {
-                            if (!TryTranslateHostExceptionToVm(ex, out var vmEx))
-                                throw new VmUnhandledException(ex.Message);
-                            if (!TryEnterExceptionHandler(frame, pc, vmEx))
-                                throw new VmThrownException(vmEx);
-                        }
-                        finally
-                        {
-                            _exceptionTranslationDepth--;
-                        }
-                    }
-                }
+                if (TryInvokeIntrinsic(target, ct))
+                    return;
             }
             finally
             {
-                ClearFinallyContextsForFrame(frame);
-                _sp = frame.FrameBase;
-                _currentFrame = previousFrame;
-                _callDepth--;
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
             }
 
-            if (detachedValue is not null && detachedType is not null)
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
             {
-                int abs = AllocStackBytes(detachedValue.Length, Math.Max(1, detachedType.AlignOf));
-                Buffer.BlockCopy(detachedValue, 0, _mem, abs, detachedValue.Length);
-                result = new Cell(CellKind.Value, abs, detachedType.TypeId);
+                if (target.BodyModule is null || target.Body is null)
+                    throw new MissingMethodException("No body for register call target M" + target.MethodId.ToString());
+                throw new MissingMethodException("Target method exists in metadata but not in register image: M" + target.MethodId.ToString());
             }
 
-            return result;
-        }
-
-        private static bool IsFloating(Cell value) => value.Kind == CellKind.R8;
-        private static bool IsI8(Cell value) => value.Kind == CellKind.I8;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void SetCell(Frame frame, int valueId, Cell value)
-        {
-            if (valueId >= 0)
-                frame.Values[valueId] = value;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecAdd(Frame frame, Instruction ins)
-        {
-            var values = frame.Values;
-            var a = values[ins.Value0];
-            var b = values[ins.Value1];
-            int result = ins.Result;
-
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, result, Cell.I4(unchecked((int)a.Payload + (int)b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, result, Cell.I8(unchecked(a.Payload + b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, result, Cell.R8(BitConverter.Int64BitsToDouble(a.Payload) + BitConverter.Int64BitsToDouble(b.Payload)));
-                return;
-            }
-
-            if (IsFloating(a) || IsFloating(b)) SetR8(frame, result, FastR8(a) + FastR8(b));
-            else if (IsI8(a) || IsI8(b)) SetI8(frame, result, unchecked(FastI8(a) + FastI8(b)));
-            else SetI4(frame, result, unchecked(FastI4(a) + FastI4(b)));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecSub(Frame frame, Instruction ins)
-        {
-            var values = frame.Values;
-            var a = values[ins.Value0];
-            var b = values[ins.Value1];
-            int result = ins.Result;
-
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, result, Cell.I4(unchecked((int)a.Payload - (int)b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, result, Cell.I8(unchecked(a.Payload - b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, result, Cell.R8(BitConverter.Int64BitsToDouble(a.Payload) - BitConverter.Int64BitsToDouble(b.Payload)));
-                return;
-            }
-
-            if (IsFloating(a) || IsFloating(b)) SetR8(frame, result, FastR8(a) - FastR8(b));
-            else if (IsI8(a) || IsI8(b)) SetI8(frame, result, unchecked(FastI8(a) - FastI8(b)));
-            else SetI4(frame, result, unchecked(FastI4(a) - FastI4(b)));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecMul(Frame frame, Instruction ins)
-        {
-            var values = frame.Values;
-            var a = values[ins.Value0];
-            var b = values[ins.Value1];
-            int result = ins.Result;
-
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, result, Cell.I4(unchecked((int)a.Payload * (int)b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, result, Cell.I8(unchecked(a.Payload * b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, result, Cell.R8(BitConverter.Int64BitsToDouble(a.Payload) * BitConverter.Int64BitsToDouble(b.Payload)));
-                return;
-            }
-
-            if (IsFloating(a) || IsFloating(b)) SetR8(frame, result, FastR8(a) * FastR8(b));
-            else if (IsI8(a) || IsI8(b)) SetI8(frame, result, unchecked(FastI8(a) * FastI8(b)));
-            else SetI4(frame, result, unchecked(FastI4(a) * FastI4(b)));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecDiv(Frame frame, Instruction ins)
-        {
-            var values = frame.Values;
-            var a = values[ins.Value0];
-            var b = values[ins.Value1];
-            int result = ins.Result;
-
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, result, Cell.I4(unchecked((int)a.Payload / (int)b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, result, Cell.I8(a.Payload / b.Payload));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, result, Cell.R8(BitConverter.Int64BitsToDouble(a.Payload) / BitConverter.Int64BitsToDouble(b.Payload)));
-                return;
-            }
-
-            if (IsFloating(a) || IsFloating(b)) SetR8(frame, result, FastR8(a) / FastR8(b));
-            else if (IsI8(a) || IsI8(b)) SetI8(frame, result, FastI8(a) / FastI8(b));
-            else SetI4(frame, result, FastI4(a) / FastI4(b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecDivUn(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4(unchecked((int)((uint)(int)a.Payload / (uint)(int)b.Payload))));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(unchecked((long)((ulong)a.Payload / (ulong)b.Payload))));
-                return;
-            }
-            if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, unchecked((long)((ulong)FastI8(a) / (ulong)FastI8(b))));
-            else SetI4(frame, ins.Result, unchecked((int)((uint)FastI4(a) / (uint)FastI4(b))));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecRem(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4(unchecked((int)a.Payload % (int)b.Payload)));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(a.Payload % b.Payload));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, ins.Result, Cell.R8(BitConverter.Int64BitsToDouble(a.Payload) % BitConverter.Int64BitsToDouble(b.Payload)));
-                return;
-            }
-            if (IsFloating(a) || IsFloating(b)) SetR8(frame, ins.Result, FastR8(a) % FastR8(b));
-            else if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, FastI8(a) % FastI8(b));
-            else SetI4(frame, ins.Result, FastI4(a) % FastI4(b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecRemUn(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4(unchecked((int)((uint)(int)a.Payload % (uint)(int)b.Payload))));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(unchecked((long)((ulong)a.Payload % (ulong)b.Payload))));
-                return;
-            }
-            if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, unchecked((long)((ulong)FastI8(a) % (ulong)FastI8(b))));
-            else SetI4(frame, ins.Result, unchecked((int)((uint)FastI4(a) % (uint)FastI4(b))));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecAnd(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload & (int)b.Payload));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(a.Payload & b.Payload));
-                return;
-            }
-            if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, FastI8(a) & FastI8(b));
-            else SetI4(frame, ins.Result, FastI4(a) & FastI4(b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecOr(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload | (int)b.Payload));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(a.Payload | b.Payload));
-                return;
-            }
-            if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, FastI8(a) | FastI8(b));
-            else SetI4(frame, ins.Result, FastI4(a) | FastI4(b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecXor(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload ^ (int)b.Payload));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I8(a.Payload ^ b.Payload));
-                return;
-            }
-            if (IsI8(a) || IsI8(b)) SetI8(frame, ins.Result, FastI8(a) ^ FastI8(b));
-            else SetI4(frame, ins.Result, FastI4(a) ^ FastI4(b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecShl(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            int shift = FastI4(frame.Values[ins.Value1]);
-            if (a.Kind == CellKind.I8) SetCell(frame, ins.Result, Cell.I8(unchecked(a.Payload << (shift & 0x3F))));
-            else if (a.Kind == CellKind.I4) SetCell(frame, ins.Result, Cell.I4(unchecked((int)a.Payload << (shift & 0x1F))));
-            else if (IsI8(a)) SetI8(frame, ins.Result, unchecked(FastI8(a) << (shift & 0x3F)));
-            else SetI4(frame, ins.Result, unchecked(FastI4(a) << (shift & 0x1F)));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecShr(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            int shift = FastI4(frame.Values[ins.Value1]);
-            if (a.Kind == CellKind.I8) SetCell(frame, ins.Result, Cell.I8(a.Payload >> (shift & 0x3F)));
-            else if (a.Kind == CellKind.I4) SetCell(frame, ins.Result, Cell.I4((int)a.Payload >> (shift & 0x1F)));
-            else if (IsI8(a)) SetI8(frame, ins.Result, FastI8(a) >> (shift & 0x3F));
-            else SetI4(frame, ins.Result, FastI4(a) >> (shift & 0x1F));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecShrUn(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            int shift = FastI4(frame.Values[ins.Value1]);
-            if (a.Kind == CellKind.I8) SetCell(frame, ins.Result, Cell.I8(unchecked((long)((ulong)a.Payload >> (shift & 0x3F)))));
-            else if (a.Kind == CellKind.I4) SetCell(frame, ins.Result, Cell.I4(unchecked((int)((uint)(int)a.Payload >> (shift & 0x1F)))));
-            else if (IsI8(a)) SetI8(frame, ins.Result, unchecked((long)((ulong)FastI8(a) >> (shift & 0x3F))));
-            else SetI4(frame, ins.Result, unchecked((int)((uint)FastI4(a) >> (shift & 0x1F))));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecNeg(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            if (a.Kind == CellKind.I4) SetCell(frame, ins.Result, Cell.I4(unchecked(-(int)a.Payload)));
-            else if (a.Kind == CellKind.I8) SetCell(frame, ins.Result, Cell.I8(unchecked(-a.Payload)));
-            else if (a.Kind == CellKind.R8) SetCell(frame, ins.Result, Cell.R8(-BitConverter.Int64BitsToDouble(a.Payload)));
-            else if (IsFloating(a)) SetR8(frame, ins.Result, -FastR8(a));
-            else if (IsI8(a)) SetI8(frame, ins.Result, unchecked(-FastI8(a)));
-            else SetI4(frame, ins.Result, unchecked(-FastI4(a)));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecNot(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            if (a.Kind == CellKind.I4) SetCell(frame, ins.Result, Cell.I4(~(int)a.Payload));
-            else if (a.Kind == CellKind.I8) SetCell(frame, ins.Result, Cell.I8(~a.Payload));
-            else if (IsI8(a)) SetI8(frame, ins.Result, ~FastI8(a));
-            else SetI4(frame, ins.Result, ~FastI4(a));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecCeq(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload == (int)b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(a.Payload == b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(BitConverter.Int64BitsToDouble(a.Payload) == BitConverter.Int64BitsToDouble(b.Payload) ? 1 : 0));
-                return;
-            }
-            SetI4(frame, ins.Result, CompareEqual(a, b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecClt(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload < (int)b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(a.Payload < b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(BitConverter.Int64BitsToDouble(a.Payload) < BitConverter.Int64BitsToDouble(b.Payload) ? 1 : 0));
-                return;
-            }
-            SetI4(frame, ins.Result, CompareLess(a, b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecCltUn(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((uint)(int)a.Payload < (uint)(int)b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I4((ulong)a.Payload < (ulong)b.Payload ? 1 : 0));
-                return;
-            }
-            SetI4(frame, ins.Result, CompareLessUn(a, b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecCgt(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((int)a.Payload > (int)b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(a.Payload > b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.R8 && b.Kind == CellKind.R8)
-            {
-                SetCell(frame, ins.Result, Cell.I4(BitConverter.Int64BitsToDouble(a.Payload) > BitConverter.Int64BitsToDouble(b.Payload) ? 1 : 0));
-                return;
-            }
-            SetI4(frame, ins.Result, CompareGreater(a, b));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ExecCgtUn(Frame frame, Instruction ins)
-        {
-            var a = frame.Values[ins.Value0];
-            var b = frame.Values[ins.Value1];
-            if (a.Kind == CellKind.I4 && b.Kind == CellKind.I4)
-            {
-                SetCell(frame, ins.Result, Cell.I4((uint)(int)a.Payload > (uint)(int)b.Payload ? 1 : 0));
-                return;
-            }
-            if (a.Kind == CellKind.I8 && b.Kind == CellKind.I8)
-            {
-                SetCell(frame, ins.Result, Cell.I4((ulong)a.Payload > (ulong)b.Payload ? 1 : 0));
-                return;
-            }
-            SetI4(frame, ins.Result, CompareGreaterUn(a, b));
-        }
-
-        private static int AlignUp(int value, int align)
-        {
-            int mask = align - 1;
-            return (value + mask) & ~mask;
-        }
-
-        private static int GetI4(Frame frame, int valueId)
-        {
-            var c = frame.Values[valueId];
-            return c.Kind == CellKind.I4 ? unchecked((int)c.Payload) : c.AsI4();
-        }
-
-        private static long GetI8(Frame frame, int valueId)
-        {
-            var c = frame.Values[valueId];
-            return c.Kind == CellKind.I8 ? c.Payload : c.AsI8();
-        }
-
-        private static double GetR8(Frame frame, int valueId)
-        {
-            var c = frame.Values[valueId];
-            return c.Kind == CellKind.R8 ? BitConverter.Int64BitsToDouble(c.Payload) : c.AsR8();
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int FastI4(Cell c)
-        {
-            return c.Kind switch
-            {
-                CellKind.I4 => unchecked((int)c.Payload),
-                CellKind.I8 => checked((int)c.Payload),
-                CellKind.Null => 0,
-                _ => c.AsI4()
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static long FastI8(Cell c)
-        {
-            return c.Kind switch
-            {
-                CellKind.I8 => c.Payload,
-                CellKind.I4 => unchecked((int)c.Payload),
-                CellKind.Null => 0,
-                _ => c.AsI8()
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static double FastR8(Cell c)
-        {
-            return c.Kind switch
-            {
-                CellKind.R8 => BitConverter.Int64BitsToDouble(c.Payload),
-                CellKind.I4 => unchecked((int)c.Payload),
-                CellKind.I8 => c.Payload,
-                _ => c.AsR8()
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool FastBool(Cell c)
-        {
-            return c.Kind switch
-            {
-                CellKind.I4 => unchecked((int)c.Payload) != 0,
-                CellKind.I8 => c.Payload != 0,
-                CellKind.R8 => BitConverter.Int64BitsToDouble(c.Payload) != 0.0,
-                CellKind.Null => false,
-                CellKind.Ref or CellKind.Ptr or CellKind.ByRef => c.Payload != 0,
-                CellKind.Value => true,
-                _ => c.AsBool()
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool GetBool(Frame frame, int valueId)
-            => FastBool(frame.Values[valueId]);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetI4(Frame frame, int valueId, int value)
-        {
-            if (valueId < 0)
-                return;
-            if ((uint)valueId >= (uint)frame.Values.Length)
-                throw new InvalidOperationException($"Value %{valueId} is out of range.");
-            if ((uint)valueId < (uint)frame.ValueFastKinds.Length && frame.ValueFastKinds[valueId] != FastCellKind.None)
-            {
-                frame.Values[valueId] = Cell.I4(value);
-                return;
-            }
-            if ((uint)valueId < (uint)frame.ValueOffsets.Length && frame.ValueOffsets[valueId] >= 0)
-            {
-                Set(frame, valueId, Cell.I4(value));
-                return;
-            }
-            frame.Values[valueId] = Cell.I4(value);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetI8(Frame frame, int valueId, long value)
-        {
-            if (valueId < 0)
-                return;
-            if ((uint)valueId >= (uint)frame.Values.Length)
-                throw new InvalidOperationException($"Value %{valueId} is out of range.");
-            if ((uint)valueId < (uint)frame.ValueFastKinds.Length && frame.ValueFastKinds[valueId] != FastCellKind.None)
-            {
-                frame.Values[valueId] = Cell.I8(value);
-                return;
-            }
-            if ((uint)valueId < (uint)frame.ValueOffsets.Length && frame.ValueOffsets[valueId] >= 0)
-            {
-                Set(frame, valueId, Cell.I8(value));
-                return;
-            }
-            frame.Values[valueId] = Cell.I8(value);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetR8(Frame frame, int valueId, double value)
-        {
-            if (valueId < 0)
-                return;
-            if ((uint)valueId >= (uint)frame.Values.Length)
-                throw new InvalidOperationException($"Value %{valueId} is out of range.");
-            if ((uint)valueId < (uint)frame.ValueFastKinds.Length && frame.ValueFastKinds[valueId] != FastCellKind.None)
-            {
-                frame.Values[valueId] = Cell.R8(value);
-                return;
-            }
-            if ((uint)valueId < (uint)frame.ValueOffsets.Length && frame.ValueOffsets[valueId] >= 0)
-            {
-                Set(frame, valueId, Cell.R8(value));
-                return;
-            }
-            frame.Values[valueId] = Cell.R8(value);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Cell Get(Frame frame, int valueId)
-        {
-            if ((uint)valueId >= (uint)frame.Values.Length)
-                throw new InvalidOperationException($"Value %{valueId} is out of range.");
-            return frame.Values[valueId];
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void Set(Frame frame, int valueId, Cell value)
-        {
-            if (valueId < 0)
-                return;
-            if ((uint)valueId >= (uint)frame.Values.Length)
-                throw new InvalidOperationException($"Value %{valueId} is out of range.");
-
-            int valueAbs = GetValueStorageAbs(frame, valueId);
-            if (valueAbs >= 0)
-            {
-                var targetType = frame.ValueTypes[valueId];
-                StoreValue(valueAbs, targetType, value);
-                frame.Values[valueId] = new Cell(CellKind.Value, valueAbs, targetType.TypeId);
-                return;
-            }
-
-            frame.Values[valueId] = value;
-        }
-
-        private Frame CreateFrame(RuntimeModule module, BytecodeFunction fn, RuntimeMethod method, Cell[] args, bool allowMissingArgs)
-        {
-            var layout = GetOrCreateMethodLayout(module, fn, method);
-            if (args.Length != layout.ArgTypes.Length && !(allowMissingArgs && args.Length == 0))
-                throw new InvalidOperationException($"Argument count mismatch for '{method.Name}': expected {layout.ArgTypes.Length}, got {args.Length}.");
-
-            var valueTypes = new RuntimeType[fn.ValueTypeTokens.Length];
-            for (int i = 0; i < valueTypes.Length; i++)
-                valueTypes[i] = ResolveTypeToken(module, fn.ValueTypeTokens[i], method);
-
-            var valueOffsets = new int[valueTypes.Length];
-            var valueSizes = new int[valueTypes.Length];
-            var valueFastKinds = new FastCellKind[valueTypes.Length];
-            Array.Fill(valueOffsets, -1);
-
-            int frameBase = AlignUp(_sp, 8);
-            int cursor = frameBase;
-            cursor = AlignUp(cursor, 8);
-            int argsBase = cursor;
-            cursor = checked(cursor + layout.ArgsAreaSize);
-            cursor = AlignUp(cursor, 8);
-            int localsBase = cursor;
-            cursor = checked(cursor + layout.LocalsAreaSize);
-            cursor = AlignUp(cursor, 8);
-            int valuesBase = cursor;
-            for (int i = 0; i < valueTypes.Length; i++)
-            {
-                var t = valueTypes[i];
-                valueFastKinds[i] = ClassifyFastCell(t);
-                if (!NeedsFixedValueStorage(t))
-                    continue;
-
-                var (size, align) = GetStorageSizeAlign(t);
-                cursor = AlignUp(cursor, Math.Max(1, align));
-                valueOffsets[i] = cursor - valuesBase;
-                valueSizes[i] = size;
-                cursor = checked(cursor + size);
-            }
-            cursor = AlignUp(cursor, 8);
-            EnsureStack(cursor);
-            Array.Clear(_mem, frameBase, cursor - frameBase);
-            _sp = cursor;
-            if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
-
-            var frame = new Frame
-            {
-                Module = module,
-                Function = fn,
-                Method = method,
-                ValueTypes = valueTypes,
-                Layout = layout,
-                ArgsBase = argsBase,
-                LocalsBase = localsBase,
-                FrameBase = frameBase,
-                Pc = 0,
-                ArgCells = layout.HasArgCellCache ? new Cell[layout.ArgTypes.Length] : Array.Empty<Cell>(),
-                LocalCells = layout.HasLocalCellCache ? new Cell[layout.LocalTypes.Length] : Array.Empty<Cell>(),
-                Values = new Cell[valueTypes.Length],
-                ValueFastKinds = valueFastKinds,
-                ValuesBase = valuesBase,
-                ValueOffsets = valueOffsets,
-                ValueSizes = valueSizes
-            };
-
-            if (layout.HasArgCellCache)
-                InitializeFastCellCache(frame.ArgCells, layout.ArgFastKinds, layout.ArgCellCached);
-
-            if (layout.HasLocalCellCache)
-                InitializeFastCellCache(frame.LocalCells, layout.LocalFastKinds, layout.LocalCellCached);
-
-            for (int i = 0; i < args.Length; i++)
-                StoreArg(frame, i, args[i]);
-
-            return frame;
-        }
-
-        private static void InitializeFastCellCache(Cell[] cells, FastCellKind[] kinds, bool[] cached)
-        {
-            for (int i = 0; i < cells.Length; i++)
-            {
-                if (cached[i])
-                    cells[i] = DefaultFastCell(kinds[i]);
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Cell DefaultFastCell(FastCellKind kind)
-        {
-            return kind switch
-            {
-                FastCellKind.I8 => Cell.I8(0),
-                FastCellKind.R4 or FastCellKind.R8 => Cell.R8(0.0),
-                FastCellKind.NativeInt or FastCellKind.NativeUInt => RuntimeTypeSystem.PointerSize == 8 ? Cell.I8(0) : Cell.I4(0),
-                _ => Cell.I4(0)
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Cell NormalizeFastCell(FastCellKind kind, Cell value)
-        {
-            return kind switch
-            {
-                FastCellKind.I4 => Cell.I4(FastI4(value)),
-                FastCellKind.I8 => Cell.I8(FastI8(value)),
-                FastCellKind.R4 => Cell.R8((float)FastR8(value)),
-                FastCellKind.R8 => value.Kind == CellKind.R8 ? value : Cell.R8(value.AsR8()),
-                FastCellKind.NativeInt or FastCellKind.NativeUInt => RuntimeTypeSystem.PointerSize == 8
-                    ? Cell.I8(FastI8(value))
-                    : Cell.I4(FastI4(value)),
-                _ => value
-            };
-        }
-
-        private MethodExecLayout GetOrCreateMethodLayout(RuntimeModule module, BytecodeFunction fn, RuntimeMethod method)
-        {
-            if (_methodLayouts.TryGetValue(method.MethodId, out var cached))
-                return cached;
-
-            var layout = new MethodExecLayout { Method = method };
-            int argCount = method.HasThis ? method.ParameterTypes.Length + 1 : method.ParameterTypes.Length;
-            layout.ArgTypes = new RuntimeType[argCount];
-            layout.ArgOffsets = new int[argCount];
-            layout.ArgSizes = new int[argCount];
-            layout.ArgFastKinds = new FastCellKind[argCount];
-            layout.ArgAddressTaken = new bool[argCount];
-            layout.ArgCellCached = new bool[argCount];
-
-            int cur = 0;
-            for (int i = 0; i < argCount; i++)
-            {
-                var t = GetArgType(method, i);
-                var (size, align) = GetStorageSizeAlign(t);
-                cur = AlignUp(cur, align);
-                layout.ArgTypes[i] = t;
-                layout.ArgOffsets[i] = cur;
-                layout.ArgSizes[i] = size;
-                layout.ArgFastKinds[i] = ClassifyFastCell(t);
-                cur = checked(cur + size);
-            }
-            layout.ArgsAreaSize = cur;
-
-            layout.LocalTypes = new RuntimeType[fn.LocalTypeTokens.Length];
-            layout.LocalOffsets = new int[fn.LocalTypeTokens.Length];
-            layout.LocalSizes = new int[fn.LocalTypeTokens.Length];
-            layout.LocalFastKinds = new FastCellKind[fn.LocalTypeTokens.Length];
-            layout.LocalAddressTaken = new bool[fn.LocalTypeTokens.Length];
-            layout.LocalCellCached = new bool[fn.LocalTypeTokens.Length];
-
-            AnalyzeAddressTaken(fn.Instructions, layout.ArgAddressTaken, layout.LocalAddressTaken);
-
-            cur = 0;
-            for (int i = 0; i < fn.LocalTypeTokens.Length; i++)
-            {
-                var t = ResolveTypeToken(module, fn.LocalTypeTokens[i], method);
-                var (size, align) = GetStorageSizeAlign(t);
-                cur = AlignUp(cur, align);
-                layout.LocalTypes[i] = t;
-                layout.LocalOffsets[i] = cur;
-                layout.LocalSizes[i] = size;
-                layout.LocalFastKinds[i] = ClassifyFastCell(t);
-                cur = checked(cur + size);
-            }
-            layout.LocalsAreaSize = cur;
-
-            for (int i = 0; i < layout.ArgCellCached.Length; i++)
-            {
-                layout.ArgCellCached[i] = layout.ArgFastKinds[i] != FastCellKind.None && !layout.ArgAddressTaken[i];
-                layout.HasArgCellCache |= layout.ArgCellCached[i];
-            }
-
-            for (int i = 0; i < layout.LocalCellCached.Length; i++)
-            {
-                layout.LocalCellCached[i] = layout.LocalFastKinds[i] != FastCellKind.None && !layout.LocalAddressTaken[i];
-                layout.HasLocalCellCache |= layout.LocalCellCached[i];
-            }
-
-            _methodLayouts.Add(method.MethodId, layout);
-            return layout;
-        }
-
-        private static void AnalyzeAddressTaken(ImmutableArray<Instruction> instructions, bool[] args, bool[] locals)
-        {
-            foreach (var ins in instructions)
-            {
-                switch (ins.Op)
-                {
-                    case Op.Ldarga:
-                        Mark(args, ins.Operand0);
-                        break;
-                    case Op.Ldarga_0:
-                        Mark(args, 0);
-                        break;
-                    case Op.Ldarga_1:
-                        Mark(args, 1);
-                        break;
-                    case Op.Ldarga_2:
-                        Mark(args, 2);
-                        break;
-                    case Op.Ldarga_3:
-                        Mark(args, 3);
-                        break;
-                    case Op.Ldloca:
-                        Mark(locals, ins.Operand0);
-                        break;
-                    case Op.Ldloca_0:
-                        Mark(locals, 0);
-                        break;
-                    case Op.Ldloca_1:
-                        Mark(locals, 1);
-                        break;
-                    case Op.Ldloca_2:
-                        Mark(locals, 2);
-                        break;
-                    case Op.Ldloca_3:
-                        Mark(locals, 3);
-                        break;
-                }
-            }
-
-            static void Mark(bool[] taken, int index)
-            {
-                if ((uint)index < (uint)taken.Length)
-                    taken[index] = true;
-            }
-        }
-
-        private RuntimeType GetArgType(RuntimeMethod method, int argIndex)
-        {
-            if (method.HasThis)
-            {
-                if (argIndex == 0)
-                    return method.DeclaringType.IsValueType ? _rts.GetByRefType(method.DeclaringType) : method.DeclaringType;
-                return method.ParameterTypes[argIndex - 1];
-            }
-            return method.ParameterTypes[argIndex];
-        }
-
-        private RuntimeMethod ResolveRuntimeMethod(RuntimeModule module, int methodToken, RuntimeMethod? context)
-        {
-            try
-            {
-                return _rts.ResolveMethodInMethodContext(module, methodToken, context);
-            }
-            catch (Exception ex)
-            {
-                throw new MissingMethodException($"RuntimeMethod not found: {module.Name} 0x{methodToken:X8}", ex);
-            }
-        }
-
-        private RuntimeType ResolveTypeToken(RuntimeModule module, int typeToken, RuntimeMethod? context)
-        {
-            try
-            {
-                return _rts.ResolveTypeInMethodContext(module, typeToken, context);
-            }
-            catch (Exception ex)
-            {
-                throw new TypeLoadException($"RuntimeType not found: {module.Name} 0x{typeToken:X8}", ex);
-            }
-        }
-
-        private RuntimeField ResolveField(Frame frame, int fieldToken)
-            => _rts.ResolveFieldInMethodContext(frame.Module, fieldToken, frame.Method);
-
-        private (int size, int align) GetStorageSizeAlign(RuntimeType type)
-            => _rts.GetStorageSizeAlign(type);
-
-        private static bool NeedsFixedValueStorage(RuntimeType type)
-        {
-            if (!type.IsValueType) return false;
-            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef) return false;
-            if (IsScalarLike(type)) return false;
-            if (IsSystemType(type, "Single") || IsSystemType(type, "Double")) return false;
-            return true;
-        }
-
-        private int GetValueStorageAbs(Frame frame, int valueId)
-        {
-            if ((uint)valueId >= (uint)frame.ValueOffsets.Length)
-                return -1;
-            int offset = frame.ValueOffsets[valueId];
-            return offset < 0 ? -1 : checked(frame.ValuesBase + offset);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Cell LoadLocal(Frame frame, int index)
-        {
-            var layout = frame.Layout;
-            if (layout.LocalCellCached[index])
-                return frame.LocalCells[index];
-
-            int abs = frame.LocalsBase + layout.LocalOffsets[index];
-            var fk = layout.LocalFastKinds[index];
-            if (fk != FastCellKind.None)
-                return LoadFastCell(abs, fk);
-
-            return LoadValue(abs, layout.LocalTypes[index]);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void StoreLocal(Frame frame, int index, Cell value)
-        {
-            var layout = frame.Layout;
-            if (layout.LocalCellCached[index])
-            {
-                frame.LocalCells[index] = NormalizeFastCell(layout.LocalFastKinds[index], value);
-                return;
-            }
-
-            int abs = frame.LocalsBase + layout.LocalOffsets[index];
-            var fk = layout.LocalFastKinds[index];
-            if (fk != FastCellKind.None)
-            {
-                StoreFastCell(abs, fk, value);
-                return;
-            }
-
-            StoreValue(abs, layout.LocalTypes[index], value);
-        }
-
-        private Cell LocalAddress(Frame frame, int index)
-        {
-            int abs = frame.LocalsBase + frame.Layout.LocalOffsets[index];
-            return Cell.ByRef(abs, frame.Layout.LocalSizes[index]);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Cell LoadArg(Frame frame, int index)
-        {
-            var layout = frame.Layout;
-            if (layout.ArgCellCached[index])
-                return frame.ArgCells[index];
-
-            int abs = frame.ArgsBase + layout.ArgOffsets[index];
-            var fk = layout.ArgFastKinds[index];
-            if (fk != FastCellKind.None)
-                return LoadFastCell(abs, fk);
-
-            return LoadValue(abs, layout.ArgTypes[index]);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void StoreArg(Frame frame, int index, Cell value)
-        {
-            var layout = frame.Layout;
-            if (layout.ArgCellCached[index])
-            {
-                frame.ArgCells[index] = NormalizeFastCell(layout.ArgFastKinds[index], value);
-                return;
-            }
-
-            int abs = frame.ArgsBase + layout.ArgOffsets[index];
-            var fk = layout.ArgFastKinds[index];
-            if (fk != FastCellKind.None)
-            {
-                StoreFastCell(abs, fk, value);
-                return;
-            }
-
-            StoreValue(abs, layout.ArgTypes[index], value);
-        }
-
-        private Cell ArgAddress(Frame frame, int index)
-        {
-            int abs = frame.ArgsBase + frame.Layout.ArgOffsets[index];
-            return Cell.ByRef(abs, frame.Layout.ArgSizes[index]);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Cell LoadFastCell(int abs, FastCellKind kind)
-        {
-            return kind switch
-            {
-                FastCellKind.I4 => Cell.I4(ReadI32Unchecked(abs)),
-                FastCellKind.I8 => Cell.I8(ReadI64Unchecked(abs)),
-                FastCellKind.R4 => Cell.R8(ReadR4Unchecked(abs)),
-                FastCellKind.R8 => new Cell(CellKind.R8, ReadI64Unchecked(abs)),
-                FastCellKind.NativeInt or FastCellKind.NativeUInt => RuntimeTypeSystem.PointerSize == 8
-                    ? Cell.I8(ReadI64Unchecked(abs))
-                    : Cell.I4(ReadI32Unchecked(abs)),
-                _ => throw new InvalidOperationException($"Unsupported fast cell kind: {kind}.")
-            };
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void StoreFastCell(int abs, FastCellKind kind, Cell value)
-        {
-            switch (kind)
-            {
-                case FastCellKind.I4:
-                    WriteI32Unchecked(abs, FastI4(value));
-                    return;
-                case FastCellKind.I8:
-                    WriteI64Unchecked(abs, FastI8(value));
-                    return;
-                case FastCellKind.R4:
-                    WriteR4Unchecked(abs, (float)FastR8(value));
-                    return;
-                case FastCellKind.R8:
-                    WriteI64Unchecked(abs, value.Kind == CellKind.R8 ? value.Payload : BitConverter.DoubleToInt64Bits(value.AsR8()));
-                    return;
-                case FastCellKind.NativeInt:
-                case FastCellKind.NativeUInt:
-                    int pointerSize = RuntimeTypeSystem.PointerSize;
-                    if (pointerSize == 8)
-                        WriteI64Unchecked(abs, FastI8(value));
-                    else
-                        WriteI32Unchecked(abs, FastI4(value));
-                    return;
-                default:
-                    throw new InvalidOperationException($"Unsupported fast cell kind: {kind}.");
-            }
-        }
-
-        private Cell LoadValue(int abs, RuntimeType type)
-        {
-            CheckRange(abs, Math.Max(0, GetStorageSizeAlign(type).size));
-
-            if (type.IsReferenceType)
-            {
-                long raw = ReadNativeInt(abs);
-                return raw == 0 ? Cell.Null : Cell.Ref(checked((int)raw));
-            }
-
-            if (type.Kind == RuntimeTypeKind.Pointer)
-                return Cell.Ptr(checked((int)ReadNativeInt(abs)), GetPointedElementSize(type));
-
-            if (type.Kind == RuntimeTypeKind.ByRef)
-                return Cell.ByRef(checked((int)ReadNativeInt(abs)), GetPointedElementSize(type));
-
-            if (IsSystemType(type, "Single"))
-                return Cell.R8(ReadR4Unchecked(abs));
-
-            if (IsSystemType(type, "Double"))
-                return Cell.R8(ReadR8Unchecked(abs));
-
-            if (type.Kind == RuntimeTypeKind.Enum)
-            {
-                var underlying = TryGetEnumUnderlyingType(type);
-                if (underlying is not null)
-                    return LoadValue(abs, underlying);
-            }
-
-            if (IsScalarLike(type))
-            {
-                if (type.Namespace == "System")
-                {
-                    switch (type.Name)
-                    {
-                        case "SByte":
-                            return Cell.I4(unchecked((sbyte)_mem[abs]));
-                        case "Byte":
-                        case "Boolean":
-                            return Cell.I4(_mem[abs]);
-                        case "Int16":
-                            return Cell.I4(ReadI16Unchecked(abs));
-                        case "UInt16":
-                        case "Char":
-                            return Cell.I4(ReadU16Unchecked(abs));
-                        case "Int32":
-                        case "UInt32":
-                            return Cell.I4(ReadI32Unchecked(abs));
-                        case "Int64":
-                        case "UInt64":
-                            return Cell.I8(ReadI64Unchecked(abs));
-                        case "IntPtr":
-                        case "UIntPtr":
-                            return RuntimeTypeSystem.PointerSize == 4
-                                ? Cell.I4(ReadI32Unchecked(abs))
-                                : Cell.I8(ReadI64Unchecked(abs));
-                    }
-                }
-
-                return type.SizeOf switch
-                {
-                    1 => Cell.I4(_mem[abs]),
-                    2 => Cell.I4(ReadU16Unchecked(abs)),
-                    4 => Cell.I4(ReadI32Unchecked(abs)),
-                    8 => Cell.I8(ReadI64Unchecked(abs)),
-                    _ => LoadValueBlob(abs, type)
-                };
-            }
-
-            return LoadValueBlob(abs, type);
-        }
-
-        private Cell LoadValueBlob(int abs, RuntimeType type)
-        {
-            int size = type.SizeOf;
-            int dst = AllocStackBytes(size, Math.Max(1, type.AlignOf));
-            Buffer.BlockCopy(_mem, abs, _mem, dst, size);
-            return new Cell(CellKind.Value, dst, type.TypeId);
-        }
-
-        private void StoreValue(int abs, RuntimeType type, Cell value)
-        {
-            var (size, _) = GetStorageSizeAlign(type);
-            CheckWritableRange(abs, Math.Max(0, size));
-
-            if (type.IsReferenceType)
-            {
-                WriteNativeInt(abs, value.Kind == CellKind.Null ? 0 : RequireObjectRef(value));
-                return;
-            }
-
-            if (type.Kind == RuntimeTypeKind.Pointer)
-            {
-                WriteNativeInt(abs, CoercePointerAddress(value));
-                return;
-            }
-
-            if (type.Kind == RuntimeTypeKind.ByRef)
-            {
-                WriteNativeInt(abs, value.Kind == CellKind.Null ? 0 : RequireByRefAddress(value));
-                return;
-            }
-
-            if (type.Kind == RuntimeTypeKind.Enum)
-            {
-                var underlying = TryGetEnumUnderlyingType(type);
-                if (underlying is not null)
-                {
-                    StoreValue(abs, underlying, value);
-                    return;
-                }
-            }
-
-            if (value.Kind == CellKind.Value)
-            {
-                Buffer.BlockCopy(_mem, checked((int)value.Payload), _mem, abs, size);
-                return;
-            }
-
-            if (IsSystemType(type, "Single"))
-            {
-                WriteR4Unchecked(abs, (float)value.AsR8());
-                return;
-            }
-
-            if (IsSystemType(type, "Double"))
-            {
-                WriteR8Unchecked(abs, value.AsR8());
-                return;
-            }
-
-            if (IsScalarLike(type))
-            {
-                switch (type.SizeOf)
-                {
-                    case 1:
-                        _mem[abs] = unchecked((byte)value.AsI4());
-                        return;
-                    case 2:
-                        WriteU16Unchecked(abs, unchecked((ushort)value.AsI4()));
-                        return;
-                    case 4:
-                        WriteI32Unchecked(abs, value.AsI4());
-                        return;
-                    case 8:
-                        WriteI64Unchecked(abs, value.AsI8());
-                        return;
-                }
-            }
-
-            throw new InvalidOperationException($"Cannot store {value.Kind} into '{type.Namespace}.{type.Name}'.");
-        }
-
-        private Cell DefaultValue(RuntimeType type)
-        {
-            if (type.IsReferenceType)
-                return Cell.Null;
-            if (type.Kind == RuntimeTypeKind.Pointer)
-                return Cell.Ptr(0, GetPointedElementSize(type));
-            if (type.Kind == RuntimeTypeKind.ByRef)
-                return Cell.ByRef(0, GetPointedElementSize(type));
-            if (IsSystemType(type, "Single") || IsSystemType(type, "Double"))
-                return Cell.R8(0);
-            if (type.Kind == RuntimeTypeKind.Enum)
-            {
-                var underlying = TryGetEnumUnderlyingType(type);
-                if (underlying is not null)
-                    return DefaultValue(underlying);
-            }
-            if (IsScalarLike(type))
-                return type.SizeOf == 8 ? Cell.I8(0) : Cell.I4(0);
-            int abs = AllocStackBytes(type.SizeOf, Math.Max(1, type.AlignOf));
-            Array.Clear(_mem, abs, type.SizeOf);
-            return new Cell(CellKind.Value, abs, type.TypeId);
-        }
-
-        private static bool IsSystemType(RuntimeType type, string name)
-            => StringComparer.Ordinal.Equals(type.Namespace, "System") && StringComparer.Ordinal.Equals(type.Name, name);
-
-        private static bool IsScalarLike(RuntimeType type)
-        {
-            if (type.Kind == RuntimeTypeKind.Enum)
-                return true;
-            if (type.Namespace != "System")
-                return false;
-            return type.Name is "Boolean" or "Char" or "SByte" or "Byte" or "Int16" or "UInt16" or "Int32" or "UInt32" or "Int64" or "UInt64" or "IntPtr" or "UIntPtr";
-        }
-
-        private static FastCellKind ClassifyFastCell(RuntimeType type)
-        {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
-                return FastCellKind.None;
-
-            if (type.Kind == RuntimeTypeKind.Enum)
-                type = TryGetEnumUnderlyingType(type) ?? type;
-
-            if (IsSystemType(type, "Single"))
-                return FastCellKind.R4;
-            if (IsSystemType(type, "Double"))
-                return FastCellKind.R8;
-
-            if (type.Namespace != "System")
-                return FastCellKind.None;
-
-            return type.Name switch
-            {
-                "Int32" or "UInt32" => FastCellKind.I4,
-                "Int64" or "UInt64" => FastCellKind.I8,
-                "IntPtr" => FastCellKind.NativeInt,
-                "UIntPtr" => FastCellKind.NativeUInt,
-                _ => FastCellKind.None
-            };
-        }
-
-        private static int CompareEqual(Cell a, Cell b)
-        {
-            if (a.Kind == CellKind.Null && b.Kind == CellKind.Null) return 1;
-            if (a.Kind == CellKind.Null) return IsReferenceLike(b) && b.Payload == 0 ? 1 : 0;
-            if (b.Kind == CellKind.Null) return IsReferenceLike(a) && a.Payload == 0 ? 1 : 0;
-            if (IsReferenceLike(a) || IsReferenceLike(b)) return a.Payload == b.Payload ? 1 : 0;
-            if (IsFloating(a) || IsFloating(b)) return a.AsR8() == b.AsR8() ? 1 : 0;
-            if (IsI8(a) || IsI8(b)) return a.AsI8() == b.AsI8() ? 1 : 0;
-            return a.AsI4() == b.AsI4() ? 1 : 0;
-        }
-
-        private static int CompareLess(Cell a, Cell b)
-        {
-            if (IsFloating(a) || IsFloating(b)) return a.AsR8() < b.AsR8() ? 1 : 0;
-            if (IsI8(a) || IsI8(b)) return a.AsI8() < b.AsI8() ? 1 : 0;
-            return a.AsI4() < b.AsI4() ? 1 : 0;
-        }
-
-        private static int CompareGreater(Cell a, Cell b)
-        {
-            if (IsFloating(a) || IsFloating(b)) return a.AsR8() > b.AsR8() ? 1 : 0;
-            if (IsI8(a) || IsI8(b)) return a.AsI8() > b.AsI8() ? 1 : 0;
-            return a.AsI4() > b.AsI4() ? 1 : 0;
-        }
-
-        private static int CompareLessUn(Cell a, Cell b)
-        {
-            if (IsI8(a) || IsI8(b)) return (ulong)a.AsI8() < (ulong)b.AsI8() ? 1 : 0;
-            return (uint)a.AsI4() < (uint)b.AsI4() ? 1 : 0;
-        }
-
-        private static int CompareGreaterUn(Cell a, Cell b)
-        {
-            if (IsI8(a) || IsI8(b)) return (ulong)a.AsI8() > (ulong)b.AsI8() ? 1 : 0;
-            return (uint)a.AsI4() > (uint)b.AsI4() ? 1 : 0;
-        }
-
-        private static bool IsReferenceLike(Cell c)
-            => c.Kind is CellKind.Ref or CellKind.Ptr or CellKind.ByRef or CellKind.Null;
-
-        private Cell Conv(Cell value, NumericConvKind kind, NumericConvFlags flags, RuntimeType? targetType)
-        {
-            bool sourceUnsigned = (flags & NumericConvFlags.SourceUnsigned) != 0;
-            bool checkedConv = (flags & NumericConvFlags.Checked) != 0;
-
-            if (targetType is not null && targetType.Kind == RuntimeTypeKind.Pointer)
-            {
-                long addr = ToNativeAddress(value, sourceUnsigned, checkedConv);
-                return Cell.Ptr(checked((int)addr), GetPointedElementSize(targetType));
-            }
-
-            static Cell MakeR4(double value) => Cell.R8((float)value);
-            static Cell MakeR8(double value) => Cell.R8(value);
-
-            try
-            {
-                if (value.Kind == CellKind.R8)
-                {
-                    double d = value.AsR8();
-                    return kind switch
-                    {
-                        NumericConvKind.I1 => Cell.I4(checkedConv ? checked((sbyte)d) : unchecked((sbyte)d)),
-                        NumericConvKind.U1 => Cell.I4(checkedConv ? checked((byte)d) : unchecked((byte)d)),
-                        NumericConvKind.I2 => Cell.I4(checkedConv ? checked((short)d) : unchecked((short)d)),
-                        NumericConvKind.U2 or NumericConvKind.Char => Cell.I4(checkedConv ? checked((ushort)d) : unchecked((ushort)d)),
-                        NumericConvKind.I4 => Cell.I4(checkedConv ? checked((int)d) : unchecked((int)d)),
-                        NumericConvKind.U4 => Cell.I4(unchecked((int)(checkedConv ? checked((uint)d) : unchecked((uint)d)))),
-                        NumericConvKind.I8 => Cell.I8(checkedConv ? checked((long)d) : unchecked((long)d)),
-                        NumericConvKind.U8 => Cell.I8(unchecked((long)(checkedConv ? checked((ulong)d) : unchecked((ulong)d)))),
-                        NumericConvKind.R4 => MakeR4(d),
-                        NumericConvKind.R8 => value,
-                        NumericConvKind.Bool => Cell.I4(d != 0.0 ? 1 : 0),
-                        NumericConvKind.NativeInt => RuntimeTypeSystem.PointerSize == 8
-                            ? Cell.I8(checkedConv ? checked((long)d) : unchecked((long)d))
-                            : Cell.I4(checkedConv ? checked((int)d) : unchecked((int)d)),
-                        NumericConvKind.NativeUInt => RuntimeTypeSystem.PointerSize == 8
-                            ? Cell.I8(unchecked((long)(checkedConv ? checked((ulong)d) : unchecked((ulong)d))))
-                            : Cell.I4(unchecked((int)(checkedConv ? checked((uint)d) : unchecked((uint)d)))),
-                        _ => throw new NotSupportedException($"Conv {kind} is not supported.")
-                    };
-                }
-
-                long s = ToSigned64(value);
-                ulong u = ToUnsigned64(value);
-
-                return kind switch
-                {
-                    NumericConvKind.I1 => Cell.I4(sourceUnsigned ? (checkedConv ? checked((sbyte)u) : unchecked((sbyte)u)) : (checkedConv ? checked((sbyte)s) : unchecked((sbyte)s))),
-                    NumericConvKind.U1 => Cell.I4(sourceUnsigned ? (checkedConv ? checked((byte)u) : unchecked((byte)u)) : (checkedConv ? checked((byte)s) : unchecked((byte)s))),
-                    NumericConvKind.I2 => Cell.I4(sourceUnsigned ? (checkedConv ? checked((short)u) : unchecked((short)u)) : (checkedConv ? checked((short)s) : unchecked((short)s))),
-                    NumericConvKind.U2 or NumericConvKind.Char => Cell.I4(sourceUnsigned ? (checkedConv ? checked((ushort)u) : unchecked((ushort)u)) : (checkedConv ? checked((ushort)s) : unchecked((ushort)s))),
-                    NumericConvKind.I4 => Cell.I4(sourceUnsigned ? (checkedConv ? checked((int)u) : unchecked((int)u)) : (checkedConv ? checked((int)s) : unchecked((int)s))),
-                    NumericConvKind.U4 => Cell.I4(unchecked((int)(sourceUnsigned ? (checkedConv ? checked((uint)u) : unchecked((uint)u)) : (checkedConv ? checked((uint)s) : unchecked((uint)s))))),
-                    NumericConvKind.I8 => Cell.I8(sourceUnsigned ? (checkedConv ? checked((long)u) : unchecked((long)u)) : s),
-                    NumericConvKind.U8 => Cell.I8(unchecked((long)(sourceUnsigned ? u : (checkedConv ? checked((ulong)s) : unchecked((ulong)s))))),
-                    NumericConvKind.R4 => MakeR4(sourceUnsigned ? (double)u : (double)s),
-                    NumericConvKind.R8 => MakeR8(sourceUnsigned ? (double)u : (double)s),
-                    NumericConvKind.Bool => Cell.I4(sourceUnsigned ? (u != 0 ? 1 : 0) : (s != 0 ? 1 : 0)),
-                    NumericConvKind.NativeInt => RuntimeTypeSystem.PointerSize == 8
-                        ? Cell.I8(sourceUnsigned ? (checkedConv ? checked((long)u) : unchecked((long)u)) : s)
-                        : Cell.I4(sourceUnsigned ? (checkedConv ? checked((int)u) : unchecked((int)u)) : (checkedConv ? checked((int)s) : unchecked((int)s))),
-                    NumericConvKind.NativeUInt => RuntimeTypeSystem.PointerSize == 8
-                        ? Cell.I8(unchecked((long)(sourceUnsigned ? u : (checkedConv ? checked((ulong)s) : unchecked((ulong)s)))))
-                        : Cell.I4(unchecked((int)(sourceUnsigned ? (checkedConv ? checked((uint)u) : unchecked((uint)u)) : (checkedConv ? checked((uint)s) : unchecked((uint)s))))),
-                    _ => throw new NotSupportedException($"Conv {kind} is not supported.")
-                };
-            }
-            catch (OverflowException) when (checkedConv)
-            {
-                throw;
-            }
-        }
-
-        private static long ToSigned64(Cell value)
-        {
-            return value.Kind switch
-            {
-                CellKind.I4 => unchecked((int)value.Payload),
-                CellKind.I8 => value.Payload,
-                CellKind.Null => 0,
-                CellKind.Ref or CellKind.Ptr or CellKind.ByRef => value.Payload,
-                _ => throw new InvalidOperationException($"Conv source must be numeric or native address, got {value.Kind}.")
-            };
-        }
+            if (_frameCount >= MaxCallFramesHard)
+                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+            if (_frameCount >= limits.MaxCallDepth)
+                throw new InvalidOperationException("Configured call depth limit exceeded.");
 
-        private static ulong ToUnsigned64(Cell value)
-        {
-            return value.Kind switch
-            {
-                CellKind.I4 => unchecked((uint)(int)value.Payload),
-                CellKind.I8 => unchecked((ulong)value.Payload),
-                CellKind.Null => 0,
-                CellKind.Ref or CellKind.Ptr or CellKind.ByRef => unchecked((ulong)value.Payload),
-                _ => throw new InvalidOperationException($"Conv source must be numeric or native address, got {value.Kind}.")
-            };
-        }
-
-        private static long ToNativeAddress(Cell value, bool sourceUnsigned, bool checkedConv)
-        {
-            if (value.Kind is CellKind.Ptr or CellKind.ByRef or CellKind.Ref)
-                return value.Payload;
-            if (value.Kind == CellKind.Null)
-                return 0;
-            if (sourceUnsigned)
-            {
-                ulong u = ToUnsigned64(value);
-                return checkedConv ? checked((long)u) : unchecked((long)u);
-            }
-            return ToSigned64(value);
-        }
-
-        private Cell ExecCall(Frame frame, Instruction ins, bool virtualDispatch, CancellationToken ct, ExecutionLimits limits)
-        {
-            int packed = ins.Operand1;
-            int argCount = packed & 0x7FFF;
-            int hasThis = (packed >> 15) & 1;
-            int total = argCount + hasThis;
-            if (ins.ValueCount != total)
-                throw new InvalidOperationException($"Call value count mismatch: expected {total}, got {ins.ValueCount}.");
-
-            var args = new Cell[total];
-            for (int i = 0; i < total; i++) args[i] = Get(frame, ins.GetValue(i));
-
-            var declared = ResolveRuntimeMethod(frame.Module, ins.Operand0, frame.Method);
-            RuntimeMethod target = declared;
-
-            if (virtualDispatch)
-            {
-                if (total == 0)
-                    throw new InvalidOperationException("callvirt without receiver.");
-                var receiverType = GetObjectTypeFromRef(args[0]);
-                target = ResolveVirtualDispatch(receiverType, declared);
-            }
-
-            if (target.HasThis && target.DeclaringType.IsValueType && args.Length != 0 && args[0].Kind == CellKind.Ref)
-            {
-                int objAbs = checked((int)args[0].Payload);
-                var actual = GetObjectTypeFromRef(args[0]);
-                if (actual.TypeId != target.DeclaringType.TypeId)
-                    throw new InvalidOperationException("Boxed receiver type mismatch.");
-                args[0] = Cell.ByRef(objAbs + ObjectHeaderSize, target.DeclaringType.SizeOf);
-            }
-
-            if (target.IsStatic && !StringComparer.Ordinal.Equals(target.Name, ".cctor"))
-                EnsureTypeInitialized(target.DeclaringType, ct, limits);
-
-            if (target.IsStatic && TryInvokeHostOverride(target, args, ct, out var hostResult))
-                return hostResult;
-
-            if (TryInvokeInternal(target, args, out var internalResult))
-                return internalResult;
-
-            if (target.BodyModule is null || target.Body is null)
-            {
-                var (moduleOpt, fn) = _domain.ResolveCall(frame.Module, ins.Operand0);
-                var module = moduleOpt ?? frame.Module;
-                return Invoke(module, fn, target, args, ct, limits);
-            }
-
-            return Invoke(target.BodyModule, target.Body, target, args, ct, limits);
+            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
         }
 
-        private Cell ExecNewobj(Frame frame, Instruction ins, CancellationToken ct, ExecutionLimits limits)
+        private void ExecNewObj(InstrDesc ins, CancellationToken ct, ExecutionLimits limits)
         {
-            var ctor = ResolveRuntimeMethod(frame.Module, ins.Operand0, frame.Method);
-            EnsureTypeInitialized(ctor.DeclaringType, ct, limits);
-            int argCount = ins.Operand1;
-            if (ins.ValueCount != argCount)
-                throw new InvalidOperationException($"newobj value count mismatch: expected {argCount}, got {ins.ValueCount}.");
-
-            var rawArgs = new Cell[argCount];
-            for (int i = 0; i < argCount; i++) rawArgs[i] = Get(frame, ins.GetValue(i));
-
-            if (IsSystemType(ctor.DeclaringType, "String"))
-                return ExecStringNewobj(ctor, rawArgs);
-
-            var args = new Cell[argCount + 1];
-            for (int i = 0; i < argCount; i++) args[i + 1] = rawArgs[i];
-
-            Cell result;
+            var ctor = _rts.GetMethodById(checked((int)ins.Imm));
             if (ctor.DeclaringType.IsValueType)
             {
-                int abs = AllocStackBytes(ctor.DeclaringType.SizeOf, Math.Max(1, ctor.DeclaringType.AlignOf));
-                Array.Clear(_mem, abs, ctor.DeclaringType.SizeOf);
-                result = new Cell(CellKind.Value, abs, ctor.DeclaringType.TypeId);
-                args[0] = Cell.ByRef(abs, ctor.DeclaringType.SizeOf);
+                if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(ctor.MethodId, out int ctorIndex))
+                    throw new MissingMethodException("Value-type constructor not in register image: M" + ctor.MethodId.ToString());
+                EnterManagedFrame(ctorIndex, _pc, CallFlags.None, ctor);
+                return;
             }
-            else
+
+            int obj = AllocObject(ctor.DeclaringType);
+            SetThisArgumentReference(ctor, obj);
+
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(ctor.MethodId, out int methodIndex))
             {
-                int obj = IsSystemType(ctor.DeclaringType, "String") ? AllocStringUninitialized(0) : AllocObject(ctor.DeclaringType);
-                result = Cell.Ref(obj);
-                args[0] = result;
+                SetGpr(ins.Rd, obj);
+                return;
             }
 
-            if (ctor.BodyModule is null || ctor.Body is null)
-            {
-                if (!TryInvokeInternal(ctor, args, out _))
-                {
-                    var (moduleOpt, fn) = _domain.ResolveCall(frame.Module, ins.Operand0);
-                    var module = moduleOpt ?? frame.Module;
-                    _ = Invoke(module, fn, ctor, args, ct, limits);
-                }
-            }
-            else
-            {
-                _ = Invoke(ctor.BodyModule, ctor.Body, ctor, args, ct, limits);
-            }
 
-            return result;
+            EnterManagedFrame(methodIndex, _pc, CallFlags.None, ctor, ins.Rd, obj);
         }
 
-
-        private Cell ExecStringNewobj(RuntimeMethod ctor, Cell[] args)
+        private bool TryRunTypeInitializer(RuntimeType type, int returnPc, CancellationToken ct, ExecutionLimits limits)
         {
-            if (args.Length == 2 && IsCharLike(ctor.ParameterTypes[0]) && IsInt32Like(ctor.ParameterTypes[1]))
-            {
-                int length = args[1].AsI4();
-                if (length < 0) throw new ArgumentOutOfRangeException();
-                int obj = AllocStringUninitialized(length);
-                ushort ch = unchecked((ushort)args[0].AsI4());
-                int dst = obj + StringCharsOffset;
-                for (int i = 0; i < length; i++)
-                    WriteU16Unchecked(dst + i * 2, ch);
-                return Cell.Ref(obj);
-            }
+            _rts.EnsureConstructedMembers(type);
 
-            if (args.Length == 1 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Array)
-            {
-                return Cell.Ref(CreateStringFromCharArray(args[0], 0, ReadArrayLength(args[0])));
-            }
-
-            if (args.Length == 3 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Array)
-            {
-                return Cell.Ref(CreateStringFromCharArray(args[0], args[1].AsI4(), args[2].AsI4()));
-            }
-
-            if (args.Length == 1 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Pointer)
-            {
-                int src = RequireAddress(args[0]);
-                int len = 0;
-                while (ReadU16Unchecked(src + len * 2) != 0)
-                    len++;
-                int obj = AllocStringUninitialized(len);
-                Buffer.BlockCopy(_mem, src, _mem, obj + StringCharsOffset, len * 2);
-                return Cell.Ref(obj);
-            }
-
-            return Cell.Ref(AllocStringUninitialized(0));
-        }
-
-        private int CreateStringFromCharArray(Cell array, int start, int length)
-        {
-            if (array.Kind == CellKind.Null) throw new ArgumentNullException();
-            if (start < 0 || length < 0) throw new ArgumentOutOfRangeException();
-            int arr = RequireObjectRef(array);
-            int arrLen = ReadI32(arr + ArrayLengthOffset);
-            if (start > arrLen || length > arrLen - start) throw new ArgumentOutOfRangeException();
-            int obj = AllocStringUninitialized(length);
-            Buffer.BlockCopy(_mem, arr + ArrayDataOffset + start * 2, _mem, obj + StringCharsOffset, length * 2);
-            return obj;
-        }
-
-        private static bool IsCharLike(RuntimeType t)
-            => t.Namespace == "System" && t.Name == "Char";
-
-        private static bool IsInt32Like(RuntimeType t)
-            => t.Namespace == "System" && t.Name == "Int32";
-
-        private Cell ExecLdfld(Frame frame, Instruction ins)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            int abs = GetInstanceFieldAddress(field, Get(frame, ins.Value0));
-            return LoadValue(abs, field.FieldType);
-        }
-
-        private void ExecStfld(Frame frame, Instruction ins)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            int abs = GetInstanceFieldAddress(field, Get(frame, ins.Value0));
-            StoreValue(abs, field.FieldType, Get(frame, ins.Value1));
-        }
-
-        private Cell ExecLdflda(Frame frame, Instruction ins)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            int abs = GetInstanceFieldAddress(field, Get(frame, ins.Value0));
-            var (size, _) = GetStorageSizeAlign(field.FieldType);
-            return Cell.ByRef(abs, size);
-        }
-
-        private Cell ExecLdsfld(Frame frame, Instruction ins, CancellationToken ct, ExecutionLimits limits)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            if (!field.IsStatic)
-                throw new InvalidOperationException($"Field '{field.Name}' is not static.");
-            EnsureTypeInitialized(field.DeclaringType, ct, limits);
-            int abs = GetStaticFieldAddress(field);
-            return LoadValue(abs, field.FieldType);
-        }
-
-        private void ExecStsfld(Frame frame, Instruction ins, CancellationToken ct, ExecutionLimits limits)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            if (!field.IsStatic)
-                throw new InvalidOperationException($"Field '{field.Name}' is not static.");
-            EnsureTypeInitialized(field.DeclaringType, ct, limits);
-            int abs = GetStaticFieldAddress(field);
-            StoreValue(abs, field.FieldType, Get(frame, ins.Value0));
-        }
-
-        private Cell ExecLdsflda(Frame frame, Instruction ins, CancellationToken ct, ExecutionLimits limits)
-        {
-            var field = ResolveField(frame, ins.Operand0);
-            if (!field.IsStatic)
-                throw new InvalidOperationException($"Field '{field.Name}' is not static.");
-            EnsureTypeInitialized(field.DeclaringType, ct, limits);
-            int abs = GetStaticFieldAddress(field);
-            var (size, _) = GetStorageSizeAlign(field.FieldType);
-            return Cell.ByRef(abs, size);
-        }
-
-        private int GetInstanceFieldAddress(RuntimeField field, Cell receiver)
-        {
-            if (field.IsStatic)
-                throw new InvalidOperationException($"Field '{field.Name}' is static.");
-
-            if (receiver.Kind == CellKind.Ref)
-            {
-                int objAbs = checked((int)receiver.Payload);
-                var actualType = GetObjectTypeFromRef(receiver);
-                field = _rts.BindFieldToReceiver(field, actualType);
-
-                if (field.DeclaringType.IsValueType)
-                {
-                    if (actualType.TypeId != field.DeclaringType.TypeId)
-                        throw new InvalidOperationException("Boxed field receiver type mismatch.");
-                    return checked(objAbs + ObjectHeaderSize + field.Offset);
-                }
-
-                if (!IsAssignableTo(actualType, field.DeclaringType))
-                    throw new InvalidOperationException($"Field '{field.Name}' is not valid for receiver '{actualType.Namespace}.{actualType.Name}'.");
-
-                return checked(objAbs + field.Offset);
-            }
-
-            if (receiver.Kind is CellKind.ByRef or CellKind.Ptr)
-                return checked((int)receiver.Payload + field.Offset);
-
-            if (receiver.Kind == CellKind.Value)
-                return checked((int)receiver.Payload + field.Offset);
-
-            if (receiver.Kind == CellKind.Null)
-                throw new NullReferenceException();
-
-            throw new InvalidOperationException($"Invalid field receiver kind: {receiver.Kind}.");
-        }
-
-        private int GetStaticFieldAddress(RuntimeField field)
-        {
-            int baseAbs = EnsureStaticStorage(field.DeclaringType);
-            if (baseAbs == 0)
-                throw new InvalidOperationException($"Static storage is empty for '{field.DeclaringType.Namespace}.{field.DeclaringType.Name}'.");
-            return checked(baseAbs + field.Offset);
-        }
-
-        private int EnsureStaticStorage(RuntimeType type)
-        {
-            if (_staticBaseByTypeId.TryGetValue(type.TypeId, out int existing))
-                return existing;
-            int size = type.StaticSize;
-            if (size <= 0)
-            {
-                _staticBaseByTypeId[type.TypeId] = 0;
-                return 0;
-            }
-            int abs = AllocHeapBytes(size, Math.Max(8, type.StaticAlign));
-            Array.Clear(_mem, abs, size);
-            _staticBaseByTypeId[type.TypeId] = abs;
-            int end = checked(abs + size);
-            if (end > _heapFloor) _heapFloor = end;
-            return abs;
-        }
-
-        private void EnsureTypeInitialized(RuntimeType type, CancellationToken ct, ExecutionLimits limits)
-        {
             if (_typeInitState.TryGetValue(type.TypeId, out byte state))
             {
-                if (state == 2 || state == 1)
-                    return;
+                // 1 == running
+                // 2 == completed or known noop
+                return false;
             }
 
             _ = EnsureStaticStorage(type);
-            var cctor = FindTypeInitializer(type);
+
+            RuntimeMethod? cctor = FindTypeInitializer(type);
             if (cctor is null || cctor.BodyModule is null || cctor.Body is null)
             {
                 _typeInitState[type.TypeId] = 2;
-                return;
+                return false;
+            }
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(cctor.MethodId, out int index))
+            {
+                _typeInitState.Remove(type.TypeId);
+                throw new MissingMethodException(
+                    $"Type initializer is reachable at runtime but is absent from register image: " +
+                    $"{type.Namespace}.{type.Name}; cctor=M{cctor.MethodId}");
             }
 
             _typeInitState[type.TypeId] = 1;
-            _ = Invoke(cctor.BodyModule, cctor.Body, cctor, Array.Empty<Cell>(), ct, limits);
-            _typeInitState[type.TypeId] = 2;
+            int snapshotIndex = SaveRegisterSnapshot();
+            EnterManagedFrame(index, returnPc, CallFlags.None, cctor);
+            SetTopRegisterSnapshotIndex(snapshotIndex);
+            return true;
         }
 
         private static RuntimeMethod? FindTypeInitializer(RuntimeType type)
         {
             for (int i = 0; i < type.Methods.Length; i++)
             {
-                var m = type.Methods[i];
+                RuntimeMethod m = type.Methods[i];
                 if (m.IsStatic && m.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(m.Name, ".cctor"))
                     return m;
             }
             return null;
         }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsRegisterVmStaticFieldInstruction(Op op)
+            => (ushort)op >= (ushort)Op.LdSFldI1 && (ushort)op <= (ushort)Op.StSFldObj;
 
-        private Cell ExecLdobj(Frame frame, Instruction ins)
+        private bool TryDeferRequiredTypeInitializationBeforeInstruction(InstrDesc ins, int executingPc, CancellationToken ct, ExecutionLimits limits)
         {
-            var t = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            int abs = RequireAddress(Get(frame, ins.Value0));
-            return LoadValue(abs, t);
-        }
-
-        private void ExecStobj(Frame frame, Instruction ins)
-        {
-            var t = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            int abs = RequireAddress(Get(frame, ins.Value0));
-            StoreValue(abs, t, Get(frame, ins.Value1));
-        }
-
-        private Cell ExecNewarr(Frame frame, Instruction ins)
-        {
-            int len = Get(frame, ins.Value0).AsI4();
-            if (len < 0) throw new InvalidOperationException("Negative array length.");
-            var elem = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var arrType = _rts.GetArrayType(elem);
-            return Cell.Ref(AllocArrayObject(arrType, len));
-        }
-
-        private Cell ExecLdelem(Frame frame, Instruction ins)
-        {
-            var elem = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            int abs = GetArrayElementAddress(Get(frame, ins.Value0), Get(frame, ins.Value1).AsI4(), elem, write: false, value: default);
-            return LoadValue(abs, elem);
-        }
-
-        private Cell ExecLdelema(Frame frame, Instruction ins)
-        {
-            var elem = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            int abs = GetArrayElementAddress(Get(frame, ins.Value0), Get(frame, ins.Value1).AsI4(), elem, write: false, value: default);
-            var (size, _) = GetStorageSizeAlign(elem);
-            return Cell.ByRef(abs, size);
-        }
-
-        private void ExecStelem(Frame frame, Instruction ins)
-        {
-            var elem = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var value = Get(frame, ins.Value2);
-            int abs = GetArrayElementAddress(Get(frame, ins.Value0), Get(frame, ins.Value1).AsI4(), elem, write: true, value: value);
-            StoreValue(abs, elem, value);
-        }
-
-        private Cell ExecLdArrayDataRef(Cell array)
-        {
-            if (array.Kind == CellKind.Null) throw new NullReferenceException();
-            if (array.Kind != CellKind.Ref) throw new InvalidOperationException("Array reference expected.");
-            int arrAbs = checked((int)array.Payload);
-            var t = GetObjectTypeFromRef(array);
-            if (t.Kind != RuntimeTypeKind.Array || t.ElementType is null)
-                throw new InvalidOperationException("Array object expected.");
-            var (size, _) = GetStorageSizeAlign(t.ElementType);
-            return Cell.ByRef(arrAbs + ArrayDataOffset, size);
-        }
-
-        private int GetArrayElementAddress(Cell array, int index, RuntimeType elementType, bool write, Cell value)
-        {
-            if (array.Kind == CellKind.Null) throw new NullReferenceException();
-            if (array.Kind != CellKind.Ref) throw new InvalidOperationException("Array reference expected.");
-            int arrAbs = checked((int)array.Payload);
-            var actual = GetObjectTypeFromRef(array);
-            if (actual.Kind != RuntimeTypeKind.Array || actual.ElementType is null)
-                throw new InvalidOperationException("Array object expected.");
-            if (actual.ArrayRank != 1)
-                throw new NotSupportedException("Only single dimensional arrays are supported.");
-            int len = ReadI32(arrAbs + ArrayLengthOffset);
-            if ((uint)index >= (uint)len)
-                throw new IndexOutOfRangeException();
-
-            var actualElem = actual.ElementType;
-            bool compatible = actualElem.TypeId == elementType.TypeId;
-            if (!compatible && actualElem.IsReferenceType && elementType.IsReferenceType && IsAssignableTo(actualElem, elementType))
-                compatible = true;
-            if (!compatible)
-                throw new ArrayTypeMismatchException();
-
-            if (write && actualElem.IsReferenceType && value.Kind == CellKind.Ref)
+            if (IsRegisterVmStaticFieldInstruction(ins.Op))
             {
-                var valueType = GetObjectTypeFromRef(value);
-                if (!IsAssignableTo(valueType, actualElem))
-                    throw new ArrayTypeMismatchException();
+                RuntimeField field = FieldById(ins.Imm);
+                if (field.IsStatic && TryRunTypeInitializer(field.DeclaringType, executingPc, ct, limits))
+                    return true;
             }
 
-            var (size, _) = GetStorageSizeAlign(actualElem);
-            return checked(arrAbs + ArrayDataOffset + index * size);
-        }
-
-        private Cell ExecStackAlloc(Cell count, int elemSize)
-        {
-            int n = count.AsI4();
-            if (n < 0) throw new InvalidOperationException("Negative stackalloc length.");
-            int bytes = checked(n * elemSize);
-            int abs = AllocStackBytes(bytes, Math.Min(Math.Max(elemSize, 1), 8));
-            Array.Clear(_mem, abs, bytes);
-            return Cell.Ptr(abs, elemSize);
-        }
-
-        private static Cell PtrElemAddr(Cell source, Cell offset, int elemSize)
-        {
-            int baseAbs = RequireAddress(source);
-            long off = offset.AsI8();
-            int abs = checked(baseAbs + checked((int)(off * elemSize)));
-            return source.Kind == CellKind.ByRef ? Cell.ByRef(abs, elemSize) : Cell.Ptr(abs, elemSize);
-        }
-
-        private static Cell PtrToByRef(Cell ptr)
-        {
-            if (ptr.Kind != CellKind.Ptr)
-                throw new InvalidOperationException($"ptr-to-byref expects Ptr, got {ptr.Kind}.");
-            return Cell.ByRef(checked((int)ptr.Payload), ptr.Aux);
-        }
-
-        private static Cell PtrDiff(Cell left, Cell right, int elemSize)
-        {
-            long diff = checked((long)RequireAddress(left) - RequireAddress(right));
-            return RuntimeTypeSystem.PointerSize == 8 ? Cell.I8(diff / elemSize) : Cell.I4(checked((int)(diff / elemSize)));
-        }
-
-        private Cell ExecCastClass(Frame frame, Instruction ins)
-        {
-            var target = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var value = Get(frame, ins.Value0);
-            if (value.Kind == CellKind.Null)
-                return value;
-            if (value.Kind != CellKind.Ref)
-                throw new InvalidCastException();
-            var actual = GetObjectTypeFromRef(value);
-            if (!IsAssignableTo(actual, target))
-                throw new InvalidCastException();
-            return value;
-        }
-
-        private Cell ExecIsinst(Frame frame, Instruction ins)
-        {
-            var target = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var value = Get(frame, ins.Value0);
-            if (value.Kind == CellKind.Null)
-                return value;
-            if (value.Kind != CellKind.Ref)
-                return Cell.Null;
-            var actual = GetObjectTypeFromRef(value);
-            return IsAssignableTo(actual, target) ? value : Cell.Null;
-        }
-
-        private Cell ExecBox(Frame frame, Instruction ins)
-        {
-            var type = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var value = Get(frame, ins.Value0);
-            if (!type.IsValueType)
+            if (ins.Op == Op.NewObj)
             {
-                if (value.Kind is CellKind.Ref or CellKind.Null)
-                    return value;
-                throw new InvalidOperationException($"box of reference type expects ref/null, got {value.Kind}.");
-            }
-
-            if (TryGetNullableInfo(type, out var underlying, out var hasValueField, out var valueField))
-            {
-                if (value.Kind != CellKind.Value)
-                    throw new InvalidOperationException($"Nullable boxing expects value cell, got {value.Kind}.");
-                var actual = GetValueType(value);
-                if (actual.TypeId != type.TypeId)
-                    throw new InvalidOperationException("Nullable boxing type mismatch.");
-
-                int src = checked((int)value.Payload);
-                bool hasValue = LoadValue(src + hasValueField.Offset, hasValueField.FieldType).AsI4() != 0;
-                if (!hasValue)
-                    return Cell.Null;
-
-                var underlyingValue = LoadValue(src + valueField.Offset, underlying);
-                int obj = AllocBoxedValueObject(underlying);
-                StoreValue(obj + ObjectHeaderSize, underlying, underlyingValue);
-                return Cell.Ref(obj);
-            }
-
-            int boxed = AllocBoxedValueObject(type);
-            StoreValue(boxed + ObjectHeaderSize, type, value);
-            return Cell.Ref(boxed);
-        }
-
-        private Cell ExecUnboxAny(Frame frame, Instruction ins)
-        {
-            var target = ResolveTypeToken(frame.Module, ins.Operand0, frame.Method);
-            var boxed = Get(frame, ins.Value0);
-            if (!target.IsValueType)
-            {
-                if (boxed.Kind == CellKind.Null)
-                    return boxed;
-                if (boxed.Kind != CellKind.Ref)
-                    throw new InvalidCastException();
-                var actualRefType = GetObjectTypeFromRef(boxed);
-                if (!IsAssignableTo(actualRefType, target))
-                    throw new InvalidCastException();
-                return boxed;
-            }
-
-            if (TryGetNullableInfo(target, out var underlying, out var hasValueField, out var valueField))
-            {
-                if (boxed.Kind == CellKind.Null)
-                    return DefaultValue(target);
-                if (boxed.Kind != CellKind.Ref)
-                    throw new InvalidCastException();
-
-                int obj = checked((int)boxed.Payload);
-                var actual = GetObjectTypeFromRef(boxed);
-                if (actual.TypeId == target.TypeId)
-                    return LoadValue(obj + ObjectHeaderSize, target);
-                if (actual.TypeId != underlying.TypeId)
-                    throw new InvalidCastException();
-
-                int dst = AllocStackBytes(target.SizeOf, Math.Max(1, target.AlignOf));
-                Array.Clear(_mem, dst, target.SizeOf);
-                StoreValue(dst + hasValueField.Offset, hasValueField.FieldType, Cell.I4(1));
-                StoreValue(dst + valueField.Offset, underlying, LoadValue(obj + ObjectHeaderSize, underlying));
-                return new Cell(CellKind.Value, dst, target.TypeId);
-            }
-
-            if (boxed.Kind == CellKind.Null)
-                throw new NullReferenceException();
-            if (boxed.Kind != CellKind.Ref)
-                throw new InvalidCastException();
-            var actualBoxed = GetObjectTypeFromRef(boxed);
-            if (actualBoxed.TypeId != target.TypeId)
-                throw new InvalidCastException();
-            return LoadValue(checked((int)boxed.Payload) + ObjectHeaderSize, target);
-        }
-
-        private Cell ExecLdstr(RuntimeModule module, int userStringToken)
-        {
-            if (MetadataToken.Table(userStringToken) != MetadataToken.UserString)
-                throw new InvalidOperationException($"ldstr expects UserString token, got 0x{userStringToken:X8}.");
-            string s = module.Md.GetUserString(MetadataToken.Rid(userStringToken));
-            if (!_internPool.TryGetValue(s, out int obj))
-            {
-                obj = AllocStringFromManaged(s);
-                _internPool.Add(s, obj);
-            }
-            return Cell.Ref(obj);
-        }
-
-        private bool TryInvokeInternal(RuntimeMethod method, Cell[] args, out Cell result)
-        {
-            result = default;
-            if (!method.HasInternalCall) return false;
-
-            var t = method.DeclaringType;
-            string ns = t.Namespace;
-            string tn = t.Name;
-            string mn = method.Name;
-
-            if (ns == "System" && tn == "Console" && mn == "_Write")
-            {
-                if (args.Length != 1) throw new InvalidOperationException("Console._Write expects one argument.");
-                WriteConsoleArg(args[0], method.ParameterTypes.Length == 1 ? method.ParameterTypes[0] : null);
-                return true;
-            }
-
-            if (ns == "System" && tn == "String")
-            {
-                if (mn == "get_Length")
-                {
-                    result = Cell.I4(ReadStringLength(args[0]));
+                RuntimeMethod ctor = _rts.GetMethodById(checked((int)ins.Imm));
+                if (TryRunTypeInitializer(ctor.DeclaringType, executingPc, ct, limits))
                     return true;
-                }
-                if (mn == "GetRawStringData" || mn == "GetPinnableReference")
-                {
-                    int obj = RequireObjectRef(args[0]);
-                    result = Cell.ByRef(obj + StringCharsOffset, 2);
-                    return true;
-                }
-                if (mn == "FastAllocateString")
-                {
-                    result = Cell.Ref(AllocStringUninitialized(args[0].AsI4()));
-                    return true;
-                }
-            }
-
-            if (ns == "System" && tn == "Array" && mn == "get_Length")
-            {
-                result = Cell.I4(ReadArrayLength(args[0]));
-                return true;
-            }
-
-            if (ns == "System" && tn == "Array" && mn == "ClearInternal")
-            {
-                ClearArray(args[0], args[1].AsI4(), args[2].AsI4());
-                return true;
-            }
-
-            if (ns == "System" && tn == "Array" && mn == "CopyInternal")
-            {
-                result = Cell.I4(CopyArray(args[0], args[1].AsI4(), args[2], args[3].AsI4(), args[4].AsI4()) ? 1 : 0);
-                return true;
-            }
-
-            if (ns == "System" && tn == "Number" && mn == "_DoubleToStringImpl")
-            {
-                result = Cell.Ref(AllocStringFromManaged(args[0].AsR8().ToString("R", CultureInfo.InvariantCulture)));
-                return true;
-            }
-
-            if (IsCoreLibRandomLike(t) && mn == "Next")
-            {
-                int r;
-                if (method.HasThis && method.ParameterTypes.Length == 0 && args.Length == 1)
-                    r = Random.Shared.Next();
-                else if (method.HasThis && method.ParameterTypes.Length == 1 && args.Length == 2)
-                    r = Random.Shared.Next(args[1].AsI4());
-                else if (method.HasThis && method.ParameterTypes.Length == 2 && args.Length == 3)
-                    r = Random.Shared.Next(args[1].AsI4(), args[2].AsI4());
-                else
-                    return false;
-
-                result = Cell.I4(r);
-                return true;
-            }
-
-            if (ns == "System.Runtime.InteropServices" && tn == "MemoryMarshal")
-            {
-                if (mn == "GetArrayDataReference")
-                {
-                    int arr = RequireObjectRef(args[0]);
-                    var elemType = method.MethodGenericArguments.Length == 1
-                        ? method.MethodGenericArguments[0]
-                        : method.ReturnType;
-                    result = Cell.ByRef(arr + ArrayDataOffset, GetStorageSizeAlign(elemType).size);
-                    return true;
-                }
-                if (mn == "GetReference")
-                {
-                    result = ReadSpanReference(args[0]);
-                    return true;
-                }
-                if (mn == "Read")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ReturnType;
-                    result = LoadValue(RequireAddress(ReadSpanReference(args[0])), type);
-                    return true;
-                }
-                if (mn == "TryRead")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ParameterTypes[1].ElementType!;
-                    int len = ReadSpanLength(args[0]);
-                    if (GetStorageSizeAlign(type).size > len)
-                    {
-                        StoreValue(RequireAddress(args[1]), type, DefaultValue(type));
-                        result = Cell.I4(0);
-                    }
-                    else
-                    {
-                        StoreValue(RequireAddress(args[1]), type, LoadValue(RequireAddress(ReadSpanReference(args[0])), type));
-                        result = Cell.I4(1);
-                    }
-                    return true;
-                }
-                if (mn == "Write" || mn == "TryWrite")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ParameterTypes[^1];
-                    int len = ReadSpanLength(args[0]);
-                    bool ok = GetStorageSizeAlign(type).size <= len;
-                    if (ok)
-                    {
-                        var source = args[1].Kind is CellKind.ByRef or CellKind.Ptr ? LoadValue(RequireAddress(args[1]), type) : args[1];
-                        StoreValue(RequireAddress(ReadSpanReference(args[0])), type, source);
-                    }
-                    if (mn == "TryWrite") result = Cell.I4(ok ? 1 : 0);
-                    if (!ok && mn == "Write") throw new ArgumentOutOfRangeException();
-                    return true;
-                }
-            }
-
-            if (ns == "System.Runtime.CompilerServices" && tn == "RuntimeHelpers")
-            {
-                if (mn == "IsReferenceOrContainsReferences")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ReturnType;
-                    result = Cell.I4(TypeIsReferenceOrContainsReferences(type) ? 1 : 0);
-                    return true;
-                }
-                if (mn == "IsKnownConstant")
-                {
-                    result = Cell.I4(0);
-                    return true;
-                }
-                if (mn == "GetHashCode")
-                {
-                    result = Cell.I4(args[0].Kind == CellKind.Ref ? checked((int)args[0].Payload) : 0);
-                    return true;
-                }
-            }
-
-            if (ns == "System.Runtime.CompilerServices" && tn == "Unsafe")
-            {
-                if (mn == "SizeOf")
-                {
-                    var type = method.MethodGenericArguments.Length >= 1 ? method.MethodGenericArguments[0] : method.ReturnType;
-                    result = Cell.I4(GetStorageSizeAlign(type).size);
-                    return true;
-                }
-                if (mn == "Add")
-                {
-                    var type = method.MethodGenericArguments.Length >= 1 ? method.MethodGenericArguments[0] : method.ReturnType.ElementType!;
-                    int elemSize = GetStorageSizeAlign(type).size;
-                    int abs = checked(RequireAddress(args[0]) + checked((int)args[1].AsI8()) * elemSize);
-                    result = args[0].Kind == CellKind.Ptr ? Cell.Ptr(abs, elemSize) : Cell.ByRef(abs, elemSize);
-                    return true;
-                }
-                if (mn == "AddByteOffset")
-                {
-                    int size = args[0].Aux == 0 ? 1 : args[0].Aux;
-                    int abs = checked(RequireAddress(args[0]) + checked((int)args[1].AsI8()));
-                    result = args[0].Kind == CellKind.Ptr ? Cell.Ptr(abs, size) : Cell.ByRef(abs, size);
-                    return true;
-                }
-                if (mn == "As")
-                {
-                    if ((args[0].Kind is CellKind.ByRef or CellKind.Ptr) && method.MethodGenericArguments.Length >= 2)
-                    {
-                        var to = method.MethodGenericArguments[1];
-                        int size = GetStorageSizeAlign(to).size;
-                        result = args[0].Kind == CellKind.Ptr ? Cell.Ptr(RequireAddress(args[0]), size) : Cell.ByRef(RequireAddress(args[0]), size);
-                    }
-                    else
-                    {
-                        result = args[0];
-                    }
-                    return true;
-                }
-                if (mn == "AsRef")
-                {
-                    var type = method.MethodGenericArguments.Length >= 1 ? method.MethodGenericArguments[0] : method.ReturnType.ElementType!;
-                    result = Cell.ByRef(RequireAddress(args[0]), GetStorageSizeAlign(type).size);
-                    return true;
-                }
-                if (mn == "AreSame")
-                {
-                    result = Cell.I4(RequireAddress(args[0]) == RequireAddress(args[1]) ? 1 : 0);
-                    return true;
-                }
-                if (mn == "ByteOffset")
-                {
-                    result = RuntimeTypeSystem.PointerSize == 8
-                        ? Cell.I8(RequireAddress(args[1]) - RequireAddress(args[0]))
-                        : Cell.I4(RequireAddress(args[1]) - RequireAddress(args[0]));
-                    return true;
-                }
-                if (mn == "ReadUnaligned")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ReturnType;
-                    result = LoadValue(RequireAddress(args[0]), type);
-                    return true;
-                }
-                if (mn == "WriteUnaligned")
-                {
-                    var type = method.MethodGenericArguments.Length == 1 ? method.MethodGenericArguments[0] : method.ParameterTypes[1];
-                    StoreValue(RequireAddress(args[0]), type, args[1]);
-                    return true;
-                }
-                if (mn == "BitCast")
-                {
-                    var from = method.MethodGenericArguments.Length >= 1 ? method.MethodGenericArguments[0] : method.ParameterTypes[0];
-                    var to = method.MethodGenericArguments.Length >= 2 ? method.MethodGenericArguments[1] : method.ReturnType;
-                    var (fromSize, _) = GetStorageSizeAlign(from);
-                    var (toSize, _) = GetStorageSizeAlign(to);
-                    if (fromSize != toSize)
-                        throw new NotSupportedException();
-                    int temp = AllocStackBytes(toSize, Math.Max(1, to.AlignOf));
-                    StoreValue(temp, from, args[0]);
-                    result = LoadValue(temp, to);
-                    return true;
-                }
             }
 
             return false;
         }
 
-
-        private void WriteConsoleArg(Cell value, RuntimeType? parameterType)
+        private void ReturnFromCurrentFrame(bool hasInteger, bool hasFloat, bool hasRef, bool hasValue, int valueSize)
         {
-            if (parameterType != null && parameterType.Kind == RuntimeTypeKind.Pointer)
+            int retPc = TopReturnPc();
+            int callerMethod = TopCallerMethodIndex();
+            RuntimeMethod returningMethod = CurrentFrameMethod();
+            long retI0 = X(MachineRegisters.ReturnValue0);
+            long retF0 = GetFprBits((byte)MachineRegisters.FloatReturnValue0);
+
+            if (hasValue && valueSize > 0 && (CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) != 0)
             {
-                WriteUtf16ZeroTerminated(RequireAddress(value));
+                int source = checked((int)retI0);
+                int target = checked((int)ReadHiddenReturnBufferAddress(returningMethod));
+                CopyBlock(target, source, valueSize);
+                retI0 = target;
+            }
+
+            if (TryBeginFinallyForReturn(_pc - 1, hasInteger, hasFloat, retI0, retF0))
+                return;
+
+            bool returnedFromCctor = StringComparer.Ordinal.Equals(returningMethod.Name, ".cctor");
+            int cctorTypeId = returnedFromCctor ? returningMethod.DeclaringType.TypeId : -1;
+            int registerSnapshotIndex = TopRegisterSnapshotIndex();
+            byte postReturnRegister = TopPostReturnRegister();
+            long postReturnObjectRef = TopPostReturnObjectRef();
+            long callerSp = TopCallerSp();
+            long callerFp = TopCallerFp();
+
+            PopFrame();
+            if (_frameCount == 0 || retPc < 0 || callerMethod < 0)
+            {
+                if (returnedFromCctor)
+                    _typeInitState[cctorTypeId] = 2;
+
+                if (registerSnapshotIndex >= 0)
+                    ReleaseRegisterSnapshot(registerSnapshotIndex);
+
+                _currentMethodIndex = -1;
+                _pc = -1;
+                _currentSafePointPc = -1;
+                X(MachineRegisters.ThreadPointer, 0);
                 return;
             }
 
-            if (parameterType != null && parameterType.IsReferenceType && IsSystemType(parameterType, "String"))
+            _currentMethodIndex = callerMethod;
+            _pc = retPc;
+            X(MachineRegisters.StackPointer, callerSp);
+            X(MachineRegisters.FramePointer, callerFp);
+            X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
+            if (registerSnapshotIndex >= 0)
             {
-                var s = ReadManagedString(value);
-                if (s != null) _textWriter.Write(s);
-                return;
+                RestoreRegisterSnapshot(registerSnapshotIndex);
+                X(MachineRegisters.StackPointer, callerSp);
+                X(MachineRegisters.FramePointer, callerFp);
+                X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
+            }
+            if (hasFloat) SetFpr(MachineRegisters.FloatReturnValue0, retF0);
+            if (hasInteger || hasRef || hasValue) SetGpr(MachineRegisters.ReturnValue0, retI0);
+            if (postReturnRegister != RegisterVmIsa.InvalidRegister) SetGpr(postReturnRegister, postReturnObjectRef);
+            if (returnedFromCctor) _typeInitState[cctorTypeId] = 2;
+        }
+
+        private int SaveRegisterSnapshot()
+        {
+            var snapshot = new RegisterSnapshot((long[])_x.Clone(), (long[])_f.Clone());
+            for (int i = 0; i < _registerSnapshots.Count; i++)
+            {
+                if (_registerSnapshots[i] is null)
+                {
+                    _registerSnapshots[i] = snapshot;
+                    return i;
+                }
             }
 
-            if (parameterType != null && parameterType.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
-            {
-                WriteSpanChars(value);
-                return;
-            }
-
-            if (value.Kind == CellKind.Ref || value.Kind == CellKind.Null)
-            {
-                var s = ReadManagedString(value);
-                if (s != null) _textWriter.Write(s);
-                return;
-            }
-
-            if (value.Kind is CellKind.Ptr or CellKind.ByRef)
-                WriteUtf16ZeroTerminated(RequireAddress(value));
+            _registerSnapshots.Add(snapshot);
+            return _registerSnapshots.Count - 1;
         }
 
-        private void WriteUtf16ZeroTerminated(int abs)
+        private void RestoreRegisterSnapshot(int index)
         {
-            while (true)
-            {
-                CheckRange(abs, 2);
-                char c = (char)ReadU16Unchecked(abs);
-                if (c == '\0') return;
-                _textWriter.Write(c);
-                abs += 2;
-            }
-        }
+            if ((uint)index >= (uint)_registerSnapshots.Count || _registerSnapshots[index] is not RegisterSnapshot snapshot)
+                throw new InvalidOperationException("Invalid register snapshot index.");
 
-        private void WriteSpanChars(Cell value)
-        {
-            Cell r = ReadSpanReference(value);
-            int len = ReadSpanLength(value);
-            int abs = RequireAddress(r);
-            for (int i = 0; i < len; i++)
-            {
-                char c = (char)ReadU16Unchecked(abs + i * 2);
-                _textWriter.Write(c);
-            }
+            Array.Copy(snapshot.General, _x, GprCount);
+            Array.Copy(snapshot.Float, _f, FprCount);
+            _registerSnapshots[index] = null;
         }
-
-        private Cell ReadSpanReference(Cell span)
+        private void ReleaseRegisterSnapshot(int index)
         {
-            RuntimeType t = GetValueType(span);
-            RuntimeField? rf = FindField(t, "_reference");
-            if (rf is null) throw new InvalidOperationException("Span reference field not found.");
-            return LoadValue(checked((int)span.Payload) + rf.Offset, rf.FieldType);
+            if ((uint)index >= (uint)_registerSnapshots.Count)
+                throw new InvalidOperationException("Invalid register snapshot index.");
+
+            _registerSnapshots[index] = null;
         }
-
-        private int ReadSpanLength(Cell span)
+        private bool TryBeginFinallyForReturn(int fromPc, bool hasInteger, bool hasFloat, long retI0, long retF0)
         {
-            RuntimeType t = GetValueType(span);
-            RuntimeField? lf = FindField(t, "_length");
-            if (lf is null) throw new InvalidOperationException("Span length field not found.");
-            return LoadValue(checked((int)span.Payload) + lf.Offset, lf.FieldType).AsI4();
-        }
-
-        private static RuntimeField? FindField(RuntimeType t, string name)
-        {
-            for (RuntimeType? cur = t; cur is not null; cur = cur.BaseType)
-            {
-                for (int i = 0; i < cur.InstanceFields.Length; i++)
-                    if (StringComparer.Ordinal.Equals(cur.InstanceFields[i].Name, name))
-                        return cur.InstanceFields[i];
-            }
-            return null;
-        }
-
-        private void ClearArray(Cell array, int index, int length)
-        {
-            if (array.Kind == CellKind.Null) throw new NullReferenceException();
-            int arr = RequireObjectRef(array);
-            var type = GetObjectTypeFromRef(array);
-            if (type.Kind != RuntimeTypeKind.Array || type.ElementType is null) throw new InvalidOperationException("Array expected.");
-            int len = ReadI32(arr + ArrayLengthOffset);
-            if (index < 0 || length < 0 || index > len - length) throw new IndexOutOfRangeException();
-            var (size, _) = GetStorageSizeAlign(type.ElementType);
-            Array.Clear(_mem, arr + ArrayDataOffset + index * size, length * size);
-        }
-
-        private bool CopyArray(Cell source, int sourceIndex, Cell dest, int destIndex, int length)
-        {
-            if (source.Kind == CellKind.Null || dest.Kind == CellKind.Null) throw new NullReferenceException();
-            int src = RequireObjectRef(source);
-            int dst = RequireObjectRef(dest);
-            var srcType = GetObjectTypeFromRef(source);
-            var dstType = GetObjectTypeFromRef(dest);
-            if (srcType.Kind != RuntimeTypeKind.Array || dstType.Kind != RuntimeTypeKind.Array || srcType.ElementType is null || dstType.ElementType is null)
+            if (!TryFindEnclosingFinally(fromPc, targetPc: -1, out var finallyRegion))
                 return false;
-            if (srcType.ArrayRank != 1 || dstType.ArrayRank != 1)
-                return false;
-            int srcLen = ReadI32(src + ArrayLengthOffset);
-            int dstLen = ReadI32(dst + ArrayLengthOffset);
-            if (sourceIndex < 0 || destIndex < 0 || length < 0 || sourceIndex > srcLen - length || destIndex > dstLen - length)
-                throw new ArgumentException();
-            if (length == 0)
-                return true;
+            SetTopContinuation(PendingContinuationKind.Return, -1, retI0, retF0, hasFloat);
+            _pc = finallyRegion.HandlerStartPc;
+            return true;
+        }
 
-            var srcElem = srcType.ElementType;
-            var dstElem = dstType.ElementType;
-            if (srcElem.TypeId == dstElem.TypeId)
+        private void Leave(int fromPc, int targetPc)
+        {
+            if (TryFindEnclosingFinally(fromPc, targetPc, out var finallyRegion))
             {
-                var (elemSize, _) = GetStorageSizeAlign(srcElem);
-                Buffer.BlockCopy(_mem, src + ArrayDataOffset + sourceIndex * elemSize, _mem, dst + ArrayDataOffset + destIndex * elemSize, length * elemSize);
-                return true;
+                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0, 0, false);
+                _pc = finallyRegion.HandlerStartPc;
+                return;
             }
+            _pc = targetPc;
+        }
 
-            if (srcElem.IsReferenceType && dstElem.IsReferenceType)
+        private void EndFinally()
+        {
+            PendingContinuationKind kind = TopContinuationKind();
+            int targetPc = TopContinuationTargetPc();
+            long i0 = TopContinuationI0();
+            long f0 = TopContinuationF0();
+            bool isFloat = TopContinuationIsFloat();
+            SetTopContinuation(PendingContinuationKind.None, -1, 0, 0, false);
+
+            switch (kind)
             {
-                int ptrSize = RuntimeTypeSystem.PointerSize;
-                int srcStart = checked(src + ArrayDataOffset + sourceIndex * ptrSize);
-                int dstStart = checked(dst + ArrayDataOffset + destIndex * ptrSize);
+                case PendingContinuationKind.None:
+                    return;
+                case PendingContinuationKind.Leave:
+                    _pc = targetPc;
+                    return;
+                case PendingContinuationKind.Throw:
+                    ThrowManaged(_currentExceptionRef, _pc - 1, preserveExistingThrowSite: true);
+                    return;
+                case PendingContinuationKind.Return:
+                case PendingContinuationKind.ReturnFloat:
+                    isFloat = kind == PendingContinuationKind.ReturnFloat;
+                    if (isFloat) SetFpr(MachineRegisters.FloatReturnValue0, f0);
+                    else SetGpr(MachineRegisters.ReturnValue0, i0);
+                    ReturnFromCurrentFrame(hasInteger: !isFloat, hasFloat: isFloat, hasRef: false, hasValue: false, valueSize: 0);
+                    return;
+                default:
+                    throw new InvalidOperationException("Invalid finally continuation.");
+            }
+        }
 
-                if (IsAssignableTo(srcElem, dstElem))
-                {
-                    Buffer.BlockCopy(_mem, srcStart, _mem, dstStart, length * ptrSize);
-                    return true;
-                }
+        private void ThrowManaged(long exceptionRef, int throwPc, bool preserveExistingThrowSite)
+        {
+            if (exceptionRef == 0)
+            {
+                exceptionRef = AllocExceptionRef("System", "NullReferenceException", "NullReferenceException");
+                preserveExistingThrowSite = false;
+            }
+            if (exceptionRef < int.MinValue || exceptionRef > int.MaxValue)
+                throw new AccessViolationException("Managed exception reference is outside VM address space.");
 
-                if (IsAssignableTo(dstElem, srcElem))
+            int exceptionRef32 = (int)exceptionRef;
+            if (!preserveExistingThrowSite || _currentExceptionRef != exceptionRef32 || _currentExceptionThrowMethodIndex < 0)
+            {
+                _currentExceptionThrowMethodIndex = _currentMethodIndex;
+                _currentExceptionThrowPc = throwPc;
+            }
+            _currentExceptionRef = exceptionRef32;
+            List<ManagedStackFrameInfo>? unhandledTrace = null;
+
+            while (_frameCount != 0)
+            {
+                unhandledTrace ??= new List<ManagedStackFrameInfo>(Math.Min(_frameCount, 64));
+                unhandledTrace.Add(CaptureManagedStackFrame(throwPc));
+
+                if (TryFindHandler(throwPc, _currentExceptionRef, out var h))
                 {
-                    for (int i = 0; i < length; i++)
+                    if ((EhRegionKind)h.Kind == EhRegionKind.Finally || (EhRegionKind)h.Kind == EhRegionKind.Fault)
                     {
-                        long raw = ReadNativeInt(srcStart + i * ptrSize);
-                        if (raw == 0)
-                            continue;
-                        var actual = GetObjectTypeFromRef(Cell.Ref(checked((int)raw)));
-                        if (!IsAssignableTo(actual, dstElem))
-                            return false;
+                        SetTopContinuation(PendingContinuationKind.Throw, -1, 0, 0, false);
+                        _pc = h.HandlerStartPc;
+                        return;
                     }
-                    Buffer.BlockCopy(_mem, srcStart, _mem, dstStart, length * ptrSize);
-                    return true;
+
+                    _pc = h.HandlerStartPc;
+                    return;
                 }
+
+                RuntimeMethod unwindingMethod = CurrentFrameMethod();
+                if (StringComparer.Ordinal.Equals(unwindingMethod.Name, ".cctor"))
+                    _typeInitState.Remove(unwindingMethod.DeclaringType.TypeId);
+
+                int registerSnapshotIndex = TopRegisterSnapshotIndex();
+                int retPc = TopReturnPc();
+                int callerMethod = TopCallerMethodIndex();
+                long callerSp = TopCallerSp();
+                long callerFp = TopCallerFp();
+                PopFrame();
+                if (registerSnapshotIndex >= 0)
+                    ReleaseRegisterSnapshot(registerSnapshotIndex);
+                if (_frameCount == 0 || retPc < 0 || callerMethod < 0)
+                    break;
+                _currentMethodIndex = callerMethod;
+                _pc = retPc;
+                X(MachineRegisters.StackPointer, callerSp);
+                X(MachineRegisters.FramePointer, callerFp);
+                X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
+                throwPc = _pc - 1;
             }
 
-            if (srcElem.IsValueType && dstElem.IsReferenceType && IsAssignableTo(srcElem, dstElem))
+            string message = TryReadExceptionMessage(_currentExceptionRef);
+            string exceptionType = FormatExceptionTypeName(_currentExceptionRef);
+            string header = FormatUnhandledExceptionHeader(exceptionType, message);
+            string managedTrace = FormatManagedStackTrace(
+                _currentExceptionThrowMethodIndex, _currentExceptionThrowPc, unhandledTrace);
+            _currentExceptionThrowMethodIndex = -1;
+            _currentExceptionThrowPc = -1;
+            throw new VmUnhandledException(header, $"<{managedTrace}>");
+        }
+        private readonly struct ManagedStackFrameInfo
+        {
+            public readonly int MethodIndex;
+            public readonly int RuntimeMethodId;
+            public readonly int Pc;
+            public readonly string MethodName;
+            public readonly string InstructionText;
+            public ManagedStackFrameInfo(int methodIndex, int runtimeMethodId, int pc, string methodName, string instructionText)
             {
-                var (srcSize, _) = GetStorageSizeAlign(srcElem);
-                int ptrSize = RuntimeTypeSystem.PointerSize;
-                int srcStart = checked(src + ArrayDataOffset + sourceIndex * srcSize);
-                int dstStart = checked(dst + ArrayDataOffset + destIndex * ptrSize);
-                for (int i = 0; i < length; i++)
+                MethodIndex = methodIndex;
+                RuntimeMethodId = runtimeMethodId;
+                Pc = pc;
+                MethodName = methodName;
+                InstructionText = instructionText;
+            }
+        }
+        private ManagedStackFrameInfo CaptureManagedStackFrame(int pc)
+        {
+            int methodIndex = _currentMethodIndex;
+            RuntimeMethod? method = null;
+            int runtimeMethodId = -1;
+            try
+            {
+                if ((uint)methodIndex < (uint)_image.Methods.Length)
                 {
-                    var value = LoadValue(srcStart + i * srcSize, srcElem);
-                    int boxed = AllocBoxedValueObject(srcElem);
-                    StoreValue(boxed + ObjectHeaderSize, srcElem, value);
-                    WriteNativeInt(dstStart + i * ptrSize, boxed);
+                    runtimeMethodId = _image.Methods[methodIndex].RuntimeMethodId;
+                    method = _rts.GetMethodById(runtimeMethodId);
                 }
-                return true;
             }
-
-            return false;
-        }
-
-        private bool TryEnterExceptionHandler(Frame frame, int throwPc, Cell exception)
-        {
-            AbandonActiveFinallyContextIfThrowingInsideFinally(frame, throwPc);
-
-            if (TryEnterCatch(frame, throwPc, exception))
-                return true;
-
-            if (TryFindFinallyHandlerForPc(frame, throwPc, out var finallyHandler))
+            catch
             {
-                BeginFinally(frame, finallyHandler, FinallyContext.ForThrow(frame, finallyHandler, exception));
-                return true;
+                method = null;
             }
-
-            return false;
+            return new ManagedStackFrameInfo(
+                methodIndex,
+                runtimeMethodId,
+                pc,
+                method is null ? "<unknown>" : FormatMethodName(method),
+                FormatInstructionAtPc(pc));
         }
-
-        private bool TryEnterCatch(Frame frame, int throwPc, Cell exception)
+        private string FormatUnhandledExceptionHeader(string exceptionType, string message)
         {
-            var handlers = frame.Function.ExceptionHandlers;
+            if (message.Length == 0)
+                return exceptionType.Length == 0 ? "Unhandled managed exception." : "Unhandled managed exception: " + exceptionType;
+            if (exceptionType.Length == 0)
+                return message;
+            return exceptionType + ": " + message;
+        }
+        private string FormatExceptionTypeName(int exceptionRef)
+        {
+            try
+            {
+                if (exceptionRef == 0) return string.Empty;
+                return FormatTypeName(GetObjectTypeFromRef(exceptionRef));
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+        private string FormatManagedStackTrace(int originalThrowMethodIndex, int originalThrowPc, List<ManagedStackFrameInfo>? frames)
+        {
+            var sb = new System.Text.StringBuilder();
+            if ((uint)originalThrowMethodIndex < (uint)_image.Methods.Length)
+            {
+                RuntimeMethod? originalMethod = null;
+                try
+                {
+                    originalMethod = MethodForIndex(originalThrowMethodIndex);
+                }
+                catch
+                {
+                    originalMethod = null;
+                }
+                sb.Append("at: ");
+                sb.Append(originalMethod is null ? "<unknown>" : FormatMethodName(originalMethod));
+                sb.Append(" [methodIndex=");
+                sb.Append(originalThrowMethodIndex);
+                sb.Append(", pc=");
+                sb.Append(originalThrowPc);
+                sb.Append(']');
+                string instruction = FormatInstructionAtPc(originalThrowPc);
+                if (instruction.Length != 0)
+                {
+                    sb.Append(Environment.NewLine);
+                    sb.Append("instr: ");
+                    sb.Append(instruction);
+                }
+            }
+            if (frames is not null && frames.Count != 0)
+            {
+                if (sb.Length != 0) sb.Append(Environment.NewLine);
+                for (int i = 0; i < frames.Count; i++)
+                {
+                    ManagedStackFrameInfo f = frames[i];
+                    sb.Append(Environment.NewLine);
+                    sb.Append("  at ");
+                    sb.Append(f.MethodName);
+                    sb.Append(']');
+                    if (f.InstructionText.Length != 0)
+                    {
+                        sb.Append(" :: ");
+                        sb.Append(f.InstructionText);
+                    }
+                }
+            }
+            return sb.ToString();
+        }
+        private string FormatInstructionAtPc(int pc)
+        {
+            if ((uint)pc >= (uint)_image.Code.Length) return string.Empty;
+            return _image.Code[pc].ToString();
+        }
+        private static string FormatMethodName(RuntimeMethod method)
+            => FormatTypeName(method.DeclaringType) + "." + method.Name;
+        private static string FormatTypeName(RuntimeType type)
+        {
+            string ns = type.Namespace;
+            if (string.IsNullOrEmpty(ns))
+                return type.Name;
+            return ns + "." + type.Name;
+        }
+        private bool TryFindHandler(int pc, int exceptionRef, out EhRegionRecord handler)
+        {
+            var m = _image.Methods[_currentMethodIndex];
             int bestSpan = int.MaxValue;
-            ExceptionHandler best = default;
-            for (int i = 0; i < handlers.Length; i++)
+            handler = default;
+            bool found = false;
+            RuntimeType? exceptionType = null;
+            if (exceptionRef != 0)
+                exceptionType = GetObjectTypeFromRef(exceptionRef);
+
+            for (int i = 0; i < m.EhCount; i++)
             {
-                var h = handlers[i];
-                if (h.CatchTypeToken == FinallyCatchTypeToken)
+                var h = _image.EhRegions[m.EhStartIndex + i];
+                if (pc < h.TryStartPc || pc >= h.TryEndPc)
                     continue;
-                if (throwPc < h.TryStartPc || throwPc >= h.TryEndPc)
+                int span = h.TryEndPc - h.TryStartPc;
+                if (span >= bestSpan)
                     continue;
-                if (h.CatchTypeToken != 0)
+                var kind = (EhRegionKind)h.Kind;
+                if (kind == EhRegionKind.Finally || kind == EhRegionKind.Fault)
                 {
-                    var catchType = ResolveTypeToken(frame.Module, h.CatchTypeToken, frame.Method);
-                    var exType = GetObjectTypeFromRef(exception);
-                    if (!IsAssignableTo(exType, catchType))
-                        continue;
+                    bestSpan = span;
+                    handler = h;
+                    found = true;
+                    continue;
                 }
+                if (kind == EhRegionKind.CatchAll)
+                {
+                    bestSpan = span;
+                    handler = h;
+                    found = true;
+                    continue;
+                }
+                if (kind == EhRegionKind.Catch && exceptionType is not null)
+                {
+                    var catchType = _rts.GetTypeById(h.CatchTypeId);
+                    if (IsAssignableTo(exceptionType, catchType))
+                    {
+                        bestSpan = span;
+                        handler = h;
+                        found = true;
+                    }
+                }
+            }
+            return found;
+        }
+
+        private bool TryFindEnclosingFinally(int fromPc, int targetPc, out EhRegionRecord region)
+        {
+            var m = _image.Methods[_currentMethodIndex];
+            int bestSpan = int.MaxValue;
+            region = default;
+            bool found = false;
+            for (int i = 0; i < m.EhCount; i++)
+            {
+                var h = _image.EhRegions[m.EhStartIndex + i];
+                if ((EhRegionKind)h.Kind != EhRegionKind.Finally)
+                    continue;
+                if (fromPc < h.TryStartPc || fromPc >= h.TryEndPc)
+                    continue;
+                if (targetPc >= h.TryStartPc && targetPc < h.TryEndPc)
+                    continue;
                 int span = h.TryEndPc - h.TryStartPc;
                 if (span < bestSpan)
                 {
                     bestSpan = span;
-                    best = h;
+                    region = h;
+                    found = true;
                 }
             }
-
-            if (bestSpan == int.MaxValue)
-                return false;
-
-            frame.Exception = exception;
-            frame.Pc = best.HandlerStartPc;
-            return true;
+            return found;
         }
 
-        private static int HandlerSpan(ExceptionHandler h) => h.TryEndPc - h.TryStartPc;
-
-        private bool TryFindFinallyHandlerForPc(Frame frame, int pc, out ExceptionHandler match)
+        private bool TryInvokeIntrinsic(RuntimeMethod rm, CancellationToken ct)
         {
-            match = default;
-            int bestSpan = int.MaxValue;
-            var handlers = frame.Function.ExceptionHandlers;
-            for (int i = 0; i < handlers.Length; i++)
+            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Console" && rm.Name == "_Write")
+                return IntrinsicConsoleWrite(rm, ct);
+
+            if (IsSystemStringType(rm.DeclaringType))
             {
-                var h = handlers[i];
-                if (h.CatchTypeToken != FinallyCatchTypeToken)
-                    continue;
-                if (pc < h.TryStartPc || pc >= h.TryEndPc)
-                    continue;
-                int span = HandlerSpan(h);
-                if (span < bestSpan)
+                if (rm.HasThis && rm.Name == "get_Length" && rm.ParameterTypes.Length == 0)
                 {
-                    bestSpan = span;
-                    match = h;
-                }
-            }
-            return bestSpan != int.MaxValue;
-        }
-
-        private bool TryFindFinallyHandlerForLeave(Frame frame, int fromPc, int toPc, out ExceptionHandler match)
-        {
-            match = default;
-            int bestSpan = int.MaxValue;
-            var handlers = frame.Function.ExceptionHandlers;
-            for (int i = 0; i < handlers.Length; i++)
-            {
-                var h = handlers[i];
-                if (h.CatchTypeToken != FinallyCatchTypeToken)
-                    continue;
-                if (fromPc < h.TryStartPc || fromPc >= h.TryEndPc)
-                    continue;
-                if (toPc >= h.TryStartPc && toPc < h.TryEndPc)
-                    continue;
-                int span = HandlerSpan(h);
-                if (span < bestSpan)
-                {
-                    bestSpan = span;
-                    match = h;
-                }
-            }
-            return bestSpan != int.MaxValue;
-        }
-
-        private void BeginFinally(Frame frame, ExceptionHandler handler, FinallyContext context)
-        {
-            _finallyStack.Add(context);
-            frame.Pc = handler.HandlerStartPc;
-        }
-
-        private bool TryBeginFinallyForJump(Frame frame, int fromPc, int targetPc)
-        {
-            if (!TryFindFinallyHandlerForLeave(frame, fromPc, targetPc, out var handler))
-                return false;
-            BeginFinally(frame, handler, FinallyContext.ForJump(frame, handler, targetPc));
-            return true;
-        }
-
-        private bool TryBeginFinallyForReturn(Frame frame, int fromPc, bool hasReturnValue, Cell returnValue)
-        {
-            if (!TryFindFinallyHandlerForLeave(frame, fromPc, -1, out var handler))
-                return false;
-            BeginFinally(frame, handler, FinallyContext.ForReturn(frame, handler, hasReturnValue, returnValue));
-            return true;
-        }
-
-        private bool ExecEndfinally(Frame frame, out Cell returned)
-        {
-            returned = default;
-            if (_finallyStack.Count == 0)
-                throw new InvalidOperationException("Endfinally without active finally context.");
-
-            int last = _finallyStack.Count - 1;
-            var ctx = _finallyStack[last];
-            _finallyStack.RemoveAt(last);
-
-            if (!ReferenceEquals(ctx.Frame, frame))
-                throw new InvalidOperationException("Endfinally frame mismatch.");
-
-            if (ctx.Kind == FinallyContinuationKind.Throw)
-            {
-                if (TryFindFinallyHandlerForPc(frame, ctx.NextFromPc, out var next))
-                {
-                    BeginFinally(frame, next, FinallyContext.ForThrow(frame, next, ctx.PendingException));
-                    return false;
-                }
-                throw new VmThrownException(ctx.PendingException);
-            }
-
-            if (ctx.Kind == FinallyContinuationKind.Jump)
-            {
-                if (!TryBeginFinallyForJump(frame, ctx.NextFromPc, ctx.TargetPc))
-                    frame.Pc = ctx.TargetPc;
-                return false;
-            }
-
-            if (ctx.Kind == FinallyContinuationKind.Return)
-            {
-                if (TryBeginFinallyForReturn(frame, ctx.NextFromPc, ctx.HasReturnValue, ctx.ReturnValue))
-                    return false;
-                returned = ctx.HasReturnValue ? ctx.ReturnValue : default;
-                return true;
-            }
-
-            throw new InvalidOperationException("Unknown finally continuation kind.");
-        }
-
-        private void AbandonActiveFinallyContextIfThrowingInsideFinally(Frame frame, int pc)
-        {
-            while (_finallyStack.Count != 0)
-            {
-                int last = _finallyStack.Count - 1;
-                var ctx = _finallyStack[last];
-                if (!ReferenceEquals(ctx.Frame, frame))
-                    break;
-                if (pc >= ctx.FinallyStartPc && pc < ctx.FinallyEndPc)
-                {
-                    _finallyStack.RemoveAt(last);
-                    continue;
-                }
-                break;
-            }
-        }
-
-        private void ClearFinallyContextsForFrame(Frame frame)
-        {
-            for (int i = _finallyStack.Count - 1; i >= 0; i--)
-            {
-                if (ReferenceEquals(_finallyStack[i].Frame, frame))
-                    _finallyStack.RemoveAt(i);
-            }
-        }
-
-        private RuntimeMethod ResolveVirtualDispatch(RuntimeType receiverType, RuntimeMethod declared)
-        {
-            if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
-            {
-                for (var t = receiverType; t != null; t = t.BaseType)
-                {
-                    var map = t.ExplicitInterfaceMethodImpls;
-                    if (map is not null && map.TryGetValue(declared.MethodId, out var impl))
-                        return impl;
-                }
-                return FindMostDerivedMethodByNameAndSig(receiverType, declared) ?? declared;
-            }
-
-            int slot = declared.VTableSlot;
-            if (slot >= 0 && (uint)slot < (uint)receiverType.VTable.Length)
-                return receiverType.VTable[slot];
-            return FindMostDerivedMethodByNameAndSig(receiverType, declared) ?? declared;
-        }
-
-        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType receiverType, RuntimeMethod declared)
-        {
-            for (var t = receiverType; t != null; t = t.BaseType)
-            {
-                var methods = t.Methods;
-                for (int i = 0; i < methods.Length; i++)
-                {
-                    var c = methods[i];
-                    if (c.IsStatic || c.IsPrivate) continue;
-                    if (!StringComparer.Ordinal.Equals(c.Name, declared.Name)) continue;
-                    if (!SameSig(c, declared)) continue;
-                    return c;
-                }
-            }
-            return null;
-        }
-
-        private static bool SameSig(RuntimeMethod a, RuntimeMethod b)
-        {
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
-            if (a.GenericArity != b.GenericArity) return false;
-            for (int i = 0; i < a.ParameterTypes.Length; i++)
-                if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
-            return true;
-        }
-
-        private bool IsAssignableTo(RuntimeType actual, RuntimeType target)
-        {
-            if (ReferenceEquals(actual, target))
-                return true;
-
-            if (target.Kind == RuntimeTypeKind.Interface && ImplementsInterface(actual, target, new HashSet<int>()))
-                return true;
-
-            if (actual.Kind == RuntimeTypeKind.Array && target.Kind == RuntimeTypeKind.Array &&
-                actual.ArrayRank == target.ArrayRank &&
-                actual.ElementType is RuntimeType actualElem &&
-                target.ElementType is RuntimeType targetElem &&
-                actualElem.IsReferenceType && targetElem.IsReferenceType &&
-                IsAssignableTo(actualElem, targetElem))
-                return true;
-
-            if (actual.IsValueType && target.IsReferenceType)
-            {
-                for (var t = actual.BaseType; t != null; t = t.BaseType)
-                    if (ReferenceEquals(t, target)) return true;
-            }
-
-            for (var t = actual.BaseType; t != null; t = t.BaseType)
-                if (ReferenceEquals(t, target)) return true;
-
-            return false;
-        }
-
-        private static bool ImplementsInterface(RuntimeType current, RuntimeType target, HashSet<int> seen)
-        {
-            if (!seen.Add(current.TypeId)) return false;
-            for (int i = 0; i < current.Interfaces.Length; i++)
-            {
-                var iface = current.Interfaces[i];
-                if (ReferenceEquals(iface, target)) return true;
-                if (ImplementsInterface(iface, target, seen)) return true;
-            }
-            return current.BaseType is not null && ImplementsInterface(current.BaseType, target, seen);
-        }
-
-        private static RuntimeType? TryGetEnumUnderlyingType(RuntimeType type)
-        {
-            if (type.Kind != RuntimeTypeKind.Enum)
-                return null;
-            if (type.ElementType is not null)
-                return type.ElementType;
-            for (int i = 0; i < type.InstanceFields.Length; i++)
-            {
-                var f = type.InstanceFields[i];
-                if (StringComparer.Ordinal.Equals(f.Name, "value__"))
-                    return f.FieldType;
-            }
-            return type.InstanceFields.Length != 0 ? type.InstanceFields[0].FieldType : null;
-        }
-
-        private static bool IsNullableTypeDefinitionName(string name)
-            => name.StartsWith("Nullable", StringComparison.Ordinal);
-
-        private static bool TryGetNullableInfo(RuntimeType type, out RuntimeType underlying, out RuntimeField hasValueField, out RuntimeField valueField)
-        {
-            underlying = null!;
-            hasValueField = null!;
-            valueField = null!;
-
-            if (!type.IsValueType)
-                return false;
-
-            RuntimeType def = type.GenericTypeDefinition ?? type;
-            if (def.Namespace != "System" || !IsNullableTypeDefinitionName(def.Name))
-                return false;
-            if (type.GenericTypeArguments.Length != 1)
-                return false;
-
-            underlying = type.GenericTypeArguments[0];
-            RuntimeField? hv = null;
-            RuntimeField? vv = null;
-            for (int i = 0; i < type.InstanceFields.Length; i++)
-            {
-                var f = type.InstanceFields[i];
-                if (StringComparer.Ordinal.Equals(f.Name, "hasValue")) hv = f;
-                else if (StringComparer.Ordinal.Equals(f.Name, "value")) vv = f;
-            }
-
-            if (hv is null || vv is null)
-                return false;
-            if (!IsSystemBooleanType(hv.FieldType))
-                return false;
-            if (vv.FieldType.TypeId != underlying.TypeId)
-                return false;
-
-            hasValueField = hv;
-            valueField = vv;
-            return true;
-        }
-
-        private static bool IsSystemBooleanType(RuntimeType type)
-            => type.Namespace == "System" && type.Name == "Boolean";
-
-        private static bool IsCoreLibRandomLike(RuntimeType type)
-        {
-            if (!StringComparer.Ordinal.Equals(type.AssemblyName, "std"))
-                return false;
-            for (var cur = type; cur is not null; cur = cur.BaseType)
-            {
-                if (StringComparer.Ordinal.Equals(cur.AssemblyName, "std") &&
-                    StringComparer.Ordinal.Equals(cur.Namespace, "System") &&
-                    StringComparer.Ordinal.Equals(cur.Name, "Random"))
+                    long s = ReadThisArgumentReference(rm);
+                    ValidateStringRef(s, out int strAbs);
+                    SetReturnI4(ReadI32(strAbs + StringLengthOffset));
                     return true;
-            }
-            return false;
-        }
-
-        private bool TypeIsReferenceOrContainsReferences(RuntimeType type)
-            => TypeIsReferenceOrContainsReferences(type, new HashSet<int>());
-
-        private bool TypeIsReferenceOrContainsReferences(RuntimeType type, HashSet<int> visiting)
-        {
-            if (type.IsReferenceType) return true;
-            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef) return false;
-            if (IsScalarLike(type) || IsSystemType(type, "Single") || IsSystemType(type, "Double") || IsSystemType(type, "Decimal")) return false;
-            if (!visiting.Add(type.TypeId)) return false;
-            for (int i = 0; i < type.InstanceFields.Length; i++)
-            {
-                if (TypeIsReferenceOrContainsReferences(type.InstanceFields[i].FieldType, visiting))
+                }
+                if (rm.HasThis && (rm.Name == "GetPinnableReference" || rm.Name == "GetRawStringData") && rm.ParameterTypes.Length == 0)
                 {
-                    visiting.Remove(type.TypeId);
+                    long s = ReadThisArgumentReference(rm);
+                    ValidateStringRef(s, out int strAbs);
+                    SetReturnRef(strAbs + StringCharsOffset);
+                    return true;
+                }
+                if (!rm.HasThis && rm.Name == "FastAllocateString" && rm.ParameterTypes.Length == 1)
+                {
+                    int len = (int)ReadAbiScalarArgument(rm, 0);
+                    SetReturnRef(AllocStringUninitialized(len));
                     return true;
                 }
             }
-            visiting.Remove(type.TypeId);
+
+            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
+            {
+                if (rm.HasThis && rm.Name == "get_Length" && rm.ParameterTypes.Length == 0)
+                {
+                    long arr = ReadThisArgumentReference(rm);
+                    ValidateArrayRef(arr, out int arrAbs, out _);
+                    SetReturnI4(ReadI32(arrAbs + ArrayLengthOffset));
+                    return true;
+                }
+                if (!rm.HasThis && rm.Name == "ClearInternal" && rm.ParameterTypes.Length == 3)
+                {
+                    long arr = ReadAbiScalarArgument(rm, 0);
+                    int index = (int)ReadAbiScalarArgument(rm, 1);
+                    int len = (int)ReadAbiScalarArgument(rm, 2);
+                    ClearArray(arr, index, len);
+                    return true;
+                }
+                if (!rm.HasThis && rm.Name == "CopyInternal" && rm.ParameterTypes.Length == 5)
+                {
+                    bool ok = CopyArray(
+                        ReadAbiScalarArgument(rm, 0),
+                        (int)ReadAbiScalarArgument(rm, 1),
+                        ReadAbiScalarArgument(rm, 2),
+                        (int)ReadAbiScalarArgument(rm, 3),
+                        (int)ReadAbiScalarArgument(rm, 4));
+                    SetReturnI4(ok ? 1 : 0);
+                    return true;
+                }
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Runtime.CompilerServices" && rm.DeclaringType.Name == "RuntimeHelpers")
+            {
+                if (!rm.HasThis && rm.Name == "IsReferenceOrContainsReferences" && rm.ParameterTypes.Length == 0)
+                {
+                    bool result = rm.MethodGenericArguments.Length == 1 && TypeIsReferenceOrContainsReferences(rm.MethodGenericArguments[0]);
+                    SetReturnI4(result ? 1 : 0);
+                    return true;
+                }
+                if (!rm.HasThis && rm.Name == "IsKnownConstant" && rm.ParameterTypes.Length == 1)
+                {
+                    SetReturnI4(0);
+                    return true;
+                }
+                if (!rm.HasThis && rm.Name == "GetHashCode" && rm.ParameterTypes.Length == 1)
+                {
+                    long obj = ReadAbiScalarArgument(rm, 0);
+                    SetReturnI4(unchecked((int)obj));
+                    return true;
+                }
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Runtime.CompilerServices" && rm.DeclaringType.Name == "Unsafe")
+                return IntrinsicUnsafe(rm);
+
+            if (rm.DeclaringType.Namespace == "System.Runtime.InteropServices" && rm.DeclaringType.Name == "MemoryMarshal")
+                return IntrinsicMemoryMarshal(rm);
+
+            if (IsCoreLibRandomLike(rm.DeclaringType) && rm.Name == "Next")
+            {
+                if (rm.ParameterTypes.Length == 0)
+                    SetReturnI4(Random.Shared.Next());
+                else if (rm.ParameterTypes.Length == 1)
+                    SetReturnI4(Random.Shared.Next((int)ReadAbiScalarArgument(rm, rm.HasThis ? 1 : 0)));
+                else if (rm.ParameterTypes.Length == 2)
+                    SetReturnI4(Random.Shared.Next((int)ReadAbiScalarArgument(rm, rm.HasThis ? 1 : 0), (int)ReadAbiScalarArgument(rm, rm.HasThis ? 2 : 1)));
+                else
+                    return false;
+                return true;
+            }
+
+            if (rm.HasInternalCall)
+                throw new NotSupportedException("InternalCall is not implemented: " + rm.DeclaringType.Namespace + "." + rm.DeclaringType.Name + "." + rm.Name);
+
             return false;
         }
 
-        private RuntimeType GetObjectTypeFromRef(Cell value)
+        private bool IntrinsicConsoleWrite(RuntimeMethod rm, CancellationToken ct)
         {
-            if (value.Kind == CellKind.Null)
+            if (rm.HasThis || rm.ParameterTypes.Length != 1)
+                throw new NotSupportedException("Console._Write intrinsic arity mismatch.");
+
+            var p = rm.ParameterTypes[0];
+            if (IsSystemStringType(p))
+            {
+                long s = ReadAbiScalarArgument(rm, 0);
+                if (s == 0) return true;
+                ValidateStringRef(s, out int strAbs);
+                int len = ReadI32(strAbs + StringLengthOffset);
+                int chars = strAbs + StringCharsOffset;
+                CheckIndirectAccess(chars, checked(len * 2), false);
+                for (int i = 0; i < len; i++)
+                {
+                    if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                    _textWriter.Write((char)ReadU16(chars + i * 2));
+                }
+                return true;
+            }
+
+            if (p.Kind == RuntimeTypeKind.Pointer && p.ElementType is { Namespace: "System", Name: "Char" })
+            {
+                int abs = checked((int)ReadAbiScalarArgument(rm, 0));
+                if (abs == 0) return true;
+                const int MaxChars = 8 * 1024;
+                for (int i = 0; i < MaxChars; i++)
+                {
+                    if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                    int pos = checked(abs + i * 2);
+                    CheckIndirectAccess(pos, 2, false);
+                    ushort ch = ReadU16(pos);
+                    if (ch == 0) break;
+                    _textWriter.Write((char)ch);
+                }
+                return true;
+            }
+
+            if (p.Name.StartsWith("ReadOnlySpan`1", StringComparison.Ordinal))
+            {
+                long addr = ReadAbiAggregateAddress(rm, 0);
+                RuntimeField? reference = null;
+                RuntimeField? length = null;
+                for (int i = 0; i < p.InstanceFields.Length; i++)
+                {
+                    if (p.InstanceFields[i].Name == "_reference") reference = p.InstanceFields[i];
+                    else if (p.InstanceFields[i].Name == "_length") length = p.InstanceFields[i];
+                }
+                if (reference is null || length is null)
+                    throw new NotSupportedException("ReadOnlySpan<char> intrinsic cannot locate fields.");
+
+                int chars = checked((int)ReadSizedInteger(checked((int)addr + reference.Offset), reference.FieldType));
+                int len = ReadI32(checked((int)addr + length.Offset));
+                CheckIndirectAccess(chars, checked(len * 2), false);
+                for (int i = 0; i < len; i++)
+                {
+                    if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                    _textWriter.Write((char)ReadU16(chars + i * 2));
+                }
+                return true;
+            }
+
+            throw new NotSupportedException("Console._Write intrinsic unsupported parameter: " + p.Namespace + "." + p.Name);
+        }
+
+        private bool IntrinsicUnsafe(RuntimeMethod rm)
+        {
+            string n = rm.Name;
+            if (n == "SizeOf" && rm.MethodGenericArguments.Length == 1)
+            {
+                SetReturnI4(StorageSizeOf(rm.MethodGenericArguments[0]));
+                return true;
+            }
+            if (n == "AreSame")
+            {
+                SetReturnI4(ReadAbiScalarArgument(rm, 0) == ReadAbiScalarArgument(rm, 1) ? 1 : 0);
+                return true;
+            }
+            if (n == "ByteOffset")
+            {
+                SetReturnRef(checked(ReadAbiScalarArgument(rm, 1) - ReadAbiScalarArgument(rm, 0)));
+                return true;
+            }
+            if (n == "Add" || n == "AddByteOffset")
+            {
+                long src = ReadAbiScalarArgument(rm, 0);
+                long offs = ReadAbiScalarArgument(rm, 1);
+                int elemSize = rm.MethodGenericArguments.Length >= 1 ? StorageSizeOf(rm.MethodGenericArguments[^1]) : 1;
+                if (n == "Add") offs = checked(offs * elemSize);
+                SetReturnRef(checked(src + offs));
+                return true;
+            }
+            if (n == "As" || n == "AsRef")
+            {
+                SetReturnRef(ReadAbiScalarArgument(rm, 0));
+                return true;
+            }
+            if (n == "ReadUnaligned")
+            {
+                long src = ReadAbiScalarArgument(rm, 0);
+                RuntimeType t = rm.MethodGenericArguments[0];
+                LoadTypedValueToReturn(checked((int)src), t);
+                return true;
+            }
+            if (n == "WriteUnaligned")
+            {
+                long dst = ReadAbiScalarArgument(rm, 0);
+                RuntimeType t = rm.MethodGenericArguments[0];
+                StoreAbiArgumentToAddress(rm, 1, checked((int)dst), t);
+                return true;
+            }
+            if (n == "BitCast" && rm.MethodGenericArguments.Length == 2)
+            {
+                RuntimeType from = rm.MethodGenericArguments[0];
+                RuntimeType to = rm.MethodGenericArguments[1];
+                if (StorageSizeOf(from) != StorageSizeOf(to))
+                    throw new NotSupportedException("Unsafe.BitCast source and destination sizes differ.");
+                LoadAbiArgumentBitsToReturn(rm, 0, from, to);
+                return true;
+            }
+            return false;
+        }
+
+        private bool IntrinsicMemoryMarshal(RuntimeMethod rm)
+        {
+            if (rm.Name == "GetArrayDataReference" && rm.ParameterTypes.Length == 1)
+            {
+                long arr = ReadAbiScalarArgument(rm, 0);
+                ValidateArrayRef(arr, out int arrAbs, out _);
+                SetReturnRef(arrAbs + ArrayDataOffset);
+                return true;
+            }
+            if (rm.Name == "GetReference" && rm.ParameterTypes.Length == 1)
+            {
+                long spanAddr = ReadAbiAggregateAddress(rm, 0);
+                RuntimeType spanType = rm.ParameterTypes[0];
+                RuntimeField? refField = null;
+                for (int i = 0; i < spanType.InstanceFields.Length; i++)
+                    if (spanType.InstanceFields[i].Name == "_reference") refField = spanType.InstanceFields[i];
+                if (refField is null) throw new NotSupportedException("Span reference field not found.");
+                SetReturnRef(ReadNative(checked((int)spanAddr + refField.Offset)));
+                return true;
+            }
+            if ((rm.Name == "Read" || rm.Name == "TryRead") && rm.ParameterTypes.Length >= 1 && rm.MethodGenericArguments.Length == 1)
+            {
+                RuntimeType valueType = rm.MethodGenericArguments[0];
+                int spanAddr = checked((int)ReadAbiAggregateAddress(rm, 0));
+                var span = ReadSpanFields(rm.ParameterTypes[0], spanAddr);
+                int size = StorageSizeOf(valueType);
+                if (rm.Name == "TryRead")
+                {
+                    if (span.Length < size)
+                    {
+                        int dst = checked((int)ReadAbiScalarArgument(rm, 1));
+                        InitTypedObject(dst, valueType);
+                        SetReturnI4(0);
+                        return true;
+                    }
+                    CopyTypedObject(checked((int)ReadAbiScalarArgument(rm, 1)), span.Reference, valueType);
+                    SetReturnI4(1);
+                    return true;
+                }
+
+                if (span.Length < size)
+                    throw new ArgumentOutOfRangeException();
+                LoadTypedValueToReturn(span.Reference, valueType);
+                return true;
+            }
+            if ((rm.Name == "Write" || rm.Name == "TryWrite") && rm.ParameterTypes.Length >= 2 && rm.MethodGenericArguments.Length == 1)
+            {
+                RuntimeType valueType = rm.MethodGenericArguments[0];
+                int spanAddr = checked((int)ReadAbiAggregateAddress(rm, 0));
+                var span = ReadSpanFields(rm.ParameterTypes[0], spanAddr);
+                int size = StorageSizeOf(valueType);
+                if (span.Length < size)
+                {
+                    if (rm.Name == "TryWrite")
+                    {
+                        SetReturnI4(0);
+                        return true;
+                    }
+                    throw new ArgumentOutOfRangeException();
+                }
+
+                StoreAbiArgumentToAddress(rm, 1, span.Reference, valueType);
+                if (rm.Name == "TryWrite")
+                    SetReturnI4(1);
+                return true;
+            }
+            return false;
+        }
+
+        private readonly struct AbiArgumentSlice
+        {
+            public readonly AbiArgumentLocation Location;
+            public readonly RegisterClass RegisterClass;
+            public readonly int Offset;
+            public readonly int Size;
+
+            public AbiArgumentSlice(AbiArgumentLocation location, RegisterClass registerClass, int offset, int size)
+            {
+                Location = location;
+                RegisterClass = registerClass;
+                Offset = offset;
+                Size = size;
+            }
+        }
+
+        private int LogicalArgumentCount(RuntimeMethod method)
+            => method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
+
+        private int HiddenReturnBufferInsertionIndex(RuntimeMethod method)
+        {
+            if ((CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) == 0)
+                return -1;
+
+            if (method.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(method.Name, ".ctor"))
+                return -1;
+
+            return MachineAbi.HiddenReturnBufferInsertionIndex(method, LogicalArgumentCount(method));
+        }
+
+        private long ReadHiddenReturnBufferAddress(RuntimeMethod method)
+        {
+            int insertion = HiddenReturnBufferInsertionIndex(method);
+            if (insertion < 0)
+                throw new InvalidOperationException("Current call has no hidden return buffer.");
+
+            int general = 0, floating = 0, stack = 0;
+            for (int i = 0; i <= insertion; i++)
+            {
+                if (i == insertion)
+                {
+                    AbiArgumentLocation loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
+                    return loc.IsRegister ? X(loc.Register) : ReadNative(GetAbiStackArgumentAddress(method, loc));
+                }
+
+                RuntimeType argType = GetLogicalArgumentType(method, i);
+                ConsumeAbiValue(argType, ref general, ref floating, ref stack);
+            }
+
+            throw new InvalidOperationException("Invalid hidden return buffer position.");
+        }
+
+        private ImmutableArray<AbiArgumentSlice> GetAbiArgumentSlices(RuntimeMethod method, int logicalIndex)
+        {
+            int argCount = LogicalArgumentCount(method);
+            if ((uint)logicalIndex >= (uint)argCount)
+                throw new ArgumentOutOfRangeException(nameof(logicalIndex));
+
+            int hiddenIndex = HiddenReturnBufferInsertionIndex(method);
+            int general = 0, floating = 0, stack = 0;
+
+            for (int i = 0; i <= logicalIndex; i++)
+            {
+                if (hiddenIndex == i)
+                    ConsumeHiddenReturnBuffer(ref general, ref stack);
+
+                RuntimeType argType = GetLogicalArgumentType(method, i);
+                var abi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false);
+
+                if (abi.PassingKind == AbiValuePassingKind.Void)
+                    continue;
+
+                if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                {
+                    AbiArgumentLocation loc = AssignScalarAbiLocation(abi.RegisterClass, abi.Size, ref general, ref floating, ref stack);
+                    if (i == logicalIndex)
+                    {
+                        return ImmutableArray.Create(new AbiArgumentSlice(
+                            loc,
+                            abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass,
+                            0,
+                            abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size));
+                    }
+                    continue;
+                }
+
+                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                {
+                    var segments = MachineAbi.GetRegisterSegments(abi);
+                    var result = i == logicalIndex ? ImmutableArray.CreateBuilder<AbiArgumentSlice>(segments.Length) : null;
+                    int aggregateStackSlot = -1;
+                    int aggregateStackBaseOffset = 0;
+
+                    for (int s = 0; s < segments.Length; s++)
+                    {
+                        AbiRegisterSegment segment = segments[s];
+                        AbiArgumentLocation loc = AssignAggregateSegmentAbiLocation(
+                            segment,
+                            ref general,
+                            ref floating,
+                            ref stack,
+                            ref aggregateStackSlot,
+                            ref aggregateStackBaseOffset);
+
+                        result?.Add(new AbiArgumentSlice(loc, segment.RegisterClass, segment.Offset, segment.Size));
+                    }
+
+                    if (i == logicalIndex)
+                        return result!.ToImmutable();
+                    continue;
+                }
+
+                int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                AbiArgumentLocation stackLoc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, stackSize);
+                if (i == logicalIndex)
+                {
+                    return ImmutableArray.Create(new AbiArgumentSlice(
+                        stackLoc,
+                        RegisterClass.General,
+                        0,
+                        stackSize));
+                }
+            }
+
+            throw new InvalidOperationException("Invalid ABI argument index.");
+        }
+
+        private void ConsumeAbiValue(RuntimeType type, ref int general, ref int floating, ref int stack)
+        {
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+            if (abi.PassingKind == AbiValuePassingKind.Void)
+                return;
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                _ = AssignScalarAbiLocation(abi.RegisterClass, abi.Size, ref general, ref floating, ref stack);
+                return;
+            }
+            if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+            {
+                int aggregateStackSlot = -1;
+                int aggregateStackBaseOffset = 0;
+                var segments = MachineAbi.GetRegisterSegments(abi);
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    _ = AssignAggregateSegmentAbiLocation(
+                        segments[i],
+                        ref general,
+                        ref floating,
+                        ref stack,
+                        ref aggregateStackSlot,
+                        ref aggregateStackBaseOffset);
+                }
+                return;
+            }
+            stack++;
+        }
+
+        private static void ConsumeHiddenReturnBuffer(ref int general, ref int stack)
+        {
+            MachineRegister r = MachineRegisters.GetIntegerArgumentRegister(general++);
+            if (r == MachineRegister.Invalid)
+                stack++;
+        }
+
+        private long ReadAbiValueBits(RuntimeMethod method, int logicalIndex, RuntimeType type, int size)
+        {
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            if (slices.Length == 1)
+            {
+                AbiArgumentSlice slice = slices[0];
+                if (slice.Location.IsRegister)
+                    return slice.RegisterClass == RegisterClass.Float ? GetFprBits((byte)slice.Location.Register) : X(slice.Location.Register);
+
+                int addr = GetAbiStackArgumentAddress(method, slice.Location);
+                return ReadRawBits(addr, Math.Min(size, slice.Size));
+            }
+
+            int temp = MaterializeAbiArgumentToStack(method, logicalIndex, type);
+            return ReadRawBits(temp, size);
+        }
+
+        private int MaterializeAbiArgumentToStack(RuntimeMethod method, int logicalIndex, RuntimeType type)
+        {
+            int size = StorageSizeOf(type);
+            int align = StorageAlignOf(type);
+            int dst = StackAllocBytes(size, align);
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            for (int i = 0; i < slices.Length; i++)
+            {
+                AbiArgumentSlice slice = slices[i];
+                int count = Math.Min(slice.Size, size - slice.Offset);
+                if (count <= 0)
+                    continue;
+
+                int target = checked(dst + slice.Offset);
+                if (slice.Location.IsRegister)
+                {
+                    long bits = slice.RegisterClass == RegisterClass.Float
+                        ? GetFprBits((byte)slice.Location.Register)
+                        : X(slice.Location.Register);
+                    WriteRawBits(target, bits, count);
+                }
+                else
+                {
+                    int source = GetAbiStackArgumentAddress(method, slice.Location);
+                    CopyBlock(target, source, count);
+                }
+            }
+            return dst;
+        }
+
+        private long ReadRawBits(int abs, int size)
+        {
+            return size switch
+            {
+                1 => ReadU8(abs),
+                2 => ReadU16(abs),
+                4 => unchecked((uint)ReadI32(abs)),
+                8 => ReadI64(abs),
+                _ => throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString()),
+            };
+        }
+
+        private void WriteRawBits(int abs, long value, int size)
+        {
+            switch (size)
+            {
+                case 1: WriteU8(abs, unchecked((byte)value)); return;
+                case 2: WriteU16(abs, unchecked((ushort)value)); return;
+                case 4: WriteI32(abs, unchecked((int)value)); return;
+                case 8: WriteI64(abs, value); return;
+                default: throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString());
+            }
+        }
+
+        private static MachineRegister ReturnRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+        {
+            if (registerClass == RegisterClass.Float)
+            {
+                return floatIndex++ switch
+                {
+                    0 => MachineRegisters.FloatReturnValue0,
+                    1 => MachineRegisters.FloatReturnValue1,
+                    _ => throw new InvalidOperationException("Too many floating return registers."),
+                };
+            }
+
+            if (registerClass == RegisterClass.General)
+            {
+                return generalIndex++ switch
+                {
+                    0 => MachineRegisters.ReturnValue0,
+                    1 => MachineRegisters.ReturnValue1,
+                    _ => throw new InvalidOperationException("Too many integer return registers."),
+                };
+            }
+
+            throw new InvalidOperationException("Invalid ABI return register class.");
+        }
+
+        private (int Reference, int Length) ReadSpanFields(RuntimeType spanType, int spanAddr)
+        {
+            RuntimeField? refField = null;
+            RuntimeField? lenField = null;
+            for (int i = 0; i < spanType.InstanceFields.Length; i++)
+            {
+                RuntimeField f = spanType.InstanceFields[i];
+                if (f.Name == "_reference") refField = f;
+                else if (f.Name == "_length") lenField = f;
+            }
+            if (refField is null || lenField is null)
+                throw new NotSupportedException("Span-like intrinsic cannot locate _reference/_length fields.");
+
+            int reference = checked((int)ReadSizedInteger(spanAddr + refField.Offset, refField.FieldType));
+            int length = ReadI32(spanAddr + lenField.Offset);
+            if (length < 0)
+                throw new InvalidOperationException("Corrupted span length.");
+            return (reference, length);
+        }
+
+        private long ReadThisArgumentReference(RuntimeMethod method)
+        {
+            if (!method.HasThis)
+                throw new InvalidOperationException("Method has no this argument.");
+            return ReadAbiScalarArgument(method, 0);
+        }
+
+        private void SetThisArgumentReference(RuntimeMethod method, long value)
+        {
+            int general = 0, floating = 0, stack = 0;
+            var loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
+            if (loc.IsRegister)
+                SetGpr(loc.Register, value);
+            else
+                WriteNative(GetOutgoingArgAddress(loc.StackSlotIndex) + loc.StackOffset, value);
+        }
+
+        private long ReadAbiScalarArgument(RuntimeMethod method, int logicalIndex)
+        {
+            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            if (slices.Length == 0)
+                return 0;
+
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                AbiArgumentSlice slice = slices[0];
+                if (slice.Location.IsRegister)
+                    return slice.RegisterClass == RegisterClass.Float ? GetFprBits((byte)slice.Location.Register) : X(slice.Location.Register);
+                return ReadSizedInteger(GetAbiStackArgumentAddress(method, slice.Location), type);
+            }
+
+            if (abi.PassingKind == AbiValuePassingKind.MultiRegister && StorageSizeOf(type) <= 8)
+            {
+                int temp = MaterializeAbiArgumentToStack(method, logicalIndex, type);
+                return ReadSizedInteger(temp, type);
+            }
+
+            return ReadAbiAggregateAddress(method, logicalIndex);
+        }
+
+        private long ReadAbiAggregateAddress(RuntimeMethod method, int logicalIndex)
+        {
+            RuntimeType t = GetLogicalArgumentType(method, logicalIndex);
+            var abi = MachineAbi.ClassifyValue(t, MachineAbi.StackKindForType(t), isReturn: false);
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister && (t.Kind == RuntimeTypeKind.ByRef || t.Kind == RuntimeTypeKind.Pointer || t.IsReferenceType))
+                return ReadAbiScalarArgument(method, logicalIndex);
+
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            if (slices.Length == 1 && slices[0].Location.IsStack && abi.PassingKind != AbiValuePassingKind.MultiRegister)
+                return GetAbiStackArgumentAddress(method, slices[0].Location);
+
+            return MaterializeAbiArgumentToStack(method, logicalIndex, t);
+        }
+
+        private RuntimeType GetLogicalArgumentType(RuntimeMethod method, int logicalIndex)
+        {
+            if (method.HasThis)
+            {
+                if (logicalIndex == 0)
+                    return method.DeclaringType.IsValueType ? _rts.GetByRefType(method.DeclaringType) : method.DeclaringType;
+                logicalIndex--;
+            }
+            if ((uint)logicalIndex >= (uint)method.ParameterTypes.Length)
+                throw new ArgumentOutOfRangeException(nameof(logicalIndex));
+            return method.ParameterTypes[logicalIndex];
+        }
+
+        private AbiArgumentLocation AssignScalarAbiLocation(RegisterClass rc, int size, ref int general, ref int floating, ref int stack)
+        {
+            int actualSize = size <= 0 ? TargetArchitecture.PointerSize : size;
+            if (rc == RegisterClass.Float)
+            {
+                var r = MachineRegisters.GetFloatArgumentRegister(floating++);
+                if (r != MachineRegister.Invalid) return AbiArgumentLocation.ForRegister(RegisterClass.Float, r, actualSize);
+                return AbiArgumentLocation.ForStack(RegisterClass.Float, stack++, 0, actualSize);
+            }
+            if (rc == RegisterClass.General || rc == RegisterClass.Invalid)
+            {
+                var r = MachineRegisters.GetIntegerArgumentRegister(general++);
+                if (r != MachineRegister.Invalid) return AbiArgumentLocation.ForRegister(RegisterClass.General, r, actualSize);
+                return AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, actualSize);
+            }
+            throw new InvalidOperationException("Invalid ABI register class.");
+        }
+
+        private AbiArgumentLocation AssignAggregateSegmentAbiLocation(
+            AbiRegisterSegment segment,
+            ref int general,
+            ref int floating,
+            ref int stack,
+            ref int aggregateStackSlot,
+            ref int aggregateStackBaseOffset)
+        {
+            MachineRegister reg;
+            if (segment.RegisterClass == RegisterClass.Float)
+            {
+                reg = MachineRegisters.GetFloatArgumentRegister(floating++);
+                if (reg != MachineRegister.Invalid)
+                    return AbiArgumentLocation.ForRegister(RegisterClass.Float, reg, segment.Size);
+            }
+            else if (segment.RegisterClass == RegisterClass.General)
+            {
+                reg = MachineRegisters.GetIntegerArgumentRegister(general++);
+                if (reg != MachineRegister.Invalid)
+                    return AbiArgumentLocation.ForRegister(RegisterClass.General, reg, segment.Size);
+            }
+            else
+            {
+                throw new InvalidOperationException("Invalid ABI aggregate segment register class.");
+            }
+
+            if (aggregateStackSlot < 0)
+            {
+                aggregateStackSlot = stack++;
+                aggregateStackBaseOffset = segment.Offset;
+            }
+
+            return AbiArgumentLocation.ForStack(
+                segment.RegisterClass,
+                aggregateStackSlot,
+                checked(segment.Offset - aggregateStackBaseOffset),
+                segment.Size);
+        }
+
+        private int GetCurrentOutgoingArgumentBase()
+        {
+            if (_currentMethodIndex < 0)
+                throw new InvalidOperationException("No current method for outgoing argument address.");
+
+            MethodRecord method = _image.Methods[_currentMethodIndex];
+            int outgoingBaseOffset = 0;
+            if (method.OutgoingArgumentAreaSize != 0)
+            {
+                outgoingBaseOffset = method.OutgoingArgumentAreaOffset;
+                if (outgoingBaseOffset < 0)
+                    throw new InvalidOperationException("Corrupted method outgoing argument area metadata.");
+            }
+
+            long frameBase = (((MethodFlags)method.Flags & MethodFlags.UsesFramePointer) != 0)
+                ? X(MachineRegisters.FramePointer)
+                : X(MachineRegisters.StackPointer);
+
+            int addr = checked((int)frameBase + outgoingBaseOffset);
+            CheckStackRange(addr, method.OutgoingArgumentAreaSize);
+            return addr;
+        }
+
+        private int GetOutgoingArgAddress(int stackIndex)
+        {
+            if (stackIndex < 0) throw new ArgumentOutOfRangeException(nameof(stackIndex));
+
+            MethodRecord method = _image.Methods[_currentMethodIndex];
+            int slotSize = MachineAbi.StackArgumentSlotSize;
+            int slotOffset = checked(stackIndex * slotSize);
+            if (method.OutgoingArgumentAreaSize != 0 && slotOffset + slotSize > method.OutgoingArgumentAreaSize)
+                throw new InvalidOperationException("ABI stack argument slot is outside caller outgoing argument area.");
+
+            int addr = checked(GetCurrentOutgoingArgumentBase() + slotOffset);
+            CheckStackRange(addr, slotSize);
+            return addr;
+        }
+
+        private int GetIncomingArgAddress(int stackIndex)
+        {
+            if (stackIndex < 0) throw new ArgumentOutOfRangeException(nameof(stackIndex));
+            long baseAddress = TopIncomingStackArgBase();
+            if (baseAddress == 0)
+                return GetOutgoingArgAddress(stackIndex);
+
+            int slotSize = MachineAbi.StackArgumentSlotSize;
+            int addr = checked((int)baseAddress + checked(stackIndex * slotSize));
+            CheckStackRange(addr, slotSize);
+            return addr;
+        }
+
+        private int GetAbiStackArgumentAddress(RuntimeMethod method, AbiArgumentLocation location)
+        {
+            int slotBase = IsReadingCurrentManagedInvocation(method)
+                ? GetIncomingArgAddress(location.StackSlotIndex)
+                : GetOutgoingArgAddress(location.StackSlotIndex);
+            return checked(slotBase + location.StackOffset);
+        }
+
+        private void LoadAbiArgumentToReturn(RuntimeMethod rm, int logicalIndex, RuntimeType type)
+            => LoadAbiArgumentBitsToReturn(rm, logicalIndex, type, type);
+
+        private void LoadAbiArgumentBitsToReturn(RuntimeMethod rm, int logicalIndex, RuntimeType sourceType, RuntimeType returnType)
+        {
+            int size = StorageSizeOf(returnType);
+            var returnAbi = MachineAbi.ClassifyValue(returnType, MachineAbi.StackKindForType(returnType), isReturn: true);
+            if (returnAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                long raw = ReadAbiValueBits(rm, logicalIndex, sourceType, size);
+                if (returnAbi.RegisterClass == RegisterClass.Float)
+                    SetFpr(MachineRegisters.FloatReturnValue0, raw);
+                else
+                    SetGpr(MachineRegisters.ReturnValue0, raw);
+                return;
+            }
+
+            int source = MaterializeAbiArgumentToStack(rm, logicalIndex, sourceType);
+            LoadTypedValueToReturn(source, returnType);
+        }
+
+        private void LoadTypedValueToReturn(int abs, RuntimeType type)
+        {
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: true);
+            if (abi.PassingKind == AbiValuePassingKind.Void)
+                return;
+
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                if (abi.RegisterClass == RegisterClass.Float)
+                    SetFpr(MachineRegisters.FloatReturnValue0, StorageSizeOf(type) == 4 ? (uint)ReadI32(abs) : ReadI64(abs));
+                else
+                    SetGpr(MachineRegisters.ReturnValue0, ReadSizedInteger(abs, type));
+                return;
+            }
+
+            if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+            {
+                var segments = MachineAbi.GetRegisterSegments(abi);
+                int generalReturnIndex = 0;
+                int floatReturnIndex = 0;
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    AbiRegisterSegment segment = segments[i];
+                    long bits = ReadRawBits(abs + segment.Offset, segment.Size);
+                    MachineRegister reg = ReturnRegister(segment.RegisterClass, ref generalReturnIndex, ref floatReturnIndex);
+                    if (segment.RegisterClass == RegisterClass.Float)
+                        SetFpr(reg, bits);
+                    else
+                        SetGpr(reg, bits);
+                }
+                return;
+            }
+
+            int retBuffer = checked((int)ReadHiddenReturnBufferAddress(_activeCallTargetMethod ?? CurrentFrameMethod()));
+            CopyTypedObject(retBuffer, abs, type);
+            SetReturnRef(retBuffer);
+        }
+
+        private void StoreAbiArgumentToAddress(RuntimeMethod rm, int logicalIndex, int abs, RuntimeType type)
+        {
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                long raw = ReadAbiScalarArgument(rm, logicalIndex);
+                if (abi.RegisterClass == RegisterClass.Float)
+                {
+                    if (StorageSizeOf(type) == 4) WriteI32(abs, unchecked((int)(uint)raw));
+                    else WriteI64(abs, raw);
+                }
+                else
+                {
+                    WriteSizedInteger(abs, type, raw);
+                }
+                return;
+            }
+
+            int source = checked((int)ReadAbiAggregateAddress(rm, logicalIndex));
+            CopyTypedObject(abs, source, type);
+        }
+
+        private int EA(InstrDesc ins)
+        {
+            long baseValue = Aux.MemoryBase(ins.Aux) switch
+            {
+                MemoryBase.Register => GetGpr(ins.Rs1),
+                MemoryBase.StackPointer => X(MachineRegisters.StackPointer),
+                MemoryBase.FramePointer => X(MachineRegisters.FramePointer),
+                MemoryBase.GlobalPointer => X(MachineRegisters.GlobalPointer),
+                MemoryBase.ThreadPointer => X(MachineRegisters.ThreadPointer),
+                _ => throw new InvalidOperationException("Invalid memory base."),
+            };
+            long index = ins.Rs2 == RegisterVmIsa.InvalidRegister ? 0 : GetGpr(ins.Rs2) << Aux.MemoryScaleLog2(ins.Aux);
+            long abs64 = checked(baseValue + index + ins.Imm);
+            if (abs64 < int.MinValue || abs64 > int.MaxValue)
+                throw new InvalidOperationException("Effective address overflow.");
+            return (int)abs64;
+        }
+
+        private int GetAddress(byte reg)
+        {
+            long v = GetGpr(reg);
+            if (v == 0) throw new NullReferenceException();
+            if (v < int.MinValue || v > int.MaxValue) throw new InvalidOperationException("Address outside VM address space.");
+            return (int)v;
+        }
+
+        private void LoadFieldInt(InstrDesc ins, int size, bool signed)
+        {
+            int abs = GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false);
+            long v = size switch
+            {
+                1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
+                2 => signed ? (short)ReadU16(abs) : ReadU16(abs),
+                _ => throw new ArgumentOutOfRangeException(nameof(size)),
+            };
+            SetGpr(ins.Rd, v);
+        }
+
+        private void LoadStaticFieldInt(InstrDesc ins, int size, bool signed)
+        {
+            int abs = GetStaticFieldAddress(FieldById(ins.Imm), false);
+            long v = size switch
+            {
+                1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
+                2 => signed ? (short)ReadU16(abs) : ReadU16(abs),
+                _ => throw new ArgumentOutOfRangeException(nameof(size)),
+            };
+            SetGpr(ins.Rd, v);
+        }
+
+        private void StoreField(InstrDesc ins)
+        {
+            var field = FieldById(ins.Imm);
+            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, field.FieldType);
+        }
+
+        private void StoreStaticField(InstrDesc ins)
+        {
+            var field = FieldById(ins.Imm);
+            int abs = GetStaticFieldAddress(field, true);
+            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, field.FieldType);
+        }
+
+        private RuntimeType ElementTypeOf(InstrDesc ins)
+            => ins.Imm > 0 ? _rts.GetTypeById(checked((int)ins.Imm)) : GetObjectTypeFromRef(GetGpr(ins.Rs1)).ElementType ?? throw new InvalidOperationException("Array has no element type.");
+
+        private int ArrayEA(InstrDesc ins)
+        {
+            return GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), ElementTypeOf(ins));
+        }
+
+        private void LoadElemInt(InstrDesc ins, int size, bool signed)
+        {
+            int abs = ArrayEA(ins);
+            long v = size switch
+            {
+                1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
+                2 => signed ? (short)ReadU16(abs) : ReadU16(abs),
+                _ => throw new ArgumentOutOfRangeException(nameof(size)),
+            };
+            SetGpr(ins.Rd, v);
+        }
+
+        private void StoreElement(InstrDesc ins)
+        {
+            RuntimeType elem = ElementTypeOf(ins);
+            int abs = ArrayEA(ins);
+            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, elem);
+        }
+
+        private void StoreRegisterToTypedAddress(Op op, byte reg, int abs, RuntimeType type)
+        {
+            int size = StorageSizeOf(type);
+            if (op is Op.StFldF32 or Op.StSFldF32 or Op.StElemF32 or Op.StF32)
+            {
+                WriteI32(abs, unchecked((int)(uint)GetFprBits(reg)));
+                return;
+            }
+            if (op is Op.StFldF64 or Op.StSFldF64 or Op.StElemF64 or Op.StF64)
+            {
+                WriteI64(abs, GetFprBits(reg));
+                return;
+            }
+            if (op is Op.StFldObj or Op.StSFldObj or Op.StElemObj or Op.StObj)
+            {
+                CopyTypedObject(abs, GetAddress(reg), type);
+                return;
+            }
+            long v = GetGpr(reg);
+            switch (size)
+            {
+                case 1: WriteU8(abs, unchecked((byte)v)); return;
+                case 2: WriteU16(abs, unchecked((ushort)v)); return;
+                case 4: WriteI32(abs, unchecked((int)v)); return;
+                case 8: WriteI64(abs, v); return;
+                default:
+                    CopyBlock(abs, checked((int)v), size);
+                    return;
+            }
+        }
+
+        private void InitDefaultValue(InstrDesc ins)
+        {
+            var t = _rts.GetTypeById(checked((int)ins.Imm));
+            if (t.IsReferenceType || t.Kind == RuntimeTypeKind.Pointer || t.Kind == RuntimeTypeKind.ByRef)
+            {
+                SetGpr(ins.Rd, 0);
+                return;
+            }
+            if (MachineRegisters.GetClass((MachineRegister)ins.Rd) == RegisterClass.Float)
+            {
+                SetFpr(ins.Rd, 0);
+                return;
+            }
+            SetGpr(ins.Rd, 0);
+        }
+
+        private int GetInstanceFieldAddress(RuntimeField field, long receiver, bool writable)
+        {
+            if (field.IsStatic)
+                throw new InvalidOperationException("Instance field access used for static field.");
+
+            if (receiver == 0)
                 throw new NullReferenceException();
-            if (value.Kind != CellKind.Ref)
-                throw new InvalidOperationException($"Object reference expected, got {value.Kind}.");
-            int obj = checked((int)value.Payload);
-            CheckHeapAccess(obj, ObjectHeaderSize, writable: false);
-            int flags = ReadI32(obj + 4);
-            if ((flags & GcFlagAllocated) == 0)
-                throw new InvalidOperationException("Dangling object reference.");
-            int typeId = ReadI32(obj);
-            return _rts.GetTypeById(typeId);
+            if (receiver < int.MinValue || receiver > int.MaxValue)
+                throw new AccessViolationException("Field receiver is outside VM address space.");
+
+            int receiverAbs = (int)receiver;
+
+            if (TryGetObjectTypeFromExactRef(receiverAbs, out RuntimeType actual))
+            {
+                field = _rts.BindFieldToReceiver(field, actual);
+                if (field.DeclaringType.IsValueType)
+                {
+                    if (actual.TypeId != field.DeclaringType.TypeId)
+                        throw new InvalidOperationException("Boxed value field receiver type mismatch.");
+                    int boxed = checked(receiverAbs + ObjectHeaderSize + field.Offset);
+                    CheckHeapAccess(boxed, StorageSizeOf(field.FieldType), writable);
+                    return boxed;
+                }
+
+                if (!IsAssignableTo(actual, field.DeclaringType))
+                    throw new InvalidOperationException("Field receiver is not assignable to declaring type.");
+
+                int abs = checked(receiverAbs + field.Offset);
+                CheckHeapAccess(abs, StorageSizeOf(field.FieldType), writable);
+                return abs;
+            }
+
+            if (!field.DeclaringType.IsValueType)
+                throw new InvalidOperationException("Address receiver is only valid for value-type field access.");
+
+            int byrefAbs = checked(receiverAbs + field.Offset);
+            CheckIndirectAccess(byrefAbs, StorageSizeOf(field.FieldType), writable);
+            return byrefAbs;
         }
 
-        private RuntimeType GetValueType(Cell value)
+        private int GetStaticFieldAddress(RuntimeField field, bool writable)
         {
-            if (value.Kind != CellKind.Value)
-                throw new InvalidOperationException($"Value cell expected, got {value.Kind}.");
-            return _rts.GetTypeById(value.Aux);
+            if (!field.IsStatic)
+                throw new InvalidOperationException("Static field access used for instance field.");
+            int baseAbs = EnsureStaticStorage(field.DeclaringType);
+            int abs = checked(baseAbs + field.Offset);
+            CheckHeapAccess(abs, StorageSizeOf(field.FieldType), writable);
+            return abs;
+        }
+
+        private int EnsureStaticStorage(RuntimeType type)
+        {
+            if (_staticBaseByTypeId.TryGetValue(type.TypeId, out int abs))
+                return abs;
+            _ = _rts.GetStorageSizeAlign(type);
+
+            if (type.StaticSize <= 0)
+            {
+                if (type.StaticFields.Length != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Static layout was not computed for '{type.Namespace}.{type.Name}'. " +
+                        $"StaticFields={type.StaticFields.Length}, StaticSize={type.StaticSize}.");
+                }
+
+                _staticBaseByTypeId[type.TypeId] = 0;
+                return 0;
+            }
+            abs = AllocRawHeapBytes(type.StaticSize, Math.Max(8, type.StaticAlign));
+            Array.Clear(_mem, abs, type.StaticSize);
+            _staticBaseByTypeId[type.TypeId] = abs;
+            if (abs + type.StaticSize > _heapFloor)
+                _heapFloor = abs + type.StaticSize;
+            return abs;
         }
 
         private int AllocObject(RuntimeType type)
         {
-            if (!type.IsReferenceType || type.Kind == RuntimeTypeKind.Array || IsSystemType(type, "String"))
-                throw new InvalidOperationException($"Cannot allocate object for '{type.Namespace}.{type.Name}'.");
-            int size = type.InstanceSize;
-            int abs = AllocHeapBytes(size, Math.Max(8, type.AlignOf));
-            Array.Clear(_mem, abs, size);
-            WriteI32(abs, type.TypeId);
-            WriteI32(abs + 4, GcFlagAllocated);
-            return abs;
+            int size = Math.Max(ObjectHeaderSize, type.IsValueType ? ObjectHeaderSize + StorageSizeOf(type) : type.InstanceSize);
+            int obj = AllocHeapBytes(size, Math.Max(8, type.AlignOf));
+            WriteI32(obj, type.TypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            if (size > ObjectHeaderSize)
+                _mem.AsSpan(obj + ObjectHeaderSize, size - ObjectHeaderSize).Clear();
+            return obj;
         }
 
-        private int AllocBoxedValueObject(RuntimeType valueType)
+        private int AllocBoxedValueObject(RuntimeType type)
         {
-            int size = AlignUp(ObjectHeaderSize + valueType.SizeOf, 8);
-            int abs = AllocHeapBytes(size, 8);
-            Array.Clear(_mem, abs, size);
-            WriteI32(abs, valueType.TypeId);
-            WriteI32(abs + 4, GcFlagAllocated);
-            return abs;
+            int payload = StorageSizeOf(type);
+            int size = checked(ObjectHeaderSize + payload);
+            int obj = AllocHeapBytes(size, Math.Max(8, type.AlignOf));
+            WriteI32(obj, type.TypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            _mem.AsSpan(obj + ObjectHeaderSize, payload).Clear();
+            return obj;
         }
 
-        private int AllocArrayObject(RuntimeType arrayType, int length)
+        private int BoxValue(RuntimeType type, byte sourceReg)
         {
-            if (arrayType.Kind != RuntimeTypeKind.Array || arrayType.ElementType is null)
-                throw new InvalidOperationException("Array type expected.");
-            var (elemSize, _) = GetStorageSizeAlign(arrayType.ElementType);
-            int size = AlignUp(ArrayDataOffset + checked(length * elemSize), 8);
-            int abs = AllocHeapBytes(size, 8);
-            Array.Clear(_mem, abs, size);
-            WriteI32(abs, arrayType.TypeId);
-            WriteI32(abs + 4, GcFlagAllocated);
-            WriteI32(abs + ArrayLengthOffset, length);
+            int obj = AllocBoxedValueObject(type);
+            int payload = obj + ObjectHeaderSize;
+            int size = StorageSizeOf(type);
+
+            if (RegisterVmIsa.IsFloatRegister(sourceReg))
+            {
+                if (size == 4) WriteI32(payload, unchecked((int)(uint)GetFprBits(sourceReg)));
+                else WriteI64(payload, GetFprBits(sourceReg));
+                return obj;
+            }
+
+            long raw = GetGpr(sourceReg);
+            if (size <= 8 && !type.ContainsGcPointers)
+            {
+                WriteSizedInteger(payload, type, raw);
+            }
+            else
+            {
+                CopyTypedObject(payload, checked((int)raw), type);
+            }
+            return obj;
+        }
+
+        private int UnboxAddress(long objRef, RuntimeType type)
+        {
+            if (objRef == 0) throw new NullReferenceException();
+            var actual = GetObjectTypeFromRef(objRef);
+            if (actual.TypeId != type.TypeId)
+                throw new InvalidCastException();
+            return checked((int)objRef + ObjectHeaderSize);
+        }
+
+        private void UnboxAny(InstrDesc ins)
+        {
+            var type = _rts.GetTypeById(checked((int)ins.Imm));
+            int addr = UnboxAddress(GetGpr(ins.Rs1), type);
+            LoadTypedAddressToRegister(ins.Rd, addr, type);
+        }
+
+        private void LoadTypedAddressToRegister(byte rd, int abs, RuntimeType type)
+        {
+            if (MachineRegisters.GetClass((MachineRegister)rd) == RegisterClass.Float)
+            {
+                SetFpr(rd, StorageSizeOf(type) == 4 ? (uint)ReadI32(abs) : ReadI64(abs));
+                return;
+            }
+            SetGpr(rd, ReadSizedInteger(abs, type));
+        }
+
+        private void InitTypedObject(int abs, RuntimeType type)
+        {
+            int size = StorageSizeOf(type);
+            CheckIndirectAccess(abs, size, true);
+            _mem.AsSpan(abs, size).Clear();
+        }
+
+        private void CopyTypedObject(int dst, int src, RuntimeType type)
+        {
+            int size = StorageSizeOf(type);
+            CheckIndirectAccess(src, size, false);
+            CheckIndirectAccess(dst, size, true);
+            _mem.AsSpan(src, size).CopyTo(_mem.AsSpan(dst, size));
+        }
+
+        private void CopyBlock(int dst, int src, int size)
+        {
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            CheckIndirectAccess(src, size, false);
+            CheckIndirectAccess(dst, size, true);
+            _mem.AsSpan(src, size).CopyTo(_mem.AsSpan(dst, size));
+        }
+
+        private void InitBlock(int dst, byte value, int size)
+        {
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            CheckIndirectAccess(dst, size, true);
+            _mem.AsSpan(dst, size).Fill(value);
+        }
+
+        private int AllocArray(RuntimeType typeOrElementType, int length)
+        {
+            if (length < 0) throw new OverflowException();
+            RuntimeType arrayType = typeOrElementType.Kind == RuntimeTypeKind.Array ? typeOrElementType : _rts.GetArrayType(typeOrElementType);
+            RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Array type has no element type.");
+            int elemSize = StorageSizeOf(elemType);
+            int dataBytes = checked(length * elemSize);
+            int size = AlignUp(ArrayDataOffset + dataBytes, 8);
+            int obj = AllocHeapBytes(size, 8);
+            WriteI32(obj, arrayType.TypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            WriteI32(obj + ArrayLengthOffset, length);
+            WriteI32(obj + ArrayLengthOffset + 4, 0);
+            if (dataBytes != 0) _mem.AsSpan(obj + ArrayDataOffset, dataBytes).Clear();
+            return obj;
+        }
+
+        private int GetArrayElementAddress(long arrRef, int index, RuntimeType elemType)
+        {
+            ValidateArrayRef(arrRef, out int arrAbs, out RuntimeType arrType);
+            int len = ReadI32(arrAbs + ArrayLengthOffset);
+            if ((uint)index >= (uint)len) throw new IndexOutOfRangeException();
+            RuntimeType actualElem = arrType.ElementType ?? elemType;
+            int elemSize = StorageSizeOf(actualElem);
+            int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            CheckHeapAccess(abs, elemSize, true);
             return abs;
         }
 
         private int AllocStringUninitialized(int length)
         {
-            if (length < 0) throw new InvalidOperationException("Negative string length.");
-            int size = AlignUp(StringCharsOffset + length * 2 + 2, 8);
-            int abs = AllocHeapBytes(size, 8);
-            Array.Clear(_mem, abs, size);
-            WriteI32(abs, _rts.SystemString.TypeId);
-            WriteI32(abs + 4, GcFlagAllocated);
-            WriteI32(abs + StringLengthOffset, length);
-            WriteU16Unchecked(abs + StringCharsOffset + length * 2, 0);
-            return abs;
+            if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+            RuntimeType stringType = ResolveRequiredType("std", "System", "String");
+            int byteLen = checked(length * 2);
+            int size = AlignUp(StringCharsOffset + byteLen, 2);
+            int obj = AllocHeapBytes(size, 8);
+            WriteI32(obj, stringType.TypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            WriteI32(obj + StringLengthOffset, length);
+            if (byteLen != 0) _mem.AsSpan(obj + StringCharsOffset, byteLen).Clear();
+            return obj;
         }
 
         private int AllocStringFromManaged(string value)
         {
-            int abs = AllocStringUninitialized(value.Length);
-            int dst = abs + StringCharsOffset;
+            int obj = AllocStringUninitialized(value.Length);
+            int chars = obj + StringCharsOffset;
             for (int i = 0; i < value.Length; i++)
-                WriteU16Unchecked(dst + i * 2, value[i]);
-            return abs;
+                WriteU16(chars + i * 2, value[i]);
+            return obj;
         }
 
-        private string? ReadManagedString(Cell value)
+        private int InternString(string value)
         {
-            if (value.Kind == CellKind.Null) return null;
-            int obj = RequireObjectRef(value);
-            var type = GetObjectTypeFromRef(value);
-            if (!IsSystemType(type, "String"))
-                return type.Namespace + "." + type.Name;
-            int len = ReadI32(obj + StringLengthOffset);
-            var chars = new char[len];
-            int src = obj + StringCharsOffset;
-            for (int i = 0; i < len; i++)
-                chars[i] = (char)ReadU16Unchecked(src + i * 2);
-            return new string(chars);
+            if (_internPool.TryGetValue(value, out int obj))
+                return obj;
+            obj = AllocStringFromManaged(value);
+            _internPool[value] = obj;
+            return obj;
         }
 
-        private int ReadStringLength(Cell value)
+        private int CastClass(long objRef, RuntimeType target)
         {
-            int obj = RequireObjectRef(value);
-            return ReadI32(obj + StringLengthOffset);
+            if (objRef == 0) return 0;
+            RuntimeType actual = GetObjectTypeFromRef(objRef);
+            if (!IsAssignableTo(actual, target)) throw new InvalidCastException();
+            return checked((int)objRef);
         }
 
-        private int ReadArrayLength(Cell value)
+        private int IsInst(long objRef, RuntimeType target)
         {
-            int obj = RequireObjectRef(value);
-            return ReadI32(obj + ArrayLengthOffset);
+            if (objRef == 0) return 0;
+            RuntimeType actual = GetObjectTypeFromRef(objRef);
+            return IsAssignableTo(actual, target) ? checked((int)objRef) : 0;
         }
 
-        private RuntimeModule FindCoreLibModuleOrThrow()
+        private void BoundsCheck(int index, int length)
         {
-            if (_modules.TryGetValue("std", out var std))
-                return std;
-
-            foreach (var kv in _modules)
-            {
-                var m = kv.Value;
-                if (m.TypeDefByFullName.ContainsKey(("System", "Object")))
-                    return m;
-            }
-
-            throw new InvalidOperationException("Core library module not found.");
+            if ((uint)index >= (uint)length) throw new IndexOutOfRangeException();
         }
 
-        private Cell NormalizeThrownException(Cell exception)
+        private int StackAlloc(int count, int elementSize)
         {
-            if (exception.Kind == CellKind.Null)
-            {
-                var core = FindCoreLibModuleOrThrow();
-                if (!core.TypeDefByFullName.TryGetValue(("System", "NullReferenceException"), out int tdTok))
-                    throw new NullReferenceException();
-                var type = _rts.ResolveType(core, tdTok);
-                return Cell.Ref(AllocObject(type));
-            }
+            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+            if (elementSize <= 0) throw new ArgumentOutOfRangeException(nameof(elementSize));
 
-            if (exception.Kind != CellKind.Ref)
-                throw new InvalidOperationException($"Throw expects object reference, got {exception.Kind}.");
-
-            return exception;
+            return StackAllocBytes(checked(count * elementSize), elementSize);
         }
 
-        private bool TryCreateCoreException(string ns, string name, string? message, out Cell exception)
+        private int StackAllocBytes(int byteCount, int alignment)
         {
-            exception = default;
-            RuntimeModule core;
-            try
-            {
-                core = FindCoreLibModuleOrThrow();
-            }
-            catch
-            {
-                return false;
-            }
+            if (byteCount < 0) throw new ArgumentOutOfRangeException(nameof(byteCount));
+            alignment = NormalizeStackAlignment(alignment);
 
-            if (!core.TypeDefByFullName.TryGetValue((ns, name), out int tdTok))
-                return false;
+            long top = CurrentFrameStackLow();
+            long aligned = AlignDown(checked(top - byteCount), alignment);
+            if (aligned < _stackBase || aligned < _frameStackTop)
+                throw new StackOverflowException();
 
-            RuntimeType type;
-            int obj;
-            try
-            {
-                type = _rts.ResolveType(core, tdTok);
-                obj = AllocObject(type);
-            }
-            catch
-            {
-                return false;
-            }
-
-            TryInitExceptionMessage(obj, type, message);
-            exception = Cell.Ref(obj);
-            return true;
+            SetTopAllocaSp(aligned);
+            TrackStackPeak(aligned);
+            if (byteCount != 0)
+                _mem.AsSpan(checked((int)aligned), byteCount).Clear();
+            return checked((int)aligned);
         }
 
-        private void TryInitExceptionMessage(int obj, RuntimeType type, string? message)
+        private static int NormalizeStackAlignment(int alignment)
         {
-            int msg;
-            try
-            {
-                msg = AllocStringFromManaged(message ?? string.Empty);
-            }
-            catch
-            {
-                try
-                {
-                    msg = AllocStringUninitialized(0);
-                }
-                catch
-                {
-                    return;
-                }
-            }
+            if (alignment <= 0)
+                return TargetArchitecture.PointerSize;
 
-            for (var cur = type; cur is not null; cur = cur.BaseType)
-            {
-                for (int i = 0; i < cur.InstanceFields.Length; i++)
-                {
-                    var f = cur.InstanceFields[i];
-                    if (!StringComparer.Ordinal.Equals(f.Name, "_message"))
-                        continue;
-                    StoreValue(checked(obj + f.Offset), f.FieldType, Cell.Ref(msg));
-                    return;
-                }
-            }
-        }
-
-
-        private static bool IsVoidReturn(RuntimeType t)
-            => t.Namespace == "System" && t.Name == "Void";
-
-        private Cell NormalizeReturnValue(RuntimeType t, VmValue v)
-        {
-            if (IsVoidReturn(t))
-                return default;
-            if (t.IsReferenceType)
-            {
-                if (v.Kind == VmValueKind.Null) return Cell.Null;
-                if (v.Kind == VmValueKind.Ref) return Cell.Ref(checked((int)v.Payload));
-                throw new InvalidOperationException($"Return type mismatch: expected managed ref, got {v.Kind}");
-            }
-            if (t.Kind == RuntimeTypeKind.Pointer)
-            {
-                if (v.Kind == VmValueKind.Null) return Cell.Ptr(0, GetPointedElementSize(t));
-                if (v.Kind == VmValueKind.Ptr) return Cell.Ptr(checked((int)v.Payload), v.Aux);
-                throw new InvalidOperationException($"Return type mismatch: expected ptr, got {v.Kind}");
-            }
-            if (t.Kind == RuntimeTypeKind.ByRef)
-            {
-                if (v.Kind == VmValueKind.Null) return Cell.ByRef(0, GetPointedElementSize(t));
-                if (v.Kind == VmValueKind.ByRef) return Cell.ByRef(checked((int)v.Payload), v.Aux);
-                throw new InvalidOperationException($"Return type mismatch: expected byref, got {v.Kind}");
-            }
-            if (t.Kind == RuntimeTypeKind.Enum)
-            {
-                var ut = TryGetEnumUnderlyingType(t) ?? throw new NotSupportedException($"Enum '{t.Namespace}.{t.Name}' has no underlying type.");
-                return NormalizeReturnValue(ut, v);
-            }
-            if (t.Namespace == "System")
-            {
-                switch (t.Name)
-                {
-                    case "Boolean":
-                    case "Char":
-                    case "SByte":
-                    case "Byte":
-                    case "Int16":
-                    case "UInt16":
-                    case "Int32":
-                    case "UInt32":
-                        return Cell.I4(v.AsInt32());
-                    case "Int64":
-                    case "UInt64":
-                        return Cell.I8(v.AsInt64());
-                    case "Single":
-                    case "Double":
-                        return Cell.R8(v.AsDouble());
-                    case "IntPtr":
-                    case "UIntPtr":
-                        return RuntimeTypeSystem.PointerSize == 8 ? Cell.I8(v.AsInt64()) : Cell.I4(v.AsInt32());
-                }
-            }
-            if (v.Kind == VmValueKind.Value)
-                return new Cell(CellKind.Value, v.Payload, v.Aux);
-            throw new NotSupportedException($"Host return marshal not supported for value type: {t.Namespace}.{t.Name}");
-        }
-
-        internal string? HostReadString(VmValue v, CancellationToken ct)
-        {
-            if (v.Kind == VmValueKind.Null) return null;
-            var c = v.ToCell();
-            int obj = RequireObjectRef(c);
-            var type = GetObjectTypeFromRef(c);
-            if (!IsSystemType(type, "String"))
-                throw new InvalidOperationException($"Expected string ref, got '{type.Namespace}.{type.Name}'.");
-            int len = ReadI32(obj + StringLengthOffset);
-            var chars = new char[len];
-            int src = obj + StringCharsOffset;
-            for (int i = 0; i < len; i++)
-            {
-                if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
-                chars[i] = (char)ReadU16Unchecked(src + i * 2);
-            }
-            return new string(chars);
-        }
-
-        private void ValidateArrayRefAny(Cell arr, out int arrAbs, out int length, out RuntimeType arrayType)
-        {
-            if (arr.Kind == CellKind.Null)
-                throw new NullReferenceException();
-            if (arr.Kind != CellKind.Ref)
-                throw new InvalidOperationException($"Expected array ref, got {arr.Kind}.");
-            arrayType = GetObjectTypeFromRef(arr);
-            if (arrayType.Kind != RuntimeTypeKind.Array)
-                throw new InvalidOperationException($"Expected array instance, got '{arrayType.Namespace}.{arrayType.Name}'.");
-            arrAbs = checked((int)arr.Payload);
-            length = ReadI32(arrAbs + ArrayLengthOffset);
-        }
-
-        internal VmValue HostAllocArray(RuntimeType arrayType, int length)
-        {
-            if (arrayType.Kind != RuntimeTypeKind.Array)
-                throw new ArgumentException("Type is not an array.", nameof(arrayType));
-            if (length < 0)
-                throw new ArgumentOutOfRangeException(nameof(length));
-            return new VmValue(VmValueKind.Ref, AllocArrayObject(arrayType, length));
-        }
-
-        internal int HostGetArrayLength(VmValue array)
-        {
-            ValidateArrayRefAny(array.ToCell(), out _, out int length, out _);
-            return length;
-        }
-
-        internal VmValue HostGetArrayElement(VmValue array, int index)
-        {
-            ValidateArrayRefAny(array.ToCell(), out int arrAbs, out int length, out var arrayType);
-            if ((uint)index >= (uint)length)
-                throw new IndexOutOfRangeException();
-            var elemType = arrayType.ElementType ?? throw new InvalidOperationException("Array type has no element type.");
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-            return new VmValue(LoadValue(elemAbs, elemType));
-        }
-
-        internal void HostSetArrayElement(VmValue array, int index, VmValue value)
-        {
-            ValidateArrayRefAny(array.ToCell(), out int arrAbs, out int length, out var arrayType);
-            if ((uint)index >= (uint)length)
-                throw new IndexOutOfRangeException();
-            var elemType = arrayType.ElementType ?? throw new InvalidOperationException("Array type has no element type.");
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-            StoreValue(elemAbs, elemType, value.ToCell());
-        }
-
-        internal VmValue HostAllocString(string? s)
-        {
-            if (s is null) return VmValue.Null;
-            return new VmValue(VmValueKind.Ref, AllocStringFromManaged(s));
-        }
-
-        internal VmValue HostAllocStringArray(RuntimeType arrayType, ReadOnlySpan<string?> values)
-        {
-            var arr = HostAllocArray(arrayType, values.Length);
-            for (int i = 0; i < values.Length; i++)
-                HostSetArrayElement(arr, i, HostAllocString(values[i]));
-            return arr;
-        }
-
-        internal int HostGetAddress(VmValue v)
-        {
-            var c = v.ToCell();
-            if (c.Kind is CellKind.Ptr or CellKind.ByRef or CellKind.Ref)
-                return checked((int)c.Payload);
-            throw new InvalidOperationException($"Address-compatible value expected, got {c.Kind}.");
-        }
-
-        internal Span<byte> HostGetSpan(int abs, int size, bool writable)
-        {
-            if (writable) CheckWritableRange(abs, size); else CheckRange(abs, size);
-            return _mem.AsSpan(abs, size);
-        }
-
-        internal void RegisterHostOverride(HostOverride ov)
-        {
-            if (ov is null) throw new ArgumentNullException(nameof(ov));
-            _hostOverrides[ov.MethodId] = ov;
-        }
-
-        private bool TryInvokeHostOverride(RuntimeMethod rm, Cell[] callArgs, CancellationToken ct, out Cell result)
-        {
-            result = default;
-            if (!_hostOverrides.TryGetValue(rm.MethodId, out var ov))
-                return false;
-            if (!rm.IsStatic || rm.HasThis)
-                return false;
-            var args = new VmValue[callArgs.Length];
-            for (int i = 0; i < callArgs.Length; i++)
-                args[i] = new VmValue(callArgs[i]);
-            _hostCtx.SetToken(ct);
-            try
-            {
-                var ret = ov.Handler(_hostCtx, args);
-                if (!IsVoidReturn(rm.ReturnType))
-                    result = NormalizeReturnValue(rm.ReturnType, ret);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                if (TryTranslateHostExceptionToVm(ex, out var vmEx))
-                    throw new VmThrownException(vmEx);
-                throw;
-            }
-        }
-
-        private bool TryTranslateHostExceptionToVm(Exception hostEx, out Cell exception)
-        {
-            exception = default;
-            string msg = hostEx.Message;
-
-            if (hostEx is DivideByZeroException)
-                return TryCreateCoreException("System", "DivideByZeroException", msg, out exception)
-                    || TryCreateCoreException("System", "ArithmeticException", msg, out exception)
-                    || TryCreateCoreException("System", "Exception", msg, out exception);
-
-            if (hostEx is OverflowException)
-                return TryCreateCoreException("System", "OverflowException", msg, out exception)
-                    || TryCreateCoreException("System", "ArithmeticException", msg, out exception)
-                    || TryCreateCoreException("System", "Exception", msg, out exception);
-
-            return false;
-        }
-
-        private string FormatThrownException(Cell exception)
-        {
-            if (exception.Kind == CellKind.Null)
-                return "VM threw null.";
-            try
-            {
-                var t = GetObjectTypeFromRef(exception);
-                return $"Unhandled VM exception: {t.Namespace}.{t.Name}";
-            }
-            catch
-            {
-                return "Unhandled VM exception.";
-            }
-        }
-
-        private static int CoercePointerAddress(Cell value)
-        {
-            return value.Kind switch
-            {
-                CellKind.Null => 0,
-                CellKind.Ptr or CellKind.ByRef or CellKind.Ref => checked((int)value.Payload),
-                CellKind.I4 => value.AsI4(),
-                CellKind.I8 => checked((int)value.AsI8()),
-                _ => throw new InvalidOperationException($"Pointer address expected, got {value.Kind}.")
-            };
-        }
-
-        private static int RequireByRefAddress(Cell value)
-        {
-            if (value.Kind == CellKind.ByRef)
-                return checked((int)value.Payload);
-            throw new InvalidOperationException($"ByRef cell expected, got {value.Kind}.");
-        }
-
-        private static int RequireAddress(Cell value)
-        {
-            if (value.Kind is CellKind.Ptr or CellKind.ByRef)
-                return checked((int)value.Payload);
-            throw new InvalidOperationException($"Address cell expected, got {value.Kind}.");
-        }
-
-        private static int RequireObjectRef(Cell value)
-        {
-            if (value.Kind == CellKind.Null)
-                throw new NullReferenceException();
-            if (value.Kind == CellKind.Ref)
-                return checked((int)value.Payload);
-            throw new InvalidOperationException($"Object reference expected, got {value.Kind}.");
-        }
-
-        private int GetPointedElementSize(RuntimeType type)
-        {
-            if (type.ElementType is null) return 1;
-            return GetStorageSizeAlign(type.ElementType).size;
-        }
-
-        private int AllocStackBytes(int size, int align)
-        {
-            int abs = AlignUp(_sp, align);
-            int end = checked(abs + Math.Max(0, size));
-            EnsureStack(end);
-            _sp = end;
-            if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
-            return abs;
+            alignment = Math.Min(16, Math.Max(TargetArchitecture.PointerSize, alignment));
+            return (alignment & (alignment - 1)) == 0 ? alignment : TargetArchitecture.PointerSize;
         }
 
         private int AllocHeapBytes(int size, int align)
         {
-            int abs = AlignUp(_heapPtr, align);
-            int end = checked(abs + Math.Max(0, size));
-            if (end > _heapEnd)
-                throw new OutOfMemoryException();
-            _heapPtr = end;
-            if (_heapPtr > _heapPeakAbs) _heapPeakAbs = _heapPtr;
-            return abs;
+            return AllocBlock(size, align, BlockMetaObject, out int obj) + BlockHeaderSize;
         }
 
-        private void EnsureStack(int end)
+        private int AllocRawHeapBytes(int size, int align)
         {
-            if (end > _stackEnd || end > _heapBase)
-                throw new StackOverflowException();
+            return AllocBlock(size, align, BlockMetaRaw, out int payload) + BlockHeaderSize;
+        }
+
+        private int AllocBlock(int payloadSize, int align, int meta, out int payload)
+        {
+            if (payloadSize < 0) throw new ArgumentOutOfRangeException(nameof(payloadSize));
+            if (payloadSize == 0) payloadSize = 1;
+            align = NormalizeHeapPayloadAlignment(align);
+
+            int blockSize = AlignUp(checked(BlockHeaderSize + payloadSize), HeapBlockAlignment);
+            int minTailFree = Math.Max(GcAllocationBudgetBytes, blockSize + HeapBlockAlignment);
+
+            if (!_gcRunning && _heapPtr > _heapBase &&
+                (_allocDebtBytes >= GcAllocationBudgetBytes || _heapEnd - _heapPtr < minTailFree))
+            {
+                CollectGarbage(compact: false);
+            }
+
+            if (TryAllocFromFreeBlock(blockSize, align, meta, out int reusedBlock, out payload))
+                return reusedBlock;
+
+            int block = AlignPayloadStart(_heapPtr, align) - BlockHeaderSize;
+            if (block != _heapPtr)
+                throw new InvalidOperationException("Heap block over-alignment requires padding block support.");
+
+            int end = checked(block + blockSize);
+
+            if (end > _heapEnd)
+            {
+                CollectGarbage(compact: false);
+                if (TryAllocFromFreeBlock(blockSize, align, meta, out reusedBlock, out payload))
+                    return reusedBlock;
+
+                CollectGarbage(compact: true);
+                if (TryAllocFromFreeBlock(blockSize, align, meta, out reusedBlock, out payload))
+                    return reusedBlock;
+
+                block = AlignPayloadStart(_heapPtr, align) - BlockHeaderSize;
+                if (block != _heapPtr)
+                    throw new InvalidOperationException("Heap block over-alignment requires padding block support.");
+
+                end = checked(block + blockSize);
+                if (end > _heapEnd)
+                    throw new OutOfMemoryException();
+            }
+
+            WriteI32(block + BlockSizeOffset, blockSize);
+            WriteI32(block + BlockMetaOffset, meta);
+            payload = checked(block + BlockHeaderSize);
+            _heapPtr = end;
+            if (_heapPtr > _heapPeakAbs) _heapPeakAbs = _heapPtr;
+            _allocDebtBytes = Math.Min(int.MaxValue - blockSize, _allocDebtBytes) + blockSize;
+            return block;
+        }
+
+        private bool TryAllocFromFreeBlock(int blockSize, int align, int meta, out int block, out int payload)
+        {
+            block = 0;
+            payload = 0;
+            if (_heapPtr <= _heapBase)
+                return false;
+
+            int scan = _heapBase;
+            while (scan < _heapPtr)
+            {
+                int size = ReadBlockSize(scan);
+                if (ReadI32(scan + BlockMetaOffset) == 0 && size >= blockSize)
+                {
+                    int alignedPayload = AlignPayloadStart(scan, align);
+                    if (alignedPayload == scan + BlockHeaderSize)
+                    {
+                        int remainder = size - blockSize;
+                        if (remainder >= BlockHeaderSize + HeapBlockAlignment)
+                        {
+                            WriteI32(scan + BlockSizeOffset, blockSize);
+                            WriteI32(scan + BlockMetaOffset, meta);
+                            int next = checked(scan + blockSize);
+                            WriteI32(next + BlockSizeOffset, remainder);
+                            WriteI32(next + BlockMetaOffset, 0);
+                        }
+                        else
+                        {
+                            blockSize = size;
+                            WriteI32(scan + BlockMetaOffset, meta);
+                        }
+
+                        block = scan;
+                        payload = checked(scan + BlockHeaderSize);
+                        _allocDebtBytes = Math.Min(int.MaxValue - blockSize, _allocDebtBytes) + blockSize;
+                        return true;
+                    }
+                }
+                scan += size;
+            }
+            return false;
+        }
+        private static int NormalizeHeapPayloadAlignment(int align)
+        {
+            if (align <= 1)
+                return 1;
+            if ((align & (align - 1)) != 0)
+                throw new ArgumentException("Alignment must be power of two.", nameof(align));
+            return Math.Min(align, HeapBlockAlignment);
+        }
+        private static int GcAllocationBudgetBytes = 256;
+
+        private void MaybeCollectGarbage()
+        {
+            if (_gcRunning)
+                return;
+
+            int sinceLastCollection = _heapPtr - _heapFloor;
+            int usefulThreshold = 128;
+            if (_allocDebtBytes < GcAllocationBudgetBytes && sinceLastCollection < usefulThreshold && _heapEnd - _heapPtr >= usefulThreshold)
+                return;
+
+            CollectGarbage(compact: false);
+        }
+
+        private void CollectGarbage(bool compact = true)
+        {
+            if (_gcRunning)
+                return;
+
+            _gcRunning = true;
+            try
+            {
+                if (_heapPtr <= _heapBase)
+                {
+                    _heapPtr = _heapBase;
+                    _heapFloor = _heapBase;
+                    _allocDebtBytes = 0;
+                    return;
+                }
+
+                MarkReachableObjects();
+
+                if (!compact)
+                {
+                    SweepHeapWithoutCompaction();
+                    return;
+                }
+
+                int dst = _heapBase;
+                int src = _heapBase;
+                while (src < _heapPtr)
+                {
+                    int size = ReadBlockSize(src);
+                    int meta = ReadI32(src + BlockMetaOffset);
+                    if (meta == BlockMetaRaw)
+                    {
+                        int targetBlock = AlignBlockStart(dst);
+                        WriteI32(src + BlockMetaOffset, -targetBlock);
+                        dst = checked(targetBlock + size);
+                    }
+                    else if (meta == BlockMetaObject)
+                    {
+                        int obj = src + BlockHeaderSize;
+                        int flags = ReadI32(obj + 4);
+                        if ((flags & GcFlagAllocated) != 0 && (flags & GcFlagMark) != 0)
+                        {
+                            int targetBlock = AlignBlockStart(dst);
+                            WriteI32(src + BlockMetaOffset, targetBlock + BlockHeaderSize);
+                            dst = checked(targetBlock + size);
+                        }
+                        else
+                        {
+                            WriteI32(src + BlockMetaOffset, 0);
+                        }
+                    }
+                    else
+                    {
+                        WriteI32(src + BlockMetaOffset, 0);
+                    }
+                    src += size;
+                }
+
+                UpdateRootsAfterCompaction();
+
+                src = _heapBase;
+                dst = _heapBase;
+                while (src < _heapPtr)
+                {
+                    int size = ReadBlockSize(src);
+                    int forward = ReadI32(src + BlockMetaOffset);
+                    if (forward != 0)
+                    {
+                        bool isObject = forward > 0;
+                        int targetBlock = isObject ? forward - BlockHeaderSize : -forward;
+                        if (isObject)
+                            UpdateObjectReferencesBeforeMove(src + BlockHeaderSize);
+                        if (targetBlock != src)
+                            Buffer.BlockCopy(_mem, src, _mem, targetBlock, size);
+                        WriteI32(targetBlock + BlockSizeOffset, size);
+                        WriteI32(targetBlock + BlockMetaOffset, isObject ? BlockMetaObject : BlockMetaRaw);
+                        if (isObject)
+                        {
+                            int targetObj = targetBlock + BlockHeaderSize;
+                            int flags = ReadI32(targetObj + 4);
+                            WriteI32(targetObj + 4, flags & ~GcFlagMark);
+                        }
+                        dst = checked(targetBlock + size);
+                    }
+                    src += size;
+                }
+
+                if (dst < _heapPtr)
+                    Array.Clear(_mem, dst, _heapPtr - dst);
+
+                _heapPtr = dst;
+                _heapFloor = _heapPtr;
+                _allocDebtBytes = 0;
+            }
+            finally
+            {
+                _gcRunning = false;
+            }
+        }
+
+        private void MarkReachableObjects()
+        {
+            _gcMarkHead = 0;
+            MarkRoots();
+
+            while (_gcMarkHead != 0)
+            {
+                int obj = PopGcMarkObject();
+                RuntimeType t = _rts.GetTypeById(ReadI32(obj));
+                MarkObjectReferences(obj, t);
+            }
+        }
+
+        private void SweepHeapWithoutCompaction()
+        {
+            int block = _heapBase;
+            while (block < _heapPtr)
+            {
+                int size = ReadBlockSize(block);
+                int meta = ReadI32(block + BlockMetaOffset);
+                if (meta == BlockMetaObject)
+                {
+                    int obj = block + BlockHeaderSize;
+                    int flags = ReadI32(obj + 4);
+                    if ((flags & GcFlagAllocated) != 0 && (flags & GcFlagMark) != 0)
+                    {
+                        WriteI32(obj + 4, flags & ~GcFlagMark);
+                    }
+                    else
+                    {
+                        Array.Clear(_mem, block + BlockHeaderSize, size - BlockHeaderSize);
+                        WriteI32(block + BlockMetaOffset, 0);
+                    }
+                }
+                block += size;
+            }
+
+            CoalesceFreeHeapBlocksAndTrimTail();
+            _heapFloor = _heapPtr;
+            _allocDebtBytes = 0;
+        }
+
+        private void CoalesceFreeHeapBlocksAndTrimTail()
+        {
+            int block = _heapBase;
+            int lastNonFreeEnd = _heapBase;
+
+            while (block < _heapPtr)
+            {
+                int size = ReadBlockSize(block);
+                int meta = ReadI32(block + BlockMetaOffset);
+                if (meta == 0)
+                {
+                    int total = size;
+                    int next = checked(block + size);
+                    while (next < _heapPtr && ReadI32(next + BlockMetaOffset) == 0)
+                    {
+                        int nextSize = ReadBlockSize(next);
+                        total = checked(total + nextSize);
+                        next = checked(next + nextSize);
+                    }
+
+                    if (total != size)
+                    {
+                        WriteI32(block + BlockSizeOffset, total);
+                        WriteI32(block + BlockMetaOffset, 0);
+                    }
+
+                    block = next;
+                    continue;
+                }
+
+                lastNonFreeEnd = checked(block + size);
+                block = lastNonFreeEnd;
+            }
+
+            if (lastNonFreeEnd < _heapPtr)
+            {
+                Array.Clear(_mem, lastNonFreeEnd, _heapPtr - lastNonFreeEnd);
+                _heapPtr = lastNonFreeEnd;
+            }
+        }
+
+
+        private void MarkRoots()
+        {
+            MarkFrameRoots(update: false);
+
+            foreach (var kv in _staticBaseByTypeId)
+            {
+                if (kv.Value == 0) continue;
+                RuntimeType t = _rts.GetTypeById(kv.Key);
+                for (int i = 0; i < t.StaticFields.Length; i++)
+                {
+                    RuntimeField f = t.StaticFields[i];
+                    MarkManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
+                }
+            }
+
+            foreach (var kv in _internPool)
+                TryMarkObject(kv.Value);
+
+            if (_currentExceptionRef != 0)
+                TryMarkObject(_currentExceptionRef);
+
+            MarkPendingPostReturnObjects();
+        }
+
+        private void UpdateRootsAfterCompaction()
+        {
+            MarkFrameRoots(update: true);
+
+            foreach (var kv in _staticBaseByTypeId)
+            {
+                if (kv.Value == 0) continue;
+                RuntimeType t = _rts.GetTypeById(kv.Key);
+                for (int i = 0; i < t.StaticFields.Length; i++)
+                {
+                    RuntimeField f = t.StaticFields[i];
+                    UpdateManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
+                }
+            }
+
+            if (_currentExceptionRef != 0)
+                _currentExceptionRef = TranslateObjectRef(_currentExceptionRef);
+
+            if (_staticBaseByTypeId.Count != 0)
+            {
+                foreach (var kv in _staticBaseByTypeId)
+                {
+                    if (kv.Value != 0)
+                        _staticBaseByTypeId[kv.Key] = TranslateRawBase(kv.Value);
+                }
+            }
+
+            if (_internPool.Count != 0)
+            {
+                foreach (var kv in _internPool)
+                    _internPool[kv.Key] = TranslateObjectRef(kv.Value);
+            }
+
+            UpdatePendingPostReturnObjectsAfterCompaction();
+        }
+
+        private void MarkFrameRoots(bool update)
+        {
+            if (_frameCount == 0)
+                return;
+
+            int top = TopFrameOffset();
+            for (int frame = _stackBase; frame <= top; frame += ShadowFrameSize)
+            {
+                int methodIndex = ReadI32(frame + ShadowFrameMethodIndex);
+                int safePointPc = frame == top ? (_currentSafePointPc >= 0 ? _currentSafePointPc : _pc) : FrameSafePointPc(frame);
+                if (methodIndex < 0 || safePointPc < 0)
+                    continue;
+                if (!TryGetSafePoint(methodIndex, safePointPc, out GcSafePointRecord sp))
+                    continue;
+
+                for (int r = 0; r < sp.RootCount; r++)
+                {
+                    GcRootRecord root = _image.GcRoots[sp.RootStartIndex + r];
+                    if (update) UpdateRoot(frame, root);
+                    else MarkRoot(frame, root);
+                }
+            }
+        }
+
+        private bool TryGetSafePoint(int methodIndex, int pc, out GcSafePointRecord safePoint)
+        {
+            safePoint = default;
+            if ((uint)methodIndex >= (uint)_image.Methods.Length)
+                return false;
+
+            MethodRecord method = _image.Methods[methodIndex];
+            int start = method.GcSafePointStartIndex;
+            int end = start + method.GcSafePointCount;
+            for (int i = start; i < end; i++)
+            {
+                GcSafePointRecord sp = _image.GcSafePoints[i];
+                if (sp.Pc == pc)
+                {
+                    safePoint = sp;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void UpdateObjectReferencesBeforeMove(int obj)
+        {
+            RuntimeType t = _rts.GetTypeById(ReadI32(obj));
+            if (t.Kind == RuntimeTypeKind.Array)
+            {
+                RuntimeType elem = t.ElementType ?? throw new InvalidOperationException("Array has no element type.");
+                if (!TypeIsReferenceOrContainsReferences(elem)) return;
+                int len = ReadI32(obj + ArrayLengthOffset);
+                int elemSize = StorageSizeOf(elem);
+                int baseAbs = obj + ArrayDataOffset;
+                for (int i = 0; i < len; i++)
+                    UpdateManagedRefCellsInTypedStorage(baseAbs + i * elemSize, elem);
+                return;
+            }
+
+            if (t.IsValueType)
+            {
+                UpdateManagedRefCellsInTypedStorage(obj + ObjectHeaderSize, t);
+                return;
+            }
+
+            for (RuntimeType? cur = t; cur != null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.InstanceFields.Length; i++)
+                {
+                    RuntimeField f = cur.InstanceFields[i];
+                    if (!f.IsStatic)
+                        UpdateManagedRefCellsInTypedStorage(obj + f.Offset, f.FieldType);
+                }
+            }
+        }
+
+        private void MarkRoot(int frameOffset, GcRootRecord root)
+        {
+            GcRootKind kind = (GcRootKind)root.Kind;
+            if (kind == GcRootKind.RegisterRef)
+            {
+                long v = ReadFrameGpr(frameOffset, root.Register);
+                if (v != 0) MarkRootValue(root, v);
+                return;
+            }
+            if (kind == GcRootKind.FrameRef)
+            {
+                int abs = FrameRootCellAddress(frameOffset, root);
+                long v = ReadNative(abs);
+                if (v != 0) MarkRootValue(root, v);
+                return;
+            }
+            if (kind == GcRootKind.RegisterByRef || kind == GcRootKind.InteriorRegister)
+            {
+                long v = ReadFrameGpr(frameOffset, root.Register);
+                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)(v - root.InteriorOffset)));
+                return;
+            }
+            if (kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
+            {
+                int abs = FrameRootAddress(frameOffset, root);
+                long v = ReadNative(abs);
+                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)(v - root.InteriorOffset)));
+            }
+        }
+
+        private void UpdateRoot(int frameOffset, GcRootRecord root)
+        {
+            GcRootKind kind = (GcRootKind)root.Kind;
+            if (kind == GcRootKind.RegisterRef)
+            {
+                long v = ReadFrameGpr(frameOffset, root.Register);
+                if (v != 0) WriteFrameGpr(frameOffset, root.Register, TranslateRootValue(root, v));
+                return;
+            }
+            if (kind == GcRootKind.FrameRef)
+            {
+                int abs = FrameRootCellAddress(frameOffset, root);
+                long v = ReadNative(abs);
+                if (v != 0) WriteNative(abs, TranslateRootValue(root, v));
+                return;
+            }
+            if (kind == GcRootKind.RegisterByRef || kind == GcRootKind.InteriorRegister)
+            {
+                long v = ReadFrameGpr(frameOffset, root.Register);
+                if (v != 0)
+                    WriteFrameGpr(frameOffset, root.Register, TranslateInteriorPointer(checked((int)(v - root.InteriorOffset))) + root.InteriorOffset);
+                return;
+            }
+            if (kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
+            {
+                int abs = FrameRootAddress(frameOffset, root);
+                long v = ReadNative(abs);
+                if (v != 0)
+                    WriteNative(abs, TranslateInteriorPointer(checked((int)(v - root.InteriorOffset))) + root.InteriorOffset);
+            }
+        }
+
+        private void MarkRootValue(GcRootRecord root, long value)
+        {
+            if (RootCellIsInteriorPointer(root))
+                TryMarkObjectFromInteriorPointer(checked((int)value));
+            else
+                TryMarkObject(checked((int)value));
+        }
+
+        private long TranslateRootValue(GcRootRecord root, long value)
+        {
+            return RootCellIsInteriorPointer(root)
+                ? TranslateInteriorPointer(checked((int)value))
+                : TranslateObjectRef(checked((int)value));
+        }
+
+        private bool RootCellIsInteriorPointer(GcRootRecord root)
+        {
+            if (TryResolveGcCellType(root, out RuntimeType cellType))
+                return cellType.Kind == RuntimeTypeKind.ByRef;
+            return false;
+        }
+
+        private bool TryResolveGcCellType(GcRootRecord root, out RuntimeType cellType)
+        {
+            cellType = null!;
+            if (root.RuntimeTypeId < 0)
+                return false;
+
+            RuntimeType type = _rts.GetTypeById(root.RuntimeTypeId);
+            return TryResolveGcCellTypeAtOffset(type, root.InteriorOffset, out cellType, depth: 0);
+        }
+
+        private bool TryResolveGcCellTypeAtOffset(RuntimeType type, int offset, out RuntimeType cellType, int depth)
+        {
+            cellType = null!;
+            if (depth > 64 || offset < 0)
+                return false;
+
+            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam || type.Kind == RuntimeTypeKind.ByRef)
+            {
+                if (offset == 0)
+                {
+                    cellType = type;
+                    return true;
+                }
+                return false;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer || !type.ContainsGcPointers)
+                return false;
+
+            for (int i = 0; i < type.InstanceFields.Length; i++)
+            {
+                RuntimeField f = type.InstanceFields[i];
+                if (f.IsStatic)
+                    continue;
+
+                int fieldSize = StorageSizeOf(f.FieldType);
+                int rel = offset - f.Offset;
+                if ((uint)rel >= (uint)fieldSize)
+                    continue;
+
+                return TryResolveGcCellTypeAtOffset(f.FieldType, rel, out cellType, depth + 1);
+            }
+
+            return false;
+        }
+        private void MarkPendingPostReturnObjects()
+        {
+            for (int frame = _stackBase; frame < _frameStackTop; frame += ShadowFrameSize)
+            {
+                long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
+                if (obj != 0) TryMarkObject(checked((int)obj));
+            }
+        }
+        private void UpdatePendingPostReturnObjectsAfterCompaction()
+        {
+            for (int frame = _stackBase; frame < _frameStackTop; frame += ShadowFrameSize)
+            {
+                long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
+                if (obj != 0) WriteI64(frame + ShadowFramePostReturnObjectRef, TranslateObjectRef(checked((int)obj)));
+            }
+        }
+        private int CurrentFrameRootAddress(GcRootRecord root)
+            => checked((int)CurrentFrameBase((RegisterFrameBase)root.FrameBase) + root.FrameOffset);
+        private long CurrentFrameBase(RegisterFrameBase frameBase)
+            => frameBase switch
+            {
+                RegisterFrameBase.StackPointer => X(MachineRegisters.StackPointer),
+                RegisterFrameBase.FramePointer => X(MachineRegisters.FramePointer),
+                RegisterFrameBase.IncomingArgumentBase => X(MachineRegisters.ThreadPointer),
+                RegisterFrameBase.None => X(MachineRegisters.FramePointer),
+                _ => throw new InvalidOperationException("Invalid GC root frame base."),
+            };
+        private int FrameRootAddress(int frameOffset, GcRootRecord root)
+            => checked((int)FrameBase(frameOffset, (RegisterFrameBase)root.FrameBase) + root.FrameOffset);
+        private int FrameRootCellAddress(int frameOffset, GcRootRecord root)
+            => checked(FrameRootAddress(frameOffset, root) + root.InteriorOffset);
+        private long FrameBase(int frameOffset, RegisterFrameBase frameBase)
+            => frameBase switch
+            {
+                RegisterFrameBase.StackPointer => FrameStackPointer(frameOffset),
+                RegisterFrameBase.FramePointer => FramePointer(frameOffset),
+                RegisterFrameBase.IncomingArgumentBase => FrameIncomingArgumentBase(frameOffset),
+                RegisterFrameBase.None => FramePointer(frameOffset),
+                _ => throw new InvalidOperationException("Invalid GC root frame base."),
+            };
+
+        private long ReadFrameGpr(int frameOffset, byte encodedRegister)
+        {
+            if (encodedRegister == (byte)MachineRegister.X0)
+                return 0;
+
+            GprStorageLocation location = ResolveFrameGprLocation(frameOffset, encodedRegister);
+            if (location.Kind == GprStorageLocation.StackSlot)
+                return ReadNative(location.Address);
+            if (location.Kind == GprStorageLocation.Snapshot)
+            {
+                if ((uint)location.SnapshotIndex >= (uint)_registerSnapshots.Count ||
+                    _registerSnapshots[location.SnapshotIndex] is not RegisterSnapshot snapshot)
+                    throw new InvalidOperationException("Invalid register snapshot index.");
+                return snapshot.General[encodedRegister];
+            }
+            return GetGpr(encodedRegister);
+        }
+
+        private void WriteFrameGpr(int frameOffset, byte encodedRegister, long value)
+        {
+            if (encodedRegister == (byte)MachineRegister.X0)
+                return;
+
+            GprStorageLocation location = ResolveFrameGprLocation(frameOffset, encodedRegister);
+            if (location.Kind == GprStorageLocation.StackSlot)
+            {
+                WriteNative(location.Address, value);
+                return;
+            }
+            if (location.Kind == GprStorageLocation.Snapshot)
+            {
+                if ((uint)location.SnapshotIndex >= (uint)_registerSnapshots.Count ||
+                    _registerSnapshots[location.SnapshotIndex] is not RegisterSnapshot snapshot)
+                    throw new InvalidOperationException("Invalid register snapshot index.");
+                snapshot.General[encodedRegister] = value;
+                return;
+            }
+            SetGpr(encodedRegister, value);
+        }
+
+        private GprStorageLocation ResolveFrameGprLocation(int frameOffset, byte encodedRegister)
+        {
+            int top = TopFrameOffset();
+            if (frameOffset == top)
+                return new GprStorageLocation(GprStorageLocation.CurrentRegister);
+
+            int directChild = checked(frameOffset + ShadowFrameSize);
+            if (directChild <= top)
+            {
+                int snapshotIndex = ReadI32(directChild + ShadowFrameRegisterSnapshotIndex);
+                if (snapshotIndex >= 0)
+                    return new GprStorageLocation(GprStorageLocation.Snapshot, snapshotIndex: snapshotIndex);
+            }
+
+            MachineRegister register = (MachineRegister)encodedRegister;
+            GprStorageLocation location = new GprStorageLocation(GprStorageLocation.CurrentRegister);
+            for (int child = top; child > frameOffset; child -= ShadowFrameSize)
+            {
+                if (TryGetSavedRegisterSlot(child, register, out int slotAddress))
+                    location = new GprStorageLocation(GprStorageLocation.StackSlot, address: slotAddress);
+            }
+            return location;
+        }
+
+        private bool TryGetSavedRegisterSlot(int frameOffset, MachineRegister register, out int slotAddress)
+        {
+            slotAddress = 0;
+            int methodIndex = ReadI32(frameOffset + ShadowFrameMethodIndex);
+            if ((uint)methodIndex >= (uint)_image.Methods.Length)
+                return false;
+
+            int safePointPc = frameOffset != TopFrameOffset() 
+                ?  FrameSafePointPc(frameOffset)
+                : _currentSafePointPc >= 0
+                    ? _currentSafePointPc
+                    : _pc;
+            MethodRecord method = _image.Methods[methodIndex];
+            int start = method.UnwindStartIndex;
+            int end = start + method.UnwindCount;
+            for (int i = start; i < end; i++)
+            {
+                UnwindRecord unwind = _image.Unwind[i];
+                if ((UnwindCodeKind)unwind.Kind != UnwindCodeKind.SaveCalleeSavedRegister)
+                    continue;
+                if ((MachineRegister)unwind.Register != register)
+                    continue;
+                if (safePointPc >= 0 && unwind.Pc > safePointPc)
+                    continue;
+                slotAddress = checked((int)FrameStackPointer(frameOffset) + unwind.StackOffset);
+                return true;
+            }
+            return false;
+        }
+
+        private void PushGcMarkObject(int obj)
+        {
+            int block = obj - BlockHeaderSize;
+            WriteI32(block + BlockMetaOffset, -(_gcMarkHead + 1));
+            _gcMarkHead = obj;
+        }
+
+        private int PopGcMarkObject()
+        {
+            int obj = _gcMarkHead;
+            int block = obj - BlockHeaderSize;
+            int encodedNext = ReadI32(block + BlockMetaOffset);
+            _gcMarkHead = -encodedNext - 1;
+            WriteI32(block + BlockMetaOffset, BlockMetaObject);
+            return obj;
+        }
+
+        private void MarkObjectReferences(int obj, RuntimeType type)
+        {
+            if (type.Kind == RuntimeTypeKind.Array)
+            {
+                RuntimeType elem = type.ElementType ?? throw new InvalidOperationException("Array has no element type.");
+                if (!TypeIsReferenceOrContainsReferences(elem)) return;
+
+                int len = ReadI32(obj + ArrayLengthOffset);
+                int elemSize = StorageSizeOf(elem);
+                int data = obj + ArrayDataOffset;
+                for (int i = 0; i < len; i++)
+                    MarkManagedRefCellsInTypedStorage(data + i * elemSize, elem);
+                return;
+            }
+
+            if (type.IsValueType)
+            {
+                MarkManagedRefCellsInTypedStorage(obj + ObjectHeaderSize, type);
+                return;
+            }
+
+            for (RuntimeType? cur = type; cur != null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.InstanceFields.Length; i++)
+                {
+                    RuntimeField f = cur.InstanceFields[i];
+                    if (!f.IsStatic)
+                        MarkManagedRefCellsInTypedStorage(obj + f.Offset, f.FieldType);
+                }
+            }
+        }
+
+        private void MarkManagedRefCellsInTypedStorage(int abs, RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) TryMarkObject(checked((int)v));
+                return;
+            }
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)v));
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer || !type.ContainsGcPointers)
+                return;
+
+            for (int i = 0; i < type.InstanceFields.Length; i++)
+            {
+                RuntimeField f = type.InstanceFields[i];
+                if (!f.IsStatic)
+                    MarkManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType);
+            }
+        }
+
+        private void MarkObjectFromCell(int obj) => TryMarkObject(obj);
+
+        private void VisitObjectReferences(int obj, RuntimeType type, Action<int> visitor)
+        {
+            if (type.Kind == RuntimeTypeKind.Array)
+            {
+                RuntimeType elem = type.ElementType ?? throw new InvalidOperationException("Array has no element type.");
+                if (!TypeIsReferenceOrContainsReferences(elem)) return;
+
+                int len = ReadI32(obj + ArrayLengthOffset);
+                int elemSize = StorageSizeOf(elem);
+                int data = obj + ArrayDataOffset;
+                for (int i = 0; i < len; i++)
+                    VisitManagedRefCellsInTypedStorage(data + i * elemSize, elem, visitor);
+                return;
+            }
+
+            if (type.IsValueType)
+            {
+                VisitManagedRefCellsInTypedStorage(obj + ObjectHeaderSize, type, visitor);
+                return;
+            }
+
+            for (RuntimeType? cur = type; cur != null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.InstanceFields.Length; i++)
+                {
+                    RuntimeField f = cur.InstanceFields[i];
+                    if (!f.IsStatic)
+                        VisitManagedRefCellsInTypedStorage(obj + f.Offset, f.FieldType, visitor);
+                }
+            }
+        }
+
+        private void VisitManagedRefCellsInTypedStorage(int abs, RuntimeType type, Action<int> visitor)
+        {
+            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) visitor(checked((int)v));
+                return;
+            }
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)v));
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer || !type.ContainsGcPointers)
+                return;
+
+            for (int i = 0; i < type.InstanceFields.Length; i++)
+            {
+                RuntimeField f = type.InstanceFields[i];
+                if (!f.IsStatic)
+                    VisitManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType, visitor);
+            }
+        }
+
+        private bool TryMarkObject(int obj)
+        {
+            if (obj == 0) return false;
+            if (!TryGetBlockFromObjectRef(obj, out int block)) return false;
+            int flags = ReadI32(obj + 4);
+            if ((flags & GcFlagAllocated) == 0 || (flags & GcFlagMark) != 0) return false;
+            WriteI32(obj + 4, flags | GcFlagMark);
+            PushGcMarkObject(obj);
+            return true;
+        }
+
+        private bool TryMarkObjectFromInteriorPointer(int targetAbs)
+        {
+            if (targetAbs == 0)
+                return false;
+            if (TryGetBlockFromObjectRef(targetAbs, out _))
+                return TryMarkObject(targetAbs);
+            if (!TryGetObjectBlockContaining(targetAbs, out int block))
+                return false;
+            return TryMarkObject(block + BlockHeaderSize);
+        }
+
+        private int TranslateObjectRef(int oldObj)
+        {
+            if (oldObj == 0) return 0;
+            if (!TryGetBlockFromObjectRef(oldObj, out int block))
+                throw new AccessViolationException("Dangling object reference during GC compaction.");
+            int target = ReadI32(block + BlockMetaOffset);
+            if (target <= 0)
+                throw new AccessViolationException("Unmarked object reference during GC compaction.");
+            return target;
+        }
+
+        private int TranslateInteriorPointer(int oldPtr)
+        {
+            if (oldPtr == 0)
+                return 0;
+
+            if (TryTranslateObjectInteriorPointer(oldPtr, out int translated))
+                return translated;
+
+            if (TryTranslateRawInteriorPointer(oldPtr, out translated))
+                return translated;
+
+            if (oldPtr < _heapBase)
+                return oldPtr;
+
+            if (oldPtr < _heapEnd)
+                throw new AccessViolationException("Dangling interior pointer during GC compaction.");
+
+            return oldPtr;
+        }
+        private bool TryTranslateObjectInteriorPointer(int oldPtr, out int translated)
+        {
+            if (TryGetBlockFromObjectRef(oldPtr, out _))
+            {
+                translated = TranslateObjectRef(oldPtr);
+                return true;
+            }
+
+            if (TryGetObjectBlockContaining(oldPtr, out int block))
+            {
+                int oldObj = block + BlockHeaderSize;
+                int targetObj = TranslateObjectRef(oldObj);
+                translated = checked(targetObj + (oldPtr - oldObj));
+                return true;
+            }
+
+            translated = 0;
+            return false;
+        }
+
+        private bool TryTranslateRawInteriorPointer(int oldPtr, out int translated)
+        {
+            if (!TryGetRawBlockContaining(oldPtr, out int block))
+            {
+                translated = 0;
+                return false;
+            }
+
+            int meta = ReadI32(block + BlockMetaOffset);
+
+            if (meta == BlockMetaRaw)
+            {
+                translated = oldPtr;
+                return true;
+            }
+
+            if (meta >= 0)
+                throw new AccessViolationException("Invalid raw block forwarding pointer during GC compaction.");
+
+            int oldPayload = block + BlockHeaderSize;
+            int newPayload = checked(-meta + BlockHeaderSize);
+            translated = checked(newPayload + (oldPtr - oldPayload));
+            return true;
+        }
+        private int TranslateRawBase(int oldBase)
+        {
+            int block = oldBase - BlockHeaderSize;
+            if (!TryGetRawBlock(oldBase, out block))
+                throw new AccessViolationException("Dangling static storage reference during GC compaction.");
+            int target = ReadI32(block + BlockMetaOffset);
+            if (target >= 0)
+                throw new AccessViolationException("Invalid static storage forwarding pointer during GC compaction.");
+            return checked(-target + BlockHeaderSize);
+        }
+
+        private void UpdateManagedRefCellsInTypedStorage(int abs, RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) WriteNative(abs, TranslateObjectRef(checked((int)v)));
+                return;
+            }
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                long v = ReadNative(abs);
+                if (v != 0) WriteNative(abs, TranslateInteriorPointer(checked((int)v)));
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer || !type.ContainsGcPointers)
+                return;
+
+            for (int i = 0; i < type.InstanceFields.Length; i++)
+            {
+                RuntimeField f = type.InstanceFields[i];
+                if (!f.IsStatic)
+                    UpdateManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType);
+            }
+        }
+
+        private int ReadBlockSize(int block)
+        {
+            if (block < _heapBase || block + BlockHeaderSize > _heapPtr)
+                throw new AccessViolationException("Bad heap block header.");
+            int size = ReadI32(block + BlockSizeOffset);
+            if (size < BlockHeaderSize + 8 || (size & 7) != 0 || block + size > _heapPtr)
+                throw new AccessViolationException("Corrupted heap block size.");
+            return size;
+        }
+
+        private bool TryGetBlockFromObjectRef(int obj, out int block)
+        {
+            block = obj - BlockHeaderSize;
+            if (block < _heapBase || obj < _heapBase + BlockHeaderSize || obj + ObjectHeaderSize > _heapPtr)
+                return false;
+
+            try { ReadBlockSize(block); }
+            catch { return false; }
+
+            if (block + BlockHeaderSize != obj)
+                return false;
+
+            int meta = ReadI32(block + BlockMetaOffset);
+            return meta == BlockMetaObject || IsGcMarkLink(meta) || IsForwardedObjectPayload(meta);
+        }
+
+        private bool TryGetObjectBlockContaining(int abs, out int block)
+        {
+            block = _heapBase;
+            while (block < _heapPtr)
+            {
+                int size;
+                try { size = ReadBlockSize(block); }
+                catch { block = 0; return false; }
+                int meta = ReadI32(block + BlockMetaOffset);
+                if ((meta == BlockMetaObject || IsGcMarkLink(meta) || IsForwardedObjectPayload(meta))
+                    && abs >= block + BlockHeaderSize && abs < block + size)
+                    return true;
+                block += size;
+            }
+            block = 0;
+            return false;
+        }
+
+        private bool TryGetRawBlock(int payload, out int block)
+        {
+            block = payload - BlockHeaderSize;
+            if (block < _heapBase || payload < _heapBase + BlockHeaderSize || payload > _heapPtr)
+                return false;
+
+            try { ReadBlockSize(block); }
+            catch { return false; }
+
+            if (block + BlockHeaderSize != payload)
+                return false;
+
+            int meta = ReadI32(block + BlockMetaOffset);
+            return meta == BlockMetaRaw || IsForwardedRawBlock(meta);
+        }
+        private bool TryGetRawBlockContaining(int abs, out int block)
+        {
+            block = _heapBase;
+
+            while (block < _heapPtr)
+            {
+                int size;
+                try { size = ReadBlockSize(block); }
+                catch
+                {
+                    block = 0;
+                    return false;
+                }
+
+                int meta = ReadI32(block + BlockMetaOffset);
+                if ((meta == BlockMetaRaw || IsForwardedRawBlock(meta)) && abs >= block + BlockHeaderSize && abs < block + size)
+                    return true;
+
+                block += size;
+            }
+
+            block = 0;
+            return false;
+        }
+        private bool IsGcMarkLink(int meta)
+        {
+            if (!_gcRunning || meta >= 0 || meta == int.MinValue)
+                return false;
+
+            int next = -meta - 1;
+            if (next == 0)
+                return true;
+
+            return next >= _heapBase + BlockHeaderSize
+                && next <= _heapPtr
+                && ((next - BlockHeaderSize) & (HeapBlockAlignment - 1)) == 0;
+        }
+
+        private bool IsForwardedObjectPayload(int meta)
+        {
+            if (meta <= 0)
+                return false;
+
+            int block = meta - BlockHeaderSize;
+            return meta >= _heapBase + BlockHeaderSize
+                && meta <= _heapEnd
+                && block >= _heapBase
+                && block <= _heapEnd
+                && (block & (HeapBlockAlignment - 1)) == 0;
+        }
+
+        private bool IsForwardedRawBlock(int meta)
+        {
+            if (meta >= 0 || meta == int.MinValue)
+                return false;
+
+            int block = -meta;
+            return block >= _heapBase
+                && block <= _heapEnd
+                && (block & (HeapBlockAlignment - 1)) == 0;
+        }
+
+
+        private int CheckedTarget(long target)
+        {
+            if (target < 0 || target >= _image.Code.Length)
+                throw new InvalidOperationException("Invalid branch target PC: " + target.ToString());
+            return (int)target;
+        }
+
+        private void Switch(long key, InstrDesc ins)
+        {
+            int start = checked((int)ins.Imm);
+            int count = ins.Aux;
+            if ((uint)start > (uint)_image.SwitchTable.Length || start + count > _image.SwitchTable.Length)
+                throw new InvalidOperationException("Invalid switch table range.");
+
+            for (int i = 0; i < count; i++)
+            {
+                var e = _image.SwitchTable[start + i];
+                if (e.Key == key)
+                {
+                    _pc = CheckedTarget(e.TargetPc);
+                    return;
+                }
+            }
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long X(MachineRegister register)
+        {
+            byte r = RegisterVmIsa.EncodeRegister(register);
+            return GetGpr(r);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void X(MachineRegister register, long value)
+        {
+            byte r = RegisterVmIsa.EncodeRegister(register);
+            SetGpr(r, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long GetGpr(byte register)
+            => register == (byte)MachineRegister.X0 ? 0 : _x[register];
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetGpr(byte register, long value)
+        {
+            if (register == (byte)MachineRegister.X0)
+                return;
+
+            _x[register] = value;
+            if (register == (byte)MachineRegister.X2)
+                TrackStackPeak(value);
+        }
+
+        private void SetGpr(MachineRegister register, long value)
+            => SetGpr(RegisterVmIsa.EncodeRegister(register), value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long GetFprBits(byte register)
+            => _f[register - (byte)MachineRegister.F0];
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetFpr(byte register, long bits)
+            => _f[register - (byte)MachineRegister.F0] = bits;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetFpr(MachineRegister register, long bits)
+            => SetFpr(RegisterVmIsa.EncodeRegister(register), bits);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private float F32(byte register)
+            => BitConverter.Int32BitsToSingle(unchecked((int)(uint)GetFprBits(register)));
+
+        private double F64(byte register)
+            => BitConverter.Int64BitsToDouble(GetFprBits(register));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetF32(byte register, float value)
+            => SetFpr(register, unchecked((uint)BitConverter.SingleToInt32Bits(value)));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetF64(byte register, double value)
+            => SetFpr(register, BitConverter.DoubleToInt64Bits(value));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetI32(byte register, int value)
+            => SetGpr(register, value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetBool(byte register, bool value)
+            => SetGpr(register, value ? 1 : 0);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetReturnI4(int value)
+            => SetGpr(MachineRegisters.ReturnValue0, value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetReturnRef(long value)
+            => SetGpr(MachineRegisters.ReturnValue0, value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private byte ReadU8(int abs)
+        {
+            CheckRange(abs, 1);
+            return _mem[abs];
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteU8(int abs, byte value)
+        {
+            CheckWritableRange(abs, 1);
+            _mem[abs] = value;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ushort ReadU16(int abs)
+        {
+            CheckRange(abs, 2);
+            return Unsafe.ReadUnaligned<ushort>(ref _mem[abs]);
+        }
+
+        private void WriteU16(int abs, ushort value)
+        {
+            CheckWritableRange(abs, 2);
+            Unsafe.WriteUnaligned(ref _mem[abs], value);
+        }
+
+        private int ReadI32(int abs)
+        {
+            CheckRange(abs, 4);
+            return Unsafe.ReadUnaligned<int>(ref _mem[abs]);
+        }
+
+        private void WriteI32(int abs, int value)
+        {
+            CheckWritableRange(abs, 4);
+            Unsafe.WriteUnaligned(ref _mem[abs], value);
+        }
+
+        private long ReadI64(int abs)
+        {
+            CheckRange(abs, 8);
+            return Unsafe.ReadUnaligned<long>(ref _mem[abs]);
+        }
+
+        private void WriteI64(int abs, long value)
+        {
+            CheckWritableRange(abs, 8);
+            Unsafe.WriteUnaligned(ref _mem[abs], value);
+        }
+
+        private long ReadNative(int abs)
+        {
+#pragma warning disable CS0162
+            if (TargetArchitecture.PointerSize == 8) return ReadI64(abs);
+            return ReadI32(abs);
+#pragma warning restore CS0162
+        }
+
+        private void WriteNative(int abs, long value)
+        {
+#pragma warning disable CS0162
+            if (TargetArchitecture.PointerSize == 8) WriteI64(abs, value);
+            else WriteI32(abs, checked((int)value));
+#pragma warning restore CS0162
+        }
+
+        private long ReadNativeOrI64(int abs, RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+                return ReadNative(abs);
+            return ReadI64(abs);
+        }
+
+        private long ReadSizedInteger(int abs, RuntimeType type)
+        {
+            int size = StorageSizeOf(type);
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+                return ReadNative(abs);
+            switch (size)
+            {
+                case 1: return IsUnsignedSmall(type) ? ReadU8(abs) : unchecked((sbyte)ReadU8(abs));
+                case 2: return IsUnsignedSmall(type) || IsCharType(type) ? ReadU16(abs) : unchecked((short)ReadU16(abs));
+                case 4: return IsUnsignedSmall(type) ? unchecked((uint)ReadI32(abs)) : ReadI32(abs);
+                case 8: return ReadI64(abs);
+                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+            }
+        }
+
+        private void WriteSizedInteger(int abs, RuntimeType type, long value)
+        {
+            int size = StorageSizeOf(type);
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+            {
+                WriteNative(abs, value);
+                return;
+            }
+            switch (size)
+            {
+                case 1: WriteU8(abs, unchecked((byte)value)); return;
+                case 2: WriteU16(abs, unchecked((ushort)value)); return;
+                case 4: WriteI32(abs, unchecked((int)value)); return;
+                case 8: WriteI64(abs, value); return;
+                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+            }
         }
 
         private void CheckRange(int abs, int size)
         {
-            if (size < 0 || abs < 0 || abs > _mem.Length - size)
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            if ((uint)abs > (uint)_mem.Length || abs + size < abs || abs + size > _mem.Length)
                 throw new AccessViolationException();
         }
 
@@ -3916,88 +4357,462 @@ namespace Cnidaria.Cs
         {
             CheckRange(abs, size);
             if (abs < _staticEnd)
-                throw new AccessViolationException();
+                throw new AccessViolationException("Attempt to write read-only/static metadata memory.");
         }
+
 
         private void CheckHeapAccess(int abs, int size, bool writable)
         {
-            if (writable) CheckWritableRange(abs, size); else CheckRange(abs, size);
-            if (abs < _heapBase || abs > _heapPtr - size)
-                throw new AccessViolationException();
+            CheckHeapAccess(abs, size);
+            if (writable) CheckWritableRange(abs, size);
         }
 
-        private ref byte Mem0 => ref MemoryMarshal.GetArrayDataReference(_mem);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private short ReadI16Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<short>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private ushort ReadU16Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int ReadI32Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private long ReadI64Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private float ReadR4Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<float>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private double ReadR8Unchecked(int abs) =>
-            Unsafe.ReadUnaligned<double>(ref Unsafe.Add(ref Mem0, abs));
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteU16Unchecked(int abs, ushort value) =>
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref Mem0, abs), value);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteI32Unchecked(int abs, int value) =>
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref Mem0, abs), value);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteI64Unchecked(int abs, long value) =>
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref Mem0, abs), value);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteR4Unchecked(int abs, float value) =>
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref Mem0, abs), value);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteR8Unchecked(int abs, double value) =>
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref Mem0, abs), value);
-
-        private int ReadI32(int abs)
+        private void CheckIndirectAccess(int abs, int size, bool writable)
         {
-            CheckRange(abs, 4);
-            return ReadI32Unchecked(abs);
+            CheckIndirectAccess(abs, size);
+            if (writable) CheckWritableRange(abs, size);
         }
 
-        private void WriteI32(int abs, int value)
+        private void CheckStackRange(int abs, int size)
         {
-            CheckWritableRange(abs, 4);
-            WriteI32Unchecked(abs, value);
+            CheckRange(abs, size);
+            long stackLow = CurrentFrameStackLow();
+            if (abs < stackLow || abs + size > _stackEnd)
+                throw new AccessViolationException("Stack access out of active frame range.");
         }
 
-        private long ReadNativeInt(int abs)
+        private void CheckHeapAccess(int abs, int size)
         {
-            return RuntimeTypeSystem.PointerSize == 8
-                ? ReadI64Unchecked(abs)
-                : ReadI32Unchecked(abs);
+            CheckRange(abs, size);
+            if (abs < _heapBase || abs + size > _heapPtr)
+                throw new AccessViolationException("Heap access out of range.");
         }
 
-        private void WriteNativeInt(int abs, long value)
+        private void CheckIndirectAccess(int abs, int size)
         {
-            int pointerSize = RuntimeTypeSystem.PointerSize;
-            if (pointerSize == 8)
-                WriteI64Unchecked(abs, value);
-            else
-                WriteI32Unchecked(abs, checked((int)value));
+            CheckRange(abs, size);
+            if (abs >= _heapBase)
+            {
+                CheckHeapAccess(abs, size);
+                return;
+            }
+            if (abs >= _stackBase && abs < _stackEnd)
+            {
+                CheckStackRange(abs, size);
+                return;
+            }
+            if (abs >= _staticEnd && abs < _heapBase)
+                return;
+            throw new AccessViolationException();
+        }
+
+        private void TrackStackPeak(long stackLow)
+        {
+            int sp = checked((int)stackLow);
+            if (sp < _frameStackTop) throw new StackOverflowException();
+            if (sp > _stackEnd) throw new AccessViolationException("Stack pointer above stack end.");
+            if (sp < _stackLowWatermark) _stackLowWatermark = sp;
+        }
+
+        private static int AlignPayloadStart(int blockLowerBound, int payloadAlignment)
+            => AlignUp(checked(blockLowerBound + BlockHeaderSize), payloadAlignment);
+
+        private static int AlignBlockStart(int lowerBound)
+            => AlignPayloadStart(lowerBound, HeapBlockAlignment) - BlockHeaderSize;
+
+        private static int AlignUp(int value, int alignment)
+        {
+            if (alignment <= 1) return value;
+            int mask = alignment - 1;
+            if ((alignment & mask) != 0) throw new ArgumentException("Alignment must be power of two.");
+            return checked((value + mask) & ~mask);
+        }
+
+        private static long AlignDown(long value, int alignment)
+        {
+            if (alignment <= 1) return value;
+            int mask = alignment - 1;
+            if ((alignment & mask) != 0) throw new ArgumentException("Alignment must be power of two.");
+            return value & ~((long)mask);
+        }
+
+        private RuntimeType ValidateArrayRef(long objRef)
+        {
+            if (objRef == 0) throw new NullReferenceException();
+            RuntimeType t = GetObjectTypeFromRef(objRef);
+            if (t.Kind != RuntimeTypeKind.Array) throw new ArrayTypeMismatchException();
+            return t;
+        }
+
+
+        private RuntimeType ValidateArrayRef(long objRef, out int abs, out RuntimeType type)
+        {
+            type = ValidateArrayRef(objRef);
+            abs = checked((int)objRef);
+            return type;
+        }
+
+        private RuntimeType ValidateStringRef(long objRef)
+        {
+            if (objRef == 0) throw new NullReferenceException();
+            RuntimeType t = GetObjectTypeFromRef(objRef);
+            if (!IsSystemStringType(t)) throw new InvalidCastException();
+            return t;
+        }
+
+        private bool TryGetObjectTypeFromExactRef(long objRef, out RuntimeType type)
+        {
+            type = null!;
+            if (objRef < int.MinValue || objRef > int.MaxValue) return false;
+            int obj = (int)objRef;
+            if (!TryGetBlockFromObjectRef(obj, out _)) return false;
+            int flags = ReadI32(obj + 4);
+            if ((flags & GcFlagAllocated) == 0) return false;
+            type = _rts.GetTypeById(ReadI32(obj));
+            return true;
+        }
+
+        private RuntimeType GetObjectTypeFromRef(long objRef)
+        {
+            int obj = checked((int)objRef);
+            if (!TryGetBlockFromObjectRef(obj, out _)) throw new AccessViolationException();
+            int flags = ReadI32(obj + 4);
+            if ((flags & GcFlagAllocated) == 0) throw new AccessViolationException();
+            return _rts.GetTypeById(ReadI32(obj));
+        }
+
+
+        private RuntimeType ValidateStringRef(long objRef, out int abs)
+        {
+            RuntimeType type = ValidateStringRef(objRef);
+            abs = checked((int)objRef);
+            return type;
+        }
+
+
+        private RuntimeType ResolveRequiredType(string assemblyName, string ns, string name)
+        {
+            RuntimeType? fallback = null;
+            foreach (RuntimeType t in EnumerateRuntimeTypes(_rts))
+            {
+                if (t.Namespace != ns || t.Name != name) continue;
+                if (t.AssemblyName == assemblyName) return t;
+                fallback ??= t;
+            }
+            if (fallback != null) return fallback;
+            throw new TypeLoadException(ns + "." + name);
+        }
+
+        private RuntimeField FieldById(long id)
+        {
+            int fieldId = checked((int)id);
+            if (_fieldById.TryGetValue(fieldId, out RuntimeField? f)) return f;
+            var fresh = BuildFieldIdMap(_rts);
+            foreach (var kv in fresh) _fieldById[kv.Key] = kv.Value;
+            if (_fieldById.TryGetValue(fieldId, out f)) return f;
+            throw new MissingFieldException("Runtime field not found: F" + fieldId.ToString());
+        }
+
+        private static Dictionary<int, RuntimeField> BuildFieldIdMap(RuntimeTypeSystem rts)
+        {
+            var result = new Dictionary<int, RuntimeField>();
+            foreach (RuntimeType t in EnumerateRuntimeTypes(rts))
+            {
+                for (int i = 0; i < t.InstanceFields.Length; i++)
+                    result[t.InstanceFields[i].FieldId] = t.InstanceFields[i];
+                for (int i = 0; i < t.StaticFields.Length; i++)
+                    result[t.StaticFields[i].FieldId] = t.StaticFields[i];
+            }
+            return result;
+        }
+
+        private static IEnumerable<RuntimeType> EnumerateRuntimeTypes(RuntimeTypeSystem rts)
+        {
+            var fi = typeof(RuntimeTypeSystem).GetField("_typeById", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (fi?.GetValue(rts) is Dictionary<int, RuntimeType> byId)
+            {
+                foreach (var kv in byId) yield return kv.Value;
+            }
+        }
+
+        private bool IsAssignableTo(RuntimeType source, RuntimeType target)
+        {
+            if (ReferenceEquals(source, target) || source.TypeId == target.TypeId) return true;
+
+            if (target.Namespace == "System" && target.Name == "Object")
+                return true;
+            if (source.IsValueType && target.Namespace == "System" && (target.Name == "ValueType" || target.Name == "Object"))
+                return true;
+            if (source.Kind == RuntimeTypeKind.Enum && target.Namespace == "System" && target.Name == "Enum")
+                return true;
+
+            for (RuntimeType? cur = source.BaseType; cur != null; cur = cur.BaseType)
+            {
+                if (cur.TypeId == target.TypeId) return true;
+            }
+
+            for (int i = 0; i < source.Interfaces.Length; i++)
+            {
+                if (source.Interfaces[i].TypeId == target.TypeId) return true;
+            }
+
+            if (source.Kind == RuntimeTypeKind.Array && target.Kind == RuntimeTypeKind.Array)
+            {
+                RuntimeType? se = source.ElementType;
+                RuntimeType? te = target.ElementType;
+                if (se == null || te == null) return false;
+                if (se.TypeId == te.TypeId) return true;
+                if (se.IsReferenceType && te.IsReferenceType) return IsAssignableTo(se, te);
+            }
+
+            return false;
+        }
+
+        private RuntimeMethod ResolveVirtualDispatch(RuntimeType actual, RuntimeMethod declared)
+        {
+            if (declared.VTableSlot >= 0 && declared.VTableSlot < actual.VTable.Length)
+                return actual.VTable[declared.VTableSlot];
+            return FindMostDerivedMethodByNameAndSig(actual, declared) ?? declared;
+        }
+
+        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
+        {
+            for (RuntimeType? cur = actual; cur != null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.Methods.Length; i++)
+                {
+                    RuntimeMethod m = cur.Methods[i];
+                    if (m.Name != declared.Name) continue;
+                    if (m.ParameterTypes.Length != declared.ParameterTypes.Length) continue;
+                    bool same = true;
+                    for (int p = 0; p < m.ParameterTypes.Length; p++)
+                    {
+                        if (m.ParameterTypes[p].TypeId != declared.ParameterTypes[p].TypeId)
+                        {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) return m;
+                }
+            }
+            return null;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TypeIsReferenceOrContainsReferences(RuntimeType type)
+        {
+            return type.IsReferenceType
+                || type.Kind == RuntimeTypeKind.ByRef
+                || type.Kind == RuntimeTypeKind.TypeParam
+                || type.ContainsGcPointers;
+        }
+
+        private int StorageSizeOf(RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                return TargetArchitecture.PointerSize;
+            return Math.Max(1, type.SizeOf);
+        }
+
+        private int StorageAlignOf(RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                return TargetArchitecture.PointerSize;
+            return Math.Max(1, type.AlignOf);
+        }
+
+        private bool IsNativeIntType(RuntimeType type)
+            => type.Namespace == "System" && (type.Name == "IntPtr" || type.Name == "UIntPtr" || type.Name == "nint" || type.Name == "nuint");
+
+        private bool IsCharType(RuntimeType type)
+            => type.Namespace == "System" && type.Name == "Char";
+
+        private bool IsUnsignedSmall(RuntimeType type)
+            => type.Namespace == "System" && (type.Name == "Byte" || type.Name == "UInt16" || type.Name == "UInt32" || type.Name == "UInt64" || type.Name == "UIntPtr");
+
+        private bool IsCoreLibRandomLike(RuntimeType type)
+            => type.Namespace == "System" && (type.Name == "Random" || type.Name == "ThreadSafeRandom");
+
+        private bool IsSystemStringType(RuntimeType type)
+            => type.Namespace == "System" && type.Name == "String";
+
+        private RuntimeType? FindRuntimeType(string ns, string name)
+        {
+            foreach (RuntimeType t in EnumerateRuntimeTypes(_rts))
+            {
+                if (t.Namespace == ns && t.Name == name) return t;
+            }
+            return null;
+        }
+
+        private string ReadManagedString(int obj)
+        {
+            if (obj == 0) return string.Empty;
+            ValidateStringRef(obj);
+            int len = ReadI32(obj + StringLengthOffset);
+            if (len < 0) throw new InvalidOperationException("Corrupted string length.");
+            char[] chars = new char[len];
+            int p = obj + StringCharsOffset;
+            for (int i = 0; i < len; i++)
+                chars[i] = (char)ReadU16(p + i * 2);
+            return new string(chars);
+        }
+
+        private bool TryTranslateHostExceptionToManaged(Exception ex, out int exceptionRef)
+        {
+            string name = ex switch
+            {
+                OverflowException => "OverflowException",
+                DivideByZeroException => "DivideByZeroException",
+                NullReferenceException => "NullReferenceException",
+                IndexOutOfRangeException => "IndexOutOfRangeException",
+                InvalidCastException => "InvalidCastException",
+                OutOfMemoryException => "OutOfMemoryException",
+                ArgumentNullException => "ArgumentNullException",
+                ArgumentOutOfRangeException => "ArgumentOutOfRangeException",
+                ArgumentException => "ArgumentException",
+                InvalidOperationException => "InvalidOperationException",
+                NotSupportedException => "NotSupportedException",
+                AccessViolationException => "AccessViolationException",
+                _ => "Exception"
+            };
+
+            try
+            {
+                exceptionRef = AllocExceptionRef("System", name, ex.Message ?? string.Empty);
+                return true;
+            }
+            catch
+            {
+                exceptionRef = 0;
+                return false;
+            }
+        }
+
+        private int AllocExceptionRef(string ns, string name, string message)
+        {
+            RuntimeType? t = FindRuntimeType(ns, name) ?? FindRuntimeType("System", "Exception");
+            if (t == null) return 0;
+            int obj = AllocObject(t);
+            RuntimeField? messageField = null;
+            for (RuntimeType? cur = t; cur != null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.InstanceFields.Length; i++)
+                {
+                    if (cur.InstanceFields[i].Name == "_message")
+                    {
+                        messageField = cur.InstanceFields[i];
+                        break;
+                    }
+                }
+                if (messageField != null) break;
+            }
+            if (messageField != null)
+            {
+                int s = InternString(message);
+                WriteNative(obj + messageField.Offset, s);
+            }
+            return obj;
+        }
+
+        private string TryReadExceptionMessage(int exceptionRef)
+        {
+            try
+            {
+                if (exceptionRef == 0) return string.Empty;
+                int obj = exceptionRef;
+                RuntimeType t = GetObjectTypeFromRef(obj);
+                for (RuntimeType? cur = t; cur != null; cur = cur.BaseType)
+                {
+                    for (int i = 0; i < cur.InstanceFields.Length; i++)
+                    {
+                        RuntimeField f = cur.InstanceFields[i];
+                        if (f.Name == "_message")
+                        {
+                            int s = checked((int)ReadNative(obj + f.Offset));
+                            return ReadManagedString(s);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return string.Empty;
+        }
+
+        private void ClearArray(long arrayRef, int index, int length)
+        {
+            RuntimeType arrayType = ValidateArrayRef(arrayRef);
+            int arr = checked((int)arrayRef);
+            int len = ReadI32(arr + ArrayLengthOffset);
+            if (index < 0 || length < 0 || index > len - length) throw new IndexOutOfRangeException();
+            RuntimeType elem = arrayType.ElementType ?? throw new InvalidOperationException("Array has no element type.");
+            int elemSize = StorageSizeOf(elem);
+            int abs = arr + ArrayDataOffset + checked(index * elemSize);
+            Array.Clear(_mem, abs, checked(length * elemSize));
+        }
+
+        private bool CopyArray(long sourceRef, int sourceIndex, long destinationRef, int destinationIndex, int length)
+        {
+            RuntimeType srcType = ValidateArrayRef(sourceRef);
+            RuntimeType dstType = ValidateArrayRef(destinationRef);
+            int src = checked((int)sourceRef);
+            int dst = checked((int)destinationRef);
+            int srcLen = ReadI32(src + ArrayLengthOffset);
+            int dstLen = ReadI32(dst + ArrayLengthOffset);
+            if (sourceIndex < 0 || destinationIndex < 0 || length < 0) throw new ArgumentOutOfRangeException();
+            if (sourceIndex > srcLen - length || destinationIndex > dstLen - length) throw new ArgumentException();
+            RuntimeType srcElem = srcType.ElementType ?? throw new InvalidOperationException("Source array has no element type.");
+            RuntimeType dstElem = dstType.ElementType ?? throw new InvalidOperationException("Destination array has no element type.");
+            if (srcElem.TypeId != dstElem.TypeId)
+            {
+                if (!(srcElem.IsReferenceType && dstElem.IsReferenceType && IsAssignableTo(srcElem, dstElem)))
+                    return false;
+            }
+            int srcSize = StorageSizeOf(srcElem);
+            int dstSize = StorageSizeOf(dstElem);
+            if (srcSize != dstSize) return false;
+            int bytes = checked(length * srcSize);
+            int srcAbs = src + ArrayDataOffset + checked(sourceIndex * srcSize);
+            int dstAbs = dst + ArrayDataOffset + checked(destinationIndex * dstSize);
+            Buffer.BlockCopy(_mem, srcAbs, _mem, dstAbs, bytes);
+            return true;
+        }
+
+        private static int BitOperationsRotateLeft(int value, int offset)
+            => (int)RotateLeft((uint)value, offset);
+
+        private static int BitOperationsRotateRight(int value, int offset)
+            => (int)RotateRight((uint)value, offset);
+
+        private static long RotateLeft(long value, int offset)
+            => (long)RotateLeft((ulong)value, offset);
+
+        private static long RotateRight(long value, int offset)
+            => (long)RotateRight((ulong)value, offset);
+
+        private static uint RotateLeft(uint value, int offset)
+        {
+            offset &= 31;
+            return (value << offset) | (value >> ((32 - offset) & 31));
+        }
+
+        private static uint RotateRight(uint value, int offset)
+        {
+            offset &= 31;
+            return (value >> offset) | (value << ((32 - offset) & 31));
+        }
+
+        private static ulong RotateLeft(ulong value, int offset)
+        {
+            offset &= 63;
+            return (value << offset) | (value >> ((64 - offset) & 63));
+        }
+
+        private static ulong RotateRight(ulong value, int offset)
+        {
+            offset &= 63;
+            return (value >> offset) | (value << ((64 - offset) & 63));
         }
     }
 }

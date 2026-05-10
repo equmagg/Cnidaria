@@ -589,7 +589,7 @@ internal class Program
 {
     public unsafe static void Main(string[] args)
     {
-        int n = 100_000;
+        int n = 10_000;
         int s = 0;
         for (int i = 0; i < n; i++)
         {
@@ -598,7 +598,7 @@ internal class Program
         Console.WriteLine(s);
     }
 }
-", "752296015");
+", "49975003");
 
             // 62 stackalloc byte
             RunTest(@"

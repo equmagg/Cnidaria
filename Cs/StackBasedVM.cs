@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
@@ -8,8 +8,14 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Cnidaria.Cs;
 
-namespace Cnidaria.Cs.Stack
+namespace Cnidaria.Cs
 {
+    public sealed class ExecutionLimits
+    {
+        public int MaxCallDepth { get; init; } = 128;
+        public long MaxInstructions { get; init; } = 100_000_000;
+        public int TokenCheckPeriod { get; init; } = 256;
+    }
     internal enum SlotKind : byte
     {
         I4,
@@ -53,7 +59,7 @@ namespace Cnidaria.Cs.Stack
         }
     }
     
-    internal sealed class Vm
+    internal sealed class StackBasedVm
     {
         private enum PendingCtorResultKind : byte
         {
@@ -142,7 +148,7 @@ namespace Cnidaria.Cs.Stack
                 PendingException = pendingException;
             }
 
-            public static FinallyContext ForJump(int frameBase, Stack.ExceptionHandler h, int targetPc)
+            public static FinallyContext ForJump(int frameBase, ExceptionHandler h, int targetPc)
                 => new FinallyContext(
                     frameBase,
                     finallyStartPc: h.HandlerStartPc,
@@ -155,7 +161,7 @@ namespace Cnidaria.Cs.Stack
                     hasPendingException: false,
                     pendingException: default);
 
-            public static FinallyContext ForReturn(int frameBase, Stack.ExceptionHandler h, bool hasRet, Slot retVal)
+            public static FinallyContext ForReturn(int frameBase, ExceptionHandler h, bool hasRet, Slot retVal)
                 => new FinallyContext(
                     frameBase,
                     finallyStartPc: h.HandlerStartPc,
@@ -168,7 +174,7 @@ namespace Cnidaria.Cs.Stack
                     hasPendingException: false,
                     pendingException: default);
 
-            public static FinallyContext ForThrow(int frameBase, Stack.ExceptionHandler h, Slot ex)
+            public static FinallyContext ForThrow(int frameBase, ExceptionHandler h, Slot ex)
                 => new FinallyContext(
                     frameBase,
                     finallyStartPc: h.HandlerStartPc,
@@ -276,7 +282,7 @@ namespace Cnidaria.Cs.Stack
         private readonly VmCallContext _hostCtx;
 
         private RuntimeModule? _curModule;
-        private Stack.BytecodeFunction? _curFn;
+        private BytecodeFunction? _curFn;
         private MethodExecLayout? _curLayout;
 
         private int _curArgsAbs;
@@ -300,7 +306,7 @@ namespace Cnidaria.Cs.Stack
         private int _minTailFreeBytes;
         private bool _gcRequested;
         private bool _gcRunning;
-        public Vm(
+        public StackBasedVm(
             byte[] memory,
             int staticEnd,
             int stackBase,
@@ -368,7 +374,7 @@ namespace Cnidaria.Cs.Stack
         private const int FrameHeaderSize = 76;
         public void Execute(
             RuntimeModule entryModule,
-            Stack.BytecodeFunction entry, 
+            BytecodeFunction entry, 
             CancellationToken ct, 
             ExecutionLimits limits, 
             ReadOnlySpan<Slot> initialArgs = default)
@@ -627,14 +633,14 @@ namespace Cnidaria.Cs.Stack
                                 int hasThis = (packed >> 15) & 1;
                                 int total = argCount + hasThis;
 
-                                var (targetModuleOpt, targetFn) = _domain.ResolveCall(mod, callTok);
-                                var targetModule = targetModuleOpt ?? mod;
                                 var rm = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
+
                                 if (rm.IsStatic && !StringComparer.Ordinal.Equals(rm.Name, ".cctor"))
                                 {
                                     if (TryDeferTypeInitialization(rm.DeclaringType, resumePc: pc, ct, limits))
                                         break;
                                 }
+
                                 if (hasThis != 0 && rm.DeclaringType.IsValueType)
                                 {
                                     int thisIndex = _curEvalSp - total;
@@ -662,7 +668,12 @@ namespace Cnidaria.Cs.Stack
                                 if (TryInvokeIntrinsic(rm, total, ct))
                                     break;
 
+                                var targetModule = rm.BodyModule;
+                                var targetFn = rm.Body;
 
+                                if (targetModule is null || targetFn is null)
+                                    throw new MissingMethodException(
+                                        $"No body for target: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
 
                                 int callerModuleId = ReadI32(_frameBase + 20);
 
@@ -672,7 +683,8 @@ namespace Cnidaria.Cs.Stack
                                     returnPc: _curPc,
                                     returnMethodToken: fn.MethodToken,
                                     returnModuleId: callerModuleId,
-                                    ct, limits,
+                                    ct,
+                                    limits,
                                     totalArgsOnCallerStack: total,
                                     runtimeMethod: rm);
 
@@ -977,7 +989,7 @@ namespace Cnidaria.Cs.Stack
             }
             void VisitRefCell(int cellAbs)
             {
-                CheckRange(cellAbs, RuntimeTypeSystem.PointerSize);
+                CheckRange(cellAbs, TargetArchitecture.PointerSize);
 
                 long raw = ReadNativeInt(cellAbs);
                 if (raw == 0)
@@ -1819,7 +1831,7 @@ namespace Cnidaria.Cs.Stack
         }
         private static bool UsesBlobOnEvalStack(RuntimeType t)
             => t.IsValueType && !IsEvalScalarValueType(t);
-        private int ComputeEvalBlobCapacity(RuntimeModule module, Stack.BytecodeFunction fn, RuntimeMethod rm)
+        private int ComputeEvalBlobCapacity(RuntimeModule module, BytecodeFunction fn, RuntimeMethod rm)
         {
             int maxBlobSize = 0;
 
@@ -2444,7 +2456,7 @@ namespace Cnidaria.Cs.Stack
             long diffBytes = (long)aAbs - (long)bAbs;
             long diffElems = diffBytes / elemSize;
 
-            int PointerSize = RuntimeTypeSystem.PointerSize;
+            int PointerSize = TargetArchitecture.PointerSize;
             if (PointerSize == 8)
                 PushSlot(new Slot(SlotKind.I8, diffElems));
             else
@@ -2910,7 +2922,7 @@ namespace Cnidaria.Cs.Stack
         }
         private void PushFrame(
             RuntimeModule module,
-            Stack.BytecodeFunction fn,
+            BytecodeFunction fn,
             int returnPc,
             int returnMethodToken,
             int returnModuleId,
@@ -3165,9 +3177,9 @@ namespace Cnidaria.Cs.Stack
             }
         }
 
-        private static int SpanOf(in Stack.ExceptionHandler h) => h.TryEndPc - h.TryStartPc;
+        private static int SpanOf(in ExceptionHandler h) => h.TryEndPc - h.TryStartPc;
 
-        private bool TryFindFinallyHandlerForPc(Stack.BytecodeFunction fn, int pcInFrame, out Stack.ExceptionHandler match)
+        private bool TryFindFinallyHandlerForPc(BytecodeFunction fn, int pcInFrame, out ExceptionHandler match)
         {
             match = default;
             var handlers = fn.ExceptionHandlers;
@@ -3194,7 +3206,7 @@ namespace Cnidaria.Cs.Stack
             return bestSpan != int.MaxValue;
         }
 
-        private bool TryFindFinallyHandlerForLeave(Stack.BytecodeFunction fn, int fromPc, int toPc, out Stack.ExceptionHandler match)
+        private bool TryFindFinallyHandlerForLeave(BytecodeFunction fn, int fromPc, int toPc, out ExceptionHandler match)
         {
             match = default;
             var handlers = fn.ExceptionHandlers;
@@ -3223,7 +3235,7 @@ namespace Cnidaria.Cs.Stack
             return bestSpan != int.MaxValue;
         }
 
-        private void BeginFinally(in Stack.ExceptionHandler h, in FinallyContext ctx)
+        private void BeginFinally(in ExceptionHandler h, in FinallyContext ctx)
         {
             PruneCatchContextsForPc(h.HandlerStartPc);
             ResetEvalStackForExceptionHandler();
@@ -3231,7 +3243,7 @@ namespace Cnidaria.Cs.Stack
             _curPc = h.HandlerStartPc;
         }
 
-        private bool TryBeginFinallyForJump(Stack.BytecodeFunction fn, int fromPc, int targetPc)
+        private bool TryBeginFinallyForJump(BytecodeFunction fn, int fromPc, int targetPc)
         {
             if (!TryFindFinallyHandlerForLeave(fn, fromPc, targetPc, out var h))
                 return false;
@@ -3240,7 +3252,7 @@ namespace Cnidaria.Cs.Stack
             return true;
         }
 
-        private bool TryBeginFinallyForReturn(Stack.BytecodeFunction fn, int fromPc, bool hasRet, Slot retVal)
+        private bool TryBeginFinallyForReturn(BytecodeFunction fn, int fromPc, bool hasRet, Slot retVal)
         {
             if (!TryFindFinallyHandlerForLeave(fn, fromPc, toPc: -1, out var h))
                 return false;
@@ -3351,7 +3363,7 @@ namespace Cnidaria.Cs.Stack
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
             if (hostEx is OverflowException)
-                return TryCreateCoreException("System", "DivideByZeroException", msg, out vmEx)
+                return TryCreateCoreException("System", "OverflowException", msg, out vmEx)
                     || TryCreateCoreException("System", "ArithmeticException", msg,out vmEx)
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
@@ -3362,7 +3374,7 @@ namespace Cnidaria.Cs.Stack
             _curEvalSp = 0;
             WriteI32(_frameBase + 52, 0);
         }
-        private bool TryFindCatchHandler(RuntimeModule mod, Stack.BytecodeFunction fn, int throwPc, Slot ex, out Stack.ExceptionHandler match)
+        private bool TryFindCatchHandler(RuntimeModule mod, BytecodeFunction fn, int throwPc, Slot ex, out ExceptionHandler match)
         {
             match = default;
             var handlers = fn.ExceptionHandlers;
@@ -3635,7 +3647,7 @@ namespace Cnidaria.Cs.Stack
         }
         private long ReadNativeInt(int abs)
         {
-            return RuntimeTypeSystem.PointerSize switch
+            return TargetArchitecture.PointerSize switch
             {
                 4 => BinaryPrimitives.ReadInt32LittleEndian(_mem.AsSpan(abs, 4)),
                 8 => BinaryPrimitives.ReadInt64LittleEndian(_mem.AsSpan(abs, 8)),
@@ -3644,7 +3656,7 @@ namespace Cnidaria.Cs.Stack
         }
         private void WriteNativeInt(int abs, long value)
         {
-            int ptrSize = RuntimeTypeSystem.PointerSize;
+            int ptrSize = TargetArchitecture.PointerSize;
             switch (ptrSize)
             {
                 case 4:
@@ -4010,69 +4022,81 @@ namespace Cnidaria.Cs.Stack
         {
             var b = PopSlot();
             var a = PopSlot();
+
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
                 PushSlot(new Slot(SlotKind.I4, I4Unchecked(in a) + I4Unchecked(in b)));
                 return;
             }
+
             if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
             {
-                long res = a.AsI8Checked() + b.AsI8Checked();
+                long res = unchecked(a.AsI8Checked() + b.AsI8Checked());
                 PushSlot(new Slot(SlotKind.I8, res));
                 return;
             }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() + b.AsR8Checked();
                 PushSlot(new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(res)));
                 return;
             }
+
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
         }
         private void ExecSubtract()
         {
             var b = PopSlot();
             var a = PopSlot();
+
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
                 PushSlot(new Slot(SlotKind.I4, I4Unchecked(in a) - I4Unchecked(in b)));
                 return;
             }
+
             if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
             {
-                long res = a.AsI8Checked() - b.AsI8Checked();
+                long res = unchecked(a.AsI8Checked() - b.AsI8Checked());
                 PushSlot(new Slot(SlotKind.I8, res));
                 return;
             }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() - b.AsR8Checked();
                 PushSlot(new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(res)));
                 return;
             }
+
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
         }
         private void ExecMultiply()
         {
             var b = PopSlot();
             var a = PopSlot();
+
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
                 PushSlot(new Slot(SlotKind.I4, I4Unchecked(in a) * I4Unchecked(in b)));
                 return;
             }
+
             if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
             {
-                long res = a.AsI8Checked() * b.AsI8Checked();
+                long res = unchecked(a.AsI8Checked() * b.AsI8Checked());
                 PushSlot(new Slot(SlotKind.I8, res));
                 return;
             }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() * b.AsR8Checked();
                 PushSlot(new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(res)));
                 return;
             }
+
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
         }
         private void ExecDivide()
@@ -4567,7 +4591,7 @@ namespace Cnidaria.Cs.Stack
 
                     case NumericConvKind.NativeInt:
                         {
-                            int PointerSize = RuntimeTypeSystem.PointerSize;
+                            int PointerSize = TargetArchitecture.PointerSize;
                             if (PointerSize == 8)
                             {
                                 long r = srcUnsigned
@@ -4584,7 +4608,7 @@ namespace Cnidaria.Cs.Stack
 
                     case NumericConvKind.NativeUInt:
                         {
-                            int PointerSize = RuntimeTypeSystem.PointerSize;
+                            int PointerSize = TargetArchitecture.PointerSize;
                             if (PointerSize == 8)
                             {
                                 ulong r = srcUnsigned
@@ -4861,7 +4885,7 @@ namespace Cnidaria.Cs.Stack
                 src += SlotSize;
             }
         }
-        private MethodExecLayout GetOrCreateMethodLayout(RuntimeModule mod, Stack.BytecodeFunction fn, RuntimeMethod? runtimeMethod = null)
+        private MethodExecLayout GetOrCreateMethodLayout(RuntimeModule mod, BytecodeFunction fn, RuntimeMethod? runtimeMethod = null)
         {
             var rm = runtimeMethod ?? ResolveRuntimeMethodOrThrow(mod, fn.MethodToken);
 
@@ -4938,7 +4962,7 @@ namespace Cnidaria.Cs.Stack
                 "Int32" or "UInt32" => FastCellKind.I4,
                 "Int64" or "UInt64" => FastCellKind.I8,
                 "Double" => FastCellKind.R8,
-                "IntPtr" or "UIntPtr" => RuntimeTypeSystem.PointerSize == 8 
+                "IntPtr" or "UIntPtr" => TargetArchitecture.PointerSize == 8 
                                             ? FastCellKind.I8 : FastCellKind.I4,
                 _ => FastCellKind.None
             };
@@ -5111,7 +5135,7 @@ namespace Cnidaria.Cs.Stack
 
                     case "IntPtr":
                     case "UIntPtr":
-                        return RuntimeTypeSystem.PointerSize == 8
+                        return TargetArchitecture.PointerSize == 8
                             ? new Slot(SlotKind.I8, v.AsInt64())
                             : new Slot(SlotKind.I4, v.AsInt32());
                 }
@@ -5417,7 +5441,7 @@ namespace Cnidaria.Cs.Stack
                         // srcElem assignable to dstElem
                         if (IsAssignableTo(srcElem, dstElem))
                         {
-                            int ptrSize = RuntimeTypeSystem.PointerSize;
+                            int ptrSize = TargetArchitecture.PointerSize;
                             int bytes = checked(length * ptrSize);
 
                             int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
@@ -5433,7 +5457,7 @@ namespace Cnidaria.Cs.Stack
                         // dstElem more derived
                         else if (IsAssignableTo(dstElem, srcElem))
                         {
-                            int ptrSize = RuntimeTypeSystem.PointerSize;
+                            int ptrSize = TargetArchitecture.PointerSize;
                             int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
 
                             for (int i = 0; i < length; i++)
@@ -5475,7 +5499,7 @@ namespace Cnidaria.Cs.Stack
                     else if (srcElem.IsValueType && dstElem.IsReferenceType && IsAssignableTo(srcElem, dstElem))
                     {
                         var (srcElemSize, _) = GetStorageSizeAlign(srcElem);
-                        int ptrSize = RuntimeTypeSystem.PointerSize;
+                        int ptrSize = TargetArchitecture.PointerSize;
 
                         int srcBase = checked(srcAbs + ArrayDataOffset + checked(srcIndex * srcElemSize));
                         int dstBase = checked(dstAbs + ArrayDataOffset + checked(dstIndex * ptrSize));
@@ -5532,26 +5556,6 @@ namespace Cnidaria.Cs.Stack
                     }
 
                     PushSlot(new Slot(SlotKind.I4, result ? 1 : 0));
-                    return true;
-                }
-            }
-            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Number")
-            {
-                // private static string _DoubleToStringImpl(double)
-                if (!rm.HasThis &&
-                    rm.Name == "_DoubleToStringImpl" &&
-                    rm.ParameterTypes.Length == 1 &&
-                    totalArgs == 1 &&
-                    rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Double" &&
-                    IsSystemStringType(rm.ReturnType))
-                {
-                    double d = PopSlot().AsR8Checked();
-
-                    // Invariant formatting
-                    string s = d.ToString("G", CultureInfo.InvariantCulture);
-
-                    int strAbs = AllocStringFromManaged(s);
-                    PushSlot(new Slot(SlotKind.Ref, strAbs));
                     return true;
                 }
             }

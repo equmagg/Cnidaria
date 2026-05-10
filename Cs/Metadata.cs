@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -7,6 +7,26 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
+    internal sealed class ReferenceEqualityComparer<T> : IEqualityComparer<T> where T : class
+    {
+        public static readonly ReferenceEqualityComparer<T> Instance = new();
+
+        private ReferenceEqualityComparer() { }
+
+        public bool Equals(T? x, T? y) => ReferenceEquals(x, y);
+
+        public int GetHashCode(T obj) => RuntimeHelpers.GetHashCode(obj);
+    }
+
+    internal interface IRuntimeMetadataModule
+    {
+        string Name { get; }
+        IMetadataView Md { get; }
+        Dictionary<(string ns, string name), int> TypeDefByFullName { get; }
+        Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; }
+        string GetSignatureKeyFromThisModule(int sigBlobIdx);
+        (string ns, string name) GetTypeDefFullNameByRid(int rid);
+    }
     internal static class MetadataToken
     {
         public const int TypeRef = 0x01000000;

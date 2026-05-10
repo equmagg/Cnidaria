@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -6,7 +6,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 
-namespace Cnidaria.Cs.Stack
+namespace Cnidaria.Cs
 {
 
     [Flags]
@@ -622,7 +622,7 @@ namespace Cnidaria.Cs.Stack
                     SpecialType.System_Double => 8,
                     SpecialType.System_Decimal => 16,
                     _ => (type.IsReferenceType || type is PointerTypeSymbol || type is ByRefTypeSymbol)
-                        ? RuntimeTypeSystem.PointerSize
+                        ? TargetArchitecture.PointerSize
                         : throw new NotSupportedException($"No known size for '{type.Name}'.")
                 };
             }
@@ -1365,7 +1365,7 @@ namespace Cnidaria.Cs.Stack
                         _il.Emit(BytecodeOp.Shl, pop: 2, push: 1);
                         return;
                     case BoundBinaryOperatorKind.RightShift:
-                        _il.Emit(BytecodeOp.Shr, pop: 2, push: 1);
+                        _il.Emit(u ? BytecodeOp.Shr_Un : BytecodeOp.Shr, pop: 2, push: 1);
                         return;
                     case BoundBinaryOperatorKind.UnsignedRightShift:
                         _il.Emit(BytecodeOp.Shr_Un, pop: 2, push: 1);
