@@ -90,6 +90,8 @@ namespace Cnidaria.Cs
         private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly Dictionary<int, byte> _typeInitState = new Dictionary<int, byte>();
         private readonly List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
+        private readonly Dictionary<int, HostOverride> _hostOverrides = new Dictionary<int, HostOverride>();
+        private readonly VmCallContext _hostCtx;
         private int _gcMarkHead;
 
         private int _heapPtr;
@@ -163,6 +165,7 @@ namespace Cnidaria.Cs
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
             _image = image ?? throw new ArgumentNullException(nameof(image));
             _textWriter = textWriter ?? TextWriter.Null;
+            _hostCtx = new VmCallContext(this);
 
             if (!(0 <= staticEnd && staticEnd <= stackBase && stackBase < stackEnd && stackEnd <= memory.Length))
                 throw new ArgumentOutOfRangeException(nameof(stackEnd), "Bad VM memory layout.");
@@ -187,6 +190,11 @@ namespace Cnidaria.Cs
 
         public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits)
         {
+            Execute(entryMethod, ct, limits, default);
+        }
+
+        public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits, ReadOnlySpan<VmValue> initialArgs)
+        {
             if (entryMethod is null) throw new ArgumentNullException(nameof(entryMethod));
             if (limits is null) throw new ArgumentNullException(nameof(limits));
 
@@ -210,6 +218,15 @@ namespace Cnidaria.Cs
             _gcMarkHead = 0;
             _allocDebtBytes = 0;
             _gcRunning = false;
+            Array.Clear(_x, 0, _x.Length);
+            Array.Clear(_f, 0, _f.Length);
+            X(MachineRegisters.StackPointer, _stackEnd);
+            X(MachineRegisters.FramePointer, _stackEnd);
+            X(MachineRegisters.ThreadPointer, 0);
+            X(MachineRegisters.ReturnAddress, -1);
+
+            int incomingStackArgBase = PrepareEntryArguments(entryMethod, initialArgs);
+
             _pc = _image.Methods[entryIndex].EntryPc;
             _currentMethodIndex = entryIndex;
             PushFrame(
@@ -219,11 +236,162 @@ namespace Cnidaria.Cs
                 X(MachineRegisters.StackPointer),
                 X(MachineRegisters.FramePointer),
                 CallFlags.None,
-                -1,
-                0);
-            X(MachineRegisters.ThreadPointer, 0);
+                entryMethod.MethodId,
+                incomingStackArgBase);
+            X(MachineRegisters.ThreadPointer, incomingStackArgBase);
 
             Run(ct, limits);
+        }
+
+        private int PrepareEntryArguments(RuntimeMethod method, ReadOnlySpan<VmValue> initialArgs)
+        {
+            if (initialArgs.Length == 0)
+                return 0;
+            if (method.HasThis)
+                throw new InvalidOperationException("Instance entrypoints are not supported by the register VM entry adapter.");
+            if (initialArgs.Length != method.ParameterTypes.Length)
+                throw new InvalidOperationException("Initial argument count does not match entrypoint signature.");
+
+            int stackAreaSize = ComputeEntryArgumentStackAreaSize(method);
+            int incomingStackArgBase = 0;
+            if (stackAreaSize != 0)
+            {
+                incomingStackArgBase = checked((int)AlignDown(_stackEnd - stackAreaSize, MachineAbi.StackArgumentSlotSize));
+                if (incomingStackArgBase < _stackBase || incomingStackArgBase < _frameStackTop + ShadowFrameSize)
+                    throw new StackOverflowException();
+                Array.Clear(_mem, incomingStackArgBase, stackAreaSize);
+                X(MachineRegisters.StackPointer, incomingStackArgBase);
+                X(MachineRegisters.FramePointer, incomingStackArgBase);
+                TrackStackPeak(incomingStackArgBase);
+            }
+
+            for (int i = 0; i < initialArgs.Length; i++)
+                WriteEntryArgument(method, i, initialArgs[i], incomingStackArgBase);
+
+            return incomingStackArgBase;
+        }
+
+        private int ComputeEntryArgumentStackAreaSize(RuntimeMethod method)
+        {
+            int max = 0;
+            for (int i = 0; i < method.ParameterTypes.Length; i++)
+            {
+                var slices = GetAbiArgumentSlices(method, i);
+                for (int s = 0; s < slices.Length; s++)
+                {
+                    AbiArgumentLocation loc = slices[s].Location;
+                    if (loc.IsStack)
+                        max = Math.Max(max, checked((loc.StackSlotIndex + 1) * MachineAbi.StackArgumentSlotSize));
+                }
+            }
+            return max == 0 ? 0 : checked((int)AlignUp(max, MachineAbi.StackArgumentSlotSize));
+        }
+
+        private void WriteEntryArgument(RuntimeMethod method, int logicalIndex, VmValue value, int incomingStackArgBase)
+        {
+            RuntimeType type = method.ParameterTypes[logicalIndex];
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+
+            if (abi.PassingKind == AbiValuePassingKind.Void || slices.Length == 0)
+                return;
+
+            if (abi.PassingKind != AbiValuePassingKind.ScalarRegister)
+            {
+                if (value.Kind == VmValueKind.Value)
+                {
+                    int source = checked((int)value.Payload);
+                    int size = value.Aux != 0 ? value.Aux : StorageSizeOf(type);
+                    for (int i = 0; i < slices.Length; i++)
+                    {
+                        AbiArgumentSlice slice = slices[i];
+                        int count = Math.Min(slice.Size, size - slice.Offset);
+                        if (count <= 0)
+                            continue;
+
+                        if (slice.Location.IsRegister)
+                        {
+                            long bits = ReadRawBits(checked(source + slice.Offset), count);
+                            if (slice.RegisterClass == RegisterClass.Float)
+                                SetFpr((byte)slice.Location.Register, bits);
+                            else
+                                SetGpr(slice.Location.Register, bits);
+                        }
+                        else
+                        {
+                            if (incomingStackArgBase == 0)
+                                throw new InvalidOperationException("Entry stack argument area was not allocated.");
+                            int target = checked(incomingStackArgBase + slice.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + slice.Location.StackOffset);
+                            CopyBlock(target, checked(source + slice.Offset), count);
+                        }
+                    }
+                    return;
+                }
+
+                throw new NotSupportedException("Only scalar and address-like entry arguments are supported by the register VM entry adapter.");
+            }
+
+            if (slices.Length != 1)
+                throw new InvalidOperationException("Scalar ABI argument unexpectedly has multiple slices.");
+
+            AbiArgumentSlice scalar = slices[0];
+            {
+                long bits = ConvertEntryArgumentToAbiBits(type, value, scalar.Size);
+                if (scalar.Location.IsRegister)
+                {
+                    if (scalar.RegisterClass == RegisterClass.Float)
+                        SetFpr((byte)scalar.Location.Register, bits);
+                    else
+                        SetGpr(scalar.Location.Register, bits);
+                }
+                else
+                {
+                    if (incomingStackArgBase == 0)
+                        throw new InvalidOperationException("Entry stack argument area was not allocated.");
+                    int target = checked(incomingStackArgBase + scalar.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + scalar.Location.StackOffset);
+                    WriteRawBits(target, bits, scalar.Size);
+                }
+            }
+        }
+
+        private long ConvertEntryArgumentToAbiBits(RuntimeType type, VmValue value, int size)
+        {
+            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.Pointer || type.Kind == RuntimeTypeKind.ByRef)
+                return value.Kind == VmValueKind.Null ? 0 : value.Payload;
+
+
+            if (type.Namespace == "System")
+            {
+                switch (type.Name)
+                {
+                    case "Single":
+                        return unchecked((uint)BitConverter.SingleToInt32Bits((float)value.AsDouble()));
+                    case "Double":
+                        return BitConverter.DoubleToInt64Bits(value.AsDouble());
+                    case "Boolean":
+                        return value.AsBool() ? 1 : 0;
+                    case "Char":
+                    case "SByte":
+                    case "Byte":
+                    case "Int16":
+                    case "UInt16":
+                    case "Int32":
+                    case "UInt32":
+                        return unchecked((uint)value.AsInt32());
+                    case "Int64":
+                    case "UInt64":
+                    case "IntPtr":
+                    case "UIntPtr":
+                        return value.AsInt64();
+                }
+            }
+
+            if (value.Kind == VmValueKind.I4 || size <= 4)
+                return unchecked((uint)value.AsInt32());
+            if (value.Kind == VmValueKind.I8)
+                return value.AsInt64();
+
+            throw new NotSupportedException("Unsupported register VM entry argument type: " + type.Namespace + "." + type.Name);
         }
 
         private void Run(CancellationToken ct, ExecutionLimits limits)
@@ -1253,6 +1421,8 @@ namespace Cnidaria.Cs
             _activeCallTargetMethod = target;
             try
             {
+                if (TryInvokeHostOverride(target, ct))
+                    return;
                 if (TryInvokeIntrinsic(target, ct))
                     return;
             }
@@ -1288,7 +1458,10 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            int obj = AllocObject(ctor.DeclaringType);
+            // System.String is a variable sized object
+            int obj = IsSystemStringType(ctor.DeclaringType)
+                ? AllocStringForNewObjConstructor(ctor)
+                : AllocObject(ctor.DeclaringType);
             SetThisArgumentReference(ctor, obj);
 
             if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(ctor.MethodId, out int methodIndex))
@@ -1300,6 +1473,97 @@ namespace Cnidaria.Cs
 
             EnterManagedFrame(methodIndex, _pc, CallFlags.None, ctor, ins.Rd, obj);
         }
+
+        private int AllocStringForNewObjConstructor(RuntimeMethod ctor)
+        {
+            int length = TryGetStringConstructorResultLength(ctor, out int computedLength) ? computedLength : 0;
+            return AllocStringUninitialized(length);
+        }
+
+        private bool TryGetStringConstructorResultLength(RuntimeMethod ctor, out int length)
+        {
+            length = 0;
+            RuntimeType[] parameters = ctor.ParameterTypes;
+
+            if (parameters.Length == 0)
+                return true;
+
+            if (parameters.Length == 1)
+            {
+                RuntimeType p0 = parameters[0];
+                if (IsCharArrayType(p0))
+                {
+                    long arrayRef = ReadAbiScalarArgument(ctor, 1);
+                    if (arrayRef == 0)
+                        return true;
+
+                    ValidateArrayRef(arrayRef, out int arrAbs, out _);
+                    length = ReadI32(arrAbs + ArrayLengthOffset);
+                    if (length < 0)
+                        throw new InvalidOperationException("Corrupted char[] length.");
+                    return true;
+                }
+
+                if (IsCharPointerType(p0))
+                {
+                    long ptr = ReadAbiScalarArgument(ctor, 1);
+                    length = ptr == 0 ? 0 : NullTerminatedCharPointerLength(checked((int)ptr));
+                    return true;
+                }
+            }
+
+            if (parameters.Length == 2 && IsCharType(parameters[0]) && IsInt32Type(parameters[1]))
+            {
+                int requestedLength = unchecked((int)ReadAbiScalarArgument(ctor, 2));
+                length = requestedLength < 0 ? 0 : requestedLength;
+                return true;
+            }
+
+            if (parameters.Length == 3 && IsCharArrayType(parameters[0]) && IsInt32Type(parameters[1]) && IsInt32Type(parameters[2]))
+            {
+                long arrayRef = ReadAbiScalarArgument(ctor, 1);
+                int startIndex = unchecked((int)ReadAbiScalarArgument(ctor, 2));
+                int requestedLength = unchecked((int)ReadAbiScalarArgument(ctor, 3));
+
+                if (arrayRef == 0 || startIndex < 0 || requestedLength < 0)
+                    return true;
+
+                ValidateArrayRef(arrayRef, out int arrAbs, out _);
+                int arrayLength = ReadI32(arrAbs + ArrayLengthOffset);
+                if (arrayLength < 0)
+                    throw new InvalidOperationException("Corrupted char[] length.");
+
+                length = (uint)startIndex <= (uint)arrayLength && requestedLength <= arrayLength - startIndex
+                    ? requestedLength
+                    : 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        private int NullTerminatedCharPointerLength(int charsAbs)
+        {
+            const int MaxStringConstructorChars = 8 * 1024 * 1024;
+            for (int i = 0; i < MaxStringConstructorChars; i++)
+            {
+                int pos = checked(charsAbs + checked(i * 2));
+                CheckIndirectAccess(pos, 2, false);
+                if (ReadU16(pos) == 0)
+                    return i;
+            }
+
+            throw new AccessViolationException("Unterminated char* string constructor input.");
+        }
+
+        private bool IsCharArrayType(RuntimeType type)
+            => type.Kind == RuntimeTypeKind.Array && type.ElementType is not null && IsCharType(type.ElementType);
+
+        private bool IsCharPointerType(RuntimeType type)
+            => type.Kind == RuntimeTypeKind.Pointer && type.ElementType is not null && IsCharType(type.ElementType);
+
+        private bool IsInt32Type(RuntimeType type)
+            => type.Namespace == "System" && type.Name == "Int32";
 
         private bool TryRunTypeInitializer(RuntimeType type, int returnPc, CancellationToken ct, ExecutionLimits limits)
         {
@@ -1773,6 +2037,438 @@ namespace Cnidaria.Cs
                 }
             }
             return found;
+        }
+
+        internal string? HostReadString(VmValue v, CancellationToken ct)
+        {
+            if (v.Kind == VmValueKind.Null) return null;
+            if (v.Kind != VmValueKind.Ref)
+                throw new InvalidOperationException($"Expected string ref, got {v.Kind}.");
+
+            ValidateStringRef(v.Payload, out int strAbs);
+            int len = ReadI32(strAbs + StringLengthOffset);
+            if (len < 0) throw new InvalidOperationException("Corrupted string length.");
+
+            char[] chars = new char[len];
+            int charsAbs = strAbs + StringCharsOffset;
+            CheckIndirectAccess(charsAbs, checked(len * 2), false);
+            for (int i = 0; i < len; i++)
+            {
+                if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+                chars[i] = (char)ReadU16(charsAbs + i * 2);
+            }
+            return new string(chars);
+        }
+
+        internal VmValue HostAllocString(string? s)
+        {
+            if (s is null) return VmValue.Null;
+            return new VmValue(VmValueKind.Ref, AllocStringFromManaged(s));
+        }
+
+        internal VmValue HostAllocArray(RuntimeType arrayType, int length)
+        {
+            if (arrayType.Kind != RuntimeTypeKind.Array)
+                throw new ArgumentException("Type is not an array.", nameof(arrayType));
+            if (length < 0)
+                throw new ArgumentOutOfRangeException(nameof(length));
+            return new VmValue(VmValueKind.Ref, AllocArray(arrayType, length));
+        }
+
+        internal int HostGetArrayLength(VmValue array)
+        {
+            ValidateHostArrayRef(array, out int arrAbs, out _);
+            return ReadI32(arrAbs + ArrayLengthOffset);
+        }
+
+        internal VmValue HostGetArrayElement(VmValue array, int index)
+        {
+            ValidateHostArrayRef(array, out int arrAbs, out RuntimeType arrayType);
+            int length = ReadI32(arrAbs + ArrayLengthOffset);
+            if ((uint)index >= (uint)length)
+                throw new IndexOutOfRangeException();
+
+            RuntimeType elemType = arrayType.ElementType
+                ?? throw new InvalidOperationException("Array type has no element type.");
+            int elemSize = StorageSizeOf(elemType);
+            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            CheckHeapAccess(elemAbs, elemSize, false);
+            return LoadHostValue(elemAbs, elemType);
+        }
+
+        internal void HostSetArrayElement(VmValue array, int index, VmValue value)
+        {
+            ValidateHostArrayRef(array, out int arrAbs, out RuntimeType arrayType);
+            int length = ReadI32(arrAbs + ArrayLengthOffset);
+            if ((uint)index >= (uint)length)
+                throw new IndexOutOfRangeException();
+
+            RuntimeType elemType = arrayType.ElementType
+                ?? throw new InvalidOperationException("Array type has no element type.");
+            int elemSize = StorageSizeOf(elemType);
+            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            CheckHeapAccess(elemAbs, elemSize, true);
+            StoreHostValue(elemAbs, elemType, value);
+        }
+
+        internal int HostGetAddress(VmValue v)
+        {
+            return v.Kind switch
+            {
+                VmValueKind.Ref or VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Value => checked((int)v.Payload),
+                VmValueKind.Null => 0,
+                _ => throw new InvalidOperationException($"Expected address-like VM value, got {v.Kind}.")
+            };
+        }
+
+        internal Span<byte> HostGetSpan(int abs, int size, bool writable)
+        {
+            CheckIndirectAccess(abs, size, writable);
+            return _mem.AsSpan(abs, size);
+        }
+
+        internal void RegisterHostOverride(HostOverride ov)
+        {
+            if (ov is null) throw new ArgumentNullException(nameof(ov));
+            _hostOverrides[ov.MethodId] = ov;
+        }
+
+        private void ValidateHostArrayRef(VmValue array, out int arrAbs, out RuntimeType arrayType)
+        {
+            if (array.Kind == VmValueKind.Null)
+                throw new NullReferenceException();
+            if (array.Kind != VmValueKind.Ref)
+                throw new InvalidOperationException($"Expected array ref, got {array.Kind}.");
+
+            arrayType = ValidateArrayRef(array.Payload, out arrAbs, out _);
+        }
+
+        private VmValue LoadHostValue(int abs, RuntimeType type)
+        {
+            if (type.IsReferenceType)
+            {
+                long value = ReadNative(abs);
+                return value == 0 ? VmValue.Null : new VmValue(VmValueKind.Ref, value);
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer)
+            {
+                long value = ReadNative(abs);
+                return value == 0 ? VmValue.Null : new VmValue(VmValueKind.Ptr, value);
+            }
+
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                long value = ReadNative(abs);
+                return value == 0 ? VmValue.Null : new VmValue(VmValueKind.ByRef, value);
+            }
+
+            if (type.Kind == RuntimeTypeKind.Enum && type.ElementType != null)
+                return LoadHostValue(abs, type.ElementType);
+
+            if (type.Namespace == "System")
+            {
+                switch (type.Name)
+                {
+                    case "Boolean":
+                    case "Char":
+                    case "SByte":
+                    case "Byte":
+                    case "Int16":
+                    case "UInt16":
+                    case "Int32":
+                    case "UInt32":
+                        return VmValue.FromInt32(unchecked((int)ReadSizedInteger(abs, type)));
+
+                    case "Int64":
+                    case "UInt64":
+                        return VmValue.FromInt64(ReadSizedInteger(abs, type));
+
+                    case "Single":
+                        return VmValue.FromDouble(BitConverter.Int32BitsToSingle(ReadI32(abs)));
+
+                    case "Double":
+                        return VmValue.FromDouble(BitConverter.Int64BitsToDouble(ReadI64(abs)));
+
+                    case "IntPtr":
+                    case "UIntPtr":
+                        return TargetArchitecture.PointerSize == 8
+                            ? VmValue.FromInt64(ReadNative(abs))
+                            : VmValue.FromInt32(unchecked((int)ReadNative(abs)));
+                }
+            }
+
+            if (StorageSizeOf(type) <= 8 && !type.ContainsGcPointers)
+                return StorageSizeOf(type) <= 4 ? VmValue.FromInt32(unchecked((int)ReadSizedInteger(abs, type))) : VmValue.FromInt64(ReadSizedInteger(abs, type));
+
+            return new VmValue(VmValueKind.Value, abs, type.TypeId);
+        }
+
+        private void StoreHostValue(int abs, RuntimeType type, VmValue value)
+        {
+            if (type.IsReferenceType)
+            {
+                if (value.Kind is not (VmValueKind.Ref or VmValueKind.Null))
+                    throw new InvalidOperationException($"Storing {value.Kind} into managed ref.");
+                WriteNative(abs, value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer)
+            {
+                if (value.Kind is not (VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Null))
+                    throw new InvalidOperationException($"Storing {value.Kind} into pointer.");
+                WriteNative(abs, value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                if (value.Kind is not (VmValueKind.ByRef or VmValueKind.Null))
+                    throw new InvalidOperationException($"Storing {value.Kind} into byref.");
+                WriteNative(abs, value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Enum)
+            {
+                if (type.ElementType != null)
+                {
+                    StoreHostValue(abs, type.ElementType, value);
+                    return;
+                }
+
+                if (StorageSizeOf(type) <= 4) WriteSizedInteger(abs, type, value.AsInt32());
+                else WriteSizedInteger(abs, type, value.AsInt64());
+                return;
+            }
+
+            if (type.Namespace == "System" && type.Name == "Single")
+            {
+                WriteI32(abs, BitConverter.SingleToInt32Bits((float)value.AsDouble()));
+                return;
+            }
+
+            if (type.Namespace == "System" && type.Name == "Double")
+            {
+                WriteI64(abs, BitConverter.DoubleToInt64Bits(value.AsDouble()));
+                return;
+            }
+
+            if (type.Namespace == "System" && (type.Name == "Int64" || type.Name == "UInt64"))
+            {
+                WriteSizedInteger(abs, type, value.AsInt64());
+                return;
+            }
+
+            if (type.Namespace == "System" && (type.Name == "IntPtr" || type.Name == "UIntPtr"))
+            {
+                WriteNative(abs, TargetArchitecture.PointerSize == 8 ? value.AsInt64() : value.AsInt32());
+                return;
+            }
+
+            if (IsHostScalarInt32Type(type))
+            {
+                WriteSizedInteger(abs, type, value.AsInt32());
+                return;
+            }
+
+            if (value.Kind == VmValueKind.Value)
+            {
+                RuntimeType valueType = _rts.GetTypeById(value.Aux);
+                if (valueType.TypeId != type.TypeId)
+                    throw new InvalidOperationException($"Struct type mismatch: value={valueType.Namespace}.{valueType.Name}, target={type.Namespace}.{type.Name}.");
+                CopyTypedObject(abs, checked((int)value.Payload), type);
+                return;
+            }
+
+            throw new NotSupportedException($"Host value marshal not supported for value type: {type.Namespace}.{type.Name}");
+        }
+
+        private static bool IsHostScalarInt32Type(RuntimeType type)
+            => type.Namespace == "System" && (type.Name == "Boolean" || type.Name == "Char" || type.Name == "SByte" ||
+                                              type.Name == "Byte" || type.Name == "Int16" || type.Name == "UInt16" ||
+                                              type.Name == "Int32" || type.Name == "UInt32");
+
+        private VmValue ReadHostArgument(RuntimeMethod rm, int logicalIndex)
+        {
+            RuntimeType type = GetLogicalArgumentType(rm, logicalIndex);
+
+            if (type.Kind == RuntimeTypeKind.Enum && type.ElementType != null)
+            {
+                long rawEnum = ReadAbiScalarArgument(rm, logicalIndex);
+                return StorageSizeOf(type.ElementType) <= 4 ? VmValue.FromInt32(unchecked((int)rawEnum)) : VmValue.FromInt64(rawEnum);
+            }
+
+            if (type.IsReferenceType)
+            {
+                long raw = ReadAbiScalarArgument(rm, logicalIndex);
+                return raw == 0 ? VmValue.Null : new VmValue(VmValueKind.Ref, raw);
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer)
+            {
+                long raw = ReadAbiScalarArgument(rm, logicalIndex);
+                return raw == 0 ? VmValue.Null : new VmValue(VmValueKind.Ptr, raw);
+            }
+
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                long raw = ReadAbiScalarArgument(rm, logicalIndex);
+                return raw == 0 ? VmValue.Null : new VmValue(VmValueKind.ByRef, raw);
+            }
+
+            if (type.Namespace == "System")
+            {
+                switch (type.Name)
+                {
+                    case "Boolean":
+                    case "Char":
+                    case "SByte":
+                    case "Byte":
+                    case "Int16":
+                    case "UInt16":
+                    case "Int32":
+                    case "UInt32":
+                        return VmValue.FromInt32(unchecked((int)ReadAbiScalarArgument(rm, logicalIndex)));
+
+                    case "Int64":
+                    case "UInt64":
+                        return VmValue.FromInt64(ReadAbiScalarArgument(rm, logicalIndex));
+
+                    case "Single":
+                        return VmValue.FromDouble(BitConverter.Int32BitsToSingle(unchecked((int)ReadAbiScalarArgument(rm, logicalIndex))));
+
+                    case "Double":
+                        return VmValue.FromDouble(BitConverter.Int64BitsToDouble(ReadAbiScalarArgument(rm, logicalIndex)));
+
+                    case "IntPtr":
+                    case "UIntPtr":
+                        return TargetArchitecture.PointerSize == 8
+                            ? VmValue.FromInt64(ReadAbiScalarArgument(rm, logicalIndex))
+                            : VmValue.FromInt32(unchecked((int)ReadAbiScalarArgument(rm, logicalIndex)));
+                }
+            }
+
+            int address = checked((int)ReadAbiAggregateAddress(rm, logicalIndex));
+            return new VmValue(VmValueKind.Value, address, type.TypeId);
+        }
+
+        private void SetHostReturn(RuntimeMethod rm, VmValue value)
+        {
+            RuntimeType type = rm.ReturnType;
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: true);
+            if (abi.PassingKind == AbiValuePassingKind.Void)
+                return;
+
+            if (type.Kind == RuntimeTypeKind.Enum)
+            {
+                if (type.ElementType != null && SetHostScalarReturn(type.ElementType, value))
+                    return;
+
+                if (StorageSizeOf(type) <= 4) SetReturnI4(value.AsInt32());
+                else SetGpr(MachineRegisters.ReturnValue0, value.AsInt64());
+                return;
+            }
+
+            if (type.IsReferenceType)
+            {
+                if (value.Kind is not (VmValueKind.Ref or VmValueKind.Null))
+                    throw new InvalidOperationException($"Return type mismatch: expected managed ref, got {value.Kind}.");
+                SetReturnRef(value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.Pointer)
+            {
+                if (value.Kind is not (VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Null))
+                    throw new InvalidOperationException($"Return type mismatch: expected ptr, got {value.Kind}.");
+                SetReturnRef(value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.ByRef)
+            {
+                if (value.Kind is not (VmValueKind.ByRef or VmValueKind.Null))
+                    throw new InvalidOperationException($"Return type mismatch: expected byref, got {value.Kind}.");
+                SetReturnRef(value.Kind == VmValueKind.Null ? 0 : value.Payload);
+                return;
+            }
+
+            if (SetHostScalarReturn(type, value))
+                return;
+
+            if (value.Kind == VmValueKind.Value)
+            {
+                RuntimeType valueType = _rts.GetTypeById(value.Aux);
+                if (valueType.TypeId != type.TypeId)
+                    throw new InvalidOperationException($"Struct return type mismatch: value={valueType.Namespace}.{valueType.Name}, target={type.Namespace}.{type.Name}.");
+                LoadTypedValueToReturn(checked((int)value.Payload), type);
+                return;
+            }
+
+            throw new NotSupportedException($"Host return marshal not supported for value type: {type.Namespace}.{type.Name}");
+        }
+
+        private bool SetHostScalarReturn(RuntimeType type, VmValue value)
+        {
+            if (type.Namespace != "System")
+                return false;
+
+            switch (type.Name)
+            {
+                case "Boolean":
+                case "Char":
+                case "SByte":
+                case "Byte":
+                case "Int16":
+                case "UInt16":
+                case "Int32":
+                case "UInt32":
+                    SetReturnI4(value.AsInt32());
+                    return true;
+
+                case "Int64":
+                case "UInt64":
+                    SetGpr(MachineRegisters.ReturnValue0, value.AsInt64());
+                    return true;
+
+                case "Single":
+                    SetFpr(MachineRegisters.FloatReturnValue0, unchecked((uint)BitConverter.SingleToInt32Bits((float)value.AsDouble())));
+                    return true;
+
+                case "Double":
+                    SetFpr(MachineRegisters.FloatReturnValue0, BitConverter.DoubleToInt64Bits(value.AsDouble()));
+                    return true;
+
+                case "IntPtr":
+                case "UIntPtr":
+                    SetGpr(MachineRegisters.ReturnValue0, TargetArchitecture.PointerSize == 8 ? value.AsInt64() : value.AsInt32());
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TryInvokeHostOverride(RuntimeMethod rm, CancellationToken ct)
+        {
+            if (!_hostOverrides.TryGetValue(rm.MethodId, out var ov))
+                return false;
+
+            if (!rm.HasInternalCall)
+                throw new InvalidOperationException($"Host override target is not InternalCall: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
+            if (!rm.IsStatic || rm.HasThis)
+                throw new InvalidOperationException("Only static host overrides are supported by the register VM.");
+
+            int argCount = rm.ParameterTypes.Length;
+            Span<VmValue> args = argCount <= 32 ? stackalloc VmValue[argCount] : new VmValue[argCount];
+            for (int i = 0; i < argCount; i++)
+                args[i] = ReadHostArgument(rm, i);
+
+            _hostCtx.SetToken(ct);
+            VmValue ret = ov.Handler(_hostCtx, args);
+            SetHostReturn(rm, ret);
+            return true;
         }
 
         private bool TryInvokeIntrinsic(RuntimeMethod rm, CancellationToken ct)
@@ -3503,28 +4199,29 @@ namespace Cnidaria.Cs
             GcRootKind kind = (GcRootKind)root.Kind;
             if (kind == GcRootKind.RegisterRef)
             {
-                long v = ReadFrameGpr(frameOffset, root.Register);
-                if (v != 0) MarkRootValue(root, v);
+                long value = ReadFrameGpr(frameOffset, root.Register);
+                if (value != 0) MarkRootValue(root, value);
                 return;
             }
-            if (kind == GcRootKind.FrameRef)
-            {
-                int abs = FrameRootCellAddress(frameOffset, root);
-                long v = ReadNative(abs);
-                if (v != 0) MarkRootValue(root, v);
-                return;
-            }
+
             if (kind == GcRootKind.RegisterByRef || kind == GcRootKind.InteriorRegister)
             {
-                long v = ReadFrameGpr(frameOffset, root.Register);
-                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)(v - root.InteriorOffset)));
+                long value = ReadFrameGpr(frameOffset, root.Register);
+                if (value != 0) TryMarkObjectFromInteriorPointer(checked((int)value));
                 return;
             }
-            if (kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
+
+            if (kind == GcRootKind.FrameRef || kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
             {
-                int abs = FrameRootAddress(frameOffset, root);
-                long v = ReadNative(abs);
-                if (v != 0) TryMarkObjectFromInteriorPointer(checked((int)(v - root.InteriorOffset)));
+                int cell = FrameRootCellAddress(frameOffset, root);
+                long value = ReadNative(cell);
+                if (value == 0)
+                    return;
+
+                if (kind == GcRootKind.FrameRef)
+                    MarkRootValue(root, value);
+                else
+                    TryMarkObjectFromInteriorPointer(checked((int)value));
             }
         }
 
@@ -3533,30 +4230,30 @@ namespace Cnidaria.Cs
             GcRootKind kind = (GcRootKind)root.Kind;
             if (kind == GcRootKind.RegisterRef)
             {
-                long v = ReadFrameGpr(frameOffset, root.Register);
-                if (v != 0) WriteFrameGpr(frameOffset, root.Register, TranslateRootValue(root, v));
+                long value = ReadFrameGpr(frameOffset, root.Register);
+                if (value != 0) WriteFrameGpr(frameOffset, root.Register, TranslateRootValue(root, value));
                 return;
             }
-            if (kind == GcRootKind.FrameRef)
-            {
-                int abs = FrameRootCellAddress(frameOffset, root);
-                long v = ReadNative(abs);
-                if (v != 0) WriteNative(abs, TranslateRootValue(root, v));
-                return;
-            }
+
             if (kind == GcRootKind.RegisterByRef || kind == GcRootKind.InteriorRegister)
             {
-                long v = ReadFrameGpr(frameOffset, root.Register);
-                if (v != 0)
-                    WriteFrameGpr(frameOffset, root.Register, TranslateInteriorPointer(checked((int)(v - root.InteriorOffset))) + root.InteriorOffset);
+                long value = ReadFrameGpr(frameOffset, root.Register);
+                if (value != 0)
+                    WriteFrameGpr(frameOffset, root.Register, TranslateInteriorPointer(checked((int)value)));
                 return;
             }
-            if (kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
+
+            if (kind == GcRootKind.FrameRef || kind == GcRootKind.FrameByRef || kind == GcRootKind.InteriorFrame)
             {
-                int abs = FrameRootAddress(frameOffset, root);
-                long v = ReadNative(abs);
-                if (v != 0)
-                    WriteNative(abs, TranslateInteriorPointer(checked((int)(v - root.InteriorOffset))) + root.InteriorOffset);
+                int cell = FrameRootCellAddress(frameOffset, root);
+                long value = ReadNative(cell);
+                if (value == 0)
+                    return;
+
+                long translated = kind == GcRootKind.FrameRef
+                    ? TranslateRootValue(root, value)
+                    : TranslateInteriorPointer(checked((int)value));
+                WriteNative(cell, translated);
             }
         }
 
@@ -3589,7 +4286,7 @@ namespace Cnidaria.Cs
                 return false;
 
             RuntimeType type = _rts.GetTypeById(root.RuntimeTypeId);
-            return TryResolveGcCellTypeAtOffset(type, root.InteriorOffset, out cellType, depth: 0);
+            return TryResolveGcCellTypeAtOffset(type, root.CellOffset, out cellType, depth: 0);
         }
 
         private bool TryResolveGcCellTypeAtOffset(RuntimeType type, int offset, out RuntimeType cellType, int depth)
@@ -3657,7 +4354,7 @@ namespace Cnidaria.Cs
         private int FrameRootAddress(int frameOffset, GcRootRecord root)
             => checked((int)FrameBase(frameOffset, (RegisterFrameBase)root.FrameBase) + root.FrameOffset);
         private int FrameRootCellAddress(int frameOffset, GcRootRecord root)
-            => checked(FrameRootAddress(frameOffset, root) + root.InteriorOffset);
+            => checked(FrameRootAddress(frameOffset, root) + root.CellOffset);
         private long FrameBase(int frameOffset, RegisterFrameBase frameBase)
             => frameBase switch
             {
@@ -3739,8 +4436,8 @@ namespace Cnidaria.Cs
             if ((uint)methodIndex >= (uint)_image.Methods.Length)
                 return false;
 
-            int safePointPc = frameOffset != TopFrameOffset() 
-                ?  FrameSafePointPc(frameOffset)
+            int safePointPc = frameOffset != TopFrameOffset()
+                ? FrameSafePointPc(frameOffset)
                 : _currentSafePointPc >= 0
                     ? _currentSafePointPc
                     : _pc;

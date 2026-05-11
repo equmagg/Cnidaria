@@ -785,7 +785,7 @@ namespace Cnidaria.Cs
 
             var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(nextBlockId);
             for (int i = 0; i < method.Blocks.Length; i++)
-                blocks.Add(RewriteOriginalBlock(method.Blocks[i], splitInfo));
+                blocks.Add(RewriteOriginalBlock(method.Blocks[i], splitInfo, ref nextTreeId));
 
             foreach (var edge in splitEdges)
             {
@@ -843,7 +843,8 @@ namespace Cnidaria.Cs
 
         private static GenTreeBlock RewriteOriginalBlock(
             GenTreeBlock block,
-            Dictionary<(int from, int to), SplitEdgeInfo> splitInfo)
+            Dictionary<(int from, int to), SplitEdgeInfo> splitInfo,
+            ref int nextTreeId)
         {
             var successors = ImmutableArray.CreateBuilder<int>(block.SuccessorBlockIds.Length);
             var successorPcs = ImmutableArray.CreateBuilder<int>(block.SuccessorBlockIds.Length);
@@ -867,12 +868,14 @@ namespace Cnidaria.Cs
             if (statements.Length != 0)
             {
                 var last = statements[statements.Length - 1];
-                if (TryRewriteTerminator(block, last, splitInfo, out var rewrittenLast))
+                if (TryRewriteTerminator(block, last, splitInfo, ref nextTreeId, out var rewrittenLast, out var appendedBranch))
                 {
-                    var rewritten = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
+                    var rewritten = ImmutableArray.CreateBuilder<GenTree>(statements.Length + (appendedBranch is null ? 0 : 1));
                     for (int i = 0; i + 1 < statements.Length; i++)
                         rewritten.Add(statements[i]);
                     rewritten.Add(rewrittenLast);
+                    if (appendedBranch is not null)
+                        rewritten.Add(appendedBranch);
                     statements = rewritten.ToImmutable();
                 }
             }
@@ -894,18 +897,19 @@ namespace Cnidaria.Cs
             GenTreeBlock block,
             GenTree terminator,
             Dictionary<(int from, int to), SplitEdgeInfo> splitInfo,
-            out GenTree rewritten)
+            ref int nextTreeId,
+            out GenTree rewritten,
+            out GenTree? appendedBranch)
         {
-            if (terminator.TargetBlockId < 0)
-            {
-                rewritten = terminator;
-                return false;
-            }
+            rewritten = terminator;
+            appendedBranch = null;
+            bool changed = false;
 
-            if (splitInfo.TryGetValue((block.Id, terminator.TargetBlockId), out var targetInfo))
+            if (terminator.TargetBlockId >= 0 &&
+                splitInfo.TryGetValue((block.Id, terminator.TargetBlockId), out var targetInfo))
             {
                 rewritten = CloneWithTarget(terminator, terminator.Kind, terminator.SourceOp, targetInfo.SplitPc, targetInfo.SplitBlockId);
-                return true;
+                changed = true;
             }
 
             if (terminator.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
@@ -918,23 +922,28 @@ namespace Cnidaria.Cs
 
                     if (splitInfo.TryGetValue((block.Id, successor), out var fallThroughInfo))
                     {
-                        var invertedKind = terminator.Kind == GenTreeKind.BranchTrue
-                            ? GenTreeKind.BranchFalse
-                            : GenTreeKind.BranchTrue;
-                        var invertedOp = terminator.SourceOp == BytecodeOp.Brtrue
-                            ? BytecodeOp.Brfalse
-                            : terminator.SourceOp == BytecodeOp.Brfalse
-                                ? BytecodeOp.Brtrue
-                                : terminator.SourceOp;
-                        rewritten = CloneWithTarget(terminator, invertedKind, invertedOp, fallThroughInfo.SplitPc, fallThroughInfo.SplitBlockId);
-                        return true;
+                        appendedBranch = CreateBranchToSplit(terminator, fallThroughInfo, ref nextTreeId);
+                        changed = true;
+                        break;
                     }
                 }
             }
 
-            rewritten = terminator;
-            return false;
+            return changed;
         }
+
+        private static GenTree CreateBranchToSplit(GenTree source, SplitEdgeInfo target, ref int nextTreeId)
+            => new GenTree(
+                nextTreeId++,
+                GenTreeKind.Branch,
+                source.Pc,
+                BytecodeOp.Br,
+                type: null,
+                stackKind: GenStackKind.Void,
+                flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
+                operands: ImmutableArray<GenTree>.Empty,
+                targetPc: target.SplitPc,
+                targetBlockId: target.SplitBlockId);
 
         private static GenTreeBlock CreateSplitBlock(
             SplitEdgeInfo info,
@@ -1028,6 +1037,12 @@ namespace Cnidaria.Cs
         }
     }
 
+    internal static class SsaConfig
+    {
+        public const int ReservedSsaNumber = 0;
+        public const int FirstSsaNumber = 1;
+    }
+
     internal enum SsaSlotKind : byte
     {
         Arg,
@@ -1039,25 +1054,70 @@ namespace Cnidaria.Cs
     {
         public readonly SsaSlotKind Kind;
         public readonly int Index;
+        public readonly int LclNum;
+        private readonly bool _hasLclNum;
 
         public SsaSlot(SsaSlotKind kind, int index)
+            : this(kind, index, lclNum: -1)
         {
-            Kind = kind;
-            Index = index;
         }
 
-        public bool Equals(SsaSlot other) => Kind == other.Kind && Index == other.Index;
+        public SsaSlot(SsaSlotKind kind, int index, int lclNum)
+        {
+            if (index < 0) throw new ArgumentOutOfRangeException(nameof(index));
+            if (lclNum < -1) throw new ArgumentOutOfRangeException(nameof(lclNum));
+            Kind = kind;
+            Index = index;
+            LclNum = lclNum;
+            _hasLclNum = lclNum >= 0;
+        }
+
+        public SsaSlot(GenLocalDescriptor descriptor)
+        {
+            if (descriptor is null) throw new ArgumentNullException(nameof(descriptor));
+            Kind = descriptor.Kind switch
+            {
+                GenLocalKind.Argument => SsaSlotKind.Arg,
+                GenLocalKind.Local => SsaSlotKind.Local,
+                GenLocalKind.Temporary => SsaSlotKind.Temp,
+                _ => throw new ArgumentOutOfRangeException(nameof(descriptor)),
+            };
+            Index = descriptor.Index;
+            LclNum = descriptor.LclNum;
+            _hasLclNum = true;
+        }
+
+        public bool HasLclNum => _hasLclNum;
+
+        public bool Equals(SsaSlot other)
+        {
+            if (HasLclNum || other.HasLclNum)
+                return HasLclNum && other.HasLclNum && LclNum == other.LclNum;
+
+            return Kind == other.Kind && Index == other.Index;
+        }
+
         public override bool Equals(object? obj) => obj is SsaSlot other && Equals(other);
-        public override int GetHashCode() => ((int)Kind * 397) ^ Index;
+
+        public override int GetHashCode()
+            => HasLclNum ? LclNum : (((int)Kind * 397) ^ Index);
 
         public int CompareTo(SsaSlot other)
         {
+            if (HasLclNum && other.HasLclNum)
+                return LclNum.CompareTo(other.LclNum);
+            if (HasLclNum != other.HasLclNum)
+                return HasLclNum ? -1 : 1;
+
             int c = Kind.CompareTo(other.Kind);
             return c != 0 ? c : Index.CompareTo(other.Index);
         }
 
         public override string ToString()
         {
+            if (HasLclNum)
+                return "V" + LclNum.ToString();
+
             char prefix = Kind switch
             {
                 SsaSlotKind.Arg => 'a',
@@ -1076,9 +1136,17 @@ namespace Cnidaria.Cs
 
         public SsaValueName(SsaSlot slot, int version)
         {
+            if (version <= SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(version));
+            if (!slot.HasLclNum)
+                throw new ArgumentException("SSA value identity must include a concrete lclNum.", nameof(slot));
+
             Slot = slot;
             Version = version;
         }
+
+        public bool IsReserved => Version == SsaConfig.ReservedSsaNumber;
+        public bool IsValid => Version > SsaConfig.ReservedSsaNumber;
 
         public bool Equals(SsaValueName other) => Slot.Equals(other.Slot) && Version == other.Version;
         public override bool Equals(object? obj) => obj is SsaValueName other && Equals(other);
@@ -1093,6 +1161,176 @@ namespace Cnidaria.Cs
         public override string ToString() => $"{Slot}_{Version}";
     }
 
+
+    internal enum SsaDefinitionKind : byte
+    {
+        Initial,
+        Phi,
+        Store,
+    }
+
+    internal sealed class SsaDescriptor
+    {
+        public SsaSlot BaseLocal { get; }
+        public int SsaNumber { get; }
+        public SsaValueName Name => new SsaValueName(BaseLocal, SsaNumber);
+        public SsaDefinitionKind DefinitionKind { get; }
+        public int DefBlockId { get; }
+        public CfgBlock? DefBlock { get; }
+        public int DefStatementIndex { get; }
+        public int DefTreeId { get; }
+        public GenTree? DefNode { get; }
+        public SsaPhi? Phi { get; }
+        public RuntimeType? Type { get; }
+        public GenStackKind StackKind { get; }
+        public int PreviousSsaNumber { get; private set; }
+        public int UseCount { get; private set; }
+        public bool HasPhiUse { get; private set; }
+        public bool HasGlobalUse { get; private set; }
+        public ValueNumberPair ValueNumbers { get; private set; }
+
+        public bool IsInitial => DefinitionKind == SsaDefinitionKind.Initial;
+        public bool IsPhi => DefinitionKind == SsaDefinitionKind.Phi;
+        public bool IsStore => DefinitionKind == SsaDefinitionKind.Store;
+        public bool IsPartialDefinition => PreviousSsaNumber != SsaConfig.ReservedSsaNumber;
+        public SsaValueName? PreviousDefinition => IsPartialDefinition ? new SsaValueName(BaseLocal, PreviousSsaNumber) : null;
+
+        public SsaDescriptor(
+            SsaSlot baseLocal,
+            int ssaNumber,
+            SsaDefinitionKind definitionKind,
+            int defBlockId,
+            int defStatementIndex,
+            int defTreeId,
+            GenTree? defNode,
+            RuntimeType? type,
+            GenStackKind stackKind,
+            int previousSsaNumber = SsaConfig.ReservedSsaNumber,
+            CfgBlock? defBlock = null,
+            SsaPhi? phiDescriptor = null)
+        {
+            if (ssaNumber <= SsaConfig.ReservedSsaNumber) throw new ArgumentOutOfRangeException(nameof(ssaNumber));
+            if (previousSsaNumber < SsaConfig.ReservedSsaNumber) throw new ArgumentOutOfRangeException(nameof(previousSsaNumber));
+            if (!baseLocal.HasLclNum) throw new ArgumentException("SSA descriptor base local must include a concrete lclNum.", nameof(baseLocal));
+            BaseLocal = baseLocal;
+            SsaNumber = ssaNumber;
+            DefinitionKind = definitionKind;
+            DefBlockId = defBlockId;
+            DefBlock = defBlock;
+            DefStatementIndex = defStatementIndex;
+            DefTreeId = defTreeId;
+            DefNode = defNode;
+            Phi = phiDescriptor;
+            Type = type;
+            StackKind = stackKind;
+            PreviousSsaNumber = previousSsaNumber;
+            ValueNumbers = default;
+        }
+
+        internal void SetPreviousDefinition(int previousSsaNumber)
+        {
+            if (previousSsaNumber < SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(previousSsaNumber));
+            if (previousSsaNumber == SsaNumber)
+                throw new InvalidOperationException("Partial SSA definition cannot use itself as the previous definition: " + Name + ".");
+            PreviousSsaNumber = previousSsaNumber;
+        }
+
+        internal void AddUse(int useBlockId)
+        {
+            if (UseCount < ushort.MaxValue)
+                UseCount++;
+            if (DefBlockId >= 0 && useBlockId >= 0 && useBlockId != DefBlockId)
+                HasGlobalUse = true;
+        }
+
+        internal void AddPhiUse(int useBlockId)
+        {
+            HasPhiUse = true;
+            AddUse(useBlockId);
+        }
+
+        internal void SetValueNumbers(ValueNumberPair valueNumbers)
+        {
+            ValueNumbers = valueNumbers;
+        }
+
+        public override string ToString()
+        {
+            string def = DefinitionKind switch
+            {
+                SsaDefinitionKind.Initial => "init",
+                SsaDefinitionKind.Phi => "phi",
+                SsaDefinitionKind.Store => "store",
+                _ => DefinitionKind.ToString(),
+            };
+            string partial = IsPartialDefinition ? " prev=" + PreviousSsaNumber.ToString() : string.Empty;
+            string uses = UseCount != 0 ? " uses=" + UseCount.ToString() : string.Empty;
+            string hints = (HasPhiUse ? " phi-use" : string.Empty) + (HasGlobalUse ? " global-use" : string.Empty);
+            string vn = ValueNumbers.Liberal.IsValid || ValueNumbers.Conservative.IsValid ? " vn=" + ValueNumbers.ToString() : string.Empty;
+            return BaseLocal.ToString() + "_" + SsaNumber.ToString() + " " + def + partial + uses + hints + vn;
+        }
+    }
+
+    internal sealed class SsaLocalDescriptor
+    {
+        public SsaSlot Slot { get; }
+        public RuntimeType? Type { get; }
+        public GenStackKind StackKind { get; }
+        public bool AddressExposed { get; }
+        public bool IsSsaPromoted { get; }
+        public GenLocalDescriptor? LocalDescriptor { get; }
+        public ImmutableArray<SsaDescriptor> PerSsaData { get; }
+
+        public SsaLocalDescriptor(
+            SsaSlot slot,
+            RuntimeType? type,
+            GenStackKind stackKind,
+            bool addressExposed,
+            bool isSsaPromoted,
+            GenLocalDescriptor? localDescriptor,
+            ImmutableArray<SsaDescriptor> perSsaData)
+        {
+            Slot = slot;
+            Type = type;
+            StackKind = stackKind;
+            AddressExposed = addressExposed;
+            IsSsaPromoted = isSsaPromoted;
+            LocalDescriptor = localDescriptor;
+            PerSsaData = perSsaData.IsDefault ? ImmutableArray<SsaDescriptor>.Empty : perSsaData;
+        }
+
+        public SsaDescriptor GetSsaDefByNumber(int ssaNumber)
+        {
+            if (ssaNumber <= SsaConfig.ReservedSsaNumber || (uint)ssaNumber >= (uint)PerSsaData.Length)
+                throw new ArgumentOutOfRangeException(nameof(ssaNumber));
+
+            var descriptor = PerSsaData[ssaNumber];
+            if (descriptor is null || descriptor.SsaNumber != ssaNumber)
+                throw new InvalidOperationException("SSA descriptor table is not dense for " + Slot + ".");
+            return descriptor;
+        }
+
+        public bool TryGetSsaDefByNumber(int ssaNumber, out SsaDescriptor descriptor)
+        {
+            if (ssaNumber > SsaConfig.ReservedSsaNumber && (uint)ssaNumber < (uint)PerSsaData.Length)
+            {
+                descriptor = PerSsaData[ssaNumber];
+                if (descriptor is not null && descriptor.SsaNumber == ssaNumber)
+                    return true;
+            }
+
+            descriptor = null!;
+            return false;
+        }
+
+        public override string ToString()
+        {
+            int defCount = PerSsaData.IsDefaultOrEmpty ? 0 : Math.Max(0, PerSsaData.Length - 1);
+            return Slot.ToString() + " defs=" + defCount.ToString() + (AddressExposed ? " addr-exposed" : string.Empty);
+        }
+    }
+
     internal readonly struct SsaValueDefinition
     {
         public readonly SsaValueName Name;
@@ -1103,6 +1341,26 @@ namespace Cnidaria.Cs
         public readonly bool IsPhi;
         public readonly RuntimeType? Type;
         public readonly GenStackKind StackKind;
+        public readonly GenTree? DefNode;
+        public readonly SsaPhi? Phi;
+        public readonly int PreviousSsaNumber;
+        public readonly SsaDescriptor Descriptor;
+
+        public SsaValueDefinition(SsaDescriptor descriptor)
+        {
+            Descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
+            Name = descriptor.Name;
+            DefBlockId = descriptor.DefBlockId;
+            DefStatementIndex = descriptor.DefStatementIndex;
+            DefTreeId = descriptor.DefTreeId;
+            IsInitial = descriptor.IsInitial;
+            IsPhi = descriptor.IsPhi;
+            Type = descriptor.Type;
+            StackKind = descriptor.StackKind;
+            DefNode = descriptor.DefNode;
+            Phi = descriptor.Phi;
+            PreviousSsaNumber = descriptor.PreviousSsaNumber;
+        }
 
         public SsaValueDefinition(
             SsaValueName name,
@@ -1113,15 +1371,17 @@ namespace Cnidaria.Cs
             bool isPhi,
             RuntimeType? type,
             GenStackKind stackKind)
+            : this(new SsaDescriptor(
+                name.Slot,
+                name.Version,
+                isInitial ? SsaDefinitionKind.Initial : isPhi ? SsaDefinitionKind.Phi : SsaDefinitionKind.Store,
+                defBlockId,
+                defStatementIndex,
+                defTreeId,
+                defNode: null,
+                type,
+                stackKind))
         {
-            Name = name;
-            DefBlockId = defBlockId;
-            DefStatementIndex = defStatementIndex;
-            DefTreeId = defTreeId;
-            IsInitial = isInitial;
-            IsPhi = isPhi;
-            Type = type;
-            StackKind = stackKind;
         }
     }
 
@@ -1131,14 +1391,47 @@ namespace Cnidaria.Cs
         public readonly RuntimeType? Type;
         public readonly GenStackKind StackKind;
         public readonly bool AddressExposed;
+        public readonly bool MemoryAliased;
+        public readonly GenLocalCategory Category;
+        public readonly int LclNum;
+        public readonly int VarIndex;
+        public readonly bool Tracked;
+        public readonly bool InSsa;
+        public readonly GenLocalDescriptor? LocalDescriptor;
 
-        public SsaSlotInfo(SsaSlot slot, RuntimeType? type, GenStackKind stackKind, bool addressExposed)
+        public SsaSlotInfo(
+            SsaSlot slot,
+            RuntimeType? type,
+            GenStackKind stackKind,
+            bool addressExposed,
+            bool memoryAliased = false,
+            GenLocalCategory category = GenLocalCategory.Unclassified,
+            int lclNum = -1,
+            int varIndex = -1,
+            bool tracked = false,
+            bool inSsa = false,
+            GenLocalDescriptor? localDescriptor = null)
         {
             Slot = slot;
             Type = type;
             StackKind = stackKind;
             AddressExposed = addressExposed;
+            MemoryAliased = memoryAliased;
+            Category = category;
+            LclNum = lclNum;
+            VarIndex = varIndex;
+            Tracked = tracked;
+            InSsa = inSsa;
+            LocalDescriptor = localDescriptor;
         }
+
+        public bool IsScalarSsaCandidate =>
+            InSsa &&
+            Tracked &&
+            VarIndex >= 0 &&
+            !AddressExposed &&
+            !MemoryAliased &&
+            LocalDescriptor is { CanBeSsaRenamedAsScalar: true };
     }
 
     internal readonly struct SsaPhiInput
@@ -1169,6 +1462,198 @@ namespace Cnidaria.Cs
         }
     }
 
+    internal enum SsaMemoryKind : byte
+    {
+        ByrefExposed = 0,
+        GcHeap = 1,
+    }
+
+    [Flags]
+    internal enum SsaMemoryKindSet : byte
+    {
+        None = 0,
+        ByrefExposed = 1,
+        GcHeap = 2,
+        All = ByrefExposed | GcHeap,
+    }
+
+    internal static class SsaMemoryKinds
+    {
+        public static readonly ImmutableArray<SsaMemoryKind> All = ImmutableArray.Create(SsaMemoryKind.ByrefExposed, SsaMemoryKind.GcHeap);
+
+        public static SsaMemoryKindSet SetOf(SsaMemoryKind kind) => (SsaMemoryKindSet)(1 << (int)kind);
+
+        public static bool Contains(this SsaMemoryKindSet set, SsaMemoryKind kind) => (set & SetOf(kind)) != 0;
+
+        public static SsaMemoryKindSet Add(this SsaMemoryKindSet set, SsaMemoryKind kind) => set | SetOf(kind);
+
+        public static SsaMemoryKindSet Remove(this SsaMemoryKindSet set, SsaMemoryKind kind) => set & ~SetOf(kind);
+
+        public static string Name(SsaMemoryKind kind)
+            => kind switch
+            {
+                SsaMemoryKind.ByrefExposed => "ByrefExposed",
+                SsaMemoryKind.GcHeap => "GcHeap",
+                _ => kind.ToString(),
+            };
+    }
+
+    internal readonly struct SsaMemoryValueName : IEquatable<SsaMemoryValueName>, IComparable<SsaMemoryValueName>
+    {
+        public readonly SsaMemoryKind Kind;
+        public readonly int Version;
+
+        public SsaMemoryValueName(SsaMemoryKind kind, int version)
+        {
+            if (version <= SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(version));
+
+            Kind = kind;
+            Version = version;
+        }
+
+        public bool Equals(SsaMemoryValueName other) => Kind == other.Kind && Version == other.Version;
+        public override bool Equals(object? obj) => obj is SsaMemoryValueName other && Equals(other);
+        public override int GetHashCode() => ((int)Kind * 397) ^ Version;
+
+        public int CompareTo(SsaMemoryValueName other)
+        {
+            int c = Kind.CompareTo(other.Kind);
+            return c != 0 ? c : Version.CompareTo(other.Version);
+        }
+
+        public override string ToString()
+            => "M" + SsaMemoryKinds.Name(Kind) + "_" + Version.ToString();
+    }
+
+    internal readonly struct SsaMemoryPhiInput
+    {
+        public readonly int PredecessorBlockId;
+        public readonly SsaMemoryValueName Value;
+
+        public SsaMemoryPhiInput(int predecessorBlockId, SsaMemoryValueName value)
+        {
+            PredecessorBlockId = predecessorBlockId;
+            Value = value;
+        }
+    }
+
+    internal sealed class SsaMemoryPhi
+    {
+        public int BlockId { get; }
+        public SsaMemoryKind Kind { get; }
+        public SsaMemoryValueName Target { get; }
+        public ImmutableArray<SsaMemoryPhiInput> Inputs { get; }
+
+        public SsaMemoryPhi(int blockId, SsaMemoryKind kind, SsaMemoryValueName target, ImmutableArray<SsaMemoryPhiInput> inputs)
+        {
+            if (target.Kind != kind)
+                throw new ArgumentException("Memory phi target kind does not match phi kind.", nameof(target));
+
+            BlockId = blockId;
+            Kind = kind;
+            Target = target;
+            Inputs = inputs.IsDefault ? ImmutableArray<SsaMemoryPhiInput>.Empty : inputs;
+        }
+    }
+
+    internal enum SsaMemoryDefinitionKind : byte
+    {
+        Initial,
+        Phi,
+        Store,
+        BlockOut,
+    }
+
+    internal sealed class SsaMemoryDescriptor
+    {
+        public SsaMemoryValueName Name { get; }
+        public SsaMemoryDefinitionKind DefinitionKind { get; }
+        public int DefBlockId { get; }
+        public CfgBlock? DefBlock { get; }
+        public int DefStatementIndex { get; }
+        public int DefTreeId { get; }
+        public GenTree? DefNode { get; }
+        public SsaMemoryPhi? Phi { get; }
+        public int UseCount { get; private set; }
+        public bool HasPhiUse { get; private set; }
+        public bool HasGlobalUse { get; private set; }
+        public ValueNumber ValueNumber { get; private set; }
+
+        public bool IsInitial => DefinitionKind == SsaMemoryDefinitionKind.Initial;
+        public bool IsPhi => DefinitionKind == SsaMemoryDefinitionKind.Phi;
+        public bool IsStore => DefinitionKind == SsaMemoryDefinitionKind.Store;
+        public bool IsBlockOut => DefinitionKind == SsaMemoryDefinitionKind.BlockOut;
+
+        public SsaMemoryDescriptor(
+            SsaMemoryValueName name,
+            SsaMemoryDefinitionKind definitionKind,
+            int defBlockId,
+            int defStatementIndex,
+            int defTreeId,
+            GenTree? defNode,
+            CfgBlock? defBlock = null,
+            SsaMemoryPhi? phi = null)
+        {
+            Name = name;
+            DefinitionKind = definitionKind;
+            DefBlockId = defBlockId;
+            DefBlock = defBlock;
+            DefStatementIndex = defStatementIndex;
+            DefTreeId = defTreeId;
+            DefNode = defNode;
+            Phi = phi;
+        }
+
+        internal void AddUse(int useBlockId)
+        {
+            if (UseCount < ushort.MaxValue)
+                UseCount++;
+            if (DefBlockId >= 0 && useBlockId >= 0 && useBlockId != DefBlockId)
+                HasGlobalUse = true;
+        }
+
+        internal void AddPhiUse(int useBlockId)
+        {
+            HasPhiUse = true;
+            AddUse(useBlockId);
+        }
+
+        internal void SetValueNumber(ValueNumber valueNumber)
+        {
+            ValueNumber = valueNumber;
+        }
+    }
+
+    internal readonly struct SsaMemoryDefinition
+    {
+        public readonly SsaMemoryValueName Name;
+        public readonly SsaMemoryDefinitionKind DefinitionKind;
+        public readonly int DefBlockId;
+        public readonly int DefStatementIndex;
+        public readonly int DefTreeId;
+        public readonly GenTree? DefNode;
+        public readonly SsaMemoryPhi? Phi;
+        public readonly SsaMemoryDescriptor Descriptor;
+
+        public SsaMemoryDefinition(SsaMemoryDescriptor descriptor)
+        {
+            Descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
+            Name = descriptor.Name;
+            DefinitionKind = descriptor.DefinitionKind;
+            DefBlockId = descriptor.DefBlockId;
+            DefStatementIndex = descriptor.DefStatementIndex;
+            DefTreeId = descriptor.DefTreeId;
+            DefNode = descriptor.DefNode;
+            Phi = descriptor.Phi;
+        }
+
+        public bool IsInitial => DefinitionKind == SsaMemoryDefinitionKind.Initial;
+        public bool IsPhi => DefinitionKind == SsaMemoryDefinitionKind.Phi;
+        public bool IsStore => DefinitionKind == SsaMemoryDefinitionKind.Store;
+        public bool IsBlockOut => DefinitionKind == SsaMemoryDefinitionKind.BlockOut;
+    }
+
     internal sealed class SsaTree
     {
         public GenTree Source { get; }
@@ -1176,13 +1661,53 @@ namespace Cnidaria.Cs
         public ImmutableArray<SsaTree> Operands { get; }
         public SsaValueName? Value { get; }
         public SsaValueName? StoreTarget { get; }
+        public SsaValueName? LocalFieldBaseValue { get; }
+        public RuntimeField? LocalField { get; }
+        public ImmutableArray<SsaMemoryValueName> MemoryUses { get; }
+        public ImmutableArray<SsaMemoryValueName> MemoryDefinitions { get; }
+        public bool IsPartialDefinition => StoreTarget.HasValue && LocalFieldBaseValue.HasValue;
+        public bool IsLocalFieldAccess => LocalFieldBaseValue.HasValue && LocalField is not null;
+        public bool HasMemoryEffects => !MemoryUses.IsDefaultOrEmpty || !MemoryDefinitions.IsDefaultOrEmpty;
 
-        public SsaTree(GenTree source, ImmutableArray<SsaTree> operands, SsaValueName? value = null, SsaValueName? storeTarget = null)
+        public SsaTree(
+            GenTree source,
+            ImmutableArray<SsaTree> operands,
+            SsaValueName? value = null,
+            SsaValueName? storeTarget = null,
+            SsaValueName? localFieldBaseValue = null,
+            RuntimeField? localField = null,
+            ImmutableArray<SsaMemoryValueName> memoryUses = default,
+            ImmutableArray<SsaMemoryValueName> memoryDefinitions = default)
         {
             Source = source ?? throw new ArgumentNullException(nameof(source));
             Operands = operands.IsDefault ? ImmutableArray<SsaTree>.Empty : operands;
             Value = value;
             StoreTarget = storeTarget;
+            LocalFieldBaseValue = localFieldBaseValue;
+            LocalField = localField;
+            MemoryUses = memoryUses.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryUses;
+            MemoryDefinitions = memoryDefinitions.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryDefinitions;
+        }
+
+        public bool TryGetMemoryUse(SsaMemoryKind kind, out SsaMemoryValueName value)
+            => TryGetMemoryValue(MemoryUses, kind, out value);
+
+        public bool TryGetMemoryDefinition(SsaMemoryKind kind, out SsaMemoryValueName value)
+            => TryGetMemoryValue(MemoryDefinitions, kind, out value);
+
+        private static bool TryGetMemoryValue(ImmutableArray<SsaMemoryValueName> values, SsaMemoryKind kind, out SsaMemoryValueName value)
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (values[i].Kind == kind)
+                {
+                    value = values[i];
+                    return true;
+                }
+            }
+
+            value = default;
+            return false;
         }
 
         public override string ToString() => SsaDumper.FormatTree(this);
@@ -1192,15 +1717,48 @@ namespace Cnidaria.Cs
     {
         public CfgBlock CfgBlock { get; }
         public ImmutableArray<SsaPhi> Phis { get; }
+        public ImmutableArray<SsaMemoryPhi> MemoryPhis { get; }
+        public ImmutableArray<SsaMemoryValueName> MemoryIn { get; }
+        public ImmutableArray<SsaMemoryValueName> MemoryOut { get; }
         public ImmutableArray<SsaTree> Statements { get; }
 
         public int Id => CfgBlock.Id;
 
-        public SsaBlock(CfgBlock cfgBlock, ImmutableArray<SsaPhi> phis, ImmutableArray<SsaTree> statements)
+        public SsaBlock(
+            CfgBlock cfgBlock,
+            ImmutableArray<SsaPhi> phis,
+            ImmutableArray<SsaTree> statements,
+            ImmutableArray<SsaMemoryPhi> memoryPhis = default,
+            ImmutableArray<SsaMemoryValueName> memoryIn = default,
+            ImmutableArray<SsaMemoryValueName> memoryOut = default)
         {
             CfgBlock = cfgBlock ?? throw new ArgumentNullException(nameof(cfgBlock));
             Phis = phis.IsDefault ? ImmutableArray<SsaPhi>.Empty : phis;
+            MemoryPhis = memoryPhis.IsDefault ? ImmutableArray<SsaMemoryPhi>.Empty : memoryPhis;
+            MemoryIn = memoryIn.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryIn;
+            MemoryOut = memoryOut.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryOut;
             Statements = statements.IsDefault ? ImmutableArray<SsaTree>.Empty : statements;
+        }
+
+        public bool TryGetMemoryIn(SsaMemoryKind kind, out SsaMemoryValueName value)
+            => TryGetMemoryValue(MemoryIn, kind, out value);
+
+        public bool TryGetMemoryOut(SsaMemoryKind kind, out SsaMemoryValueName value)
+            => TryGetMemoryValue(MemoryOut, kind, out value);
+
+        private static bool TryGetMemoryValue(ImmutableArray<SsaMemoryValueName> values, SsaMemoryKind kind, out SsaMemoryValueName value)
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (values[i].Kind == kind)
+                {
+                    value = values[i];
+                    return true;
+                }
+            }
+
+            value = default;
+            return false;
         }
     }
 
@@ -1209,9 +1767,13 @@ namespace Cnidaria.Cs
         public GenTreeMethod GenTreeMethod { get; }
         public ControlFlowGraph Cfg { get; }
         public ImmutableArray<SsaSlotInfo> Slots { get; }
+        public ImmutableArray<SsaLocalDescriptor> SsaLocalDescriptors { get; }
         public ImmutableArray<SsaValueName> InitialValues { get; }
+        public ImmutableArray<SsaMemoryValueName> InitialMemoryValues { get; }
         public ImmutableArray<SsaValueDefinition> ValueDefinitions { get; }
+        public ImmutableArray<SsaMemoryDefinition> MemoryDefinitions { get; }
         public ImmutableArray<SsaBlock> Blocks { get; }
+        public SsaValueNumberingResult? ValueNumbers { get; }
 
         public SsaMethod(
             GenTreeMethod genTreeMethod,
@@ -1219,14 +1781,22 @@ namespace Cnidaria.Cs
             ImmutableArray<SsaSlotInfo> slots,
             ImmutableArray<SsaValueName> initialValues,
             ImmutableArray<SsaValueDefinition> valueDefinitions,
-            ImmutableArray<SsaBlock> blocks)
+            ImmutableArray<SsaBlock> blocks,
+            SsaValueNumberingResult? valueNumbers = null,
+            ImmutableArray<SsaLocalDescriptor> ssaLocalDescriptors = default,
+            ImmutableArray<SsaMemoryValueName> initialMemoryValues = default,
+            ImmutableArray<SsaMemoryDefinition> memoryDefinitions = default)
         {
             GenTreeMethod = genTreeMethod ?? throw new ArgumentNullException(nameof(genTreeMethod));
             Cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
             Slots = slots.IsDefault ? ImmutableArray<SsaSlotInfo>.Empty : slots;
+            SsaLocalDescriptors = ssaLocalDescriptors.IsDefault ? ImmutableArray<SsaLocalDescriptor>.Empty : ssaLocalDescriptors;
             InitialValues = initialValues.IsDefault ? ImmutableArray<SsaValueName>.Empty : initialValues;
+            InitialMemoryValues = initialMemoryValues.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : initialMemoryValues;
             ValueDefinitions = valueDefinitions.IsDefault ? ImmutableArray<SsaValueDefinition>.Empty : valueDefinitions;
+            MemoryDefinitions = memoryDefinitions.IsDefault ? ImmutableArray<SsaMemoryDefinition>.Empty : memoryDefinitions;
             Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
+            ValueNumbers = valueNumbers;
         }
     }
 
@@ -1245,32 +1815,1521 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal static class GenTreeSsaBuilder
-    {
-        public static SsaProgram BuildProgram(GenTreeProgram program, bool includeExceptionEdges = true, bool validate = true, bool optimize = true)
-        {
-            if (program is null) throw new ArgumentNullException(nameof(program));
 
-            var methods = ImmutableArray.CreateBuilder<SsaMethod>(program.Methods.Length);
-            for (int i = 0; i < program.Methods.Length; i++)
-                methods.Add(BuildMethod(program.Methods[i], includeExceptionEdges, validate, optimize));
-            return new SsaProgram(methods.ToImmutable());
+
+    internal enum SsaLocalAccessKind : byte
+    {
+        None,
+        Use,
+        FullDefinition,
+        PartialDefinition,
+        Address,
+    }
+
+    internal readonly struct SsaLocalAccess
+    {
+        public readonly SsaLocalAccessKind Kind;
+        public readonly SsaSlot Slot;
+        public readonly SsaSlot BaseSlot;
+        public readonly RuntimeField? Field;
+        public readonly GenTree? Receiver;
+        public readonly int ReceiverOperandIndex;
+
+        public SsaLocalAccess(
+            SsaLocalAccessKind kind,
+            SsaSlot slot,
+            RuntimeField? field = null,
+            GenTree? receiver = null,
+            int receiverOperandIndex = -1,
+            SsaSlot? baseSlot = null)
+        {
+            Kind = kind;
+            Slot = slot;
+            BaseSlot = baseSlot ?? slot;
+            Field = field;
+            Receiver = receiver;
+            ReceiverOperandIndex = receiverOperandIndex;
         }
 
-        public static SsaMethod BuildMethod(GenTreeMethod method, bool includeExceptionEdges = true, bool validate = true, bool optimize = true)
+        public bool IsUse => Kind == SsaLocalAccessKind.Use;
+        public bool IsFullDefinition => Kind == SsaLocalAccessKind.FullDefinition;
+        public bool IsPartialDefinition => Kind == SsaLocalAccessKind.PartialDefinition;
+        public bool IsAddress => Kind == SsaLocalAccessKind.Address;
+        public bool IsDefinition => IsFullDefinition || IsPartialDefinition;
+        public bool IsPromotedFieldAccess => Field is not null && !Slot.Equals(BaseSlot);
+    }
+
+    internal static class SsaSlotHelpers
+    {
+        public static bool TryGetLoadSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            if (TryGetDirectLoadSlot(node, out slot))
+                return true;
+
+            if (TryGetLocalFieldAccess(node, out var access) && access.Kind == SsaLocalAccessKind.Use)
+            {
+                slot = access.Slot;
+                return true;
+            }
+
+            slot = default;
+            return false;
+        }
+
+        public static bool TryGetStoreSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            if (TryGetDirectStoreSlot(node, out slot))
+                return true;
+
+            if (TryGetLocalFieldAccess(node, out var access) && access.IsDefinition)
+            {
+                slot = access.Slot;
+                return true;
+            }
+
+            slot = default;
+            return false;
+        }
+
+        public static bool TryGetDirectLoadSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.Arg:
+                    return TryMakeSlot(node, SsaSlotKind.Arg, out slot);
+                case GenTreeKind.Local:
+                    return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+                case GenTreeKind.Temp:
+                    return TryMakeSlot(node, SsaSlotKind.Temp, out slot);
+                default:
+                    slot = default;
+                    return false;
+            }
+        }
+
+        public static bool TryGetDirectStoreSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.StoreArg:
+                    return TryMakeSlot(node, SsaSlotKind.Arg, out slot);
+                case GenTreeKind.StoreLocal:
+                    return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+                case GenTreeKind.StoreTemp:
+                    return TryMakeSlot(node, SsaSlotKind.Temp, out slot);
+                default:
+                    slot = default;
+                    return false;
+            }
+        }
+
+        public static bool TryGetAddressExposedSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.ArgAddr:
+                    return TryMakeSlot(node, SsaSlotKind.Arg, out slot);
+                case GenTreeKind.LocalAddr:
+                    return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+                default:
+                    slot = default;
+                    return false;
+            }
+        }
+
+        public static bool TryGetLocalFieldAccess(GenTree node, out SsaLocalAccess access)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            if (node.Kind == GenTreeKind.Field && node.Operands.Length != 0)
+            {
+                var receiver = node.Operands[0];
+                if (TryGetContainedLocalAddressSlot(receiver, out var parentSlot))
+                {
+                    var slot = ResolvePromotedFieldSlot(receiver, parentSlot, node.Field);
+                    access = new SsaLocalAccess(SsaLocalAccessKind.Use, slot, node.Field, receiver, 0, parentSlot);
+                    return true;
+                }
+            }
+
+            if (node.Kind == GenTreeKind.StoreField && node.Operands.Length >= 2)
+            {
+                var receiver = node.Operands[0];
+                if (TryGetContainedLocalAddressSlot(receiver, out var parentSlot))
+                {
+                    var slot = ResolvePromotedFieldSlot(receiver, parentSlot, node.Field);
+                    var kind = slot.Equals(parentSlot) ? SsaLocalAccessKind.PartialDefinition : SsaLocalAccessKind.FullDefinition;
+                    access = new SsaLocalAccess(kind, slot, node.Field, receiver, 0, parentSlot);
+                    return true;
+                }
+            }
+
+            access = default;
+            return false;
+        }
+
+        private static SsaSlot ResolvePromotedFieldSlot(GenTree receiver, SsaSlot parentSlot, RuntimeField? field)
+        {
+            if (field is not null && receiver.LocalDescriptor is not null && receiver.LocalDescriptor.TryGetPromotedField(field, out var fieldDescriptor))
+                return new SsaSlot(fieldDescriptor);
+
+            return parentSlot;
+        }
+
+        public static bool IsContainedLocalFieldAddressUse(GenTree parent, int operandIndex)
+        {
+            if (parent is null)
+                return false;
+
+            return operandIndex == 0 && parent.Kind is GenTreeKind.Field or GenTreeKind.StoreField;
+        }
+
+        private static bool TryGetContainedLocalAddressSlot(GenTree node, out SsaSlot slot)
+        {
+            if (node is null)
+                throw new ArgumentNullException(nameof(node));
+
+            if (node.Kind == GenTreeKind.ArgAddr)
+                return TryMakeSlot(node, SsaSlotKind.Arg, out slot);
+
+            if (node.Kind == GenTreeKind.LocalAddr)
+                return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+
+            slot = default;
+            return false;
+        }
+
+        private static bool TryMakeSlot(GenTree node, SsaSlotKind expectedKind, out SsaSlot slot)
+        {
+            if (node.LocalDescriptor is not null)
+            {
+                slot = new SsaSlot(node.LocalDescriptor);
+                if (slot.Kind != expectedKind)
+                    throw new InvalidOperationException("GenTree local descriptor kind does not match node kind: " + node + ".");
+                if (node.LocalDescriptor.Index != node.Int32)
+                    throw new InvalidOperationException("GenTree local descriptor index does not match node index: " + node + ".");
+                return true;
+            }
+
+            slot = new SsaSlot(expectedKind, node.Int32);
+            return true;
+        }
+    }
+
+
+    internal sealed class GenTreeLocalTrackingResult
+    {
+        public ImmutableArray<SsaSlotInfo> AllSlots { get; }
+        public ImmutableArray<SsaSlot> TrackedSlots { get; }
+        public ImmutableArray<SsaSlot> SsaCandidateSlots { get; }
+        public TrackedLocalTable TrackedLocals { get; }
+
+        public GenTreeLocalTrackingResult(
+            ImmutableArray<SsaSlotInfo> allSlots,
+            ImmutableArray<SsaSlot> trackedSlots,
+            ImmutableArray<SsaSlot> ssaCandidateSlots,
+            TrackedLocalTable trackedLocals)
+        {
+            AllSlots = allSlots.IsDefault ? ImmutableArray<SsaSlotInfo>.Empty : allSlots;
+            TrackedSlots = trackedSlots.IsDefault ? ImmutableArray<SsaSlot>.Empty : trackedSlots;
+            SsaCandidateSlots = ssaCandidateSlots.IsDefault ? ImmutableArray<SsaSlot>.Empty : ssaCandidateSlots;
+            TrackedLocals = trackedLocals ?? TrackedLocalTable.Empty;
+            if (TrackedLocals.Count != TrackedSlots.Length)
+                throw new InvalidOperationException("Tracked local table and tracked local slot list disagree.");
+        }
+    }
+
+    internal sealed class TrackedLocalTable
+    {
+        public static readonly TrackedLocalTable Empty = new TrackedLocalTable(ImmutableArray<SsaSlot>.Empty);
+
+        private readonly Dictionary<SsaSlot, int> _varIndexBySlot;
+
+        public ImmutableArray<SsaSlot> Slots { get; }
+        public int Count => Slots.Length;
+
+        public TrackedLocalTable(ImmutableArray<SsaSlot> slots)
+        {
+            Slots = slots.IsDefault ? ImmutableArray<SsaSlot>.Empty : slots;
+            _varIndexBySlot = new Dictionary<SsaSlot, int>(Slots.Length);
+
+            for (int i = 0; i < Slots.Length; i++)
+            {
+                if (!_varIndexBySlot.TryAdd(Slots[i], i))
+                    throw new InvalidOperationException("Duplicate tracked local slot " + Slots[i] + ".");
+            }
+        }
+
+        public bool Contains(SsaSlot slot) => _varIndexBySlot.ContainsKey(slot);
+
+        public bool TryGetVarIndex(SsaSlot slot, out int varIndex) => _varIndexBySlot.TryGetValue(slot, out varIndex);
+
+        public int GetVarIndex(SsaSlot slot)
+        {
+            if (_varIndexBySlot.TryGetValue(slot, out int varIndex))
+                return varIndex;
+
+            throw new InvalidOperationException("Local " + slot + " is not a tracked local.");
+        }
+
+        public SsaSlot GetSlot(int varIndex)
+        {
+            if ((uint)varIndex >= (uint)Slots.Length)
+                throw new ArgumentOutOfRangeException(nameof(varIndex));
+            return Slots[varIndex];
+        }
+
+        public TrackedLocalSet NewEmptySet() => new TrackedLocalSet(this);
+    }
+
+    internal sealed class TrackedLocalSet
+    {
+        private readonly ulong[] _bits;
+
+        public TrackedLocalTable Table { get; }
+        public int Count
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < _bits.Length; i++)
+                    count += PopCount(_bits[i]);
+                return count;
+            }
+        }
+
+        public TrackedLocalSet(TrackedLocalTable table)
+        {
+            Table = table ?? throw new ArgumentNullException(nameof(table));
+            _bits = new ulong[(Table.Count + 63) >> 6];
+        }
+
+        private TrackedLocalSet(TrackedLocalTable table, ulong[] bits)
+        {
+            Table = table ?? throw new ArgumentNullException(nameof(table));
+            _bits = bits ?? throw new ArgumentNullException(nameof(bits));
+        }
+
+        public TrackedLocalSet Clone()
+        {
+            var copy = new ulong[_bits.Length];
+            Array.Copy(_bits, copy, _bits.Length);
+            return new TrackedLocalSet(Table, copy);
+        }
+
+        public bool Add(SsaSlot slot)
+        {
+            if (!Table.TryGetVarIndex(slot, out int varIndex))
+                return false;
+            return AddIndex(varIndex);
+        }
+
+        public bool AddIndex(int varIndex)
+        {
+            CheckVarIndex(varIndex);
+            int word = varIndex >> 6;
+            ulong mask = 1UL << (varIndex & 63);
+            ulong old = _bits[word];
+            _bits[word] = old | mask;
+            return (old & mask) == 0;
+        }
+
+        public bool Remove(SsaSlot slot)
+        {
+            if (!Table.TryGetVarIndex(slot, out int varIndex))
+                return false;
+            return RemoveIndex(varIndex);
+        }
+
+        public bool RemoveIndex(int varIndex)
+        {
+            CheckVarIndex(varIndex);
+            int word = varIndex >> 6;
+            ulong mask = 1UL << (varIndex & 63);
+            ulong old = _bits[word];
+            _bits[word] = old & ~mask;
+            return (old & mask) != 0;
+        }
+
+        public bool Contains(SsaSlot slot)
+            => Table.TryGetVarIndex(slot, out int varIndex) && ContainsIndex(varIndex);
+
+        public bool ContainsIndex(int varIndex)
+        {
+            CheckVarIndex(varIndex);
+            return (_bits[varIndex >> 6] & (1UL << (varIndex & 63))) != 0;
+        }
+
+        public bool UnionWith(TrackedLocalSet other)
+        {
+            CheckCompatible(other);
+            bool changed = false;
+            for (int i = 0; i < _bits.Length; i++)
+            {
+                ulong old = _bits[i];
+                ulong next = old | other._bits[i];
+                _bits[i] = next;
+                changed |= next != old;
+            }
+            return changed;
+        }
+
+        public bool ExceptWith(TrackedLocalSet other)
+        {
+            CheckCompatible(other);
+            bool changed = false;
+            for (int i = 0; i < _bits.Length; i++)
+            {
+                ulong old = _bits[i];
+                ulong next = old & ~other._bits[i];
+                _bits[i] = next;
+                changed |= next != old;
+            }
+            return changed;
+        }
+
+        public bool SetEquals(TrackedLocalSet other)
+        {
+            CheckCompatible(other);
+            for (int i = 0; i < _bits.Length; i++)
+            {
+                if (_bits[i] != other._bits[i])
+                    return false;
+            }
+            return true;
+        }
+
+        public ImmutableArray<SsaSlot> ToImmutableSlots()
+        {
+            var builder = ImmutableArray.CreateBuilder<SsaSlot>();
+            for (int i = 0; i < Table.Count; i++)
+            {
+                if (ContainsIndex(i))
+                    builder.Add(Table.GetSlot(i));
+            }
+            return builder.ToImmutable();
+        }
+
+        private void CheckVarIndex(int varIndex)
+        {
+            if ((uint)varIndex >= (uint)Table.Count)
+                throw new ArgumentOutOfRangeException(nameof(varIndex));
+        }
+
+        private void CheckCompatible(TrackedLocalSet other)
+        {
+            if (other is null)
+                throw new ArgumentNullException(nameof(other));
+            if (!ReferenceEquals(Table, other.Table))
+                throw new InvalidOperationException("Tracked local bitsets were built from different tracked-local tables.");
+        }
+
+        private static int PopCount(ulong value)
+        {
+            int count = 0;
+            while (value != 0)
+            {
+                value &= value - 1;
+                count++;
+            }
+            return count;
+        }
+
+        public override string ToString() => "{" + string.Join(", ", ToImmutableSlots()) + "}";
+    }
+
+    internal static class GenTreeLocalTracking
+    {
+        private const int MaxTrackedLocals = 512;
+
+        public static GenTreeLocalTrackingResult AssignTrackedLocals(GenTreeMethod method, ControlFlowGraph cfg)
+        {
+            if (method is null) throw new ArgumentNullException(nameof(method));
+            if (cfg is null) throw new ArgumentNullException(nameof(cfg));
+            if (cfg.Blocks.Length != method.Blocks.Length)
+                throw new InvalidOperationException("local tracking requires a CFG that matches the method block count.");
+
+            ResetDescriptors(method.ArgDescriptors);
+            ResetDescriptors(method.LocalDescriptors);
+            ResetDescriptors(method.TempDescriptors);
+            method.EnsurePromotedStructFieldLocals();
+
+            var addressExposed = new HashSet<SsaSlot>();
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    CollectAddressExposed(statements[s], addressExposed);
+            }
+
+            var ehExposed = BuildEhExposedSlots(cfg);
+            var structPromotionBlockedParents = BuildStructPromotionBlockedParents(method);
+            var weightedUses = ComputeWeightedSlotUses(method, cfg);
+            var allSlots = new List<SsaSlotInfo>();
+            var trackingCandidates = new List<SsaSlot>();
+            var descriptors = new Dictionary<SsaSlot, GenLocalDescriptor>();
+
+            for (int i = 0; i < method.ArgDescriptors.Length; i++)
+                AddDescriptor(new SsaSlot(method.ArgDescriptors[i]), method.ArgDescriptors[i]);
+
+            for (int i = 0; i < method.LocalDescriptors.Length; i++)
+                AddDescriptor(new SsaSlot(method.LocalDescriptors[i]), method.LocalDescriptors[i]);
+
+            for (int i = 0; i < method.TempDescriptors.Length; i++)
+                AddDescriptor(new SsaSlot(method.TempDescriptors[i]), method.TempDescriptors[i]);
+
+            trackingCandidates.Sort((a, b) =>
+            {
+                weightedUses.TryGetValue(a, out int aw);
+                weightedUses.TryGetValue(b, out int bw);
+                int c = bw.CompareTo(aw);
+                return c != 0 ? c : a.CompareTo(b);
+            });
+
+            var tracked = new HashSet<SsaSlot>();
+            int trackedCount = Math.Min(MaxTrackedLocals, trackingCandidates.Count);
+            for (int i = 0; i < trackedCount; i++)
+                tracked.Add(trackingCandidates[i]);
+
+            var trackedList = new List<SsaSlot>(tracked);
+            trackedList.Sort();
+            for (int i = 0; i < trackedList.Count; i++)
+            {
+                var slot = trackedList[i];
+                var descriptor = descriptors[slot];
+                if (CanTrackAsScalar(slot, descriptor))
+                {
+                    descriptor.MarkRegularPromotedScalar(i);
+                }
+                else
+                {
+                    descriptor.MarkTrackedButNotSsa(i, descriptor.Category is GenLocalCategory.Unclassified or GenLocalCategory.UntrackedLocal
+                        ? GenLocalCategory.TrackedNonSsaLocal
+                        : descriptor.Category);
+                }
+            }
+
+            foreach (var kv in descriptors)
+            {
+                if (tracked.Contains(kv.Key))
+                    continue;
+
+                var descriptor = kv.Value;
+                if (descriptor.AddressExposed)
+                    descriptor.MarkAddressExposed();
+                else if (descriptor.MemoryAliased)
+                    descriptor.MarkMemoryAliased();
+                else if (descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
+                    descriptor.MarkUntracked();
+                else if (descriptor.IsCompilerTemp)
+                {
+                    descriptor.MarkUntracked();
+                    descriptor.Category = GenLocalCategory.CompilerTemp;
+                }
+                else if (descriptor.Promoted && descriptor.Category == GenLocalCategory.PromotedStruct)
+                    descriptor.MarkPromotedStructParent();
+                else
+                    descriptor.MarkUntracked();
+            }
+
+            allSlots.Clear();
+            foreach (var kv in descriptors)
+                allSlots.Add(CreateSlotInfo(kv.Key, kv.Value));
+            allSlots.Sort((a, b) => a.Slot.CompareTo(b.Slot));
+
+            var ssaCandidates = new List<SsaSlot>();
+            for (int i = 0; i < trackedList.Count; i++)
+            {
+                var slot = trackedList[i];
+                if (descriptors[slot].CanBeSsaRenamedAsScalar)
+                    ssaCandidates.Add(slot);
+            }
+
+            var trackedSlots = trackedList.ToImmutableArray();
+            return new GenTreeLocalTrackingResult(
+                allSlots.ToImmutableArray(),
+                trackedSlots,
+                ssaCandidates.ToImmutableArray(),
+                new TrackedLocalTable(trackedSlots));
+
+            void AddDescriptor(SsaSlot slot, GenLocalDescriptor descriptor)
+            {
+                bool exposed = descriptor.AddressExposed || addressExposed.Contains(slot) || ehExposed.Contains(slot);
+                if (exposed)
+                    descriptor.MarkAddressExposed();
+
+                if (descriptor.IsStructField && structPromotionBlockedParents.Contains(descriptor.ParentLclNum))
+                    descriptor.MarkMemoryAliased();
+
+                descriptors[slot] = descriptor;
+
+                if (!CanTrackForLiveness(slot, descriptor))
+                    return;
+
+                if (!weightedUses.ContainsKey(slot))
+                    return;
+
+                trackingCandidates.Add(slot);
+            }
+
+            static SsaSlotInfo CreateSlotInfo(SsaSlot slot, GenLocalDescriptor descriptor)
+                => new SsaSlotInfo(
+                    slot,
+                    descriptor.Type,
+                    descriptor.StackKind,
+                    descriptor.AddressExposed,
+                    descriptor.MemoryAliased,
+                    descriptor.Category,
+                    descriptor.LclNum,
+                    descriptor.VarIndex,
+                    descriptor.Tracked,
+                    descriptor.SsaPromoted,
+                    descriptor);
+
+            static bool CanTrackForLiveness(SsaSlot slot, GenLocalDescriptor descriptor)
+            {
+                if (descriptor.AddressExposed || descriptor.MemoryAliased)
+                    return false;
+
+                if (descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
+                    return false;
+
+                if (descriptor.Category is GenLocalCategory.AddressExposedLocal or GenLocalCategory.MemoryAliasedLocal or GenLocalCategory.ImplicitByRefPinnedRefLikeLocal)
+                    return false;
+
+                if (descriptor.Category == GenLocalCategory.PromotedStruct)
+                    return false;
+
+                if (descriptor.StackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
+                    return false;
+
+                return true;
+            }
+
+            static bool CanTrackAsScalar(SsaSlot slot, GenLocalDescriptor descriptor)
+            {
+                if (!CanTrackForLiveness(slot, descriptor))
+                    return false;
+
+                if (descriptor.DoNotEnregister && !descriptor.IsCompilerTemp)
+                    return false;
+
+                if (descriptor.Category == GenLocalCategory.PromotedStruct)
+                    return false;
+
+                if (descriptor.IsStructField && descriptor.Category != GenLocalCategory.PromotedStructField)
+                    return false;
+
+                if (!descriptor.IsStructField && descriptor.Category is GenLocalCategory.PromotedStructField or GenLocalCategory.AddressExposedLocal or GenLocalCategory.MemoryAliasedLocal or GenLocalCategory.ImplicitByRefPinnedRefLikeLocal)
+                    return false;
+
+                return IsPromotableStorageSlot(descriptor.Type, descriptor.StackKind);
+            }
+        }
+
+        public static ImmutableArray<SsaSlot> CurrentTrackedSlots(GenTreeMethod method)
         {
             if (method is null) throw new ArgumentNullException(nameof(method));
 
-            method = GenTreeCriticalEdgeSplitter.SplitCriticalEdges(method);
+            var result = new List<SsaSlot>();
+            AddTracked(method.ArgDescriptors, SsaSlotKind.Arg, result);
+            AddTracked(method.LocalDescriptors, SsaSlotKind.Local, result);
+            AddTracked(method.TempDescriptors, SsaSlotKind.Temp, result);
+            result.Sort();
+            return result.ToImmutableArray();
+        }
 
-            var cfg = ControlFlowGraph.Build(method, includeExceptionEdges);
-            var slotTable = SlotTable.Build(method, cfg);
+        private static void AddTracked(ImmutableArray<GenLocalDescriptor> descriptors, SsaSlotKind kind, List<SsaSlot> result)
+        {
+            for (int i = 0; i < descriptors.Length; i++)
+            {
+                var descriptor = descriptors[i];
+                if (descriptor.IsTrackedForLiveness)
+                    result.Add(new SsaSlot(descriptor));
+            }
+        }
+
+        private static void ResetDescriptors(ImmutableArray<GenLocalDescriptor> descriptors)
+        {
+            for (int i = 0; i < descriptors.Length; i++)
+            {
+                var descriptor = descriptors[i];
+                descriptor.ResetTrackingAndLivenessState();
+            }
+        }
+
+        private static void CollectAddressExposed(GenTree node, HashSet<SsaSlot> addressExposed)
+        {
+            CollectAddressExposed(node, parent: null, operandIndex: -1, addressExposed);
+        }
+
+        private static void CollectAddressExposed(GenTree node, GenTree? parent, int operandIndex, HashSet<SsaSlot> addressExposed)
+        {
+            if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out var slot) &&
+                (parent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex)))
+            {
+                addressExposed.Add(slot);
+                if (node.LocalDescriptor is not null)
+                {
+                    node.LocalDescriptor.MarkAddressExposed();
+                    node.Flags |= GenTreeFlags.AddressExposed;
+                }
+            }
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                CollectAddressExposed(node.Operands[i], node, i, addressExposed);
+        }
+
+        private static HashSet<int> BuildStructPromotionBlockedParents(GenTreeMethod method)
+        {
+            var blocked = new HashSet<int>();
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    Visit(statements[s], parent: null, operandIndex: -1);
+            }
+
+            return blocked;
+
+            void Visit(GenTree node, GenTree? parent, int operandIndex)
+            {
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        Visit(node.Operands[i], node, i);
+                    }
+                    return;
+                }
+
+                if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out _) ||
+                    SsaSlotHelpers.TryGetDirectStoreSlot(node, out _))
+                {
+                    if (node.LocalDescriptor is { HasPromotedStructFields: true } descriptor)
+                        blocked.Add(descriptor.LclNum);
+                }
+
+                if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _) &&
+                    (parent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex)))
+                {
+                    if (node.LocalDescriptor is { HasPromotedStructFields: true } descriptor)
+                        blocked.Add(descriptor.LclNum);
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                    Visit(node.Operands[i], node, i);
+            }
+        }
+
+        private static Dictionary<SsaSlot, int> ComputeWeightedSlotUses(GenTreeMethod method, ControlFlowGraph cfg)
+        {
+            var result = new Dictionary<SsaSlot, int>();
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                int weight = 1 + 8 * LoopDepth(cfg, b);
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    CountSlotUses(statements[s], result, weight);
+            }
+            return result;
+        }
+
+        private static int LoopDepth(ControlFlowGraph cfg, int blockId)
+        {
+            int depth = 0;
+            for (int i = 0; i < cfg.NaturalLoops.Length; i++)
+            {
+                if (cfg.NaturalLoops[i].Contains(blockId))
+                    depth++;
+            }
+            return depth;
+        }
+
+        private static void CountSlotUses(GenTree node, Dictionary<SsaSlot, int> counts, int weight)
+        {
+            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+            {
+                if (fieldAccess.Kind == SsaLocalAccessKind.Use)
+                {
+                    AddUse(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight);
+                }
+                else if (fieldAccess.Kind == SsaLocalAccessKind.PartialDefinition)
+                {
+                    AddUse(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight);
+                    AddDef(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight, partial: true);
+                }
+                else if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
+                {
+                    AddDef(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight, partial: false);
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (i == fieldAccess.ReceiverOperandIndex)
+                        continue;
+                    CountSlotUses(node.Operands[i], counts, weight);
+                }
+                return;
+            }
+
+            if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+            {
+                AddUse(loadSlot, node.LocalDescriptor, weight);
+                return;
+            }
+
+            if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+            {
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CountSlotUses(node.Operands[i], counts, weight);
+                AddDef(storeSlot, node.LocalDescriptor, weight, partial: false);
+                return;
+            }
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                CountSlotUses(node.Operands[i], counts, weight);
+
+            GenLocalDescriptor? DescriptorForFieldAccess(SsaLocalAccess access, GenTree node)
+            {
+                if (access.Field is not null && access.Receiver?.LocalDescriptor is not null && access.Receiver.LocalDescriptor.TryGetPromotedField(access.Field, out var fieldDescriptor))
+                    return fieldDescriptor;
+                return node.LocalDescriptor ?? access.Receiver?.LocalDescriptor;
+            }
+
+            void AddUse(SsaSlot slot, GenLocalDescriptor? descriptor, int w)
+            {
+                counts.TryGetValue(slot, out int current);
+                counts[slot] = current + Math.Max(1, w);
+                descriptor?.AddUse(w);
+            }
+
+            void AddDef(SsaSlot slot, GenLocalDescriptor? descriptor, int w, bool partial)
+            {
+                counts.TryGetValue(slot, out int current);
+                counts[slot] = current + Math.Max(1, w);
+                if (partial)
+                    descriptor?.AddPartialDefinition(w);
+                else
+                    descriptor?.AddFullDefinition(w);
+            }
+        }
+
+        private static HashSet<SsaSlot> BuildEhExposedSlots(ControlFlowGraph cfg)
+        {
+            var exposed = new HashSet<SsaSlot>();
+            if (cfg.ExceptionRegions.Length == 0)
+                return exposed;
+
+            int blockCount = cfg.Blocks.Length;
+            var uses = NewSetArray(blockCount);
+            var defs = NewSetArray(blockCount);
+            var touched = NewSetArray(blockCount);
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                var statements = cfg.Blocks[b].SourceBlock.Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    CollectUseDefAndTouch(statements[s], uses[b], defs[b], touched[b]);
+            }
+
+            var liveIn = NewSetArray(blockCount);
+            var liveOut = NewSetArray(blockCount);
+            bool changed;
+            do
+            {
+                changed = false;
+                for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
+                {
+                    int b = cfg.ReversePostOrder[r];
+                    var newOut = new HashSet<SsaSlot>();
+                    var successors = cfg.Blocks[b].Successors;
+                    for (int i = 0; i < successors.Length; i++)
+                        newOut.UnionWith(liveIn[successors[i].ToBlockId]);
+
+                    var newIn = new HashSet<SsaSlot>(newOut);
+                    newIn.ExceptWith(defs[b]);
+                    newIn.UnionWith(uses[b]);
+
+                    if (!liveOut[b].SetEquals(newOut))
+                    {
+                        liveOut[b] = newOut;
+                        changed = true;
+                    }
+
+                    if (!liveIn[b].SetEquals(newIn))
+                    {
+                        liveIn[b] = newIn;
+                        changed = true;
+                    }
+                }
+            }
+            while (changed);
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                var successors = cfg.Blocks[b].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                {
+                    var edge = successors[i];
+                    if (edge.Kind != CfgEdgeKind.Exception)
+                        continue;
+
+                    exposed.UnionWith(liveOut[b]);
+                    exposed.UnionWith(liveIn[edge.ToBlockId]);
+                }
+            }
+
+            var touchedFunclets = new Dictionary<SsaSlot, int>();
+            for (int b = 0; b < blockCount; b++)
+            {
+                int funcletId = FuncletIdentity(cfg.Blocks[b]);
+                foreach (var slot in touched[b])
+                {
+                    if (!touchedFunclets.TryGetValue(slot, out int previous))
+                        touchedFunclets.Add(slot, funcletId);
+                    else if (previous != funcletId)
+                        exposed.Add(slot);
+                }
+            }
+
+            return exposed;
+
+            static HashSet<SsaSlot>[] NewSetArray(int count)
+            {
+                var result = new HashSet<SsaSlot>[count];
+                for (int i = 0; i < result.Length; i++)
+                    result[i] = new HashSet<SsaSlot>();
+                return result;
+            }
+
+            static int FuncletIdentity(CfgBlock block)
+                => block.HandlerRegionIndexes.Length == 0
+                    ? 0
+                    : block.HandlerRegionIndexes[block.HandlerRegionIndexes.Length - 1] + 1;
+
+            static void CollectUseDefAndTouch(GenTree node, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
+            {
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+                    }
+
+                    if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
+                        uses.Add(fieldAccess.Slot);
+                    if (fieldAccess.IsDefinition)
+                        defs.Add(fieldAccess.Slot);
+                    touched.Add(fieldAccess.Slot);
+                    return;
+                }
+
+                if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                        CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+
+                    defs.Add(storeSlot);
+                    touched.Add(storeSlot);
+                    return;
+                }
+
+                if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+                {
+                    if (!defs.Contains(loadSlot))
+                        uses.Add(loadSlot);
+                    touched.Add(loadSlot);
+                    return;
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+            }
+        }
+
+        private static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind)
+        {
+            if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
+                return false;
+
+            if (stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
+                return true;
+
+            if (type is not null)
+            {
+                if (type.Kind == RuntimeTypeKind.ByRef || type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType)
+                    return true;
+
+                if (type.IsValueType && type.ContainsGcPointers)
+                    return false;
+            }
+
+            if (type is null)
+                return stackKind is
+                    GenStackKind.I4 or
+                    GenStackKind.I8 or
+                    GenStackKind.R4 or
+                    GenStackKind.R8 or
+                    GenStackKind.NativeInt or
+                    GenStackKind.NativeUInt or
+                    GenStackKind.Ptr;
+
+            return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind);
+        }
+
+        private static GenStackKind StackKindOf(RuntimeType? type)
+        {
+            if (type is null)
+                return GenStackKind.Unknown;
+
+            if (type.Namespace == "System" && type.Name == "Void")
+                return GenStackKind.Void;
+
+            if (type.IsReferenceType)
+                return GenStackKind.Ref;
+
+            if (type.Kind == RuntimeTypeKind.Pointer)
+                return GenStackKind.Ptr;
+
+            if (type.Kind == RuntimeTypeKind.ByRef)
+                return GenStackKind.ByRef;
+
+            if (type.Kind == RuntimeTypeKind.TypeParam)
+                return GenStackKind.Value;
+
+            if (type.Kind == RuntimeTypeKind.Enum)
+                return type.SizeOf <= 4 ? GenStackKind.I4 : GenStackKind.I8;
+
+            if (type.Namespace == "System")
+            {
+                switch (type.Name)
+                {
+                    case "Boolean":
+                    case "Char":
+                    case "SByte":
+                    case "Byte":
+                    case "Int16":
+                    case "UInt16":
+                    case "Int32":
+                    case "UInt32":
+                        return GenStackKind.I4;
+                    case "Int64":
+                    case "UInt64":
+                        return GenStackKind.I8;
+                    case "Single":
+                        return GenStackKind.R4;
+                    case "Double":
+                        return GenStackKind.R8;
+                    case "IntPtr":
+                        return GenStackKind.NativeInt;
+                    case "UIntPtr":
+                        return GenStackKind.NativeUInt;
+                }
+            }
+
+            return GenStackKind.Value;
+        }
+    }
+
+    internal sealed class GenTreeLocalLiveness
+    {
+        public ControlFlowGraph Cfg { get; }
+        public TrackedLocalTable TrackedLocals { get; }
+        public ImmutableArray<SsaSlot> TrackedSlots { get; }
+        public ImmutableArray<SsaSlot> SsaCandidateSlots { get; }
+        public ImmutableArray<ImmutableArray<SsaSlot>> Uses { get; }
+        public ImmutableArray<ImmutableArray<SsaSlot>> Defs { get; }
+        public ImmutableArray<ImmutableArray<SsaSlot>> LiveIn { get; }
+        public ImmutableArray<ImmutableArray<SsaSlot>> LiveOut { get; }
+        public ImmutableArray<TrackedLocalSet> UseBits { get; }
+        public ImmutableArray<TrackedLocalSet> DefBits { get; }
+        public ImmutableArray<TrackedLocalSet> LiveInBits { get; }
+        public ImmutableArray<TrackedLocalSet> LiveOutBits { get; }
+
+        private GenTreeLocalLiveness(
+            ControlFlowGraph cfg,
+            TrackedLocalTable trackedLocals,
+            ImmutableArray<SsaSlot> ssaCandidateSlots,
+            TrackedLocalSet[] uses,
+            TrackedLocalSet[] defs,
+            TrackedLocalSet[] liveIn,
+            TrackedLocalSet[] liveOut)
+        {
+            Cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            TrackedLocals = trackedLocals ?? TrackedLocalTable.Empty;
+            TrackedSlots = TrackedLocals.Slots;
+            SsaCandidateSlots = ssaCandidateSlots.IsDefault ? ImmutableArray<SsaSlot>.Empty : ssaCandidateSlots;
+            Uses = FreezeSets(uses);
+            Defs = FreezeSets(defs);
+            LiveIn = FreezeSets(liveIn);
+            LiveOut = FreezeSets(liveOut);
+            UseBits = FreezeBitSets(uses);
+            DefBits = FreezeBitSets(defs);
+            LiveInBits = FreezeBitSets(liveIn);
+            LiveOutBits = FreezeBitSets(liveOut);
+        }
+
+        public bool IsLiveIn(int blockId, SsaSlot slot) => Contains(LiveInBits, blockId, slot);
+        public bool IsLiveOut(int blockId, SsaSlot slot) => Contains(LiveOutBits, blockId, slot);
+        public bool IsUsedInBlock(int blockId, SsaSlot slot) => Contains(UseBits, blockId, slot);
+        public bool IsDefinedInBlock(int blockId, SsaSlot slot) => Contains(DefBits, blockId, slot);
+
+        public static GenTreeLocalLiveness Build(GenTreeMethod method, ControlFlowGraph cfg)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (cfg is null)
+                throw new ArgumentNullException(nameof(cfg));
+            if (cfg.Blocks.Length != method.Blocks.Length)
+                throw new InvalidOperationException("HIR liveness CFG does not match method block count.");
+
+            var tracking = GenTreeLocalTracking.AssignTrackedLocals(method, cfg);
+            var trackedLocals = tracking.TrackedLocals;
+            int blockCount = cfg.Blocks.Length;
+            var uses = NewSetArray(blockCount, trackedLocals);
+            var defs = NewSetArray(blockCount, trackedLocals);
+            var liveIn = NewSetArray(blockCount, trackedLocals);
+            var liveOut = NewSetArray(blockCount, trackedLocals);
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                var statements = cfg.Blocks[b].SourceBlock.Statements;
+                for (int s = 0; s < statements.Length; s++)
+                {
+                    ClearLocalDataflowFlags(statements[s]);
+                    CollectUseDef(statements[s], trackedLocals, uses[b], defs[b]);
+                }
+            }
+
+            bool changed;
+            do
+            {
+                changed = false;
+                for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
+                {
+                    int blockId = cfg.ReversePostOrder[r];
+                    var newOut = trackedLocals.NewEmptySet();
+                    var successors = cfg.Blocks[blockId].Successors;
+                    for (int i = 0; i < successors.Length; i++)
+                        newOut.UnionWith(liveIn[successors[i].ToBlockId]);
+
+                    var newIn = newOut.Clone();
+                    newIn.ExceptWith(defs[blockId]);
+                    newIn.UnionWith(uses[blockId]);
+
+                    if (!liveOut[blockId].SetEquals(newOut))
+                    {
+                        liveOut[blockId] = newOut;
+                        changed = true;
+                    }
+
+                    if (!liveIn[blockId].SetEquals(newIn))
+                    {
+                        liveIn[blockId] = newIn;
+                        changed = true;
+                    }
+                }
+            }
+            while (changed);
+
+            MarkLastUses(cfg, trackedLocals, liveOut);
+
+            return new GenTreeLocalLiveness(
+                cfg,
+                trackedLocals,
+                tracking.SsaCandidateSlots,
+                uses,
+                defs,
+                liveIn,
+                liveOut);
+        }
+
+        private static void MarkLastUses(ControlFlowGraph cfg, TrackedLocalTable trackedLocals, TrackedLocalSet[] liveOut)
+        {
+            for (int b = 0; b < cfg.Blocks.Length; b++)
+            {
+                var live = liveOut[b].Clone();
+                var events = new List<LocalLivenessEvent>();
+                var statements = cfg.Blocks[b].SourceBlock.Statements;
+
+                for (int s = 0; s < statements.Length; s++)
+                    CollectLivenessEvents(statements[s], trackedLocals, events);
+
+                for (int i = events.Count - 1; i >= 0; i--)
+                {
+                    var e = events[i];
+                    if (e.IsDefinition)
+                        live.Remove(e.Slot);
+
+                    if (e.IsUse)
+                    {
+                        if (!live.Contains(e.Slot))
+                            e.Node.Flags |= GenTreeFlags.VarDeath;
+                        live.Add(e.Slot);
+                    }
+                }
+            }
+        }
+
+        private readonly struct LocalLivenessEvent
+        {
+            public readonly GenTree Node;
+            public readonly SsaSlot Slot;
+            public readonly bool IsUse;
+            public readonly bool IsDefinition;
+
+            public LocalLivenessEvent(GenTree node, SsaSlot slot, bool isUse, bool isDefinition)
+            {
+                Node = node;
+                Slot = slot;
+                IsUse = isUse;
+                IsDefinition = isDefinition;
+            }
+        }
+
+        private static void CollectLivenessEvents(GenTree node, TrackedLocalTable trackedLocals, List<LocalLivenessEvent> events)
+        {
+            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+            {
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (i == fieldAccess.ReceiverOperandIndex)
+                        continue;
+                    CollectLivenessEvents(node.Operands[i], trackedLocals, events);
+                }
+
+                if (trackedLocals.Contains(fieldAccess.Slot))
+                {
+                    events.Add(new LocalLivenessEvent(
+                        node,
+                        fieldAccess.Slot,
+                        isUse: fieldAccess.Kind != SsaLocalAccessKind.FullDefinition,
+                        isDefinition: fieldAccess.IsDefinition));
+                }
+                return;
+            }
+
+            if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+            {
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CollectLivenessEvents(node.Operands[i], trackedLocals, events);
+
+                if (trackedLocals.Contains(storeSlot))
+                    events.Add(new LocalLivenessEvent(node, storeSlot, isUse: false, isDefinition: true));
+                return;
+            }
+
+            if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+            {
+                if (trackedLocals.Contains(loadSlot))
+                    events.Add(new LocalLivenessEvent(node, loadSlot, isUse: true, isDefinition: false));
+                return;
+            }
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                CollectLivenessEvents(node.Operands[i], trackedLocals, events);
+        }
+
+        private static bool Contains(ImmutableArray<TrackedLocalSet> sets, int blockId, SsaSlot slot)
+        {
+            if ((uint)blockId >= (uint)sets.Length)
+                throw new ArgumentOutOfRangeException(nameof(blockId));
+            return sets[blockId].Contains(slot);
+        }
+
+        private static void ClearLocalDataflowFlags(GenTree node)
+        {
+            node.Flags &= ~(GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath);
+            for (int i = 0; i < node.Operands.Length; i++)
+                ClearLocalDataflowFlags(node.Operands[i]);
+        }
+
+        private static void CollectUseDef(GenTree node, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
+        {
+            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+            {
+                if (fieldAccess.Kind == SsaLocalAccessKind.Use)
+                {
+                    MarkUse(node, fieldAccess.Slot, trackedLocals, uses, defs);
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
+                    }
+                    return;
+                }
+
+                if (fieldAccess.Kind == SsaLocalAccessKind.PartialDefinition)
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
+                    }
+
+                    MarkUse(node, fieldAccess.Slot, trackedLocals, uses, defs);
+                    if (trackedLocals.Contains(fieldAccess.Slot))
+                        defs.Add(fieldAccess.Slot);
+                    node.Flags |= GenTreeFlags.LocalUse | GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg;
+                    return;
+                }
+
+                if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
+                    }
+
+                    if (trackedLocals.Contains(fieldAccess.Slot))
+                        defs.Add(fieldAccess.Slot);
+                    node.Flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef;
+                    return;
+                }
+            }
+
+            if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+            {
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
+
+                if (trackedLocals.Contains(storeSlot))
+                    defs.Add(storeSlot);
+                node.Flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef;
+                return;
+            }
+
+            if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+            {
+                MarkUse(node, loadSlot, trackedLocals, uses, defs);
+                return;
+            }
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
+        }
+
+        private static void MarkUse(GenTree node, SsaSlot slot, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
+        {
+            if (trackedLocals.Contains(slot) && !defs.Contains(slot))
+                uses.Add(slot);
+            node.Flags |= GenTreeFlags.LocalUse;
+        }
+
+        private static TrackedLocalSet[] NewSetArray(int count, TrackedLocalTable table)
+        {
+            var result = new TrackedLocalSet[count];
+            for (int i = 0; i < result.Length; i++)
+                result[i] = table.NewEmptySet();
+            return result;
+        }
+
+        private static ImmutableArray<TrackedLocalSet> FreezeBitSets(TrackedLocalSet[] sets)
+        {
+            var builder = ImmutableArray.CreateBuilder<TrackedLocalSet>(sets.Length);
+            for (int i = 0; i < sets.Length; i++)
+                builder.Add(sets[i].Clone());
+            return builder.ToImmutable();
+        }
+
+        private static ImmutableArray<ImmutableArray<SsaSlot>> FreezeSets(TrackedLocalSet[] sets)
+        {
+            var builder = ImmutableArray.CreateBuilder<ImmutableArray<SsaSlot>>(sets.Length);
+            for (int i = 0; i < sets.Length; i++)
+                builder.Add(sets[i].ToImmutableSlots());
+            return builder.ToImmutable();
+        }
+    }
+
+    internal static class SsaSourceAnnotations
+    {
+        public static void Clear(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    ClearTree(statements[s]);
+            }
+        }
+
+        public static void Attach(SsaMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            Clear(method.GenTreeMethod);
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    AttachTree(method, statements[s]);
+            }
+        }
+
+        private static void ClearTree(GenTree node)
+        {
+            node.ClearSsaAnnotation();
+            for (int i = 0; i < node.Operands.Length; i++)
+                ClearTree(node.Operands[i]);
+        }
+
+        private static void AttachTree(SsaMethod method, SsaTree tree)
+        {
+            if (tree.Value.HasValue)
+            {
+                tree.Source.AttachSsaUse(tree.Value.Value);
+                AttachDescriptor(method.GenTreeMethod, tree.Source, tree.Value.Value.Slot);
+            }
+
+            for (int i = 0; i < tree.Operands.Length; i++)
+                AttachTree(method, tree.Operands[i]);
+
+            if (tree.StoreTarget.HasValue)
+            {
+                var target = tree.StoreTarget.Value;
+                var info = GetSlotInfo(method, target.Slot);
+                tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
+                AttachDescriptor(method.GenTreeMethod, tree.Source, target.Slot);
+            }
+        }
+
+        private static SsaSlotInfo GetSlotInfo(SsaMethod method, SsaSlot slot)
+        {
+            for (int i = 0; i < method.Slots.Length; i++)
+            {
+                if (method.Slots[i].Slot.Equals(slot))
+                    return method.Slots[i];
+            }
+
+            return new SsaSlotInfo(slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
+        }
+
+        private static void AttachDescriptor(GenTreeMethod method, GenTree node, SsaSlot slot)
+        {
+            if (node.LocalDescriptor is not null)
+                return;
+
+            if (TryGetDescriptor(method, slot, out var descriptor))
+                node.LocalDescriptor = descriptor;
+        }
+
+        private static bool TryGetDescriptor(GenTreeMethod method, SsaSlot slot, out GenLocalDescriptor descriptor)
+        {
+            if (slot.HasLclNum)
+            {
+                var all = method.AllLocalDescriptors;
+                if ((uint)slot.LclNum < (uint)all.Length)
+                {
+                    descriptor = all[slot.LclNum];
+                    return descriptor.Kind switch
+                    {
+                        GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg,
+                        GenLocalKind.Local => slot.Kind == SsaSlotKind.Local,
+                        GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp,
+                        _ => false,
+                    };
+                }
+            }
+
+            switch (slot.Kind)
+            {
+                case SsaSlotKind.Arg:
+                    if ((uint)slot.Index < (uint)method.ArgDescriptors.Length)
+                    {
+                        descriptor = method.ArgDescriptors[slot.Index];
+                        return true;
+                    }
+                    break;
+                case SsaSlotKind.Local:
+                    if ((uint)slot.Index < (uint)method.LocalDescriptors.Length)
+                    {
+                        descriptor = method.LocalDescriptors[slot.Index];
+                        return true;
+                    }
+                    break;
+                case SsaSlotKind.Temp:
+                    for (int i = 0; i < method.TempDescriptors.Length; i++)
+                    {
+                        if (method.TempDescriptors[i].Index == slot.Index)
+                        {
+                            descriptor = method.TempDescriptors[i];
+                            return true;
+                        }
+                    }
+                    break;
+            }
+
+            descriptor = null!;
+            return false;
+        }
+    }
+
+    internal static class GenTreeSsaBuilder
+    {
+        public static SsaMethod BuildMethod(
+            GenTreeMethod method,
+            ControlFlowGraph cfg,
+            GenTreeLocalLiveness? hirLiveness = null,
+            bool validate = true)
+        {
+            if (method is null) throw new ArgumentNullException(nameof(method));
+            if (cfg is null) throw new ArgumentNullException(nameof(cfg));
+            if (method.Phase < GenTreeMethodPhase.HirLiveness)
+                throw new InvalidOperationException("SSA construction requires morph, local rewriting, CFG construction, and HIR liveness to have already run.");
+
+            if (!ReferenceEquals(cfg, method.Cfg))
+                throw new InvalidOperationException("SSA construction was given a CFG that is not attached to the GenTree method.");
+
+            hirLiveness ??= method.HirLiveness ?? GenTreeLocalLiveness.Build(method, cfg);
+            if (!ReferenceEquals(hirLiveness.Cfg, cfg))
+                throw new InvalidOperationException("SSA construction was given HIR liveness for a different CFG.");
+
+            SsaSourceAnnotations.Clear(method);
+
+            var slotTable = SlotTable.Build(method, cfg, hirLiveness);
             var liveness = Liveness.Build(cfg, slotTable.PromotableSlots);
+            var memoryLiveness = MemoryLiveness.Build(cfg, slotTable);
             var phis = InsertPhis(cfg, slotTable.PromotableSlots, liveness);
-            var rename = new RenameState(cfg, slotTable, phis);
+            var memoryPhis = InsertMemoryPhis(cfg, memoryLiveness);
+            var rename = new RenameState(cfg, slotTable, phis, memoryPhis, memoryLiveness);
             var blocks = rename.Run();
             var initialValues = rename.InitialValues.ToImmutableArray();
+            var initialMemoryValues = rename.InitialMemoryValues.ToImmutableArray();
             var valueDefinitions = BuildValueDefinitions(slotTable, initialValues, blocks);
+            var memoryDefinitions = BuildMemoryDefinitions(initialMemoryValues, blocks);
+            AnnotateSsaUses(valueDefinitions, memoryDefinitions, blocks);
+            var ssaLocalDescriptors = BuildSsaLocalDescriptors(slotTable, valueDefinitions);
 
             var result = new SsaMethod(
                 method,
@@ -1278,10 +3337,13 @@ namespace Cnidaria.Cs
                 slotTable.AllSlots.ToImmutableArray(),
                 initialValues,
                 valueDefinitions,
-                blocks);
+                blocks,
+                valueNumbers: null,
+                ssaLocalDescriptors: ssaLocalDescriptors,
+                initialMemoryValues: initialMemoryValues,
+                memoryDefinitions: memoryDefinitions);
 
-            if (optimize)
-                result = SsaOptimizer.OptimizeMethod(result, SsaOptimizationOptions.DefaultWithoutValidation);
+            SsaSourceAnnotations.Attach(result);
 
             if (validate)
                 SsaVerifier.Verify(result);
@@ -1301,7 +3363,16 @@ namespace Cnidaria.Cs
             {
                 var name = initialValues[i];
                 var info = slotTable.GetInfo(name.Slot);
-                Add(new SsaValueDefinition(name, -1, -1, -1, true, false, info.Type, info.StackKind));
+                Add(new SsaValueDefinition(new SsaDescriptor(
+                    name.Slot,
+                    name.Version,
+                    SsaDefinitionKind.Initial,
+                    -1,
+                    -1,
+                    -1,
+                    defNode: null,
+                    info.Type,
+                    info.StackKind)));
             }
 
             for (int b = 0; b < blocks.Length; b++)
@@ -1311,34 +3382,50 @@ namespace Cnidaria.Cs
                 {
                     var phi = block.Phis[p];
                     var info = slotTable.GetInfo(phi.Target.Slot);
-                    Add(new SsaValueDefinition(phi.Target, block.Id, -1, -1, false, true, info.Type, info.StackKind));
+                    Add(new SsaValueDefinition(new SsaDescriptor(
+                        phi.Target.Slot,
+                        phi.Target.Version,
+                        SsaDefinitionKind.Phi,
+                        block.Id,
+                        -1,
+                        -1,
+                        defNode: null,
+                        info.Type,
+                        info.StackKind,
+                        defBlock: block.CfgBlock,
+                        phiDescriptor: phi)));
                 }
 
                 for (int s = 0; s < block.Statements.Length; s++)
-                    CollectStatementDefinitions(block.Statements[s], block.Id, s);
+                    CollectStatementDefinitions(block.Statements[s], block, s);
             }
 
             definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
             return definitions.ToImmutableArray();
 
-            void CollectStatementDefinitions(SsaTree tree, int blockId, int statementIndex)
+            void CollectStatementDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
             {
                 for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectStatementDefinitions(tree.Operands[i], blockId, statementIndex);
+                    CollectStatementDefinitions(tree.Operands[i], block, statementIndex);
+
+                int blockId = block.Id;
 
                 if (tree.StoreTarget.HasValue)
                 {
                     var name = tree.StoreTarget.Value;
                     var info = slotTable.GetInfo(name.Slot);
-                    Add(new SsaValueDefinition(
-                        name,
+                    Add(new SsaValueDefinition(new SsaDescriptor(
+                        name.Slot,
+                        name.Version,
+                        SsaDefinitionKind.Store,
                         blockId,
                         statementIndex,
                         tree.Source.Id,
-                        false,
-                        false,
+                        tree.Source,
                         info.Type,
-                        info.StackKind));
+                        info.StackKind,
+                        tree.LocalFieldBaseValue.HasValue ? tree.LocalFieldBaseValue.Value.Version : SsaConfig.ReservedSsaNumber,
+                        block.CfgBlock)));
                 }
             }
 
@@ -1347,6 +3434,227 @@ namespace Cnidaria.Cs
                 if (!seen.Add(definition.Name))
                     throw new InvalidOperationException($"Duplicate SSA definition {definition.Name}.");
                 definitions.Add(definition);
+            }
+        }
+
+        internal static ImmutableArray<SsaMemoryDefinition> BuildMemoryDefinitions(
+            ImmutableArray<SsaMemoryValueName> initialMemoryValues,
+            ImmutableArray<SsaBlock> blocks)
+        {
+            var definitions = new List<SsaMemoryDefinition>();
+            var seen = new HashSet<SsaMemoryValueName>();
+
+            for (int i = 0; i < initialMemoryValues.Length; i++)
+            {
+                var name = initialMemoryValues[i];
+                Add(new SsaMemoryDefinition(new SsaMemoryDescriptor(
+                    name,
+                    SsaMemoryDefinitionKind.Initial,
+                    -1,
+                    -1,
+                    -1,
+                    defNode: null)));
+            }
+
+            for (int b = 0; b < blocks.Length; b++)
+            {
+                var block = blocks[b];
+                for (int p = 0; p < block.MemoryPhis.Length; p++)
+                {
+                    var phi = block.MemoryPhis[p];
+                    Add(new SsaMemoryDefinition(new SsaMemoryDescriptor(
+                        phi.Target,
+                        SsaMemoryDefinitionKind.Phi,
+                        block.Id,
+                        -1,
+                        -1,
+                        defNode: null,
+                        defBlock: block.CfgBlock,
+                        phi: phi)));
+                }
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                    CollectStatementMemoryDefinitions(block.Statements[s], block, s);
+
+                for (int i = 0; i < block.MemoryOut.Length; i++)
+                {
+                    var name = block.MemoryOut[i];
+                    if (seen.Contains(name))
+                        continue;
+
+                    Add(new SsaMemoryDefinition(new SsaMemoryDescriptor(
+                        name,
+                        SsaMemoryDefinitionKind.BlockOut,
+                        block.Id,
+                        block.Statements.Length,
+                        -1,
+                        defNode: null,
+                        defBlock: block.CfgBlock)));
+                }
+            }
+
+            definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
+            return definitions.ToImmutableArray();
+
+            void CollectStatementMemoryDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    CollectStatementMemoryDefinitions(tree.Operands[i], block, statementIndex);
+
+                for (int i = 0; i < tree.MemoryDefinitions.Length; i++)
+                {
+                    var name = tree.MemoryDefinitions[i];
+                    Add(new SsaMemoryDefinition(new SsaMemoryDescriptor(
+                        name,
+                        SsaMemoryDefinitionKind.Store,
+                        block.Id,
+                        statementIndex,
+                        tree.Source.Id,
+                        tree.Source,
+                        block.CfgBlock)));
+                }
+            }
+
+            void Add(SsaMemoryDefinition definition)
+            {
+                if (!seen.Add(definition.Name))
+                    throw new InvalidOperationException($"Duplicate memory SSA definition {definition.Name}.");
+                definitions.Add(definition);
+            }
+        }
+
+        internal static void AnnotateSsaUses(
+            ImmutableArray<SsaValueDefinition> valueDefinitions,
+            ImmutableArray<SsaMemoryDefinition> memoryDefinitions,
+            ImmutableArray<SsaBlock> blocks)
+        {
+            var descriptors = new Dictionary<SsaValueName, SsaDescriptor>();
+            for (int i = 0; i < valueDefinitions.Length; i++)
+                descriptors[valueDefinitions[i].Name] = valueDefinitions[i].Descriptor;
+
+            var memoryDescriptors = new Dictionary<SsaMemoryValueName, SsaMemoryDescriptor>();
+            for (int i = 0; i < memoryDefinitions.Length; i++)
+                memoryDescriptors[memoryDefinitions[i].Name] = memoryDefinitions[i].Descriptor;
+
+            for (int b = 0; b < blocks.Length; b++)
+            {
+                var block = blocks[b];
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    var phi = block.Phis[p];
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        if (descriptors.TryGetValue(phi.Inputs[i].Value, out var descriptor))
+                            descriptor.AddPhiUse(block.Id);
+                    }
+                }
+
+                for (int p = 0; p < block.MemoryPhis.Length; p++)
+                {
+                    var phi = block.MemoryPhis[p];
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        if (memoryDescriptors.TryGetValue(phi.Inputs[i].Value, out var descriptor))
+                            descriptor.AddPhiUse(block.Id);
+                    }
+                }
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                    AnnotateTreeUses(block.Statements[s], block.Id, descriptors, memoryDescriptors);
+            }
+
+            static void AnnotateTreeUses(
+                SsaTree tree,
+                int blockId,
+                Dictionary<SsaValueName, SsaDescriptor> descriptors,
+                Dictionary<SsaMemoryValueName, SsaMemoryDescriptor> memoryDescriptors)
+            {
+                if (tree.Value.HasValue && descriptors.TryGetValue(tree.Value.Value, out var valueDescriptor))
+                    valueDescriptor.AddUse(blockId);
+
+                if (tree.LocalFieldBaseValue.HasValue && descriptors.TryGetValue(tree.LocalFieldBaseValue.Value, out var baseDescriptor))
+                    baseDescriptor.AddUse(blockId);
+
+                for (int i = 0; i < tree.MemoryUses.Length; i++)
+                {
+                    if (memoryDescriptors.TryGetValue(tree.MemoryUses[i], out var memoryDescriptor))
+                        memoryDescriptor.AddUse(blockId);
+                }
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    AnnotateTreeUses(tree.Operands[i], blockId, descriptors, memoryDescriptors);
+            }
+        }
+
+        private static ImmutableArray<SsaLocalDescriptor> BuildSsaLocalDescriptors(
+            SlotTable slotTable,
+            ImmutableArray<SsaValueDefinition> valueDefinitions)
+        {
+            var descriptorsBySlot = new Dictionary<SsaSlot, List<SsaDescriptor>>();
+            for (int i = 0; i < valueDefinitions.Length; i++)
+            {
+                var descriptor = valueDefinitions[i].Descriptor;
+                if (!descriptorsBySlot.TryGetValue(descriptor.BaseLocal, out var list))
+                {
+                    list = new List<SsaDescriptor>();
+                    descriptorsBySlot.Add(descriptor.BaseLocal, list);
+                }
+                list.Add(descriptor);
+            }
+
+            var result = ImmutableArray.CreateBuilder<SsaLocalDescriptor>(slotTable.AllSlots.Length);
+            for (int i = 0; i < slotTable.AllSlots.Length; i++)
+            {
+                var info = slotTable.AllSlots[i];
+                descriptorsBySlot.TryGetValue(info.Slot, out var list);
+                var perSsaData = DensePerSsaData(info.Slot, list);
+                GenLocalDescriptor? localDescriptor = slotTable.GetLocalDescriptorOrNull(info.Slot);
+                var local = new SsaLocalDescriptor(
+                    info.Slot,
+                    info.Type,
+                    info.StackKind,
+                    info.AddressExposed,
+                    slotTable.IsPromotable(info.Slot),
+                    localDescriptor,
+                    perSsaData);
+                result.Add(local);
+                localDescriptor?.SetSsaDescriptors(perSsaData);
+            }
+
+            return result.ToImmutable();
+
+            static ImmutableArray<SsaDescriptor> DensePerSsaData(SsaSlot slot, List<SsaDescriptor>? descriptors)
+            {
+                if (descriptors is null || descriptors.Count == 0)
+                    return ImmutableArray<SsaDescriptor>.Empty;
+
+                int max = -1;
+                for (int i = 0; i < descriptors.Count; i++)
+                    max = Math.Max(max, descriptors[i].SsaNumber);
+
+                var table = new SsaDescriptor?[max + 1];
+                for (int i = 0; i < descriptors.Count; i++)
+                {
+                    var descriptor = descriptors[i];
+                    if (table[descriptor.SsaNumber] is not null)
+                        throw new InvalidOperationException("Duplicate SSA descriptor " + descriptor.Name + ".");
+                    table[descriptor.SsaNumber] = descriptor;
+                }
+
+                var builder = ImmutableArray.CreateBuilder<SsaDescriptor>(table.Length);
+                for (int i = 0; i < table.Length; i++)
+                {
+                    if (i == SsaConfig.ReservedSsaNumber)
+                    {
+                        builder.Add(null!);
+                        continue;
+                    }
+
+                    if (table[i] is null)
+                        throw new InvalidOperationException("Missing SSA descriptor " + slot + "_" + i.ToString() + ".");
+                    builder.Add(table[i]!);
+                }
+                return builder.ToImmutable();
             }
         }
 
@@ -1405,19 +3713,80 @@ namespace Cnidaria.Cs
             return result;
         }
 
+        private static MutableMemoryPhi[][] InsertMemoryPhis(ControlFlowGraph cfg, MemoryLiveness liveness)
+        {
+            int n = cfg.Blocks.Length;
+            var byBlock = new List<MutableMemoryPhi>[n];
+            for (int i = 0; i < n; i++)
+                byBlock[i] = new List<MutableMemoryPhi>();
+
+            var hasPhi = new HashSet<(SsaMemoryKind kind, int blockId)>();
+
+            foreach (var kind in SsaMemoryKinds.All)
+            {
+                var work = new Queue<int>();
+                var inWork = new HashSet<int>();
+
+                for (int b = 0; b < n; b++)
+                {
+                    if (liveness.Defs[b].Contains(kind))
+                    {
+                        work.Enqueue(b);
+                        inWork.Add(b);
+                    }
+                }
+
+                while (work.Count != 0)
+                {
+                    int x = work.Dequeue();
+                    inWork.Remove(x);
+
+                    var df = cfg.DominanceFrontiers[x];
+                    for (int i = 0; i < df.Length; i++)
+                    {
+                        int y = df[i];
+                        if (!liveness.LiveIn[y].Contains(kind))
+                            continue;
+
+                        if (hasPhi.Add((kind, y)))
+                        {
+                            byBlock[y].Add(new MutableMemoryPhi(y, kind));
+                            if (!liveness.Defs[y].Contains(kind) && inWork.Add(y))
+                                work.Enqueue(y);
+                        }
+                    }
+                }
+            }
+
+            var result = new MutableMemoryPhi[n][];
+            for (int i = 0; i < n; i++)
+            {
+                byBlock[i].Sort((a, b) => a.Kind.CompareTo(b.Kind));
+                result[i] = byBlock[i].ToArray();
+            }
+            return result;
+        }
+
         private sealed class SlotTable
         {
+            private const int MaxTrackedPromotableSlots = 512;
+
             private readonly Dictionary<SsaSlot, SsaSlotInfo> _infoBySlot;
+            private readonly Dictionary<SsaSlot, GenLocalDescriptor> _localDescriptorBySlot;
             private readonly HashSet<SsaSlot> _promotable;
 
             public ImmutableArray<SsaSlotInfo> AllSlots { get; }
             public ImmutableArray<SsaSlot> PromotableSlots { get; }
 
-            private SlotTable(ImmutableArray<SsaSlotInfo> allSlots, ImmutableArray<SsaSlot> promotableSlots)
+            private SlotTable(
+                ImmutableArray<SsaSlotInfo> allSlots,
+                ImmutableArray<SsaSlot> promotableSlots,
+                Dictionary<SsaSlot, GenLocalDescriptor> localDescriptorBySlot)
             {
                 AllSlots = allSlots;
                 PromotableSlots = promotableSlots;
                 _infoBySlot = new Dictionary<SsaSlot, SsaSlotInfo>();
+                _localDescriptorBySlot = new Dictionary<SsaSlot, GenLocalDescriptor>(localDescriptorBySlot);
                 _promotable = new HashSet<SsaSlot>();
 
                 for (int i = 0; i < allSlots.Length; i++)
@@ -1433,74 +3802,237 @@ namespace Cnidaria.Cs
                 if (_infoBySlot.TryGetValue(slot, out var info))
                     return info;
 
-                return new SsaSlotInfo(slot, type: null, stackKind: GenStackKind.Unknown, addressExposed: false);
+                return new SsaSlotInfo(slot, type: null, stackKind: GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
             }
 
-            public static SlotTable Build(GenTreeMethod method, ControlFlowGraph cfg)
+            public GenLocalDescriptor? GetLocalDescriptorOrNull(SsaSlot slot)
             {
+                _localDescriptorBySlot.TryGetValue(slot, out var descriptor);
+                return descriptor;
+            }
+
+            public static SlotTable Build(GenTreeMethod method, ControlFlowGraph cfg, GenTreeLocalLiveness hirLiveness)
+            {
+                if (method is null) throw new ArgumentNullException(nameof(method));
                 if (cfg is null) throw new ArgumentNullException(nameof(cfg));
-
-                var addressExposed = new HashSet<SsaSlot>();
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var statements = method.Blocks[b].Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        CollectAddressExposed(statements[s], addressExposed);
-                }
-
-                var ehExposed = BuildEhExposedSlots(cfg);
+                if (hirLiveness is null) throw new ArgumentNullException(nameof(hirLiveness));
+                if (!ReferenceEquals(hirLiveness.Cfg, cfg))
+                    throw new InvalidOperationException("SSA slot table requires HIR liveness for the same CFG.");
 
                 var slots = new List<SsaSlotInfo>();
                 var promotable = new List<SsaSlot>();
+                var descriptorBySlot = new Dictionary<SsaSlot, GenLocalDescriptor>();
 
-                for (int i = 0; i < method.ArgTypes.Length; i++)
-                    AddSlot(new SsaSlot(SsaSlotKind.Arg, i), method.ArgTypes[i], StackKindOf(method.ArgTypes[i]));
-
-                for (int i = 0; i < method.LocalTypes.Length; i++)
-                    AddSlot(new SsaSlot(SsaSlotKind.Local, i), method.LocalTypes[i], StackKindOf(method.LocalTypes[i]));
-
-                for (int i = 0; i < method.Temps.Length; i++)
+                for (int i = 0; i < method.ArgDescriptors.Length; i++)
                 {
-                    var t = method.Temps[i];
-                    AddSlot(new SsaSlot(SsaSlotKind.Temp, t.Index), t.Type, t.StackKind);
+                    var descriptor = method.ArgDescriptors[i];
+                    AddSlot(new SsaSlot(descriptor), descriptor.Type, descriptor.StackKind, descriptor);
+                }
+
+                for (int i = 0; i < method.LocalDescriptors.Length; i++)
+                {
+                    var descriptor = method.LocalDescriptors[i];
+                    AddSlot(new SsaSlot(descriptor), descriptor.Type, descriptor.StackKind, descriptor);
+                }
+
+                for (int i = 0; i < method.TempDescriptors.Length; i++)
+                {
+                    var descriptor = method.TempDescriptors[i];
+                    AddSlot(new SsaSlot(descriptor), descriptor.Type, descriptor.StackKind, descriptor);
                 }
 
                 slots.Sort((a, b) => a.Slot.CompareTo(b.Slot));
                 promotable.Sort();
+                VerifyTrackedSplit(hirLiveness.SsaCandidateSlots, promotable);
 
-                return new SlotTable(slots.ToImmutableArray(), promotable.ToImmutableArray());
+                return new SlotTable(slots.ToImmutableArray(), promotable.ToImmutableArray(), descriptorBySlot);
 
-                void AddSlot(SsaSlot slot, RuntimeType? type, GenStackKind stackKind)
+                void AddSlot(SsaSlot slot, RuntimeType? type, GenStackKind stackKind, GenLocalDescriptor descriptor)
                 {
-                    bool exposed = addressExposed.Contains(slot) || ehExposed.Contains(slot);
-                    var info = new SsaSlotInfo(slot, type, stackKind, exposed);
-                    slots.Add(info);
+                    slots.Add(new SsaSlotInfo(
+                        slot,
+                        type,
+                        stackKind,
+                        descriptor.AddressExposed,
+                        descriptor.MemoryAliased,
+                        descriptor.Category,
+                        descriptor.LclNum,
+                        descriptor.VarIndex,
+                        descriptor.Tracked,
+                        descriptor.SsaPromoted,
+                        descriptor));
+                    descriptorBySlot[slot] = descriptor;
 
-                    if (!exposed && IsPromotableStorageSlot(type, stackKind))
-                        promotable.Add(slot);
+                    if (!descriptor.SsaPromoted)
+                        return;
+
+                    if (!descriptor.CanBeSsaRenamedAsScalar)
+                        throw new InvalidOperationException("LclVarDsc marked non-scalar or memory-aliased local as SSA-renamable: " + descriptor + ".");
+
+                    if (!IsPromotableStorageSlot(type, stackKind))
+                        throw new InvalidOperationException("tracked SSA local has non-promotable storage kind: " + slot + ".");
+
+                    promotable.Add(slot);
+                }
+
+                static void VerifyTrackedSplit(ImmutableArray<SsaSlot> ssaCandidateSlots, List<SsaSlot> ssaSlots)
+                {
+                    if (ssaCandidateSlots.Length != ssaSlots.Count)
+                        throw new InvalidOperationException("SSA local set does not match HIR tracked-local SSA candidate set.");
+
+                    var sortedCandidates = new List<SsaSlot>(ssaCandidateSlots);
+                    sortedCandidates.Sort();
+                    for (int i = 0; i < sortedCandidates.Count; i++)
+                    {
+                        if (!sortedCandidates[i].Equals(ssaSlots[i]))
+                            throw new InvalidOperationException("SSA local set does not match HIR tracked-local SSA candidate set.");
+                    }
                 }
 
                 static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind)
                 {
-                    if (stackKind is GenStackKind.Void or GenStackKind.Unknown)
+                    if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                         return false;
 
-                    if (type is not null && type.Kind == RuntimeTypeKind.TypeParam)
-                        return false;
+                    if (stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
+                        return true;
+
+                    if (type is not null)
+                    {
+                        if (type.Kind == RuntimeTypeKind.ByRef || type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType)
+                            return true;
+
+                        if (type.IsValueType && type.ContainsGcPointers)
+                            return false;
+                    }
 
                     if (type is null)
                         return stackKind is
                             GenStackKind.I4 or
                             GenStackKind.I8 or
+                            GenStackKind.R4 or
                             GenStackKind.R8 or
                             GenStackKind.NativeInt or
                             GenStackKind.NativeUInt or
-                            GenStackKind.Ref or
-                            GenStackKind.Ptr or
-                            GenStackKind.ByRef or
-                            GenStackKind.Null;
+                            GenStackKind.Ptr;
 
                     return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind);
+                }
+            }
+
+            private static Dictionary<SsaSlot, int> ComputeWeightedSlotUses(GenTreeMethod method, ControlFlowGraph cfg)
+            {
+                var result = new Dictionary<SsaSlot, int>();
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    int weight = 1 + 8 * LoopDepth(cfg, b);
+                    var statements = method.Blocks[b].Statements;
+                    for (int s = 0; s < statements.Length; s++)
+                        CountSlotUses(statements[s], result, weight);
+                }
+                return result;
+            }
+
+            private static int LoopDepth(ControlFlowGraph cfg, int blockId)
+            {
+                int depth = 0;
+                for (int i = 0; i < cfg.NaturalLoops.Length; i++)
+                {
+                    if (cfg.NaturalLoops[i].Contains(blockId))
+                        depth++;
+                }
+                return depth;
+            }
+
+            private static void CountSlotUses(GenTree node, Dictionary<SsaSlot, int> counts, int weight)
+            {
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                {
+                    if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition)
+                        Add(fieldAccess.Slot);
+
+                    if (fieldAccess.IsDefinition)
+                        Add(fieldAccess.Slot);
+
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CountSlotUses(node.Operands[i], counts, weight);
+                    }
+                    return;
+                }
+
+                if (TryGetDirectLoadSlot(node, out var loadSlot) || TryGetDirectStoreSlot(node, out loadSlot))
+                    Add(loadSlot);
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CountSlotUses(node.Operands[i], counts, weight);
+
+                void Add(SsaSlot slot)
+                {
+                    counts.TryGetValue(slot, out int current);
+                    counts[slot] = current + Math.Max(1, weight);
+                }
+            }
+
+            private static bool NeedsDescriptorHomeGcReporting(RuntimeType? type, GenStackKind stackKind)
+            {
+                if (type is not null)
+                {
+                    if (type.Kind == RuntimeTypeKind.ByRef || type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType)
+                        return true;
+                    if (type.IsValueType && type.ContainsGcPointers)
+                        return true;
+                }
+
+                return stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
+            }
+
+            private static void ApplyTrackedSlotBudget(
+                List<SsaSlot> promotable,
+                Dictionary<SsaSlot, GenLocalDescriptor> descriptorBySlot,
+                Dictionary<SsaSlot, int> weightedUses)
+            {
+                if (promotable.Count <= MaxTrackedPromotableSlots)
+                    return;
+
+                promotable.Sort((a, b) =>
+                {
+                    weightedUses.TryGetValue(a, out int aw);
+                    weightedUses.TryGetValue(b, out int bw);
+                    int c = bw.CompareTo(aw);
+                    return c != 0 ? c : a.CompareTo(b);
+                });
+
+                var kept = new HashSet<SsaSlot>();
+                for (int i = 0; i < MaxTrackedPromotableSlots; i++)
+                    kept.Add(promotable[i]);
+
+                for (int i = promotable.Count - 1; i >= 0; i--)
+                {
+                    var slot = promotable[i];
+                    if (kept.Contains(slot))
+                        continue;
+
+                    promotable.RemoveAt(i);
+                    if (descriptorBySlot.TryGetValue(slot, out var descriptor))
+                    {
+                        descriptor.MarkUntracked();
+                    }
+                }
+            }
+
+            private static void ResetSsaPromotionState(GenTreeMethod method)
+            {
+                Reset(method.ArgDescriptors);
+                Reset(method.LocalDescriptors);
+                Reset(method.TempDescriptors);
+
+                static void Reset(ImmutableArray<GenLocalDescriptor> descriptors)
+                {
+                    for (int i = 0; i < descriptors.Length; i++)
+                        descriptors[i].ResetTrackingAndLivenessState();
                 }
             }
 
@@ -1604,7 +4136,26 @@ namespace Cnidaria.Cs
 
                 static void CollectUseDefAndTouch(GenTree node, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
                 {
-                    if (TryGetStoreSlot(node, out var storeSlot))
+                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                    {
+                        for (int i = 0; i < node.Operands.Length; i++)
+                        {
+                            if (i == fieldAccess.ReceiverOperandIndex)
+                                continue;
+                            CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+                        }
+
+                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
+                            uses.Add(fieldAccess.Slot);
+
+                        if (fieldAccess.IsDefinition)
+                            defs.Add(fieldAccess.Slot);
+
+                        touched.Add(fieldAccess.Slot);
+                        return;
+                    }
+
+                    if (TryGetDirectStoreSlot(node, out var storeSlot))
                     {
                         for (int i = 0; i < node.Operands.Length; i++)
                             CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
@@ -1614,7 +4165,7 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    if (TryGetLoadSlot(node, out var loadSlot))
+                    if (TryGetDirectLoadSlot(node, out var loadSlot))
                     {
                         if (!defs.Contains(loadSlot))
                             uses.Add(loadSlot);
@@ -1629,31 +4180,31 @@ namespace Cnidaria.Cs
 
             private static void CollectAddressExposed(GenTree node, HashSet<SsaSlot> addressExposed)
             {
-                switch (node.Kind)
-                {
-                    case GenTreeKind.LocalAddr:
-                        addressExposed.Add(new SsaSlot(SsaSlotKind.Local, node.Int32));
-                        break;
+                CollectAddressExposed(node, parent: null, operandIndex: -1, addressExposed);
+            }
 
-                    case GenTreeKind.ArgAddr:
-                        addressExposed.Add(new SsaSlot(SsaSlotKind.Arg, node.Int32));
-                        break;
-                }
+            private static void CollectAddressExposed(GenTree node, GenTree? parent, int operandIndex, HashSet<SsaSlot> addressExposed)
+            {
+                if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out var slot) &&
+                    (parent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex)))
+                    addressExposed.Add(slot);
 
                 for (int i = 0; i < node.Operands.Length; i++)
-                    CollectAddressExposed(node.Operands[i], addressExposed);
+                    CollectAddressExposed(node.Operands[i], node, i, addressExposed);
             }
         }
 
         private sealed class Liveness
         {
-            public HashSet<SsaSlot>[] Uses { get; }
-            public HashSet<SsaSlot>[] Defs { get; }
-            public HashSet<SsaSlot>[] LiveIn { get; }
-            public HashSet<SsaSlot>[] LiveOut { get; }
+            public TrackedLocalTable Table { get; }
+            public TrackedLocalSet[] Uses { get; }
+            public TrackedLocalSet[] Defs { get; }
+            public TrackedLocalSet[] LiveIn { get; }
+            public TrackedLocalSet[] LiveOut { get; }
 
-            private Liveness(HashSet<SsaSlot>[] uses, HashSet<SsaSlot>[] defs, HashSet<SsaSlot>[] liveIn, HashSet<SsaSlot>[] liveOut)
+            private Liveness(TrackedLocalTable table, TrackedLocalSet[] uses, TrackedLocalSet[] defs, TrackedLocalSet[] liveIn, TrackedLocalSet[] liveOut)
             {
+                Table = table;
                 Uses = uses;
                 Defs = defs;
                 LiveIn = liveIn;
@@ -1663,17 +4214,17 @@ namespace Cnidaria.Cs
             public static Liveness Build(ControlFlowGraph cfg, ImmutableArray<SsaSlot> promotableSlots)
             {
                 int n = cfg.Blocks.Length;
-                var promotable = new HashSet<SsaSlot>(promotableSlots);
-                var uses = NewSetArray(n);
-                var defs = NewSetArray(n);
-                var liveIn = NewSetArray(n);
-                var liveOut = NewSetArray(n);
+                var table = new TrackedLocalTable(promotableSlots);
+                var uses = NewSetArray(n, table);
+                var defs = NewSetArray(n, table);
+                var liveIn = NewSetArray(n, table);
+                var liveOut = NewSetArray(n, table);
 
                 for (int b = 0; b < n; b++)
                 {
                     var statements = cfg.Blocks[b].SourceBlock.Statements;
                     for (int s = 0; s < statements.Length; s++)
-                        CollectUseDef(statements[s], promotable, uses[b], defs[b]);
+                        CollectUseDef(statements[s], table, uses[b], defs[b]);
                 }
 
                 bool changed;
@@ -1684,22 +4235,22 @@ namespace Cnidaria.Cs
                     {
                         int b = cfg.ReversePostOrder[r];
 
-                        var newOut = new HashSet<SsaSlot>();
+                        var newOut = table.NewEmptySet();
                         var successors = cfg.Blocks[b].Successors;
                         for (int i = 0; i < successors.Length; i++)
                             newOut.UnionWith(liveIn[successors[i].ToBlockId]);
 
-                        var newIn = new HashSet<SsaSlot>(newOut);
+                        var newIn = newOut.Clone();
                         newIn.ExceptWith(defs[b]);
                         newIn.UnionWith(uses[b]);
 
-                        if (!SetEquals(liveOut[b], newOut))
+                        if (!liveOut[b].SetEquals(newOut))
                         {
                             liveOut[b] = newOut;
                             changed = true;
                         }
 
-                        if (!SetEquals(liveIn[b], newIn))
+                        if (!liveIn[b].SetEquals(newIn))
                         {
                             liveIn[b] = newIn;
                             changed = true;
@@ -1708,23 +4259,36 @@ namespace Cnidaria.Cs
                 }
                 while (changed);
 
-                return new Liveness(uses, defs, liveIn, liveOut);
+                return new Liveness(table, uses, defs, liveIn, liveOut);
             }
 
-            private static HashSet<SsaSlot>[] NewSetArray(int count)
+            private static TrackedLocalSet[] NewSetArray(int count, TrackedLocalTable table)
             {
-                var result = new HashSet<SsaSlot>[count];
+                var result = new TrackedLocalSet[count];
                 for (int i = 0; i < result.Length; i++)
-                    result[i] = new HashSet<SsaSlot>();
+                    result[i] = table.NewEmptySet();
                 return result;
             }
 
-            private static bool SetEquals(HashSet<SsaSlot> left, HashSet<SsaSlot> right)
-                => left.Count == right.Count && left.SetEquals(right);
-
-            private static void CollectUseDef(GenTree node, HashSet<SsaSlot> promotable, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs)
+            private static void CollectUseDef(GenTree node, TrackedLocalTable promotable, TrackedLocalSet uses, TrackedLocalSet defs)
             {
-                if (TryGetStoreSlot(node, out var storeSlot))
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CollectUseDef(node.Operands[i], promotable, uses, defs);
+                    }
+
+                    if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && promotable.Contains(fieldAccess.Slot) && !defs.Contains(fieldAccess.Slot))
+                        uses.Add(fieldAccess.Slot);
+                    if (fieldAccess.IsDefinition && promotable.Contains(fieldAccess.Slot))
+                        defs.Add(fieldAccess.Slot);
+                    return;
+                }
+
+                if (TryGetDirectStoreSlot(node, out var storeSlot))
                 {
                     for (int i = 0; i < node.Operands.Length; i++)
                         CollectUseDef(node.Operands[i], promotable, uses, defs);
@@ -1734,7 +4298,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                if (TryGetLoadSlot(node, out var loadSlot))
+                if (TryGetDirectLoadSlot(node, out var loadSlot))
                 {
                     if (promotable.Contains(loadSlot) && !defs.Contains(loadSlot))
                         uses.Add(loadSlot);
@@ -1746,25 +4310,252 @@ namespace Cnidaria.Cs
             }
         }
 
+        private sealed class MemoryLiveness
+        {
+            public SsaMemoryKindSet[] Uses { get; }
+            public SsaMemoryKindSet[] Defs { get; }
+            public SsaMemoryKindSet[] LiveIn { get; }
+            public SsaMemoryKindSet[] LiveOut { get; }
+
+            private MemoryLiveness(SsaMemoryKindSet[] uses, SsaMemoryKindSet[] defs, SsaMemoryKindSet[] liveIn, SsaMemoryKindSet[] liveOut)
+            {
+                Uses = uses;
+                Defs = defs;
+                LiveIn = liveIn;
+                LiveOut = liveOut;
+            }
+
+            public static MemoryLiveness Build(ControlFlowGraph cfg, SlotTable slots)
+            {
+                int n = cfg.Blocks.Length;
+                var uses = new SsaMemoryKindSet[n];
+                var defs = new SsaMemoryKindSet[n];
+                var liveIn = new SsaMemoryKindSet[n];
+                var liveOut = new SsaMemoryKindSet[n];
+
+                for (int b = 0; b < n; b++)
+                {
+                    var statements = cfg.Blocks[b].SourceBlock.Statements;
+                    for (int s = 0; s < statements.Length; s++)
+                        CollectMemoryUseDef(statements[s], slots, ref uses[b], ref defs[b]);
+                }
+
+                bool changed;
+                do
+                {
+                    changed = false;
+                    for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
+                    {
+                        int b = cfg.ReversePostOrder[r];
+
+                        SsaMemoryKindSet newOut = SsaMemoryKindSet.None;
+                        var successors = cfg.Blocks[b].Successors;
+                        for (int i = 0; i < successors.Length; i++)
+                            newOut |= liveIn[successors[i].ToBlockId];
+
+                        SsaMemoryKindSet newIn = uses[b] | (newOut & ~defs[b]);
+
+                        if (liveOut[b] != newOut)
+                        {
+                            liveOut[b] = newOut;
+                            changed = true;
+                        }
+
+                        if (liveIn[b] != newIn)
+                        {
+                            liveIn[b] = newIn;
+                            changed = true;
+                        }
+                    }
+                }
+                while (changed);
+
+                return new MemoryLiveness(uses, defs, liveIn, liveOut);
+            }
+        }
+
+        private readonly struct MemoryEffects
+        {
+            public readonly SsaMemoryKindSet Uses;
+            public readonly SsaMemoryKindSet Definitions;
+
+            public MemoryEffects(SsaMemoryKindSet uses, SsaMemoryKindSet definitions)
+            {
+                Uses = uses;
+                Definitions = definitions;
+            }
+        }
+
+        private static void CollectMemoryUseDef(GenTree node, SlotTable slots, ref SsaMemoryKindSet uses, ref SsaMemoryKindSet defs)
+        {
+            for (int i = 0; i < node.Operands.Length; i++)
+                CollectMemoryUseDef(node.Operands[i], slots, ref uses, ref defs);
+
+            var effects = GetMemoryEffects(node, slots);
+            SsaMemoryKindSet nodeUses = effects.Uses | effects.Definitions;
+            uses |= nodeUses & ~defs;
+            defs |= effects.Definitions;
+        }
+
+        private static MemoryEffects GetMemoryEffects(GenTree node, SlotTable slots)
+        {
+            SsaMemoryKindSet uses = SsaMemoryKindSet.None;
+            SsaMemoryKindSet defs = SsaMemoryKindSet.None;
+
+            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var localFieldAccess))
+            {
+                var fieldSlotInfo = slots.GetInfo(localFieldAccess.Slot);
+                var baseSlotInfo = slots.GetInfo(localFieldAccess.BaseSlot);
+                bool fieldIsByrefExposed = fieldSlotInfo.AddressExposed || fieldSlotInfo.MemoryAliased || baseSlotInfo.AddressExposed || baseSlotInfo.MemoryAliased;
+
+                if (localFieldAccess.Kind == SsaLocalAccessKind.Use && !_slotsArePromotable(slots, localFieldAccess))
+                {
+                    if (fieldIsByrefExposed)
+                        uses = uses.Add(SsaMemoryKind.ByrefExposed);
+                }
+                else if (localFieldAccess.IsDefinition && !_slotsArePromotable(slots, localFieldAccess))
+                {
+                    if (fieldIsByrefExposed)
+                        defs = defs.Add(SsaMemoryKind.ByrefExposed);
+                }
+            }
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.Local:
+                case GenTreeKind.Arg:
+                case GenTreeKind.Temp:
+                    if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+                    {
+                        var info = slots.GetInfo(loadSlot);
+                        if ((info.AddressExposed || info.MemoryAliased) && !slots.IsPromotable(loadSlot))
+                            uses = uses.Add(SsaMemoryKind.ByrefExposed);
+                    }
+                    break;
+
+                case GenTreeKind.StoreLocal:
+                case GenTreeKind.StoreArg:
+                case GenTreeKind.StoreTemp:
+                    if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+                    {
+                        var info = slots.GetInfo(storeSlot);
+                        if (info.AddressExposed || info.MemoryAliased)
+                            defs = defs.Add(SsaMemoryKind.ByrefExposed);
+                    }
+                    break;
+
+                case GenTreeKind.Field:
+                    if (!SsaSlotHelpers.TryGetLocalFieldAccess(node, out _))
+                        uses = uses.Add(SsaMemoryKind.GcHeap);
+                    break;
+
+                case GenTreeKind.StaticField:
+                case GenTreeKind.ArrayElement:
+                case GenTreeKind.ArrayDataRef:
+                    uses = uses.Add(SsaMemoryKind.GcHeap);
+                    break;
+
+                case GenTreeKind.LoadIndirect:
+                    uses |= IndirectMemoryKinds(node);
+                    break;
+
+                case GenTreeKind.StoreField:
+                    if (!SsaSlotHelpers.TryGetLocalFieldAccess(node, out _))
+                        defs = defs.Add(SsaMemoryKind.GcHeap);
+                    break;
+
+                case GenTreeKind.StoreStaticField:
+                case GenTreeKind.StoreArrayElement:
+                    defs = defs.Add(SsaMemoryKind.GcHeap);
+                    break;
+
+                case GenTreeKind.StoreIndirect:
+                    defs |= IndirectMemoryKinds(node);
+                    break;
+
+                case GenTreeKind.Call:
+                case GenTreeKind.VirtualCall:
+                    uses = SsaMemoryKindSet.All;
+                    defs = SsaMemoryKindSet.All;
+                    break;
+
+                case GenTreeKind.NewObject:
+                case GenTreeKind.NewArray:
+                case GenTreeKind.Box:
+                    defs = defs.Add(SsaMemoryKind.GcHeap);
+                    break;
+            }
+
+            if (node.WritesMemory && defs == SsaMemoryKindSet.None)
+                defs = defs.Add(SsaMemoryKind.GcHeap);
+
+            if (node.ReadsMemory && uses == SsaMemoryKindSet.None)
+                uses = uses.Add(SsaMemoryKind.GcHeap);
+
+            return new MemoryEffects(uses, defs);
+
+            static bool _slotsArePromotable(SlotTable slots, SsaLocalAccess access)
+                => access.IsPromotedFieldAccess
+                    ? slots.IsPromotable(access.Slot)
+                    : slots.IsPromotable(access.BaseSlot);
+
+            static SsaMemoryKindSet IndirectMemoryKinds(GenTree node)
+            {
+                if (node.Operands.Length != 0 && IsLocalOrByrefAddress(node.Operands[0]))
+                    return SsaMemoryKindSet.ByrefExposed;
+
+                return SsaMemoryKindSet.All;
+            }
+
+            static bool IsLocalOrByrefAddress(GenTree node)
+            {
+                if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _))
+                    return true;
+
+                if (node.Kind == GenTreeKind.PointerToByRef)
+                    return true;
+
+                if (node.Kind == GenTreeKind.FieldAddr && node.Operands.Length != 0)
+                    return IsLocalOrByrefAddress(node.Operands[0]);
+
+                if (node.Kind == GenTreeKind.ArrayElementAddr || node.Kind == GenTreeKind.ArrayDataRef)
+                    return false;
+
+                return false;
+            }
+        }
+
         private sealed class RenameState
         {
             private readonly ControlFlowGraph _cfg;
             private readonly SlotTable _slots;
             private readonly MutablePhi[][] _phis;
+            private readonly MutableMemoryPhi[][] _memoryPhis;
+            private readonly MemoryLiveness _memoryLiveness;
             private readonly Dictionary<SsaSlot, int> _nextVersion = new();
             private readonly Dictionary<SsaSlot, Stack<SsaValueName>> _stacks = new();
+            private readonly Dictionary<SsaMemoryKind, int> _nextMemoryVersion = new();
+            private readonly Dictionary<SsaMemoryKind, Stack<SsaMemoryValueName>> _memoryStacks = new();
             private readonly List<SsaValueName> _initialValues = new();
+            private readonly List<SsaMemoryValueName> _initialMemoryValues = new();
             private readonly List<SsaTree>[] _renamedStatements;
+            private readonly ImmutableArray<SsaMemoryValueName>[] _memoryIn;
+            private readonly ImmutableArray<SsaMemoryValueName>[] _memoryOut;
             private readonly bool[] _visited;
 
             public IReadOnlyList<SsaValueName> InitialValues => _initialValues;
+            public IReadOnlyList<SsaMemoryValueName> InitialMemoryValues => _initialMemoryValues;
 
-            public RenameState(ControlFlowGraph cfg, SlotTable slots, MutablePhi[][] phis)
+            public RenameState(ControlFlowGraph cfg, SlotTable slots, MutablePhi[][] phis, MutableMemoryPhi[][] memoryPhis, MemoryLiveness memoryLiveness)
             {
                 _cfg = cfg;
                 _slots = slots;
                 _phis = phis;
+                _memoryPhis = memoryPhis;
+                _memoryLiveness = memoryLiveness;
                 _renamedStatements = new List<SsaTree>[cfg.Blocks.Length];
+                _memoryIn = new ImmutableArray<SsaMemoryValueName>[cfg.Blocks.Length];
+                _memoryOut = new ImmutableArray<SsaMemoryValueName>[cfg.Blocks.Length];
                 _visited = new bool[cfg.Blocks.Length];
                 for (int i = 0; i < _renamedStatements.Length; i++)
                     _renamedStatements[i] = new List<SsaTree>();
@@ -1772,14 +4563,24 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < slots.PromotableSlots.Length; i++)
                 {
                     var slot = slots.PromotableSlots[i];
-                    var initial = new SsaValueName(slot, 0);
-                    _nextVersion[slot] = 0;
+                    var initial = new SsaValueName(slot, SsaConfig.FirstSsaNumber);
+                    _nextVersion[slot] = SsaConfig.FirstSsaNumber;
                     _stacks[slot] = new Stack<SsaValueName>();
                     _stacks[slot].Push(initial);
                     _initialValues.Add(initial);
                 }
 
+                foreach (var kind in SsaMemoryKinds.All)
+                {
+                    var initial = new SsaMemoryValueName(kind, SsaConfig.FirstSsaNumber);
+                    _nextMemoryVersion[kind] = SsaConfig.FirstSsaNumber;
+                    _memoryStacks[kind] = new Stack<SsaMemoryValueName>();
+                    _memoryStacks[kind].Push(initial);
+                    _initialMemoryValues.Add(initial);
+                }
+
                 _initialValues.Sort();
+                _initialMemoryValues.Sort();
             }
 
             public ImmutableArray<SsaBlock> Run()
@@ -1794,6 +4595,7 @@ namespace Cnidaria.Cs
                 }
 
                 _initialValues.Sort();
+                _initialMemoryValues.Sort();
 
                 var blocks = ImmutableArray.CreateBuilder<SsaBlock>(_cfg.Blocks.Length);
                 for (int b = 0; b < _cfg.Blocks.Length; b++)
@@ -1802,10 +4604,17 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < _phis[b].Length; i++)
                         phiBuilder.Add(_phis[b][i].Freeze(_cfg.Blocks[b]));
 
+                    var memoryPhiBuilder = ImmutableArray.CreateBuilder<SsaMemoryPhi>(_memoryPhis[b].Length);
+                    for (int i = 0; i < _memoryPhis[b].Length; i++)
+                        memoryPhiBuilder.Add(_memoryPhis[b][i].Freeze(_cfg.Blocks[b]));
+
                     blocks.Add(new SsaBlock(
                         _cfg.Blocks[b],
                         phiBuilder.ToImmutable(),
-                        _renamedStatements[b].ToImmutableArray()));
+                        _renamedStatements[b].ToImmutableArray(),
+                        memoryPhiBuilder.ToImmutable(),
+                        _memoryIn[b],
+                        _memoryOut[b]));
                 }
                 return blocks.ToImmutable();
             }
@@ -1817,6 +4626,9 @@ namespace Cnidaria.Cs
                 _visited[blockId] = true;
 
                 var pushed = new List<SsaSlot>();
+                var pushedMemory = new List<SsaMemoryKind>();
+
+                RenameIncomingMemoryStates(blockId, pushedMemory);
 
                 for (int i = 0; i < _phis[blockId].Length; i++)
                 {
@@ -1829,9 +4641,11 @@ namespace Cnidaria.Cs
                 var statements = _cfg.Blocks[blockId].SourceBlock.Statements;
                 for (int i = 0; i < statements.Length; i++)
                 {
-                    var renamed = RenameTree(statements[i], pushed);
+                    var renamed = RenameTree(statements[i], pushed, pushedMemory);
                     _renamedStatements[blockId].Add(renamed);
                 }
+
+                RenameOutgoingMemoryStates(blockId, pushedMemory);
 
                 var successors = _cfg.Blocks[blockId].Successors;
                 for (int i = 0; i < successors.Length; i++)
@@ -1842,6 +4656,12 @@ namespace Cnidaria.Cs
                         var phi = _phis[succ][p];
                         phi.SetInput(blockId, Top(phi.Slot));
                     }
+
+                    for (int p = 0; p < _memoryPhis[succ].Length; p++)
+                    {
+                        var phi = _memoryPhis[succ][p];
+                        phi.SetInput(blockId, TopMemory(phi.Kind));
+                    }
                 }
 
                 var children = _cfg.DominatorTreeChildren[blockId];
@@ -1850,39 +4670,213 @@ namespace Cnidaria.Cs
 
                 for (int i = pushed.Count - 1; i >= 0; i--)
                     Pop(pushed[i]);
+
+                for (int i = pushedMemory.Count - 1; i >= 0; i--)
+                    PopMemory(pushedMemory[i]);
             }
 
-            private SsaTree RenameTree(GenTree node, List<SsaSlot> pushed)
+            private void RenameIncomingMemoryStates(int blockId, List<SsaMemoryKind> pushedMemory)
             {
-                if (TryGetLoadSlot(node, out var loadSlot) && _slots.IsPromotable(loadSlot))
-                    return new SsaTree(node, ImmutableArray<SsaTree>.Empty, value: Top(loadSlot));
-
-                var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
-                for (int i = 0; i < node.Operands.Length; i++)
-                    operands.Add(RenameTree(node.Operands[i], pushed));
-
-                if (TryGetStoreSlot(node, out var storeSlot) && _slots.IsPromotable(storeSlot))
+                var builder = ImmutableArray.CreateBuilder<SsaMemoryValueName>(SsaMemoryKinds.All.Length);
+                foreach (var kind in SsaMemoryKinds.All)
                 {
-                    var target = NewVersion(storeSlot);
-                    Push(storeSlot, target);
-                    pushed.Add(storeSlot);
-                    return new SsaTree(node, operands.ToImmutable(), storeTarget: target);
+                    if (TryGetMemoryPhi(blockId, kind, out var phi))
+                    {
+                        phi.Target = NewMemoryVersion(kind);
+                        PushMemory(kind, phi.Target);
+                        pushedMemory.Add(kind);
+                        builder.Add(phi.Target);
+                    }
+                    else
+                    {
+                        builder.Add(TopMemory(kind));
+                    }
                 }
 
-                return new SsaTree(node, operands.ToImmutable());
+                _memoryIn[blockId] = builder.ToImmutable();
+            }
+
+            private void RenameOutgoingMemoryStates(int blockId, List<SsaMemoryKind> pushedMemory)
+            {
+                var builder = ImmutableArray.CreateBuilder<SsaMemoryValueName>(SsaMemoryKinds.All.Length);
+                foreach (var kind in SsaMemoryKinds.All)
+                {
+                    if (_memoryLiveness.Defs[blockId].Contains(kind))
+                    {
+                        var outValue = NewMemoryVersion(kind);
+                        PushMemory(kind, outValue);
+                        pushedMemory.Add(kind);
+                        builder.Add(outValue);
+                    }
+                    else
+                    {
+                        builder.Add(TopMemory(kind));
+                    }
+                }
+
+                _memoryOut[blockId] = builder.ToImmutable();
+            }
+
+            private bool TryGetMemoryPhi(int blockId, SsaMemoryKind kind, out MutableMemoryPhi phi)
+            {
+                for (int i = 0; i < _memoryPhis[blockId].Length; i++)
+                {
+                    if (_memoryPhis[blockId][i].Kind == kind)
+                    {
+                        phi = _memoryPhis[blockId][i];
+                        return true;
+                    }
+                }
+
+                phi = null!;
+                return false;
+            }
+
+            private SsaTree RenameTree(GenTree node, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            {
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                {
+                    if (fieldAccess.Kind == SsaLocalAccessKind.Use)
+                    {
+                        if (fieldAccess.IsPromotedFieldAccess && _slots.IsPromotable(fieldAccess.Slot))
+                        {
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            return AttachMemory(node, operands, pushedMemory, value: Top(fieldAccess.Slot));
+                        }
+
+                        if (!fieldAccess.IsPromotedFieldAccess && fieldAccess.Field is not null && _slots.IsPromotable(fieldAccess.BaseSlot))
+                        {
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            return AttachMemory(node, operands, pushedMemory, localFieldBaseValue: Top(fieldAccess.BaseSlot), localField: fieldAccess.Field);
+                        }
+                    }
+                    else if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
+                    {
+                        if (_slots.IsPromotable(fieldAccess.Slot))
+                        {
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            var target = NewVersion(fieldAccess.Slot);
+                            Push(fieldAccess.Slot, target);
+                            pushed.Add(fieldAccess.Slot);
+                            return AttachMemory(node, operands, pushedMemory, storeTarget: target);
+                        }
+                    }
+                    else if (fieldAccess.Kind == SsaLocalAccessKind.PartialDefinition)
+                    {
+                        if (_slots.IsPromotable(fieldAccess.BaseSlot))
+                        {
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            var previous = Top(fieldAccess.BaseSlot);
+                            var target = NewVersion(fieldAccess.BaseSlot);
+                            Push(fieldAccess.BaseSlot, target);
+                            pushed.Add(fieldAccess.BaseSlot);
+                            return AttachMemory(node, operands, pushedMemory, storeTarget: target, localFieldBaseValue: previous, localField: fieldAccess.Field);
+                        }
+                    }
+                }
+
+                if (TryGetDirectLoadSlot(node, out var loadSlot) && _slots.IsPromotable(loadSlot))
+                    return AttachMemory(node, ImmutableArray<SsaTree>.Empty, pushedMemory, value: Top(loadSlot));
+
+                {
+                    var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
+                    for (int i = 0; i < node.Operands.Length; i++)
+                        operands.Add(RenameTree(node.Operands[i], pushed, pushedMemory));
+
+                    if (TryGetDirectStoreSlot(node, out var storeSlot) && _slots.IsPromotable(storeSlot))
+                    {
+                        var target = NewVersion(storeSlot);
+                        Push(storeSlot, target);
+                        pushed.Add(storeSlot);
+                        return AttachMemory(node, operands.ToImmutable(), pushedMemory, storeTarget: target);
+                    }
+
+                    return AttachMemory(node, operands.ToImmutable(), pushedMemory);
+                }
+            }
+
+            private SsaTree AttachMemory(
+                GenTree node,
+                ImmutableArray<SsaTree> operands,
+                List<SsaMemoryKind> pushedMemory,
+                SsaValueName? value = null,
+                SsaValueName? storeTarget = null,
+                SsaValueName? localFieldBaseValue = null,
+                RuntimeField? localField = null)
+            {
+                var effects = GetMemoryEffects(node, _slots);
+                var memoryUses = ImmutableArray.CreateBuilder<SsaMemoryValueName>();
+                var memoryDefs = ImmutableArray.CreateBuilder<SsaMemoryValueName>();
+
+                SsaMemoryKindSet useSet = effects.Uses | effects.Definitions;
+                foreach (var kind in SsaMemoryKinds.All)
+                {
+                    if (useSet.Contains(kind))
+                        memoryUses.Add(TopMemory(kind));
+                }
+
+                foreach (var kind in SsaMemoryKinds.All)
+                {
+                    if (!effects.Definitions.Contains(kind))
+                        continue;
+
+                    var def = NewMemoryVersion(kind);
+                    PushMemory(kind, def);
+                    pushedMemory.Add(kind);
+                    memoryDefs.Add(def);
+                }
+
+                return new SsaTree(
+                    node,
+                    operands,
+                    value,
+                    storeTarget,
+                    localFieldBaseValue,
+                    localField,
+                    memoryUses.ToImmutable(),
+                    memoryDefs.ToImmutable());
+            }
+
+            private ImmutableArray<SsaTree> RenameLocalFieldNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            {
+                var operands = ImmutableArray.CreateBuilder<SsaTree>(Math.Max(0, node.Operands.Length - 1));
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (i == fieldAccess.ReceiverOperandIndex)
+                        continue;
+                    operands.Add(RenameTree(node.Operands[i], pushed, pushedMemory));
+                }
+                return operands.ToImmutable();
             }
 
             private SsaValueName Top(SsaSlot slot)
             {
                 if (!_stacks.TryGetValue(slot, out var stack) || stack.Count == 0)
                 {
-                    var initial = new SsaValueName(slot, 0);
-                    _nextVersion[slot] = Math.Max(_nextVersion.TryGetValue(slot, out int n) ? n : 0, 0);
+                    var initial = new SsaValueName(slot, SsaConfig.FirstSsaNumber);
+                    _nextVersion[slot] = Math.Max(_nextVersion.TryGetValue(slot, out int n) ? n : SsaConfig.FirstSsaNumber, SsaConfig.FirstSsaNumber);
                     stack = new Stack<SsaValueName>();
                     stack.Push(initial);
                     _stacks[slot] = stack;
                     if (!_initialValues.Contains(initial))
                         _initialValues.Add(initial);
+                    return initial;
+                }
+
+                return stack.Peek();
+            }
+
+            private SsaMemoryValueName TopMemory(SsaMemoryKind kind)
+            {
+                if (!_memoryStacks.TryGetValue(kind, out var stack) || stack.Count == 0)
+                {
+                    var initial = new SsaMemoryValueName(kind, SsaConfig.FirstSsaNumber);
+                    _nextMemoryVersion[kind] = Math.Max(_nextMemoryVersion.TryGetValue(kind, out int n) ? n : SsaConfig.FirstSsaNumber, SsaConfig.FirstSsaNumber);
+                    stack = new Stack<SsaMemoryValueName>();
+                    stack.Push(initial);
+                    _memoryStacks[kind] = stack;
+                    if (!_initialMemoryValues.Contains(initial))
+                        _initialMemoryValues.Add(initial);
                     return initial;
                 }
 
@@ -1896,6 +4890,13 @@ namespace Cnidaria.Cs
                 return new SsaValueName(slot, next);
             }
 
+            private SsaMemoryValueName NewMemoryVersion(SsaMemoryKind kind)
+            {
+                int next = _nextMemoryVersion.TryGetValue(kind, out int current) ? current + 1 : 1;
+                _nextMemoryVersion[kind] = next;
+                return new SsaMemoryValueName(kind, next);
+            }
+
             private void Push(SsaSlot slot, SsaValueName value)
             {
                 if (!_stacks.TryGetValue(slot, out var stack))
@@ -1906,10 +4907,30 @@ namespace Cnidaria.Cs
                 stack.Push(value);
             }
 
+            private void PushMemory(SsaMemoryKind kind, SsaMemoryValueName value)
+            {
+                if (value.Kind != kind)
+                    throw new InvalidOperationException("Memory SSA push kind mismatch: " + value + " for " + kind.ToString() + ".");
+
+                if (!_memoryStacks.TryGetValue(kind, out var stack))
+                {
+                    stack = new Stack<SsaMemoryValueName>();
+                    _memoryStacks[kind] = stack;
+                }
+                stack.Push(value);
+            }
+
             private void Pop(SsaSlot slot)
             {
                 if (!_stacks.TryGetValue(slot, out var stack) || stack.Count == 0)
                     throw new InvalidOperationException($"SSA rename stack underflow for {slot}.");
+                stack.Pop();
+            }
+
+            private void PopMemory(SsaMemoryKind kind)
+            {
+                if (!_memoryStacks.TryGetValue(kind, out var stack) || stack.Count == 0)
+                    throw new InvalidOperationException($"Memory SSA rename stack underflow for {kind}.");
                 stack.Pop();
             }
         }
@@ -1954,43 +4975,59 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static bool TryGetLoadSlot(GenTree node, out SsaSlot slot)
+        private sealed class MutableMemoryPhi
         {
-            switch (node.Kind)
+            private readonly Dictionary<int, SsaMemoryValueName> _inputs = new();
+
+            public int BlockId { get; }
+            public SsaMemoryKind Kind { get; }
+            public SsaMemoryValueName Target { get; set; }
+
+            public MutableMemoryPhi(int blockId, SsaMemoryKind kind)
             {
-                case GenTreeKind.Arg:
-                    slot = new SsaSlot(SsaSlotKind.Arg, node.Int32);
-                    return true;
-                case GenTreeKind.Local:
-                    slot = new SsaSlot(SsaSlotKind.Local, node.Int32);
-                    return true;
-                case GenTreeKind.Temp:
-                    slot = new SsaSlot(SsaSlotKind.Temp, node.Int32);
-                    return true;
-                default:
-                    slot = default;
-                    return false;
+                BlockId = blockId;
+                Kind = kind;
+            }
+
+            public void SetInput(int predecessorBlockId, SsaMemoryValueName value)
+            {
+                if (value.Kind != Kind)
+                    throw new InvalidOperationException($"Memory phi input kind mismatch for {Kind}: {value}.");
+                _inputs[predecessorBlockId] = value;
+            }
+
+            public SsaMemoryPhi Freeze(CfgBlock block)
+            {
+                var inputs = ImmutableArray.CreateBuilder<SsaMemoryPhiInput>(block.Predecessors.Length);
+                var seen = new HashSet<int>();
+
+                for (int i = 0; i < block.Predecessors.Length; i++)
+                {
+                    int pred = block.Predecessors[i].FromBlockId;
+                    if (!seen.Add(pred))
+                        continue;
+
+                    if (!_inputs.TryGetValue(pred, out var value))
+                        throw new InvalidOperationException($"Missing memory SSA phi input for {Kind} in B{BlockId} from B{pred}.");
+
+                    inputs.Add(new SsaMemoryPhiInput(pred, value));
+                }
+
+                return new SsaMemoryPhi(BlockId, Kind, Target, inputs.ToImmutable());
             }
         }
 
+        private static bool TryGetLoadSlot(GenTree node, out SsaSlot slot)
+            => SsaSlotHelpers.TryGetLoadSlot(node, out slot);
+
         private static bool TryGetStoreSlot(GenTree node, out SsaSlot slot)
-        {
-            switch (node.Kind)
-            {
-                case GenTreeKind.StoreArg:
-                    slot = new SsaSlot(SsaSlotKind.Arg, node.Int32);
-                    return true;
-                case GenTreeKind.StoreLocal:
-                    slot = new SsaSlot(SsaSlotKind.Local, node.Int32);
-                    return true;
-                case GenTreeKind.StoreTemp:
-                    slot = new SsaSlot(SsaSlotKind.Temp, node.Int32);
-                    return true;
-                default:
-                    slot = default;
-                    return false;
-            }
-        }
+            => SsaSlotHelpers.TryGetStoreSlot(node, out slot);
+
+        private static bool TryGetDirectLoadSlot(GenTree node, out SsaSlot slot)
+            => SsaSlotHelpers.TryGetDirectLoadSlot(node, out slot);
+
+        private static bool TryGetDirectStoreSlot(GenTree node, out SsaSlot slot)
+            => SsaSlotHelpers.TryGetDirectStoreSlot(node, out slot);
 
         private static GenStackKind StackKindOf(RuntimeType? type)
         {
@@ -2032,6 +5069,7 @@ namespace Cnidaria.Cs
                     case "UInt64":
                         return GenStackKind.I8;
                     case "Single":
+                        return GenStackKind.R4;
                     case "Double":
                         return GenStackKind.R8;
                     case "IntPtr":
@@ -2051,29 +5089,15 @@ namespace Cnidaria.Cs
         public static SsaOptimizationOptions DefaultWithoutValidation => new SsaOptimizationOptions { Validate = false };
 
         public bool Validate { get; set; } = true;
-        public bool PropagateCopies { get; set; } = true;
         public bool PropagateConstants { get; set; } = true;
         public bool FoldConstants { get; set; } = true;
+        public bool SimplifyAlgebraicIdentities { get; set; } = true;
         public bool RemoveDeadDefinitions { get; set; } = true;
         public int MaxIterations { get; set; } = 8;
     }
 
     internal static class SsaOptimizer
     {
-        public static SsaProgram OptimizeProgram(SsaProgram program, SsaOptimizationOptions? options = null)
-        {
-            if (program is null)
-                throw new ArgumentNullException(nameof(program));
-
-            options ??= SsaOptimizationOptions.Default;
-
-            var methods = ImmutableArray.CreateBuilder<SsaMethod>(program.Methods.Length);
-            for (int i = 0; i < program.Methods.Length; i++)
-                methods.Add(OptimizeMethod(program.Methods[i], options));
-
-            return new SsaProgram(methods.ToImmutable());
-        }
-
         public static SsaMethod OptimizeMethod(SsaMethod method, SsaOptimizationOptions? options = null)
         {
             if (method is null)
@@ -2183,21 +5207,26 @@ namespace Cnidaria.Cs
         {
             private readonly SsaMethod _original;
             private readonly SsaOptimizationOptions _options;
+            private readonly Dictionary<SsaSlot, SsaSlotInfo> _slotInfos = new();
             private int _nextSyntheticTreeId;
 
             public MethodOptimizer(SsaMethod method, SsaOptimizationOptions options)
             {
                 _original = method;
                 _options = options;
+                for (int i = 0; i < method.Slots.Length; i++)
+                    _slotInfos[method.Slots[i].Slot] = method.Slots[i];
                 _nextSyntheticTreeId = MaxTreeId(method) + 1;
             }
 
             public SsaMethod Run()
             {
-                var current = _original;
+                var current = EnsureValueNumbers(_original);
 
                 for (int iteration = 0; iteration < _options.MaxIterations; iteration++)
                 {
+                    current = EnsureValueNumbers(current);
+
                     var facts = ComputeFacts(current);
                     var rewrite = Rewrite(current, facts);
                     var afterRewrite = WithBlocks(current, rewrite.Blocks);
@@ -2208,100 +5237,110 @@ namespace Cnidaria.Cs
 
                     var next = WithBlocks(afterRewrite, dce.Blocks);
                     bool changed = rewrite.Changed || dce.Changed;
-                    current = next;
 
                     if (!changed)
+                    {
+                        current = EnsureValueNumbers(next);
                         break;
+                    }
+
+                    current = EnsureValueNumbers(next);
                 }
 
                 var definitions = BuildValueDefinitions(current.Slots, current.InitialValues, current.Blocks);
-                return new SsaMethod(
+                var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(current.InitialMemoryValues, current.Blocks);
+                GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, current.Blocks);
+                var localDescriptors = BuildSsaLocalDescriptors(current.Slots, definitions, current.SsaLocalDescriptors);
+                var finalWithoutVn = new SsaMethod(
                     current.GenTreeMethod,
                     current.Cfg,
                     current.Slots,
                     current.InitialValues,
                     definitions,
-                    current.Blocks);
+                    current.Blocks,
+                    valueNumbers: null,
+                    ssaLocalDescriptors: localDescriptors,
+                    initialMemoryValues: current.InitialMemoryValues,
+                    memoryDefinitions: memoryDefinitions);
+                return SsaValueNumbering.BuildMethod(finalWithoutVn);
             }
 
             private Dictionary<SsaValueName, ValueFact> ComputeFacts(SsaMethod method)
             {
+                method = EnsureValueNumbers(method);
+
                 var facts = new Dictionary<SsaValueName, ValueFact>();
                 for (int i = 0; i < method.ValueDefinitions.Length; i++)
                     facts[method.ValueDefinitions[i].Name] = ValueFact.Unknown;
 
-                bool changed;
-                int iteration = 0;
-                do
+                if (method.ValueNumbers is null)
+                    return facts;
+
+                if (_options.PropagateConstants)
                 {
-                    changed = false;
-
-                    for (int b = 0; b < method.Blocks.Length; b++)
+                    for (int i = 0; i < method.ValueDefinitions.Length; i++)
                     {
-                        var block = method.Blocks[b];
-                        for (int p = 0; p < block.Phis.Length; p++)
-                        {
-                            var phi = block.Phis[p];
-                            var fact = EvaluatePhi(phi, facts);
-                            if (SetFact(facts, phi.Target, fact))
-                                changed = true;
-                        }
-
-                        for (int s = 0; s < block.Statements.Length; s++)
-                            CollectStoreFacts(block.Statements[s], facts, ref changed);
+                        var name = method.ValueDefinitions[i].Name;
+                        if (TryGetSsaConstant(method, name, out var constant))
+                            SetFact(facts, name, ValueFact.ForConstant(constant));
                     }
-
-                    iteration++;
                 }
-                while (changed && iteration < _options.MaxIterations);
 
                 return facts;
             }
 
-            private ValueFact EvaluatePhi(SsaPhi phi, Dictionary<SsaValueName, ValueFact> facts)
-            {
-                if (phi.Inputs.Length == 0)
-                    return ValueFact.Unknown;
-
-                ValueFact? merged = null;
-                for (int i = 0; i < phi.Inputs.Length; i++)
-                {
-                    var input = NormalizeValue(phi.Inputs[i].Value, facts);
-                    if (input.Kind == ValueFactKind.Alias && input.Alias.Equals(phi.Target))
-                        input = ValueFact.Unknown;
-
-                    if (!merged.HasValue)
-                    {
-                        merged = input;
-                        continue;
-                    }
-
-                    if (!merged.Value.Equals(input))
-                        return ValueFact.Unknown;
-                }
-
-                return merged.GetValueOrDefault(ValueFact.Unknown);
-            }
-
-            private void CollectStoreFacts(SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, ref bool changed)
+            private void CollectVnFactsForTree(
+                SsaMethod method,
+                SsaTree tree,
+                Dictionary<SsaValueName, ValueFact> facts,
+                Dictionary<ValueNumber, SsaValueName> available)
             {
                 for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectStoreFacts(tree.Operands[i], facts, ref changed);
+                    CollectVnFactsForTree(method, tree.Operands[i], facts, available);
 
                 if (!tree.StoreTarget.HasValue)
                     return;
 
-                var value = tree.Operands.Length == 1
-                    ? EvaluateTree(tree.Operands[0], facts)
-                    : ValueFact.Unknown;
+                var target = tree.StoreTarget.Value;
+                ValueFact value = ValueFact.Unknown;
 
-                if (value.Kind == ValueFactKind.Alias && value.Alias.Equals(tree.StoreTarget.Value))
+                if (tree.Operands.Length == 1)
+                    value = EvaluateTree(method, tree.Operands[0], facts);
+
+                if (_options.PropagateConstants && TryGetSsaConstant(method, target, out var constant))
+                    value = ValueFact.ForConstant(constant);
+
+                if (value.Kind == ValueFactKind.Alias && value.Alias.Equals(target))
                     value = ValueFact.Unknown;
 
-                if (SetFact(facts, tree.StoreTarget.Value, value))
-                    changed = true;
+                if (value.Kind == ValueFactKind.Alias)
+                    value = ValueFact.Unknown;
+
+                if (value.Kind != ValueFactKind.Unknown)
+                    SetFact(facts, target, value);
+
+                PublishDefinition(method, target, facts, available);
             }
 
+            private void PublishDefinition(
+                SsaMethod method,
+                SsaValueName target,
+                Dictionary<SsaValueName, ValueFact> facts,
+                Dictionary<ValueNumber, SsaValueName> available)
+            {
+                if (!TryGetSsaValueNumber(method, target, out var vn) || !vn.IsValid)
+                    return;
+
+                if (_options.PropagateConstants && TryGetConstantFromValueNumber(method, vn, out var constant))
+                {
+                    SetFact(facts, target, ValueFact.ForConstant(constant));
+                    return;
+                }
+
+
+                if (CanPublishAsValueNumber(target) && !available.ContainsKey(vn))
+                    available.Add(vn, target);
+            }
             private bool SetFact(Dictionary<SsaValueName, ValueFact> facts, SsaValueName name, ValueFact fact)
             {
                 if (fact.Kind == ValueFactKind.Alias)
@@ -2324,7 +5363,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            private ValueFact EvaluateTree(SsaTree tree, Dictionary<SsaValueName, ValueFact> facts)
+            private ValueFact EvaluateTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts)
             {
                 if (tree.Value.HasValue)
                     return NormalizeValue(tree.Value.Value, facts);
@@ -2332,27 +5371,30 @@ namespace Cnidaria.Cs
                 if (TryGetSourceConstant(tree.Source, out var sourceConstant))
                     return ValueFact.ForConstant(sourceConstant);
 
+                if (_options.FoldConstants && TryGetTreeConstant(method, tree, out var vnConstant))
+                    return ValueFact.ForConstant(vnConstant);
+
                 if (!_options.FoldConstants)
                     return ValueFact.Unknown;
 
                 if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
                 {
-                    var operand = EvaluateTree(tree.Operands[0], facts);
+                    var operand = EvaluateTree(method, tree.Operands[0], facts);
                     if (operand.Kind == ValueFactKind.Constant && TryFoldUnary(tree.Source, operand.Constant, out var folded))
                         return ValueFact.ForConstant(folded);
                 }
 
                 if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
                 {
-                    var left = EvaluateTree(tree.Operands[0], facts);
-                    var right = EvaluateTree(tree.Operands[1], facts);
+                    var left = EvaluateTree(method, tree.Operands[0], facts);
+                    var right = EvaluateTree(method, tree.Operands[1], facts);
                     if (left.Kind == ValueFactKind.Constant && right.Kind == ValueFactKind.Constant && TryFoldBinary(tree.Source, left.Constant, right.Constant, out var folded))
                         return ValueFact.ForConstant(folded);
                 }
 
                 if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
                 {
-                    var operand = EvaluateTree(tree.Operands[0], facts);
+                    var operand = EvaluateTree(method, tree.Operands[0], facts);
                     if (operand.Kind == ValueFactKind.Constant && TryFoldConversion(tree.Source, operand.Constant, out var folded))
                         return ValueFact.ForConstant(folded);
                 }
@@ -2376,7 +5418,133 @@ namespace Cnidaria.Cs
                     current = fact.Alias;
                 }
 
-                return _options.PropagateCopies ? ValueFact.ForAlias(current) : ValueFact.Unknown;
+                return ValueFact.Unknown;
+            }
+
+            private static SsaMethod EnsureValueNumbers(SsaMethod method)
+                => method.ValueNumbers is null ? SsaValueNumbering.BuildMethod(method) : method;
+
+            private bool TryGetSsaConstant(SsaMethod method, SsaValueName name, out ConstValue constant)
+            {
+                constant = default;
+                if (!TryGetSsaValueNumber(method, name, out var vn))
+                    return false;
+                return TryGetConstantFromValueNumber(method, vn, out constant);
+            }
+
+            private bool TryGetTreeConstant(SsaMethod method, SsaTree tree, out ConstValue constant)
+            {
+                constant = default;
+
+                if (tree.Value.HasValue)
+                    return TryGetSsaConstant(method, tree.Value.Value, out constant);
+
+                if (tree.Source is null || method.ValueNumbers is null)
+                    return false;
+
+                if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
+                    return false;
+
+                return TryGetConstantFromValueNumber(method, pair.Liberal, out constant);
+            }
+
+            private static bool TryGetSsaValueNumber(SsaMethod method, SsaValueName name, out ValueNumber vn)
+            {
+                vn = ValueNumberStore.NoVN;
+                if (method.ValueNumbers is null)
+                    return false;
+                if (!method.ValueNumbers.TryGetSsaValue(name, out var pair))
+                    return false;
+                vn = pair.Liberal;
+                return vn.IsValid;
+            }
+
+            private bool TryGetTreeValueNumber(SsaMethod method, SsaTree tree, out ValueNumber vn)
+            {
+                vn = ValueNumberStore.NoVN;
+
+                if (tree.Value.HasValue)
+                    return TryGetSsaValueNumber(method, tree.Value.Value, out vn);
+
+                if (method.ValueNumbers is null || tree.Source is null)
+                    return false;
+
+                if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
+                    return false;
+
+                vn = pair.Liberal;
+                return vn.IsValid;
+            }
+
+            private bool TryGetConstantFromValueNumber(SsaMethod method, ValueNumber vn, out ConstValue constant)
+            {
+                constant = default;
+                if (method.ValueNumbers is null || !vn.IsValid)
+                    return false;
+
+                if (!method.ValueNumbers.Store.TryGetConstant(vn, out var key))
+                    return false;
+
+                switch (key.Kind)
+                {
+                    case ValueNumberConstantKind.Int32:
+                        constant = ConstValue.ForI4((int)key.A);
+                        return true;
+                    case ValueNumberConstantKind.Int64:
+                        constant = ConstValue.ForI8(key.A);
+                        return true;
+                    case ValueNumberConstantKind.Null:
+                        constant = ConstValue.Null;
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
+            private bool SameValueNumber(SsaMethod method, SsaTree left, SsaTree right)
+            {
+                return TryGetTreeValueNumber(method, left, out var leftVn) &&
+                       TryGetTreeValueNumber(method, right, out var rightVn) &&
+                       leftVn.IsValid &&
+                       leftVn == rightVn;
+            }
+
+            private bool CanPublishAsValueNumber(SsaValueName target)
+            {
+                if (!_slotInfos.TryGetValue(target.Slot, out var info))
+                    return false;
+
+                if (info.AddressExposed)
+                    return false;
+
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                return abi.PassingKind is AbiValuePassingKind.ScalarRegister or AbiValuePassingKind.MultiRegister;
+            }
+
+            private static bool IsGcOrManagedPointerKind(GenStackKind stackKind)
+                => stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
+
+            private static bool CanReplaceWithConstant(GenTree template, ConstValue constant)
+            {
+                if (constant.Kind == ConstKind.Null)
+                {
+                    return template.Kind == GenTreeKind.ConstNull;
+                }
+
+                return IsIntegerLike(template.StackKind);
+            }
+
+            private static bool SameRuntimeType(RuntimeType? left, RuntimeType? right)
+            {
+                if (ReferenceEquals(left, right))
+                    return true;
+                if (left is null || right is null)
+                    return false;
+                return left.Namespace == right.Namespace &&
+                       left.Name == right.Name &&
+                       left.Kind == right.Kind &&
+                       left.SizeOf == right.SizeOf &&
+                       left.IsReferenceType == right.IsReferenceType;
             }
 
             private OptimizationResult Rewrite(SsaMethod method, Dictionary<SsaValueName, ValueFact> facts)
@@ -2398,18 +5566,7 @@ namespace Cnidaria.Cs
                         {
                             var input = phi.Inputs[i];
                             var fact = NormalizeValue(input.Value, facts);
-                            if (_options.PropagateCopies &&
-                                fact.Kind == ValueFactKind.Alias &&
-                                !fact.Alias.Equals(input.Value) &&
-                                fact.Alias.Slot.Equals(phi.Slot))
-                            {
-                                newInputs.Add(new SsaPhiInput(input.PredecessorBlockId, fact.Alias));
-                                phiChanged = true;
-                            }
-                            else
-                            {
-                                newInputs.Add(input);
-                            }
+                            newInputs.Add(input);
                         }
 
                         var rewrittenPhi = phiChanged
@@ -2431,11 +5588,11 @@ namespace Cnidaria.Cs
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
                     for (int s = 0; s < block.Statements.Length; s++)
                     {
-                        var rewritten = RewriteTree(block.Statements[s], facts, ref changed);
+                        var rewritten = RewriteTree(method, block.Statements[s], facts, ref changed);
                         statements.Add(rewritten);
                     }
 
-                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable()));
+                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
                 }
 
                 return new OptimizationResult(blocks.ToImmutable(), changed);
@@ -2443,7 +5600,7 @@ namespace Cnidaria.Cs
 
             private bool PhiIsTrivial(SsaPhi phi, Dictionary<SsaValueName, ValueFact> facts)
             {
-                if (!_options.PropagateCopies && !_options.PropagateConstants)
+                if (!_options.PropagateConstants)
                     return false;
 
                 var fact = NormalizeValue(phi.Target, facts);
@@ -2473,24 +5630,15 @@ namespace Cnidaria.Cs
                 return single.HasValue && !single.Value.Equals(phi.Target);
             }
 
-            private SsaTree RewriteTree(SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, ref bool changed)
+            private SsaTree RewriteTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, ref bool changed)
             {
                 if (tree.Value.HasValue)
                 {
                     var fact = NormalizeValue(tree.Value.Value, facts);
-                    if (_options.PropagateConstants && fact.Kind == ValueFactKind.Constant)
+                    if (_options.PropagateConstants && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(tree.Source, fact.Constant))
                     {
                         changed = true;
                         return new SsaTree(CreateConstantTree(tree.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
-                    }
-
-                    if (_options.PropagateCopies &&
-                        fact.Kind == ValueFactKind.Alias &&
-                        !fact.Alias.Equals(tree.Value.Value) &&
-                        fact.Alias.Slot.Equals(tree.Value.Value.Slot))
-                    {
-                        changed = true;
-                        return new SsaTree(tree.Source, ImmutableArray<SsaTree>.Empty, value: fact.Alias);
                     }
 
                     return tree;
@@ -2500,7 +5648,7 @@ namespace Cnidaria.Cs
                 bool operandChanged = false;
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
-                    var rewritten = RewriteTree(tree.Operands[i], facts, ref changed);
+                    var rewritten = RewriteTree(method, tree.Operands[i], facts, ref changed);
                     if (!ReferenceEquals(rewritten, tree.Operands[i]))
                         operandChanged = true;
                     operands.Add(rewritten);
@@ -2508,13 +5656,21 @@ namespace Cnidaria.Cs
 
                 var newOperands = operandChanged ? operands.ToImmutable() : tree.Operands;
                 var candidate = operandChanged
-                    ? new SsaTree(tree.Source, newOperands, tree.Value, tree.StoreTarget)
+                    ? new SsaTree(tree.Source, newOperands, tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions)
                     : tree;
+
+                if (_options.SimplifyAlgebraicIdentities && TrySimplifyTree(method, candidate, facts, out var simplified))
+                {
+                    changed = true;
+                    return simplified;
+                }
 
                 if (_options.FoldConstants && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source))
                 {
-                    var fact = EvaluateTree(candidate, facts);
-                    if (fact.Kind == ValueFactKind.Constant && !TryGetSourceConstant(candidate.Source, out _))
+                    var fact = EvaluateTree(method, candidate, facts);
+                    if (fact.Kind == ValueFactKind.Constant &&
+                        !TryGetSourceConstant(candidate.Source, out _) &&
+                        CanReplaceWithConstant(candidate.Source, fact.Constant))
                     {
                         changed = true;
                         return new SsaTree(CreateConstantTree(candidate.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
@@ -2552,6 +5708,12 @@ namespace Cnidaria.Cs
                         var statement = block.Statements[s];
                         if (statement.StoreTarget.HasValue && !live.Contains(statement.StoreTarget.Value))
                         {
+                            if (MustPreserveDeadStore(statement.StoreTarget.Value))
+                            {
+                                statements.Add(statement);
+                                continue;
+                            }
+
                             var sideEffects = ExtractSideEffects(statement);
                             if (sideEffects is not null)
                                 statements.Add(sideEffects);
@@ -2568,10 +5730,22 @@ namespace Cnidaria.Cs
                         statements.Add(statement);
                     }
 
-                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable()));
+                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
                 }
 
                 return new OptimizationResult(blocks.ToImmutable(), changed);
+            }
+
+            private bool MustPreserveDeadStore(SsaValueName target)
+            {
+                if (!_slotInfos.TryGetValue(target.Slot, out var info))
+                    return true;
+
+                if (IsGcOrManagedPointerKind(info.StackKind))
+                    return true;
+
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                return abi.ContainsGcPointers;
             }
 
             private HashSet<SsaValueName> ComputeLiveValues(SsaMethod method)
@@ -2642,6 +5816,9 @@ namespace Cnidaria.Cs
                 if (tree.Value.HasValue)
                     MarkValue(tree.Value.Value, live, work);
 
+                if (tree.LocalFieldBaseValue.HasValue)
+                    MarkValue(tree.LocalFieldBaseValue.Value, live, work);
+
                 if (includeStoreTarget && tree.StoreTarget.HasValue)
                     MarkValue(tree.StoreTarget.Value, live, work);
 
@@ -2696,6 +5873,9 @@ namespace Cnidaria.Cs
 
             private bool HasObservableEffect(SsaTree tree)
             {
+                if (tree.HasMemoryEffects)
+                    return true;
+
                 if (tree.Value.HasValue)
                     return false;
 
@@ -2706,6 +5886,7 @@ namespace Cnidaria.Cs
                 {
                     case GenTreeKind.ConstI4:
                     case GenTreeKind.ConstI8:
+                    case GenTreeKind.ConstR4Bits:
                     case GenTreeKind.ConstR8Bits:
                     case GenTreeKind.ConstNull:
                     case GenTreeKind.ConstString:
@@ -2735,6 +5916,269 @@ namespace Cnidaria.Cs
 
                 return false;
             }
+
+            private bool TrySimplifyTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
+            {
+                simplified = null!;
+
+                if (tree.StoreTarget.HasValue || !ProducesValue(tree.Source))
+                    return false;
+
+                if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
+                    return TrySimplifyUnary(method, tree, facts, out simplified);
+
+                if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
+                    return TrySimplifyBinary(method, tree, facts, out simplified);
+
+                if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
+                    return TrySimplifyConversion(method, tree, facts, out simplified);
+
+                return false;
+            }
+
+            private bool TrySimplifyUnary(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
+            {
+                simplified = null!;
+                var operand = tree.Operands[0];
+                var fact = EvaluateTree(method, operand, facts);
+
+                if (tree.Source.SourceOp == BytecodeOp.Neg && IsZero(fact))
+                {
+                    simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
+                    return true;
+                }
+
+                if (tree.Source.SourceOp == BytecodeOp.Not && IsAllBitsSet(fact))
+                {
+                    simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool TrySimplifyConversion(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
+            {
+                simplified = null!;
+
+                if ((tree.Source.ConvFlags & NumericConvFlags.Checked) != 0)
+                    return false;
+
+                var operand = tree.Operands[0];
+                if (!operand.Value.HasValue)
+                    return false;
+
+                if (!_slotInfos.TryGetValue(operand.Value.Value.Slot, out var operandInfo))
+                    return false;
+
+                var sourceAbi = MachineAbi.ClassifyStorageValue(operandInfo.Type, operandInfo.StackKind);
+                var destinationAbi = MachineAbi.ClassifyStorageValue(tree.Source.Type, tree.Source.StackKind);
+                if (sourceAbi.PassingKind == destinationAbi.PassingKind &&
+                    sourceAbi.RegisterClass == destinationAbi.RegisterClass &&
+                    sourceAbi.Size == destinationAbi.Size &&
+                    sourceAbi.ContainsGcPointers == destinationAbi.ContainsGcPointers)
+                {
+                    simplified = operand;
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool TrySimplifyBinary(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
+            {
+                simplified = null!;
+
+                if (!IsIntegerLike(tree.Source.StackKind) && tree.Source.StackKind is not (GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null))
+                    return false;
+
+                var left = tree.Operands[0];
+                var right = tree.Operands[1];
+                var leftFact = EvaluateTree(method, left, facts);
+                var rightFact = EvaluateTree(method, right, facts);
+                var op = tree.Source.SourceOp;
+
+                switch (op)
+                {
+                    case BytecodeOp.Add:
+                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        if (IsZero(leftFact)) { simplified = right; return true; }
+                        break;
+
+                    case BytecodeOp.Sub:
+                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        break;
+
+                    case BytecodeOp.Mul:
+                        if (IsOne(rightFact)) { simplified = left; return true; }
+                        if (IsOne(leftFact)) { simplified = right; return true; }
+                        if (IsZero(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsZero(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift)) { simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift); return true; }
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift)) { simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift); return true; }
+                        break;
+
+                    case BytecodeOp.Div:
+                    case BytecodeOp.Div_Un:
+                        if (IsOne(rightFact)) { simplified = left; return true; }
+                        break;
+
+                    case BytecodeOp.Rem:
+                    case BytecodeOp.Rem_Un:
+                        if (IsOne(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        break;
+
+                    case BytecodeOp.And:
+                        if (IsZero(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsZero(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsAllBitsSet(rightFact)) { simplified = left; return true; }
+                        if (IsAllBitsSet(leftFact)) { simplified = right; return true; }
+                        if (SameValue(method, left, right, facts)) { simplified = left; return true; }
+                        break;
+
+                    case BytecodeOp.Or:
+                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        if (IsZero(leftFact)) { simplified = right; return true; }
+                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
+                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
+                        if (SameValue(method, left, right, facts)) { simplified = left; return true; }
+                        break;
+
+                    case BytecodeOp.Xor:
+                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        if (IsZero(leftFact)) { simplified = right; return true; }
+                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        break;
+
+                    case BytecodeOp.Shl:
+                    case BytecodeOp.Shr:
+                    case BytecodeOp.Shr_Un:
+                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        break;
+
+                    case BytecodeOp.Ceq:
+                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
+                        break;
+
+                    case BytecodeOp.Clt:
+                    case BytecodeOp.Clt_Un:
+                    case BytecodeOp.Cgt:
+                    case BytecodeOp.Cgt_Un:
+                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
+                        break;
+                }
+
+                return false;
+            }
+
+            private SsaTree CreateConstantSsaTree(GenTree template, ConstValue value)
+                => new SsaTree(CreateConstantTree(template, value), ImmutableArray<SsaTree>.Empty);
+
+            private SsaTree CreateShiftLeftSsaTree(GenTree template, SsaTree value, int shift)
+            {
+                var shiftConst = CreateConstantSsaTree(template, ConstValue.ForI4(shift));
+                var operands = ImmutableArray.Create(value, shiftConst);
+                var genOperands = ImmutableArray.Create(value.Source, shiftConst.Source);
+                var source = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Binary,
+                    template.Pc,
+                    BytecodeOp.Shl,
+                    template.Type,
+                    template.StackKind,
+                    template.Flags & ~(GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow),
+                    genOperands);
+
+                return new SsaTree(source, operands);
+            }
+
+            private GenTree CreateLoadTree(GenTree template, SsaValueName value)
+            {
+                var info = _slotInfos.TryGetValue(value.Slot, out var slotInfo)
+                    ? slotInfo
+                    : new SsaSlotInfo(value.Slot, template.Type, template.StackKind, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
+
+                return new GenTree(
+                    _nextSyntheticTreeId++,
+                    LoadKindFor(value.Slot.Kind),
+                    template.Pc,
+                    BytecodeOp.Nop,
+                    info.Type,
+                    info.StackKind,
+                    GenTreeFlags.LocalUse,
+                    ImmutableArray<GenTree>.Empty,
+                    int32: value.Slot.Index);
+            }
+
+            private static GenTreeKind LoadKindFor(SsaSlotKind kind)
+                => kind switch
+                {
+                    SsaSlotKind.Arg => GenTreeKind.Arg,
+                    SsaSlotKind.Local => GenTreeKind.Local,
+                    SsaSlotKind.Temp => GenTreeKind.Temp,
+                    _ => GenTreeKind.Nop,
+                };
+
+            private bool SameValue(SsaMethod method, SsaTree left, SsaTree right, Dictionary<SsaValueName, ValueFact> facts)
+            {
+                if (SameValueNumber(method, left, right))
+                    return true;
+
+                var leftFact = EvaluateTree(method, left, facts);
+                var rightFact = EvaluateTree(method, right, facts);
+
+                if (leftFact.Kind == ValueFactKind.Constant && rightFact.Kind == ValueFactKind.Constant)
+                    return leftFact.Constant.Equals(rightFact.Constant);
+
+                if (leftFact.Kind == ValueFactKind.Alias && rightFact.Kind == ValueFactKind.Alias)
+                    return leftFact.Alias.Equals(rightFact.Alias);
+
+                if (left.Value.HasValue && right.Value.HasValue)
+                    return left.Value.Value.Equals(right.Value.Value);
+
+                return false;
+            }
+
+            private static bool IsZero(ValueFact fact)
+                => fact.Kind == ValueFactKind.Constant &&
+                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == 0 ||
+                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 0 ||
+                    fact.Constant.Kind == ConstKind.Null);
+
+            private static bool IsOne(ValueFact fact)
+                => fact.Kind == ValueFactKind.Constant &&
+                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == 1 ||
+                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 1);
+
+            private static bool IsAllBitsSet(ValueFact fact)
+                => fact.Kind == ValueFactKind.Constant &&
+                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == -1 ||
+                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == -1);
+
+            private static bool TryGetPositivePowerOfTwoShift(ValueFact fact, out int shift)
+            {
+                shift = 0;
+                if (fact.Kind != ValueFactKind.Constant || fact.Constant.Kind == ConstKind.Null)
+                    return false;
+
+                ulong value = fact.Constant.Kind == ConstKind.I8
+                    ? (ulong)fact.Constant.I8
+                    : (uint)fact.Constant.I4;
+
+                if (value <= 1 || (value & (value - 1)) != 0)
+                    return false;
+
+                while ((value >>= 1) != 0)
+                    shift++;
+                return true;
+            }
+
+            private static ConstValue ZeroFor(GenTree template)
+                => template.StackKind == GenStackKind.I8 ? ConstValue.ForI8(0) : ConstValue.ForI4(0);
+
+            private static ConstValue AllBitsSetFor(GenTree template)
+                => template.StackKind == GenStackKind.I8 ? ConstValue.ForI8(-1) : ConstValue.ForI4(-1);
 
             private GenTree CreateConstantTree(GenTree template, ConstValue constant)
             {
@@ -2812,6 +6256,15 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
+
+            private static bool IsIntegerLike(GenStackKind stackKind)
+                => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
+
+            private static bool IsPotentiallyThrowingBinaryOp(BytecodeOp op)
+                => op is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un;
+
+            private static bool IsCommutativeBinaryOp(BytecodeOp op)
+                => op is BytecodeOp.Add or BytecodeOp.Mul or BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or BytecodeOp.Ceq;
 
             private static bool TryFoldUnary(GenTree source, ConstValue operand, out ConstValue result)
             {
@@ -3109,14 +6562,146 @@ namespace Cnidaria.Cs
 
             private static SsaMethod WithBlocks(SsaMethod method, ImmutableArray<SsaBlock> blocks)
             {
-                var definitions = BuildValueDefinitions(method.Slots, method.InitialValues, blocks);
+                var compacted = CompactSsaNumbers(method.InitialValues, blocks);
+                var definitions = BuildValueDefinitions(method.Slots, compacted.InitialValues, compacted.Blocks);
+                var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(method.InitialMemoryValues, compacted.Blocks);
+                GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, compacted.Blocks);
+                var localDescriptors = BuildSsaLocalDescriptors(method.Slots, definitions, method.SsaLocalDescriptors);
                 return new SsaMethod(
                     method.GenTreeMethod,
                     method.Cfg,
                     method.Slots,
-                    method.InitialValues,
+                    compacted.InitialValues,
                     definitions,
-                    blocks);
+                    compacted.Blocks,
+                    valueNumbers: null,
+                    ssaLocalDescriptors: localDescriptors,
+                    initialMemoryValues: method.InitialMemoryValues,
+                    memoryDefinitions: memoryDefinitions);
+            }
+
+            private readonly struct SsaCompactionResult
+            {
+                public readonly ImmutableArray<SsaValueName> InitialValues;
+                public readonly ImmutableArray<SsaBlock> Blocks;
+
+                public SsaCompactionResult(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks)
+                {
+                    InitialValues = initialValues;
+                    Blocks = blocks;
+                }
+            }
+
+            private static SsaCompactionResult CompactSsaNumbers(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks)
+            {
+                var map = new Dictionary<SsaValueName, SsaValueName>();
+                var nextBySlot = new Dictionary<SsaSlot, int>();
+                var compactedInitialValues = ImmutableArray.CreateBuilder<SsaValueName>(initialValues.Length);
+
+                for (int i = 0; i < initialValues.Length; i++)
+                {
+                    var oldInitial = initialValues[i];
+                    var newInitial = new SsaValueName(oldInitial.Slot, SsaConfig.FirstSsaNumber);
+                    if (!map.TryAdd(oldInitial, newInitial))
+                        throw new InvalidOperationException("Duplicate initial SSA value " + oldInitial + ".");
+                    nextBySlot[oldInitial.Slot] = SsaConfig.FirstSsaNumber;
+                    compactedInitialValues.Add(newInitial);
+                }
+
+                for (int b = 0; b < blocks.Length; b++)
+                {
+                    var block = blocks[b];
+                    for (int p = 0; p < block.Phis.Length; p++)
+                        AssignDefinition(block.Phis[p].Target);
+
+                    for (int s = 0; s < block.Statements.Length; s++)
+                        AssignDefinitions(block.Statements[s]);
+                }
+
+                var compactedBlocks = ImmutableArray.CreateBuilder<SsaBlock>(blocks.Length);
+                for (int b = 0; b < blocks.Length; b++)
+                {
+                    var block = blocks[b];
+                    var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
+                    for (int p = 0; p < block.Phis.Length; p++)
+                    {
+                        var phi = block.Phis[p];
+                        var inputs = ImmutableArray.CreateBuilder<SsaPhiInput>(phi.Inputs.Length);
+                        for (int i = 0; i < phi.Inputs.Length; i++)
+                        {
+                            var input = phi.Inputs[i];
+                            inputs.Add(new SsaPhiInput(input.PredecessorBlockId, MapUse(input.Value, "phi input")));
+                        }
+
+                        phis.Add(new SsaPhi(block.Id, phi.Slot, MapDefinition(phi.Target), inputs.ToImmutable()));
+                    }
+
+                    var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
+                    for (int s = 0; s < block.Statements.Length; s++)
+                        statements.Add(RewriteTree(block.Statements[s]));
+
+                    compactedBlocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
+                }
+
+                var initialList = new List<SsaValueName>(compactedInitialValues.Count);
+                for (int i = 0; i < compactedInitialValues.Count; i++)
+                    initialList.Add(compactedInitialValues[i]);
+                initialList.Sort();
+                return new SsaCompactionResult(initialList.ToImmutableArray(), compactedBlocks.ToImmutable());
+
+                void AssignDefinitions(SsaTree tree)
+                {
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                        AssignDefinitions(tree.Operands[i]);
+
+                    if (tree.StoreTarget.HasValue)
+                        AssignDefinition(tree.StoreTarget.Value);
+                }
+
+                void AssignDefinition(SsaValueName oldName)
+                {
+                    if (oldName.Version <= SsaConfig.ReservedSsaNumber)
+                        throw new InvalidOperationException("Non-initial SSA definition reused the reserved SSA number: " + oldName + ".");
+                    if (map.ContainsKey(oldName))
+                        throw new InvalidOperationException("Duplicate active SSA definition " + oldName + ".");
+
+                    int next = nextBySlot.TryGetValue(oldName.Slot, out int current) ? current + 1 : SsaConfig.FirstSsaNumber;
+                    var newName = new SsaValueName(oldName.Slot, next);
+                    nextBySlot[oldName.Slot] = next;
+                    map.Add(oldName, newName);
+                }
+
+                SsaValueName MapDefinition(SsaValueName oldName)
+                {
+                    if (map.TryGetValue(oldName, out var newName))
+                        return newName;
+                    throw new InvalidOperationException("Active SSA definition " + oldName + " was not assigned a compact SSA number.");
+                }
+
+                SsaValueName MapUse(SsaValueName oldName, string context)
+                {
+                    if (map.TryGetValue(oldName, out var newName))
+                        return newName;
+                    throw new InvalidOperationException("SSA " + context + " uses removed or never-defined value " + oldName + ".");
+                }
+
+                SsaTree RewriteTree(SsaTree tree)
+                {
+                    var operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                        operands.Add(RewriteTree(tree.Operands[i]));
+
+                    SsaValueName? value = tree.Value.HasValue
+                        ? MapUse(tree.Value.Value, "tree use")
+                        : null;
+                    SsaValueName? target = tree.StoreTarget.HasValue
+                        ? MapDefinition(tree.StoreTarget.Value)
+                        : null;
+                    SsaValueName? localFieldBase = tree.LocalFieldBaseValue.HasValue
+                        ? MapUse(tree.LocalFieldBaseValue.Value, "local field base")
+                        : null;
+                    return new SsaTree(tree.Source, operands.ToImmutable(), value, target, localFieldBase, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
+                }
             }
 
             private static ImmutableArray<SsaValueDefinition> BuildValueDefinitions(
@@ -3135,7 +6720,16 @@ namespace Cnidaria.Cs
                 {
                     var name = initialValues[i];
                     var info = GetSlotInfo(infoBySlot, name.Slot);
-                    Add(new SsaValueDefinition(name, -1, -1, -1, true, false, info.Type, info.StackKind));
+                    Add(new SsaValueDefinition(new SsaDescriptor(
+                    name.Slot,
+                    name.Version,
+                    SsaDefinitionKind.Initial,
+                    -1,
+                    -1,
+                    -1,
+                    defNode: null,
+                    info.Type,
+                    info.StackKind)));
                 }
 
                 for (int b = 0; b < blocks.Length; b++)
@@ -3145,27 +6739,51 @@ namespace Cnidaria.Cs
                     {
                         var phi = block.Phis[p];
                         var info = GetSlotInfo(infoBySlot, phi.Target.Slot);
-                        Add(new SsaValueDefinition(phi.Target, block.Id, -1, -1, false, true, info.Type, info.StackKind));
+                        Add(new SsaValueDefinition(new SsaDescriptor(
+                        phi.Target.Slot,
+                        phi.Target.Version,
+                        SsaDefinitionKind.Phi,
+                        block.Id,
+                        -1,
+                        -1,
+                        defNode: null,
+                        info.Type,
+                        info.StackKind,
+                        defBlock: block.CfgBlock,
+                        phiDescriptor: phi)));
                     }
 
                     for (int s = 0; s < block.Statements.Length; s++)
-                        CollectDefinitions(block.Statements[s], block.Id, s);
+                        CollectDefinitions(block.Statements[s], block, s);
                 }
 
                 definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
                 return definitions.ToImmutableArray();
 
-                void CollectDefinitions(SsaTree tree, int blockId, int statementIndex)
+                void CollectDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
                 {
                     for (int i = 0; i < tree.Operands.Length; i++)
-                        CollectDefinitions(tree.Operands[i], blockId, statementIndex);
+                        CollectDefinitions(tree.Operands[i], block, statementIndex);
+
+                    int blockId = block.Id;
 
                     if (!tree.StoreTarget.HasValue)
                         return;
 
                     var name = tree.StoreTarget.Value;
                     var info = GetSlotInfo(infoBySlot, name.Slot);
-                    Add(new SsaValueDefinition(name, blockId, statementIndex, tree.Source.Id, false, false, info.Type, info.StackKind));
+                    Add(new SsaValueDefinition(new SsaDescriptor(
+                        name.Slot,
+                        name.Version,
+                        SsaDefinitionKind.Store,
+                        blockId,
+                        statementIndex,
+                        tree.Source.Id,
+                        tree.Source,
+                        info.Type,
+                        info.StackKind,
+                        tree.LocalFieldBaseValue.HasValue ? tree.LocalFieldBaseValue.Value.Version : SsaConfig.ReservedSsaNumber,
+                        block.CfgBlock)));
                 }
 
                 void Add(SsaValueDefinition definition)
@@ -3176,11 +6794,88 @@ namespace Cnidaria.Cs
                 }
             }
 
+            private static ImmutableArray<SsaLocalDescriptor> BuildSsaLocalDescriptors(
+                ImmutableArray<SsaSlotInfo> slots,
+                ImmutableArray<SsaValueDefinition> valueDefinitions,
+                ImmutableArray<SsaLocalDescriptor> previousDescriptors)
+            {
+                var previousBySlot = new Dictionary<SsaSlot, SsaLocalDescriptor>();
+                for (int i = 0; i < previousDescriptors.Length; i++)
+                    previousBySlot[previousDescriptors[i].Slot] = previousDescriptors[i];
+
+                var descriptorsBySlot = new Dictionary<SsaSlot, List<SsaDescriptor>>();
+                for (int i = 0; i < valueDefinitions.Length; i++)
+                {
+                    var descriptor = valueDefinitions[i].Descriptor;
+                    if (!descriptorsBySlot.TryGetValue(descriptor.BaseLocal, out var list))
+                    {
+                        list = new List<SsaDescriptor>();
+                        descriptorsBySlot.Add(descriptor.BaseLocal, list);
+                    }
+                    list.Add(descriptor);
+                }
+
+                var result = ImmutableArray.CreateBuilder<SsaLocalDescriptor>(slots.Length);
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    var info = slots[i];
+                    descriptorsBySlot.TryGetValue(info.Slot, out var list);
+                    var perSsaData = DensePerSsaData(info.Slot, list);
+                    previousBySlot.TryGetValue(info.Slot, out var previous);
+                    var local = new SsaLocalDescriptor(
+                        info.Slot,
+                        info.Type,
+                        info.StackKind,
+                        info.AddressExposed,
+                        previous?.IsSsaPromoted ?? perSsaData.Length != 0,
+                        previous?.LocalDescriptor,
+                        perSsaData);
+                    previous?.LocalDescriptor?.SetSsaDescriptors(perSsaData);
+                    result.Add(local);
+                }
+
+                return result.ToImmutable();
+
+                static ImmutableArray<SsaDescriptor> DensePerSsaData(SsaSlot slot, List<SsaDescriptor>? descriptors)
+                {
+                    if (descriptors is null || descriptors.Count == 0)
+                        return ImmutableArray<SsaDescriptor>.Empty;
+
+                    int max = -1;
+                    for (int i = 0; i < descriptors.Count; i++)
+                        max = Math.Max(max, descriptors[i].SsaNumber);
+
+                    var table = new SsaDescriptor?[max + 1];
+                    for (int i = 0; i < descriptors.Count; i++)
+                    {
+                        var descriptor = descriptors[i];
+                        if (table[descriptor.SsaNumber] is not null)
+                            throw new InvalidOperationException("Duplicate SSA descriptor " + descriptor.Name + ".");
+                        table[descriptor.SsaNumber] = descriptor;
+                    }
+
+                    var builder = ImmutableArray.CreateBuilder<SsaDescriptor>(table.Length);
+                    for (int i = 0; i < table.Length; i++)
+                    {
+                        if (i == SsaConfig.ReservedSsaNumber)
+                        {
+                            builder.Add(null!);
+                            continue;
+                        }
+
+                        if (table[i] is null)
+                            throw new InvalidOperationException("Missing SSA descriptor " + slot + "_" + i.ToString() + ".");
+                        builder.Add(table[i]!);
+                    }
+                    return builder.ToImmutable();
+                }
+            }
+
             private static SsaSlotInfo GetSlotInfo(Dictionary<SsaSlot, SsaSlotInfo> infoBySlot, SsaSlot slot)
             {
                 if (infoBySlot.TryGetValue(slot, out var info))
                     return info;
-                return new SsaSlotInfo(slot, null, GenStackKind.Unknown, addressExposed: false);
+                return new SsaSlotInfo(slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
             }
 
             private static int MaxTreeId(SsaMethod method)
@@ -3212,14 +6907,19 @@ namespace Cnidaria.Cs
             if (method is null) throw new ArgumentNullException(nameof(method));
 
             var definitions = BuildDefinitionMap(method);
+            var memoryDefinitions = BuildMemoryDefinitionMap(method);
+            VerifyDescriptorTables(method, definitions);
+            VerifyLclVarDscState(method);
 
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 var block = method.Blocks[b];
                 VerifyPhis(method, definitions, block);
+                VerifyMemoryBlockStates(method, memoryDefinitions, block);
+                VerifyMemoryPhis(method, memoryDefinitions, block);
 
                 for (int s = 0; s < block.Statements.Length; s++)
-                    VerifyStatement(method, definitions, block.Id, s, block.Statements[s]);
+                    VerifyStatement(method, definitions, memoryDefinitions, block.Id, s, block.Statements[s]);
             }
         }
 
@@ -3230,12 +6930,15 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.ValueDefinitions.Length; i++)
             {
                 var definition = method.ValueDefinitions[i];
-                if (definition.Name.Version < 0)
+                if (definition.Name.Version <= SsaConfig.ReservedSsaNumber)
                     throw new InvalidOperationException($"Invalid SSA version {definition.Name}.");
+
+                if (!definition.Name.Slot.HasLclNum)
+                    throw new InvalidOperationException($"SSA definition {definition.Name} does not carry a concrete lclNum.");
 
                 if (definition.IsInitial)
                 {
-                    if (definition.Name.Version != 0 || definition.DefBlockId != -1)
+                    if (definition.Name.Version != SsaConfig.FirstSsaNumber || definition.DefBlockId != -1)
                         throw new InvalidOperationException($"Malformed initial SSA definition {definition.Name}.");
                 }
                 else if ((uint)definition.DefBlockId >= (uint)method.Blocks.Length)
@@ -3264,6 +6967,144 @@ namespace Cnidaria.Cs
             return result;
         }
 
+        private static Dictionary<SsaMemoryValueName, SsaMemoryDefinition> BuildMemoryDefinitionMap(SsaMethod method)
+        {
+            var result = new Dictionary<SsaMemoryValueName, SsaMemoryDefinition>();
+
+            for (int i = 0; i < method.MemoryDefinitions.Length; i++)
+            {
+                var definition = method.MemoryDefinitions[i];
+                if (definition.Name.Version <= SsaConfig.ReservedSsaNumber)
+                    throw new InvalidOperationException("Invalid memory SSA version " + definition.Name + ".");
+
+                if (definition.IsInitial)
+                {
+                    if (definition.Name.Version != SsaConfig.FirstSsaNumber || definition.DefBlockId != -1)
+                        throw new InvalidOperationException("Malformed initial memory SSA definition " + definition.Name + ".");
+                }
+                else if ((uint)definition.DefBlockId >= (uint)method.Blocks.Length)
+                {
+                    throw new InvalidOperationException("Memory SSA definition " + definition.Name + " has invalid block B" + definition.DefBlockId.ToString() + ".");
+                }
+
+                if (definition.IsPhi && definition.DefStatementIndex != -1)
+                    throw new InvalidOperationException("Memory phi definition " + definition.Name + " has statement index " + definition.DefStatementIndex.ToString() + ".");
+
+                if (definition.IsStore && definition.DefStatementIndex < 0)
+                    throw new InvalidOperationException("Memory store definition " + definition.Name + " has no statement index.");
+
+                if (definition.IsBlockOut && definition.DefStatementIndex < 0)
+                    throw new InvalidOperationException("Memory block-out definition " + definition.Name + " has no statement index.");
+
+                if (result.ContainsKey(definition.Name))
+                    throw new InvalidOperationException("Duplicate memory SSA definition " + definition.Name + ".");
+
+                result.Add(definition.Name, definition);
+            }
+
+            for (int i = 0; i < method.InitialMemoryValues.Length; i++)
+            {
+                if (!result.TryGetValue(method.InitialMemoryValues[i], out var definition) || !definition.IsInitial)
+                    throw new InvalidOperationException("Initial memory SSA value " + method.InitialMemoryValues[i] + " is missing from definition table.");
+            }
+
+            return result;
+        }
+
+        private static void VerifyDescriptorTables(SsaMethod method, Dictionary<SsaValueName, SsaValueDefinition> definitions)
+        {
+            var localsBySlot = new Dictionary<SsaSlot, SsaLocalDescriptor>();
+            for (int i = 0; i < method.SsaLocalDescriptors.Length; i++)
+            {
+                var local = method.SsaLocalDescriptors[i];
+                if (!local.Slot.HasLclNum)
+                    throw new InvalidOperationException("SSA local descriptor does not carry a concrete lclNum: " + local.Slot + ".");
+                if (local.LocalDescriptor is not null && local.LocalDescriptor.LclNum != local.Slot.LclNum)
+                    throw new InvalidOperationException("SSA local descriptor lclNum disagrees with LclVarDsc: " + local.Slot + " vs " + local.LocalDescriptor + ".");
+                if (localsBySlot.ContainsKey(local.Slot))
+                    throw new InvalidOperationException("Duplicate SSA local descriptor for " + local.Slot + ".");
+                localsBySlot.Add(local.Slot, local);
+
+                for (int ssaNum = SsaConfig.FirstSsaNumber; ssaNum < local.PerSsaData.Length; ssaNum++)
+                {
+                    var descriptor = local.PerSsaData[ssaNum];
+                    if (descriptor is null || !descriptor.BaseLocal.Equals(local.Slot) || descriptor.SsaNumber != ssaNum)
+                        throw new InvalidOperationException("Malformed SSA descriptor table entry for " + local.Slot + " at index " + ssaNum.ToString() + ".");
+                    if (!definitions.TryGetValue(descriptor.Name, out var definition))
+                        throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " is missing from definition table.");
+                    if (!ReferenceEquals(definition.Descriptor, descriptor))
+                        throw new InvalidOperationException("Definition table and descriptor table disagree for " + descriptor.Name + ".");
+                    if (descriptor.IsPartialDefinition)
+                    {
+                        var previous = new SsaValueName(descriptor.BaseLocal, descriptor.PreviousSsaNumber);
+                        if (!definitions.ContainsKey(previous))
+                            throw new InvalidOperationException("Partial SSA definition " + descriptor.Name + " references missing previous definition " + previous + ".");
+                    }
+                }
+            }
+
+            foreach (var item in definitions)
+            {
+                if (!localsBySlot.TryGetValue(item.Key.Slot, out var local))
+                    throw new InvalidOperationException("SSA definition " + item.Key + " is missing its base local descriptor.");
+                if (!local.TryGetSsaDefByNumber(item.Key.Version, out var descriptor) || !ReferenceEquals(descriptor, item.Value.Descriptor))
+                    throw new InvalidOperationException("SSA definition " + item.Key + " is not reachable through base local descriptor.");
+            }
+        }
+
+        private static void VerifyLclVarDscState(SsaMethod method)
+        {
+            var descriptors = method.GenTreeMethod.AllLocalDescriptors;
+            var seenVarIndex = new Dictionary<int, GenLocalDescriptor>();
+
+            for (int i = 0; i < descriptors.Length; i++)
+            {
+                var descriptor = descriptors[i];
+                if (descriptor.LclNum != i)
+                    throw new InvalidOperationException("LclVarDsc table is not dense at lclNum " + i.ToString() + ".");
+
+                if (descriptor.VarIndex >= 0)
+                {
+                    if (!descriptor.Tracked)
+                        throw new InvalidOperationException("Untracked LclVarDsc has lvVarIndex: " + descriptor + ".");
+
+                    if (descriptor.AddressExposed || descriptor.MemoryAliased)
+                        throw new InvalidOperationException("Address-exposed or memory-aliased LclVarDsc participates in tracked-local liveness: " + descriptor + ".");
+
+                    if (seenVarIndex.TryGetValue(descriptor.VarIndex, out var other))
+                        throw new InvalidOperationException("Duplicate dense lvVarIndex " + descriptor.VarIndex.ToString() + " for " + other + " and " + descriptor + ".");
+
+                    seenVarIndex.Add(descriptor.VarIndex, descriptor);
+                }
+
+                if (descriptor.SsaPromoted && !descriptor.CanBeSsaRenamedAsScalar)
+                    throw new InvalidOperationException("Memory-aliased or non-scalar LclVarDsc is marked lvInSsa: " + descriptor + ".");
+            }
+
+            for (int i = 0; i < seenVarIndex.Count; i++)
+            {
+                if (!seenVarIndex.ContainsKey(i))
+                    throw new InvalidOperationException("lvVarIndex is not dense; missing index " + i.ToString() + ".");
+            }
+
+            for (int i = 0; i < method.SsaLocalDescriptors.Length; i++)
+            {
+                var local = method.SsaLocalDescriptors[i];
+                var descriptor = local.LocalDescriptor;
+                if (descriptor is null)
+                    continue;
+
+                if (local.PerSsaData.Length != descriptor.PerSsaData.Length)
+                    throw new InvalidOperationException("SsaLocalDescriptor and LclVarDsc lvPerSsaData length disagree for " + descriptor + ".");
+
+                for (int ssaNum = SsaConfig.ReservedSsaNumber; ssaNum < local.PerSsaData.Length; ssaNum++)
+                {
+                    if (!ReferenceEquals(local.PerSsaData[ssaNum], descriptor.PerSsaData[ssaNum]))
+                        throw new InvalidOperationException("SsaLocalDescriptor and LclVarDsc lvPerSsaData entry disagree for " + descriptor + " at " + ssaNum.ToString() + ".");
+                }
+            }
+        }
+
         private static void VerifyPhis(SsaMethod method, Dictionary<SsaValueName, SsaValueDefinition> definitions, SsaBlock block)
         {
             var expectedPreds = new HashSet<int>();
@@ -3278,6 +7119,9 @@ namespace Cnidaria.Cs
 
                 if (!definition.IsPhi || definition.DefBlockId != block.Id)
                     throw new InvalidOperationException($"Definition table entry for {phi.Target} does not match phi in B{block.Id}.");
+
+                if (!ReferenceEquals(definition.Phi, phi) || !ReferenceEquals(definition.Descriptor.Phi, phi))
+                    throw new InvalidOperationException($"SSA descriptor for phi {phi.Target} in B{block.Id} does not point back to its phi node.");
 
                 if (!phi.Target.Slot.Equals(phi.Slot))
                     throw new InvalidOperationException($"Phi target {phi.Target} in B{block.Id} does not belong to phi slot {phi.Slot}.");
@@ -3300,17 +7144,19 @@ namespace Cnidaria.Cs
         private static void VerifyStatement(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
-            VerifyTreeUses(method, definitions, blockId, statementIndex, tree);
-            VerifyTreeDefinitions(method, definitions, blockId, statementIndex, tree);
+            VerifyTreeUses(method, definitions, memoryDefinitions, blockId, statementIndex, tree);
+            VerifyTreeDefinitions(method, definitions, memoryDefinitions, blockId, statementIndex, tree);
         }
 
         private static void VerifyTreeUses(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
             int blockId,
             int statementIndex,
             SsaTree tree)
@@ -3318,22 +7164,50 @@ namespace Cnidaria.Cs
             if (tree.Value.HasValue)
                 VerifyLocalUse(method, definitions, tree.Value.Value, blockId, statementIndex, tree.Source.Id);
 
+            if (tree.LocalFieldBaseValue.HasValue)
+                VerifyLocalUse(method, definitions, tree.LocalFieldBaseValue.Value, blockId, statementIndex, tree.Source.Id);
+
+            for (int i = 0; i < tree.MemoryUses.Length; i++)
+                VerifyMemoryUse(method, memoryDefinitions, tree.MemoryUses[i], blockId, statementIndex, tree.Source.Id);
+
             for (int i = 0; i < tree.Operands.Length; i++)
-                VerifyTreeUses(method, definitions, blockId, statementIndex, tree.Operands[i]);
+                VerifyTreeUses(method, definitions, memoryDefinitions, blockId, statementIndex, tree.Operands[i]);
         }
 
         private static void VerifyTreeDefinitions(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
             for (int i = 0; i < tree.Operands.Length; i++)
-                VerifyTreeDefinitions(method, definitions, blockId, statementIndex, tree.Operands[i]);
+                VerifyTreeDefinitions(method, definitions, memoryDefinitions, blockId, statementIndex, tree.Operands[i]);
+
+            if (tree.LocalFieldBaseValue.HasValue)
+            {
+                if (tree.LocalField is null)
+                    throw new InvalidOperationException($"SSA local-field node {tree.Source.Id} has a base value but no field.");
+
+                if (tree.StoreTarget.HasValue && !tree.StoreTarget.Value.Slot.Equals(tree.LocalFieldBaseValue.Value.Slot))
+                    throw new InvalidOperationException($"Partial definition at node {tree.Source.Id} changes slot {tree.StoreTarget.Value.Slot} from base slot {tree.LocalFieldBaseValue.Value.Slot}.");
+            }
+
+            for (int i = 0; i < tree.MemoryDefinitions.Length; i++)
+            {
+                var memoryName = tree.MemoryDefinitions[i];
+                if (!memoryDefinitions.TryGetValue(memoryName, out var memoryDefinition))
+                    throw new InvalidOperationException("Memory definition " + memoryName + " at node " + tree.Source.Id.ToString() + " is missing from definition table.");
+                if (!memoryDefinition.IsStore || memoryDefinition.DefBlockId != blockId || memoryDefinition.DefStatementIndex != statementIndex || memoryDefinition.DefTreeId != tree.Source.Id)
+                    throw new InvalidOperationException("Memory definition table entry for " + memoryName + " does not match store node " + tree.Source.Id.ToString() + ".");
+            }
 
             if (!tree.StoreTarget.HasValue)
                 return;
+
+            if (tree.LocalFieldBaseValue.HasValue != tree.IsPartialDefinition)
+                throw new InvalidOperationException($"Store node {tree.Source.Id} has inconsistent partial-definition metadata.");
 
             var name = tree.StoreTarget.Value;
             if (!definitions.TryGetValue(name, out var definition))
@@ -3341,6 +7215,106 @@ namespace Cnidaria.Cs
 
             if (definition.IsInitial || definition.IsPhi || definition.DefBlockId != blockId || definition.DefStatementIndex != statementIndex || definition.DefTreeId != tree.Source.Id)
                 throw new InvalidOperationException($"Definition table entry for {name} does not match store node {tree.Source.Id}.");
+        }
+
+        private static void VerifyMemoryBlockStates(
+            SsaMethod method,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaBlock block)
+        {
+            for (int k = 0; k < SsaMemoryKinds.All.Length; k++)
+            {
+                var kind = SsaMemoryKinds.All[k];
+                if (!block.TryGetMemoryIn(kind, out var memoryIn))
+                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has no incoming memory SSA value for " + SsaMemoryKinds.Name(kind) + ".");
+                if (!memoryDefinitions.ContainsKey(memoryIn))
+                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has undefined incoming memory SSA value " + memoryIn + ".");
+
+                if (!block.TryGetMemoryOut(kind, out var memoryOut))
+                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has no outgoing memory SSA value for " + SsaMemoryKinds.Name(kind) + ".");
+                if (!memoryDefinitions.ContainsKey(memoryOut))
+                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has undefined outgoing memory SSA value " + memoryOut + ".");
+            }
+        }
+
+        private static void VerifyMemoryPhis(
+            SsaMethod method,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaBlock block)
+        {
+            var expectedPreds = new HashSet<int>();
+            for (int p = 0; p < block.CfgBlock.Predecessors.Length; p++)
+                expectedPreds.Add(block.CfgBlock.Predecessors[p].FromBlockId);
+
+            for (int i = 0; i < block.MemoryPhis.Length; i++)
+            {
+                var phi = block.MemoryPhis[i];
+                if (!memoryDefinitions.TryGetValue(phi.Target, out var definition))
+                    throw new InvalidOperationException("Memory phi target " + phi.Target + " in B" + block.Id.ToString() + " is missing from definition table.");
+
+                if (!definition.IsPhi || definition.DefBlockId != block.Id)
+                    throw new InvalidOperationException("Definition table entry for memory phi " + phi.Target + " does not match B" + block.Id.ToString() + ".");
+
+                if (!ReferenceEquals(definition.Phi, phi) || !ReferenceEquals(definition.Descriptor.Phi, phi))
+                    throw new InvalidOperationException("Memory SSA descriptor for phi " + phi.Target + " in B" + block.Id.ToString() + " does not point back to its phi node.");
+
+                if (phi.Target.Kind != phi.Kind)
+                    throw new InvalidOperationException("Memory phi target " + phi.Target + " in B" + block.Id.ToString() + " does not belong to phi kind " + SsaMemoryKinds.Name(phi.Kind) + ".");
+
+                if (!block.TryGetMemoryIn(phi.Kind, out var memoryIn) || !memoryIn.Equals(phi.Target))
+                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " incoming memory state for " + SsaMemoryKinds.Name(phi.Kind) + " does not point at its phi target.");
+
+                var actualPreds = new HashSet<int>();
+                for (int p = 0; p < phi.Inputs.Length; p++)
+                {
+                    var input = phi.Inputs[p];
+                    if (input.Value.Kind != phi.Kind)
+                        throw new InvalidOperationException("Memory phi " + phi.Target + " in B" + block.Id.ToString() + " has cross-kind input " + input.Value + " from B" + input.PredecessorBlockId.ToString() + ".");
+                    actualPreds.Add(input.PredecessorBlockId);
+                    VerifyMemoryEdgeUse(method, memoryDefinitions, phi.Target, input.Value, input.PredecessorBlockId);
+                }
+
+                if (!expectedPreds.SetEquals(actualPreds))
+                    throw new InvalidOperationException("Malformed memory phi " + phi.Target + " in B" + block.Id.ToString() + ": predecessor set mismatch.");
+            }
+        }
+
+        private static void VerifyMemoryUse(
+            SsaMethod method,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> definitions,
+            SsaMemoryValueName use,
+            int useBlockId,
+            int useStatementIndex,
+            int useTreeId)
+        {
+            if (!definitions.TryGetValue(use, out var definition))
+                throw new InvalidOperationException("Use of undefined memory SSA value " + use + " at node " + useTreeId.ToString() + ".");
+
+            if (definition.IsInitial)
+                return;
+
+            if (!method.Cfg.Dominates(definition.DefBlockId, useBlockId))
+                throw new InvalidOperationException("Memory SSA definition " + use + " in B" + definition.DefBlockId.ToString() + " does not dominate use at node " + useTreeId.ToString() + " in B" + useBlockId.ToString() + ".");
+
+            if (definition.DefBlockId == useBlockId && !definition.IsPhi && definition.DefStatementIndex >= useStatementIndex)
+                throw new InvalidOperationException("Memory SSA definition " + use + " at statement " + definition.DefStatementIndex.ToString() + " does not precede use at statement " + useStatementIndex.ToString() + " in B" + useBlockId.ToString() + ".");
+        }
+
+        private static void VerifyMemoryEdgeUse(
+            SsaMethod method,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> definitions,
+            SsaMemoryValueName phiTarget,
+            SsaMemoryValueName use,
+            int predecessorBlockId)
+        {
+            if (!definitions.TryGetValue(use, out var definition))
+                throw new InvalidOperationException("Memory phi " + phiTarget + " uses undefined value " + use + " from B" + predecessorBlockId.ToString() + ".");
+
+            if (definition.IsInitial)
+                return;
+
+            if (!method.Cfg.Dominates(definition.DefBlockId, predecessorBlockId))
+                throw new InvalidOperationException("Memory phi " + phiTarget + " input " + use + " from B" + predecessorBlockId.ToString() + " is not dominated by its definition in B" + definition.DefBlockId.ToString() + ".");
         }
 
         private static void VerifyLocalUse(
@@ -3433,6 +7407,35 @@ namespace Cnidaria.Cs
                 sb.AppendLine();
             }
 
+            if (method.InitialMemoryValues.Length != 0)
+            {
+                sb.Append("  initial-memory: ");
+                AppendMemoryValueList(sb, method.InitialMemoryValues);
+                sb.AppendLine();
+            }
+
+            if (method.SsaLocalDescriptors.Length != 0)
+            {
+                sb.AppendLine("  ssa descriptors:");
+                for (int l = 0; l < method.SsaLocalDescriptors.Length; l++)
+                {
+                    var local = method.SsaLocalDescriptors[l];
+                    if (local.PerSsaData.IsDefaultOrEmpty)
+                        continue;
+                    sb.Append("    ").Append(local.Slot).Append(':');
+                    for (int ssaNum = SsaConfig.FirstSsaNumber; ssaNum < local.PerSsaData.Length; ssaNum++)
+                    {
+                        var descriptor = local.PerSsaData[ssaNum];
+                        if (descriptor is null)
+                            continue;
+                        if (ssaNum != SsaConfig.FirstSsaNumber)
+                            sb.Append(';');
+                        sb.Append(' ').Append(descriptor);
+                    }
+                    sb.AppendLine();
+                }
+            }
+
             if (method.Cfg.NaturalLoops.Length != 0)
             {
                 sb.Append("  loops: ");
@@ -3463,6 +7466,13 @@ namespace Cnidaria.Cs
                 }
                 sb.AppendLine();
 
+                if (block.MemoryIn.Length != 0)
+                {
+                    sb.Append("    memory-in: ");
+                    AppendMemoryValueList(sb, block.MemoryIn);
+                    sb.AppendLine();
+                }
+
                 for (int i = 0; i < block.Phis.Length; i++)
                 {
                     var phi = block.Phis[i];
@@ -3475,12 +7485,61 @@ namespace Cnidaria.Cs
                     sb.AppendLine(")");
                 }
 
+                for (int i = 0; i < block.MemoryPhis.Length; i++)
+                {
+                    var phi = block.MemoryPhis[i];
+                    sb.Append("    ").Append(phi.Target).Append(" = memory-phi(");
+                    for (int p = 0; p < phi.Inputs.Length; p++)
+                    {
+                        if (p != 0) sb.Append(", ");
+                        sb.Append("B").Append(phi.Inputs[p].PredecessorBlockId).Append(':').Append(phi.Inputs[p].Value);
+                    }
+                    sb.AppendLine(")");
+                }
+
                 for (int i = 0; i < block.Statements.Length; i++)
                 {
                     sb.Append("    ");
                     AppendTree(sb, block.Statements[i]);
+                    AppendMemoryAnnotation(sb, block.Statements[i]);
                     sb.AppendLine();
                 }
+
+                if (block.MemoryOut.Length != 0)
+                {
+                    sb.Append("    memory-out: ");
+                    AppendMemoryValueList(sb, block.MemoryOut);
+                    sb.AppendLine();
+                }
+            }
+        }
+
+        private static void AppendMemoryValueList(StringBuilder sb, ImmutableArray<SsaMemoryValueName> values)
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (i != 0) sb.Append(", ");
+                sb.Append(values[i]);
+            }
+        }
+
+        private static void AppendMemoryAnnotation(StringBuilder sb, SsaTree tree)
+        {
+            if (!tree.HasMemoryEffects)
+                return;
+
+            sb.Append("  ; mem");
+            if (tree.MemoryUses.Length != 0)
+            {
+                sb.Append(" use=[");
+                AppendMemoryValueList(sb, tree.MemoryUses);
+                sb.Append(']');
+            }
+            if (tree.MemoryDefinitions.Length != 0)
+            {
+                sb.Append(" def=[");
+                AppendMemoryValueList(sb, tree.MemoryDefinitions);
+                sb.Append(']');
             }
         }
 
@@ -3499,6 +7558,9 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.ConstI8:
                     sb.Append(tree.Source.Int64).Append('L');
+                    return;
+                case GenTreeKind.ConstR4Bits:
+                    sb.Append(BitConverter.Int32BitsToSingle(tree.Source.Int32).ToString("R", System.Globalization.CultureInfo.InvariantCulture)).Append('f');
                     return;
                 case GenTreeKind.ConstR8Bits:
                     sb.Append(BitConverter.Int64BitsToDouble(tree.Source.Int64).ToString("R", System.Globalization.CultureInfo.InvariantCulture));

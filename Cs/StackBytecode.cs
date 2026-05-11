@@ -36,6 +36,7 @@ namespace Cnidaria.Cs
         Ldnull,
         Ldc_I4,
         Ldc_I8,
+        Ldc_R4,
         Ldc_R8,
         Ldstr,          // operand0: UserString token
         DefaultValue,   // operand0: Type token
@@ -1055,7 +1056,7 @@ namespace Cnidaria.Cs
                         unchecked { _il.Emit(BytecodeOp.Ldc_I8, operand2: (long)ul, pop: 0, push: 1); }
                         return;
                     case float f:
-                        _il.Emit(BytecodeOp.Ldc_R8, operand2: BitConverter.DoubleToInt64Bits(f), pop: 0, push: 1);
+                        _il.Emit(BytecodeOp.Ldc_R4, operand0: BitConverter.SingleToInt32Bits(f), pop: 0, push: 1);
                         return;
                     case double d:
                         _il.Emit(BytecodeOp.Ldc_R8, operand2: BitConverter.DoubleToInt64Bits(d), pop: 0, push: 1);
@@ -1122,7 +1123,7 @@ namespace Cnidaria.Cs
                         return;
 
                     case float f:
-                        _il.Emit(BytecodeOp.Ldc_R8, operand2: BitConverter.DoubleToInt64Bits(f), pop: 0, push: 1);
+                        _il.Emit(BytecodeOp.Ldc_R4, operand0: BitConverter.SingleToInt32Bits(f), pop: 0, push: 1);
                         return;
 
                     case double d:

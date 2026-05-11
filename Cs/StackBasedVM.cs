@@ -20,6 +20,7 @@ namespace Cnidaria.Cs
     {
         I4,
         I8,
+        R4,
         R8,
         Ref,   // payload: handle/offset, aux: type id/token if needed
         Ptr,   // payload: offset in mem, aux: elementSize
@@ -52,13 +53,19 @@ namespace Cnidaria.Cs
             return Payload;
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float AsR4Checked()
+        {
+            if (Kind != SlotKind.R4) throw new InvalidOperationException($"Expected R4, got {Kind}");
+            return BitConverter.Int32BitsToSingle(unchecked((int)Payload));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public double AsR8Checked()
         {
             if (Kind != SlotKind.R8) throw new InvalidOperationException($"Expected R8, got {Kind}");
             return BitConverter.Int64BitsToDouble(Payload);
         }
     }
-    
+
     internal sealed class StackBasedVm
     {
         private enum PendingCtorResultKind : byte
@@ -72,7 +79,7 @@ namespace Cnidaria.Cs
         private readonly struct PendingCtorResult
         {
             public readonly PendingCtorResultKind Kind;
-            public readonly long Payload;      
+            public readonly long Payload;
             public readonly RuntimeType? Type;
 
             public PendingCtorResult(PendingCtorResultKind kind, long payload, RuntimeType? type)
@@ -210,7 +217,8 @@ namespace Cnidaria.Cs
             None = 0,
             I4 = 1,
             I8 = 2,
-            R8 = 3,
+            R4 = 3,
+            R8 = 4,
         }
         private sealed class MethodExecLayout
         {
@@ -374,9 +382,9 @@ namespace Cnidaria.Cs
         private const int FrameHeaderSize = 76;
         public void Execute(
             RuntimeModule entryModule,
-            BytecodeFunction entry, 
-            CancellationToken ct, 
-            ExecutionLimits limits, 
+            BytecodeFunction entry,
+            CancellationToken ct,
+            ExecutionLimits limits,
             ReadOnlySpan<Slot> initialArgs = default)
         {
             if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
@@ -427,6 +435,10 @@ namespace Cnidaria.Cs
 
                         case BytecodeOp.Ldc_I8:
                             PushSlot(new Slot(SlotKind.I8, ins.Operand2));
+                            break;
+
+                        case BytecodeOp.Ldc_R4:
+                            PushSlot(new Slot(SlotKind.R4, ins.Operand0));
                             break;
 
                         case BytecodeOp.Ldc_R8:
@@ -1296,11 +1308,11 @@ namespace Cnidaria.Cs
             }
 
             _gcRunning = true;
-                SpillCurrentFrameHotState();
-                CollectGarbage();
-                _allocDebtBytes = 0;
-                _gcRequested = false;
-                RecomputeGcThresholds();
+            SpillCurrentFrameHotState();
+            CollectGarbage();
+            _allocDebtBytes = 0;
+            _gcRequested = false;
+            RecomputeGcThresholds();
             // no try finally for better inlining, since GC failure is fatal
             _gcRunning = false;
         }
@@ -2462,7 +2474,7 @@ namespace Cnidaria.Cs
             else
                 PushSlot(new Slot(SlotKind.I4, unchecked((int)diffElems)));
         }
-       
+
         private void ExecLdobj(RuntimeModule mod, int typeToken)
         {
             var a = PopSlot();
@@ -2649,7 +2661,7 @@ namespace Cnidaria.Cs
 
                 _pendingCtorResults[_frameBase] = PendingCtorResult.ForValue(vt, tempAbs);
             }
-            
+
         }
         private int AllocFrameScratch(int bytes, int align)
         {
@@ -3364,7 +3376,7 @@ namespace Cnidaria.Cs
 
             if (hostEx is OverflowException)
                 return TryCreateCoreException("System", "OverflowException", msg, out vmEx)
-                    || TryCreateCoreException("System", "ArithmeticException", msg,out vmEx)
+                    || TryCreateCoreException("System", "ArithmeticException", msg, out vmEx)
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
             return false;
@@ -3732,8 +3744,7 @@ namespace Cnidaria.Cs
                     case "Single":
                         {
                             int bits = BinaryPrimitives.ReadInt32LittleEndian(_mem.AsSpan(abs, 4));
-                            float f = BitConverter.Int32BitsToSingle(bits);
-                            return new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits((double)f));
+                            return new Slot(SlotKind.R4, bits);
                         }
 
                     case "Double":
@@ -3825,15 +3836,16 @@ namespace Cnidaria.Cs
 
             if (t.Namespace == "System" && t.Name == "Single")
             {
-                float f = v.Kind switch
+                int bits = v.Kind switch
                 {
-                    SlotKind.R8 => (float)v.AsR8Checked(),
-                    SlotKind.I4 => (float)v.AsI4Checked(),
-                    SlotKind.I8 => (float)v.AsI8Checked(),
+                    SlotKind.R4 => unchecked((int)v.Payload),
+                    SlotKind.R8 => BitConverter.SingleToInt32Bits((float)v.AsR8Checked()),
+                    SlotKind.I4 => BitConverter.SingleToInt32Bits((float)v.AsI4Checked()),
+                    SlotKind.I8 => BitConverter.SingleToInt32Bits((float)v.AsI8Checked()),
                     _ => throw new InvalidOperationException($"Cannot store {v.Kind} into System.Single")
                 };
 
-                BinaryPrimitives.WriteInt32LittleEndian(_mem.AsSpan(abs, 4), BitConverter.SingleToInt32Bits(f));
+                BinaryPrimitives.WriteInt32LittleEndian(_mem.AsSpan(abs, 4), bits);
                 return;
             }
 
@@ -3841,6 +3853,7 @@ namespace Cnidaria.Cs
             {
                 double d = v.Kind switch
                 {
+                    SlotKind.R4 => v.AsR4Checked(),
                     SlotKind.R8 => v.AsR8Checked(),
                     SlotKind.I4 => v.AsI4Checked(),
                     SlotKind.I8 => v.AsI8Checked(),
@@ -3924,7 +3937,7 @@ namespace Cnidaria.Cs
             CheckActiveStackAccess(abs, size, writable);
         }
         private static int AlignUp(int v, int a) => (v + (a - 1)) & ~(a - 1);
-        
+
         private void ExecNeg()
         {
             var v = PopSlot();
@@ -3938,6 +3951,13 @@ namespace Cnidaria.Cs
                 case SlotKind.I8:
                     PushSlot(new Slot(SlotKind.I8, unchecked(-v.AsI8Checked())));
                     return;
+
+                case SlotKind.R4:
+                    {
+                        float f = -v.AsR4Checked();
+                        PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(f)));
+                        return;
+                    }
 
                 case SlotKind.R8:
                     {
@@ -4036,6 +4056,13 @@ namespace Cnidaria.Cs
                 return;
             }
 
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4)
+            {
+                float res = a.AsR4Checked() + b.AsR4Checked();
+                PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(res)));
+                return;
+            }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() + b.AsR8Checked();
@@ -4060,6 +4087,13 @@ namespace Cnidaria.Cs
             {
                 long res = unchecked(a.AsI8Checked() - b.AsI8Checked());
                 PushSlot(new Slot(SlotKind.I8, res));
+                return;
+            }
+
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4)
+            {
+                float res = a.AsR4Checked() - b.AsR4Checked();
+                PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(res)));
                 return;
             }
 
@@ -4090,6 +4124,13 @@ namespace Cnidaria.Cs
                 return;
             }
 
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4)
+            {
+                float res = a.AsR4Checked() * b.AsR4Checked();
+                PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(res)));
+                return;
+            }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() * b.AsR8Checked();
@@ -4114,6 +4155,13 @@ namespace Cnidaria.Cs
                 PushSlot(new Slot(SlotKind.I8, res));
                 return;
             }
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4)
+            {
+                float res = a.AsR4Checked() / b.AsR4Checked();
+                PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(res)));
+                return;
+            }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() / b.AsR8Checked();
@@ -4137,6 +4185,13 @@ namespace Cnidaria.Cs
                 PushSlot(new Slot(SlotKind.I8, res));
                 return;
             }
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4)
+            {
+                float res = a.AsR4Checked() % b.AsR4Checked();
+                PushSlot(new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(res)));
+                return;
+            }
+
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8)
             {
                 double res = a.AsR8Checked() % b.AsR8Checked();
@@ -4296,6 +4351,7 @@ namespace Cnidaria.Cs
         {
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4) return a.AsI4Checked() < b.AsI4Checked() ? 1 : 0;
             if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8) return a.AsI8Checked() < b.AsI8Checked() ? 1 : 0;
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4) return a.AsR4Checked() < b.AsR4Checked() ? 1 : 0;
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8) return a.AsR8Checked() < b.AsR8Checked() ? 1 : 0;
             throw new InvalidOperationException($"Clt type mismatch: {a.Kind} vs {b.Kind}");
         }
@@ -4325,6 +4381,7 @@ namespace Cnidaria.Cs
         {
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4) return a.AsI4Checked() > b.AsI4Checked() ? 1 : 0;
             if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8) return a.AsI8Checked() > b.AsI8Checked() ? 1 : 0;
+            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4) return a.AsR4Checked() > b.AsR4Checked() ? 1 : 0;
             if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8) return a.AsR8Checked() > b.AsR8Checked() ? 1 : 0;
             throw new InvalidOperationException($"Cgt type mismatch: {a.Kind} vs {b.Kind}");
         }
@@ -4340,6 +4397,8 @@ namespace Cnidaria.Cs
                     return a.AsI4Checked() == b.AsI4Checked() ? 1 : 0;
                 case SlotKind.I8:
                     return a.AsI8Checked() == b.AsI8Checked() ? 1 : 0;
+                case SlotKind.R4:
+                    return a.AsR4Checked() == b.AsR4Checked() ? 1 : 0;
                 case SlotKind.R8:
                     return a.AsR8Checked() == b.AsR8Checked() ? 1 : 0;
                 case SlotKind.Ptr:
@@ -4410,7 +4469,7 @@ namespace Cnidaria.Cs
             };
 
             static Slot MakeR4(float value) =>
-                new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits((double)value));
+                new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits(value));
 
             static Slot MakeR8(double value) =>
                 new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(value));
@@ -4419,9 +4478,9 @@ namespace Cnidaria.Cs
 
             try
             {
-                if (v.Kind == SlotKind.R8)
+                if (v.Kind is SlotKind.R4 or SlotKind.R8)
                 {
-                    double d = v.AsR8Checked();
+                    double d = v.Kind == SlotKind.R4 ? v.AsR4Checked() : v.AsR8Checked();
 
                     switch (kind)
                     {
@@ -4483,11 +4542,10 @@ namespace Cnidaria.Cs
                             }
 
                         case NumericConvKind.R4:
-                            return MakeR4((float)d);
+                            return v.Kind == SlotKind.R4 ? v : MakeR4((float)d);
 
                         case NumericConvKind.R8:
-
-                            return v;
+                            return v.Kind == SlotKind.R8 ? v : MakeR8(d);
 
                         default:
                             throw new NotSupportedException($"Conv {kind} not implemented");
@@ -4784,6 +4842,7 @@ namespace Cnidaria.Cs
             {
                 FastCellKind.I4 => new Slot(SlotKind.I4, ReadI32(abs)),
                 FastCellKind.I8 => new Slot(SlotKind.I8, ReadI64(abs)),
+                FastCellKind.R4 => new Slot(SlotKind.R4, ReadI32(abs)),
                 FastCellKind.R8 => new Slot(SlotKind.R8, ReadI64(abs)),
                 _ => throw new InvalidOperationException("Not a fast cell.")
             };
@@ -4811,10 +4870,25 @@ namespace Cnidaria.Cs
                         return true;
                     }
 
+                case FastCellKind.R4:
+                    {
+                        int bits = v.Kind switch
+                        {
+                            SlotKind.R4 => unchecked((int)v.Payload),
+                            SlotKind.R8 => BitConverter.SingleToInt32Bits((float)BitConverter.Int64BitsToDouble(v.Payload)),
+                            SlotKind.I4 => BitConverter.SingleToInt32Bits(unchecked((int)v.Payload)),
+                            SlotKind.I8 => BitConverter.SingleToInt32Bits(v.Payload),
+                            _ => throw new InvalidOperationException($"Cannot store {v.Kind} into Single local/arg.")
+                        };
+                        WriteI32(abs, bits);
+                        return true;
+                    }
+
                 case FastCellKind.R8:
                     {
                         double d = v.Kind switch
                         {
+                            SlotKind.R4 => v.AsR4Checked(),
                             SlotKind.R8 => BitConverter.Int64BitsToDouble(v.Payload),
                             SlotKind.I4 => unchecked((int)v.Payload),
                             SlotKind.I8 => v.Payload,
@@ -4961,8 +5035,9 @@ namespace Cnidaria.Cs
             {
                 "Int32" or "UInt32" => FastCellKind.I4,
                 "Int64" or "UInt64" => FastCellKind.I8,
+                "Single" => FastCellKind.R4,
                 "Double" => FastCellKind.R8,
-                "IntPtr" or "UIntPtr" => TargetArchitecture.PointerSize == 8 
+                "IntPtr" or "UIntPtr" => TargetArchitecture.PointerSize == 8
                                             ? FastCellKind.I8 : FastCellKind.I4,
                 _ => FastCellKind.None
             };
@@ -5073,7 +5148,7 @@ namespace Cnidaria.Cs
 
             return t.InstanceFields.Length > 0 ? t.InstanceFields[0].FieldType : null;
         }
-        private static bool IsVoidReturn(RuntimeType t) 
+        private static bool IsVoidReturn(RuntimeType t)
             => t.Namespace == "System" && t.Name == "Void";
 
         private Slot NormalizeReturnValue(RuntimeType t, VmValue v)
@@ -5130,6 +5205,7 @@ namespace Cnidaria.Cs
                         return new Slot(SlotKind.I8, v.AsInt64());
 
                     case "Single":
+                        return new Slot(SlotKind.R4, BitConverter.SingleToInt32Bits((float)v.AsDouble()));
                     case "Double":
                         return new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(v.AsDouble()));
 
@@ -5352,17 +5428,17 @@ namespace Cnidaria.Cs
 
                     return true;
                 }
-                    // private static bool _CopyImpl(Array, int, Array, int, int)
-                    if (!rm.HasThis &&
-                    rm.Name == "CopyInternal" &&
-                    rm.ParameterTypes.Length == 5 &&
-                    totalArgs == 5 &&
-                    rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
-                    rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
-                    rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
-                    rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
-                    rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
-                    rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
+                // private static bool _CopyImpl(Array, int, Array, int, int)
+                if (!rm.HasThis &&
+                rm.Name == "CopyInternal" &&
+                rm.ParameterTypes.Length == 5 &&
+                totalArgs == 5 &&
+                rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Boolean" &&
+                rm.ParameterTypes[0].Namespace == "System" && rm.ParameterTypes[0].Name == "Array" &&
+                rm.ParameterTypes[1].Namespace == "System" && rm.ParameterTypes[1].Name == "Int32" &&
+                rm.ParameterTypes[2].Namespace == "System" && rm.ParameterTypes[2].Name == "Array" &&
+                rm.ParameterTypes[3].Namespace == "System" && rm.ParameterTypes[3].Name == "Int32" &&
+                rm.ParameterTypes[4].Namespace == "System" && rm.ParameterTypes[4].Name == "Int32")
                 {
                     int length = PopSlot().AsI4Checked();
                     int dstIndex = PopSlot().AsI4Checked();

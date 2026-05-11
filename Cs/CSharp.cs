@@ -15,14 +15,26 @@ namespace Cnidaria.Cs
     {
         private static bool HasErrors(List<IDiagnostic> diags)
             => diags.Any(x => x.GetSeverity() == DiagnosticSeverity.Error);
+
+        private static void AddDiagnostics<TDiagnostic>(List<IDiagnostic> target, IEnumerable<TDiagnostic> source)
+        {
+            foreach (var diagnostic in source)
+            {
+                object? boxed = diagnostic;
+                if (boxed is IDiagnostic typed)
+                {
+                    target.Add(typed);
+                }
+                else if (boxed != null)
+                {
+                    target.Add(new Diagnostic("DIAGNOSTIC", DiagnosticSeverity.Error, boxed.ToString() ?? string.Empty, default));
+                }
+            }
+        }
         public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
             StandartLibrary = CompileCoreLibrary(GetCoreBCLSource());
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            StackStandartLibrary = StandartLibrary;
         public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
             ExtendedLibrary = CompileLibrary(GetExtendedBCLSource(), "extendedStd");
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
-            StackExtendedLibrary = ExtendedLibrary;
         public readonly struct ExecutionContext
         {
             public readonly long InstructionsCount;
@@ -38,103 +50,64 @@ namespace Cnidaria.Cs
             }
             public static ExecutionContext Empty => new ExecutionContext(-1, TimeSpan.MinValue, -1, -1);
         }
-        private readonly struct StackCompiledModuleData
-        {
-            public readonly byte[] Image;
-            public readonly IMetadataView Meta;
-            public readonly Dictionary<int, Cnidaria.Cs.BytecodeFunction> Funcs;
-
-            public StackCompiledModuleData(byte[] image, IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            {
-                Image = image;
-                Meta = meta;
-                Funcs = funcs;
-            }
-
-            public static StackCompiledModuleData Load(byte[] image)
-            {
-                var (_, meta, funcs) = BytecodeSerializer.DeserializeCompiledModule(image);
-                return new StackCompiledModuleData(image, meta, funcs);
-            }
-        }
-        private readonly struct StackCompiledRunnableApplicationData
-        {
-            public readonly byte[] Image;
-            public readonly StackCompiledModuleData Module;
-
-            public StackCompiledRunnableApplicationData(byte[] image, StackCompiledModuleData module)
-            {
-                Image = image;
-                Module = module;
-            }
-
-            public static StackCompiledRunnableApplicationData Load(byte[] image)
-            {
-                return new StackCompiledRunnableApplicationData(image, StackCompiledModuleData.Load(image));
-            }
-        }
         public static (byte[]? image, List<IDiagnostic> diagnostics) CompileStackApplicationToRunnableBytes(
             string source,
-            byte[]? externalLibImage = null,
-            bool allowInlining = true)
+            byte[]? externalLibImage = null)
         {
-            var diagnostics = new List<IDiagnostic>(StackExtendedLibrary.diags);
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
 
-            var parser = new Parser(source);
-            var root = parser.Parse();
-
-            foreach (var diag in parser.LexerDiagnostics)
-                diagnostics.Add(diag);
-            foreach (var diag in parser.Diagnostics)
-                diagnostics.Add(diag);
-            if (HasErrors(diagnostics))
-                return (null, diagnostics);
-
-            var tree = new SyntaxTree(root, "app");
-            var trees = ImmutableArray.Create(tree);
-
-            StackCompiledModuleData? ext = null;
-            MetadataReferenceSet refs;
-
-            if (externalLibImage != null)
+            try
             {
-                ext = StackCompiledModuleData.Load(externalLibImage);
-                refs = new MetadataReferenceSet(new[] { StackStandartLibrary.meta, StackExtendedLibrary.meta, ext.Value.Meta });
+                var parser = new Parser(source);
+                var root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                IMetadataView? externalMeta = null;
+                if (externalLibImage != null)
+                {
+                    var (_, meta, _) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
+                    externalMeta = meta;
+                }
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var refs = externalMeta != null
+                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, externalMeta })
+                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+
+                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                AddDiagnostics(diagnostics, declDiag);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: refs.ResolveAssemblyName,
+                    print: false);
+
+                if (ex != null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+                AddDiagnostics(diagnostics, diags);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                byte[] flatMd = FlatMetadataBuilder.Build(md);
+                return (BytecodeSerializer.SerializeCompiledModule(flatMd, builtFuncs), diagnostics);
             }
-            else
+            catch (Exception ex)
             {
-                refs = new MetadataReferenceSet(new[] { StackStandartLibrary.meta, StackExtendedLibrary.meta });
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (null, diagnostics);
             }
-
-            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
-            foreach (var diag in declDiag)
-                diagnostics.Add(diag);
-            if (HasErrors(diagnostics))
-                return (null, diagnostics);
-
-            var (md, funcs, diags, ex) = compilation.BuildModule(
-                moduleName: "app",
-                tree: tree,
-                includeCoreTypesInTypeDefs: false,
-                defaultExternalAssemblyName: "std",
-                allowInlining: allowInlining,
-                externalAssemblyResolver: refs.ResolveAssemblyName,
-                print: false);
-
-            if (ex != null)
-                diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
-
-            foreach (var diag in diags)
-                diagnostics.Add(diag);
-            if (HasErrors(diagnostics))
-                return (null, diagnostics);
-
-            byte[] flatMd = FlatMetadataBuilder.Build(md);
-            byte[] moduleImage = BytecodeSerializer.SerializeCompiledModule(flatMd, funcs);
-
-            return (moduleImage, diagnostics);
         }
-        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) InterpretStack(
+
+        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) InterpretOnStack(
             byte[] runnableAppImage,
             CancellationTokenSource cts,
             int heapSize = 32 * 1024,
@@ -151,67 +124,25 @@ namespace Cnidaria.Cs
         {
             execLimits ??= new ExecutionLimits();
             var output = new StringBuilder();
-            var diagnostics = new List<IDiagnostic>(StackExtendedLibrary.diags);
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
 
             try
             {
-                var app = StackCompiledRunnableApplicationData.Load(runnableAppImage);
-                StackCompiledModuleData? ext = null;
-
+                var (_, appMeta, appFuncs) = BytecodeSerializer.DeserializeCompiledModule(runnableAppImage);
+                (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
                 if (externalLibImage != null)
-                    ext = StackCompiledModuleData.Load(externalLibImage);
+                {
+                    var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
+                    external = (meta, externalFuncs);
+                }
 
-                return ExecuteStackCompiledApplication(
-                    app,
-                    ext,
-                    cts,
-                    heapSize,
-                    stackSize,
-                    staticRegionLimit,
-                    outputLimit,
-                    execLimits,
-                    host,
-                    streamAction,
-                    entryAttributeTypeName,
-                    entryAttributeArgs,
-                    entryMethodArgs);
-            }
-            catch (Exception ex)
-            {
-                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
-                return (output.ToString(), diagnostics, ExecutionContext.Empty);
-            }
-        }
-        private static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) ExecuteStackCompiledApplication(
-            StackCompiledRunnableApplicationData app,
-            StackCompiledModuleData? ext,
-            CancellationTokenSource cts,
-            int heapSize,
-            int stackSize,
-            int staticRegionLimit,
-            int outputLimit,
-            ExecutionLimits? execLimits,
-            Action<Cnidaria.Cs.HostInterface>? host,
-            Action<string>? streamAction,
-            string? entryAttributeTypeName,
-            string[]? entryAttributeArgs,
-            string[]? entryMethodArgs)
-        {
-            execLimits ??= new ExecutionLimits();
-            var output = new StringBuilder();
-            var diagnostics = new List<IDiagnostic>(StackExtendedLibrary.diags);
+                var domain = new Domain();
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
-            try
-            {
-                var domain = new Cnidaria.Cs.Domain();
-
-                var stdModule = new Cnidaria.Cs.RuntimeModule(StackStandartLibrary.meta.ModuleName, StackStandartLibrary.meta, StackStandartLibrary.funcs);
-                var extStdModule = new Cnidaria.Cs.RuntimeModule(StackExtendedLibrary.meta.ModuleName, StackExtendedLibrary.meta, StackExtendedLibrary.funcs);
-                var appModule = new Cnidaria.Cs.RuntimeModule(app.Module.Meta.ModuleName, app.Module.Meta, app.Module.Funcs);
-
-                var modules = new Dictionary<string, Cnidaria.Cs.RuntimeModule>(StringComparer.Ordinal);
-
-                void AddUnique(Cnidaria.Cs.RuntimeModule m)
+                void AddUnique(RuntimeModule m)
                 {
                     if (!modules.TryAdd(m.Name, m))
                         throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
@@ -220,34 +151,21 @@ namespace Cnidaria.Cs
 
                 AddUnique(stdModule);
                 AddUnique(extStdModule);
+                if (external != null)
+                    AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
                 AddUnique(appModule);
-
-                if (ext != null)
-                {
-                    var extModule = new Cnidaria.Cs.RuntimeModule(ext.Value.Meta.ModuleName, ext.Value.Meta, ext.Value.Funcs);
-                    AddUnique(extModule);
-                }
 
                 int entryTok;
                 object?[]? selectedValues = null;
-
                 if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
                 {
-                    entryTok = Cnidaria.Cs.BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                    entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
                 }
                 else
                 {
                     var attrArgs = entryAttributeArgs ?? Array.Empty<string>();
                     var callArgs = entryMethodArgs ?? Array.Empty<string>();
-
-                    if (!TryResolveAttributedEntryPoint(
-                            app.Module.Meta,
-                            entryAttributeTypeName!,
-                            attrArgs,
-                            callArgs,
-                            out entryTok,
-                            out selectedValues,
-                            out var err))
+                    if (!TryResolveAttributedEntryPoint(appMeta, entryAttributeTypeName!, attrArgs, callArgs, out entryTok, out selectedValues, out var err))
                     {
                         var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
                         diagnostics.Add(diagnostic);
@@ -256,19 +174,13 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                var rts = new Cnidaria.Cs.RuntimeTypeSystem(modules);
-
+                var rts = new RuntimeTypeSystem(modules);
                 byte[] mem = new byte[stackSize + heapSize + staticRegionLimit];
                 int staticEnd = staticRegionLimit;
                 int stackBase = staticEnd;
                 int stackEnd = stackBase + stackSize;
 
                 var sb = new StringBuilder();
-                long instructionCount = -1;
-                long stackUsage = -1;
-                long heapUsage = -1;
-                TimeSpan timeElapsed = TimeSpan.MinValue;
-
                 using var stringWriter = new StringWriter(sb);
                 using var writer = new BoundedTextWriter(
                     inner: stringWriter,
@@ -277,7 +189,7 @@ namespace Cnidaria.Cs
                     onChunk: streamAction,
                     streamOnlyWhatWasWritten: true);
 
-                var vm = new Cnidaria.Cs.StackBasedVm(
+                var stVm = new StackBasedVm(
                     memory: mem,
                     staticEnd: staticEnd,
                     stackBase: stackBase,
@@ -288,46 +200,28 @@ namespace Cnidaria.Cs
                     textWriter: writer);
 
                 var entryFn = appModule.MethodsByDefToken[entryTok];
-                Cnidaria.Cs.Slot[]? initialArgs = null;
-
+                Slot[]? initialArgs = null;
                 if (selectedValues != null)
                 {
                     var rm = rts.ResolveMethod(appModule, entryTok);
-
                     if (!rm.IsStatic || rm.HasThis)
                         throw new InvalidOperationException("Command entrypoints must be static.");
-
-                    initialArgs = BuildStackInitialArgs(vm, rts, rm, selectedValues);
+                    initialArgs = BuildStackInitialArgs(stVm, rts, rm, selectedValues);
                 }
 
-                var t = Stopwatch.StartNew();
-                try
-                {
-                    host?.Invoke(new HostInterface(vm, rts, modules));
-                    if (initialArgs != null)
-                        vm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
-                    else
-                        vm.Execute(appModule, entryFn, cts.Token, execLimits);
-                }
-                catch (Exception e)
-                {
-                    var diagnostic = new Diagnostic("INTERNAL", DiagnosticSeverity.Error, e.ToString(), default);
-                    diagnostics.Add(diagnostic);
-                    output.AppendLine(diagnostic.GetMessage());
-                    return (sb.ToString() + output.ToString(), diagnostics, ExecutionContext.Empty);
-                }
+                host?.Invoke(new HostInterface(stVm, rts, modules));
 
-                t.Stop();
-
-                instructionCount = vm.InctructionsElapsed;
-                stackUsage = vm.StackPeakBytes;
-                heapUsage = vm.HeapPeakBytes;
-                timeElapsed = t.Elapsed;
+                var sw = Stopwatch.StartNew();
+                if (initialArgs != null)
+                    stVm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
+                else
+                    stVm.Execute(appModule, entryFn, cts.Token, execLimits);
+                sw.Stop();
 
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(Math.Max(instructionCount, -1), timeElapsed, stackUsage, heapUsage));
+                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -335,13 +229,92 @@ namespace Cnidaria.Cs
                 return (output.ToString(), diagnostics, ExecutionContext.Empty);
             }
         }
+        /// <summary>
+        /// Compiles source code to register based bytecode image as a byte array
+        /// </summary>
         public static (byte[]? image, List<IDiagnostic> diagnostics) CompileApplicationToRunnableBytes(
             string source,
-            byte[]? externalLibImage = null,
-            bool allowInlining = true)
+            byte[]? externalLibImage = null)
         {
-            return CompileStackApplicationToRunnableBytes(source, externalLibImage, allowInlining);
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            try
+            {
+                var parser = new Parser(source);
+                var root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+                if (externalLibImage != null)
+                {
+                    var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
+                    external = (meta, externalFuncs);
+                }
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var refs = external != null
+                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+
+                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                AddDiagnostics(diagnostics, declDiag);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: refs.ResolveAssemblyName,
+                    print: false);
+
+                if (ex != null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+                AddDiagnostics(diagnostics, diags);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                byte[] flatMd = FlatMetadataBuilder.Build(md);
+                IMetadataView appMeta = new FlatMetadataView(flatMd);
+
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+
+                void AddUnique(RuntimeModule m)
+                {
+                    if (!modules.TryAdd(m.Name, m))
+                        throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
+                }
+
+                AddUnique(stdModule);
+                AddUnique(extStdModule);
+                if (external != null)
+                    AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(appModule);
+
+                var rts = new RuntimeTypeSystem(modules);
+                int entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
+                var backend = BackendPipeline.CompileProgram(genTreeProgram);
+                byte[] registerImage = ImageSerializer.ToBytes(backend.Image);
+                byte[] stackFunctions = BytecodeSerializer.SerializeStackFunctions(builtFuncs);
+
+                return (SerializeRegisterRunnableApplication(flatMd, stackFunctions, registerImage), diagnostics);
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (null, diagnostics);
+            }
         }
+
         public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
             byte[] runnableAppImage,
             CancellationTokenSource cts,
@@ -357,21 +330,147 @@ namespace Cnidaria.Cs
             string[]? entryAttributeArgs = null,
             string[]? entryMethodArgs = null)
         {
-            return InterpretStack(
-                runnableAppImage,
-                cts,
-                heapSize,
-                stackSize,
-                staticRegionLimit,
-                outputLimit,
-                execLimits,
-                externalLibImage,
-                host,
-                streamAction,
-                entryAttributeTypeName,
-                entryAttributeArgs,
-                entryMethodArgs);
+            execLimits ??= new ExecutionLimits();
+            var output = new StringBuilder();
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            try
+            {
+                var app = DeserializeRegisterRunnableApplication(runnableAppImage);
+                var appMeta = new FlatMetadataView(app.flatMetadata);
+                var appFuncs = BytecodeSerializer.DeserializeFunctions(app.stackFunctions);
+                var image = ImageSerializer.FromBytes(app.registerImage);
+
+                (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+                if (externalLibImage != null)
+                {
+                    var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
+                    external = (meta, externalFuncs);
+                }
+
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+
+                void AddUnique(RuntimeModule m)
+                {
+                    if (!modules.TryAdd(m.Name, m))
+                        throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
+                }
+
+                AddUnique(stdModule);
+                AddUnique(extStdModule);
+                if (external != null)
+                    AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(appModule);
+
+                int entryTok;
+                object?[]? selectedValues = null;
+                if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
+                {
+                    entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                }
+                else
+                {
+                    var attrArgs = entryAttributeArgs ?? Array.Empty<string>();
+                    var callArgs = entryMethodArgs ?? Array.Empty<string>();
+                    if (!TryResolveAttributedEntryPoint(appMeta, entryAttributeTypeName!, attrArgs, callArgs, out entryTok, out selectedValues, out var err))
+                    {
+                        var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
+                        diagnostics.Add(diagnostic);
+                        output.AppendLine(diagnostic.GetMessage());
+                        return (output.ToString(), diagnostics, ExecutionContext.Empty);
+                    }
+                }
+
+                var rts = new RuntimeTypeSystem(modules);
+                var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
+
+                byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + staticRegionLimit);
+                int staticEnd = staticRegionLimit;
+                int stackBase = staticEnd;
+                int stackEnd = stackBase + stackSize;
+
+                var sb = new StringBuilder();
+                using var stringWriter = new StringWriter(sb);
+                using var writer = new BoundedTextWriter(
+                    inner: stringWriter,
+                    maxChars: outputLimit,
+                    mode: BoundedTextWriter.OverflowMode.Truncate,
+                    onChunk: streamAction,
+                    streamOnlyWhatWasWritten: true);
+
+                var regVm = new RegisterBasedVm(
+                    memory: mem,
+                    staticEnd: staticEnd,
+                    stackBase: stackBase,
+                    stackEnd: stackEnd,
+                    rts: rts,
+                    modules: modules,
+                    image: image,
+                    textWriter: writer);
+
+                VmValue[]? initialArgs = null;
+                if (selectedValues != null)
+                    initialArgs = BuildRegisterInitialArgs(regVm, rts, entryRuntimeMethod, selectedValues);
+
+                host?.Invoke(new HostInterface(regVm, rts, modules));
+
+                var sw = Stopwatch.StartNew();
+                if (initialArgs != null)
+                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits, initialArgs);
+                else
+                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits);
+                sw.Stop();
+
+                return (
+                    sb.ToString(),
+                    diagnostics,
+                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (output.ToString(), diagnostics, ExecutionContext.Empty);
+            }
         }
+
+        private static byte[] SerializeRegisterRunnableApplication(byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage)
+        {
+            using var ms = new MemoryStream(24 + flatMetadata.Length + stackFunctions.Length + registerImage.Length);
+            using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+            bw.Write((ushort)0);
+            bw.Write(flatMetadata.Length);
+            bw.Write(stackFunctions.Length);
+            bw.Write(registerImage.Length);
+            bw.Write(flatMetadata);
+            bw.Write(stackFunctions);
+            bw.Write(registerImage);
+            bw.Flush();
+            return ms.ToArray();
+        }
+
+        private static (byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage) DeserializeRegisterRunnableApplication(byte[] image)
+        {
+            using var ms = new MemoryStream(image, writable: false);
+            using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+            _ = br.ReadUInt16();
+            int metadataSize = br.ReadInt32();
+            int stackFunctionsSize = br.ReadInt32();
+            int registerImageSize = br.ReadInt32();
+            if (metadataSize < 0 || stackFunctionsSize < 0 || registerImageSize < 0)
+                throw new InvalidDataException("Negative register runnable section size.");
+            byte[] metadata = br.ReadBytes(metadataSize);
+            byte[] stackFunctions = br.ReadBytes(stackFunctionsSize);
+            byte[] registerImage = br.ReadBytes(registerImageSize);
+            if (metadata.Length != metadataSize || stackFunctions.Length != stackFunctionsSize || registerImage.Length != registerImageSize)
+                throw new EndOfStreamException("Truncated register runnable image.");
+            if (ms.Position != ms.Length)
+                throw new InvalidDataException("Trailing bytes found in register runnable image.");
+            return (metadata, stackFunctions, registerImage);
+        }
+
         private readonly struct MetadataEntryParameterSpec
         {
             public readonly SpecialType SpecialType;
@@ -546,27 +645,151 @@ namespace Cnidaria.Cs
             Action<string>? streamAction = null,
             string? entryAttributeTypeName = null,
             string[]? entryAttributeArgs = null,
-            string[]? entryMethodArgs = null,
-            bool allowInlining = true)
+            string[]? entryMethodArgs = null)
         {
-            return InterpretStack(
-                source,
-                cts,
-                heapSize,
-                stackSize,
-                metaSize,
-                outputLimit,
-                execLimits,
-                externalLibSource,
-                host,
-                streamAction,
-                entryAttributeTypeName,
-                entryAttributeArgs,
-                entryMethodArgs,
-                allowInlining);
+            execLimits ??= new ExecutionLimits();
+            var output = new StringBuilder();
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+
+            try
+            {
+                (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+                if (externalLibSource != null)
+                {
+                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external");
+                    AddDiagnostics(diagnostics, extDiags);
+                    if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
+                        return (string.Empty, diagnostics, ExecutionContext.Empty);
+                    external = (extMeta, extFuncs);
+                }
+
+                var parser = new Parser(source);
+                var root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
+                    return (string.Empty, diagnostics, ExecutionContext.Empty);
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var refs = external != null
+                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+
+                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                AddDiagnostics(diagnostics, declDiag);
+                if (HasErrors(diagnostics))
+                    return (string.Empty, diagnostics, ExecutionContext.Empty);
+
+                var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: refs.ResolveAssemblyName,
+                    print: false);
+
+                if (ex != null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+                AddDiagnostics(diagnostics, diags);
+                if (HasErrors(diagnostics))
+                    return (string.Empty, diagnostics, ExecutionContext.Empty);
+
+                byte[] flatMd = FlatMetadataBuilder.Build(md);
+                IMetadataView appMeta = new FlatMetadataView(flatMd);
+
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+
+                void AddUnique(RuntimeModule m)
+                {
+                    if (!modules.TryAdd(m.Name, m))
+                        throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
+                }
+
+                AddUnique(stdModule);
+                AddUnique(extStdModule);
+                if (external != null)
+                    AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(appModule);
+
+                int entryTok;
+                object?[]? selectedValues = null;
+                if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
+                {
+                    entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                }
+                else
+                {
+                    var attrArgs = entryAttributeArgs ?? Array.Empty<string>();
+                    var callArgs = entryMethodArgs ?? Array.Empty<string>();
+                    if (!TryResolveAttributedEntryPoint(
+                        appMeta, entryAttributeTypeName!, attrArgs, callArgs, out entryTok, out selectedValues, out var err))
+                    {
+                        var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
+                        diagnostics.Add(diagnostic);
+                        output.AppendLine(diagnostic.GetMessage());
+                        return (output.ToString(), diagnostics, ExecutionContext.Empty);
+                    }
+                }
+
+                var rts = new RuntimeTypeSystem(modules);
+                var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
+                var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
+                var backend = BackendPipeline.CompileProgram(genTreeProgram);
+
+                byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + metaSize);
+                int staticEnd = metaSize;
+                int stackBase = staticEnd;
+                int stackEnd = stackBase + stackSize;
+
+                var sb = new StringBuilder();
+                using var stringWriter = new StringWriter(sb);
+                using var writer = new BoundedTextWriter(
+                    inner: stringWriter,
+                    maxChars: outputLimit,
+                    mode: BoundedTextWriter.OverflowMode.Truncate,
+                    onChunk: streamAction,
+                    streamOnlyWhatWasWritten: true);
+
+                var regVm = new RegisterBasedVm(
+                    memory: mem,
+                    staticEnd: staticEnd,
+                    stackBase: stackBase,
+                    stackEnd: stackEnd,
+                    rts: rts,
+                    modules: modules,
+                    image: backend.Image,
+                    textWriter: writer);
+
+                VmValue[]? initialArgs = null;
+                if (selectedValues != null)
+                    initialArgs = BuildRegisterInitialArgs(regVm, rts, entryRuntimeMethod, selectedValues);
+
+                host?.Invoke(new HostInterface(regVm, rts, modules));
+
+                var sw = Stopwatch.StartNew();
+                if (initialArgs != null)
+                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits, initialArgs);
+                else
+                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits);
+                sw.Stop();
+
+                return (
+                    sb.ToString(),
+                    diagnostics,
+                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (output.ToString(), diagnostics, ExecutionContext.Empty);
+            }
         }
 
-        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) InterpretStack(
+        public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) InterpretOnStack(
             string source,
             CancellationTokenSource cts,
             int heapSize = 32 * 1024,
@@ -579,73 +802,154 @@ namespace Cnidaria.Cs
             Action<string>? streamAction = null,
             string? entryAttributeTypeName = null,
             string[]? entryAttributeArgs = null,
-            string[]? entryMethodArgs = null,
-            bool allowInlining = true)
+            string[]? entryMethodArgs = null)
         {
-            var diagnostics = new List<IDiagnostic>();
-            byte[]? externalImage = null;
+            execLimits ??= new ExecutionLimits();
+            var output = new StringBuilder();
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
 
-            if (externalLibSource != null)
+            try
             {
-                var ext = CompileStackExternalLibraryToBytes(externalLibSource, "external");
-                diagnostics.AddRange(ext.diagnostics);
-                if (HasErrors(diagnostics) || ext.image == null)
+                (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+                if (externalLibSource != null)
+                {
+                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external");
+                    AddDiagnostics(diagnostics, extDiags);
+                    if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
+                        return (string.Empty, diagnostics, ExecutionContext.Empty);
+                    external = (extMeta, extFuncs);
+                }
+
+                var parser = new Parser(source);
+                var root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
                     return (string.Empty, diagnostics, ExecutionContext.Empty);
-                externalImage = ext.image;
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var refs = external != null
+                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+
+                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                AddDiagnostics(diagnostics, declDiag);
+                if (HasErrors(diagnostics))
+                    return (string.Empty, diagnostics, ExecutionContext.Empty);
+
+                var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: refs.ResolveAssemblyName,
+                    print: false);
+
+                if (ex != null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, ex.ToString(), default));
+                AddDiagnostics(diagnostics, diags);
+                if (HasErrors(diagnostics))
+                    return (string.Empty, diagnostics, ExecutionContext.Empty);
+
+                byte[] flatMd = FlatMetadataBuilder.Build(md);
+                IMetadataView appMeta = new FlatMetadataView(flatMd);
+
+                var domain = new Domain();
+                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
+                var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+
+                void AddUnique(RuntimeModule m)
+                {
+                    if (!modules.TryAdd(m.Name, m))
+                        throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
+                    domain.Add(m);
+                }
+
+                AddUnique(stdModule);
+                AddUnique(extStdModule);
+                if (external != null)
+                    AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(appModule);
+
+                int entryTok;
+                object?[]? selectedValues = null;
+                if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
+                {
+                    entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                }
+                else
+                {
+                    var attrArgs = entryAttributeArgs ?? Array.Empty<string>();
+                    var callArgs = entryMethodArgs ?? Array.Empty<string>();
+                    if (!TryResolveAttributedEntryPoint(appMeta, entryAttributeTypeName!, attrArgs, callArgs, out entryTok, out selectedValues, out var err))
+                    {
+                        var diagnostic = new Diagnostic("ENTRYPOINT", DiagnosticSeverity.Error, err, default);
+                        diagnostics.Add(diagnostic);
+                        output.AppendLine(diagnostic.GetMessage());
+                        return (output.ToString(), diagnostics, ExecutionContext.Empty);
+                    }
+                }
+
+                var rts = new RuntimeTypeSystem(modules);
+                byte[] mem = new byte[stackSize + heapSize + metaSize];
+                int staticEnd = metaSize;
+                int stackBase = staticEnd;
+                int stackEnd = stackBase + stackSize;
+
+                var sb = new StringBuilder();
+                using var stringWriter = new StringWriter(sb);
+                using var writer = new BoundedTextWriter(
+                    inner: stringWriter,
+                    maxChars: outputLimit,
+                    mode: BoundedTextWriter.OverflowMode.Truncate,
+                    onChunk: streamAction,
+                    streamOnlyWhatWasWritten: true);
+
+                var stVm = new StackBasedVm(
+                    memory: mem,
+                    staticEnd: staticEnd,
+                    stackBase: stackBase,
+                    stackEnd: stackEnd,
+                    domain: domain,
+                    rts: rts,
+                    modules: modules,
+                    textWriter: writer);
+
+                var entryFn = appModule.MethodsByDefToken[entryTok];
+                Slot[]? initialArgs = null;
+                if (selectedValues != null)
+                {
+                    var rm = rts.ResolveMethod(appModule, entryTok);
+                    if (!rm.IsStatic || rm.HasThis)
+                        throw new InvalidOperationException("Command entrypoints must be static.");
+                    initialArgs = BuildStackInitialArgs(stVm, rts, rm, selectedValues);
+                }
+
+                host?.Invoke(new HostInterface(stVm, rts, modules));
+
+                var sw = Stopwatch.StartNew();
+                if (initialArgs != null)
+                    stVm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
+                else
+                    stVm.Execute(appModule, entryFn, cts.Token, execLimits);
+                sw.Stop();
+
+                return (
+                    sb.ToString(),
+                    diagnostics,
+                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
-
-            var app = CompileStackApplicationToRunnableBytes(source, externalImage, allowInlining);
-            diagnostics.AddRange(app.diagnostics);
-            if (HasErrors(diagnostics) || app.image == null)
-                return (string.Empty, diagnostics, ExecutionContext.Empty);
-
-            var run = InterpretStack(
-                app.image,
-                cts,
-                heapSize,
-                stackSize,
-                metaSize,
-                outputLimit,
-                execLimits,
-                externalImage,
-                host,
-                streamAction,
-                entryAttributeTypeName,
-                entryAttributeArgs,
-                entryMethodArgs);
-
-            int skip = Math.Min(StackExtendedLibrary.diags.Count, run.diagnostics.Count);
-            for (int i = skip; i < run.diagnostics.Count; i++)
-                diagnostics.Add(run.diagnostics[i]);
-
-            return (run.output, diagnostics, run.context);
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (output.ToString(), diagnostics, ExecutionContext.Empty);
+            }
         }
+
         internal static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs) CompileCoreLibrary(string source)
-        {
-            return CompileStackCoreLibrary(source);
-        }
-
-        public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileLibrary(string source, string modulename)
-        {
-            return CompileStackLibrary(source, modulename);
-        }
-
-        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
-            string source,
-            string moduleName = "external")
-        {
-            return CompileStackExternalLibraryToBytes(source, moduleName);
-        }
-
-        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileApplicationToBytes(
-            string source,
-            byte[]? externalLibImage = null,
-            bool allowInlining = true)
-        {
-            return CompileStackApplicationToBytes(source, externalLibImage, allowInlining);
-        }
-
-        internal static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs) CompileStackCoreLibrary(string source)
         {
             if (string.IsNullOrWhiteSpace(source)) throw new ArgumentException("standart library source code is empty");
             var stdParser = new Cnidaria.Cs.Parser(source);
@@ -664,7 +968,6 @@ namespace Cnidaria.Cs
                 tree: stdTrees[0],
                 includeCoreTypesInTypeDefs: true,
                 defaultExternalAssemblyName: "std",
-                allowInlining: true,
                 print: false);
             if (stdEx != null)
                 throw new InvalidOperationException("std build internal error", stdEx);
@@ -677,7 +980,7 @@ namespace Cnidaria.Cs
             IMetadataView stdViewFlat = new FlatMetadataView(stdFlatMd);
             return (stdViewFlat, stdFuncs);
         }
-        public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileStackLibrary(string source, string modulename)
+        public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileLibrary(string source, string modulename)
         {
             var diagnostics = new List<IDiagnostic>();
             var parser = new Cnidaria.Cs.Parser(source);
@@ -696,7 +999,7 @@ namespace Cnidaria.Cs
             }
             var tree = new SyntaxTree(root, modulename);
             var trees = ImmutableArray.Create(new[] { tree });
-            var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StackStandartLibrary.meta });
+            var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandartLibrary.meta });
             var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
 
             foreach (var diag in declDiag)
@@ -707,12 +1010,11 @@ namespace Cnidaria.Cs
             {
                 return (null!, null!, diagnostics);
             }
-            var (md, funcs, diags, ex) = compilation.BuildModule(
+            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
                 moduleName: modulename,
                 tree: trees[0],
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
-                allowInlining: true,
                 print: false,
                 externalAssemblyResolver: refs.ResolveAssemblyName);
             if (ex != null)
@@ -730,10 +1032,10 @@ namespace Cnidaria.Cs
             }
             byte[] flatMd = Cnidaria.Cs.FlatMetadataBuilder.Build(md);
             IMetadataView viewFlat = new FlatMetadataView(flatMd);
-            return (viewFlat, funcs, diagnostics);
+            return (viewFlat, builtFuncs, diagnostics);
         }
         private static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction>? funcs, List<IDiagnostic> diags)
-            CompileStackLibraryCore(string source, string moduleName)
+            CompileLibraryCore(string source, string moduleName)
         {
             var diagnostics = new List<IDiagnostic>();
             var parser = new Parser(source);
@@ -748,7 +1050,7 @@ namespace Cnidaria.Cs
 
             var tree = new SyntaxTree(root, moduleName);
             var trees = ImmutableArray.Create(tree);
-            var refs = new MetadataReferenceSet(new[] { StackStandartLibrary.meta });
+            var refs = new MetadataReferenceSet(new[] { StandartLibrary.meta });
             var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
 
             foreach (var diag in declDiag)
@@ -756,12 +1058,11 @@ namespace Cnidaria.Cs
             if (HasErrors(diagnostics))
                 return (null, null, null, diagnostics);
 
-            var (md, funcs, diags, ex) = compilation.BuildModule(
+            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
                 moduleName: moduleName,
                 tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
-                allowInlining: true,
                 print: false,
                 externalAssemblyResolver: refs.ResolveAssemblyName);
 
@@ -776,24 +1077,17 @@ namespace Cnidaria.Cs
             byte[] flatMd = FlatMetadataBuilder.Build(md);
             IMetadataView viewFlat = new FlatMetadataView(flatMd);
 
-            return (flatMd, viewFlat, funcs, diagnostics);
+            return (flatMd, viewFlat, builtFuncs, diagnostics);
         }
-        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileStackExternalLibraryToBytes(
+        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
             string source,
             string moduleName = "external")
         {
-            var (flatMd, _, funcs, diags) = CompileStackLibraryCore(source, moduleName);
-            if (HasErrors(diags) || flatMd == null || funcs == null)
+            var (flatMd, _, extFuncs, diags) = CompileLibraryCore(source, moduleName);
+            if (HasErrors(diags) || flatMd == null || extFuncs == null)
                 return (null, diags);
 
-            return (BytecodeSerializer.SerializeCompiledModule(flatMd, funcs), diags);
-        }
-        public static (byte[]? image, List<IDiagnostic> diagnostics) CompileStackApplicationToBytes(
-            string source,
-            byte[]? externalLibImage = null,
-            bool allowInlining = true)
-        {
-            return CompileStackApplicationToRunnableBytes(source, externalLibImage, allowInlining);
+            return (BytecodeSerializer.SerializeCompiledModule(flatMd, extFuncs), diags);
         }
         internal static string GetCoreBCLSource()
         {
@@ -1455,93 +1749,6 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        private static bool TryBindPositionalArguments(
-    Compilation compilation,
-    MethodSymbol m,
-    string[] callArgs,
-    out object?[] values,
-    out int cost,
-    out int defaultsUsed,
-    out bool usedParams)
-        {
-            cost = 0;
-            defaultsUsed = 0;
-            usedParams = false;
-
-            var ps = m.Parameters;
-            values = new object?[ps.Length];
-
-            int ai = 0;
-
-            bool hasParams = ps.Length > 0 && ps[^1].IsParams && IsParamsStringArray(ps[^1].Type);
-            int fixedCount = hasParams ? ps.Length - 1 : ps.Length;
-
-            // Bind fixed parameters
-            for (int pi = 0; pi < fixedCount; pi++)
-            {
-                var p = ps[pi];
-
-                if (ai < callArgs.Length)
-                {
-                    if (!TryParseStringToType(callArgs[ai], p.Type, out var v, out var c))
-                        return false;
-
-                    values[pi] = v;
-                    cost += c;
-                    ai++;
-                }
-                else
-                {
-                    if (!TryGetOptionalDefault(p, out var dv))
-                        return false;
-
-                    values[pi] = dv;
-                    defaultsUsed++;
-                }
-            }
-
-            // Bind params string[]
-            if (hasParams)
-            {
-                usedParams = true;
-
-                int rest = callArgs.Length - ai;
-                if (rest < 0) rest = 0;
-
-                var arr = new string?[rest];
-                for (int i = 0; i < rest; i++)
-                    arr[i] = callArgs[ai + i];
-
-                values[^1] = arr;
-
-                cost += 5;
-
-                ai += rest;
-            }
-
-            // Extra args => reject
-            return ai == callArgs.Length;
-        }
-        private static bool IsParamsStringArray(TypeSymbol t)
-        {
-            if (t is not ArrayTypeSymbol at) return false;
-            if (at.Rank != 1) return false;
-            return at.ElementType.SpecialType == SpecialType.System_String;
-        }
-
-        private static bool TryGetOptionalDefault(ParameterSymbol p, out object? value)
-        {
-            value = null;
-
-            if (!p.HasExplicitDefault)
-                return false;
-
-            if (!p.DefaultValueOpt.HasValue)
-                return false;
-
-            value = p.DefaultValueOpt.Value;
-            return true;
-        }
         private static ArgLexKind ClassifyArg(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return ArgLexKind.Other;
@@ -1572,72 +1779,13 @@ namespace Cnidaria.Cs
             if (!anyDigit) return ArgLexKind.Other;
             return (hasDot || hasExp) ? ArgLexKind.Floating : ArgLexKind.Integer;
         }
-        private static bool TryParseStringToType(string token, TypeSymbol t, out object? value, out int cost)
-        {
-            value = null;
-            cost = 0;
-
-            var k = ClassifyArg(token);
-
-            switch (t.SpecialType)
-            {
-                case SpecialType.System_String:
-                    value = token;
-                    cost = (k == ArgLexKind.Other) ? 0 : 10; // prefer numeric overloads
-                    return true;
-
-                case SpecialType.System_Boolean:
-                    if (bool.TryParse(token, out var b))
-                    {
-                        value = b;
-                        cost = 0;
-                        return true;
-                    }
-                    return false;
-
-                case SpecialType.System_Char:
-                    if (token.Length == 1)
-                    {
-                        value = token[0];
-                        cost = 0;
-                        return true;
-                    }
-                    return false;
-
-                case SpecialType.System_Int8:
-                    return TryParseInt(token, NumberStyles.Integer, out sbyte sb, out value, out cost, baseCost: 0);
-                case SpecialType.System_UInt8:
-                    return TryParseInt(token, NumberStyles.Integer, out byte ub, out value, out cost, baseCost: 0);
-                case SpecialType.System_Int16:
-                    return TryParseInt(token, NumberStyles.Integer, out short s16, out value, out cost, baseCost: 1);
-                case SpecialType.System_UInt16:
-                    return TryParseInt(token, NumberStyles.Integer, out ushort u16, out value, out cost, baseCost: 1);
-                case SpecialType.System_Int32:
-                    return TryParseInt(token, NumberStyles.Integer, out int s32, out value, out cost, baseCost: 2);
-                case SpecialType.System_UInt32:
-                    return TryParseInt(token, NumberStyles.Integer, out uint u32, out value, out cost, baseCost: 2);
-                case SpecialType.System_Int64:
-                    return TryParseInt(token, NumberStyles.Integer, out long s64, out value, out cost, baseCost: 3);
-                case SpecialType.System_UInt64:
-                    return TryParseInt(token, NumberStyles.Integer, out ulong u64, out value, out cost, baseCost: 3);
-
-                case SpecialType.System_Single:
-                    return TryParseFloat(token, out float f, out value, out cost, k, baseCost: 1);
-
-                case SpecialType.System_Double:
-                    return TryParseFloat(token, out double d, out value, out cost, k, baseCost: 0);
-
-                default:
-                    return false;
-            }
-        }
         private static bool TryParseInt<T>(
-    string token,
-    NumberStyles styles,
-    out T parsed,
-    out object? value,
-    out int cost,
-    int baseCost) where T : struct
+            string token,
+            NumberStyles styles,
+            out T parsed,
+            out object? value,
+            out int cost,
+            int baseCost) where T : struct
         {
             parsed = default;
             value = null;
@@ -1748,7 +1896,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        
+
 
         private static Cnidaria.Cs.Slot[] BuildStackInitialArgs(Cnidaria.Cs.StackBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts,
             Cnidaria.Cs.RuntimeMethod rm, object?[] values)
@@ -1802,6 +1950,68 @@ namespace Cnidaria.Cs
                     case "UInt64": return new Cnidaria.Cs.Slot(Cnidaria.Cs.SlotKind.I8, unchecked((long)(ulong)v));
                     case "Single": return new Cnidaria.Cs.Slot(Cnidaria.Cs.SlotKind.R8, BitConverter.DoubleToInt64Bits((float)v));
                     case "Double": return new Cnidaria.Cs.Slot(Cnidaria.Cs.SlotKind.R8, BitConverter.DoubleToInt64Bits((double)v));
+                }
+            }
+
+            throw new NotSupportedException($"Host marshal not supported for value type: {t.Namespace}.{t.Name}");
+        }
+
+        private static Cnidaria.Cs.VmValue[] BuildRegisterInitialArgs(Cnidaria.Cs.RegisterBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts,
+            Cnidaria.Cs.RuntimeMethod rm, object?[] values)
+        {
+            if (rm.HasThis) throw new InvalidOperationException("Instance entrypoints are not supported.");
+            if (rm.ParameterTypes.Length != values.Length)
+                throw new InvalidOperationException("Bound values length mismatch.");
+
+            var args = new Cnidaria.Cs.VmValue[values.Length];
+            for (int i = 0; i < values.Length; i++)
+                args[i] = MarshalToRegisterValue(vm, rts, rm.ParameterTypes[i], values[i]);
+            return args;
+        }
+
+        private static Cnidaria.Cs.VmValue MarshalToRegisterValue(Cnidaria.Cs.RegisterBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts, Cnidaria.Cs.RuntimeType t, object? v)
+        {
+            if (t.IsReferenceType)
+            {
+                if (v is null)
+                    return Cnidaria.Cs.VmValue.Null;
+
+                if (t.TypeId == rts.SystemString.TypeId)
+                    return vm.HostAllocString((string)v);
+
+                if (t.Kind == Cnidaria.Cs.RuntimeTypeKind.Array)
+                {
+                    if (v is not string?[] ss)
+                        throw new NotSupportedException("Only string[] values are supported for array parameters.");
+
+                    var arr = vm.HostAllocArray(t, ss.Length);
+                    for (int i = 0; i < ss.Length; i++)
+                        vm.HostSetArrayElement(arr, i, vm.HostAllocString(ss[i]));
+                    return arr;
+                }
+
+                throw new NotSupportedException($"Host marshal not supported for ref type: {t.Namespace}.{t.Name}");
+            }
+
+            if (v is null)
+                throw new InvalidOperationException($"Null passed to value type {t.Namespace}.{t.Name}");
+
+            if (t.Namespace == "System")
+            {
+                switch (t.Name)
+                {
+                    case "Boolean": return Cnidaria.Cs.VmValue.FromInt32((bool)v ? 1 : 0);
+                    case "Char": return Cnidaria.Cs.VmValue.FromInt32((char)v);
+                    case "SByte": return Cnidaria.Cs.VmValue.FromInt32((sbyte)v);
+                    case "Byte": return Cnidaria.Cs.VmValue.FromInt32((byte)v);
+                    case "Int16": return Cnidaria.Cs.VmValue.FromInt32((short)v);
+                    case "UInt16": return Cnidaria.Cs.VmValue.FromInt32(unchecked((ushort)v));
+                    case "Int32": return Cnidaria.Cs.VmValue.FromInt32((int)v);
+                    case "UInt32": return Cnidaria.Cs.VmValue.FromInt32(unchecked((int)(uint)v));
+                    case "Int64": return Cnidaria.Cs.VmValue.FromInt64((long)v);
+                    case "UInt64": return Cnidaria.Cs.VmValue.FromInt64(unchecked((long)(ulong)v));
+                    case "Single": return Cnidaria.Cs.VmValue.FromDouble((float)v);
+                    case "Double": return Cnidaria.Cs.VmValue.FromDouble((double)v);
                 }
             }
 

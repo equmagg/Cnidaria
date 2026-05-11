@@ -536,14 +536,12 @@ internal class Program
 ", "0");
             // 55 Vector3
             RunTest(@"
-using System.Numerics;
 var vec = new Vector3(2f, 3, 1f);
 vec = vec * 2;
 Console.WriteLine(vec.ToString());
 ", "<4, 6, 2>");
             // 56 List<T> Add / indexer / Count
             RunTest(@"
-using System.Collections.Generic;
 var l = new List<int>();
 l.Add(7);
 l.Add(8);

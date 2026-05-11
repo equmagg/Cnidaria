@@ -76,7 +76,7 @@ namespace Cnidaria.Cs
         AbiCall = 1 << 0,
 
         // The node can clobber caller saved registers. This is broader than AbiCall because
-        // helper expanded nodes such as allocation and type-check nodes may still lower to calls
+        // helper expanded nodes such as allocation and type check nodes may still lower to calls
         CallerSavedKill = 1 << 1,
 
         // The backend expects all non contained operands and any result to be registers
@@ -91,6 +91,8 @@ namespace Cnidaria.Cs
 
         UsesTrackedLocal = 1 << 6,
         DefinesTrackedLocal = 1 << 7,
+
+        UnusedValue = 1 << 8,
     }
 
 
@@ -321,6 +323,7 @@ namespace Cnidaria.Cs
                 {
                     GenStackKind.I4 => 4,
                     GenStackKind.I8 => 8,
+                    GenStackKind.R4 => 4,
                     GenStackKind.R8 => 8,
                     GenStackKind.NativeInt => TargetArchitecture.PointerSize,
                     GenStackKind.NativeUInt => TargetArchitecture.PointerSize,
@@ -342,6 +345,7 @@ namespace Cnidaria.Cs
                 {
                     GenStackKind.I4 => 4,
                     GenStackKind.I8 => 8,
+                    GenStackKind.R4 => 4,
                     GenStackKind.R8 => 8,
                     GenStackKind.NativeInt => TargetArchitecture.PointerSize,
                     GenStackKind.NativeUInt => TargetArchitecture.PointerSize,
@@ -578,6 +582,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Nop => false,
                 GenTreeKind.ConstI4 => false,
                 GenTreeKind.ConstI8 => false,
+                GenTreeKind.ConstR4Bits => false,
                 GenTreeKind.ConstR8Bits => false,
                 GenTreeKind.ConstNull => false,
                 GenTreeKind.ConstString => false,
@@ -865,52 +870,47 @@ namespace Cnidaria.Cs
 
         public bool IncludeExceptionEdges { get; set; } = true;
 
-        public bool SplitCriticalEdges { get; set; }
-
         public bool Validate { get; set; } = true;
     }
 
     internal static class GenTreeLinearIrRationalizer
     {
-        public static GenTreeProgram LowerProgram(GenTreeProgram program, LinearRationalizationOptions? options = null)
-        {
-            if (program is null)
-                throw new ArgumentNullException(nameof(program));
-
-            options ??= LinearRationalizationOptions.Default;
-
-            var methods = ImmutableArray.CreateBuilder<GenTreeMethod>(program.Methods.Length);
-            for (int i = 0; i < program.Methods.Length; i++)
-                methods.Add(LowerMethod(program.Methods[i], options));
-
-            return new GenTreeProgram(methods.ToImmutable());
-        }
-
-        public static GenTreeMethod LowerMethod(GenTreeMethod method, LinearRationalizationOptions? options = null)
+        public static GenTreeMethod RationalizeMethod(GenTreeMethod method, SsaMethod? ssa = null, LinearRationalizationOptions? options = null)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
             options ??= LinearRationalizationOptions.Default;
-            if (options.SplitCriticalEdges)
-                method = GenTreeCriticalEdgeSplitter.SplitCriticalEdges(method);
 
-            var cfg = ControlFlowGraph.Build(method, options.IncludeExceptionEdges);
-            var builder = new MethodBuilder(method, cfg);
-            var lowered = builder.Run();
-            var result = LinearLiveness.Attach(lowered);
+            ControlFlowGraph cfg;
+            if (ssa is not null)
+            {
+                method = ssa.GenTreeMethod;
+                if (method.Phase < GenTreeMethodPhase.Ssa)
+                    throw new InvalidOperationException("Rationalization received SSA data that is not attached to the GenTree method.");
+                cfg = ssa.Cfg;
+            }
+            else
+            {
+                if (method.Phase < GenTreeMethodPhase.HirLiveness)
+                    throw new InvalidOperationException("Rationalization requires HIR liveness or SSA. Run GenTreeBackendPipeline.PrepareHir before HIR->LIR rationalization.");
+                cfg = method.Cfg;
+            }
 
-            if (options.Validate)
-                LinearVerifier.Verify(result);
-
-            return result;
+            var builder = new MethodBuilder(method, cfg, ssa);
+            return builder.Run();
         }
 
         private sealed class MethodBuilder
         {
             private readonly GenTreeMethod _method;
             private readonly ControlFlowGraph _cfg;
+            private readonly SsaMethod? _ssa;
             private readonly Dictionary<GenTreeValueKey, GenTreeValueInfo> _valueInfos = new();
+            private readonly Dictionary<SsaSlot, SsaSlotInfo> _ssaSlotInfos = new();
+            private readonly Dictionary<SsaValueName, SsaValueDefinition> _ssaDefinitions = new();
+            private readonly Dictionary<SsaValueName, GenTree> _ssaValues = new();
+            private readonly HashSet<SsaValueName> _usedSsaValues = new();
             private readonly List<GenTree> _allNodes = new();
             private readonly List<GenTree>[] _nodesByBlock;
             private int _nextNodeId;
@@ -918,20 +918,38 @@ namespace Cnidaria.Cs
             private int _currentBlockId;
             private int _currentBlockOrdinal;
 
-            public MethodBuilder(GenTreeMethod method, ControlFlowGraph cfg)
+            public MethodBuilder(GenTreeMethod method, ControlFlowGraph cfg, SsaMethod? ssa = null)
             {
                 _method = method;
                 _cfg = cfg;
+                _ssa = ssa;
                 _nodesByBlock = new List<GenTree>[method.Blocks.Length];
                 for (int i = 0; i < _nodesByBlock.Length; i++)
                     _nodesByBlock[i] = new List<GenTree>();
                 _nextSyntheticTreeId = ComputeNextSyntheticTreeId(method);
+                if (ssa is not null)
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, ComputeNextSyntheticTreeId(ssa));
+
+                if (ssa is not null)
+                {
+                    for (int i = 0; i < ssa.Slots.Length; i++)
+                        _ssaSlotInfos[ssa.Slots[i].Slot] = ssa.Slots[i];
+                    for (int i = 0; i < ssa.ValueDefinitions.Length; i++)
+                        _ssaDefinitions[ssa.ValueDefinitions[i].Name] = ssa.ValueDefinitions[i];
+                }
             }
 
             public GenTreeMethod Run()
             {
                 ResetExistingLinearState();
+                if (_ssa is not null)
+                    PrepareSsaValues();
+
                 LowerBlocks();
+
+                if (_ssa is not null)
+                    EmitPhiCopies();
+
                 return Freeze();
             }
 
@@ -955,6 +973,26 @@ namespace Cnidaria.Cs
                 }
             }
 
+            private static int ComputeNextSyntheticTreeId(SsaMethod method)
+            {
+                int max = -1;
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    var statements = method.Blocks[b].Statements;
+                    for (int s = 0; s < statements.Length; s++)
+                        Visit(statements[s]);
+                }
+                return max + 1;
+
+                void Visit(SsaTree tree)
+                {
+                    if (tree.Source.Id > max)
+                        max = tree.Source.Id;
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                        Visit(tree.Operands[i]);
+                }
+            }
+
             private void ResetExistingLinearState()
             {
                 for (int b = 0; b < _method.Blocks.Length; b++)
@@ -967,9 +1005,254 @@ namespace Cnidaria.Cs
                 static void Reset(GenTree node)
                 {
                     node.ResetLinearState();
+                    node.ClearSsaAnnotation();
                     for (int i = 0; i < node.Operands.Length; i++)
                         Reset(node.Operands[i]);
                 }
+            }
+
+            private void PrepareSsaValues()
+            {
+                if (_ssa is null)
+                    return;
+
+                CollectUsedSsaValues();
+
+                for (int b = 0; b < _ssa.Blocks.Length; b++)
+                {
+                    var block = _ssa.Blocks[b];
+                    for (int p = 0; p < block.Phis.Length; p++)
+                    {
+                        var phi = block.Phis[p];
+                        if (!_ssaValues.ContainsKey(phi.Target))
+                            _ssaValues[phi.Target] = CreateSsaPlaceholderValueNode(phi.Target);
+                    }
+
+                    for (int s = 0; s < block.Statements.Length; s++)
+                        AttachSsaAnnotations(block.Statements[s]);
+                }
+            }
+
+            private void CollectUsedSsaValues()
+            {
+                if (_ssa is null)
+                    return;
+
+                for (int b = 0; b < _ssa.Blocks.Length; b++)
+                {
+                    var block = _ssa.Blocks[b];
+                    for (int p = 0; p < block.Phis.Length; p++)
+                    {
+                        var phi = block.Phis[p];
+                        for (int i = 0; i < phi.Inputs.Length; i++)
+                            _usedSsaValues.Add(phi.Inputs[i].Value);
+                    }
+
+                    for (int s = 0; s < block.Statements.Length; s++)
+                        CollectUsedSsaValues(block.Statements[s]);
+                }
+            }
+
+            private void CollectUsedSsaValues(SsaTree tree)
+            {
+                if (tree.Value.HasValue)
+                    _usedSsaValues.Add(tree.Value.Value);
+
+                if (tree.LocalFieldBaseValue.HasValue)
+                    _usedSsaValues.Add(tree.LocalFieldBaseValue.Value);
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    CollectUsedSsaValues(tree.Operands[i]);
+            }
+
+            private void AttachSsaAnnotations(SsaTree tree)
+            {
+                if (tree.Value.HasValue)
+                {
+                    tree.Source.AttachSsaUse(tree.Value.Value);
+                }
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    AttachSsaAnnotations(tree.Operands[i]);
+
+                if (tree.StoreTarget.HasValue)
+                {
+                    var target = tree.StoreTarget.Value;
+                    var info = GetSsaSlotInfo(target.Slot);
+                    tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
+                    AttachSsaDescriptor(tree.Source, target.Slot);
+                    _ssaValues[target] = tree.Source;
+                    EnsureSsaValueInfo(target, tree.Source);
+                }
+            }
+
+            private SsaSlotInfo GetSsaSlotInfo(SsaSlot slot)
+            {
+                if (_ssaSlotInfos.TryGetValue(slot, out var info))
+                    return info;
+                return new SsaSlotInfo(slot, type: null, stackKind: GenStackKind.Unknown, addressExposed: false);
+            }
+
+            private bool TryGetSsaDescriptor(SsaSlot slot, out GenLocalDescriptor descriptor)
+            {
+                if (slot.HasLclNum)
+                {
+                    var all = _method.AllLocalDescriptors;
+                    if ((uint)slot.LclNum < (uint)all.Length)
+                    {
+                        descriptor = all[slot.LclNum];
+                        return descriptor.Kind switch
+                        {
+                            GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg,
+                            GenLocalKind.Local => slot.Kind == SsaSlotKind.Local,
+                            GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp,
+                            _ => false,
+                        };
+                    }
+                }
+
+                switch (slot.Kind)
+                {
+                    case SsaSlotKind.Arg:
+                        if ((uint)slot.Index < (uint)_method.ArgDescriptors.Length)
+                        {
+                            descriptor = _method.ArgDescriptors[slot.Index];
+                            return true;
+                        }
+                        break;
+
+                    case SsaSlotKind.Local:
+                        if ((uint)slot.Index < (uint)_method.LocalDescriptors.Length)
+                        {
+                            descriptor = _method.LocalDescriptors[slot.Index];
+                            return true;
+                        }
+                        break;
+
+                    case SsaSlotKind.Temp:
+                        for (int i = 0; i < _method.TempDescriptors.Length; i++)
+                        {
+                            if (_method.TempDescriptors[i].Index == slot.Index)
+                            {
+                                descriptor = _method.TempDescriptors[i];
+                                return true;
+                            }
+                        }
+                        break;
+                }
+
+                descriptor = null!;
+                return false;
+            }
+
+            private void AttachSsaDescriptor(GenTree node, SsaSlot slot)
+            {
+                if (node.LocalDescriptor is null && TryGetSsaDescriptor(slot, out var descriptor))
+                    node.LocalDescriptor = descriptor;
+            }
+
+            private GenTree CreateSsaInitialValueNode(SsaValueName value)
+            {
+                var info = GetSsaSlotInfo(value.Slot);
+                var kind = ToLoadKind(value.Slot.Kind);
+                var node = new GenTree(
+                    _nextSyntheticTreeId++,
+                    kind,
+                    pc: -1,
+                    BytecodeOp.Nop,
+                    info.Type,
+                    info.StackKind,
+                    GenTreeFlags.LocalUse | GenTreeFlags.Ordered,
+                    ImmutableArray<GenTree>.Empty,
+                    int32: value.Slot.Index);
+                node.AttachSsaUse(value);
+                AttachSsaDescriptor(node, value.Slot);
+                EnsureSsaValueInfo(value, node);
+                return node;
+            }
+
+            private GenTree CreateSsaPlaceholderValueNode(SsaValueName value)
+            {
+                var info = GetSsaSlotInfo(value.Slot);
+                var node = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Nop,
+                    pc: -1,
+                    BytecodeOp.Nop,
+                    info.Type,
+                    info.StackKind,
+                    GenTreeFlags.None,
+                    ImmutableArray<GenTree>.Empty);
+                node.AttachSsaDefinition(value, info.Type, info.StackKind);
+                AttachSsaDescriptor(node, value.Slot);
+                EnsureSsaValueInfo(value, node);
+                return node;
+            }
+
+            private static GenTreeKind ToLoadKind(SsaSlotKind kind)
+                => kind switch
+                {
+                    SsaSlotKind.Arg => GenTreeKind.Arg,
+                    SsaSlotKind.Local => GenTreeKind.Local,
+                    SsaSlotKind.Temp => GenTreeKind.Temp,
+                    _ => GenTreeKind.Nop,
+                };
+
+            private GenTree GetOrCreateSsaValue(SsaValueName value, GenTree? suggestedNode = null)
+            {
+                if (_ssaValues.TryGetValue(value, out var existing))
+                {
+                    EnsureSsaValueInfo(value, existing);
+                    return existing;
+                }
+
+                GenTree node;
+                if (suggestedNode is not null)
+                {
+                    var info = GetSsaSlotInfo(value.Slot);
+                    suggestedNode.AttachSsaUse(value);
+                    suggestedNode.Type = info.Type;
+                    suggestedNode.StackKind = info.StackKind;
+                    AttachSsaDescriptor(suggestedNode, value.Slot);
+                    node = suggestedNode;
+                }
+                else if (_ssaDefinitions.TryGetValue(value, out var definition) && definition.IsInitial)
+                {
+                    node = CreateSsaInitialValueNode(value);
+                }
+                else
+                {
+                    node = CreateSsaPlaceholderValueNode(value);
+                }
+
+                _ssaValues[value] = node;
+                EnsureSsaValueInfo(value, node);
+                return node;
+            }
+
+            private void EnsureSsaValueInfo(SsaValueName value, GenTree representative)
+            {
+                var key = GenTreeValueKey.ForSsaValue(value);
+                if (_valueInfos.ContainsKey(key))
+                    return;
+
+                var slotInfo = GetSsaSlotInfo(value.Slot);
+                int defBlock = -1;
+                int defNode = -1;
+                if (_ssaDefinitions.TryGetValue(value, out var definition))
+                {
+                    defBlock = definition.DefBlockId;
+                    defNode = definition.DefTreeId;
+                }
+
+                _valueInfos.Add(key, new GenTreeValueInfo(
+                    key,
+                    representative,
+                    slotInfo.Type,
+                    slotInfo.StackKind,
+                    ResolveRegisterClass(slotInfo.Type, slotInfo.StackKind),
+                    defBlock,
+                    defNode));
             }
 
             private static RegisterClass ResolveRegisterClass(RuntimeType? type, GenStackKind stackKind)
@@ -998,18 +1281,37 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                return stackKind == GenStackKind.R8
+                return stackKind is GenStackKind.R4 or GenStackKind.R8
                     ? RegisterClass.Float
                     : RegisterClass.General;
             }
 
             private void LowerBlocks()
             {
+                if (_ssa is null)
+                {
+                    LowerGenTreeBlocks();
+                    return;
+                }
+
+                for (int b = 0; b < _ssa.Blocks.Length; b++)
+                {
+                    var block = _ssa.Blocks[b];
+                    _currentBlockId = block.Id;
+                    _currentBlockOrdinal = _nodesByBlock[_currentBlockId].Count;
+
+                    for (int s = 0; s < block.Statements.Length; s++)
+                        LowerStatement(block.Statements[s]);
+                }
+            }
+
+            private void LowerGenTreeBlocks()
+            {
                 for (int b = 0; b < _method.Blocks.Length; b++)
                 {
                     var block = _method.Blocks[b];
                     _currentBlockId = block.Id;
-                    _currentBlockOrdinal = 0;
+                    _currentBlockOrdinal = _nodesByBlock[_currentBlockId].Count;
 
                     for (int s = 0; s < block.Statements.Length; s++)
                         LowerStatement(block.Statements[s]);
@@ -1042,7 +1344,45 @@ namespace Cnidaria.Cs
                 LowerForSideEffects(tree);
             }
 
+            private void LowerStatement(SsaTree tree)
+            {
+                if (tree is null)
+                    throw new ArgumentNullException(nameof(tree));
+
+                if (tree.Value.HasValue)
+                {
+                    _ = LowerValueOrVoid(tree);
+                    return;
+                }
+
+                if (tree.Source.Kind == GenTreeKind.Eval)
+                {
+                    LowerEval(tree);
+                    return;
+                }
+
+                if (IsControlTransfer(tree.Source))
+                {
+                    LowerControlTransfer(tree);
+                    return;
+                }
+
+                if (tree.StoreTarget.HasValue || MustMaterializeForSideEffects(tree.Source))
+                {
+                    _ = LowerValueOrVoid(tree);
+                    return;
+                }
+
+                LowerForSideEffects(tree);
+            }
+
             private void LowerEval(GenTree tree)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    LowerForSideEffects(tree.Operands[i]);
+            }
+
+            private void LowerEval(SsaTree tree)
             {
                 for (int i = 0; i < tree.Operands.Length; i++)
                     LowerForSideEffects(tree.Operands[i]);
@@ -1057,6 +1397,27 @@ namespace Cnidaria.Cs
                 }
 
                 if (MustMaterializeForSideEffects(tree))
+                {
+                    _ = LowerValueOrVoid(tree);
+                    return;
+                }
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    LowerForSideEffects(tree.Operands[i]);
+            }
+
+            private void LowerForSideEffects(SsaTree tree)
+            {
+                if (tree.Value.HasValue)
+                    return;
+
+                if (IsControlTransfer(tree.Source))
+                {
+                    LowerControlTransfer(tree);
+                    return;
+                }
+
+                if (tree.StoreTarget.HasValue || MustMaterializeForSideEffects(tree.Source))
                 {
                     _ = LowerValueOrVoid(tree);
                     return;
@@ -1105,6 +1466,20 @@ namespace Cnidaria.Cs
                 EmitTree(tree, uses, result);
             }
 
+            private void LowerControlTransfer(SsaTree tree)
+            {
+                var uses = LowerOperands(tree);
+
+                if (IsBackwardBranch(tree.Source))
+                    EmitGcPoll(tree.Source);
+
+                GenTree? result = ProducesValue(tree.Source)
+                    ? NewTemp(tree.Source)
+                    : null;
+
+                EmitTree(tree.Source, uses, result);
+            }
+
             private ImmutableArray<LirOperandFlags> LowerOperands(GenTree tree)
             {
                 if (TryLowerCommutativeBinaryOperands(tree, out var binaryOperands))
@@ -1123,6 +1498,81 @@ namespace Cnidaria.Cs
                     _ = LowerValueOrVoid(operandTree);
                     flags.Add(LirOperandFlags.None);
                 }
+                return flags.ToImmutable();
+            }
+
+            private ImmutableArray<LirOperandFlags> LowerOperands(SsaTree tree)
+            {
+                if (TryLowerCommutativeBinaryOperands(tree, out var binaryOperands))
+                    return binaryOperands;
+
+                if (tree.LocalFieldBaseValue.HasValue && SsaSlotHelpers.TryGetLocalFieldAccess(tree.Source, out var localFieldAccess))
+                    return LowerLocalFieldOperands(tree, localFieldAccess);
+
+                var flags = ImmutableArray.CreateBuilder<LirOperandFlags>(tree.Operands.Length);
+                var sources = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    var operandTree = tree.Operands[i];
+                    sources.Add(operandTree.Source);
+                    if (TryCreateContainedOperand(tree.Source, i, operandTree.Source, out var containedFlags))
+                    {
+                        flags.Add(containedFlags);
+                        continue;
+                    }
+
+                    var value = LowerValueOrVoid(operandTree);
+                    if (value is not null)
+                        operandTree.Source.RegisterResult = value;
+                    flags.Add(LirOperandFlags.None);
+                }
+
+                tree.Source.SetOperands(sources.ToImmutable());
+                return flags.ToImmutable();
+            }
+
+            private ImmutableArray<LirOperandFlags> LowerLocalFieldOperands(SsaTree tree, SsaLocalAccess localFieldAccess)
+            {
+                var originalOperands = tree.Source.Operands;
+                var flags = ImmutableArray.CreateBuilder<LirOperandFlags>(originalOperands.Length);
+                var sources = ImmutableArray.CreateBuilder<GenTree>(originalOperands.Length);
+
+                for (int originalIndex = 0, ssaIndex = 0; originalIndex < originalOperands.Length; originalIndex++)
+                {
+                    if (originalIndex == localFieldAccess.ReceiverOperandIndex)
+                    {
+                        var receiver = originalOperands[originalIndex];
+                        sources.Add(receiver);
+                        var value = LowerValueOrVoid(receiver);
+                        if (value is not null)
+                            receiver.RegisterResult = value;
+                        flags.Add(LirOperandFlags.None);
+                        continue;
+                    }
+
+                    if ((uint)ssaIndex >= (uint)tree.Operands.Length)
+                        throw new InvalidOperationException("SSA local-field operand mapping is malformed for node " + tree.Source.Id.ToString() + ".");
+
+                    var operandTree = tree.Operands[ssaIndex++];
+                    sources.Add(operandTree.Source);
+                    if (TryCreateContainedOperand(tree.Source, originalIndex, operandTree.Source, out var containedFlags))
+                    {
+                        flags.Add(containedFlags);
+                        continue;
+                    }
+                    {
+                        var value = LowerValueOrVoid(operandTree);
+                        if (value is not null)
+                            operandTree.Source.RegisterResult = value;
+                    }
+
+                    flags.Add(LirOperandFlags.None);
+                }
+
+                if (sources.Count - 1 > tree.Operands.Length)
+                    throw new InvalidOperationException("SSA local-field operand mapping has too many source operands for node " + tree.Source.Id.ToString() + ".");
+
+                tree.Source.SetOperands(sources.ToImmutable());
                 return flags.ToImmutable();
             }
 
@@ -1148,6 +1598,33 @@ namespace Cnidaria.Cs
                 _ = LowerValue(right);
                 left.IsContainedInLinear = true;
                 tree.SetOperands(ImmutableArray.Create(right, left));
+                operands = ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.Contained);
+                return true;
+            }
+
+            private bool TryLowerCommutativeBinaryOperands(SsaTree tree, out ImmutableArray<LirOperandFlags> operands)
+            {
+                operands = default;
+
+                if (tree.Source.Kind != GenTreeKind.Binary || tree.Operands.Length != 2)
+                    return false;
+
+                if (!IsCommutativeBinaryImmediateOp(tree.Source.SourceOp))
+                    return false;
+
+                var left = tree.Operands[0];
+                var right = tree.Operands[1];
+
+                if (!CanContainBinaryImmediate(tree.Source, operandIndex: 1, left.Source))
+                    return false;
+
+                if (CanContainBinaryImmediate(tree.Source, operandIndex: 1, right.Source))
+                    return false;
+
+                var rightValue = LowerValue(right);
+                right.Source.RegisterResult = rightValue;
+                left.Source.IsContainedInLinear = true;
+                tree.Source.SetOperands(ImmutableArray.Create(right.Source, left.Source));
                 operands = ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.Contained);
                 return true;
             }
@@ -1199,13 +1676,21 @@ namespace Cnidaria.Cs
                 => op is BytecodeOp.Add or BytecodeOp.Mul or BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or BytecodeOp.Ceq;
 
             private static bool IsFloatLike(RuntimeType? type, GenStackKind stackKind)
-                => stackKind == GenStackKind.R8 || type?.Name is "Single" or "Double";
+                => stackKind is GenStackKind.R4 or GenStackKind.R8 || type?.Name is "Single" or "Double";
 
             private GenTree LowerValue(GenTree tree)
             {
                 var result = LowerValueOrVoid(tree);
                 if (result is null)
                     throw new InvalidOperationException($"Tree node {tree.Id} ({tree.Kind}) does not produce a value.");
+                return result;
+            }
+
+            private GenTree LowerValue(SsaTree tree)
+            {
+                var result = LowerValueOrVoid(tree);
+                if (result is null)
+                    throw new InvalidOperationException($"Tree node {tree.Source.Id} ({tree.Source.Kind}) does not produce a value.");
                 return result;
             }
 
@@ -1216,6 +1701,35 @@ namespace Cnidaria.Cs
                 GenTree? result = ProducesValue(tree) ? NewTemp(tree) : null;
 
                 EmitTree(tree, uses, result);
+                return result;
+            }
+
+            private GenTree? LowerValueOrVoid(SsaTree tree)
+            {
+                if (tree.Value.HasValue)
+                {
+                    var value = GetOrCreateSsaValue(tree.Value.Value, tree.Source);
+                    tree.Source.RegisterResult = value;
+                    tree.Source.ValueKey = value.ValueKey;
+                    return value;
+                }
+
+                var uses = LowerOperands(tree);
+
+                if (tree.StoreTarget.HasValue)
+                {
+                    var targetName = tree.StoreTarget.Value;
+                    var target = GetOrCreateSsaValue(targetName, tree.Source);
+                    var info = GetSsaSlotInfo(targetName.Slot);
+                    tree.Source.AttachSsaDefinition(targetName, info.Type, info.StackKind);
+                    tree.Source.RegisterResult = target;
+                    EmitTree(tree.Source, uses, target);
+                    return target;
+                }
+
+                GenTree? result = ProducesValue(tree.Source) ? NewTemp(tree.Source) : null;
+
+                EmitTree(tree.Source, uses, result);
                 return result;
             }
 
@@ -1290,6 +1804,126 @@ namespace Cnidaria.Cs
                 return pollTree;
             }
 
+            private void EmitPhiCopies()
+            {
+                if (_ssa is null)
+                    return;
+
+                for (int b = 0; b < _ssa.Blocks.Length; b++)
+                {
+                    var block = _ssa.Blocks[b];
+                    for (int p = 0; p < block.Phis.Length; p++)
+                    {
+                        var phi = block.Phis[p];
+                        var target = GetOrCreateSsaValue(phi.Target);
+
+                        for (int i = 0; i < phi.Inputs.Length; i++)
+                        {
+                            var input = phi.Inputs[i];
+                            if (input.Value.Equals(phi.Target))
+                                continue;
+
+                            var source = GetOrCreateSsaValue(input.Value);
+                            EmitPhiCopy(input.PredecessorBlockId, block.Id, source, target);
+                        }
+                    }
+                }
+            }
+
+            private void EmitPhiCopy(int fromBlockId, int toBlockId, GenTree source, GenTree destination)
+            {
+                if ((uint)fromBlockId >= (uint)_nodesByBlock.Length)
+                    throw new InvalidOperationException($"SSA phi input references invalid predecessor B{fromBlockId}.");
+
+                var copy = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Copy,
+                    pc: -1,
+                    BytecodeOp.Nop,
+                    destination.Type ?? source.Type,
+                    destination.StackKind != GenStackKind.Unknown ? destination.StackKind : source.StackKind,
+                    GenTreeFlags.Ordered,
+                    ImmutableArray.Create(source));
+
+                var uses = ImmutableArray.Create(source);
+                var lowering = new GenTreeLinearLoweringInfo(GenTreeLinearFlags.IsStandaloneLoweredNode, 0, 0);
+                int placementBlockId = SelectPhiCopyPlacementBlock(fromBlockId, toBlockId);
+                copy.SetLinearState(
+                    _nextNodeId++,
+                    placementBlockId,
+                    ordinal: 0,
+                    GenTreeLinearKind.Copy,
+                    destination,
+                    ImmutableArray<LirOperandFlags>.Empty,
+                    uses,
+                    lowering,
+                    LinearMemoryAccess.None,
+                    phiCopyFromBlockId: fromBlockId,
+                    phiCopyToBlockId: toBlockId);
+
+                if (placementBlockId == fromBlockId)
+                    InsertNodeBeforeTerminator(fromBlockId, copy);
+                else
+                    InsertNodeAtBlockEntry(toBlockId, copy);
+
+                _allNodes.Add(copy);
+                UpdateDefinitionInfo(copy);
+            }
+
+            private int SelectPhiCopyPlacementBlock(int fromBlockId, int toBlockId)
+            {
+                if (CountNormalSuccessors(fromBlockId) <= 1)
+                    return fromBlockId;
+
+                if (CountNormalPredecessors(toBlockId) <= 1)
+                    return toBlockId;
+
+                throw new InvalidOperationException(
+                    $"SSA phi copy for critical edge B{fromBlockId}->B{toBlockId} requires CFG edge splitting before LIR/LSRA.");
+            }
+
+            private int CountNormalSuccessors(int blockId)
+            {
+                int count = 0;
+                var successors = _cfg.Blocks[blockId].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                {
+                    if (successors[i].Kind != CfgEdgeKind.Exception)
+                        count++;
+                }
+                return count;
+            }
+
+            private int CountNormalPredecessors(int blockId)
+            {
+                int count = 0;
+                var predecessors = _cfg.Blocks[blockId].Predecessors;
+                for (int i = 0; i < predecessors.Length; i++)
+                {
+                    if (predecessors[i].Kind != CfgEdgeKind.Exception)
+                        count++;
+                }
+                return count;
+            }
+
+            private void InsertNodeAtBlockEntry(int blockId, GenTree node)
+            {
+                var list = _nodesByBlock[blockId];
+                int index = 0;
+                while (index < list.Count && list[index].IsPhiCopy)
+                    index++;
+                list.Insert(index, node);
+            }
+
+            private void InsertNodeBeforeTerminator(int blockId, GenTree node)
+            {
+                var list = _nodesByBlock[blockId];
+                int index = list.Count;
+                if (index > 0 && IsControlTransfer(list[index - 1]))
+                    index--;
+                list.Insert(index, node);
+            }
+
             private static ImmutableArray<GenTree> BuildUses(GenTree tree, ImmutableArray<LirOperandFlags> operandFlags)
             {
                 if (tree.Operands.IsDefaultOrEmpty)
@@ -1324,12 +1958,18 @@ namespace Cnidaria.Cs
             {
                 _nodesByBlock[_currentBlockId].Add(node);
                 _allNodes.Add(node);
+                UpdateDefinitionInfo(node);
+            }
 
+            private void UpdateDefinitionInfo(GenTree node)
+            {
                 if (node.RegisterResult is not null)
                 {
                     var value = ValueKeyForNode(node.RegisterResult);
-                    if (_valueInfos.TryGetValue(value, out var info) && info.Origin == GenTreeValueOrigin.TreeNode)
-                        _valueInfos[value] = info.WithDefinitionNode(node, node.LinearBlockId, node.LinearId);
+                    if (_valueInfos.TryGetValue(value, out var info))
+                    {
+                        _valueInfos[value] = info.WithDefinitionNode(info.RepresentativeNode, node.LinearBlockId, node.LinearId);
+                    }
                 }
             }
 
@@ -1339,11 +1979,16 @@ namespace Cnidaria.Cs
 
             private GenTreeMethod Freeze()
             {
+                _allNodes.Clear();
                 for (int b = 0; b < _method.Blocks.Length; b++)
                 {
                     var nodes = _nodesByBlock[b].ToImmutableArray();
                     _method.Blocks[b].SetLinearNodes(nodes);
+                    for (int i = 0; i < nodes.Length; i++)
+                        _allNodes.Add(nodes[i]);
                 }
+
+                NormalizeRepresentativeValueKeys();
 
                 var values = new List<GenTreeValueInfo>(_valueInfos.Values);
                 values.Sort(static (a, b) => string.Compare(a.Value.ToString(), b.Value.ToString(), StringComparison.Ordinal));
@@ -1353,8 +1998,20 @@ namespace Cnidaria.Cs
                     _allNodes.ToImmutableArray(),
                     values.ToImmutableArray(),
                     new Dictionary<GenTreeValueKey, GenTreeValueInfo>(_valueInfos),
-                    LinearBlockOrder.Compute(_cfg));
+                    LinearBlockOrder.Compute(_cfg),
+                    _ssa);
                 return _method;
+            }
+
+            private void NormalizeRepresentativeValueKeys()
+            {
+                foreach (var kv in _valueInfos)
+                {
+                    var value = kv.Key;
+                    var representative = kv.Value.RepresentativeNode;
+                    if (!representative.LinearValueKey.Equals(value))
+                        representative.ValueKey = value;
+                }
             }
 
             private static bool ProducesValue(GenTree node)
@@ -1386,6 +2043,30 @@ namespace Cnidaria.Cs
         }
     }
 
+
+
+    internal static class GenTreeLinearLowerer
+    {
+        public static GenTreeMethod LowerMethod(GenTreeMethod rationalizedMethod, LinearRationalizationOptions? options = null)
+        {
+            if (rationalizedMethod is null)
+                throw new ArgumentNullException(nameof(rationalizedMethod));
+
+            options ??= LinearRationalizationOptions.Default;
+            if (rationalizedMethod.Phase < GenTreeMethodPhase.RationalizedLir)
+                throw new InvalidOperationException("Lowering requires a rationalized LIR method. Run GenTreeLinearIrRationalizer.RationalizeMethod first.");
+            if (rationalizedMethod.LinearNodes.IsDefaultOrEmpty && rationalizedMethod.Blocks.Length != 0)
+                throw new InvalidOperationException("Lowering requires rationalized LIR nodes. Call GenTreeLinearIrRationalizer.RationalizeMethod first.");
+
+            var result = LinearLiveness.Attach(rationalizedMethod);
+
+            if (options.Validate)
+                LinearVerifier.Verify(result);
+
+            return result;
+        }
+    }
+
     internal static class LinearLiveness
     {
         public static GenTreeMethod Attach(GenTreeMethod method)
@@ -1394,6 +2075,7 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(method));
 
             var intervals = BuildIntervals(method, out var intervalMap);
+            MarkUnusedValueDefinitions(method, intervalMap);
             var refPositions = BuildRefPositions(method, intervalMap);
             method.AttachLiveness(intervals, intervalMap, refPositions);
             return method;
@@ -1510,6 +2192,11 @@ namespace Cnidaria.Cs
                 sourceFlags |= LinearRefPositionFlags.StackOnly | LinearRefPositionFlags.ExposedMemory;
             if (destinationAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
                 destinationFlags |= LinearRefPositionFlags.StackOnly | LinearRefPositionFlags.ExposedMemory;
+
+            if (IsSsaLocalValue(sourceValue) && sourceAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                sourceFlags |= LinearRefPositionFlags.RequiresRegister;
+            if (IsSsaLocalValue(destinationValue) && destinationAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                destinationFlags |= LinearRefPositionFlags.RequiresRegister;
 
             if (sourceAbi.PassingKind == AbiValuePassingKind.MultiRegister ||
                 destinationAbi.PassingKind == AbiValuePassingKind.MultiRegister)
@@ -1753,6 +2440,9 @@ namespace Cnidaria.Cs
             if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister)
                 return false;
 
+            if (node.RegisterResult is not null && IsSsaLocalValue(node.RegisterResult))
+                return true;
+
             return node.Kind switch
             {
                 GenTreeKind.Local => false,
@@ -1765,6 +2455,9 @@ namespace Cnidaria.Cs
                 _ => true,
             };
         }
+
+        private static bool IsSsaLocalValue(GenTree value)
+            => value.LinearValueKey.IsSsaValue;
 
         private static void ApplyMemoryUseFlags(LinearMemoryAccess memory, int operandIndex, ref LinearRefPositionFlags flags)
         {
@@ -2172,6 +2865,62 @@ namespace Cnidaria.Cs
             return interval.UsePositions[interval.UsePositions.Length - 1] == usePosition;
         }
 
+        private static void MarkUnusedValueDefinitions(
+            GenTreeMethod method,
+            IReadOnlyDictionary<GenTree, LinearLiveInterval> intervals)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (intervals is null)
+                throw new ArgumentNullException(nameof(intervals));
+
+            foreach (var node in method.LinearNodes)
+            {
+                if (!node.HasLoweringFlag(GenTreeLinearFlags.UnusedValue))
+                    continue;
+
+                node.LinearLowering = new GenTreeLinearLoweringInfo(
+                    node.LinearLowering.Flags & ~GenTreeLinearFlags.UnusedValue,
+                    node.LinearLowering.InternalGeneralRegisters,
+                    node.LinearLowering.InternalFloatRegisters);
+            }
+
+            var unusedValues = new HashSet<GenTreeValueKey>();
+            for (int i = 0; i < method.Values.Length; i++)
+            {
+                var value = method.Values[i].RepresentativeNode;
+                if (!intervals.TryGetValue(value, out var interval) || interval.UsePositions.Length == 0)
+                    unusedValues.Add(method.Values[i].Value);
+            }
+
+            if (unusedValues.Count == 0)
+                return;
+
+            foreach (var node in method.LinearNodes)
+            {
+                if (node.RegisterResults.Length == 0)
+                    continue;
+
+                bool allResultsUnused = true;
+                for (int r = 0; r < node.RegisterResults.Length; r++)
+                {
+                    if (!unusedValues.Contains(node.RegisterResults[r].LinearValueKey))
+                    {
+                        allResultsUnused = false;
+                        break;
+                    }
+                }
+
+                if (!allResultsUnused)
+                    continue;
+
+                node.LinearLowering = new GenTreeLinearLoweringInfo(
+                    node.LinearLowering.Flags | GenTreeLinearFlags.UnusedValue,
+                    node.LinearLowering.InternalGeneralRegisters,
+                    node.LinearLowering.InternalFloatRegisters);
+            }
+        }
+
         public static ImmutableArray<LinearLiveInterval> BuildIntervals(
             GenTreeMethod method,
             out IReadOnlyDictionary<GenTree, LinearLiveInterval> intervalMap)
@@ -2350,6 +3099,7 @@ namespace Cnidaria.Cs
                     : ImmutableArray<int>.Empty;
                 int def = defPositions.TryGetValue(value, out var defPos) ? defPos : layout.FirstPosition;
                 var interval = new LinearLiveInterval(value, mergedRanges, uses, def);
+                VerifyTreeTempInvariant(method, layout, method.Values[i], interval);
                 result.Add(interval);
                 map[value] = interval;
             }
@@ -2358,6 +3108,52 @@ namespace Cnidaria.Cs
             return result.ToImmutable();
         }
 
+
+
+        private static void VerifyTreeTempInvariant(
+            GenTreeMethod method,
+            PositionLayout layout,
+            GenTreeValueInfo info,
+            LinearLiveInterval interval)
+        {
+            if (!info.Value.IsTreeNode)
+                return;
+
+            if (interval.UsePositions.Length > 1)
+            {
+                throw new InvalidOperationException(
+                    $"Tree temp {info.Value} has {interval.UsePositions.Length} distinct use positions. " +
+                    "Tree temps must be single-def/single-use; use a local descriptor or SSA temp for duplicated values.");
+            }
+
+            if (interval.Ranges.Length > 1)
+            {
+                throw new InvalidOperationException(
+                    $"Tree temp {info.Value} has multiple live ranges. " +
+                    "Tree temps cannot have lifetime holes or CFG liveness; use a local descriptor or SSA temp.");
+            }
+
+            if (interval.Ranges.Length == 0)
+                return;
+
+            int definitionBlockId = info.DefinitionBlockId;
+            if ((uint)definitionBlockId >= (uint)method.Blocks.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Tree temp {info.Value} has no valid definition block. " +
+                    "Only local descriptors / SSA values may be live without a concrete tree definition.");
+            }
+
+            var range = interval.Ranges[0];
+            int blockStart = layout.BlockStartPositions[definitionBlockId];
+            int blockEndExclusive = layout.BlockEndPositions[definitionBlockId] + 1;
+            if (range.Start < blockStart || range.End > blockEndExclusive)
+            {
+                throw new InvalidOperationException(
+                    $"Tree temp {info.Value} is live outside B{definitionBlockId}: {range}. " +
+                    "Tree temps must not cross basic-block boundaries; materialize the value as a local descriptor / SSA temp.");
+            }
+        }
 
         private static bool SamePhiCopyGroup(GenTree left, GenTree right)
             => left.IsPhiCopy &&
@@ -2576,11 +3372,264 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
+            VerifyCore(method);
+        }
+
+        public static void VerifyBeforeLsra(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            VerifyCore(method);
+            VerifyLoweringInvariants(method);
+        }
+
+        private static void VerifyCore(GenTreeMethod method)
+        {
             VerifyBlocks(method);
             VerifyLinearBlockOrder(method);
             VerifyOperands(method);
             VerifyValues(method);
+            VerifySsaBinding(method);
             VerifyRefPositions(method);
+        }
+
+
+        private static void VerifyLoweringInvariants(GenTreeMethod method)
+        {
+            var useRefsByNodeAndUse = new Dictionary<(int NodeId, int UseIndex), List<LinearRefPosition>>();
+            var defRefsByNode = new Dictionary<int, List<LinearRefPosition>>();
+            var internalRefsByNode = new Dictionary<int, List<LinearRefPosition>>();
+
+            for (int i = 0; i < method.RefPositions.Length; i++)
+            {
+                var rp = method.RefPositions[i];
+                switch (rp.Kind)
+                {
+                    case LinearRefPositionKind.Use:
+                        if (!useRefsByNodeAndUse.TryGetValue((rp.NodeId, rp.OperandIndex), out var uses))
+                        {
+                            uses = new List<LinearRefPosition>();
+                            useRefsByNodeAndUse.Add((rp.NodeId, rp.OperandIndex), uses);
+                        }
+                        uses.Add(rp);
+                        break;
+
+                    case LinearRefPositionKind.Def:
+                        if (!defRefsByNode.TryGetValue(rp.NodeId, out var defs))
+                        {
+                            defs = new List<LinearRefPosition>();
+                            defRefsByNode.Add(rp.NodeId, defs);
+                        }
+                        defs.Add(rp);
+                        break;
+
+                    case LinearRefPositionKind.Internal:
+                        if (!internalRefsByNode.TryGetValue(rp.NodeId, out var internals))
+                        {
+                            internals = new List<LinearRefPosition>();
+                            internalRefsByNode.Add(rp.NodeId, internals);
+                        }
+                        internals.Add(rp);
+                        break;
+                }
+            }
+
+            var lastUsePositions = new Dictionary<GenTreeValueKey, int>();
+            foreach (var interval in method.LiveIntervals)
+            {
+                var key = interval.Value.LinearValueKey;
+                lastUsePositions[key] = interval.UsePositions.Length == 0 ? -1 : interval.UsePositions[interval.UsePositions.Length - 1];
+            }
+
+            var seenLoweringNodeIds = new HashSet<int>();
+            for (int n = 0; n < method.LinearNodes.Length; n++)
+            {
+                var node = method.LinearNodes[n];
+                if ((uint)node.LinearId >= (uint)method.LinearNodes.Length)
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node list index {n} contains out-of-range linear node id {node.LinearId}.");
+
+                if (!seenLoweringNodeIds.Add(node.LinearId))
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: duplicate linear node id {node.LinearId}.");
+
+                if (node.LinearKind == GenTreeLinearKind.Tree && !node.HasLoweringFlag(GenTreeLinearFlags.IsStandaloneLoweredNode))
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} is not marked as standalone lowered LIR.");
+
+                VerifyContainedAndRegOptionalOperands(method, node, useRefsByNodeAndUse);
+                VerifyInternalRegisterInvariants(node, internalRefsByNode.TryGetValue(node.LinearId, out var internals) ? internals : null);
+                VerifyUnusedValueInvariant(method, node, defRefsByNode.TryGetValue(node.LinearId, out var defs) ? defs : null);
+            }
+
+            VerifyLastUseInvariants(method, lastUsePositions);
+        }
+
+        private static void VerifyContainedAndRegOptionalOperands(
+            GenTreeMethod method,
+            GenTree node,
+            IReadOnlyDictionary<(int NodeId, int UseIndex), List<LinearRefPosition>> useRefsByNodeAndUse)
+        {
+            if (node.OperandFlags.IsDefaultOrEmpty || node.Operands.IsDefaultOrEmpty)
+                return;
+
+            bool registerOnly = node.HasLoweringFlag(GenTreeLinearFlags.RequiresRegisterOperands);
+            int flagCount = Math.Min(node.OperandFlags.Length, node.Operands.Length);
+            int useIndex = 0;
+
+            for (int operandIndex = 0; operandIndex < node.Operands.Length; operandIndex++)
+            {
+                var operandFlags = operandIndex < flagCount ? node.OperandFlags[operandIndex] : LirOperandFlags.None;
+                bool contained = (operandFlags & LirOperandFlags.Contained) != 0;
+                bool regOptional = (operandFlags & LirOperandFlags.RegOptional) != 0;
+
+                if (contained && regOptional)
+                {
+                    throw new InvalidOperationException(
+                        $"pre-LSRA lowering invariant failed: node {node.LinearId} operand {operandIndex} is both contained and reg-optional.");
+                }
+
+                var operand = node.Operands[operandIndex];
+                var value = operand.RegisterResult;
+
+                if (contained)
+                {
+                    if (!operand.IsContainedInLinear)
+                    {
+                        throw new InvalidOperationException(
+                            $"pre-LSRA lowering invariant failed: node {node.LinearId} operand {operandIndex} is marked contained, " +
+                            $"but operand node {operand.LinearId} is not marked contained-in-linear.");
+                    }
+
+                    if (value is not null)
+                    {
+                        throw new InvalidOperationException(
+                            $"pre-LSRA lowering invariant failed: contained operand {operandIndex} of node {node.LinearId} still exposes register value {value.LinearValueKey}.");
+                    }
+
+                    continue;
+                }
+
+                if (value is null)
+                    continue;
+
+                if (useIndex >= node.RegisterUses.Length || !node.RegisterUses[useIndex].Equals(value))
+                {
+                    throw new InvalidOperationException(
+                        $"pre-LSRA lowering invariant failed: node {node.LinearId} operand {operandIndex} does not map to register-use index {useIndex}.");
+                }
+
+                if (regOptional)
+                {
+                    if (registerOnly)
+                    {
+                        throw new InvalidOperationException(
+                            $"pre-LSRA lowering invariant failed: node {node.LinearId} operand {operandIndex} is reg-optional on a register-only node.");
+                    }
+
+                    if (!useRefsByNodeAndUse.TryGetValue((node.LinearId, useIndex), out var refs) || refs.Count == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"pre-LSRA lowering invariant failed: reg-optional operand {operandIndex} of node {node.LinearId} has no use ref-position.");
+                    }
+
+                    for (int r = 0; r < refs.Count; r++)
+                    {
+                        var rp = refs[r];
+                        if (!rp.HasFlag(LinearRefPositionFlags.RegOptional) || rp.HasFlag(LinearRefPositionFlags.RequiresRegister))
+                        {
+                            throw new InvalidOperationException(
+                                $"pre-LSRA lowering invariant failed: reg-optional operand {operandIndex} of node {node.LinearId} produced incompatible ref-position {rp}.");
+                        }
+                    }
+                }
+
+                useIndex++;
+            }
+        }
+
+        private static void VerifyInternalRegisterInvariants(GenTree node, List<LinearRefPosition>? internalRefs)
+        {
+            byte expectedGeneral = node.LinearLowering.InternalGeneralRegisters;
+            byte expectedFloat = node.LinearLowering.InternalFloatRegisters;
+            byte actualGeneral = 0;
+            byte actualFloat = 0;
+
+            if (internalRefs is not null)
+            {
+                for (int i = 0; i < internalRefs.Count; i++)
+                {
+                    var rp = internalRefs[i];
+                    if (!rp.HasFlag(LinearRefPositionFlags.Internal) || !rp.HasFlag(LinearRefPositionFlags.RequiresRegister) || rp.Value is not null)
+                    {
+                        throw new InvalidOperationException(
+                            $"pre-LSRA lowering invariant failed: node {node.LinearId} has malformed internal ref-position {rp}.");
+                    }
+
+                    if (rp.RegisterClass == RegisterClass.General)
+                        actualGeneral += rp.MinimumRegisterCount;
+                    else if (rp.RegisterClass == RegisterClass.Float)
+                        actualFloat += rp.MinimumRegisterCount;
+                    else
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} has invalid internal register class {rp.RegisterClass}.");
+                }
+            }
+
+            if (actualGeneral != expectedGeneral || actualFloat != expectedFloat)
+            {
+                throw new InvalidOperationException(
+                    $"pre-LSRA lowering invariant failed: node {node.LinearId} internal register refs are gen={actualGeneral}, float={actualFloat}; " +
+                    $"lowering requested gen={expectedGeneral}, float={expectedFloat}.");
+            }
+        }
+
+        private static void VerifyUnusedValueInvariant(GenTreeMethod method, GenTree node, List<LinearRefPosition>? defRefs)
+        {
+            if (node.RegisterResults.Length == 0)
+            {
+                if (node.HasLoweringFlag(GenTreeLinearFlags.UnusedValue))
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} is marked unused but defines no value.");
+                return;
+            }
+
+            bool allResultsUnused = true;
+            for (int r = 0; r < node.RegisterResults.Length; r++)
+            {
+                var result = node.RegisterResults[r];
+                if (!method.LiveIntervalByNode.TryGetValue(result, out var interval))
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} defines {result.LinearValueKey} without a live interval.");
+
+                if (interval.UsePositions.Length != 0)
+                    allResultsUnused = false;
+            }
+
+            bool markedUnused = node.HasLoweringFlag(GenTreeLinearFlags.UnusedValue);
+            if (allResultsUnused != markedUnused)
+            {
+                throw new InvalidOperationException(
+                    $"pre-LSRA lowering invariant failed: node {node.LinearId} unused flag is {markedUnused}, expected {allResultsUnused}.");
+            }
+
+            if (!allResultsUnused && (defRefs is null || defRefs.Count == 0))
+                throw new InvalidOperationException($"pre-LSRA lowering invariant failed: used result of node {node.LinearId} has no def ref-position.");
+        }
+
+        private static void VerifyLastUseInvariants(GenTreeMethod method, IReadOnlyDictionary<GenTreeValueKey, int> lastUsePositions)
+        {
+            foreach (var rp in method.RefPositions)
+            {
+                if (rp.Kind != LinearRefPositionKind.Use || rp.Value is null)
+                    continue;
+
+                if (!lastUsePositions.TryGetValue(rp.Value.LinearValueKey, out int lastUsePosition))
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: use ref-position {rp} references a value without interval.");
+
+                bool expected = rp.Position == lastUsePosition;
+                bool actual = rp.HasFlag(LinearRefPositionFlags.LastUse);
+                if (expected != actual)
+                {
+                    throw new InvalidOperationException(
+                        $"pre-LSRA lowering invariant failed: use ref-position {rp} last-use flag is {actual}, expected {expected}.");
+                }
+            }
         }
 
         private static void VerifyBlocks(GenTreeMethod method)
@@ -2599,6 +3648,9 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < block.LinearNodes.Length; i++)
                 {
                     var node = block.LinearNodes[i];
+                    if ((uint)node.LinearId >= (uint)method.LinearNodes.Length)
+                        throw new InvalidOperationException($"GenTree GenTree LIR node id {node.LinearId} is outside method node table length {method.LinearNodes.Length}.");
+
                     if (!seenNodes.Add(node.LinearId))
                         throw new InvalidOperationException("Duplicate GenTree GenTree LIR node id " + node.LinearId + ".");
 
@@ -2719,8 +3771,16 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < method.Values.Length; i++)
             {
-                if (!declared.Add(method.Values[i].Value))
-                    throw new InvalidOperationException("Duplicate GenTree value " + method.Values[i].Value + ".");
+                var info = method.Values[i];
+                if (!declared.Add(info.Value))
+                    throw new InvalidOperationException("Duplicate GenTree value " + info.Value + ".");
+
+                if (!info.RepresentativeNode.LinearValueKey.Equals(info.Value))
+                {
+                    throw new InvalidOperationException(
+                        "GenTree value " + info.Value + " is represented by node " + info.RepresentativeNode +
+                        " whose linear key is " + info.RepresentativeNode.LinearValueKey + ".");
+                }
             }
 
             foreach (var node in method.LinearNodes)
@@ -2771,6 +3831,129 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException($"GenTree LIR tree node {kv.Key} crosses a basic-block boundary.");
                 }
             }
+        }
+
+
+        private static void VerifySsaBinding(GenTreeMethod method)
+        {
+            var ssa = method.Ssa;
+            if (ssa is null)
+                return;
+
+            var declaredSsaValues = new HashSet<SsaValueName>();
+            for (int i = 0; i < ssa.InitialValues.Length; i++)
+                declaredSsaValues.Add(ssa.InitialValues[i]);
+            for (int i = 0; i < ssa.ValueDefinitions.Length; i++)
+                declaredSsaValues.Add(ssa.ValueDefinitions[i].Name);
+
+            for (int i = 0; i < method.Values.Length; i++)
+            {
+                var key = method.Values[i].Value;
+                if (!key.IsSsaValue)
+                    continue;
+
+                var name = new SsaValueName(key.SsaSlot, key.SsaVersion);
+                if (!declaredSsaValues.Contains(name))
+                    throw new InvalidOperationException("linear IR contains SSA value " + name + " that is not declared by the SSA side table.");
+            }
+
+            var expectedPhiCopies = new Dictionary<(int from, int to, GenTreeValueKey source, GenTreeValueKey destination), int>();
+            for (int b = 0; b < ssa.Blocks.Length; b++)
+            {
+                var block = ssa.Blocks[b];
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    var phi = block.Phis[p];
+                    var destination = GenTreeValueKey.ForSsaValue(phi.Target);
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        var input = phi.Inputs[i];
+                        if (input.Value.Equals(phi.Target))
+                            continue;
+
+                        var key = (input.PredecessorBlockId, phi.BlockId, GenTreeValueKey.ForSsaValue(input.Value), destination);
+                        expectedPhiCopies.TryGetValue(key, out int count);
+                        expectedPhiCopies[key] = count + 1;
+                    }
+                }
+            }
+
+            var actualPhiCopies = new Dictionary<(int from, int to, GenTreeValueKey source, GenTreeValueKey destination), int>();
+            foreach (var node in method.LinearNodes)
+            {
+                VerifyPromotedValueIdentity(method, node, node.RegisterResult, isDefinition: true);
+                for (int u = 0; u < node.RegisterUses.Length; u++)
+                    VerifyPromotedValueIdentity(method, node, node.RegisterUses[u], isDefinition: false);
+
+                if (node.SsaStoreTargetName.HasValue)
+                {
+                    if (node.RegisterResult is null)
+                        throw new InvalidOperationException("SSA store node " + node.LinearId + " has no register result value.");
+
+                    var targetKey = GenTreeValueKey.ForSsaValue(node.SsaStoreTargetName.Value);
+                    if (!node.RegisterResult.LinearValueKey.Equals(targetKey))
+                        throw new InvalidOperationException("SSA store node " + node.LinearId + " defines " + node.RegisterResult.LinearValueKey + " but is annotated as " + targetKey + ".");
+                }
+
+                if (!node.IsPhiCopy)
+                    continue;
+
+                if (node.RegisterUses.Length != 1 || node.RegisterResult is null)
+                    throw new InvalidOperationException("SSA phi copy node " + node.LinearId + " must have one source and one destination.");
+
+                var source = node.RegisterUses[0].LinearValueKey;
+                var destination = node.RegisterResult.LinearValueKey;
+                if (!source.IsSsaValue || !destination.IsSsaValue)
+                    throw new InvalidOperationException("SSA phi copy node " + node.LinearId + " must copy SSA values, got " + source + " -> " + destination + ".");
+
+                var key = (node.LinearPhiCopyFromBlockId, node.LinearPhiCopyToBlockId, source, destination);
+                actualPhiCopies.TryGetValue(key, out int count);
+                actualPhiCopies[key] = count + 1;
+            }
+
+            foreach (var kv in expectedPhiCopies)
+            {
+                actualPhiCopies.TryGetValue(kv.Key, out int actual);
+                if (actual != kv.Value)
+                    throw new InvalidOperationException("Missing or duplicated SSA phi edge copy for B" + kv.Key.from + "->B" + kv.Key.to + " " + kv.Key.source + " -> " + kv.Key.destination + ".");
+            }
+
+            foreach (var kv in actualPhiCopies)
+            {
+                expectedPhiCopies.TryGetValue(kv.Key, out int expected);
+                if (expected != kv.Value)
+                    throw new InvalidOperationException("Unexpected SSA phi edge copy for B" + kv.Key.from + "->B" + kv.Key.to + " " + kv.Key.source + " -> " + kv.Key.destination + ".");
+            }
+        }
+
+        private static void VerifyPromotedValueIdentity(GenTreeMethod method, GenTree owner, GenTree? value, bool isDefinition)
+        {
+            if (value is null)
+                return;
+
+            var descriptor = value.LocalDescriptor;
+            if (descriptor is null || !descriptor.SsaPromoted)
+                return;
+
+            if (!value.LinearValueKey.IsSsaValue)
+            {
+                string direction = isDefinition ? "defines" : "uses";
+                throw new InvalidOperationException("linear IR node " + owner.LinearId + " " + direction + " promoted local " + descriptor + " through a raw local value key " + value.LinearValueKey + ".");
+            }
+
+            var key = value.LinearValueKey;
+            bool sameSlot = key.SsaSlot.HasLclNum
+                ? key.SsaSlot.LclNum == descriptor.LclNum
+                : descriptor.Kind switch
+                {
+                    GenLocalKind.Argument => key.SsaSlot.Kind == SsaSlotKind.Arg && key.SsaSlot.Index == descriptor.Index,
+                    GenLocalKind.Local => key.SsaSlot.Kind == SsaSlotKind.Local && key.SsaSlot.Index == descriptor.Index,
+                    GenLocalKind.Temporary => key.SsaSlot.Kind == SsaSlotKind.Temp && key.SsaSlot.Index == descriptor.Index,
+                    _ => false,
+                };
+
+            if (!sameSlot)
+                throw new InvalidOperationException("SSA value " + key + " is attached to mismatched local descriptor " + descriptor + ".");
         }
 
 
@@ -2980,6 +4163,9 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.ConstI8:
                     sb.Append(source.Int64).Append('L');
+                    return;
+                case GenTreeKind.ConstR4Bits:
+                    sb.Append(BitConverter.Int32BitsToSingle(source.Int32).ToString("R", System.Globalization.CultureInfo.InvariantCulture)).Append('f');
                     return;
                 case GenTreeKind.ConstR8Bits:
                     sb.Append(BitConverter.Int64BitsToDouble(source.Int64).ToString("R", System.Globalization.CultureInfo.InvariantCulture));

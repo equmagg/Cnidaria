@@ -994,24 +994,24 @@ namespace Cnidaria.Cs
         public readonly int FrameOffset;
         public readonly int Size;
         public readonly int RuntimeTypeId;
-        public readonly int InteriorOffset;
+        public readonly int CellOffset;
         public readonly byte FrameBase;
         public readonly byte Reserved0;
         public readonly ushort Reserved1;
 
         public GcRootRecord(
-            GcRootKind kind, 
-            MachineRegister register, 
-            int frameOffset, 
-            int size, 
-            int runtimeTypeId, 
-            int interiorOffset, 
+            GcRootKind kind,
+            MachineRegister register,
+            int frameOffset,
+            int size,
+            int runtimeTypeId,
+            int cellOffset,
             GcRootFlags flags,
             RegisterFrameBase frameBase)
         {
             if (frameOffset < -1) throw new ArgumentOutOfRangeException(nameof(frameOffset));
             if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
-            if (interiorOffset < 0) throw new ArgumentOutOfRangeException(nameof(interiorOffset));
+            if (cellOffset < 0) throw new ArgumentOutOfRangeException(nameof(cellOffset));
             bool frameRoot = kind is GcRootKind.FrameRef or GcRootKind.FrameByRef or GcRootKind.InteriorFrame;
             if (frameRoot && frameBase == RegisterFrameBase.None)
                 frameBase = RegisterFrameBase.FramePointer;
@@ -1021,7 +1021,7 @@ namespace Cnidaria.Cs
             FrameOffset = frameOffset;
             Size = size;
             RuntimeTypeId = runtimeTypeId;
-            InteriorOffset = interiorOffset;
+            CellOffset = cellOffset;
             FrameBase = (byte)frameBase;
             Reserved0 = 0;
             Reserved1 = 0;
@@ -1247,6 +1247,8 @@ namespace Cnidaria.Cs
             {
                 if (root.Register == RegisterVmIsa.InvalidRegister || !RegisterVmIsa.IsIntegerRegister(root.Register))
                     throw new InvalidOperationException("GC register root must use a GPR.");
+                if (root.CellOffset != 0)
+                    throw new InvalidOperationException("GC register root must not use a frame-cell offset.");
             }
             else
             {
@@ -1257,9 +1259,11 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("GC frame root has invalid frame base.");
                 if (root.FrameOffset < 0)
                     throw new InvalidOperationException("GC frame root has negative offset.");
+                if (root.CellOffset < 0)
+                    throw new InvalidOperationException("GC frame root has negative cell offset.");
                 if (frameBase is RegisterFrameBase.StackPointer or RegisterFrameBase.FramePointer)
                 {
-                    if (root.FrameOffset + root.Size > method.FrameSize)
+                    if (root.FrameOffset + root.CellOffset + root.Size > method.FrameSize)
                         throw new InvalidOperationException("GC frame root exceeds method frame size.");
                 }
             }
@@ -2214,6 +2218,75 @@ namespace Cnidaria.Cs
             return bytes;
         }
 
+        public static CodeImage FromBytes(ReadOnlySpan<byte> data)
+        {
+            if (!BitConverter.IsLittleEndian)
+                throw new PlatformNotSupportedException("Image serialization is little-endian only.");
+            EnsureStructSizes();
+            if (data.Length < RegisterVmIsa.HeaderSize)
+                throw new InvalidDataException("Register image is shorter than the fixed header.");
+
+            CodeImageHeader header = MemoryMarshal.Read<CodeImageHeader>(data);
+            if (header.HeaderSize != RegisterVmIsa.HeaderSize)
+                throw new InvalidDataException("Invalid register image header size.");
+            if (header.InstructionSize != RegisterVmIsa.InstructionSize)
+                throw new InvalidDataException("Invalid register image instruction size.");
+
+            int end = 0;
+            ValidateSection(data.Length, header.CodeOffset, header.CodeCount, RegisterVmIsa.InstructionSize, "code", ref end);
+            ValidateSection(data.Length, header.MethodOffset, header.MethodCount, Marshal.SizeOf<MethodRecord>(), "method", ref end);
+            ValidateSection(data.Length, header.CallSiteOffset, header.CallSiteCount, Marshal.SizeOf<CallSiteRecord>(), "call-site", ref end);
+            ValidateSection(data.Length, header.EhOffset, header.EhCount, Marshal.SizeOf<EhRegionRecord>(), "EH", ref end);
+            ValidateSection(data.Length, header.GcSafePointOffset, header.GcSafePointCount, Marshal.SizeOf<GcSafePointRecord>(), "GC safepoint", ref end);
+            ValidateSection(data.Length, header.GcRootOffset, header.GcRootCount, Marshal.SizeOf<GcRootRecord>(), "GC root", ref end);
+            ValidateSection(data.Length, header.UnwindOffset, header.UnwindCount, Marshal.SizeOf<UnwindRecord>(), "unwind", ref end);
+            ValidateSection(data.Length, header.SwitchTableOffset, header.SwitchTableCount, Marshal.SizeOf<SwitchTableRecord>(), "switch", ref end);
+            ValidateSection(data.Length, header.BlobOffset, header.BlobLength, 1, "blob", ref end);
+            if (end != data.Length)
+                throw new InvalidDataException("Trailing bytes found in register image.");
+
+            return new CodeImage(
+                (ImageFlags)header.Flags,
+                ReadMany<InstrDesc>(data, header.CodeOffset, header.CodeCount),
+                ReadMany<MethodRecord>(data, header.MethodOffset, header.MethodCount),
+                ReadMany<CallSiteRecord>(data, header.CallSiteOffset, header.CallSiteCount),
+                ReadMany<EhRegionRecord>(data, header.EhOffset, header.EhCount),
+                ReadMany<GcSafePointRecord>(data, header.GcSafePointOffset, header.GcSafePointCount),
+                ReadMany<GcRootRecord>(data, header.GcRootOffset, header.GcRootCount),
+                ReadMany<UnwindRecord>(data, header.UnwindOffset, header.UnwindCount),
+                ReadMany<SwitchTableRecord>(data, header.SwitchTableOffset, header.SwitchTableCount),
+                data.Slice(header.BlobOffset, header.BlobLength).ToArray().ToImmutableArray());
+        }
+
+        private static void ValidateSection(int imageLength, int offset, int count, int elementSize, string name, ref int end)
+        {
+            if (offset < 0 || count < 0)
+                throw new InvalidDataException($"Negative {name} section offset or count.");
+            if (elementSize <= 0)
+                throw new InvalidDataException($"Invalid {name} section element size.");
+            long byteLength = (long)count * elementSize;
+            long sectionEnd = (long)offset + byteLength;
+            if (sectionEnd > imageLength)
+                throw new InvalidDataException($"Register image {name} section is outside the image.");
+            if (count != 0 && offset < RegisterVmIsa.HeaderSize)
+                throw new InvalidDataException($"Register image {name} section overlaps the fixed header.");
+            if (sectionEnd > end)
+                end = checked((int)sectionEnd);
+        }
+
+        private static ImmutableArray<T> ReadMany<T>(ReadOnlySpan<byte> source, int offset, int count)
+            where T : struct
+        {
+            if (count == 0)
+                return ImmutableArray<T>.Empty;
+
+            int size = Marshal.SizeOf<T>();
+            var result = new T[count];
+            for (int i = 0; i < count; i++)
+                result[i] = MemoryMarshal.Read<T>(source.Slice(offset + i * size, size));
+            return ImmutableArray.Create(result);
+        }
+
         private static void WriteOne<T>(byte[] destination, int offset, T value)
             where T : struct
         {
@@ -2939,10 +3012,10 @@ namespace Cnidaria.Cs
                 sb.Append(" type=T");
                 sb.Append(root.RuntimeTypeId);
             }
-            if (root.InteriorOffset != 0)
+            if (root.CellOffset != 0)
             {
-                sb.Append(" interior+");
-                sb.Append(root.InteriorOffset);
+                sb.Append(" cell+");
+                sb.Append(root.CellOffset);
             }
             AppendFlags(sb, " flags", (GcRootFlags)root.Flags);
             return sb.ToString();

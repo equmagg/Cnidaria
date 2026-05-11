@@ -13,6 +13,7 @@ namespace Cnidaria.Cs
         Void,
         I4,
         I8,
+        R4,
         R8,
         NativeInt,
         NativeUInt,
@@ -34,6 +35,7 @@ namespace Cnidaria.Cs
 
         ConstI4,
         ConstI8,
+        ConstR4Bits,
         ConstR8Bits,
         ConstNull,
         ConstString,
@@ -125,6 +127,10 @@ namespace Cnidaria.Cs
         GlobalRef = 1u << 11,
         Indirect = 1u << 12,
         Ordered = 1u << 13,
+
+        VarDef = 1u << 14,
+        VarUseAsg = 1u << 15,
+        VarDeath = 1u << 16,
     }
 
     internal enum GenTreeBlockJumpKind : byte
@@ -152,12 +158,30 @@ namespace Cnidaria.Cs
         InHandlerRegion = 1 << 6,
     }
 
+
+
+    internal enum GenTreeMethodPhase : byte
+    {
+        ImportedHir,
+        MorphedHir,
+        LocalRewrittenHir,
+        FlowgraphBuilt,
+        HirLiveness,
+        Ssa,
+        SsaOptimized,
+        RationalizedLir,
+        LoweredLir,
+        RegisterAllocated,
+        CodeGenerated,
+    }
+
     internal enum GenTempKind : byte
     {
         StackSpill,
         DupSpill,
         InlineArg,
         InlineLocal,
+        InlineReturn,
     }
 
     internal readonly struct GenTemp
@@ -184,6 +208,36 @@ namespace Cnidaria.Cs
         Temporary,
     }
 
+    internal enum GenLocalCategory : byte
+    {
+        Unclassified,
+        RegularPromotedScalarLocal,
+        PromotedStruct,
+        PromotedStructField,
+        AddressExposedLocal,
+        ImplicitByRefPinnedRefLikeLocal,
+        CompilerTemp,
+        MemoryAliasedLocal,
+        TrackedNonSsaLocal,
+        UntrackedLocal,
+    }
+    [Flags]
+    internal enum GenLocalFlags : ushort
+    {
+        None = 0,
+        AddressExposed = 1 << 0,
+        DoNotEnregister = 1 << 1,
+        Promoted = 1 << 2,
+        IsStructField = 1 << 3,
+        IsCompilerTemp = 1 << 4,
+        IsImplicitByRef = 1 << 5,
+        IsPinned = 1 << 6,
+        IsRefLike = 1 << 7,
+        MemoryAliased = 1 << 8,
+        InSsa = 1 << 9,
+        Tracked = 1 << 10,
+    }
+
     [Flags]
     internal enum GenTreeLsraFlags : ushort
     {
@@ -204,13 +258,26 @@ namespace Cnidaria.Cs
         public readonly GenLocalKind LocalKind;
         public readonly int Index;
         public readonly GenTree? Node;
+        public readonly bool HasSsaName;
+        public readonly SsaSlot SsaSlot;
+        public readonly int SsaVersion;
 
-        private GenTreeValueKey(GenTreeValueOrigin origin, GenLocalKind localKind, int index, GenTree? node)
+        private GenTreeValueKey(
+            GenTreeValueOrigin origin,
+            GenLocalKind localKind,
+            int index,
+            GenTree? node,
+            bool hasSsaName = false,
+            SsaSlot ssaSlot = default,
+            int ssaVersion = -1)
         {
             Origin = origin;
             LocalKind = localKind;
             Index = index;
             Node = node;
+            HasSsaName = hasSsaName;
+            SsaSlot = ssaSlot;
+            SsaVersion = ssaVersion;
         }
 
         public static GenTreeValueKey ForTree(GenTree node)
@@ -232,14 +299,60 @@ namespace Cnidaria.Cs
             return new GenTreeValueKey(origin, localKind, index, null);
         }
 
+        public static GenTreeValueKey ForSsaValue(SsaValueName name)
+        {
+            if (name.Version <= SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(name));
+            if (!name.Slot.HasLclNum)
+                throw new ArgumentException("SSA value names must be based on a concrete lclNum.", nameof(name));
+
+            GenLocalKind localKind = name.Slot.Kind switch
+            {
+                SsaSlotKind.Arg => GenLocalKind.Argument,
+                SsaSlotKind.Local => GenLocalKind.Local,
+                SsaSlotKind.Temp => GenLocalKind.Temporary,
+                _ => throw new ArgumentOutOfRangeException(nameof(name)),
+            };
+
+            GenTreeValueOrigin origin = localKind switch
+            {
+                GenLocalKind.Argument => GenTreeValueOrigin.Argument,
+                GenLocalKind.Local => GenTreeValueOrigin.Local,
+                GenLocalKind.Temporary => GenTreeValueOrigin.Temporary,
+                _ => throw new ArgumentOutOfRangeException(nameof(name)),
+            };
+
+            return new GenTreeValueKey(origin, localKind, name.Slot.Index, null, true, name.Slot, name.Version);
+        }
+
         public bool IsTreeNode => Origin == GenTreeValueOrigin.TreeNode;
-        public bool IsLocalDescriptor => Origin != GenTreeValueOrigin.TreeNode;
+        public bool IsLocalDescriptor => Origin != GenTreeValueOrigin.TreeNode && !HasSsaName;
+        public bool IsSsaValue => HasSsaName;
 
         public bool Equals(GenTreeValueKey other)
-            => Origin == other.Origin && LocalKind == other.LocalKind && Index == other.Index && ReferenceEquals(Node, other.Node);
+        {
+            if (HasSsaName || other.HasSsaName)
+                return HasSsaName && other.HasSsaName && SsaSlot.Equals(other.SsaSlot) && SsaVersion == other.SsaVersion;
+
+            return Origin == other.Origin &&
+                   LocalKind == other.LocalKind &&
+                   Index == other.Index &&
+                   ReferenceEquals(Node, other.Node);
+        }
 
         public override bool Equals(object? obj) => obj is GenTreeValueKey other && Equals(other);
-        public override int GetHashCode() => HashCode.Combine((int)Origin, (int)LocalKind, Index, Node is null ? 0 : RuntimeHelpers.GetHashCode(Node));
+
+        public override int GetHashCode()
+        {
+            if (HasSsaName)
+                return HashCode.Combine(SsaSlot, SsaVersion);
+
+            return HashCode.Combine(
+                (int)Origin,
+                (int)LocalKind,
+                Index,
+                Node is null ? 0 : RuntimeHelpers.GetHashCode(Node));
+        }
 
         public override string ToString()
         {
@@ -252,32 +365,377 @@ namespace Cnidaria.Cs
                 GenLocalKind.Temporary => "tmp",
                 _ => "local",
             };
-            return prefix + Index.ToString();
+            return HasSsaName
+                ? "V" + SsaSlot.LclNum.ToString() + "_" + SsaVersion.ToString()
+                : prefix + Index.ToString();
         }
     }
 
-    internal sealed class GenLocalDescriptor
+    internal class LclVarDsc
     {
+        public int LclNum { get; }
         public GenLocalKind Kind { get; }
         public int Index { get; }
         public RuntimeType? Type { get; }
         public GenStackKind StackKind { get; }
-        public bool Tracked { get; internal set; }
-        public bool AddressExposed { get; internal set; }
-        public bool DoNotEnregister { get; internal set; }
-        public MachineRegister LvRegNum { get; internal set; } = MachineRegister.Invalid;
-        public bool LvRegister { get; internal set; }
-        public bool LvSpilled { get; internal set; }
+        public GenLocalCategory Category { get; internal set; }
+        public GenLocalFlags LocalFlags { get; private set; }
+        public int ParentLclNum { get; internal set; } = -1;
+        public int FieldOrdinal { get; internal set; } = -1;
+        public int FieldOffset { get; internal set; } = -1;
+        public int FieldSize { get; internal set; } = -1;
+        public RuntimeField? PromotedField { get; internal set; }
+        private readonly Dictionary<int, GenLocalDescriptor> _promotedFieldsByFieldId = new Dictionary<int, GenLocalDescriptor>();
+        private readonly Dictionary<int, GenLocalDescriptor> _promotedFieldsByOffset = new Dictionary<int, GenLocalDescriptor>();
+        public bool Tracked { get => (LocalFlags & GenLocalFlags.Tracked) != 0; internal set => SetLocalFlag(GenLocalFlags.Tracked, value); }
+        public int VarIndex { get; internal set; } = -1;
+        public bool AddressExposed { get => (LocalFlags & GenLocalFlags.AddressExposed) != 0; internal set => SetLocalFlag(GenLocalFlags.AddressExposed, value); }
+        public bool Promoted { get => (LocalFlags & GenLocalFlags.Promoted) != 0; internal set => SetLocalFlag(GenLocalFlags.Promoted, value); }
+        public bool DoNotEnregister { get => (LocalFlags & GenLocalFlags.DoNotEnregister) != 0; internal set => SetLocalFlag(GenLocalFlags.DoNotEnregister, value); }
+        public bool SsaPromoted { get => (LocalFlags & GenLocalFlags.InSsa) != 0; internal set => SetLocalFlag(GenLocalFlags.InSsa, value); }
+        public int UseCount { get; internal set; }
+        public int DefCount { get; internal set; }
+        public int FullDefCount { get; internal set; }
+        public int PartialDefCount { get; internal set; }
+        public double WeightedUseCount { get; internal set; }
+        public double WeightedDefCount { get; internal set; }
+        public bool IsCompilerTemp { get => (LocalFlags & GenLocalFlags.IsCompilerTemp) != 0; internal set => SetLocalFlag(GenLocalFlags.IsCompilerTemp, value); }
+        public bool IsImplicitByRef { get => (LocalFlags & GenLocalFlags.IsImplicitByRef) != 0; internal set => SetLocalFlag(GenLocalFlags.IsImplicitByRef, value); }
+        public bool Pinned { get => (LocalFlags & GenLocalFlags.IsPinned) != 0; internal set => SetLocalFlag(GenLocalFlags.IsPinned, value); }
+        public bool IsRefLike { get => (LocalFlags & GenLocalFlags.IsRefLike) != 0; internal set => SetLocalFlag(GenLocalFlags.IsRefLike, value); }
+        public bool IsStructField { get => (LocalFlags & GenLocalFlags.IsStructField) != 0; internal set => SetLocalFlag(GenLocalFlags.IsStructField, value); }
+        public bool MemoryAliased { get => (LocalFlags & GenLocalFlags.MemoryAliased) != 0; internal set => SetLocalFlag(GenLocalFlags.MemoryAliased, value); }
+        public bool HasMemoryAlias => AddressExposed || MemoryAliased;
+        public MachineRegister RegNum { get; internal set; } = MachineRegister.Invalid;
+        public bool Register { get; internal set; }
+        public bool Spilled { get; internal set; }
         public RegisterOperand FrameHome { get; internal set; } = RegisterOperand.None;
+        public bool LRACandidate { get; internal set; }
+        public bool IsTrackedForLiveness => Tracked && VarIndex >= 0;
+        public bool IsRegisterCandidate => IsTrackedForLiveness && LRACandidate && !DoNotEnregister && !HasMemoryAlias;
+        public bool CanBeSsaRenamedAsScalar =>
+            SsaPromoted &&
+            Tracked &&
+            VarIndex >= 0 &&
+            !DoNotEnregister &&
+            !HasMemoryAlias &&
+            (
+                (!IsStructField && (Category == GenLocalCategory.RegularPromotedScalarLocal || Category == GenLocalCategory.CompilerTemp)) ||
+                (IsStructField && Category == GenLocalCategory.PromotedStructField && ParentLclNum >= 0)
+            );
 
-        public GenLocalDescriptor(GenLocalKind kind, int index, RuntimeType? type, GenStackKind stackKind)
+        public ImmutableArray<SsaDescriptor> PerSsaData => _ssaDescriptors;
+
+        private readonly Dictionary<int, RegisterAllocationInfo> _ssaAllocations = new Dictionary<int, RegisterAllocationInfo>();
+        private ImmutableArray<SsaDescriptor> _ssaDescriptors = ImmutableArray<SsaDescriptor>.Empty;
+
+        public IReadOnlyDictionary<int, RegisterAllocationInfo> SsaAllocations => _ssaAllocations;
+        public ImmutableArray<SsaDescriptor> SsaDescriptors => _ssaDescriptors;
+
+        public bool HasSsaAllocations => _ssaAllocations.Count != 0;
+        public bool HasSsaDescriptors => !_ssaDescriptors.IsDefaultOrEmpty && _ssaDescriptors.Length > SsaConfig.ReservedSsaNumber + 1;
+
+        internal void ResetTrackingAndLivenessState()
         {
+            bool promotedParent = Category == GenLocalCategory.PromotedStruct;
+            bool promotedField = Category == GenLocalCategory.PromotedStructField;
+            Tracked = false;
+            VarIndex = -1;
+            Promoted = promotedParent || promotedField;
+            SsaPromoted = false;
+            LRACandidate = false;
+            DoNotEnregister = promotedParent || AddressExposed || MemoryAliased || IsCompilerTemp || IsImplicitByRef || Pinned || IsRefLike;
+            if (promotedField && !AddressExposed && !MemoryAliased && !IsImplicitByRef && !Pinned && !IsRefLike)
+                DoNotEnregister = false;
+            UseCount = 0;
+            DefCount = 0;
+            FullDefCount = 0;
+            PartialDefCount = 0;
+            WeightedUseCount = 0;
+            WeightedDefCount = 0;
+            SetSsaDescriptors(ImmutableArray<SsaDescriptor>.Empty);
+            ResetRegisterAllocationState();
+        }
+
+        internal void ResetPreSsaClassification()
+        {
+            LocalFlags = GenLocalFlags.None;
+            Category = GenLocalCategory.Unclassified;
+            ParentLclNum = -1;
+            FieldOrdinal = -1;
+            FieldOffset = -1;
+            FieldSize = -1;
+            PromotedField = null;
+            _promotedFieldsByFieldId.Clear();
+            _promotedFieldsByOffset.Clear();
+            if (Kind == GenLocalKind.Temporary)
+            {
+                IsCompilerTemp = true;
+                Category = GenLocalCategory.CompilerTemp;
+            }
+            ClassifySpecialStorage();
+            ResetTrackingAndLivenessState();
+        }
+
+        internal void ClassifySpecialStorage()
+        {
+            if (StackKind == GenStackKind.ByRef || Type?.Kind == RuntimeTypeKind.ByRef)
+                IsImplicitByRef = true;
+
+            if (IsKnownRefLike(Type))
+                IsRefLike = true;
+
+            if (IsImplicitByRef || Pinned || IsRefLike)
+            {
+                Category = GenLocalCategory.ImplicitByRefPinnedRefLikeLocal;
+                DoNotEnregister = true;
+                SsaPromoted = false;
+                LRACandidate = false;
+            }
+        }
+
+        internal void MarkAddressExposed()
+        {
+            AddressExposed = true;
+            MemoryAliased = true;
+            Category = GenLocalCategory.AddressExposedLocal;
+            DoNotEnregister = true;
+            SsaPromoted = false;
+            Tracked = false;
+            LRACandidate = false;
+            VarIndex = -1;
+        }
+
+        internal void MarkMemoryAliased()
+        {
+            MemoryAliased = true;
+            if (!AddressExposed)
+                Category = GenLocalCategory.MemoryAliasedLocal;
+            DoNotEnregister = true;
+            SsaPromoted = false;
+            LRACandidate = false;
+        }
+
+        internal void MarkPromotedStructParent()
+        {
+            if (AddressExposed)
+                return;
+
+            Promoted = true;
+            MemoryAliased = false;
+            Category = GenLocalCategory.PromotedStruct;
+            DoNotEnregister = true;
+            SsaPromoted = false;
+            Tracked = false;
+            LRACandidate = false;
+            VarIndex = -1;
+        }
+
+        internal void MarkPromotedStructField(int parentLclNum, int ordinal, int offset, int size, RuntimeField? field = null)
+        {
+            IsStructField = true;
+            Promoted = true;
+            ParentLclNum = parentLclNum;
+            FieldOrdinal = ordinal;
+            FieldOffset = offset;
+            FieldSize = size;
+            PromotedField = field;
+            Category = GenLocalCategory.PromotedStructField;
+            AddressExposed = false;
+            MemoryAliased = false;
+            DoNotEnregister = false;
+        }
+
+        internal IReadOnlyDictionary<int, GenLocalDescriptor> PromotedFieldsByFieldId => _promotedFieldsByFieldId;
+
+        internal bool HasPromotedStructFields => _promotedFieldsByFieldId.Count != 0;
+
+        internal bool TryGetPromotedField(RuntimeField field, out GenLocalDescriptor descriptor)
+        {
+            if (field is null)
+                throw new ArgumentNullException(nameof(field));
+            return _promotedFieldsByFieldId.TryGetValue(field.FieldId, out descriptor!);
+        }
+
+        internal void AddPromotedField(RuntimeField field, GenLocalDescriptor descriptor)
+        {
+            if (field is null)
+                throw new ArgumentNullException(nameof(field));
+            if (descriptor is null)
+                throw new ArgumentNullException(nameof(descriptor));
+            if (!ReferenceEquals(descriptor.PromotedField, field))
+                throw new InvalidOperationException("Promoted field descriptor is bound to a different RuntimeField.");
+            _promotedFieldsByFieldId[field.FieldId] = descriptor;
+            _promotedFieldsByOffset[field.Offset] = descriptor;
+        }
+
+        internal void MarkRegularPromotedScalar(int denseVarIndex)
+        {
+            if (HasMemoryAlias || IsImplicitByRef || Pinned || IsRefLike)
+                throw new InvalidOperationException("Cannot mark memory-aliased local as an SSA scalar: " + this + ".");
+
+            if (IsStructField && Category != GenLocalCategory.PromotedStructField)
+                throw new InvalidOperationException("Cannot mark malformed promoted struct field as an SSA scalar: " + this + ".");
+
+            Tracked = true;
+            VarIndex = denseVarIndex;
+            SsaPromoted = true;
+            Promoted = true;
+            LRACandidate = true;
+            DoNotEnregister = false;
+            if (IsStructField)
+            {
+                Category = GenLocalCategory.PromotedStructField;
+            }
+            else if (!IsCompilerTemp)
+            {
+                Category = GenLocalCategory.RegularPromotedScalarLocal;
+            }
+            else
+            {
+                Category = GenLocalCategory.CompilerTemp;
+            }
+        }
+
+        internal void MarkTrackedButNotSsa(int denseVarIndex, GenLocalCategory category)
+        {
+            Tracked = true;
+            VarIndex = denseVarIndex;
+            SsaPromoted = false;
+            LRACandidate = false;
+            DoNotEnregister = true;
+            if (Category == GenLocalCategory.Unclassified || Category == GenLocalCategory.RegularPromotedScalarLocal)
+                Category = category;
+        }
+
+        internal void MarkUntracked()
+        {
+            bool promotedParent = Category == GenLocalCategory.PromotedStruct;
+            bool promotedField = Category == GenLocalCategory.PromotedStructField;
+            Tracked = false;
+            VarIndex = -1;
+            SsaPromoted = false;
+            LRACandidate = false;
+            DoNotEnregister = true;
+            Promoted = promotedParent || promotedField;
+            if (Category == GenLocalCategory.Unclassified)
+                Category = GenLocalCategory.UntrackedLocal;
+        }
+
+        private void SetLocalFlag(GenLocalFlags flag, bool value)
+        {
+            LocalFlags = value ? (LocalFlags | flag) : (LocalFlags & ~flag);
+        }
+
+        private static bool IsKnownRefLike(RuntimeType? type)
+        {
+            if (type is null)
+                return false;
+
+            return type.Name == "Span`1" ||
+                   type.Name == "ReadOnlySpan`1" ||
+                   type.Name == "Span" ||
+                   type.Name == "ReadOnlySpan";
+        }
+
+        internal void ResetRegisterAllocationState()
+        {
+            RegNum = MachineRegister.Invalid;
+            Register = false;
+            Spilled = false;
+            FrameHome = RegisterOperand.None;
+            _ssaAllocations.Clear();
+        }
+
+        internal void AddUse(double weight)
+        {
+            UseCount++;
+            WeightedUseCount += Math.Max(1.0, weight);
+        }
+
+        internal void AddFullDefinition(double weight)
+        {
+            DefCount++;
+            FullDefCount++;
+            WeightedDefCount += Math.Max(1.0, weight);
+        }
+
+        internal void AddPartialDefinition(double weight)
+        {
+            DefCount++;
+            PartialDefCount++;
+            WeightedDefCount += Math.Max(1.0, weight);
+        }
+
+        internal void SetSsaAllocation(int ssaVersion, RegisterAllocationInfo allocation)
+        {
+            if (ssaVersion <= SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(ssaVersion));
+            if (allocation is null)
+                throw new ArgumentNullException(nameof(allocation));
+            _ssaAllocations[ssaVersion] = allocation;
+        }
+
+        internal bool TryGetSsaAllocation(int ssaVersion, out RegisterAllocationInfo? allocation)
+            => _ssaAllocations.TryGetValue(ssaVersion, out allocation);
+
+        internal void SetSsaDescriptors(ImmutableArray<SsaDescriptor> descriptors)
+        {
+            if (descriptors.IsDefaultOrEmpty)
+            {
+                _ssaDescriptors = ImmutableArray<SsaDescriptor>.Empty;
+                return;
+            }
+
+            if (descriptors.Length <= SsaConfig.ReservedSsaNumber || descriptors[SsaConfig.ReservedSsaNumber] is not null)
+                throw new InvalidOperationException("SSA descriptor table must reserve index zero for " + ValueKey + ".");
+
+            for (int i = SsaConfig.FirstSsaNumber; i < descriptors.Length; i++)
+            {
+                if (descriptors[i] is null || descriptors[i].SsaNumber != i)
+                    throw new InvalidOperationException("SSA descriptor table is not dense for " + ValueKey + ".");
+            }
+
+            _ssaDescriptors = descriptors;
+        }
+
+        internal SsaDescriptor GetSsaDescriptor(int ssaVersion)
+        {
+            if (ssaVersion <= SsaConfig.ReservedSsaNumber || (uint)ssaVersion >= (uint)_ssaDescriptors.Length)
+                throw new ArgumentOutOfRangeException(nameof(ssaVersion));
+            var descriptor = _ssaDescriptors[ssaVersion];
+            if (descriptor is null || descriptor.SsaNumber != ssaVersion)
+                throw new InvalidOperationException("SSA descriptor table is not dense for " + ValueKey + ".");
+            return descriptor;
+        }
+
+        internal bool TryGetSsaDescriptor(int ssaVersion, out SsaDescriptor descriptor)
+        {
+            if (ssaVersion > SsaConfig.ReservedSsaNumber && (uint)ssaVersion < (uint)_ssaDescriptors.Length)
+            {
+                descriptor = _ssaDescriptors[ssaVersion];
+                if (descriptor is not null && descriptor.SsaNumber == ssaVersion)
+                    return true;
+            }
+
+            descriptor = null!;
+            return false;
+        }
+
+        public LclVarDsc(int lclNum, GenLocalKind kind, int index, RuntimeType? type, GenStackKind stackKind, GenLocalCategory category = GenLocalCategory.Unclassified)
+        {
+            if (lclNum < 0) throw new ArgumentOutOfRangeException(nameof(lclNum));
             if (index < 0) throw new ArgumentOutOfRangeException(nameof(index));
+            LclNum = lclNum;
             Kind = kind;
             Index = index;
             Type = type;
             StackKind = stackKind;
-            Tracked = true;
+            Category = category;
+            if (kind == GenLocalKind.Temporary)
+                IsCompilerTemp = true;
+            ClassifySpecialStorage();
+            Tracked = false;
         }
 
         public GenTreeValueKey ValueKey => GenTreeValueKey.ForLocal(Kind, Index);
@@ -291,8 +749,26 @@ namespace Cnidaria.Cs
                 GenLocalKind.Temporary => "T",
                 _ => "L",
             };
-            return prefix + Index.ToString() + (LvRegister ? " reg=" + MachineRegisters.Format(LvRegNum) : " home=" + FrameHome.ToString()) +
-                   (LvSpilled ? " spilled" : string.Empty) + (AddressExposed ? " addr-exposed" : string.Empty);
+            return prefix + Index.ToString() + "#" + LclNum.ToString() + " " + Category.ToString() + (Tracked ? " tracked=" + VarIndex.ToString() : " untracked") +
+                   " uses=" + UseCount.ToString() + "/" + WeightedUseCount.ToString("0.##") +
+                   " defs=" + DefCount.ToString() + "/" + WeightedDefCount.ToString("0.##") +
+                   (PartialDefCount != 0 ? " partial-defs=" + PartialDefCount.ToString() : string.Empty) +
+                   (Register ? " reg=" + MachineRegisters.Format(RegNum) : " home=" + FrameHome.ToString()) +
+                   (Spilled ? " spilled" : string.Empty) +
+                   (AddressExposed ? " addr-exposed" : string.Empty) +
+                   (Promoted ? " promoted" : string.Empty) +
+                   (IsStructField ? " parent=" + ParentLclNum.ToString() + " fld=" + (PromotedField?.Name ?? FieldOrdinal.ToString()) : string.Empty) +
+                   (SsaPromoted ? " ssa" : string.Empty) +
+                   (HasSsaDescriptors ? " ssa-defs=" + (_ssaDescriptors.Length - 1).ToString() : string.Empty) +
+                   (HasSsaAllocations ? " ssa-allocs=" + _ssaAllocations.Count.ToString() : string.Empty);
+        }
+    }
+
+    internal sealed class GenLocalDescriptor : LclVarDsc
+    {
+        public GenLocalDescriptor(int lclNum, GenLocalKind kind, int index, RuntimeType? type, GenStackKind stackKind, GenLocalCategory category = GenLocalCategory.Unclassified)
+            : base(lclNum, kind, index, type, stackKind, category)
+        {
         }
     }
 
@@ -369,6 +845,8 @@ namespace Cnidaria.Cs
         public bool IsContainedInLinear { get; internal set; }
         public GenLocalDescriptor? LocalDescriptor { get; internal set; }
         public GenTreeValueKey ValueKey { get; internal set; }
+        public SsaValueName? SsaValueName { get; internal set; }
+        public SsaValueName? SsaStoreTargetName { get; internal set; }
         public GenTreeLsraInfo LsraInfo { get; private set; } = GenTreeLsraInfo.Empty;
         public ImmutableArray<GenTreeInternalRegister> InternalRegisters => LsraInfo.InternalRegisters;
         public GenTreeLsraFlags LsraFlags => LsraInfo.Flags;
@@ -387,6 +865,8 @@ namespace Cnidaria.Cs
         public MoveFlags MoveFlags => LsraInfo.MoveFlags;
 
         public GenTreeValueKey LinearValueKey => ValueKey;
+        public bool HasSsaUse => SsaValueName.HasValue;
+        public bool HasSsaDefinition => SsaStoreTargetName.HasValue;
 
         public MoveKind MoveKind
         {
@@ -492,6 +972,29 @@ namespace Cnidaria.Cs
                 Operands[i].Parent = this;
         }
 
+        internal void AttachSsaUse(SsaValueName value)
+        {
+            SsaValueName = value;
+            SsaStoreTargetName = null;
+            ValueKey = GenTreeValueKey.ForSsaValue(value);
+        }
+
+        internal void AttachSsaDefinition(SsaValueName value, RuntimeType? type, GenStackKind stackKind)
+        {
+            SsaValueName = null;
+            SsaStoreTargetName = value;
+            ValueKey = GenTreeValueKey.ForSsaValue(value);
+            Type = type;
+            StackKind = stackKind;
+        }
+
+        internal void ClearSsaAnnotation()
+        {
+            SsaValueName = null;
+            SsaStoreTargetName = null;
+            ValueKey = GenTreeValueKey.ForTree(this);
+        }
+
         internal void ResetLinearState()
         {
             Previous = null;
@@ -528,12 +1031,41 @@ namespace Cnidaria.Cs
             int phiCopyFromBlockId = -1,
             int phiCopyToBlockId = -1)
         {
+            var results = result is null ? ImmutableArray<GenTree>.Empty : ImmutableArray.Create(result);
+            SetLinearState(
+                linearId,
+                blockId,
+                ordinal,
+                linearKind,
+                results,
+                operands,
+                uses,
+                lowering,
+                memoryAccess,
+                phiCopyFromBlockId,
+                phiCopyToBlockId);
+        }
+
+        internal void SetLinearState(
+            int linearId,
+            int blockId,
+            int ordinal,
+            GenTreeLinearKind linearKind,
+            ImmutableArray<GenTree> results,
+            ImmutableArray<LirOperandFlags> operands,
+            ImmutableArray<GenTree> uses,
+            GenTreeLinearLoweringInfo lowering,
+            LinearMemoryAccess memoryAccess,
+            int phiCopyFromBlockId = -1,
+            int phiCopyToBlockId = -1)
+        {
+            var normalizedResults = results.IsDefault ? ImmutableArray<GenTree>.Empty : results;
             LinearId = linearId;
             LinearBlockId = blockId;
             LinearOrdinal = ordinal;
             LinearKind = linearKind;
-            RegisterResult = result;
-            RegisterResults = result is null ? ImmutableArray<GenTree>.Empty : ImmutableArray.Create(result);
+            RegisterResults = normalizedResults;
+            RegisterResult = normalizedResults.Length == 1 ? normalizedResults[0] : null;
             OperandFlags = operands.IsDefault ? ImmutableArray<LirOperandFlags>.Empty : operands;
             RegisterUses = uses.IsDefault ? ImmutableArray<GenTree>.Empty : uses;
             LinearLowering = lowering;
@@ -652,18 +1184,25 @@ namespace Cnidaria.Cs
         public ImmutableArray<RuntimeType> ArgTypes { get; }
         public ImmutableArray<RuntimeType> LocalTypes { get; }
         public ImmutableArray<GenTemp> Temps { get; }
-        public ImmutableArray<GenLocalDescriptor> ArgDescriptors { get; }
-        public ImmutableArray<GenLocalDescriptor> LocalDescriptors { get; }
-        public ImmutableArray<GenLocalDescriptor> TempDescriptors { get; }
+        public ImmutableArray<GenLocalDescriptor> ArgDescriptors { get; private set; }
+        public ImmutableArray<GenLocalDescriptor> LocalDescriptors { get; private set; }
+        public ImmutableArray<GenLocalDescriptor> TempDescriptors { get; private set; }
+        public ImmutableArray<GenLocalDescriptor> AllLocalDescriptors { get; private set; }
         public ImmutableArray<GenTreeBlock> Blocks { get; }
         public ImmutableArray<RuntimeMethod> DirectDependencies { get; }
         public ImmutableArray<RuntimeMethod> VirtualDependencies { get; }
 
         private ControlFlowGraph? _cfg;
+        private SsaMethod? _ssa;
+        private GenTreeLocalLiveness? _hirLiveness;
         private IReadOnlyDictionary<GenTreeValueKey, GenTreeValueInfo> _valueInfoByNode = new Dictionary<GenTreeValueKey, GenTreeValueInfo>();
+        private IReadOnlyDictionary<GenTree, GenTreeValueInfo> _valueInfoByRepresentativeNode = new Dictionary<GenTree, GenTreeValueInfo>();
         private IReadOnlyDictionary<GenTree, LinearLiveInterval> _liveIntervalByNode = new Dictionary<GenTree, LinearLiveInterval>();
 
-        public ControlFlowGraph Cfg => _cfg ?? throw new InvalidOperationException("GenTree method has not been rationalized to linear IR.");
+        public GenTreeMethodPhase Phase { get; private set; } = GenTreeMethodPhase.ImportedHir;
+        public ControlFlowGraph Cfg => _cfg ?? throw new InvalidOperationException("GenTree method has no control-flow graph attached.");
+        public SsaMethod? Ssa => _ssa;
+        public GenTreeLocalLiveness? HirLiveness => _hirLiveness;
         public ImmutableArray<GenTree> LinearNodes { get; private set; } = ImmutableArray<GenTree>.Empty;
         public ImmutableArray<int> LinearBlockOrder { get; private set; } = ImmutableArray<int>.Empty;
         public ImmutableArray<GenTreeValueInfo> Values { get; private set; } = ImmutableArray<GenTreeValueInfo>.Empty;
@@ -703,8 +1242,9 @@ namespace Cnidaria.Cs
             LocalTypes = localTypes.IsDefault ? ImmutableArray<RuntimeType>.Empty : localTypes;
             Temps = temps.IsDefault ? ImmutableArray<GenTemp>.Empty : temps;
             ArgDescriptors = BuildArgDescriptors(ArgTypes);
-            LocalDescriptors = BuildLocalDescriptors(LocalTypes);
-            TempDescriptors = BuildTempDescriptors(Temps);
+            LocalDescriptors = BuildLocalDescriptors(LocalTypes, ArgDescriptors.Length);
+            TempDescriptors = BuildTempDescriptors(Temps, ArgDescriptors.Length + LocalDescriptors.Length);
+            AllLocalDescriptors = BuildAllLocalDescriptors(ArgDescriptors, LocalDescriptors, TempDescriptors);
             AttachLocalDescriptorsToTrees(blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks);
             Blocks = blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks;
             DirectDependencies = directDependencies.IsDefault ? ImmutableArray<RuntimeMethod>.Empty : directDependencies;
@@ -715,28 +1255,74 @@ namespace Cnidaria.Cs
         {
             var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(args.Length);
             for (int i = 0; i < args.Length; i++)
-                builder.Add(new GenLocalDescriptor(GenLocalKind.Argument, i, args[i], StackKindForDescriptor(args[i])));
+            {
+                var stackKind = StackKindForDescriptor(args[i]);
+                var category = IsSpecialByrefPinnedOrRefLike(args[i], stackKind)
+                    ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
+                    : GenLocalCategory.Unclassified;
+                builder.Add(new GenLocalDescriptor(i, GenLocalKind.Argument, i, args[i], stackKind, category));
+            }
             return builder.ToImmutable();
         }
 
-        private static ImmutableArray<GenLocalDescriptor> BuildLocalDescriptors(ImmutableArray<RuntimeType> locals)
+        private static ImmutableArray<GenLocalDescriptor> BuildLocalDescriptors(ImmutableArray<RuntimeType> locals, int lclNumBase)
         {
             var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(locals.Length);
             for (int i = 0; i < locals.Length; i++)
-                builder.Add(new GenLocalDescriptor(GenLocalKind.Local, i, locals[i], StackKindForDescriptor(locals[i])));
+            {
+                var stackKind = StackKindForDescriptor(locals[i]);
+                var category = IsSpecialByrefPinnedOrRefLike(locals[i], stackKind)
+                    ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
+                    : GenLocalCategory.Unclassified;
+                builder.Add(new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Local, i, locals[i], stackKind, category));
+            }
             return builder.ToImmutable();
         }
 
-        private static ImmutableArray<GenLocalDescriptor> BuildTempDescriptors(ImmutableArray<GenTemp> temps)
+        private static ImmutableArray<GenLocalDescriptor> BuildTempDescriptors(ImmutableArray<GenTemp> temps, int lclNumBase)
         {
             var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(temps.Length);
             for (int i = 0; i < temps.Length; i++)
             {
                 var temp = temps[i];
-                var descriptor = new GenLocalDescriptor(GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind);
+                var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, GenLocalCategory.CompilerTemp);
+                descriptor.IsCompilerTemp = true;
+                descriptor.DoNotEnregister = true;
                 builder.Add(descriptor);
             }
             return builder.ToImmutable();
+        }
+
+        private static ImmutableArray<GenLocalDescriptor> BuildAllLocalDescriptors(
+            ImmutableArray<GenLocalDescriptor> args,
+            ImmutableArray<GenLocalDescriptor> locals,
+            ImmutableArray<GenLocalDescriptor> temps)
+        {
+            var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(args.Length + locals.Length + temps.Length);
+            builder.AddRange(args);
+            builder.AddRange(locals);
+            builder.AddRange(temps);
+            builder.Sort(static (left, right) => left.LclNum.CompareTo(right.LclNum));
+            for (int i = 0; i < builder.Count; i++)
+            {
+                if (builder[i].LclNum != i)
+                    throw new InvalidOperationException("LclVarDsc table must be dense by lclNum.");
+            }
+            return builder.ToImmutable();
+        }
+
+        private static bool IsSpecialByrefPinnedOrRefLike(RuntimeType? type, GenStackKind stackKind)
+        {
+            if (stackKind == GenStackKind.ByRef || type?.Kind == RuntimeTypeKind.ByRef)
+                return true;
+
+            if (type is null)
+                return false;
+
+            return type.Name == "Span`1" ||
+                   type.Name == "ReadOnlySpan`1" ||
+                   type.Name == "Span" ||
+                   type.Name == "ReadOnlySpan";
         }
 
         private static GenStackKind StackKindForDescriptor(RuntimeType type)
@@ -744,10 +1330,123 @@ namespace Cnidaria.Cs
             if (type.IsReferenceType) return GenStackKind.Ref;
             if (type.Kind == RuntimeTypeKind.ByRef) return GenStackKind.ByRef;
             if (type.Kind == RuntimeTypeKind.Pointer) return GenStackKind.Ptr;
-            if (type.Name == "Single" || type.Name == "Double") return GenStackKind.R8;
+            if (type.Name == "Single") return GenStackKind.R4;
+            if (type.Name == "Double") return GenStackKind.R8;
             if (type.SizeOf <= 4) return GenStackKind.I4;
             if (type.SizeOf <= 8) return GenStackKind.I8;
             return GenStackKind.Value;
+        }
+
+        internal void EnsurePromotedStructFieldLocals()
+        {
+            if (AllLocalDescriptors.IsDefaultOrEmpty)
+                return;
+
+            var args = ArgDescriptors.ToBuilder();
+            var locals = LocalDescriptors.ToBuilder();
+            var temps = TempDescriptors.ToBuilder();
+            int nextLclNum = AllLocalDescriptors.Length;
+            bool changed = false;
+
+            PromoteFrom(args, GenLocalKind.Argument, ref nextLclNum, ref changed);
+            PromoteFrom(locals, GenLocalKind.Local, ref nextLclNum, ref changed);
+            PromoteFrom(temps, GenLocalKind.Temporary, ref nextLclNum, ref changed);
+
+            if (!changed)
+                return;
+
+            ArgDescriptors = args.ToImmutable();
+            LocalDescriptors = locals.ToImmutable();
+            TempDescriptors = temps.ToImmutable();
+            AllLocalDescriptors = BuildAllLocalDescriptors(ArgDescriptors, LocalDescriptors, TempDescriptors);
+
+            static void PromoteFrom(ImmutableArray<GenLocalDescriptor>.Builder descriptors, GenLocalKind kind, ref int nextLclNum, ref bool changed)
+            {
+                int originalCount = descriptors.Count;
+                for (int i = 0; i < originalCount; i++)
+                {
+                    var parent = descriptors[i];
+                    if (parent.Category != GenLocalCategory.PromotedStruct)
+                        continue;
+                    if (parent.AddressExposed || parent.MemoryAliased)
+                        continue;
+                    if (parent.HasPromotedStructFields)
+                        continue;
+                    if (!CanPromoteStruct(parent.Type))
+                        continue;
+
+                    var fields = parent.Type!.InstanceFields;
+                    if (!HasNonOverlappingFields(fields))
+                        continue;
+
+                    for (int f = 0; f < fields.Length; f++)
+                    {
+                        var field = fields[f];
+                        if (!CanPromoteField(field))
+                            continue;
+
+                        var stackKind = StackKindForDescriptor(field.FieldType);
+                        int fieldIndex = descriptors.Count;
+                        var fieldDescriptor = new GenLocalDescriptor(
+                            nextLclNum++,
+                            kind,
+                            fieldIndex,
+                            field.FieldType,
+                            stackKind,
+                            GenLocalCategory.PromotedStructField);
+
+                        fieldDescriptor.MarkPromotedStructField(
+                            parent.LclNum,
+                            ordinal: f,
+                            offset: field.Offset,
+                            size: Math.Max(1, field.FieldType.SizeOf),
+                            field: field);
+
+                        descriptors.Add(fieldDescriptor);
+                        parent.AddPromotedField(field, fieldDescriptor);
+                        changed = true;
+                    }
+                }
+            }
+
+            static bool CanPromoteStruct(RuntimeType? type)
+            {
+                if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct)
+                    return false;
+                if (type.InstanceFields.Length == 0)
+                    return false;
+                return true;
+            }
+
+            static bool CanPromoteField(RuntimeField field)
+            {
+                if (field.IsStatic)
+                    return false;
+                var stackKind = StackKindForDescriptor(field.FieldType);
+                if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
+                    return false;
+                if (field.FieldType.IsValueType && field.FieldType.ContainsGcPointers)
+                    return false;
+                return MachineAbi.IsPhysicallyPromotableStorage(field.FieldType, stackKind) ||
+                       stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Ptr or GenStackKind.NativeInt or GenStackKind.NativeUInt;
+            }
+
+            static bool HasNonOverlappingFields(RuntimeField[] fields)
+            {
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    int iStart = fields[i].Offset;
+                    int iEnd = iStart + Math.Max(1, fields[i].FieldType.SizeOf);
+                    for (int j = i + 1; j < fields.Length; j++)
+                    {
+                        int jStart = fields[j].Offset;
+                        int jEnd = jStart + Math.Max(1, fields[j].FieldType.SizeOf);
+                        if (iStart < jEnd && jStart < iEnd)
+                            return false;
+                    }
+                }
+                return true;
+            }
         }
 
         private void AttachLocalDescriptorsToTrees(ImmutableArray<GenTreeBlock> blocks)
@@ -770,8 +1469,6 @@ namespace Cnidaria.Cs
                         {
                             node.LocalDescriptor = ArgDescriptors[node.Int32];
                             node.ValueKey = GenTreeValueKey.ForTree(node);
-                            if (node.Kind == GenTreeKind.ArgAddr)
-                                node.LocalDescriptor.AddressExposed = true;
                         }
                         break;
                     case GenTreeKind.Local:
@@ -781,8 +1478,6 @@ namespace Cnidaria.Cs
                         {
                             node.LocalDescriptor = LocalDescriptors[node.Int32];
                             node.ValueKey = GenTreeValueKey.ForTree(node);
-                            if (node.Kind == GenTreeKind.LocalAddr)
-                                node.LocalDescriptor.AddressExposed = true;
                         }
                         break;
                     case GenTreeKind.Temp:
@@ -804,21 +1499,55 @@ namespace Cnidaria.Cs
             }
         }
 
+        internal void SetPhase(GenTreeMethodPhase phase)
+        {
+            if (phase < Phase)
+                throw new InvalidOperationException($"Cannot move GenTree method {RuntimeMethod} phase backwards from {Phase} to {phase}.");
+            Phase = phase;
+        }
+
+        internal void AttachFlowGraph(ControlFlowGraph cfg, GenTreeMethodPhase phase = GenTreeMethodPhase.FlowgraphBuilt)
+        {
+            _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            SetPhase(phase);
+        }
+
+        internal void AttachHirLiveness(GenTreeLocalLiveness liveness)
+        {
+            _hirLiveness = liveness ?? throw new ArgumentNullException(nameof(liveness));
+            _cfg = liveness.Cfg;
+            SetPhase(GenTreeMethodPhase.HirLiveness);
+        }
+
+        internal void AttachSsa(SsaMethod ssa, bool optimized)
+        {
+            _ssa = ssa ?? throw new ArgumentNullException(nameof(ssa));
+            _cfg = ssa.Cfg;
+            SetPhase(optimized ? GenTreeMethodPhase.SsaOptimized : GenTreeMethodPhase.Ssa);
+        }
+
         internal void AttachLinearBackendState(
             ControlFlowGraph cfg,
             ImmutableArray<GenTree> linearNodes,
             ImmutableArray<GenTreeValueInfo> values,
             IReadOnlyDictionary<GenTreeValueKey, GenTreeValueInfo> valueInfoByNode,
-            ImmutableArray<int> linearBlockOrder)
+            ImmutableArray<int> linearBlockOrder,
+            SsaMethod? ssa = null)
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            _ssa = ssa;
             LinearNodes = linearNodes.IsDefault ? ImmutableArray<GenTree>.Empty : linearNodes;
             Values = values.IsDefault ? ImmutableArray<GenTreeValueInfo>.Empty : values;
             _valueInfoByNode = valueInfoByNode ?? throw new ArgumentNullException(nameof(valueInfoByNode));
+            var representativeMap = new Dictionary<GenTree, GenTreeValueInfo>();
+            for (int i = 0; i < Values.Length; i++)
+                representativeMap[Values[i].RepresentativeNode] = Values[i];
+            _valueInfoByRepresentativeNode = representativeMap;
             LinearBlockOrder = Cnidaria.Cs.LinearBlockOrder.Normalize(Cfg, linearBlockOrder);
             LiveIntervals = ImmutableArray<LinearLiveInterval>.Empty;
             _liveIntervalByNode = new Dictionary<GenTree, LinearLiveInterval>();
             RefPositions = ImmutableArray<LinearRefPosition>.Empty;
+            SetPhase(GenTreeMethodPhase.RationalizedLir);
         }
 
         internal void AttachLiveness(
@@ -832,6 +1561,7 @@ namespace Cnidaria.Cs
             LiveIntervals = liveIntervals.IsDefault ? ImmutableArray<LinearLiveInterval>.Empty : liveIntervals;
             _liveIntervalByNode = liveIntervalByNode ?? throw new ArgumentNullException(nameof(liveIntervalByNode));
             RefPositions = refPositions.IsDefault ? ImmutableArray<LinearRefPosition>.Empty : refPositions;
+            SetPhase(GenTreeMethodPhase.LoweredLir);
         }
 
         internal void AttachLsraFinalState(
@@ -862,6 +1592,7 @@ namespace Cnidaria.Cs
             Funclets = funclets.IsDefault ? ImmutableArray<RegisterFunclet>.Empty : funclets;
             FrameRegions = frameRegions.IsDefault ? ImmutableArray<RegisterFrameRegion>.Empty : frameRegions;
             GcReportOnlyLeafFunclet = gcReportOnlyLeafFunclet;
+            SetPhase(GenTreeMethodPhase.RegisterAllocated);
         }
 
         public RegisterOperand GetHome(GenTree value)
@@ -884,7 +1615,16 @@ namespace Cnidaria.Cs
             return value.RegisterLocationAtDefinition;
         }
 
-        public GenTreeValueInfo GetValueInfo(GenTree value) => GetValueInfo(value.LinearValueKey);
+        public GenTreeValueInfo GetValueInfo(GenTree value)
+        {
+            if (value is null) throw new ArgumentNullException(nameof(value));
+            if (_valueInfoByNode.TryGetValue(value.LinearValueKey, out var info))
+                return info;
+            if (_valueInfoByRepresentativeNode.TryGetValue(value, out info))
+                return info;
+
+            throw new InvalidOperationException("Unknown linear GenTree value " + value.LinearValueKey + ".");
+        }
 
         public GenTreeValueInfo GetValueInfo(GenTreeValueKey value)
         {
@@ -1313,6 +2053,10 @@ namespace Cnidaria.Cs
                         Push(stack, Node(GenTreeKind.ConstI8, pc, ins.Op, stackKind: GenStackKind.I8, int64: ins.Operand2));
                         break;
 
+                    case BytecodeOp.Ldc_R4:
+                        Push(stack, Node(GenTreeKind.ConstR4Bits, pc, ins.Op, stackKind: GenStackKind.R4, int32: ins.Operand0));
+                        break;
+
                     case BytecodeOp.Ldc_R8:
                         Push(stack, Node(GenTreeKind.ConstR8Bits, pc, ins.Op, stackKind: GenStackKind.R8, int64: ins.Operand2));
                         break;
@@ -1350,7 +2094,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Stloc:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            statements.Add(Node(GenTreeKind.StoreLocal, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreLocal, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
                             break;
                         }
 
@@ -1372,7 +2116,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Starg:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            statements.Add(Node(GenTreeKind.StoreArg, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreArg, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
                             break;
                         }
 
@@ -1396,7 +2140,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Pop:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            statements.Add(Node(GenTreeKind.Eval, pc, ins.Op, operands: One(value.Node)));
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(value.Node)));
                             break;
                         }
 
@@ -1404,7 +2148,7 @@ namespace Cnidaria.Cs
                         {
                             var value = Pop(stack, pc, ins.Op);
                             var temp = CreateDupTemp(value.Type, value.StackKind);
-                            statements.Add(Node(GenTreeKind.StoreTemp, pc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreTemp, pc, ins.Op, operands: One(value.Node), int32: temp.Index));
                             var load1 = TempLoad(pc, ins.Op, temp);
                             var load2 = TempLoad(pc, ins.Op, temp);
                             Push(stack, load1);
@@ -1419,7 +2163,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Isinst:
                     case BytecodeOp.Box:
                     case BytecodeOp.UnboxAny:
-                        EmitUnary(stack, pc, ins);
+                        EmitUnary(stack, statements, pc, ins);
                         break;
 
                     case BytecodeOp.Add:
@@ -1442,14 +2186,14 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Cgt_Un:
                     case BytecodeOp.PtrElemAddr:
                     case BytecodeOp.PtrDiff:
-                        EmitBinary(stack, pc, ins);
+                        EmitBinary(stack, statements, pc, ins);
                         break;
 
                     case BytecodeOp.Conv:
                         {
                             var value = Pop(stack, pc, ins.Op);
                             var stackKind = StackKindOf((NumericConvKind)ins.Operand0);
-                            Push(stack, Node(GenTreeKind.Conv, pc, ins.Op, stackKind: stackKind, operands: One(value.Node),
+                            PushImportedValue(stack, statements, Node(GenTreeKind.Conv, pc, ins.Op, stackKind: stackKind, operands: One(value.Node),
                                 convKind: (NumericConvKind)ins.Operand0, convFlags: (NumericConvFlags)ins.Operand1));
                             break;
                         }
@@ -1463,7 +2207,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Newobj:
-                        EmitNewObject(stack, pc, ins);
+                        EmitNewObject(stack, statements, pc, ins);
                         break;
 
                     case BytecodeOp.Ldfld:
@@ -1479,7 +2223,7 @@ namespace Cnidaria.Cs
                         {
                             var address = Pop(stack, pc, ins.Op);
                             var t = ResolveType(ins.Operand0);
-                            Push(stack, Node(GenTreeKind.LoadIndirect, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
+                            PushImportedValue(stack, statements, Node(GenTreeKind.LoadIndirect, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
                             break;
                         }
 
@@ -1488,7 +2232,7 @@ namespace Cnidaria.Cs
                             var value = Pop(stack, pc, ins.Op);
                             var address = Pop(stack, pc, ins.Op);
                             var t = ResolveType(ins.Operand0);
-                            statements.Add(Node(GenTreeKind.StoreIndirect, pc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreIndirect, pc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
                             break;
                         }
 
@@ -1497,7 +2241,7 @@ namespace Cnidaria.Cs
                             var length = Pop(stack, pc, ins.Op);
                             var elemType = ResolveType(ins.Operand0);
                             var arrayType = _rts.GetArrayType(elemType);
-                            Push(stack, Node(GenTreeKind.NewArray, pc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
+                            PushImportedValue(stack, statements, Node(GenTreeKind.NewArray, pc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
                                 operands: One(length.Node), runtimeType: elemType));
                             break;
                         }
@@ -1507,7 +2251,7 @@ namespace Cnidaria.Cs
                             var index = Pop(stack, pc, ins.Op);
                             var array = Pop(stack, pc, ins.Op);
                             var elemType = ResolveType(ins.Operand0);
-                            Push(stack, Node(GenTreeKind.ArrayElement, pc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
+                            PushImportedValue(stack, statements, Node(GenTreeKind.ArrayElement, pc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
                                 operands: Two(array.Node, index.Node), runtimeType: elemType));
                             break;
                         }
@@ -1518,7 +2262,7 @@ namespace Cnidaria.Cs
                             var array = Pop(stack, pc, ins.Op);
                             var elemType = ResolveType(ins.Operand0);
                             var byRef = _rts.GetByRefType(elemType);
-                            Push(stack, Node(GenTreeKind.ArrayElementAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                            PushImportedValue(stack, statements, Node(GenTreeKind.ArrayElementAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                                 operands: Two(array.Node, index.Node), runtimeType: elemType));
                             break;
                         }
@@ -1529,7 +2273,7 @@ namespace Cnidaria.Cs
                             var index = Pop(stack, pc, ins.Op);
                             var array = Pop(stack, pc, ins.Op);
                             var elemType = ResolveType(ins.Operand0);
-                            statements.Add(Node(GenTreeKind.StoreArrayElement, pc, ins.Op,
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreArrayElement, pc, ins.Op,
                                 operands: ImmutableArray.Create(array.Node, index.Node, value.Node), runtimeType: elemType));
                             break;
                         }
@@ -1537,14 +2281,14 @@ namespace Cnidaria.Cs
                     case BytecodeOp.LdArrayDataRef:
                         {
                             var array = Pop(stack, pc, ins.Op);
-                            Push(stack, Node(GenTreeKind.ArrayDataRef, pc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
+                            PushImportedValue(stack, statements, Node(GenTreeKind.ArrayDataRef, pc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
                             break;
                         }
 
                     case BytecodeOp.StackAlloc:
                         {
                             var count = Pop(stack, pc, ins.Op);
-                            Push(stack, Node(GenTreeKind.StackAlloc, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(count.Node), int32: ins.Operand0));
+                            PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(count.Node), int32: ins.Operand0));
                             break;
                         }
 
@@ -1831,6 +2575,114 @@ namespace Cnidaria.Cs
             return GenStackKind.Unknown;
         }
 
+        private void AppendImporterStatement(List<GenTree> statements, List<StackValue> stack, GenTree statement)
+        {
+            if (RequiresImporterStackBarrier(statement))
+                SpillEvaluationStackForImportBarrier(statements, stack, statement.Pc, statement.SourceOp);
+
+            statements.Add(statement);
+        }
+
+        private void PushImportedValue(List<StackValue> stack, List<GenTree> statements, GenTree value)
+        {
+            if (!RequiresImmediateMaterialization(value))
+            {
+                Push(stack, value);
+                return;
+            }
+
+            SpillEvaluationStackForImportBarrier(statements, stack, value.Pc, value.SourceOp);
+
+            var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
+            statements.Add(Node(GenTreeKind.StoreTemp, value.Pc, value.SourceOp, operands: One(value), int32: temp.Index));
+            Push(stack, TempLoad(value.Pc, value.SourceOp, temp));
+        }
+
+        private void SpillEvaluationStackForImportBarrier(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp)
+        {
+            if (stack.Count == 0)
+                return;
+
+            for (int i = 0; i < stack.Count; i++)
+            {
+                StackValue value = stack[i];
+                var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
+                statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(value.Node), int32: temp.Index));
+                stack[i] = TempLoad(pc, sourceOp, temp);
+            }
+        }
+
+        private GenTemp CreateImporterSpillTemp(RuntimeType? type, GenStackKind stackKind)
+        {
+            int index = _nextTempIndex++;
+            var temp = new GenTemp(index, GenTempKind.StackSpill, type, stackKind);
+            _temps.Add(temp);
+            return temp;
+        }
+
+        private static bool RequiresImporterStackBarrier(GenTree statement)
+        {
+            if (statement is null)
+                return false;
+
+            if ((statement.Flags & (GenTreeFlags.LocalDef | GenTreeFlags.MemoryWrite | GenTreeFlags.GlobalRef | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow)) != 0)
+                return true;
+
+            return statement.Kind is
+                GenTreeKind.StoreLocal or
+                GenTreeKind.StoreArg or
+                GenTreeKind.StoreTemp or
+                GenTreeKind.StoreIndirect or
+                GenTreeKind.StoreField or
+                GenTreeKind.StoreStaticField or
+                GenTreeKind.StoreArrayElement or
+                GenTreeKind.Eval or
+                GenTreeKind.Return or
+                GenTreeKind.Throw or
+                GenTreeKind.Rethrow or
+                GenTreeKind.EndFinally;
+        }
+
+        private static bool RequiresImmediateMaterialization(GenTree value)
+        {
+            if (value is null)
+                return false;
+
+            if (value.StackKind == GenStackKind.Void)
+                return false;
+
+            const GenTreeFlags materializeFlags =
+                GenTreeFlags.ContainsCall |
+                GenTreeFlags.CanThrow |
+                GenTreeFlags.SideEffect |
+                GenTreeFlags.MemoryRead |
+                GenTreeFlags.MemoryWrite |
+                GenTreeFlags.GlobalRef |
+                GenTreeFlags.Indirect |
+                GenTreeFlags.Allocation;
+
+            if ((value.Flags & materializeFlags) != 0)
+                return true;
+
+            return value.Kind is
+                GenTreeKind.Call or
+                GenTreeKind.VirtualCall or
+                GenTreeKind.NewObject or
+                GenTreeKind.NewArray or
+                GenTreeKind.ArrayElement or
+                GenTreeKind.ArrayElementAddr or
+                GenTreeKind.ArrayDataRef or
+                GenTreeKind.Field or
+                GenTreeKind.FieldAddr or
+                GenTreeKind.StaticField or
+                GenTreeKind.StaticFieldAddr or
+                GenTreeKind.LoadIndirect or
+                GenTreeKind.StackAlloc or
+                GenTreeKind.Box or
+                GenTreeKind.UnboxAny or
+                GenTreeKind.CastClass;
+        }
+
         private GenTemp CreateDupTemp(RuntimeType? type, GenStackKind stackKind)
         {
             int index = _nextTempIndex++;
@@ -1859,7 +2711,7 @@ namespace Cnidaria.Cs
             return new StackValue(Node(GenTreeKind.Temp, pc, sourceOp, type: temp.Type, stackKind: temp.StackKind, int32: temp.Index), temp.Type, temp.StackKind);
         }
 
-        private void EmitUnary(List<StackValue> stack, int pc, Instruction ins)
+        private void EmitUnary(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
         {
             var value = Pop(stack, pc, ins.Op);
             RuntimeType? type = value.Type;
@@ -1904,10 +2756,10 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            Push(stack, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: One(value.Node), int32: ins.Operand0, runtimeType: operandType));
+            PushImportedValue(stack, statements, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: One(value.Node), int32: ins.Operand0, runtimeType: operandType));
         }
 
-        private void EmitBinary(List<StackValue> stack, int pc, Instruction ins)
+        private void EmitBinary(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
         {
             var right = Pop(stack, pc, ins.Op);
             var left = Pop(stack, pc, ins.Op);
@@ -1941,7 +2793,7 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            Push(stack, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
+            PushImportedValue(stack, statements, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
                 int32: ins.Operand0, runtimeType: runtimeType));
         }
 
@@ -1965,6 +2817,8 @@ namespace Cnidaria.Cs
                     AddTypeInitializerDependency(method.DeclaringType);
             }
 
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
             if (!isVirtual && TryInlineCall(method, args, statements, pc, ins.Op, out var inlineResult))
             {
                 if (inlineResult is not null)
@@ -1984,12 +2838,12 @@ namespace Cnidaria.Cs
                 method: method);
 
             if (returnsVoid)
-                statements.Add(Node(GenTreeKind.Eval, pc, ins.Op, operands: One(call)));
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(call)));
             else
-                Push(stack, call);
+                PushImportedValue(stack, statements, call);
         }
 
-        private void EmitNewObject(List<StackValue> stack, int pc, Instruction ins)
+        private void EmitNewObject(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
         {
             int argCount = ins.Operand1;
             var args = PopMany(stack, argCount, pc, ins.Op);
@@ -1998,7 +2852,7 @@ namespace Cnidaria.Cs
             AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
-            Push(stack, Node(GenTreeKind.NewObject, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
+            PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: ins.Operand0, method: ctor, runtimeType: t));
         }
 
@@ -2052,9 +2906,17 @@ namespace Cnidaria.Cs
                 if (ins.Op == BytecodeOp.Ret)
                 {
                     if (ins.Pop == 1)
-                        result = Pop(inlineStack, callPc, ins.Op).Node;
+                    {
+                        var returnValue = Pop(inlineStack, callPc, ins.Op);
+
+                        var returnTemp = CreateInlineTemp(GenTempKind.InlineReturn, returnValue.Type, returnValue.StackKind);
+                        AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(returnValue.Node), int32: returnTemp.Index));
+                        result = TempLoad(callPc, ins.Op, returnTemp).Node;
+                    }
                     else
+                    {
                         result = null;
+                    }
 
                     sawReturn = true;
                     for (int tail = pc + 1; tail < body.Instructions.Length; tail++)
@@ -2076,6 +2938,10 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Ldc_I8:
                         Push(inlineStack, Node(GenTreeKind.ConstI8, callPc, ins.Op, stackKind: GenStackKind.I8, int64: ins.Operand2));
+                        break;
+
+                    case BytecodeOp.Ldc_R4:
+                        Push(inlineStack, Node(GenTreeKind.ConstR4Bits, callPc, ins.Op, stackKind: GenStackKind.R4, int32: ins.Operand0));
                         break;
 
                     case BytecodeOp.Ldc_R8:
@@ -2117,7 +2983,7 @@ namespace Cnidaria.Cs
                         {
                             var value = Pop(inlineStack, callPc, ins.Op);
                             var temp = CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op);
-                            statements.Add(Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
                             break;
                         }
 
@@ -2129,14 +2995,14 @@ namespace Cnidaria.Cs
                         {
                             var value = Pop(inlineStack, callPc, ins.Op);
                             var temp = CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op);
-                            statements.Add(Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
                             break;
                         }
 
                     case BytecodeOp.Pop:
                         {
                             var value = Pop(inlineStack, callPc, ins.Op);
-                            statements.Add(Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
                             break;
                         }
 
@@ -2144,7 +3010,7 @@ namespace Cnidaria.Cs
                         {
                             var value = Pop(inlineStack, callPc, ins.Op);
                             var temp = CreateDupTemp(value.Type, value.StackKind);
-                            statements.Add(Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
                             Push(inlineStack, TempLoad(callPc, ins.Op, temp));
                             Push(inlineStack, TempLoad(callPc, ins.Op, temp));
                             break;
@@ -2157,7 +3023,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Isinst:
                     case BytecodeOp.Box:
                     case BytecodeOp.UnboxAny:
-                        EmitInlineUnary(inlineStack, bodyModule, callee, callPc, ins);
+                        EmitInlineUnary(inlineStack, statements, bodyModule, callee, callPc, ins);
                         break;
 
                     case BytecodeOp.Add:
@@ -2180,20 +3046,20 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Cgt_Un:
                     case BytecodeOp.PtrElemAddr:
                     case BytecodeOp.PtrDiff:
-                        EmitInlineBinary(inlineStack, callPc, ins);
+                        EmitInlineBinary(inlineStack, statements, callPc, ins);
                         break;
 
                     case BytecodeOp.Conv:
                         {
                             var value = Pop(inlineStack, callPc, ins.Op);
                             var stackKind = StackKindOf((NumericConvKind)ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.Conv, callPc, ins.Op, stackKind: stackKind, operands: One(value.Node),
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.Conv, callPc, ins.Op, stackKind: stackKind, operands: One(value.Node),
                                 convKind: (NumericConvKind)ins.Operand0, convFlags: (NumericConvFlags)ins.Operand1));
                             break;
                         }
 
                     case BytecodeOp.Newobj:
-                        EmitInlineNewObject(inlineStack, bodyModule, callee, callPc, ins);
+                        EmitInlineNewObject(inlineStack, statements, bodyModule, callee, callPc, ins);
                         break;
 
                     case BytecodeOp.Ldfld:
@@ -2209,7 +3075,7 @@ namespace Cnidaria.Cs
                         {
                             var address = Pop(inlineStack, callPc, ins.Op);
                             var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.LoadIndirect, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.LoadIndirect, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
                             break;
                         }
 
@@ -2218,7 +3084,7 @@ namespace Cnidaria.Cs
                             var value = Pop(inlineStack, callPc, ins.Op);
                             var address = Pop(inlineStack, callPc, ins.Op);
                             var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            statements.Add(Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
                             break;
                         }
 
@@ -2227,7 +3093,7 @@ namespace Cnidaria.Cs
                             var length = Pop(inlineStack, callPc, ins.Op);
                             var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
                             var arrayType = _rts.GetArrayType(elemType);
-                            Push(inlineStack, Node(GenTreeKind.NewArray, callPc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.NewArray, callPc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
                                 operands: One(length.Node), runtimeType: elemType));
                             break;
                         }
@@ -2237,7 +3103,7 @@ namespace Cnidaria.Cs
                             var index = Pop(inlineStack, callPc, ins.Op);
                             var array = Pop(inlineStack, callPc, ins.Op);
                             var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.ArrayElement, callPc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElement, callPc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
                                 operands: Two(array.Node, index.Node), runtimeType: elemType));
                             break;
                         }
@@ -2248,7 +3114,7 @@ namespace Cnidaria.Cs
                             var array = Pop(inlineStack, callPc, ins.Op);
                             var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
                             var byRef = _rts.GetByRefType(elemType);
-                            Push(inlineStack, Node(GenTreeKind.ArrayElementAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElementAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                                 operands: Two(array.Node, index.Node), runtimeType: elemType));
                             break;
                         }
@@ -2259,7 +3125,7 @@ namespace Cnidaria.Cs
                             var index = Pop(inlineStack, callPc, ins.Op);
                             var array = Pop(inlineStack, callPc, ins.Op);
                             var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            statements.Add(Node(GenTreeKind.StoreArrayElement, callPc, ins.Op,
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreArrayElement, callPc, ins.Op,
                                 operands: ImmutableArray.Create(array.Node, index.Node, value.Node), runtimeType: elemType));
                             break;
                         }
@@ -2267,7 +3133,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.LdArrayDataRef:
                         {
                             var array = Pop(inlineStack, callPc, ins.Op);
-                            Push(inlineStack, Node(GenTreeKind.ArrayDataRef, callPc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
+                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayDataRef, callPc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
                             break;
                         }
 
@@ -2352,6 +3218,7 @@ namespace Cnidaria.Cs
                 BytecodeOp.Ldnull or
                 BytecodeOp.Ldc_I4 or
                 BytecodeOp.Ldc_I8 or
+                BytecodeOp.Ldc_R4 or
                 BytecodeOp.Ldc_R8 or
                 BytecodeOp.Ldstr or
                 BytecodeOp.DefaultValue or
@@ -2412,7 +3279,7 @@ namespace Cnidaria.Cs
             return op switch
             {
                 BytecodeOp.Nop => 0,
-                BytecodeOp.Ldarg or BytecodeOp.Ldthis or BytecodeOp.Ldloc or BytecodeOp.Ldc_I4 or BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull => 1,
+                BytecodeOp.Ldarg or BytecodeOp.Ldthis or BytecodeOp.Ldloc or BytecodeOp.Ldc_I4 or BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R4 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull => 1,
                 BytecodeOp.Starg or BytecodeOp.Stloc or BytecodeOp.Dup => 2,
                 BytecodeOp.Ldfld or BytecodeOp.Ldflda or BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Ldelem or BytecodeOp.Ldelema => 3,
                 BytecodeOp.Stfld or BytecodeOp.Stsfld or BytecodeOp.Stobj or BytecodeOp.Stelem => 4,
@@ -2455,7 +3322,7 @@ namespace Cnidaria.Cs
             return temps[index];
         }
 
-        private void EmitInlineUnary(List<StackValue> stack, RuntimeModule bodyModule, RuntimeMethod callee, int callPc, Instruction ins)
+        private void EmitInlineUnary(List<StackValue> stack, List<GenTree> statements, RuntimeModule bodyModule, RuntimeMethod callee, int callPc, Instruction ins)
         {
             var value = Pop(stack, callPc, ins.Op);
             RuntimeType? type = value.Type;
@@ -2500,10 +3367,10 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            Push(stack, Node(kind, callPc, ins.Op, type: type, stackKind: stackKind, operands: One(value.Node), int32: ins.Operand0, runtimeType: operandType));
+            PushImportedValue(stack, statements, Node(kind, callPc, ins.Op, type: type, stackKind: stackKind, operands: One(value.Node), int32: ins.Operand0, runtimeType: operandType));
         }
 
-        private void EmitInlineBinary(List<StackValue> stack, int callPc, Instruction ins)
+        private void EmitInlineBinary(List<StackValue> stack, List<GenTree> statements, int callPc, Instruction ins)
         {
             var right = Pop(stack, callPc, ins.Op);
             var left = Pop(stack, callPc, ins.Op);
@@ -2537,11 +3404,11 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            Push(stack, Node(kind, callPc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
+            PushImportedValue(stack, statements, Node(kind, callPc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
                 int32: ins.Operand0, runtimeType: runtimeType));
         }
 
-        private void EmitInlineNewObject(List<StackValue> stack, RuntimeModule bodyModule, RuntimeMethod callee, int callPc, Instruction ins)
+        private void EmitInlineNewObject(List<StackValue> stack, List<GenTree> statements, RuntimeModule bodyModule, RuntimeMethod callee, int callPc, Instruction ins)
         {
             int argCount = ins.Operand1;
             var args = PopMany(stack, argCount, callPc, ins.Op);
@@ -2550,7 +3417,7 @@ namespace Cnidaria.Cs
             AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
-            Push(stack, Node(GenTreeKind.NewObject, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
+            PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: ins.Operand0, method: ctor, runtimeType: t));
         }
 
@@ -2568,7 +3435,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Ldfld:
                     {
                         var receiver = Pop(stack, callPc, ins.Op);
-                        Push(stack, Node(GenTreeKind.Field, callPc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
+                        PushImportedValue(stack, statements, Node(GenTreeKind.Field, callPc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                             operands: One(receiver.Node), field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2577,7 +3444,7 @@ namespace Cnidaria.Cs
                     {
                         var receiver = Pop(stack, callPc, ins.Op);
                         var byRef = _rts.GetByRefType(field.FieldType);
-                        Push(stack, Node(GenTreeKind.FieldAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                        PushImportedValue(stack, statements, Node(GenTreeKind.FieldAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             operands: One(receiver.Node), field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2586,13 +3453,13 @@ namespace Cnidaria.Cs
                     {
                         var value = Pop(stack, callPc, ins.Op);
                         var receiver = Pop(stack, callPc, ins.Op);
-                        statements.Add(Node(GenTreeKind.StoreField, callPc, ins.Op, operands: Two(receiver.Node, value.Node), field: field, int64: ins.Operand0));
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreField, callPc, ins.Op, operands: Two(receiver.Node, value.Node), field: field, int64: ins.Operand0));
                         break;
                     }
 
                 case BytecodeOp.Ldsfld:
                     AddTypeInitializerDependency(field.DeclaringType);
-                    Push(stack, Node(GenTreeKind.StaticField, callPc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
+                    PushImportedValue(stack, statements, Node(GenTreeKind.StaticField, callPc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                         field: field, int64: ins.Operand0));
                     break;
 
@@ -2600,7 +3467,7 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var byRef = _rts.GetByRefType(field.FieldType);
-                        Push(stack, Node(GenTreeKind.StaticFieldAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                        PushImportedValue(stack, statements, Node(GenTreeKind.StaticFieldAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2609,7 +3476,7 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var value = Pop(stack, callPc, ins.Op);
-                        statements.Add(Node(GenTreeKind.StoreStaticField, callPc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, callPc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
                         break;
                     }
             }
@@ -2623,7 +3490,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Ldfld:
                     {
                         var receiver = Pop(stack, pc, ins.Op);
-                        Push(stack, Node(GenTreeKind.Field, pc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
+                        PushImportedValue(stack, statements, Node(GenTreeKind.Field, pc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                             operands: One(receiver.Node), field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2632,7 +3499,7 @@ namespace Cnidaria.Cs
                     {
                         var receiver = Pop(stack, pc, ins.Op);
                         var byRef = _rts.GetByRefType(field.FieldType);
-                        Push(stack, Node(GenTreeKind.FieldAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                        PushImportedValue(stack, statements, Node(GenTreeKind.FieldAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             operands: One(receiver.Node), field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2641,13 +3508,13 @@ namespace Cnidaria.Cs
                     {
                         var value = Pop(stack, pc, ins.Op);
                         var receiver = Pop(stack, pc, ins.Op);
-                        statements.Add(Node(GenTreeKind.StoreField, pc, ins.Op, operands: Two(receiver.Node, value.Node), field: field, int64: ins.Operand0));
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreField, pc, ins.Op, operands: Two(receiver.Node, value.Node), field: field, int64: ins.Operand0));
                         break;
                     }
 
                 case BytecodeOp.Ldsfld:
                     AddTypeInitializerDependency(field.DeclaringType);
-                    Push(stack, Node(GenTreeKind.StaticField, pc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
+                    PushImportedValue(stack, statements, Node(GenTreeKind.StaticField, pc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                         field: field, int64: ins.Operand0));
                     break;
 
@@ -2655,7 +3522,7 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var byRef = _rts.GetByRefType(field.FieldType);
-                        Push(stack, Node(GenTreeKind.StaticFieldAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                        PushImportedValue(stack, statements, Node(GenTreeKind.StaticFieldAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             field: field, int64: ins.Operand0));
                         break;
                     }
@@ -2664,7 +3531,7 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var value = Pop(stack, pc, ins.Op);
-                        statements.Add(Node(GenTreeKind.StoreStaticField, pc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, pc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
                         break;
                     }
             }
@@ -3056,7 +3923,8 @@ namespace Cnidaria.Cs
             return kind switch
             {
                 NumericConvKind.I8 or NumericConvKind.U8 => GenStackKind.I8,
-                NumericConvKind.R4 or NumericConvKind.R8 => GenStackKind.R8,
+                NumericConvKind.R4 => GenStackKind.R4,
+                NumericConvKind.R8 => GenStackKind.R8,
                 NumericConvKind.NativeInt => GenStackKind.NativeInt,
                 NumericConvKind.NativeUInt => GenStackKind.NativeUInt,
                 _ => GenStackKind.I4,
@@ -3103,6 +3971,7 @@ namespace Cnidaria.Cs
                     case "UInt64":
                         return GenStackKind.I8;
                     case "Single":
+                        return GenStackKind.R4;
                     case "Double":
                         return GenStackKind.R8;
                     case "IntPtr":
@@ -3149,6 +4018,9 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.ConstI8:
                     sb.Append(node.Int64).Append('L');
+                    return;
+                case GenTreeKind.ConstR4Bits:
+                    sb.Append(BitConverter.Int32BitsToSingle(node.Int32).ToString("R", System.Globalization.CultureInfo.InvariantCulture)).Append('f');
                     return;
                 case GenTreeKind.ConstR8Bits:
                     sb.Append(BitConverter.Int64BitsToDouble(node.Int64).ToString("R", System.Globalization.CultureInfo.InvariantCulture));

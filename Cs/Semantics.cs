@@ -869,7 +869,6 @@ namespace Cnidaria.Cs
             bool includeCoreTypesInTypeDefs,
             string defaultExternalAssemblyName,
             Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
-            bool allowInlining = true,
             bool print = false)
         {
             Compilation compilation = this;
@@ -1922,89 +1921,6 @@ namespace Cnidaria.Cs
     }
     internal static class ImportsBuilder
     {
-        public static Imports Build(Compilation compilation, SyntaxTree tree, IBindingRecorder recorder, DiagnosticBag diagnostics)
-        {
-            var containers = ImmutableArray.CreateBuilder<Symbol>();
-            var aliases = ImmutableDictionary.CreateBuilder<string, AliasSymbol>(StringComparer.Ordinal);
-            var staticTypes = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
-
-            AddImplicitUsing(compilation, containers, "System");
-            AddImplicitUsing(compilation, containers, "System.Numerics");
-            AddImplicitUsing(compilation, containers, "System.Collections");
-            AddImplicitUsing(compilation, containers, "System.Collections.Generic");
-            AddImplicitUsing(compilation, containers, "System.Runtime.CompilerServices");
-
-            foreach (var u in tree.Root.Usings)
-            {
-                if (u.StaticKeyword.Span.Length != 0)
-                {
-                    if (u.Alias != null)
-                    {
-                        diagnostics.Add(new Diagnostic(
-                            "CN_USING_STATIC_ALIAS001",
-                            DiagnosticSeverity.Error,
-                            "A 'using static' directive cannot declare an alias.",
-                            new Location(tree, u.Span)));
-                        continue;
-                    }
-                    var target = ResolveNamespaceOrType(compilation, u.Name, containers.ToImmutable(), aliases.ToImmutable(), diagnostics, tree);
-                    if (target is null)
-                        continue;
-
-                    if (target is not NamedTypeSymbol nt)
-                    {
-                        diagnostics.Add(new Diagnostic(
-                            "CN_USING_STATIC001",
-                            DiagnosticSeverity.Error,
-                            "A 'using static' directive must reference a type.",
-                            new Location(tree, u.Span)));
-                        continue;
-                    }
-                    bool dup = false;
-                    for (int i = 0; i < staticTypes.Count; i++)
-                    {
-                        if (ReferenceEquals(staticTypes[i], nt))
-                        {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if (!dup)
-                        staticTypes.Add(nt);
-
-                    continue;
-                }
-                {
-                    var target = ResolveNamespaceOrType(compilation, u.Name, containers.ToImmutable(), aliases.ToImmutable(), diagnostics, tree);
-                    if (target is null)
-                        continue;
-
-                    if (u.Alias != null)
-                    {
-                        var aliasName = u.Alias.Name.Identifier.ValueText ?? "";
-                        if (aliasName.Length == 0)
-                            continue;
-
-                        var aliasSym = new AliasSymbol(
-                            name: aliasName,
-                            containing: null,
-                            target: target,
-                            locations: ImmutableArray.Create(new Location(tree, u.Alias.Span)));
-
-                        aliases[aliasName] = aliasSym;
-
-                        recorder.RecordDeclared(u, aliasSym);
-                    }
-                    else
-                    {
-                        containers.Add(target);
-                    }
-                }
-
-            }
-
-            return new Imports(containers.ToImmutable(), aliases.ToImmutable(), staticTypes.ToImmutable());
-        }
         public static ImportScopeMap BuildImportScopeMap(
             Compilation compilation,
             SyntaxTree tree,
@@ -2117,6 +2033,7 @@ namespace Cnidaria.Cs
             var staticTypes = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
 
             AddImplicitUsing(compilation, containers, "System");
+            AddImplicitUsing(compilation, containers, "System.Numerics");
             AddImplicitUsing(compilation, containers, "System.Collections");
             AddImplicitUsing(compilation, containers, "System.Collections.Generic");
             AddImplicitUsing(compilation, containers, "System.Runtime.CompilerServices");

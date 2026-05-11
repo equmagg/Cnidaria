@@ -111,20 +111,35 @@ namespace Cnidaria.Cs
     public sealed class VmCallContext
     {
         private readonly Cnidaria.Cs.StackBasedVm? _stackVm;
+        private readonly Cnidaria.Cs.RegisterBasedVm? _registerVm;
         private CancellationToken _ct;
 
         internal VmCallContext(Cnidaria.Cs.StackBasedVm vm) => _stackVm = vm ?? throw new ArgumentNullException(nameof(vm));
+        internal VmCallContext(Cnidaria.Cs.RegisterBasedVm vm) => _registerVm = vm ?? throw new ArgumentNullException(nameof(vm));
 
         internal void SetToken(CancellationToken ct) => _ct = ct;
 
         public CancellationToken CancellationToken => _ct;
-        public string? ReadString(VmValue v) => _stackVm!.HostReadString(v, _ct);
-        public VmValue NewString(string? s) => _stackVm!.HostAllocString(s);
-        public int GetAddress(VmValue v) => _stackVm!.HostGetAddress(v);
-        public ReadOnlySpan<byte> ReadOnlyMemory(int address, int size) => _stackVm!.HostGetSpan(address, size, writable: false);
-        public Span<byte> Memory(int address, int size) => _stackVm!.HostGetSpan(address, size, writable: true);
-        public int GetArrayLength(VmValue array) => _stackVm!.HostGetArrayLength(array);
-        public VmValue GetArrayElement(VmValue array, int index) => _stackVm!.HostGetArrayElement(array, index);
+        public string? ReadString(VmValue v)
+            => _stackVm != null ? _stackVm.HostReadString(v, _ct) : _registerVm!.HostReadString(v, _ct);
+        public VmValue NewString(string? s)
+            => _stackVm != null ? _stackVm.HostAllocString(s) : _registerVm!.HostAllocString(s);
+        public int GetAddress(VmValue v)
+            => _stackVm != null ? _stackVm.HostGetAddress(v) : _registerVm!.HostGetAddress(v);
+        public ReadOnlySpan<byte> ReadOnlyMemory(int address, int size)
+        {
+            if (_stackVm != null) return _stackVm.HostGetSpan(address, size, writable: false);
+            return _registerVm!.HostGetSpan(address, size, writable: false);
+        }
+        public Span<byte> Memory(int address, int size)
+        {
+            if (_stackVm != null) return _stackVm.HostGetSpan(address, size, writable: true);
+            return _registerVm!.HostGetSpan(address, size, writable: true);
+        }
+        public int GetArrayLength(VmValue array)
+            => _stackVm != null ? _stackVm.HostGetArrayLength(array) : _registerVm!.HostGetArrayLength(array);
+        public VmValue GetArrayElement(VmValue array, int index)
+            => _stackVm != null ? _stackVm.HostGetArrayElement(array, index) : _registerVm!.HostGetArrayElement(array, index);
 
         public int ReadInt32(int address) => BinaryPrimitives.ReadInt32LittleEndian(ReadOnlyMemory(address, 4));
         public long ReadInt64(int address) => BinaryPrimitives.ReadInt64LittleEndian(ReadOnlyMemory(address, 8));
@@ -145,6 +160,8 @@ namespace Cnidaria.Cs
         public HostOverride(Cnidaria.Cs.RuntimeMethod method, HostMethod handler)
         {
             if (method is null) throw new ArgumentNullException(nameof(method));
+            if (!method.HasInternalCall)
+                throw new InvalidOperationException($"Host override target must be marked InternalCall: {method.DeclaringType.Namespace}.{method.DeclaringType.Name}.{method.Name}");
             MethodId = method.MethodId;
             Handler = handler ?? throw new ArgumentNullException(nameof(handler));
         }
@@ -154,14 +171,22 @@ namespace Cnidaria.Cs
     public sealed class HostInterface
     {
         private readonly Cnidaria.Cs.StackBasedVm? _stackVm;
-        private readonly Cnidaria.Cs.RuntimeTypeSystem? _stackRts;
-        private readonly IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule>? _stackModules;
+        private readonly Cnidaria.Cs.RegisterBasedVm? _registerVm;
+        private readonly Cnidaria.Cs.RuntimeTypeSystem _rts;
+        private readonly IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> _modules;
 
         internal HostInterface(Cnidaria.Cs.StackBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts, IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules)
         {
             _stackVm = vm ?? throw new ArgumentNullException(nameof(vm));
-            _stackRts = rts ?? throw new ArgumentNullException(nameof(rts));
-            _stackModules = modules ?? throw new ArgumentNullException(nameof(modules));
+            _rts = rts ?? throw new ArgumentNullException(nameof(rts));
+            _modules = modules ?? throw new ArgumentNullException(nameof(modules));
+        }
+
+        internal HostInterface(Cnidaria.Cs.RegisterBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts, IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules)
+        {
+            _registerVm = vm ?? throw new ArgumentNullException(nameof(vm));
+            _rts = rts ?? throw new ArgumentNullException(nameof(rts));
+            _modules = modules ?? throw new ArgumentNullException(nameof(modules));
         }
 
         public void OverrideStatic(string assemblyName, string typeFullName, string methodName, Delegate handler)
@@ -169,7 +194,7 @@ namespace Cnidaria.Cs
             if (handler is null) throw new ArgumentNullException(nameof(handler));
             var stackSig = ExtractSignatureStack(handler);
             var stackMethod = ResolveStaticMethodStack(assemblyName, typeFullName, methodName, stackSig.ParamTypes, stackSig.ReturnType);
-            _stackVm!.RegisterHostOverride(new HostOverride(stackMethod, BuildWrapperStack(handler, stackSig, stackMethod)));
+            RegisterHostOverride(new HostOverride(stackMethod, BuildWrapperStack(handler, stackSig, stackMethod)));
         }
 
         public void OverrideStaticRaw(string assemblyName, string typeFullName, string methodName, Type returnType, Type[] paramTypes, HostMethod handler)
@@ -182,8 +207,19 @@ namespace Cnidaria.Cs
                 stackParams[i] = MapClrTypeToVmStack(paramTypes[i]);
             var stackRet = MapClrTypeToVmStack(returnType);
             var stackMethod = ResolveStaticMethodStack(assemblyName, typeFullName, methodName, stackParams, stackRet);
-            _stackVm!.RegisterHostOverride(new HostOverride(stackMethod, handler));
+            RegisterHostOverride(new HostOverride(stackMethod, handler));
         }
+        private void RegisterHostOverride(HostOverride ov)
+        {
+            if (_stackVm != null)
+            {
+                _stackVm.RegisterHostOverride(ov);
+                return;
+            }
+
+            _registerVm!.RegisterHostOverride(ov);
+        }
+
         private (bool HasContext, Type ReturnClr, Cnidaria.Cs.RuntimeType ReturnType, Type[] ParamClr, Cnidaria.Cs.RuntimeType[] ParamTypes) ExtractSignatureStack(Delegate d)
         {
             var mi = d.Method;
@@ -278,8 +314,13 @@ namespace Cnidaria.Cs
                 if (retObj is not Array arr) throw new InvalidOperationException($"Expected array return value for '{clr.FullName}'.");
                 if (actualVmType.Kind != Cnidaria.Cs.RuntimeTypeKind.Array || actualVmType.ElementType is null) throw new InvalidOperationException($"VM return type '{actualVmType.Namespace}.{actualVmType.Name}' is not an array.");
                 var elementClr = clr.GetElementType() ?? throw new InvalidOperationException("Array without element type.");
-                var vmArr = _stackVm!.HostAllocArray(actualVmType, arr.Length);
-                for (int i = 0; i < arr.Length; i++) _stackVm.HostSetArrayElement(vmArr, i, ConvertRetStack(ctx, arr.GetValue(i), elementClr, actualVmType.ElementType));
+                var vmArr = _stackVm != null ? _stackVm.HostAllocArray(actualVmType, arr.Length) : _registerVm!.HostAllocArray(actualVmType, arr.Length);
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    VmValue elem = ConvertRetStack(ctx, arr.GetValue(i), elementClr, actualVmType.ElementType);
+                    if (_stackVm != null) _stackVm.HostSetArrayElement(vmArr, i, elem);
+                    else _registerVm!.HostSetArrayElement(vmArr, i, elem);
+                }
                 return vmArr;
             }
             return ConvertScalarRet(ctx, retObj, clr);
@@ -319,16 +360,16 @@ namespace Cnidaria.Cs
 
         private Cnidaria.Cs.RuntimeMethod ResolveStaticMethodStack(string assemblyName, string typeFullName, string methodName, Cnidaria.Cs.RuntimeType[] ps, Cnidaria.Cs.RuntimeType ret)
         {
-            if (!_stackModules!.TryGetValue(assemblyName, out var mod)) throw new TypeLoadException($"Module '{assemblyName}' not loaded.");
+            if (!_modules.TryGetValue(assemblyName, out var mod)) throw new TypeLoadException($"Module '{assemblyName}' not loaded.");
             SplitTypeFullName(typeFullName, out var ns, out var name);
             if (!mod.TypeDefByFullName.TryGetValue((ns, name), out var typeDefTok)) throw new TypeLoadException($"Type '{ns}.{name}' not found in '{assemblyName}'.");
-            var owner = _stackRts!.ResolveType(mod, typeDefTok);
+            var owner = _rts.ResolveType(mod, typeDefTok);
             Cnidaria.Cs.RuntimeMethod? match = null;
             int bestScore = int.MaxValue;
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
-                if (!m.IsStatic || m.HasThis || !StringComparer.Ordinal.Equals(m.Name, methodName) || m.ParameterTypes.Length != ps.Length) continue;
+                if (!m.IsStatic || m.HasThis || !m.HasInternalCall || !StringComparer.Ordinal.Equals(m.Name, methodName) || m.ParameterTypes.Length != ps.Length) continue;
                 if (!TryGetHostTypeMatchCostStack(m.ReturnType, ret, out int score)) continue;
                 bool ok = true;
                 for (int p = 0; p < ps.Length; p++)
@@ -360,9 +401,9 @@ namespace Cnidaria.Cs
             if (t.IsArray)
             {
                 if (t.GetArrayRank() != 1) throw new NotSupportedException("Only SZARRAY supported in host marshaling.");
-                return _stackRts!.GetArrayType(MapClrTypeToVmStack(t.GetElementType()!));
+                return _rts.GetArrayType(MapClrTypeToVmStack(t.GetElementType()!));
             }
-            if (t == typeof(string)) return _stackRts!.SystemString;
+            if (t == typeof(string)) return _rts.SystemString;
             if (t == typeof(bool)) return ResolveStdStack("System", "Boolean");
             if (t == typeof(char)) return ResolveStdStack("System", "Char");
             if (t == typeof(byte)) return ResolveStdStack("System", "Byte");
@@ -383,9 +424,9 @@ namespace Cnidaria.Cs
 
         private Cnidaria.Cs.RuntimeType ResolveStdStack(string ns, string name)
         {
-            if (!_stackModules!.TryGetValue("std", out var std)) throw new InvalidOperationException("Std module not loaded.");
+            if (!_modules.TryGetValue("std", out var std)) throw new InvalidOperationException("Std module not loaded.");
             if (!std.TypeDefByFullName.TryGetValue((ns, name), out var tok)) throw new TypeLoadException($"Std type not found: std:{ns}.{name}");
-            return _stackRts!.ResolveType(std, tok);
+            return _rts.ResolveType(std, tok);
         }
 
         private static void SplitTypeFullName(string full, out string ns, out string name)

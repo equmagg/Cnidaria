@@ -6499,6 +6499,26 @@ namespace Cnidaria.Cs
                 ConstantValueOpt = Optional<object>.None;
             }
         }
+        private sealed class BoundOutVarPendingExpression : BoundExpression
+        {
+            public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
+
+            public string Name { get; }
+            public SingleVariableDesignationSyntax Designation { get; }
+
+            public BoundOutVarPendingExpression(
+                DeclarationExpressionSyntax syntax,
+                string name,
+                SingleVariableDesignationSyntax designation,
+                TypeSymbol markerType)
+                : base(syntax)
+            {
+                Name = name;
+                Designation = designation;
+                Type = markerType;
+                ConstantValueOpt = Optional<object>.None;
+            }
+        }
         private enum BindValueKind : byte
         {
             RValue, LValue
@@ -10627,6 +10647,9 @@ namespace Cnidaria.Cs
             if (expr.HasErrors)
                 return expr;
 
+            if (expr is BoundOutVarPendingExpression)
+                return expr;
+
             if (expr is BoundOutDiscardExpression)
                 return expr;
 
@@ -10739,21 +10762,16 @@ namespace Cnidaria.Cs
 
             var isVar = IsVar(de.Type);
 
-            TypeSymbol localType;
             if (isVar)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_OUTDECL003",
-                    DiagnosticSeverity.Error,
-                    "'out var' type inference is not implemented. Use an explicit type.",
-                    new Location(context.SemanticModel.SyntaxTree, de.Type.Span)));
+                return new BoundOutVarPendingExpression(
+                    de,
+                    name,
+                    sv,
+                    context.Compilation.GetSpecialType(SpecialType.System_Void));
+            }
 
-                localType = new ErrorTypeSymbol("out-var", containing: null, ImmutableArray<Location>.Empty);
-            }
-            else
-            {
-                localType = BindType(de.Type, context, diagnostics);
-            }
+            TypeSymbol localType = BindType(de.Type, context, diagnostics);
 
             var local = new LocalSymbol(
                 name: name,
@@ -10946,6 +10964,17 @@ namespace Cnidaria.Cs
             bool isOutArgument = argRefKind == ParameterRefKind.Out;
             bool isReadOnlyPass = argRefKind == ParameterRefKind.In;
 
+            if (!isOutArgument && argSyntax.Expression is DeclarationExpressionSyntax)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OUTDECL004",
+                    DiagnosticSeverity.Error,
+                    "A declaration expression is only valid as an out argument.",
+                    new Location(context.SemanticModel.SyntaxTree, argSyntax.Expression.Span)));
+
+                return new BoundBadExpression(argSyntax);
+            }
+
             if (isOutArgument && argSyntax.Expression is IdentifierNameSyntax id 
                 && string.Equals(id.Identifier.ValueText, "_", StringComparison.Ordinal))
             {
@@ -10960,6 +10989,8 @@ namespace Cnidaria.Cs
 
             var operand = BindAssignableValue(argSyntax.Expression, context, diagnostics);
             if (operand.HasErrors)
+                return operand;
+            if (operand is BoundOutVarPendingExpression)
                 return operand;
             if (operand is BoundOutDiscardExpression)
                 return operand;
@@ -18829,6 +18860,19 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
+            if (expr is BoundOutVarPendingExpression outVar)
+            {
+                var converted = MaterializeOutVarPending(
+                    exprSyntax,
+                    outVar,
+                    targetType,
+                    diagnosticNode,
+                    context,
+                    diagnostics);
+
+                context.Recorder.RecordBound(exprSyntax, converted);
+                return converted;
+            }
             if (expr is BoundOutDiscardExpression discard)
             {
                 var converted = MaterializeOutDiscard(
@@ -19016,6 +19060,59 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
+        }
+        private BoundExpression MaterializeOutVarPending(
+            ExpressionSyntax exprSyntax,
+            BoundOutVarPendingExpression outVar,
+            TypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (targetType is not ByRefTypeSymbol targetByRef)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OUTVAR001",
+                    DiagnosticSeverity.Error,
+                    "An out variable declaration can only be converted to a by-ref parameter type.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                var bad = new BoundBadExpression(exprSyntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            if (IsNameDeclaredInEnclosingScopes(outVar.Name))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OUTDECL002",
+                    DiagnosticSeverity.Error,
+                    $"A local named '{outVar.Name}' is already declared in this scope.",
+                    new Location(context.SemanticModel.SyntaxTree, outVar.Designation.Span)));
+
+                var bad = new BoundBadExpression(exprSyntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            var elementType = targetByRef.ElementType;
+
+            var local = new LocalSymbol(
+                name: outVar.Name,
+                containing: _containing,
+                type: elementType,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, outVar.Designation.Span)),
+                isConst: false,
+                constantValueOpt: Optional<object>.None,
+                isByRef: false);
+
+            _locals[outVar.Name] = local;
+            context.Recorder.RecordDeclared(outVar.Designation, local);
+
+            return new BoundRefExpression(
+                exprSyntax,
+                targetType,
+                new BoundLocalExpression(exprSyntax, local));
         }
         private BoundExpression MaterializeOutDiscard(
             ExpressionSyntax exprSyntax,
@@ -20506,6 +20603,8 @@ namespace Cnidaria.Cs
         }
         private Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, BindingContext context)
         {
+            if (expr is BoundOutVarPendingExpression)
+                return ClassifyOutVarPendingConversion(target);
             if (expr is BoundOutDiscardExpression discard)
                 return ClassifyOutDiscardConversion(discard, target);
             if (expr is BoundUnboundImplicitObjectCreationExpression unbound)
@@ -20706,6 +20805,9 @@ namespace Cnidaria.Cs
         }
         internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target)
         {
+            if (expr is BoundOutVarPendingExpression)
+                return ClassifyOutVarPendingConversion(target);
+
             if (expr is BoundOutDiscardExpression discard)
                 return ClassifyOutDiscardConversion(discard, target);
 
@@ -21041,6 +21143,12 @@ namespace Cnidaria.Cs
                     _ => false
                 };
             }
+        }
+        private static Conversion ClassifyOutVarPendingConversion(TypeSymbol target)
+        {
+            return target is ByRefTypeSymbol
+                ? new Conversion(ConversionKind.Identity)
+                : new Conversion(ConversionKind.None);
         }
         private static Conversion ClassifyOutDiscardConversion(BoundOutDiscardExpression discard, TypeSymbol target)
         {
