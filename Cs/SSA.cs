@@ -201,6 +201,8 @@ namespace Cnidaria.Cs
         public ImmutableArray<CfgLoop> NaturalLoops { get; }
         public ImmutableArray<CfgExceptionRegion> ExceptionRegions { get; }
 
+        private const int VirtualRootBlockId = -2;
+        public ImmutableArray<int> DominatorRoots { get; }
         public CfgBlock Entry => Blocks.Length == 0
             ? throw new InvalidOperationException("CFG has no entry block.")
             : Blocks[0];
@@ -213,7 +215,8 @@ namespace Cnidaria.Cs
             ImmutableArray<ImmutableArray<int>> dominanceFrontiers,
             ImmutableArray<ImmutableArray<int>> dominatorTreeChildren,
             ImmutableArray<CfgLoop> naturalLoops,
-            ImmutableArray<CfgExceptionRegion> exceptionRegions)
+            ImmutableArray<CfgExceptionRegion> exceptionRegions,
+            ImmutableArray<int> dominatorRoots)
         {
             Method = method ?? throw new ArgumentNullException(nameof(method));
             Blocks = blocks.IsDefault ? ImmutableArray<CfgBlock>.Empty : blocks;
@@ -223,6 +226,7 @@ namespace Cnidaria.Cs
             DominatorTreeChildren = dominatorTreeChildren.IsDefault ? ImmutableArray<ImmutableArray<int>>.Empty : dominatorTreeChildren;
             NaturalLoops = naturalLoops.IsDefault ? ImmutableArray<CfgLoop>.Empty : naturalLoops;
             ExceptionRegions = exceptionRegions.IsDefault ? ImmutableArray<CfgExceptionRegion>.Empty : exceptionRegions;
+            DominatorRoots = dominatorRoots.IsDefault ? ImmutableArray<int>.Empty : dominatorRoots;
         }
 
         public static ControlFlowGraph Build(GenTreeMethod method, bool includeExceptionEdges = true)
@@ -285,13 +289,14 @@ namespace Cnidaria.Cs
             }
 
             var blocks = blocksBuilder.ToImmutable();
-            var rpo = ComputeReversePostOrder(blocks);
-            var idom = ComputeImmediateDominators(blocks, rpo);
+            var dominatorRoots = ComputeDominatorRoots(blocks, exceptionRegions);
+            var rpo = ComputeReversePostOrder(blocks, dominatorRoots);
+            var idom = ComputeImmediateDominators(blocks, rpo, dominatorRoots);
             var df = ComputeDominanceFrontiers(blocks, idom);
             var children = ComputeDominatorTreeChildren(idom);
             var loops = ComputeNaturalLoops(blocks, idom);
 
-            return new ControlFlowGraph(method, blocks, rpo.ToImmutableArray(), idom.ToImmutableArray(), df, children, loops, exceptionRegions);
+            return new ControlFlowGraph(method, blocks, rpo.ToImmutableArray(), idom.ToImmutableArray(), df, children, loops, exceptionRegions, dominatorRoots);
         }
 
         private static ImmutableArray<CfgExceptionRegion> BuildExceptionRegions(GenTreeMethod method, IReadOnlyDictionary<int, int> blockByStartPc)
@@ -490,14 +495,31 @@ namespace Cnidaria.Cs
                     return CfgEdgeKind.FallThrough;
             }
         }
-
-        private static List<int> ComputeReversePostOrder(ImmutableArray<CfgBlock> blocks)
+        private static ImmutableArray<int> ComputeDominatorRoots(ImmutableArray<CfgBlock> blocks, ImmutableArray<CfgExceptionRegion> exceptionRegions)
+        {
+            var roots = new SortedSet<int>();
+            if (blocks.Length != 0)
+                roots.Add(0);
+            for (int i = 0; i < exceptionRegions.Length; i++)
+            {
+                int handler = exceptionRegions[i].HandlerStartBlockId;
+                if ((uint)handler < (uint)blocks.Length)
+                    roots.Add(handler);
+            }
+            for (int i = 0; i < blocks.Length; i++)
+            {
+                if (blocks[i].Predecessors.Length == 0)
+                    roots.Add(i);
+            }
+            return roots.ToImmutableArray();
+        }
+        private static List<int> ComputeReversePostOrder(ImmutableArray<CfgBlock> blocks, ImmutableArray<int> roots)
         {
             var visited = new bool[blocks.Length];
             var post = new List<int>(blocks.Length);
 
-            if (blocks.Length != 0)
-                Dfs(0);
+            for (int i = 0; i < roots.Length; i++)
+                Dfs(roots[i]);
 
             for (int i = 0; i < blocks.Length; i++)
             {
@@ -522,21 +544,32 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static int[] ComputeImmediateDominators(ImmutableArray<CfgBlock> blocks, List<int> rpo)
+        private static int[] ComputeImmediateDominators(ImmutableArray<CfgBlock> blocks, List<int> rpo, ImmutableArray<int> roots)
         {
             int n = blocks.Length;
             var rpoIndex = new int[n];
+            for (int i = 0; i < rpoIndex.Length; i++)
+                rpoIndex[i] = int.MaxValue;
             for (int i = 0; i < rpo.Count; i++)
                 rpoIndex[rpo[i]] = i;
+            var rootSet = new HashSet<int>();
+            for (int i = 0; i < roots.Length; i++)
+            {
+                int root = roots[i];
+                if ((uint)root < (uint)n)
+                    rootSet.Add(root);
+            }
 
             var idom = new int[n];
             for (int i = 0; i < idom.Length; i++)
                 idom[i] = -1;
 
+            foreach (int root in rootSet)
+                idom[root] = VirtualRootBlockId;
+
             if (n == 0)
                 return idom;
 
-            idom[0] = 0;
             bool changed;
             do
             {
@@ -545,7 +578,7 @@ namespace Cnidaria.Cs
                 for (int r = 0; r < rpo.Count; r++)
                 {
                     int b = rpo[r];
-                    if (b == 0)
+                    if (rootSet.Contains(b))
                         continue;
 
                     int newIdom = -1;
@@ -553,7 +586,7 @@ namespace Cnidaria.Cs
                     for (int p = 0; p < predecessors.Length; p++)
                     {
                         int pred = predecessors[p].FromBlockId;
-                        if (idom[pred] == -1)
+                        if ((uint)pred >= (uint)n || idom[pred] == -1)
                             continue;
 
                         newIdom = newIdom == -1
@@ -562,7 +595,10 @@ namespace Cnidaria.Cs
                     }
 
                     if (newIdom == -1)
-                        newIdom = b;
+                    {
+                        newIdom = VirtualRootBlockId;
+                        rootSet.Add(b);
+                    }
 
                     if (idom[b] != newIdom)
                     {
@@ -583,9 +619,11 @@ namespace Cnidaria.Cs
 
             while (finger1 != finger2)
             {
-                while (rpoIndex[finger1] > rpoIndex[finger2])
+                if (finger1 == VirtualRootBlockId || finger2 == VirtualRootBlockId)
+                    return VirtualRootBlockId;
+                while (finger1 != VirtualRootBlockId && finger2 != VirtualRootBlockId && rpoIndex[finger1] > rpoIndex[finger2])
                     finger1 = idom[finger1];
-                while (rpoIndex[finger2] > rpoIndex[finger1])
+                while (finger1 != VirtualRootBlockId && finger2 != VirtualRootBlockId && rpoIndex[finger2] > rpoIndex[finger1])
                     finger2 = idom[finger2];
             }
 
@@ -603,16 +641,17 @@ namespace Cnidaria.Cs
                 var predecessors = blocks[b].Predecessors;
                 if (predecessors.Length < 2)
                     continue;
-
+                int stop = idom[b];
                 for (int p = 0; p < predecessors.Length; p++)
                 {
                     int runner = predecessors[p].FromBlockId;
-                    while (runner >= 0 && runner != idom[b])
+                    while ((uint)runner < (uint)blocks.Length && runner != stop)
                     {
                         frontier[runner].Add(b);
-                        if (idom[runner] == runner)
+                        int next = idom[runner];
+                        if (next == VirtualRootBlockId || next < 0 || next == runner)
                             break;
-                        runner = idom[runner];
+                        runner = next;
                     }
                 }
             }
@@ -1162,6 +1201,28 @@ namespace Cnidaria.Cs
     }
 
 
+    internal readonly struct SsaUseDefLink : IEquatable<SsaUseDefLink>
+    {
+        public readonly SsaValueName Definition;
+        public readonly SsaValueName Use;
+
+        public SsaUseDefLink(SsaValueName definition, SsaValueName use)
+        {
+            if (!definition.Slot.Equals(use.Slot))
+                throw new ArgumentException("SSA use-def link must stay within a single base local.", nameof(use));
+            if (definition.Version == use.Version)
+                throw new ArgumentException("SSA use-def link cannot refer to the definition itself.", nameof(use));
+
+            Definition = definition;
+            Use = use;
+        }
+
+        public bool Equals(SsaUseDefLink other) => Definition.Equals(other.Definition) && Use.Equals(other.Use);
+        public override bool Equals(object? obj) => obj is SsaUseDefLink other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(Definition, Use);
+        public override string ToString() => Definition.ToString() + " uses " + Use.ToString();
+    }
+
     internal enum SsaDefinitionKind : byte
     {
         Initial,
@@ -1183,7 +1244,8 @@ namespace Cnidaria.Cs
         public SsaPhi? Phi { get; }
         public RuntimeType? Type { get; }
         public GenStackKind StackKind { get; }
-        public int PreviousSsaNumber { get; private set; }
+        public int UseDefSsaNumber { get; private set; }
+        public int PreviousSsaNumber => UseDefSsaNumber;
         public int UseCount { get; private set; }
         public bool HasPhiUse { get; private set; }
         public bool HasGlobalUse { get; private set; }
@@ -1192,8 +1254,10 @@ namespace Cnidaria.Cs
         public bool IsInitial => DefinitionKind == SsaDefinitionKind.Initial;
         public bool IsPhi => DefinitionKind == SsaDefinitionKind.Phi;
         public bool IsStore => DefinitionKind == SsaDefinitionKind.Store;
-        public bool IsPartialDefinition => PreviousSsaNumber != SsaConfig.ReservedSsaNumber;
-        public SsaValueName? PreviousDefinition => IsPartialDefinition ? new SsaValueName(BaseLocal, PreviousSsaNumber) : null;
+        public bool HasUseDefSsaNum => UseDefSsaNumber != SsaConfig.ReservedSsaNumber;
+        public bool IsPartialDefinition => HasUseDefSsaNum;
+        public SsaValueName? UseDef => HasUseDefSsaNum ? new SsaValueName(BaseLocal, UseDefSsaNumber) : null;
+        public SsaValueName? PreviousDefinition => UseDef;
 
         public SsaDescriptor(
             SsaSlot baseLocal,
@@ -1205,12 +1269,13 @@ namespace Cnidaria.Cs
             GenTree? defNode,
             RuntimeType? type,
             GenStackKind stackKind,
-            int previousSsaNumber = SsaConfig.ReservedSsaNumber,
+            int useDefSsaNumber = SsaConfig.ReservedSsaNumber,
             CfgBlock? defBlock = null,
             SsaPhi? phiDescriptor = null)
         {
             if (ssaNumber <= SsaConfig.ReservedSsaNumber) throw new ArgumentOutOfRangeException(nameof(ssaNumber));
-            if (previousSsaNumber < SsaConfig.ReservedSsaNumber) throw new ArgumentOutOfRangeException(nameof(previousSsaNumber));
+            if (useDefSsaNumber < SsaConfig.ReservedSsaNumber) throw new ArgumentOutOfRangeException(nameof(useDefSsaNumber));
+            if (useDefSsaNumber == ssaNumber) throw new InvalidOperationException("SSA use-def link cannot refer to its own definition.");
             if (!baseLocal.HasLclNum) throw new ArgumentException("SSA descriptor base local must include a concrete lclNum.", nameof(baseLocal));
             BaseLocal = baseLocal;
             SsaNumber = ssaNumber;
@@ -1223,18 +1288,20 @@ namespace Cnidaria.Cs
             Phi = phiDescriptor;
             Type = type;
             StackKind = stackKind;
-            PreviousSsaNumber = previousSsaNumber;
+            UseDefSsaNumber = useDefSsaNumber;
             ValueNumbers = default;
         }
 
-        internal void SetPreviousDefinition(int previousSsaNumber)
+        internal void SetUseDefSsaNum(int useDefSsaNumber)
         {
-            if (previousSsaNumber < SsaConfig.ReservedSsaNumber)
-                throw new ArgumentOutOfRangeException(nameof(previousSsaNumber));
-            if (previousSsaNumber == SsaNumber)
-                throw new InvalidOperationException("Partial SSA definition cannot use itself as the previous definition: " + Name + ".");
-            PreviousSsaNumber = previousSsaNumber;
+            if (useDefSsaNumber < SsaConfig.ReservedSsaNumber)
+                throw new ArgumentOutOfRangeException(nameof(useDefSsaNumber));
+            if (useDefSsaNumber == SsaNumber)
+                throw new InvalidOperationException("SSA use-def link cannot refer to its own definition: " + Name + ".");
+            UseDefSsaNumber = useDefSsaNumber;
         }
+
+        internal void SetPreviousDefinition(int previousSsaNumber) => SetUseDefSsaNum(previousSsaNumber);
 
         internal void AddUse(int useBlockId)
         {
@@ -1264,7 +1331,7 @@ namespace Cnidaria.Cs
                 SsaDefinitionKind.Store => "store",
                 _ => DefinitionKind.ToString(),
             };
-            string partial = IsPartialDefinition ? " prev=" + PreviousSsaNumber.ToString() : string.Empty;
+            string partial = HasUseDefSsaNum ? " use=" + UseDefSsaNumber.ToString() : string.Empty;
             string uses = UseCount != 0 ? " uses=" + UseCount.ToString() : string.Empty;
             string hints = (HasPhiUse ? " phi-use" : string.Empty) + (HasGlobalUse ? " global-use" : string.Empty);
             string vn = ValueNumbers.Liberal.IsValid || ValueNumbers.Conservative.IsValid ? " vn=" + ValueNumbers.ToString() : string.Empty;
@@ -1343,7 +1410,8 @@ namespace Cnidaria.Cs
         public readonly GenStackKind StackKind;
         public readonly GenTree? DefNode;
         public readonly SsaPhi? Phi;
-        public readonly int PreviousSsaNumber;
+        public readonly int UseDefSsaNumber;
+        public int PreviousSsaNumber => UseDefSsaNumber;
         public readonly SsaDescriptor Descriptor;
 
         public SsaValueDefinition(SsaDescriptor descriptor)
@@ -1359,7 +1427,7 @@ namespace Cnidaria.Cs
             StackKind = descriptor.StackKind;
             DefNode = descriptor.DefNode;
             Phi = descriptor.Phi;
-            PreviousSsaNumber = descriptor.PreviousSsaNumber;
+            UseDefSsaNumber = descriptor.UseDefSsaNumber;
         }
 
         public SsaValueDefinition(
@@ -1665,8 +1733,8 @@ namespace Cnidaria.Cs
         public RuntimeField? LocalField { get; }
         public ImmutableArray<SsaMemoryValueName> MemoryUses { get; }
         public ImmutableArray<SsaMemoryValueName> MemoryDefinitions { get; }
-        public bool IsPartialDefinition => StoreTarget.HasValue && LocalFieldBaseValue.HasValue;
-        public bool IsLocalFieldAccess => LocalFieldBaseValue.HasValue && LocalField is not null;
+        public bool IsPartialDefinition => StoreTarget.HasValue && LocalField is not null;
+        public bool IsLocalFieldAccess => (LocalFieldBaseValue.HasValue || IsPartialDefinition) && LocalField is not null;
         public bool HasMemoryEffects => !MemoryUses.IsDefaultOrEmpty || !MemoryDefinitions.IsDefaultOrEmpty;
 
         public SsaTree(
@@ -1797,6 +1865,46 @@ namespace Cnidaria.Cs
             MemoryDefinitions = memoryDefinitions.IsDefault ? ImmutableArray<SsaMemoryDefinition>.Empty : memoryDefinitions;
             Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
             ValueNumbers = valueNumbers;
+        }
+
+        public bool TryGetSsaLocalDescriptor(SsaSlot slot, out SsaLocalDescriptor descriptor)
+        {
+            for (int i = 0; i < SsaLocalDescriptors.Length; i++)
+            {
+                if (SsaLocalDescriptors[i].Slot.Equals(slot))
+                {
+                    descriptor = SsaLocalDescriptors[i];
+                    return true;
+                }
+            }
+
+            descriptor = null!;
+            return false;
+        }
+
+        public SsaLocalDescriptor GetSsaLocalDescriptor(SsaSlot slot)
+        {
+            if (TryGetSsaLocalDescriptor(slot, out var descriptor))
+                return descriptor;
+
+            throw new InvalidOperationException("SSA local descriptor is missing for " + slot + ".");
+        }
+
+        public bool TryGetSsaDescriptor(SsaValueName name, out SsaDescriptor descriptor)
+        {
+            if (TryGetSsaLocalDescriptor(name.Slot, out var local))
+                return local.TryGetSsaDefByNumber(name.Version, out descriptor);
+
+            descriptor = null!;
+            return false;
+        }
+
+        public SsaDescriptor GetSsaDescriptor(SsaValueName name)
+        {
+            if (TryGetSsaDescriptor(name, out var descriptor))
+                return descriptor;
+
+            throw new InvalidOperationException("SSA descriptor is missing for " + name + ".");
         }
     }
 
@@ -2278,7 +2386,6 @@ namespace Cnidaria.Cs
                     CollectAddressExposed(statements[s], addressExposed);
             }
 
-            var ehExposed = BuildEhExposedSlots(cfg);
             var structPromotionBlockedParents = BuildStructPromotionBlockedParents(method);
             var weightedUses = ComputeWeightedSlotUses(method, cfg);
             var allSlots = new List<SsaSlotInfo>();
@@ -2370,7 +2477,7 @@ namespace Cnidaria.Cs
 
             void AddDescriptor(SsaSlot slot, GenLocalDescriptor descriptor)
             {
-                bool exposed = descriptor.AddressExposed || addressExposed.Contains(slot) || ehExposed.Contains(slot);
+                bool exposed = descriptor.AddressExposed || addressExposed.Contains(slot);
                 if (exposed)
                     descriptor.MarkAddressExposed();
 
@@ -2853,6 +2960,304 @@ namespace Cnidaria.Cs
         }
     }
 
+
+    internal sealed class SsaLocalLiveness
+    {
+        private readonly Dictionary<(int blockId, int statementIndex, int treeId), TrackedLocalSet> _liveBeforeTree;
+        private readonly Dictionary<(int blockId, int statementIndex), TrackedLocalSet> _liveBeforeStatement;
+
+        public TrackedLocalTable Table { get; }
+        public ImmutableArray<TrackedLocalSet> UseBits { get; }
+        public ImmutableArray<TrackedLocalSet> DefBits { get; }
+        public ImmutableArray<TrackedLocalSet> LiveInBits { get; }
+        public ImmutableArray<TrackedLocalSet> LiveOutBits { get; }
+
+        private SsaLocalLiveness(
+            TrackedLocalTable table,
+            TrackedLocalSet[] uses,
+            TrackedLocalSet[] defs,
+            TrackedLocalSet[] liveIn,
+            TrackedLocalSet[] liveOut,
+            Dictionary<(int blockId, int statementIndex, int treeId), TrackedLocalSet> liveBeforeTree,
+            Dictionary<(int blockId, int statementIndex), TrackedLocalSet> liveBeforeStatement)
+        {
+            Table = table ?? throw new ArgumentNullException(nameof(table));
+            UseBits = FreezeBitSets(uses);
+            DefBits = FreezeBitSets(defs);
+            LiveInBits = FreezeBitSets(liveIn);
+            LiveOutBits = FreezeBitSets(liveOut);
+            _liveBeforeTree = liveBeforeTree ?? throw new ArgumentNullException(nameof(liveBeforeTree));
+            _liveBeforeStatement = liveBeforeStatement ?? throw new ArgumentNullException(nameof(liveBeforeStatement));
+        }
+
+        public bool IsTracked(SsaSlot slot) => Table.Contains(slot);
+        public bool IsLiveIn(int blockId, SsaSlot slot) => Contains(LiveInBits, blockId, slot);
+        public bool IsLiveOut(int blockId, SsaSlot slot) => Contains(LiveOutBits, blockId, slot);
+
+        public bool IsLiveBeforeStatement(int blockId, int statementIndex, SsaSlot slot)
+        {
+            if (!Table.Contains(slot))
+                return false;
+            if (_liveBeforeStatement.TryGetValue((blockId, statementIndex), out var live))
+                return live.Contains(slot);
+            return IsLiveIn(blockId, slot);
+        }
+
+        public bool IsLiveBeforeTree(int blockId, int statementIndex, int treeId, SsaSlot slot)
+        {
+            if (!Table.Contains(slot))
+                return false;
+            if (_liveBeforeTree.TryGetValue((blockId, statementIndex, treeId), out var live))
+                return live.Contains(slot);
+            return IsLiveBeforeStatement(blockId, statementIndex, slot);
+        }
+
+        public static SsaLocalLiveness Build(SsaMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            var slots = ImmutableArray.CreateBuilder<SsaSlot>();
+            var seenSlots = new HashSet<SsaSlot>();
+            for (int i = 0; i < method.SsaLocalDescriptors.Length; i++)
+            {
+                var slot = method.SsaLocalDescriptors[i].Slot;
+                if (seenSlots.Add(slot))
+                    slots.Add(slot);
+            }
+
+            var sorted = new List<SsaSlot>(slots.ToImmutable());
+            sorted.Sort();
+            var table = new TrackedLocalTable(sorted.ToImmutableArray());
+            int blockCount = method.Blocks.Length;
+            var uses = NewSetArray(blockCount, table);
+            var defs = NewSetArray(blockCount, table);
+            var liveIn = NewSetArray(blockCount, table);
+            var liveOut = NewSetArray(blockCount, table);
+            var eventsByBlock = new List<SsaLocalLivenessEvent>[blockCount];
+            var blockById = new SsaBlock[blockCount];
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                eventsByBlock[b] = new List<SsaLocalLivenessEvent>();
+                blockById[method.Blocks[b].Id] = method.Blocks[b];
+            }
+
+            var partialUseByDefinition = BuildPartialUseMap(method);
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                var block = method.Blocks[b];
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    if (table.Contains(block.Phis[p].Slot))
+                        defs[block.Id].Add(block.Phis[p].Slot);
+                }
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                    CollectStatementEvents(block.Statements[s], block.Id, s, partialUseByDefinition, table, eventsByBlock[block.Id]);
+
+                for (int e = 0; e < eventsByBlock[block.Id].Count; e++)
+                {
+                    var ev = eventsByBlock[block.Id][e];
+                    if (ev.IsUse && !defs[block.Id].Contains(ev.Slot))
+                        uses[block.Id].Add(ev.Slot);
+                    if (ev.IsDefinition)
+                        defs[block.Id].Add(ev.Slot);
+                }
+            }
+
+            bool changed;
+            do
+            {
+                changed = false;
+                for (int r = method.Cfg.ReversePostOrder.Length - 1; r >= 0; r--)
+                {
+                    int blockId = method.Cfg.ReversePostOrder[r];
+                    var block = blockById[blockId];
+                    if (block is null)
+                        continue;
+
+                    var newOut = table.NewEmptySet();
+                    var successors = method.Cfg.Blocks[blockId].Successors;
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int succ = successors[i].ToBlockId;
+                        newOut.UnionWith(liveIn[succ]);
+                        AddPhiEdgeUses(blockById[succ], blockId, newOut, table);
+                    }
+
+                    var newIn = newOut.Clone();
+                    newIn.ExceptWith(defs[blockId]);
+                    newIn.UnionWith(uses[blockId]);
+
+                    if (!liveOut[blockId].SetEquals(newOut))
+                    {
+                        liveOut[blockId] = newOut;
+                        changed = true;
+                    }
+
+                    if (!liveIn[blockId].SetEquals(newIn))
+                    {
+                        liveIn[blockId] = newIn;
+                        changed = true;
+                    }
+                }
+            }
+            while (changed);
+
+            var liveBeforeTree = new Dictionary<(int blockId, int statementIndex, int treeId), TrackedLocalSet>();
+            var liveBeforeStatement = new Dictionary<(int blockId, int statementIndex), TrackedLocalSet>();
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                var block = method.Blocks[b];
+                var live = liveOut[block.Id].Clone();
+                var events = eventsByBlock[block.Id];
+                int currentStatement = block.Statements.Length;
+
+                for (int e = events.Count - 1; e >= 0; e--)
+                {
+                    var ev = events[e];
+                    while (currentStatement > ev.StatementIndex + 1)
+                    {
+                        currentStatement--;
+                        liveBeforeStatement[(block.Id, currentStatement)] = live.Clone();
+                    }
+
+                    var before = live.Clone();
+                    if (ev.IsDefinition)
+                        before.Remove(ev.Slot);
+                    if (ev.IsUse)
+                        before.Add(ev.Slot);
+
+                    liveBeforeTree[(block.Id, ev.StatementIndex, ev.TreeId)] = before.Clone();
+                    live = before;
+                    currentStatement = ev.StatementIndex + 1;
+                }
+
+                while (currentStatement > 0)
+                {
+                    currentStatement--;
+                    liveBeforeStatement[(block.Id, currentStatement)] = live.Clone();
+                }
+            }
+
+            return new SsaLocalLiveness(table, uses, defs, liveIn, liveOut, liveBeforeTree, liveBeforeStatement);
+        }
+
+        private static Dictionary<SsaValueName, SsaValueName> BuildPartialUseMap(SsaMethod method)
+        {
+            var result = new Dictionary<SsaValueName, SsaValueName>();
+            for (int i = 0; i < method.ValueDefinitions.Length; i++)
+            {
+                var descriptor = method.ValueDefinitions[i].Descriptor;
+                if (descriptor.HasUseDefSsaNum)
+                    result[descriptor.Name] = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+            }
+            return result;
+        }
+
+        private static void AddPhiEdgeUses(SsaBlock? successor, int predecessorBlockId, TrackedLocalSet liveOut, TrackedLocalTable table)
+        {
+            if (successor is null)
+                return;
+
+            for (int p = 0; p < successor.Phis.Length; p++)
+            {
+                var phi = successor.Phis[p];
+                if (!table.Contains(phi.Slot))
+                    continue;
+
+                for (int i = 0; i < phi.Inputs.Length; i++)
+                {
+                    if (phi.Inputs[i].PredecessorBlockId == predecessorBlockId)
+                    {
+                        liveOut.Add(phi.Slot);
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static void CollectStatementEvents(
+            SsaTree tree,
+            int blockId,
+            int statementIndex,
+            IReadOnlyDictionary<SsaValueName, SsaValueName> partialUseByDefinition,
+            TrackedLocalTable table,
+            List<SsaLocalLivenessEvent> events)
+        {
+            for (int i = 0; i < tree.Operands.Length; i++)
+                CollectStatementEvents(tree.Operands[i], blockId, statementIndex, partialUseByDefinition, table, events);
+
+            if (tree.Value.HasValue && table.Contains(tree.Value.Value.Slot))
+                events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, tree.Value.Value.Slot));
+
+            if (tree.LocalFieldBaseValue.HasValue && table.Contains(tree.LocalFieldBaseValue.Value.Slot))
+                events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, tree.LocalFieldBaseValue.Value.Slot));
+
+            if (tree.StoreTarget.HasValue)
+            {
+                var target = tree.StoreTarget.Value;
+                if (partialUseByDefinition.TryGetValue(target, out var previous) && table.Contains(previous.Slot))
+                    events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, previous.Slot));
+
+                if (table.Contains(target.Slot))
+                    events.Add(SsaLocalLivenessEvent.Definition(blockId, statementIndex, tree.Source.Id, target.Slot));
+            }
+        }
+
+        private readonly struct SsaLocalLivenessEvent
+        {
+            public readonly int BlockId;
+            public readonly int StatementIndex;
+            public readonly int TreeId;
+            public readonly SsaSlot Slot;
+            public readonly bool IsUse;
+            public readonly bool IsDefinition;
+
+            private SsaLocalLivenessEvent(int blockId, int statementIndex, int treeId, SsaSlot slot, bool isUse, bool isDefinition)
+            {
+                BlockId = blockId;
+                StatementIndex = statementIndex;
+                TreeId = treeId;
+                Slot = slot;
+                IsUse = isUse;
+                IsDefinition = isDefinition;
+            }
+
+            public static SsaLocalLivenessEvent Use(int blockId, int statementIndex, int treeId, SsaSlot slot)
+                => new SsaLocalLivenessEvent(blockId, statementIndex, treeId, slot, isUse: true, isDefinition: false);
+
+            public static SsaLocalLivenessEvent Definition(int blockId, int statementIndex, int treeId, SsaSlot slot)
+                => new SsaLocalLivenessEvent(blockId, statementIndex, treeId, slot, isUse: false, isDefinition: true);
+        }
+
+        private static TrackedLocalSet[] NewSetArray(int count, TrackedLocalTable table)
+        {
+            var result = new TrackedLocalSet[count];
+            for (int i = 0; i < result.Length; i++)
+                result[i] = table.NewEmptySet();
+            return result;
+        }
+
+        private static ImmutableArray<TrackedLocalSet> FreezeBitSets(TrackedLocalSet[] sets)
+        {
+            var builder = ImmutableArray.CreateBuilder<TrackedLocalSet>(sets.Length);
+            for (int i = 0; i < sets.Length; i++)
+                builder.Add(sets[i].Clone());
+            return builder.ToImmutable();
+        }
+
+        private static bool Contains(ImmutableArray<TrackedLocalSet> sets, int blockId, SsaSlot slot)
+        {
+            if ((uint)blockId >= (uint)sets.Length)
+                throw new ArgumentOutOfRangeException(nameof(blockId));
+            return sets[blockId].Contains(slot);
+        }
+    }
+
     internal sealed class GenTreeLocalLiveness
     {
         public ControlFlowGraph Cfg { get; }
@@ -3322,11 +3727,12 @@ namespace Cnidaria.Cs
             var memoryLiveness = MemoryLiveness.Build(cfg, slotTable);
             var phis = InsertPhis(cfg, slotTable.PromotableSlots, liveness);
             var memoryPhis = InsertMemoryPhis(cfg, memoryLiveness);
-            var rename = new RenameState(cfg, slotTable, phis, memoryPhis, memoryLiveness);
+            var rename = new RenameState(cfg, slotTable, phis, memoryPhis, liveness, memoryLiveness);
             var blocks = rename.Run();
             var initialValues = rename.InitialValues.ToImmutableArray();
             var initialMemoryValues = rename.InitialMemoryValues.ToImmutableArray();
-            var valueDefinitions = BuildValueDefinitions(slotTable, initialValues, blocks);
+            var useDefLinks = rename.UseDefLinks;
+            var valueDefinitions = BuildValueDefinitions(slotTable, initialValues, blocks, useDefLinks);
             var memoryDefinitions = BuildMemoryDefinitions(initialMemoryValues, blocks);
             AnnotateSsaUses(valueDefinitions, memoryDefinitions, blocks);
             var ssaLocalDescriptors = BuildSsaLocalDescriptors(slotTable, valueDefinitions);
@@ -3354,7 +3760,8 @@ namespace Cnidaria.Cs
         private static ImmutableArray<SsaValueDefinition> BuildValueDefinitions(
             SlotTable slotTable,
             ImmutableArray<SsaValueName> initialValues,
-            ImmutableArray<SsaBlock> blocks)
+            ImmutableArray<SsaBlock> blocks,
+            IReadOnlyDictionary<SsaValueName, SsaUseDefLink>? useDefLinks)
         {
             var definitions = new List<SsaValueDefinition>();
             var seen = new HashSet<SsaValueName>();
@@ -3374,6 +3781,7 @@ namespace Cnidaria.Cs
                     info.Type,
                     info.StackKind)));
             }
+
 
             for (int b = 0; b < blocks.Length; b++)
             {
@@ -3414,6 +3822,16 @@ namespace Cnidaria.Cs
                 {
                     var name = tree.StoreTarget.Value;
                     var info = slotTable.GetInfo(name.Slot);
+                    int useDefSsaNum = SsaConfig.ReservedSsaNumber;
+                    if (useDefLinks is not null && useDefLinks.TryGetValue(name, out var useDefLink))
+                    {
+                        if (!useDefLink.Definition.Equals(name))
+                            throw new InvalidOperationException("SSA use-def link is keyed by the wrong definition: " + useDefLink + ".");
+                        if (!useDefLink.Use.Slot.Equals(name.Slot))
+                            throw new InvalidOperationException("SSA use-def link crosses base locals: " + useDefLink + ".");
+                        useDefSsaNum = useDefLink.Use.Version;
+                    }
+
                     Add(new SsaValueDefinition(new SsaDescriptor(
                         name.Slot,
                         name.Version,
@@ -3424,7 +3842,7 @@ namespace Cnidaria.Cs
                         tree.Source,
                         info.Type,
                         info.StackKind,
-                        tree.LocalFieldBaseValue.HasValue ? tree.LocalFieldBaseValue.Value.Version : SsaConfig.ReservedSsaNumber,
+                        useDefSsaNum,
                         block.CfgBlock)));
                 }
             }
@@ -3535,6 +3953,17 @@ namespace Cnidaria.Cs
             var memoryDescriptors = new Dictionary<SsaMemoryValueName, SsaMemoryDescriptor>();
             for (int i = 0; i < memoryDefinitions.Length; i++)
                 memoryDescriptors[memoryDefinitions[i].Name] = memoryDefinitions[i].Descriptor;
+
+            for (int i = 0; i < valueDefinitions.Length; i++)
+            {
+                var descriptor = valueDefinitions[i].Descriptor;
+                if (!descriptor.HasUseDefSsaNum)
+                    continue;
+
+                var use = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                if (descriptors.TryGetValue(use, out var useDescriptor))
+                    useDescriptor.AddUse(descriptor.DefBlockId);
+            }
 
             for (int b = 0; b < blocks.Length; b++)
             {
@@ -3682,22 +4111,39 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                while (work.Count != 0)
+                ProcessWorklist();
+
+                for (int r = 0; r < cfg.ExceptionRegions.Length; r++)
                 {
-                    int x = work.Dequeue();
-                    inWork.Remove(x);
+                    var region = cfg.ExceptionRegions[r];
+                    int handler = region.HandlerStartBlockId;
+                    if ((uint)handler >= (uint)n)
+                        continue;
 
-                    var df = cfg.DominanceFrontiers[x];
-                    for (int i = 0; i < df.Length; i++)
+                    if (!HasPotentialExceptionEdgeToHandler(cfg, region))
+                        continue;
+
+                    if (liveness.LiveIn[handler].Contains(slot) && AddPhi(slot, handler) && !liveness.Defs[handler].Contains(slot) && inWork.Add(handler))
+                        work.Enqueue(handler);
+                }
+
+                ProcessWorklist();
+
+                void ProcessWorklist()
+                {
+                    while (work.Count != 0)
                     {
-                        int y = df[i];
-                        if (!liveness.LiveIn[y].Contains(slot))
-                            continue;
+                        int x = work.Dequeue();
+                        inWork.Remove(x);
 
-                        if (hasPhi.Add((slot, y)))
+                        var df = cfg.DominanceFrontiers[x];
+                        for (int i = 0; i < df.Length; i++)
                         {
-                            byBlock[y].Add(new MutablePhi(y, slot));
-                            if (!liveness.Defs[y].Contains(slot) && inWork.Add(y))
+                            int y = df[i];
+                            if (!liveness.LiveIn[y].Contains(slot))
+                                continue;
+
+                            if (AddPhi(slot, y) && !liveness.Defs[y].Contains(slot) && inWork.Add(y))
                                 work.Enqueue(y);
                         }
                     }
@@ -3711,6 +4157,15 @@ namespace Cnidaria.Cs
                 result[i] = byBlock[i].ToArray();
             }
             return result;
+
+            bool AddPhi(SsaSlot slot, int blockId)
+            {
+                if (!hasPhi.Add((slot, blockId)))
+                    return false;
+
+                byBlock[blockId].Add(new MutablePhi(blockId, slot));
+                return true;
+            }
         }
 
         private static MutableMemoryPhi[][] InsertMemoryPhis(ControlFlowGraph cfg, MemoryLiveness liveness)
@@ -3736,22 +4191,39 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                while (work.Count != 0)
+                ProcessWorklist();
+
+                for (int r = 0; r < cfg.ExceptionRegions.Length; r++)
                 {
-                    int x = work.Dequeue();
-                    inWork.Remove(x);
+                    var region = cfg.ExceptionRegions[r];
+                    int handler = region.HandlerStartBlockId;
+                    if ((uint)handler >= (uint)n)
+                        continue;
 
-                    var df = cfg.DominanceFrontiers[x];
-                    for (int i = 0; i < df.Length; i++)
+                    if (!HasPotentialExceptionEdgeToHandler(cfg, region))
+                        continue;
+
+                    if (liveness.LiveIn[handler].Contains(kind) && AddPhi(kind, handler) && !liveness.Defs[handler].Contains(kind) && inWork.Add(handler))
+                        work.Enqueue(handler);
+                }
+
+                ProcessWorklist();
+
+                void ProcessWorklist()
+                {
+                    while (work.Count != 0)
                     {
-                        int y = df[i];
-                        if (!liveness.LiveIn[y].Contains(kind))
-                            continue;
+                        int x = work.Dequeue();
+                        inWork.Remove(x);
 
-                        if (hasPhi.Add((kind, y)))
+                        var df = cfg.DominanceFrontiers[x];
+                        for (int i = 0; i < df.Length; i++)
                         {
-                            byBlock[y].Add(new MutableMemoryPhi(y, kind));
-                            if (!liveness.Defs[y].Contains(kind) && inWork.Add(y))
+                            int y = df[i];
+                            if (!liveness.LiveIn[y].Contains(kind))
+                                continue;
+
+                            if (AddPhi(kind, y) && !liveness.Defs[y].Contains(kind) && inWork.Add(y))
                                 work.Enqueue(y);
                         }
                     }
@@ -3765,6 +4237,33 @@ namespace Cnidaria.Cs
                 result[i] = byBlock[i].ToArray();
             }
             return result;
+
+            bool AddPhi(SsaMemoryKind kind, int blockId)
+            {
+                if (!hasPhi.Add((kind, blockId)))
+                    return false;
+
+                byBlock[blockId].Add(new MutableMemoryPhi(blockId, kind));
+                return true;
+            }
+        }
+
+
+        private static bool HasPotentialExceptionEdgeToHandler(ControlFlowGraph cfg, CfgExceptionRegion region)
+        {
+            int handler = region.HandlerStartBlockId;
+            for (int b = region.TryStartBlockId; b < region.TryEndBlockIdExclusive && b < cfg.Blocks.Length; b++)
+            {
+                var successors = cfg.Blocks[b].Successors;
+                for (int s = 0; s < successors.Length; s++)
+                {
+                    var edge = successors[s];
+                    if (edge.Kind == CfgEdgeKind.Exception && edge.ToBlockId == handler)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private sealed class SlotTable
@@ -4531,6 +5030,7 @@ namespace Cnidaria.Cs
             private readonly SlotTable _slots;
             private readonly MutablePhi[][] _phis;
             private readonly MutableMemoryPhi[][] _memoryPhis;
+            private readonly Liveness _localLiveness;
             private readonly MemoryLiveness _memoryLiveness;
             private readonly Dictionary<SsaSlot, int> _nextVersion = new();
             private readonly Dictionary<SsaSlot, Stack<SsaValueName>> _stacks = new();
@@ -4538,6 +5038,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<SsaMemoryKind, Stack<SsaMemoryValueName>> _memoryStacks = new();
             private readonly List<SsaValueName> _initialValues = new();
             private readonly List<SsaMemoryValueName> _initialMemoryValues = new();
+            private readonly Dictionary<SsaValueName, SsaUseDefLink> _useDefLinks = new();
             private readonly List<SsaTree>[] _renamedStatements;
             private readonly ImmutableArray<SsaMemoryValueName>[] _memoryIn;
             private readonly ImmutableArray<SsaMemoryValueName>[] _memoryOut;
@@ -4545,13 +5046,15 @@ namespace Cnidaria.Cs
 
             public IReadOnlyList<SsaValueName> InitialValues => _initialValues;
             public IReadOnlyList<SsaMemoryValueName> InitialMemoryValues => _initialMemoryValues;
+            public IReadOnlyDictionary<SsaValueName, SsaUseDefLink> UseDefLinks => _useDefLinks;
 
-            public RenameState(ControlFlowGraph cfg, SlotTable slots, MutablePhi[][] phis, MutableMemoryPhi[][] memoryPhis, MemoryLiveness memoryLiveness)
+            public RenameState(ControlFlowGraph cfg, SlotTable slots, MutablePhi[][] phis, MutableMemoryPhi[][] memoryPhis, Liveness localLiveness, MemoryLiveness memoryLiveness)
             {
                 _cfg = cfg;
                 _slots = slots;
                 _phis = phis;
                 _memoryPhis = memoryPhis;
+                _localLiveness = localLiveness;
                 _memoryLiveness = memoryLiveness;
                 _renamedStatements = new List<SsaTree>[cfg.Blocks.Length];
                 _memoryIn = new ImmutableArray<SsaMemoryValueName>[cfg.Blocks.Length];
@@ -4585,8 +5088,8 @@ namespace Cnidaria.Cs
 
             public ImmutableArray<SsaBlock> Run()
             {
-                if (_cfg.Blocks.Length != 0)
-                    RenameBlock(0);
+                for (int i = 0; i < _cfg.DominatorRoots.Length; i++)
+                    RenameBlock(_cfg.DominatorRoots[i]);
 
                 for (int i = 0; i < _cfg.Blocks.Length; i++)
                 {
@@ -4641,7 +5144,7 @@ namespace Cnidaria.Cs
                 var statements = _cfg.Blocks[blockId].SourceBlock.Statements;
                 for (int i = 0; i < statements.Length; i++)
                 {
-                    var renamed = RenameTree(statements[i], pushed, pushedMemory);
+                    var renamed = RenameTree(statements[i], blockId, pushed, pushedMemory);
                     _renamedStatements[blockId].Add(renamed);
                 }
 
@@ -4650,18 +5153,12 @@ namespace Cnidaria.Cs
                 var successors = _cfg.Blocks[blockId].Successors;
                 for (int i = 0; i < successors.Length; i++)
                 {
-                    int succ = successors[i].ToBlockId;
-                    for (int p = 0; p < _phis[succ].Length; p++)
-                    {
-                        var phi = _phis[succ][p];
-                        phi.SetInput(blockId, Top(phi.Slot));
-                    }
+                    var edge = successors[i];
+                    int succ = edge.ToBlockId;
+                    AddPhiArgsToSuccessor(blockId, succ);
 
-                    for (int p = 0; p < _memoryPhis[succ].Length; p++)
-                    {
-                        var phi = _memoryPhis[succ][p];
-                        phi.SetInput(blockId, TopMemory(phi.Kind));
-                    }
+                    if (edge.Kind != CfgEdgeKind.Exception)
+                        AddPhiArgsToNewlyEnteredHandlers(blockId, succ);
                 }
 
                 var children = _cfg.DominatorTreeChildren[blockId];
@@ -4707,6 +5204,7 @@ namespace Cnidaria.Cs
                         PushMemory(kind, outValue);
                         pushedMemory.Add(kind);
                         builder.Add(outValue);
+                        AddMemoryDefToEHSuccessorPhis(blockId, kind, outValue);
                     }
                     else
                     {
@@ -4732,7 +5230,139 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private SsaTree RenameTree(GenTree node, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            private void AddPhiArgsToSuccessor(int predBlockId, int succBlockId)
+            {
+                bool handlerEntry = _cfg.Blocks[succBlockId].IsHandlerEntry;
+
+                for (int p = 0; p < _phis[succBlockId].Length; p++)
+                {
+                    var phi = _phis[succBlockId][p];
+                    phi.AddInput(predBlockId, Top(phi.Slot), allowMultipleForPred: handlerEntry);
+                }
+
+                for (int p = 0; p < _memoryPhis[succBlockId].Length; p++)
+                {
+                    var phi = _memoryPhis[succBlockId][p];
+                    phi.AddInput(predBlockId, TopMemory(phi.Kind), allowMultipleForPred: handlerEntry);
+                }
+            }
+
+            private void AddDefToEHSuccessorPhis(int blockId, SsaSlot slot, SsaValueName value)
+            {
+                if (!_localLiveness.Table.Contains(slot) || !HasPotentialEHSuccs(blockId))
+                    return;
+
+                VisitEHSuccs(blockId, succBlockId =>
+                {
+                    if (!_localLiveness.LiveIn[succBlockId].Contains(slot))
+                        return;
+
+                    if (TryGetPhi(succBlockId, slot, out var phi))
+                        phi.AddInput(blockId, value, allowMultipleForPred: true);
+                });
+            }
+
+            private void AddMemoryDefToEHSuccessorPhis(int blockId, SsaMemoryKind kind, SsaMemoryValueName value)
+            {
+                if (!HasPotentialEHSuccs(blockId))
+                    return;
+
+                VisitEHSuccs(blockId, succBlockId =>
+                {
+                    if (!_memoryLiveness.LiveIn[succBlockId].Contains(kind))
+                        return;
+
+                    if (TryGetMemoryPhi(succBlockId, kind, out var phi))
+                        phi.AddInput(blockId, value, allowMultipleForPred: true);
+                });
+            }
+
+            private void AddPhiArgsToNewlyEnteredHandlers(int predBlockId, int enterBlockId)
+            {
+                for (int r = 0; r < _cfg.ExceptionRegions.Length; r++)
+                {
+                    var region = _cfg.ExceptionRegions[r];
+                    if (region.TryStartBlockId != enterBlockId)
+                        continue;
+
+                    if (region.ContainsTryBlock(predBlockId))
+                        continue;
+
+                    int handler = region.HandlerStartBlockId;
+                    if ((uint)handler >= (uint)_cfg.Blocks.Length)
+                        continue;
+
+                    for (int p = 0; p < _phis[handler].Length; p++)
+                    {
+                        var phi = _phis[handler][p];
+                        if (_localLiveness.LiveOut[predBlockId].Contains(phi.Slot))
+                            phi.AddInput(enterBlockId, Top(phi.Slot), allowMultipleForPred: true);
+                    }
+
+                    for (int p = 0; p < _memoryPhis[handler].Length; p++)
+                    {
+                        var phi = _memoryPhis[handler][p];
+                        if (_memoryLiveness.LiveOut[predBlockId].Contains(phi.Kind))
+                            phi.AddInput(enterBlockId, _memoryOut[predBlockId].IsDefaultOrEmpty ? TopMemory(phi.Kind) : GetMemoryOut(predBlockId, phi.Kind), allowMultipleForPred: true);
+                    }
+                }
+            }
+
+            private SsaMemoryValueName GetMemoryOut(int blockId, SsaMemoryKind kind)
+            {
+                var values = _memoryOut[blockId];
+                for (int i = 0; i < values.Length; i++)
+                {
+                    if (values[i].Kind == kind)
+                        return values[i];
+                }
+
+                return TopMemory(kind);
+            }
+
+            private bool TryGetPhi(int blockId, SsaSlot slot, out MutablePhi phi)
+            {
+                for (int i = 0; i < _phis[blockId].Length; i++)
+                {
+                    if (_phis[blockId][i].Slot.Equals(slot))
+                    {
+                        phi = _phis[blockId][i];
+                        return true;
+                    }
+                }
+
+                phi = null!;
+                return false;
+            }
+
+            private bool HasPotentialEHSuccs(int blockId)
+            {
+                var successors = _cfg.Blocks[blockId].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                {
+                    if (successors[i].Kind == CfgEdgeKind.Exception)
+                        return true;
+                }
+
+                return false;
+            }
+
+            private void VisitEHSuccs(int blockId, Action<int> visitor)
+            {
+                var seen = new HashSet<int>();
+                var successors = _cfg.Blocks[blockId].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                {
+                    var edge = successors[i];
+                    if (edge.Kind != CfgEdgeKind.Exception)
+                        continue;
+
+                    if (seen.Add(edge.ToBlockId))
+                        visitor(edge.ToBlockId);
+                }
+            }
+
+            private SsaTree RenameTree(GenTree node, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
             {
                 if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                 {
@@ -4740,64 +5370,69 @@ namespace Cnidaria.Cs
                     {
                         if (fieldAccess.IsPromotedFieldAccess && _slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
-                            return AttachMemory(node, operands, pushedMemory, value: Top(fieldAccess.Slot));
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            return AttachMemory(node, operands, blockId, pushedMemory, value: Top(fieldAccess.Slot));
                         }
 
                         if (!fieldAccess.IsPromotedFieldAccess && fieldAccess.Field is not null && _slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
-                            return AttachMemory(node, operands, pushedMemory, localFieldBaseValue: Top(fieldAccess.BaseSlot), localField: fieldAccess.Field);
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            return AttachMemory(node, operands, blockId, pushedMemory, localFieldBaseValue: Top(fieldAccess.BaseSlot), localField: fieldAccess.Field);
                         }
                     }
                     else if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
                     {
                         if (_slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
                             var target = NewVersion(fieldAccess.Slot);
                             Push(fieldAccess.Slot, target);
                             pushed.Add(fieldAccess.Slot);
-                            return AttachMemory(node, operands, pushedMemory, storeTarget: target);
+                            AddDefToEHSuccessorPhis(blockId, fieldAccess.Slot, target);
+                            return AttachMemory(node, operands, blockId, pushedMemory, storeTarget: target);
                         }
                     }
                     else if (fieldAccess.Kind == SsaLocalAccessKind.PartialDefinition)
                     {
                         if (_slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, pushed, pushedMemory);
+                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
                             var previous = Top(fieldAccess.BaseSlot);
                             var target = NewVersion(fieldAccess.BaseSlot);
+                            SetUseDefSsaNum(target, previous);
                             Push(fieldAccess.BaseSlot, target);
                             pushed.Add(fieldAccess.BaseSlot);
-                            return AttachMemory(node, operands, pushedMemory, storeTarget: target, localFieldBaseValue: previous, localField: fieldAccess.Field);
+                            AddDefToEHSuccessorPhis(blockId, fieldAccess.BaseSlot, target);
+                            return AttachMemory(node, operands, blockId, pushedMemory, storeTarget: target, localField: fieldAccess.Field);
                         }
                     }
                 }
 
                 if (TryGetDirectLoadSlot(node, out var loadSlot) && _slots.IsPromotable(loadSlot))
-                    return AttachMemory(node, ImmutableArray<SsaTree>.Empty, pushedMemory, value: Top(loadSlot));
+                    return AttachMemory(node, ImmutableArray<SsaTree>.Empty, blockId, pushedMemory, value: Top(loadSlot));
 
                 {
                     var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
                     for (int i = 0; i < node.Operands.Length; i++)
-                        operands.Add(RenameTree(node.Operands[i], pushed, pushedMemory));
+                        operands.Add(RenameTree(node.Operands[i], blockId, pushed, pushedMemory));
 
                     if (TryGetDirectStoreSlot(node, out var storeSlot) && _slots.IsPromotable(storeSlot))
                     {
                         var target = NewVersion(storeSlot);
                         Push(storeSlot, target);
                         pushed.Add(storeSlot);
-                        return AttachMemory(node, operands.ToImmutable(), pushedMemory, storeTarget: target);
+                        AddDefToEHSuccessorPhis(blockId, storeSlot, target);
+                        return AttachMemory(node, operands.ToImmutable(), blockId, pushedMemory, storeTarget: target);
                     }
 
-                    return AttachMemory(node, operands.ToImmutable(), pushedMemory);
+                    return AttachMemory(node, operands.ToImmutable(), blockId, pushedMemory);
                 }
             }
 
             private SsaTree AttachMemory(
                 GenTree node,
                 ImmutableArray<SsaTree> operands,
+                int blockId,
                 List<SsaMemoryKind> pushedMemory,
                 SsaValueName? value = null,
                 SsaValueName? storeTarget = null,
@@ -4824,6 +5459,7 @@ namespace Cnidaria.Cs
                     PushMemory(kind, def);
                     pushedMemory.Add(kind);
                     memoryDefs.Add(def);
+                    AddMemoryDefToEHSuccessorPhis(blockId, kind, def);
                 }
 
                 return new SsaTree(
@@ -4837,16 +5473,25 @@ namespace Cnidaria.Cs
                     memoryDefs.ToImmutable());
             }
 
-            private ImmutableArray<SsaTree> RenameLocalFieldNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            private ImmutableArray<SsaTree> RenameLocalFieldNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
             {
                 var operands = ImmutableArray.CreateBuilder<SsaTree>(Math.Max(0, node.Operands.Length - 1));
                 for (int i = 0; i < node.Operands.Length; i++)
                 {
                     if (i == fieldAccess.ReceiverOperandIndex)
                         continue;
-                    operands.Add(RenameTree(node.Operands[i], pushed, pushedMemory));
+                    operands.Add(RenameTree(node.Operands[i], blockId, pushed, pushedMemory));
                 }
                 return operands.ToImmutable();
+            }
+
+
+            private void SetUseDefSsaNum(SsaValueName definition, SsaValueName use)
+            {
+                if (!definition.Slot.Equals(use.Slot))
+                    throw new InvalidOperationException("Partial SSA definition " + definition + " uses different base local " + use + ".");
+                if (!_useDefLinks.TryAdd(definition, new SsaUseDefLink(definition, use)))
+                    throw new InvalidOperationException("Duplicate SSA use-def link for " + definition + ".");
             }
 
             private SsaValueName Top(SsaSlot slot)
@@ -4937,7 +5582,7 @@ namespace Cnidaria.Cs
 
         private sealed class MutablePhi
         {
-            private readonly Dictionary<int, SsaValueName> _inputs = new();
+            private readonly List<SsaPhiInput> _inputs = new();
 
             public int BlockId { get; }
             public SsaSlot Slot { get; }
@@ -4949,27 +5594,54 @@ namespace Cnidaria.Cs
                 Slot = slot;
             }
 
-            public void SetInput(int predecessorBlockId, SsaValueName value)
+            public void AddInput(int predecessorBlockId, SsaValueName value, bool allowMultipleForPred)
             {
-                _inputs[predecessorBlockId] = value;
+                if (!value.Slot.Equals(Slot))
+                    throw new InvalidOperationException($"SSA phi input slot mismatch for {Slot}: {value}.");
+
+                for (int i = 0; i < _inputs.Count; i++)
+                {
+                    var input = _inputs[i];
+                    if (input.PredecessorBlockId != predecessorBlockId)
+                        continue;
+
+                    if (input.Value.Equals(value))
+                        return;
+
+                    if (!allowMultipleForPred)
+                        throw new InvalidOperationException($"Conflicting SSA phi inputs for {Slot} in B{BlockId} from B{predecessorBlockId}: {input.Value} and {value}.");
+                }
+
+                _inputs.Add(new SsaPhiInput(predecessorBlockId, value));
             }
 
             public SsaPhi Freeze(CfgBlock block)
             {
-                var inputs = ImmutableArray.CreateBuilder<SsaPhiInput>(block.Predecessors.Length);
-                var seen = new HashSet<int>();
-
-                for (int i = 0; i < block.Predecessors.Length; i++)
+                var expectedPreds = UniquePredecessors(block);
+                var actualPreds = new HashSet<int>();
+                var sortedInputs = new List<SsaPhiInput>(_inputs);
+                sortedInputs.Sort(static (a, b) =>
                 {
-                    int pred = block.Predecessors[i].FromBlockId;
-                    if (!seen.Add(pred))
-                        continue;
+                    int c = a.PredecessorBlockId.CompareTo(b.PredecessorBlockId);
+                    return c != 0 ? c : a.Value.CompareTo(b.Value);
+                });
 
-                    if (!_inputs.TryGetValue(pred, out var value))
-                        throw new InvalidOperationException($"Missing SSA phi input for {Slot} in B{BlockId} from B{pred}.");
-
-                    inputs.Add(new SsaPhiInput(pred, value));
+                var inputs = ImmutableArray.CreateBuilder<SsaPhiInput>(sortedInputs.Count);
+                for (int i = 0; i < sortedInputs.Count; i++)
+                {
+                    var input = sortedInputs[i];
+                    actualPreds.Add(input.PredecessorBlockId);
+                    inputs.Add(input);
                 }
+
+                foreach (int pred in expectedPreds)
+                {
+                    if (!actualPreds.Contains(pred))
+                        throw new InvalidOperationException($"Missing SSA phi input for {Slot} in B{BlockId} from B{pred}.");
+                }
+
+                if (!block.IsHandlerEntry && !expectedPreds.SetEquals(actualPreds))
+                    throw new InvalidOperationException($"Malformed SSA phi inputs for {Slot} in B{BlockId}: predecessor set mismatch.");
 
                 return new SsaPhi(BlockId, Slot, Target, inputs.ToImmutable());
             }
@@ -4977,7 +5649,7 @@ namespace Cnidaria.Cs
 
         private sealed class MutableMemoryPhi
         {
-            private readonly Dictionary<int, SsaMemoryValueName> _inputs = new();
+            private readonly List<SsaMemoryPhiInput> _inputs = new();
 
             public int BlockId { get; }
             public SsaMemoryKind Kind { get; }
@@ -4989,32 +5661,65 @@ namespace Cnidaria.Cs
                 Kind = kind;
             }
 
-            public void SetInput(int predecessorBlockId, SsaMemoryValueName value)
+            public void AddInput(int predecessorBlockId, SsaMemoryValueName value, bool allowMultipleForPred)
             {
                 if (value.Kind != Kind)
                     throw new InvalidOperationException($"Memory phi input kind mismatch for {Kind}: {value}.");
-                _inputs[predecessorBlockId] = value;
+
+                for (int i = 0; i < _inputs.Count; i++)
+                {
+                    var input = _inputs[i];
+                    if (input.PredecessorBlockId != predecessorBlockId)
+                        continue;
+
+                    if (input.Value.Equals(value))
+                        return;
+
+                    if (!allowMultipleForPred)
+                        throw new InvalidOperationException($"Conflicting memory SSA phi inputs for {Kind} in B{BlockId} from B{predecessorBlockId}: {input.Value} and {value}.");
+                }
+
+                _inputs.Add(new SsaMemoryPhiInput(predecessorBlockId, value));
             }
 
             public SsaMemoryPhi Freeze(CfgBlock block)
             {
-                var inputs = ImmutableArray.CreateBuilder<SsaMemoryPhiInput>(block.Predecessors.Length);
-                var seen = new HashSet<int>();
-
-                for (int i = 0; i < block.Predecessors.Length; i++)
+                var expectedPreds = UniquePredecessors(block);
+                var actualPreds = new HashSet<int>();
+                var sortedInputs = new List<SsaMemoryPhiInput>(_inputs);
+                sortedInputs.Sort(static (a, b) =>
                 {
-                    int pred = block.Predecessors[i].FromBlockId;
-                    if (!seen.Add(pred))
-                        continue;
+                    int c = a.PredecessorBlockId.CompareTo(b.PredecessorBlockId);
+                    return c != 0 ? c : a.Value.CompareTo(b.Value);
+                });
 
-                    if (!_inputs.TryGetValue(pred, out var value))
-                        throw new InvalidOperationException($"Missing memory SSA phi input for {Kind} in B{BlockId} from B{pred}.");
-
-                    inputs.Add(new SsaMemoryPhiInput(pred, value));
+                var inputs = ImmutableArray.CreateBuilder<SsaMemoryPhiInput>(sortedInputs.Count);
+                for (int i = 0; i < sortedInputs.Count; i++)
+                {
+                    var input = sortedInputs[i];
+                    actualPreds.Add(input.PredecessorBlockId);
+                    inputs.Add(input);
                 }
+
+                foreach (int pred in expectedPreds)
+                {
+                    if (!actualPreds.Contains(pred))
+                        throw new InvalidOperationException($"Missing memory SSA phi input for {Kind} in B{BlockId} from B{pred}.");
+                }
+
+                if (!block.IsHandlerEntry && !expectedPreds.SetEquals(actualPreds))
+                    throw new InvalidOperationException($"Malformed memory SSA phi inputs for {Kind} in B{BlockId}: predecessor set mismatch.");
 
                 return new SsaMemoryPhi(BlockId, Kind, Target, inputs.ToImmutable());
             }
+        }
+
+        private static HashSet<int> UniquePredecessors(CfgBlock block)
+        {
+            var result = new HashSet<int>();
+            for (int i = 0; i < block.Predecessors.Length; i++)
+                result.Add(block.Predecessors[i].FromBlockId);
+            return result;
         }
 
         private static bool TryGetLoadSlot(GenTree node, out SsaSlot slot)
@@ -5149,25 +5854,21 @@ namespace Cnidaria.Cs
         {
             Unknown,
             Constant,
-            Alias,
         }
 
         private readonly struct ValueFact : IEquatable<ValueFact>
         {
             public readonly ValueFactKind Kind;
             public readonly ConstValue Constant;
-            public readonly SsaValueName Alias;
 
-            private ValueFact(ValueFactKind kind, ConstValue constant, SsaValueName alias)
+            private ValueFact(ValueFactKind kind, ConstValue constant)
             {
                 Kind = kind;
                 Constant = constant;
-                Alias = alias;
             }
 
             public static ValueFact Unknown => default;
-            public static ValueFact ForConstant(ConstValue constant) => new ValueFact(ValueFactKind.Constant, constant, default);
-            public static ValueFact ForAlias(SsaValueName alias) => new ValueFact(ValueFactKind.Alias, default, alias);
+            public static ValueFact ForConstant(ConstValue constant) => new ValueFact(ValueFactKind.Constant, constant);
 
             public bool Equals(ValueFact other)
             {
@@ -5177,7 +5878,6 @@ namespace Cnidaria.Cs
                 return Kind switch
                 {
                     ValueFactKind.Constant => Constant.Equals(other.Constant),
-                    ValueFactKind.Alias => Alias.Equals(other.Alias),
                     _ => true,
                 };
             }
@@ -5186,7 +5886,6 @@ namespace Cnidaria.Cs
             public override int GetHashCode() => Kind switch
             {
                 ValueFactKind.Constant => ((int)Kind * 397) ^ Constant.GetHashCode(),
-                ValueFactKind.Alias => ((int)Kind * 397) ^ Alias.GetHashCode(),
                 _ => 0,
             };
         }
@@ -5228,7 +5927,8 @@ namespace Cnidaria.Cs
                     current = EnsureValueNumbers(current);
 
                     var facts = ComputeFacts(current);
-                    var rewrite = Rewrite(current, facts);
+                    var pointLiveness = SsaLocalLiveness.Build(current);
+                    var rewrite = Rewrite(current, facts, pointLiveness);
                     var afterRewrite = WithBlocks(current, rewrite.Blocks);
 
                     OptimizationResult dce = _options.RemoveDeadDefinitions
@@ -5247,7 +5947,8 @@ namespace Cnidaria.Cs
                     current = EnsureValueNumbers(next);
                 }
 
-                var definitions = BuildValueDefinitions(current.Slots, current.InitialValues, current.Blocks);
+                var useDefLinks = ExtractUseDefLinks(current.ValueDefinitions);
+                var definitions = BuildValueDefinitions(current.Slots, current.InitialValues, current.Blocks, useDefLinks);
                 var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(current.InitialMemoryValues, current.Blocks);
                 GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, current.Blocks);
                 var localDescriptors = BuildSsaLocalDescriptors(current.Slots, definitions, current.SsaLocalDescriptors);
@@ -5264,6 +5965,8 @@ namespace Cnidaria.Cs
                     memoryDefinitions: memoryDefinitions);
                 return SsaValueNumbering.BuildMethod(finalWithoutVn);
             }
+
+
 
             private Dictionary<SsaValueName, ValueFact> ComputeFacts(SsaMethod method)
             {
@@ -5289,67 +5992,8 @@ namespace Cnidaria.Cs
                 return facts;
             }
 
-            private void CollectVnFactsForTree(
-                SsaMethod method,
-                SsaTree tree,
-                Dictionary<SsaValueName, ValueFact> facts,
-                Dictionary<ValueNumber, SsaValueName> available)
-            {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectVnFactsForTree(method, tree.Operands[i], facts, available);
-
-                if (!tree.StoreTarget.HasValue)
-                    return;
-
-                var target = tree.StoreTarget.Value;
-                ValueFact value = ValueFact.Unknown;
-
-                if (tree.Operands.Length == 1)
-                    value = EvaluateTree(method, tree.Operands[0], facts);
-
-                if (_options.PropagateConstants && TryGetSsaConstant(method, target, out var constant))
-                    value = ValueFact.ForConstant(constant);
-
-                if (value.Kind == ValueFactKind.Alias && value.Alias.Equals(target))
-                    value = ValueFact.Unknown;
-
-                if (value.Kind == ValueFactKind.Alias)
-                    value = ValueFact.Unknown;
-
-                if (value.Kind != ValueFactKind.Unknown)
-                    SetFact(facts, target, value);
-
-                PublishDefinition(method, target, facts, available);
-            }
-
-            private void PublishDefinition(
-                SsaMethod method,
-                SsaValueName target,
-                Dictionary<SsaValueName, ValueFact> facts,
-                Dictionary<ValueNumber, SsaValueName> available)
-            {
-                if (!TryGetSsaValueNumber(method, target, out var vn) || !vn.IsValid)
-                    return;
-
-                if (_options.PropagateConstants && TryGetConstantFromValueNumber(method, vn, out var constant))
-                {
-                    SetFact(facts, target, ValueFact.ForConstant(constant));
-                    return;
-                }
-
-
-                if (CanPublishAsValueNumber(target) && !available.ContainsKey(vn))
-                    available.Add(vn, target);
-            }
             private bool SetFact(Dictionary<SsaValueName, ValueFact> facts, SsaValueName name, ValueFact fact)
             {
-                if (fact.Kind == ValueFactKind.Alias)
-                {
-                    fact = NormalizeValue(fact.Alias, facts);
-                    if (fact.Kind == ValueFactKind.Alias && fact.Alias.Equals(name))
-                        fact = ValueFact.Unknown;
-                }
-
                 if (!facts.TryGetValue(name, out var current))
                 {
                     facts.Add(name, fact);
@@ -5404,21 +6048,9 @@ namespace Cnidaria.Cs
 
             private ValueFact NormalizeValue(SsaValueName name, Dictionary<SsaValueName, ValueFact> facts)
             {
-                var seen = new HashSet<SsaValueName>();
-                var current = name;
-
-                while (seen.Add(current) && facts.TryGetValue(current, out var fact))
-                {
-                    if (fact.Kind == ValueFactKind.Constant)
-                        return fact;
-
-                    if (fact.Kind != ValueFactKind.Alias)
-                        break;
-
-                    current = fact.Alias;
-                }
-
-                return ValueFact.Unknown;
+                return facts.TryGetValue(name, out var fact) && fact.Kind == ValueFactKind.Constant
+                    ? fact
+                    : ValueFact.Unknown;
             }
 
             private static SsaMethod EnsureValueNumbers(SsaMethod method)
@@ -5442,20 +6074,22 @@ namespace Cnidaria.Cs
                 if (tree.Source is null || method.ValueNumbers is null)
                     return false;
 
+                if (tree.Source.CanThrow)
+                    return false;
+
                 if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
                     return false;
 
-                return TryGetConstantFromValueNumber(method, pair.Liberal, out constant);
+                return TryGetConstantFromValueNumber(method, pair.Conservative, out constant);
             }
 
             private static bool TryGetSsaValueNumber(SsaMethod method, SsaValueName name, out ValueNumber vn)
             {
                 vn = ValueNumberStore.NoVN;
-                if (method.ValueNumbers is null)
+                if (!method.TryGetSsaDescriptor(name, out var descriptor))
                     return false;
-                if (!method.ValueNumbers.TryGetSsaValue(name, out var pair))
-                    return false;
-                vn = pair.Liberal;
+
+                vn = descriptor.ValueNumbers.Conservative;
                 return vn.IsValid;
             }
 
@@ -5472,7 +6106,7 @@ namespace Cnidaria.Cs
                 if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
                     return false;
 
-                vn = pair.Liberal;
+                vn = pair.Conservative;
                 return vn.IsValid;
             }
 
@@ -5509,23 +6143,13 @@ namespace Cnidaria.Cs
                        leftVn == rightVn;
             }
 
-            private bool CanPublishAsValueNumber(SsaValueName target)
-            {
-                if (!_slotInfos.TryGetValue(target.Slot, out var info))
-                    return false;
-
-                if (info.AddressExposed)
-                    return false;
-
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
-                return abi.PassingKind is AbiValuePassingKind.ScalarRegister or AbiValuePassingKind.MultiRegister;
-            }
-
             private static bool IsGcOrManagedPointerKind(GenStackKind stackKind)
                 => stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
 
             private static bool CanReplaceWithConstant(GenTree template, ConstValue constant)
             {
+                if (template.CanThrow)
+                    return false;
                 if (constant.Kind == ConstKind.Null)
                 {
                     return template.Kind == GenTreeKind.ConstNull;
@@ -5534,20 +6158,7 @@ namespace Cnidaria.Cs
                 return IsIntegerLike(template.StackKind);
             }
 
-            private static bool SameRuntimeType(RuntimeType? left, RuntimeType? right)
-            {
-                if (ReferenceEquals(left, right))
-                    return true;
-                if (left is null || right is null)
-                    return false;
-                return left.Namespace == right.Namespace &&
-                       left.Name == right.Name &&
-                       left.Kind == right.Kind &&
-                       left.SizeOf == right.SizeOf &&
-                       left.IsReferenceType == right.IsReferenceType;
-            }
-
-            private OptimizationResult Rewrite(SsaMethod method, Dictionary<SsaValueName, ValueFact> facts)
+            private OptimizationResult Rewrite(SsaMethod method, Dictionary<SsaValueName, ValueFact> facts, SsaLocalLiveness pointLiveness)
             {
                 bool changed = false;
                 var blocks = ImmutableArray.CreateBuilder<SsaBlock>(method.Blocks.Length);
@@ -5588,7 +6199,7 @@ namespace Cnidaria.Cs
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
                     for (int s = 0; s < block.Statements.Length; s++)
                     {
-                        var rewritten = RewriteTree(method, block.Statements[s], facts, ref changed);
+                        var rewritten = RewriteTree(method, block.Statements[s], facts, pointLiveness, block.Id, s, ref changed);
                         statements.Add(rewritten);
                     }
 
@@ -5604,33 +6215,10 @@ namespace Cnidaria.Cs
                     return false;
 
                 var fact = NormalizeValue(phi.Target, facts);
-                if (fact.Kind == ValueFactKind.Constant && _options.PropagateConstants)
-                    return true;
-
-                if (fact.Kind == ValueFactKind.Alias &&
-                    !fact.Alias.Equals(phi.Target) &&
-                    fact.Alias.Slot.Equals(phi.Slot))
-                {
-                    return true;
-                }
-
-                SsaValueName? single = null;
-                for (int i = 0; i < phi.Inputs.Length; i++)
-                {
-                    var input = NormalizeValue(phi.Inputs[i].Value, facts);
-                    if (input.Kind != ValueFactKind.Alias || !input.Alias.Slot.Equals(phi.Slot))
-                        return false;
-
-                    if (!single.HasValue)
-                        single = input.Alias;
-                    else if (!single.Value.Equals(input.Alias))
-                        return false;
-                }
-
-                return single.HasValue && !single.Value.Equals(phi.Target);
+                return fact.Kind == ValueFactKind.Constant;
             }
 
-            private SsaTree RewriteTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, ref bool changed)
+            private SsaTree RewriteTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, SsaLocalLiveness pointLiveness, int blockId, int statementIndex, ref bool changed)
             {
                 if (tree.Value.HasValue)
                 {
@@ -5648,7 +6236,7 @@ namespace Cnidaria.Cs
                 bool operandChanged = false;
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
-                    var rewritten = RewriteTree(method, tree.Operands[i], facts, ref changed);
+                    var rewritten = RewriteTree(method, tree.Operands[i], facts, pointLiveness, blockId, statementIndex, ref changed);
                     if (!ReferenceEquals(rewritten, tree.Operands[i]))
                         operandChanged = true;
                     operands.Add(rewritten);
@@ -5661,8 +6249,11 @@ namespace Cnidaria.Cs
 
                 if (_options.SimplifyAlgebraicIdentities && TrySimplifyTree(method, candidate, facts, out var simplified))
                 {
-                    changed = true;
-                    return simplified;
+                    if (CanUseReplacementTreeAt(method, pointLiveness, candidate, simplified, blockId, statementIndex))
+                    {
+                        changed = true;
+                        return simplified;
+                    }
                 }
 
                 if (_options.FoldConstants && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source))
@@ -5681,6 +6272,44 @@ namespace Cnidaria.Cs
                     changed = true;
 
                 return candidate;
+            }
+
+
+            private bool CanUseReplacementTreeAt(
+                SsaMethod method,
+                SsaLocalLiveness pointLiveness,
+                SsaTree useSite,
+                SsaTree replacement,
+                int blockId,
+                int statementIndex)
+            {
+                if (ReferenceEquals(useSite, replacement))
+                    return true;
+
+                var requiredSlots = new HashSet<SsaSlot>();
+                CollectReplacementLocalUses(replacement, requiredSlots);
+                if (requiredSlots.Count == 0)
+                    return true;
+
+                foreach (var slot in requiredSlots)
+                {
+                    if (!pointLiveness.IsLiveBeforeTree(blockId, statementIndex, useSite.Source.Id, slot))
+                        return false;
+                }
+
+                return true;
+            }
+
+            private static void CollectReplacementLocalUses(SsaTree tree, HashSet<SsaSlot> slots)
+            {
+                if (tree.Value.HasValue)
+                    slots.Add(tree.Value.Value.Slot);
+
+                if (tree.LocalFieldBaseValue.HasValue)
+                    slots.Add(tree.LocalFieldBaseValue.Value.Slot);
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    CollectReplacementLocalUses(tree.Operands[i], slots);
             }
 
             private OptimizationResult EliminateDeadDefinitions(SsaMethod method)
@@ -5762,6 +6391,14 @@ namespace Cnidaria.Cs
                         CollectStoreDefinitions(block.Statements[s], storeDefs);
                 }
 
+                var useDefByDef = new Dictionary<SsaValueName, SsaValueName>();
+                for (int i = 0; i < method.ValueDefinitions.Length; i++)
+                {
+                    var descriptor = method.ValueDefinitions[i].Descriptor;
+                    if (descriptor.HasUseDefSsaNum)
+                        useDefByDef[descriptor.Name] = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                }
+
                 var live = new HashSet<SsaValueName>();
                 var work = new Queue<SsaValueName>();
 
@@ -5788,6 +6425,8 @@ namespace Cnidaria.Cs
                     var value = work.Dequeue();
                     if (storeDefs.TryGetValue(value, out var store))
                     {
+                        if (useDefByDef.TryGetValue(value, out var useDef))
+                            MarkValue(useDef, live, work);
                         MarkUses(store, live, work, includeStoreTarget: false);
                         continue;
                     }
@@ -6093,33 +6732,6 @@ namespace Cnidaria.Cs
                 return new SsaTree(source, operands);
             }
 
-            private GenTree CreateLoadTree(GenTree template, SsaValueName value)
-            {
-                var info = _slotInfos.TryGetValue(value.Slot, out var slotInfo)
-                    ? slotInfo
-                    : new SsaSlotInfo(value.Slot, template.Type, template.StackKind, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
-
-                return new GenTree(
-                    _nextSyntheticTreeId++,
-                    LoadKindFor(value.Slot.Kind),
-                    template.Pc,
-                    BytecodeOp.Nop,
-                    info.Type,
-                    info.StackKind,
-                    GenTreeFlags.LocalUse,
-                    ImmutableArray<GenTree>.Empty,
-                    int32: value.Slot.Index);
-            }
-
-            private static GenTreeKind LoadKindFor(SsaSlotKind kind)
-                => kind switch
-                {
-                    SsaSlotKind.Arg => GenTreeKind.Arg,
-                    SsaSlotKind.Local => GenTreeKind.Local,
-                    SsaSlotKind.Temp => GenTreeKind.Temp,
-                    _ => GenTreeKind.Nop,
-                };
-
             private bool SameValue(SsaMethod method, SsaTree left, SsaTree right, Dictionary<SsaValueName, ValueFact> facts)
             {
                 if (SameValueNumber(method, left, right))
@@ -6130,9 +6742,6 @@ namespace Cnidaria.Cs
 
                 if (leftFact.Kind == ValueFactKind.Constant && rightFact.Kind == ValueFactKind.Constant)
                     return leftFact.Constant.Equals(rightFact.Constant);
-
-                if (leftFact.Kind == ValueFactKind.Alias && rightFact.Kind == ValueFactKind.Alias)
-                    return leftFact.Alias.Equals(rightFact.Alias);
 
                 if (left.Value.HasValue && right.Value.HasValue)
                     return left.Value.Value.Equals(right.Value.Value);
@@ -6261,10 +6870,10 @@ namespace Cnidaria.Cs
                 => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
 
             private static bool IsPotentiallyThrowingBinaryOp(BytecodeOp op)
-                => op is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un;
-
-            private static bool IsCommutativeBinaryOp(BytecodeOp op)
-                => op is BytecodeOp.Add or BytecodeOp.Mul or BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or BytecodeOp.Ceq;
+                => op is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un
+                    or BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
+                    or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
+                    or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
 
             private static bool TryFoldUnary(GenTree source, ConstValue operand, out ConstValue result)
             {
@@ -6325,6 +6934,66 @@ namespace Cnidaria.Cs
                 result = default;
                 switch (op)
                 {
+                    case BytecodeOp.Add_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI4(checked(left + right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Sub_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI4(checked(left - right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Mul_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI4(checked(left * right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Add_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI4(unchecked((int)checked((uint)left + (uint)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Sub_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI4(unchecked((int)checked((uint)left - (uint)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Mul_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI4(unchecked((int)checked((uint)left * (uint)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
                     case BytecodeOp.Add:
                         result = ConstValue.ForI4(unchecked(left + right));
                         return true;
@@ -6387,12 +7056,71 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
-
             private static bool TryFoldBinaryI8(BytecodeOp op, long left, long right, out ConstValue result)
             {
                 result = default;
                 switch (op)
                 {
+                    case BytecodeOp.Add_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI8(checked(left + right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Sub_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI8(checked(left - right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Mul_Ovf:
+                        try
+                        {
+                            result = ConstValue.ForI8(checked(left * right));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Add_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left + (ulong)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Sub_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left - (ulong)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+                    case BytecodeOp.Mul_Ovf_Un:
+                        try
+                        {
+                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left * (ulong)right)));
+                            return true;
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
                     case BytecodeOp.Add:
                         result = ConstValue.ForI8(unchecked(left + right));
                         return true;
@@ -6562,8 +7290,8 @@ namespace Cnidaria.Cs
 
             private static SsaMethod WithBlocks(SsaMethod method, ImmutableArray<SsaBlock> blocks)
             {
-                var compacted = CompactSsaNumbers(method.InitialValues, blocks);
-                var definitions = BuildValueDefinitions(method.Slots, compacted.InitialValues, compacted.Blocks);
+                var compacted = CompactSsaNumbers(method.InitialValues, method.ValueDefinitions, blocks);
+                var definitions = BuildValueDefinitions(method.Slots, compacted.InitialValues, compacted.Blocks, compacted.UseDefLinks);
                 var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(method.InitialMemoryValues, compacted.Blocks);
                 GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, compacted.Blocks);
                 var localDescriptors = BuildSsaLocalDescriptors(method.Slots, definitions, method.SsaLocalDescriptors);
@@ -6584,15 +7312,17 @@ namespace Cnidaria.Cs
             {
                 public readonly ImmutableArray<SsaValueName> InitialValues;
                 public readonly ImmutableArray<SsaBlock> Blocks;
+                public readonly ImmutableArray<SsaUseDefLink> UseDefLinks;
 
-                public SsaCompactionResult(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks)
+                public SsaCompactionResult(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks, ImmutableArray<SsaUseDefLink> useDefLinks)
                 {
                     InitialValues = initialValues;
                     Blocks = blocks;
+                    UseDefLinks = useDefLinks.IsDefault ? ImmutableArray<SsaUseDefLink>.Empty : useDefLinks;
                 }
             }
 
-            private static SsaCompactionResult CompactSsaNumbers(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks)
+            private static SsaCompactionResult CompactSsaNumbers(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaValueDefinition> previousDefinitions, ImmutableArray<SsaBlock> blocks)
             {
                 var map = new Dictionary<SsaValueName, SsaValueName>();
                 var nextBySlot = new Dictionary<SsaSlot, int>();
@@ -6647,7 +7377,20 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < compactedInitialValues.Count; i++)
                     initialList.Add(compactedInitialValues[i]);
                 initialList.Sort();
-                return new SsaCompactionResult(initialList.ToImmutableArray(), compactedBlocks.ToImmutable());
+                var compactedUseDefs = ImmutableArray.CreateBuilder<SsaUseDefLink>();
+                for (int i = 0; i < previousDefinitions.Length; i++)
+                {
+                    var descriptor = previousDefinitions[i].Descriptor;
+                    if (!descriptor.HasUseDefSsaNum)
+                        continue;
+
+                    var oldDef = descriptor.Name;
+                    var oldUse = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                    if (map.TryGetValue(oldDef, out var compactedDef) && map.TryGetValue(oldUse, out var compactedUse))
+                        compactedUseDefs.Add(new SsaUseDefLink(compactedDef, compactedUse));
+                }
+
+                return new SsaCompactionResult(initialList.ToImmutableArray(), compactedBlocks.ToImmutable(), compactedUseDefs.ToImmutable());
 
                 void AssignDefinitions(SsaTree tree)
                 {
@@ -6704,10 +7447,28 @@ namespace Cnidaria.Cs
                 }
             }
 
+            private static ImmutableArray<SsaUseDefLink> ExtractUseDefLinks(ImmutableArray<SsaValueDefinition> definitions)
+            {
+                var result = ImmutableArray.CreateBuilder<SsaUseDefLink>();
+                for (int i = 0; i < definitions.Length; i++)
+                {
+                    var descriptor = definitions[i].Descriptor;
+                    if (!descriptor.HasUseDefSsaNum)
+                        continue;
+
+                    var definition = descriptor.Name;
+                    var use = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                    result.Add(new SsaUseDefLink(definition, use));
+                }
+
+                return result.ToImmutable();
+            }
+
             private static ImmutableArray<SsaValueDefinition> BuildValueDefinitions(
                 ImmutableArray<SsaSlotInfo> slots,
                 ImmutableArray<SsaValueName> initialValues,
-                ImmutableArray<SsaBlock> blocks)
+                ImmutableArray<SsaBlock> blocks,
+                ImmutableArray<SsaUseDefLink> useDefLinks)
             {
                 var infoBySlot = new Dictionary<SsaSlot, SsaSlotInfo>();
                 for (int i = 0; i < slots.Length; i++)
@@ -6772,6 +7533,16 @@ namespace Cnidaria.Cs
 
                     var name = tree.StoreTarget.Value;
                     var info = GetSlotInfo(infoBySlot, name.Slot);
+                    int useDefSsaNum = SsaConfig.ReservedSsaNumber;
+                    for (int i = 0; i < useDefLinks.Length; i++)
+                    {
+                        if (useDefLinks[i].Definition.Equals(name))
+                        {
+                            useDefSsaNum = useDefLinks[i].Use.Version;
+                            break;
+                        }
+                    }
+
                     Add(new SsaValueDefinition(new SsaDescriptor(
                         name.Slot,
                         name.Version,
@@ -6782,7 +7553,7 @@ namespace Cnidaria.Cs
                         tree.Source,
                         info.Type,
                         info.StackKind,
-                        tree.LocalFieldBaseValue.HasValue ? tree.LocalFieldBaseValue.Value.Version : SsaConfig.ReservedSsaNumber,
+                        useDefSsaNum,
                         block.CfgBlock)));
                 }
 
@@ -6908,18 +7679,23 @@ namespace Cnidaria.Cs
 
             var definitions = BuildDefinitionMap(method);
             var memoryDefinitions = BuildMemoryDefinitionMap(method);
+            var definitionsBySlot = BuildDefinitionsBySlot(definitions);
+            var localLiveness = SsaLocalLiveness.Build(method);
             VerifyDescriptorTables(method, definitions);
             VerifyLclVarDscState(method);
+            VerifyPrunedSsaLiveness(method, localLiveness);
+            VerifyValueNumberBindings(method, definitions, memoryDefinitions);
+            VerifyDescriptorUseCounts(method, definitions, memoryDefinitions);
 
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 var block = method.Blocks[b];
-                VerifyPhis(method, definitions, block);
+                VerifyPhis(method, definitions, definitionsBySlot, localLiveness, block);
                 VerifyMemoryBlockStates(method, memoryDefinitions, block);
                 VerifyMemoryPhis(method, memoryDefinitions, block);
 
                 for (int s = 0; s < block.Statements.Length; s++)
-                    VerifyStatement(method, definitions, memoryDefinitions, block.Id, s, block.Statements[s]);
+                    VerifyStatement(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, block.Id, s, block.Statements[s]);
             }
         }
 
@@ -6964,6 +7740,27 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException($"Initial SSA value {method.InitialValues[i]} is missing from definition table.");
             }
 
+            return result;
+        }
+
+
+        private static Dictionary<SsaSlot, List<SsaValueDefinition>> BuildDefinitionsBySlot(Dictionary<SsaValueName, SsaValueDefinition> definitions)
+        {
+            var result = new Dictionary<SsaSlot, List<SsaValueDefinition>>();
+            foreach (var item in definitions)
+            {
+                if (!result.TryGetValue(item.Key.Slot, out var list))
+                {
+                    list = new List<SsaValueDefinition>();
+                    result.Add(item.Key.Slot, list);
+                }
+                list.Add(item.Value);
+            }
+
+            foreach (var item in result)
+            {
+                item.Value.Sort(static (a, b) => a.Name.CompareTo(b.Name));
+            }
             return result;
         }
 
@@ -7034,11 +7831,11 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " is missing from definition table.");
                     if (!ReferenceEquals(definition.Descriptor, descriptor))
                         throw new InvalidOperationException("Definition table and descriptor table disagree for " + descriptor.Name + ".");
-                    if (descriptor.IsPartialDefinition)
+                    if (descriptor.HasUseDefSsaNum)
                     {
-                        var previous = new SsaValueName(descriptor.BaseLocal, descriptor.PreviousSsaNumber);
-                        if (!definitions.ContainsKey(previous))
-                            throw new InvalidOperationException("Partial SSA definition " + descriptor.Name + " references missing previous definition " + previous + ".");
+                        var use = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                        if (!definitions.ContainsKey(use))
+                            throw new InvalidOperationException("SSA use-def link " + descriptor.Name + " references missing use definition " + use + ".");
                     }
                 }
             }
@@ -7105,7 +7902,273 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void VerifyPhis(SsaMethod method, Dictionary<SsaValueName, SsaValueDefinition> definitions, SsaBlock block)
+
+        private static bool IsPhiResultLiveAfterDefinition(SsaBlock block, SsaLocalLiveness liveness, SsaSlot slot)
+        {
+            if (block.Statements.Length == 0)
+                return liveness.IsLiveOut(block.Id, slot);
+
+            return liveness.IsLiveBeforeStatement(block.Id, 0, slot);
+        }
+
+        private static void VerifyPrunedSsaLiveness(SsaMethod method, SsaLocalLiveness liveness)
+        {
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var block = method.Blocks[b];
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    var phi = block.Phis[p];
+                    if (!IsPhiResultLiveAfterDefinition(block, liveness, phi.Slot))
+                        throw new InvalidOperationException("Pruned SSA contains dead phi " + phi.Target + " in B" + block.Id.ToString() + "; phi result is not live after the phi definition.");
+                }
+
+                var successors = block.CfgBlock.Successors;
+                for (int s = 0; s < successors.Length; s++)
+                {
+                    int succ = successors[s].ToBlockId;
+                    if ((uint)succ >= (uint)method.Blocks.Length)
+                        continue;
+
+                    var succBlock = method.Blocks[succ];
+                    for (int p = 0; p < succBlock.Phis.Length; p++)
+                    {
+                        var phi = succBlock.Phis[p];
+                        bool hasInput = false;
+                        for (int i = 0; i < phi.Inputs.Length; i++)
+                        {
+                            if (phi.Inputs[i].PredecessorBlockId == block.Id)
+                            {
+                                hasInput = true;
+                                break;
+                            }
+                        }
+
+                        if (hasInput && IsPhiResultLiveAfterDefinition(succBlock, liveness, phi.Slot) && !liveness.IsLiveOut(block.Id, phi.Slot))
+                            throw new InvalidOperationException("SSA phi input for " + phi.Target + " from B" + block.Id.ToString() + " uses a slot that is not live-out of the predecessor.");
+                    }
+                }
+            }
+        }
+
+        private static void VerifyValueNumberBindings(
+            SsaMethod method,
+            Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions)
+        {
+            if (method.ValueNumbers is null)
+                return;
+
+            for (int i = 0; i < method.ValueDefinitions.Length; i++)
+            {
+                var definition = method.ValueDefinitions[i];
+                var descriptor = definition.Descriptor;
+                if (!descriptor.ValueNumbers.Liberal.IsValid || !descriptor.ValueNumbers.Conservative.IsValid)
+                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " has no value-number pair.");
+
+                if (!method.ValueNumbers.TryGetSsaValue(definition.Name, out var resultPair))
+                    throw new InvalidOperationException("SSA VN result table is missing " + definition.Name + ".");
+
+                if (!resultPair.Equals(descriptor.ValueNumbers))
+                    throw new InvalidOperationException("SSA descriptor VN and VN result table disagree for " + definition.Name + ".");
+            }
+
+            foreach (var item in method.ValueNumbers.SsaValues)
+            {
+                if (!definitions.TryGetValue(item.Key, out var definition))
+                    throw new InvalidOperationException("SSA VN result table contains undefined value " + item.Key + ".");
+
+                if (!definition.Descriptor.ValueNumbers.Equals(item.Value))
+                    throw new InvalidOperationException("SSA VN result table bypasses descriptor value numbers for " + item.Key + ".");
+            }
+
+            for (int i = 0; i < method.MemoryDefinitions.Length; i++)
+            {
+                var definition = method.MemoryDefinitions[i];
+                if (!definition.Descriptor.ValueNumber.IsValid)
+                    throw new InvalidOperationException("Memory SSA descriptor " + definition.Name + " has no value number.");
+
+                if (!method.ValueNumbers.TryGetMemoryValue(definition.Name, out var resultVn))
+                    throw new InvalidOperationException("Memory SSA VN result table is missing " + definition.Name + ".");
+
+                if (resultVn != definition.Descriptor.ValueNumber)
+                    throw new InvalidOperationException("Memory SSA descriptor VN and VN result table disagree for " + definition.Name + ".");
+            }
+
+            foreach (var item in method.ValueNumbers.MemoryValues)
+            {
+                if (!memoryDefinitions.TryGetValue(item.Key, out var definition))
+                    throw new InvalidOperationException("Memory SSA VN result table contains undefined value " + item.Key + ".");
+
+                if (definition.Descriptor.ValueNumber != item.Value)
+                    throw new InvalidOperationException("Memory SSA VN result table bypasses descriptor value number for " + item.Key + ".");
+            }
+        }
+
+        private sealed class DescriptorUseStats
+        {
+            public int Count;
+            public bool HasPhiUse;
+            public bool HasGlobalUse;
+
+            public void Add(int defBlockId, int useBlockId, bool isPhi)
+            {
+                if (Count < ushort.MaxValue)
+                    Count++;
+                if (isPhi)
+                    HasPhiUse = true;
+                if (defBlockId >= 0 && useBlockId >= 0 && defBlockId != useBlockId)
+                    HasGlobalUse = true;
+            }
+        }
+
+        private static void VerifyDescriptorUseCounts(
+            SsaMethod method,
+            Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions)
+        {
+            var localUses = new Dictionary<SsaValueName, DescriptorUseStats>();
+            var memoryUses = new Dictionary<SsaMemoryValueName, DescriptorUseStats>();
+
+            for (int i = 0; i < method.ValueDefinitions.Length; i++)
+            {
+                var descriptor = method.ValueDefinitions[i].Descriptor;
+                if (!descriptor.HasUseDefSsaNum)
+                    continue;
+
+                var previous = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
+                if (!definitions.TryGetValue(previous, out var previousDefinition))
+                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " has missing previous definition " + previous + ".");
+
+                AddLocalUse(localUses, previousDefinition.Descriptor, descriptor.DefBlockId, isPhi: false);
+            }
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var block = method.Blocks[b];
+
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    var phi = block.Phis[p];
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        var input = phi.Inputs[i].Value;
+                        if (!definitions.TryGetValue(input, out var inputDefinition))
+                            throw new InvalidOperationException("Phi " + phi.Target + " uses missing SSA value " + input + ".");
+
+                        AddLocalUse(localUses, inputDefinition.Descriptor, block.Id, isPhi: true);
+                    }
+                }
+
+                for (int p = 0; p < block.MemoryPhis.Length; p++)
+                {
+                    var phi = block.MemoryPhis[p];
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        var input = phi.Inputs[i].Value;
+                        if (!memoryDefinitions.TryGetValue(input, out var inputDefinition))
+                            throw new InvalidOperationException("Memory phi " + phi.Target + " uses missing memory SSA value " + input + ".");
+
+                        AddMemoryUse(memoryUses, inputDefinition.Descriptor, block.Id, isPhi: true);
+                    }
+                }
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                    AccumulateTreeUseStats(block.Statements[s], block.Id, definitions, memoryDefinitions, localUses, memoryUses);
+            }
+
+            for (int i = 0; i < method.ValueDefinitions.Length; i++)
+            {
+                var descriptor = method.ValueDefinitions[i].Descriptor;
+                localUses.TryGetValue(descriptor.Name, out var stats);
+                int expectedUseCount = stats?.Count ?? 0;
+                bool expectedPhiUse = stats?.HasPhiUse ?? false;
+                bool expectedGlobalUse = stats?.HasGlobalUse ?? false;
+
+                if (descriptor.UseCount != expectedUseCount)
+                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " use-count mismatch: descriptor=" + descriptor.UseCount.ToString() + ", recomputed=" + expectedUseCount.ToString() + ".");
+                if (descriptor.HasPhiUse != expectedPhiUse)
+                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " phi-use flag mismatch.");
+                if (descriptor.HasGlobalUse != expectedGlobalUse)
+                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " global-use flag mismatch.");
+            }
+
+            for (int i = 0; i < method.MemoryDefinitions.Length; i++)
+            {
+                var descriptor = method.MemoryDefinitions[i].Descriptor;
+                memoryUses.TryGetValue(descriptor.Name, out var stats);
+                int expectedUseCount = stats?.Count ?? 0;
+                bool expectedPhiUse = stats?.HasPhiUse ?? false;
+                bool expectedGlobalUse = stats?.HasGlobalUse ?? false;
+
+                if (descriptor.UseCount != expectedUseCount)
+                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " use-count mismatch: descriptor=" + descriptor.UseCount.ToString() + ", recomputed=" + expectedUseCount.ToString() + ".");
+                if (descriptor.HasPhiUse != expectedPhiUse)
+                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " phi-use flag mismatch.");
+                if (descriptor.HasGlobalUse != expectedGlobalUse)
+                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " global-use flag mismatch.");
+            }
+        }
+
+        private static void AddLocalUse(Dictionary<SsaValueName, DescriptorUseStats> uses, SsaDescriptor descriptor, int useBlockId, bool isPhi)
+        {
+            if (!uses.TryGetValue(descriptor.Name, out var stats))
+            {
+                stats = new DescriptorUseStats();
+                uses.Add(descriptor.Name, stats);
+            }
+
+            stats.Add(descriptor.DefBlockId, useBlockId, isPhi);
+        }
+
+        private static void AddMemoryUse(Dictionary<SsaMemoryValueName, DescriptorUseStats> uses, SsaMemoryDescriptor descriptor, int useBlockId, bool isPhi)
+        {
+            if (!uses.TryGetValue(descriptor.Name, out var stats))
+            {
+                stats = new DescriptorUseStats();
+                uses.Add(descriptor.Name, stats);
+            }
+
+            stats.Add(descriptor.DefBlockId, useBlockId, isPhi);
+        }
+
+        private static void AccumulateTreeUseStats(
+            SsaTree tree,
+            int blockId,
+            Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            Dictionary<SsaValueName, DescriptorUseStats> localUses,
+            Dictionary<SsaMemoryValueName, DescriptorUseStats> memoryUses)
+        {
+            if (tree.Value.HasValue)
+            {
+                var value = tree.Value.Value;
+                if (!definitions.TryGetValue(value, out var definition))
+                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing SSA value " + value + ".");
+                AddLocalUse(localUses, definition.Descriptor, blockId, isPhi: false);
+            }
+
+            if (tree.LocalFieldBaseValue.HasValue)
+            {
+                var value = tree.LocalFieldBaseValue.Value;
+                if (!definitions.TryGetValue(value, out var definition))
+                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing local-field base SSA value " + value + ".");
+                AddLocalUse(localUses, definition.Descriptor, blockId, isPhi: false);
+            }
+
+            for (int i = 0; i < tree.MemoryUses.Length; i++)
+            {
+                var value = tree.MemoryUses[i];
+                if (!memoryDefinitions.TryGetValue(value, out var definition))
+                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing memory SSA value " + value + ".");
+                AddMemoryUse(memoryUses, definition.Descriptor, blockId, isPhi: false);
+            }
+
+            for (int i = 0; i < tree.Operands.Length; i++)
+                AccumulateTreeUseStats(tree.Operands[i], blockId, definitions, memoryDefinitions, localUses, memoryUses);
+        }
+
+        private static void VerifyPhis(SsaMethod method, Dictionary<SsaValueName, SsaValueDefinition> definitions, Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot, SsaLocalLiveness localLiveness, SsaBlock block)
         {
             var expectedPreds = new HashSet<int>();
             for (int p = 0; p < block.CfgBlock.Predecessors.Length; p++)
@@ -7133,66 +8196,93 @@ namespace Cnidaria.Cs
                     if (!input.Value.Slot.Equals(phi.Slot))
                         throw new InvalidOperationException($"Phi {phi.Target} in B{block.Id} has cross-slot input {input.Value} from B{input.PredecessorBlockId}; phi operands must remain on the same tracked local slot.");
                     actualPreds.Add(input.PredecessorBlockId);
-                    VerifyEdgeUse(method, definitions, phi.Target, input.Value, input.PredecessorBlockId);
+                    if (block.CfgBlock.IsHandlerEntry)
+                    {
+                        if (!definitions.ContainsKey(input.Value))
+                            throw new InvalidOperationException($"Handler phi {phi.Target} uses undefined value {input.Value} from B{input.PredecessorBlockId}.");
+                    }
+                    else
+                    {
+                        VerifyEdgeUse(method, definitions, definitionsBySlot, phi.Target, input.Value, input.PredecessorBlockId);
+                    }
                 }
 
-                if (!expectedPreds.SetEquals(actualPreds))
+                if (block.CfgBlock.IsHandlerEntry)
+                {
+                    foreach (int expectedPred in expectedPreds)
+                    {
+                        if (!actualPreds.Contains(expectedPred))
+                            throw new InvalidOperationException($"Malformed handler phi {phi.Target} in B{block.Id}: missing predecessor B{expectedPred}.");
+                    }
+                }
+                else if (!expectedPreds.SetEquals(actualPreds))
+                {
                     throw new InvalidOperationException($"Malformed phi {phi.Target} in B{block.Id}: predecessor set mismatch.");
+                }
             }
         }
 
         private static void VerifyStatement(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaLocalLiveness localLiveness,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
-            VerifyTreeUses(method, definitions, memoryDefinitions, blockId, statementIndex, tree);
-            VerifyTreeDefinitions(method, definitions, memoryDefinitions, blockId, statementIndex, tree);
+            VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree);
+            VerifyTreeDefinitions(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree);
         }
 
         private static void VerifyTreeUses(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaLocalLiveness localLiveness,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
             if (tree.Value.HasValue)
-                VerifyLocalUse(method, definitions, tree.Value.Value, blockId, statementIndex, tree.Source.Id);
+                VerifyLocalUse(method, definitions, definitionsBySlot, localLiveness, tree.Value.Value, blockId, statementIndex, tree.Source.Id);
 
             if (tree.LocalFieldBaseValue.HasValue)
-                VerifyLocalUse(method, definitions, tree.LocalFieldBaseValue.Value, blockId, statementIndex, tree.Source.Id);
+                VerifyLocalUse(method, definitions, definitionsBySlot, localLiveness, tree.LocalFieldBaseValue.Value, blockId, statementIndex, tree.Source.Id);
 
             for (int i = 0; i < tree.MemoryUses.Length; i++)
                 VerifyMemoryUse(method, memoryDefinitions, tree.MemoryUses[i], blockId, statementIndex, tree.Source.Id);
 
             for (int i = 0; i < tree.Operands.Length; i++)
-                VerifyTreeUses(method, definitions, memoryDefinitions, blockId, statementIndex, tree.Operands[i]);
+                VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree.Operands[i]);
         }
 
         private static void VerifyTreeDefinitions(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaLocalLiveness localLiveness,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
             for (int i = 0; i < tree.Operands.Length; i++)
-                VerifyTreeDefinitions(method, definitions, memoryDefinitions, blockId, statementIndex, tree.Operands[i]);
+                VerifyTreeDefinitions(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree.Operands[i]);
 
             if (tree.LocalFieldBaseValue.HasValue)
             {
                 if (tree.LocalField is null)
                     throw new InvalidOperationException($"SSA local-field node {tree.Source.Id} has a base value but no field.");
 
-                if (tree.StoreTarget.HasValue && !tree.StoreTarget.Value.Slot.Equals(tree.LocalFieldBaseValue.Value.Slot))
-                    throw new InvalidOperationException($"Partial definition at node {tree.Source.Id} changes slot {tree.StoreTarget.Value.Slot} from base slot {tree.LocalFieldBaseValue.Value.Slot}.");
+                if (tree.StoreTarget.HasValue)
+                    throw new InvalidOperationException($"Partial definition at node {tree.Source.Id} still carries node-level use-def metadata.");
             }
+
+            if (tree.IsPartialDefinition && tree.LocalField is null)
+                throw new InvalidOperationException($"Partial definition at node {tree.Source.Id} has no field metadata.");
 
             for (int i = 0; i < tree.MemoryDefinitions.Length; i++)
             {
@@ -7206,15 +8296,27 @@ namespace Cnidaria.Cs
             if (!tree.StoreTarget.HasValue)
                 return;
 
-            if (tree.LocalFieldBaseValue.HasValue != tree.IsPartialDefinition)
-                throw new InvalidOperationException($"Store node {tree.Source.Id} has inconsistent partial-definition metadata.");
-
             var name = tree.StoreTarget.Value;
             if (!definitions.TryGetValue(name, out var definition))
                 throw new InvalidOperationException($"Store target {name} at node {tree.Source.Id} is missing from definition table.");
 
             if (definition.IsInitial || definition.IsPhi || definition.DefBlockId != blockId || definition.DefStatementIndex != statementIndex || definition.DefTreeId != tree.Source.Id)
                 throw new InvalidOperationException($"Definition table entry for {name} does not match store node {tree.Source.Id}.");
+
+            if (tree.IsPartialDefinition)
+            {
+                if (!definition.Descriptor.HasUseDefSsaNum)
+                    throw new InvalidOperationException($"Partial definition {name} at node {tree.Source.Id} has no descriptor use-def SSA number.");
+
+                var previous = new SsaValueName(definition.Descriptor.BaseLocal, definition.Descriptor.UseDefSsaNumber);
+                if (previous.Equals(name))
+                    throw new InvalidOperationException($"Partial definition {name} at node {tree.Source.Id} has a self-referential use-def SSA number.");
+                VerifyLocalUse(method, definitions, definitionsBySlot, localLiveness, previous, blockId, statementIndex, tree.Source.Id);
+            }
+            else if (definition.Descriptor.HasUseDefSsaNum)
+            {
+                throw new InvalidOperationException($"Full definition {name} at node {tree.Source.Id} unexpectedly has a descriptor use-def SSA number.");
+            }
         }
 
         private static void VerifyMemoryBlockStates(
@@ -7271,11 +8373,109 @@ namespace Cnidaria.Cs
                     if (input.Value.Kind != phi.Kind)
                         throw new InvalidOperationException("Memory phi " + phi.Target + " in B" + block.Id.ToString() + " has cross-kind input " + input.Value + " from B" + input.PredecessorBlockId.ToString() + ".");
                     actualPreds.Add(input.PredecessorBlockId);
-                    VerifyMemoryEdgeUse(method, memoryDefinitions, phi.Target, input.Value, input.PredecessorBlockId);
+                    if (block.CfgBlock.IsHandlerEntry)
+                    {
+                        if (!memoryDefinitions.ContainsKey(input.Value))
+                            throw new InvalidOperationException("Handler memory phi " + phi.Target + " uses undefined value " + input.Value + " from B" + input.PredecessorBlockId.ToString() + ".");
+                    }
+                    else
+                    {
+                        VerifyMemoryEdgeUse(method, memoryDefinitions, phi.Target, input.Value, input.PredecessorBlockId);
+                    }
                 }
 
-                if (!expectedPreds.SetEquals(actualPreds))
+                if (block.CfgBlock.IsHandlerEntry)
+                {
+                    foreach (int expectedPred in expectedPreds)
+                    {
+                        if (!actualPreds.Contains(expectedPred))
+                            throw new InvalidOperationException("Malformed handler memory phi " + phi.Target + " in B" + block.Id.ToString() + ": missing predecessor B" + expectedPred.ToString() + ".");
+                    }
+                }
+                else if (!expectedPreds.SetEquals(actualPreds))
+                {
                     throw new InvalidOperationException("Malformed memory phi " + phi.Target + " in B" + block.Id.ToString() + ": predecessor set mismatch.");
+                }
+            }
+        }
+
+
+        private static bool DefinitionDominatesUsePoint(SsaMethod method, SsaValueDefinition definition, int useBlockId, int useStatementIndex)
+        {
+            if (definition.IsInitial)
+                return true;
+
+            if (!method.Cfg.Dominates(definition.DefBlockId, useBlockId))
+                return false;
+
+            if (definition.DefBlockId != useBlockId)
+                return true;
+
+            if (definition.IsPhi)
+                return true;
+
+            return definition.DefStatementIndex < useStatementIndex;
+        }
+
+        private static bool DefinitionDominatesBlockEnd(SsaMethod method, SsaValueDefinition definition, int blockId)
+        {
+            if (definition.IsInitial)
+                return true;
+
+            return method.Cfg.Dominates(definition.DefBlockId, blockId);
+        }
+
+        private static bool DefinitionDominatesDefinition(SsaMethod method, SsaValueDefinition left, SsaValueDefinition right)
+        {
+            if (left.Name.Equals(right.Name))
+                return true;
+
+            if (left.IsInitial)
+                return true;
+            if (right.IsInitial)
+                return false;
+
+            if (!method.Cfg.Dominates(left.DefBlockId, right.DefBlockId))
+                return false;
+
+            if (left.DefBlockId != right.DefBlockId)
+                return true;
+
+            if (left.IsPhi)
+                return true;
+            if (right.IsPhi)
+                return false;
+
+            return left.DefStatementIndex < right.DefStatementIndex;
+        }
+
+        private static void VerifyNoInterveningSameSlotDefinition(
+            SsaMethod method,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
+            SsaValueDefinition chosenDefinition,
+            int useBlockId,
+            int useStatementIndex,
+            string useDescription)
+        {
+            if (!definitionsBySlot.TryGetValue(chosenDefinition.Name.Slot, out var sameSlotDefinitions))
+                return;
+
+            for (int i = 0; i < sameSlotDefinitions.Count; i++)
+            {
+                var candidate = sameSlotDefinitions[i];
+                if (candidate.Name.Equals(chosenDefinition.Name))
+                    continue;
+
+                if (!DefinitionDominatesUsePoint(method, candidate, useBlockId, useStatementIndex))
+                    continue;
+
+                if (DefinitionDominatesDefinition(method, chosenDefinition, candidate))
+                {
+                    throw new InvalidOperationException(
+                        "SSA use " + chosenDefinition.Name + " at " + useDescription +
+                        " is not the nearest dominating definition for " + chosenDefinition.Name.Slot +
+                        "; intervening definition is " + candidate.Name + ". This would cross a phi/store and violates conventional SSA.");
+                }
             }
         }
 
@@ -7320,6 +8520,8 @@ namespace Cnidaria.Cs
         private static void VerifyLocalUse(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
+            SsaLocalLiveness localLiveness,
             SsaValueName use,
             int useBlockId,
             int useStatementIndex,
@@ -7328,19 +8530,19 @@ namespace Cnidaria.Cs
             if (!definitions.TryGetValue(use, out var definition))
                 throw new InvalidOperationException($"Use of undefined SSA value {use} at node {useTreeId}.");
 
-            if (definition.IsInitial)
-                return;
+            if (!localLiveness.IsLiveBeforeTree(useBlockId, useStatementIndex, useTreeId, use.Slot))
+                throw new InvalidOperationException("Use of " + use + " at node " + useTreeId.ToString() + " occurs where its base local is not live; this is illegal with pruned SSA.");
 
-            if (!method.Cfg.Dominates(definition.DefBlockId, useBlockId))
+            if (!DefinitionDominatesUsePoint(method, definition, useBlockId, useStatementIndex))
                 throw new InvalidOperationException($"SSA definition {use} in B{definition.DefBlockId} does not dominate use at node {useTreeId} in B{useBlockId}.");
 
-            if (definition.DefBlockId == useBlockId && !definition.IsPhi && definition.DefStatementIndex >= useStatementIndex)
-                throw new InvalidOperationException($"SSA definition {use} at statement {definition.DefStatementIndex} does not precede use at statement {useStatementIndex} in B{useBlockId}.");
+            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, useBlockId, useStatementIndex, "node " + useTreeId.ToString());
         }
 
         private static void VerifyEdgeUse(
             SsaMethod method,
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             SsaValueName phiTarget,
             SsaValueName use,
             int predecessorBlockId)
@@ -7348,11 +8550,10 @@ namespace Cnidaria.Cs
             if (!definitions.TryGetValue(use, out var definition))
                 throw new InvalidOperationException($"Phi {phiTarget} uses undefined value {use} from B{predecessorBlockId}.");
 
-            if (definition.IsInitial)
-                return;
-
-            if (!method.Cfg.Dominates(definition.DefBlockId, predecessorBlockId))
+            if (!DefinitionDominatesBlockEnd(method, definition, predecessorBlockId))
                 throw new InvalidOperationException($"Phi {phiTarget} input {use} from B{predecessorBlockId} is not dominated by its definition in B{definition.DefBlockId}.");
+
+            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, predecessorBlockId, int.MaxValue, "phi edge B" + predecessorBlockId.ToString() + " -> " + phiTarget.ToString());
         }
     }
 

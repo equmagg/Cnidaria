@@ -53,8 +53,14 @@ namespace Cnidaria.Cs
         Ldthis,
         // Arithmetic / bitwise / compare
         Add,
+        Add_Ovf,
+        Add_Ovf_Un,
         Sub,
+        Sub_Ovf,
+        Sub_Ovf_Un,
         Mul,
+        Mul_Ovf,
+        Mul_Ovf_Un,
         Div,
         Div_Un,
         Rem,
@@ -97,6 +103,7 @@ namespace Cnidaria.Cs
 
         // Control flow
         Br,          // operand0: target PC
+        Leave,       // operand0: target PC
         Brtrue,      // operand0: target PC
         Brfalse,     // operand0: target PC
         Ret,
@@ -190,22 +197,44 @@ namespace Cnidaria.Cs
     {
         public static int FindEntryPointMethodDef(RuntimeModule module)
         {
-            if (TryFindEntryByName(module, "<Main>$", out var tok))
-                return tok;
+            if (module is null)
+                throw new ArgumentNullException(nameof(module));
 
-            if (TryFindStaticMain(module, out tok))
-                return tok;
+            return FindEntryPointMethodDef(module.Md);
+        }
+        public static int FindEntryPointMethodDef(IMetadataView metadata)
+        {
+            if (metadata is null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (TryFindEntryPointMethodDef(metadata, out int methodDefToken))
+                return methodDefToken;
 
             throw new InvalidOperationException("Entry point not found in module metadata.");
         }
-
-        private static bool TryFindEntryByName(RuntimeModule m, string name, out int methodDefToken)
+        public static bool TryFindEntryPointMethodDef(IMetadataView metadata, out int methodDefToken)
         {
-            var md = m.Md;
-            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
+            if (metadata is null)
+                throw new ArgumentNullException(nameof(metadata));
+
+            if (TryFindEntryByName(metadata, "<Main>$", out methodDefToken))
+                return true;
+
+            if (TryFindStaticMain(metadata, out methodDefToken))
+                return true;
+
+            methodDefToken = 0;
+            return false;
+        }
+        private static bool TryFindEntryByName(IMetadataView metadata, string name, out int methodDefToken)
+        {
+            int count = metadata.GetRowCount(MetadataTableKind.MethodDef);
+
+            for (int rid = 1; rid <= count; rid++)
             {
-                var row = md.GetMethodDef(rid);
-                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), name))
+                var row = metadata.GetMethodDef(rid);
+
+                if (!StringComparer.Ordinal.Equals(metadata.GetString(row.Name), name))
                     continue;
 
                 methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
@@ -216,17 +245,18 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static bool TryFindStaticMain(RuntimeModule m, out int methodDefToken)
+        private static bool TryFindStaticMain(IMetadataView metadata, out int methodDefToken)
         {
-            var md = m.Md;
+            int count = metadata.GetRowCount(MetadataTableKind.MethodDef);
 
-            for (int rid = 1; rid <= md.GetRowCount(MetadataTableKind.MethodDef); rid++)
+            for (int rid = 1; rid <= count; rid++)
             {
-                var row = md.GetMethodDef(rid);
-                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), "Main"))
+                var row = metadata.GetMethodDef(rid);
+
+                if (!StringComparer.Ordinal.Equals(metadata.GetString(row.Name), "Main"))
                     continue;
 
-                if (!IsStaticMainStringArraySignature(md.GetBlob(row.Signature)))
+                if (!IsStaticMainStringArraySignature(metadata.GetBlob(row.Signature)))
                     continue;
 
                 methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
@@ -269,6 +299,8 @@ namespace Cnidaria.Cs
 
             return true;
         }
+
+
         private readonly List<Instruction> _insns = new();
         private readonly List<int> _labelToPc = new();
         private readonly List<(int pc, BcLabel label)> _fixups = new();
@@ -299,7 +331,7 @@ namespace Cnidaria.Cs
         }
         public void EmitBranch(BytecodeOp op, BcLabel target, short pop)
         {
-            if (op is not (BytecodeOp.Br or BytecodeOp.Brtrue or BytecodeOp.Brfalse))
+            if (op is not (BytecodeOp.Br or BytecodeOp.Leave or BytecodeOp.Brtrue or BytecodeOp.Brfalse))
                 throw new ArgumentOutOfRangeException(nameof(op));
 
             int pc = _insns.Count;
@@ -710,50 +742,52 @@ namespace Cnidaria.Cs
 
                 if (hasFinally && !hasCatches)
                 {
-                    // try/finally
                     var tryStart = _il.DefineLabel();
                     var finallyStart = _il.DefineLabel();
                     var after = _il.DefineLabel();
 
                     _il.MarkLabel(tryStart);
+
                     EmitStatement(t.TryBlock);
 
-                    bool tryFallsThrough = !_il.TryGetLastOp(out var lastTryOp) ||
-                        (lastTryOp != BytecodeOp.Ret && lastTryOp != BytecodeOp.Throw && lastTryOp != BytecodeOp.Rethrow);
-
-                    if (tryFallsThrough)
-                        _il.EmitBranch(BytecodeOp.Br, after, pop: 0);
+                    _il.EmitBranch(BytecodeOp.Leave, after, pop: 0);
 
                     _il.MarkLabel(finallyStart);
+
                     EmitStatement(t.FinallyBlockOpt!);
                     _il.Emit(BytecodeOp.Endfinally, pop: 0, push: 0);
 
                     _il.MarkLabel(after);
 
-                    _ehSpecs.Add(new ExceptionHandlerSpec(tryStart, finallyStart, finallyStart, after, FinallyCatchTypeToken));
+                    _ehSpecs.Add(new ExceptionHandlerSpec(
+                        tryStart,
+                        finallyStart,
+                        finallyStart,
+                        after,
+                        FinallyCatchTypeToken));
+
                     return;
                 }
 
                 if (hasCatches && !hasFinally)
                 {
-                    // try/catch
                     var tryStart = _il.DefineLabel();
                     var tryEnd = _il.DefineLabel();
                     var endLabel = _il.DefineLabel();
+
                     int n = t.CatchBlocks.Length;
                     var handlerStarts = new BcLabel[n];
+
                     for (int i = 0; i < n; i++)
                         handlerStarts[i] = _il.DefineLabel();
 
                     _il.MarkLabel(tryStart);
+
                     EmitStatement(t.TryBlock);
 
-                    bool tryFallsThrough = !_il.TryGetLastOp(out var lastTryOp) ||
-                        (lastTryOp != BytecodeOp.Ret && lastTryOp != BytecodeOp.Throw && lastTryOp != BytecodeOp.Rethrow);
+                    _il.EmitBranch(BytecodeOp.Leave, endLabel, pop: 0);
 
                     _il.MarkLabel(tryEnd);
-                    if (tryFallsThrough)
-                        _il.EmitBranch(BytecodeOp.Br, endLabel, pop: 0);
 
                     for (int i = 0; i < n; i++)
                     {
@@ -772,14 +806,16 @@ namespace Cnidaria.Cs
 
                         EmitStatement(c.Body);
 
-                        if (!_il.TryGetLastOp(out var lastOp) ||
-                            (lastOp != BytecodeOp.Ret && lastOp != BytecodeOp.Throw && lastOp != BytecodeOp.Rethrow))
-                        {
-                            _il.EmitBranch(BytecodeOp.Br, endLabel, pop: 0);
-                        }
+                        _il.EmitBranch(BytecodeOp.Leave, endLabel, pop: 0);
 
                         int catchTypeTok = _tokens.GetTypeToken(c.ExceptionType);
-                        _ehSpecs.Add(new ExceptionHandlerSpec(tryStart, tryEnd, handlerStart, handlerEnd, catchTypeTok));
+
+                        _ehSpecs.Add(new ExceptionHandlerSpec(
+                            tryStart,
+                            tryEnd,
+                            handlerStart,
+                            handlerEnd,
+                            catchTypeTok));
                     }
 
                     _il.MarkLabel(endLabel);
@@ -795,18 +831,17 @@ namespace Cnidaria.Cs
 
                     int n = t.CatchBlocks.Length;
                     var handlerStarts = new BcLabel[n];
+
                     for (int i = 0; i < n; i++)
                         handlerStarts[i] = _il.DefineLabel();
 
                     _il.MarkLabel(tryStart);
+
                     EmitStatement(t.TryBlock);
 
-                    bool tryFallsThrough = !_il.TryGetLastOp(out var lastTryOp) ||
-                        (lastTryOp != BytecodeOp.Ret && lastTryOp != BytecodeOp.Throw && lastTryOp != BytecodeOp.Rethrow);
+                    _il.EmitBranch(BytecodeOp.Leave, afterCatches, pop: 0);
 
                     _il.MarkLabel(tryEnd);
-                    if (tryFallsThrough)
-                        _il.EmitBranch(BytecodeOp.Br, afterCatches, pop: 0);
 
                     for (int i = 0; i < n; i++)
                     {
@@ -825,26 +860,35 @@ namespace Cnidaria.Cs
 
                         EmitStatement(c.Body);
 
-                        if (!_il.TryGetLastOp(out var lastOp) ||
-                            (lastOp != BytecodeOp.Ret && lastOp != BytecodeOp.Throw && lastOp != BytecodeOp.Rethrow))
-                        {
-                            _il.EmitBranch(BytecodeOp.Br, afterCatches, pop: 0);
-                        }
+                        _il.EmitBranch(BytecodeOp.Leave, afterCatches, pop: 0);
 
                         int catchTypeTok = _tokens.GetTypeToken(c.ExceptionType);
-                        _ehSpecs.Add(new ExceptionHandlerSpec(tryStart, tryEnd, handlerStart, handlerEnd, catchTypeTok));
+
+                        _ehSpecs.Add(new ExceptionHandlerSpec(
+                            tryStart,
+                            tryEnd,
+                            handlerStart,
+                            handlerEnd,
+                            catchTypeTok));
                     }
 
                     _il.MarkLabel(afterCatches);
-                    _il.EmitBranch(BytecodeOp.Br, after, pop: 0);
+
+                    _il.EmitBranch(BytecodeOp.Leave, after, pop: 0);
 
                     _il.MarkLabel(finallyStart);
+
                     EmitStatement(t.FinallyBlockOpt!);
                     _il.Emit(BytecodeOp.Endfinally, pop: 0, push: 0);
 
                     _il.MarkLabel(after);
 
-                    _ehSpecs.Add(new ExceptionHandlerSpec(tryStart, finallyStart, finallyStart, after, FinallyCatchTypeToken));
+                    _ehSpecs.Add(new ExceptionHandlerSpec(
+                        tryStart,
+                        finallyStart,
+                        finallyStart,
+                        after,
+                        FinallyCatchTypeToken));
                 }
             }
             private void EmitLocalDeclaration(BoundLocalDeclarationStatement ld)
@@ -1275,6 +1319,26 @@ namespace Cnidaria.Cs
                     SpecialType.System_UInt64 or
                     SpecialType.System_UIntPtr;
             }
+            private static bool IsCheckedIntegerArithmetic(BoundBinaryExpression bin)
+            {
+                if (!bin.IsChecked)
+                    return false;
+
+                if (bin.OperatorKind is not (BoundBinaryOperatorKind.Add or BoundBinaryOperatorKind.Subtract or BoundBinaryOperatorKind.Multiply))
+                    return false;
+
+                var st = bin.Type is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum
+                    ? (nt.EnumUnderlyingType?.SpecialType ?? SpecialType.System_Int32)
+                    : bin.Type.SpecialType;
+
+                return st is
+                    SpecialType.System_Int32 or
+                    SpecialType.System_UInt32 or
+                    SpecialType.System_Int64 or
+                    SpecialType.System_UInt64 or
+                    SpecialType.System_IntPtr or
+                    SpecialType.System_UIntPtr;
+            }
             private void EmitBinary(BoundBinaryExpression bin, EmitMode mode)
             {
                 if (bin.OperatorKind is BoundBinaryOperatorKind.LogicalAnd or BoundBinaryOperatorKind.LogicalOr)
@@ -1334,16 +1398,17 @@ namespace Cnidaria.Cs
                     return;
                 }
                 bool u = UsesUnsignedIntegerSemantics(bin.Left.Type);
+                bool checkedIntegerArithmetic = IsCheckedIntegerArithmetic(bin);
                 switch (op)
                 {
                     case BoundBinaryOperatorKind.Add:
-                        _il.Emit(BytecodeOp.Add, pop: 2, push: 1);
+                        _il.Emit(checkedIntegerArithmetic ? (u ? BytecodeOp.Add_Ovf_Un : BytecodeOp.Add_Ovf) : BytecodeOp.Add, pop: 2, push: 1);
                         return;
                     case BoundBinaryOperatorKind.Subtract:
-                        _il.Emit(BytecodeOp.Sub, pop: 2, push: 1);
+                        _il.Emit(checkedIntegerArithmetic ? (u ? BytecodeOp.Sub_Ovf_Un : BytecodeOp.Sub_Ovf) : BytecodeOp.Sub, pop: 2, push: 1);
                         return;
                     case BoundBinaryOperatorKind.Multiply:
-                        _il.Emit(BytecodeOp.Mul, pop: 2, push: 1);
+                        _il.Emit(checkedIntegerArithmetic ? (u ? BytecodeOp.Mul_Ovf_Un : BytecodeOp.Mul_Ovf) : BytecodeOp.Mul, pop: 2, push: 1);
                         return;
                     case BoundBinaryOperatorKind.Divide:
                         _il.Emit(u ? BytecodeOp.Div_Un : BytecodeOp.Div, pop: 2, push: 1);
@@ -2634,6 +2699,10 @@ namespace Cnidaria.Cs
                         {
                             case BytecodeOp.Br:
                                 Propagate(ins.Operand0, nextStack);
+                                goto NextWorkItem;
+
+                            case BytecodeOp.Leave:
+                                Propagate(ins.Operand0, 0);
                                 goto NextWorkItem;
 
                             case BytecodeOp.Brtrue:

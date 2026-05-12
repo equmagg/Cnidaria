@@ -1678,8 +1678,14 @@ namespace Cnidaria.Cs
             RuntimeTypeSystem rts,
             RuntimeModule entryModule,
             int entryMethodToken)
-            => new GenTreeBuilder(modules, rts).BuildReachable(entryModule, entryMethodToken);
+            => new GenTreeBuilder(modules, rts).BuildReachable(entryModule, ImmutableArray.Create(entryMethodToken));
 
+        public static GenTreeProgram BuildReachableProgram(
+            IReadOnlyDictionary<string, RuntimeModule> modules,
+            RuntimeTypeSystem rts,
+            RuntimeModule entryModule,
+            ImmutableArray<int> entryMethodTokens)
+            => new GenTreeBuilder(modules, rts).BuildReachable(entryModule, entryMethodTokens);
         public GenTreeProgram BuildAllBodies()
         {
             foreach (var item in _bodyByMethodId.Values)
@@ -1688,19 +1694,26 @@ namespace Cnidaria.Cs
             return new GenTreeProgram(SortedBuiltMethods());
         }
 
-        public GenTreeProgram BuildReachable(RuntimeModule entryModule, int entryMethodToken)
+        public GenTreeProgram BuildReachable(RuntimeModule entryModule, ImmutableArray<int> entryMethodTokens)
         {
-            if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
+            if (entryModule is null)
+                throw new ArgumentNullException(nameof(entryModule));
 
-            RuntimeMethod entryMethod = _rts.ResolveMethodInMethodContext(
-                entryModule,
-                entryMethodToken,
-                methodContext: null);
+            if (entryMethodTokens.IsDefaultOrEmpty)
+                throw new ArgumentException("At least one entry method token is required.", nameof(entryMethodTokens));
 
             var queue = new Queue<RuntimeMethod>();
             var scheduledOrBuilt = new HashSet<int>();
 
-            Enqueue(entryMethod);
+            foreach (int entryMethodToken in entryMethodTokens)
+            {
+                RuntimeMethod entryMethod = _rts.ResolveMethodInMethodContext(
+                    entryModule,
+                    entryMethodToken,
+                    methodContext: null);
+
+                Enqueue(entryMethod);
+            }
 
             for (; ; )
             {
@@ -2167,8 +2180,14 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Add:
+                    case BytecodeOp.Add_Ovf:
+                    case BytecodeOp.Add_Ovf_Un:
                     case BytecodeOp.Sub:
+                    case BytecodeOp.Sub_Ovf:
+                    case BytecodeOp.Sub_Ovf_Un:
                     case BytecodeOp.Mul:
+                    case BytecodeOp.Mul_Ovf:
+                    case BytecodeOp.Mul_Ovf_Un:
                     case BytecodeOp.Div:
                     case BytecodeOp.Div_Un:
                     case BytecodeOp.Rem:
@@ -2295,8 +2314,33 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Br:
                         {
                             AddSuccessor(successorPcs, ins.Operand0);
+
                             SpillStackForBoundaries(statements, stack, successorPcs, pc, ins.Op);
-                            statements.Add(Node(GenTreeKind.Branch, pc, ins.Op, targetPc: ins.Operand0, targetBlockId: BlockIdForPc(ins.Operand0)));
+
+                            statements.Add(Node(
+                                GenTreeKind.Branch,
+                                pc,
+                                ins.Op,
+                                targetPc: ins.Operand0,
+                                targetBlockId: BlockIdForPc(ins.Operand0)));
+
+                            pc++;
+                            return CreateBlock(blockId, startPc, pc, statements, successorPcs, stack.Count);
+                        }
+
+                    case BytecodeOp.Leave:
+                        {
+                            AddSuccessor(successorPcs, ins.Operand0);
+
+                            DiscardStackForLeave(statements, stack, pc, ins.Op);
+
+                            statements.Add(Node(
+                                GenTreeKind.Branch,
+                                pc,
+                                ins.Op,
+                                targetPc: ins.Operand0,
+                                targetBlockId: BlockIdForPc(ins.Operand0)));
+
                             pc++;
                             return CreateBlock(blockId, startPc, pc, statements, successorPcs, stack.Count);
                         }
@@ -2426,7 +2470,17 @@ namespace Cnidaria.Cs
 
             return flags;
         }
-
+        private void DiscardStackForLeave(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp)
+        {
+            if (stack.Count == 0)
+                return;
+            for (int i = 0; i < stack.Count; i++)
+            {
+                GenTree value = stack[i].Node;
+                statements.Add(Node(GenTreeKind.Eval, pc, sourceOp, operands: One(value)));
+            }
+            stack.Clear();
+        }
         private static bool RangesIntersect(int aStart, int aEnd, int bStart, int bEnd)
             => aStart < bEnd && bStart < aEnd;
 
@@ -3027,8 +3081,14 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Add:
+                    case BytecodeOp.Add_Ovf:
+                    case BytecodeOp.Add_Ovf_Un:
                     case BytecodeOp.Sub:
+                    case BytecodeOp.Sub_Ovf:
+                    case BytecodeOp.Sub_Ovf_Un:
                     case BytecodeOp.Mul:
+                    case BytecodeOp.Mul_Ovf:
+                    case BytecodeOp.Mul_Ovf_Un:
                     case BytecodeOp.Div:
                     case BytecodeOp.Div_Un:
                     case BytecodeOp.Rem:
@@ -3142,6 +3202,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Call:
                     case BytecodeOp.CallVirt:
                     case BytecodeOp.Br:
+                    case BytecodeOp.Leave:
                     case BytecodeOp.Brtrue:
                     case BytecodeOp.Brfalse:
                     case BytecodeOp.Throw:
@@ -3229,8 +3290,14 @@ namespace Cnidaria.Cs
                 BytecodeOp.Starg or
                 BytecodeOp.Ldthis or
                 BytecodeOp.Add or
+                BytecodeOp.Add_Ovf or
+                BytecodeOp.Add_Ovf_Un or
                 BytecodeOp.Sub or
+                BytecodeOp.Sub_Ovf or
+                BytecodeOp.Sub_Ovf_Un or
                 BytecodeOp.Mul or
+                BytecodeOp.Mul_Ovf or
+                BytecodeOp.Mul_Ovf_Un or
                 BytecodeOp.Div or
                 BytecodeOp.Div_Un or
                 BytecodeOp.Rem or
@@ -3725,7 +3792,10 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.Binary:
-                    if (sourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
+                    if (sourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un or
+                        BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
+                        BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
+                        BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un)
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
@@ -3802,7 +3872,7 @@ namespace Cnidaria.Cs
 
                 int inDepth = result[pc];
                 var ins = _body.Instructions[pc];
-                int outDepth = checked(inDepth - ins.Pop + ins.Push);
+                int outDepth = ins.Op == BytecodeOp.Leave ? 0 : checked(inDepth - ins.Pop + ins.Push);
                 if (outDepth < 0)
                     throw Fail(pc, ins.Op, $"Negative evaluation stack depth. In={inDepth}, pop={ins.Pop}, push={ins.Push}.");
                 if (outDepth > _body.MaxStack)
@@ -3836,6 +3906,7 @@ namespace Cnidaria.Cs
             switch (ins.Op)
             {
                 case BytecodeOp.Br:
+                case BytecodeOp.Leave:
                     yield return ins.Operand0;
                     yield break;
 
@@ -3876,6 +3947,7 @@ namespace Cnidaria.Cs
                 switch (ins.Op)
                 {
                     case BytecodeOp.Br:
+                    case BytecodeOp.Leave:
                         AddReachableLeader(ins.Operand0);
                         break;
 
@@ -3911,7 +3983,7 @@ namespace Cnidaria.Cs
 
         private static bool IsBlockTerminator(BytecodeOp op)
         {
-            return op is BytecodeOp.Br or BytecodeOp.Brtrue or BytecodeOp.Brfalse or
+            return op is BytecodeOp.Br or BytecodeOp.Leave or BytecodeOp.Brtrue or BytecodeOp.Brfalse or
                 BytecodeOp.Ret or BytecodeOp.Throw or BytecodeOp.Rethrow or BytecodeOp.Endfinally;
         }
 

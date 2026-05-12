@@ -914,6 +914,29 @@ namespace Cnidaria.Cs
             }
         }
 
+        private sealed class NestedLocalFunctionCollector : BoundTreeRewriter
+        {
+            private readonly ImmutableArray<BoundLocalFunctionStatement>.Builder _localFunctions =
+                ImmutableArray.CreateBuilder<BoundLocalFunctionStatement>();
+
+            private NestedLocalFunctionCollector()
+            {
+            }
+
+            public static ImmutableArray<BoundLocalFunctionStatement> Collect(BoundStatement body)
+            {
+                var collector = new NestedLocalFunctionCollector();
+                collector.RewriteStatement(body);
+                return collector._localFunctions.ToImmutable();
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                _localFunctions.Add(node);
+                return node;
+            }
+        }
+
         public LocalFunctionClosureRewriter(Compilation compilation)
         {
             _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
@@ -1071,10 +1094,41 @@ namespace Cnidaria.Cs
             return map;
         }
 
+        private ImmutableArray<Symbol> CollectRequiredCaptures(MethodSymbol owner, BoundStatement body)
+        {
+            var captures = ImmutableArray.CreateBuilder<Symbol>();
+            var seen = new HashSet<Symbol>(ReferenceEqualityComparer<Symbol>.Instance);
+
+            void Add(Symbol symbol)
+            {
+                if (seen.Add(symbol))
+                    captures.Add(symbol);
+            }
+
+            var directCaptures = CaptureCollector.Collect(owner, body);
+            for (int i = 0; i < directCaptures.Length; i++)
+                Add(directCaptures[i]);
+
+            var nestedLocalFunctions = NestedLocalFunctionCollector.Collect(body);
+            for (int i = 0; i < nestedLocalFunctions.Length; i++)
+            {
+                var nested = nestedLocalFunctions[i];
+                var nestedCaptures = CollectRequiredCaptures(nested.LocalFunction, nested.Body);
+                for (int j = 0; j < nestedCaptures.Length; j++)
+                {
+                    var symbol = nestedCaptures[j];
+                    if (!ReferenceEquals(symbol.ContainingSymbol, owner))
+                        Add(symbol);
+                }
+            }
+
+            return captures.ToImmutable();
+        }
+
         private CaptureInfo CreateCaptureInfo(BoundLocalFunctionStatement statement)
         {
             var original = statement.LocalFunction;
-            var capturedSymbols = CaptureCollector.Collect(original, statement.Body);
+            var capturedSymbols = CollectRequiredCaptures(original, statement.Body);
 
             if (capturedSymbols.IsDefaultOrEmpty)
                 return new CaptureInfo(original, original, capturedSymbols, ImmutableArray<ParameterSymbol>.Empty);
@@ -1302,6 +1356,9 @@ namespace Cnidaria.Cs
 
             private LocalSymbol CreateTempLocal(TypeSymbol type)
                 => new LocalSymbol($"$temp{_tempId++}", _method, type, ImmutableArray<Location>.Empty);
+
+            private LocalSymbol CreateRefTempLocal(TypeSymbol type)
+                => new LocalSymbol($"$temp{_tempId++}", _method, type, ImmutableArray<Location>.Empty, isByRef: true);
             private NamedTypeSymbol GetValueTupleDef(int arity)
             {
                 if (_valueTupleDefCache.TryGetValue(arity, out var t))
@@ -3138,24 +3195,11 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>(initialCapacity: 2);
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(initialCapacity: 3);
 
-                BoundExpression? receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
-
-                // Ensure receiver is evaluated once
-                if (receiver is not null && !IsSimpleReceiver(receiver))
-                {
-                    var receiverTemp = CreateTempLocal(receiver.Type);
-                    locals.Add(receiverTemp);
-
-                    sideEffects.Add(
-                        new BoundExpressionStatement(
-                            node.Syntax,
-                            new BoundAssignmentExpression(
-                                node.Syntax,
-                                new BoundLocalExpression(node.Syntax, receiverTemp),
-                                receiver)));
-
-                    receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                }
+                BoundExpression? receiver = SpillReceiverForLValueAccess(
+                    node.Syntax,
+                    left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
+                    locals,
+                    sideEffects);
                 // Ensure assigned value is evaluated once and is the result of the assignment expression
                 var rewrittenRight = RewriteExpression(node.Right);
 
@@ -3192,6 +3236,50 @@ namespace Cnidaria.Cs
                     or BoundParameterExpression
                     or BoundThisExpression
                     or BoundBaseExpression;
+
+            private BoundExpression? SpillReceiverForLValueAccess(
+                SyntaxNode syntax,
+                BoundExpression? receiver,
+                ImmutableArray<LocalSymbol>.Builder locals,
+                ImmutableArray<BoundStatement>.Builder sideEffects)
+            {
+                if (receiver is null || IsSimpleReceiver(receiver))
+                    return receiver;
+
+                if (receiver.Type.IsValueType)
+                {
+                    if (!receiver.IsLValue)
+                        throw new InvalidOperationException(
+                            "Cannot mutate a field of a non-lvalue value-type receiver.");
+
+                    var receiverTemp = CreateRefTempLocal(receiver.Type);
+                    locals.Add(receiverTemp);
+
+                    sideEffects.Add(
+                        new BoundLocalDeclarationStatement(
+                            syntax,
+                            receiverTemp,
+                            new BoundRefExpression(
+                                syntax,
+                                _compilation.CreateByRefType(receiver.Type),
+                                receiver)));
+
+                    return new BoundLocalExpression(syntax, receiverTemp);
+                }
+
+                var temp = CreateTempLocal(receiver.Type);
+                locals.Add(temp);
+
+                sideEffects.Add(
+                    new BoundExpressionStatement(
+                        syntax,
+                        new BoundAssignmentExpression(
+                            syntax,
+                            new BoundLocalExpression(syntax, temp),
+                            receiver)));
+
+                return new BoundLocalExpression(syntax, temp);
+            }
             private BoundExpression LowerIncrementDecrementWithSpill(
                 BoundIncrementDecrementExpression node,
                 BoundExpression rewrittenTarget)
@@ -3256,26 +3344,23 @@ namespace Cnidaria.Cs
 
                             break;
                         }
+                    case BoundArrayElementAccessExpression aea:
+                        {
+                            lvalue = SpillArrayElementAccess(
+                                node.Syntax,
+                                aea,
+                                localsBuilder,
+                                sideEffectsBuilder);
 
+                            break;
+                        }
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
-                            BoundExpression? receiver = ma.ReceiverOpt;
-
-                            if (receiver is not null && !IsSimpleReceiver(receiver))
-                            {
-                                var receiverTemp = CreateTempLocal(receiver.Type);
-                                localsBuilder.Add(receiverTemp);
-
-                                sideEffectsBuilder.Add(
-                                    new BoundExpressionStatement(
-                                        node.Syntax,
-                                        new BoundAssignmentExpression(
-                                            node.Syntax,
-                                            new BoundLocalExpression(node.Syntax, receiverTemp),
-                                            receiver)));
-
-                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                            }
+                            BoundExpression? receiver = SpillReceiverForLValueAccess(
+                                node.Syntax,
+                                ma.ReceiverOpt,
+                                localsBuilder,
+                                sideEffectsBuilder);
 
                             lvalue = new BoundMemberAccessExpression(
                                 (ExpressionSyntax)node.Syntax,
@@ -3339,23 +3424,11 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>(initialCapacity: node.IsPostfix ? 3 : 2);
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(initialCapacity: node.IsPostfix ? 4 : 3);
 
-                BoundExpression? receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
-
-                if (receiver is not null && !IsSimpleReceiver(receiver))
-                {
-                    var receiverTemp = CreateTempLocal(receiver.Type);
-                    locals.Add(receiverTemp);
-
-                    sideEffects.Add(
-                        new BoundExpressionStatement(
-                            node.Syntax,
-                            new BoundAssignmentExpression(
-                                node.Syntax,
-                                new BoundLocalExpression(node.Syntax, receiverTemp),
-                                receiver)));
-
-                    receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                }
+                BoundExpression? receiver = SpillReceiverForLValueAccess(
+                    node.Syntax,
+                    left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
+                    locals,
+                    sideEffects);
 
                 var getCall = new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty);
 
@@ -3545,22 +3618,11 @@ namespace Cnidaria.Cs
 
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
-                            BoundExpression? receiver = ma.ReceiverOpt;
-                            if (receiver is not null && !IsSimpleReceiver(receiver))
-                            {
-                                var receiverTemp = CreateTempLocal(receiver.Type);
-                                localsBuilder.Add(receiverTemp);
-
-                                sideEffectsBuilder.Add(
-                                    new BoundExpressionStatement(
-                                        node.Syntax,
-                                        new BoundAssignmentExpression(
-                                            node.Syntax,
-                                            new BoundLocalExpression(node.Syntax, receiverTemp),
-                                            receiver)));
-
-                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                            }
+                            BoundExpression? receiver = SpillReceiverForLValueAccess(
+                                node.Syntax,
+                                ma.ReceiverOpt,
+                                localsBuilder,
+                                sideEffectsBuilder);
 
                             lvalue = new BoundMemberAccessExpression(
                                 (ExpressionSyntax)node.Syntax,
@@ -3626,8 +3688,8 @@ namespace Cnidaria.Cs
                 return LowerCompoundAssignmentWithSpill(node, rewrittenLeft2);
             }
             private BoundExpression LowerSimpleDirectCompoundAssignment(
-    BoundCompoundAssignmentExpression node,
-    BoundExpression rewrittenLeft)
+                BoundCompoundAssignmentExpression node,
+                BoundExpression rewrittenLeft)
             {
                 var directCall = RewriteExpression(ReplaceExpressionByReference(node.Value, node.Left, rewrittenLeft));
 
@@ -3704,22 +3766,11 @@ namespace Cnidaria.Cs
 
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
-                            BoundExpression? receiver = ma.ReceiverOpt;
-                            if (receiver is not null && !IsSimpleReceiver(receiver))
-                            {
-                                var receiverTemp = CreateTempLocal(receiver.Type);
-                                localsBuilder.Add(receiverTemp);
-
-                                sideEffectsBuilder.Add(
-                                    new BoundExpressionStatement(
-                                        node.Syntax,
-                                        new BoundAssignmentExpression(
-                                            node.Syntax,
-                                            new BoundLocalExpression(node.Syntax, receiverTemp),
-                                            receiver)));
-
-                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                            }
+                            BoundExpression? receiver = SpillReceiverForLValueAccess(
+                                node.Syntax,
+                                ma.ReceiverOpt,
+                                localsBuilder,
+                                sideEffectsBuilder);
 
                             lvalue = new BoundMemberAccessExpression(
                                 (ExpressionSyntax)node.Syntax,
@@ -3792,23 +3843,11 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
 
-                BoundExpression? receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
-
-                if (receiver is not null && !IsSimpleReceiver(receiver))
-                {
-                    var receiverTemp = CreateTempLocal(receiver.Type);
-                    locals.Add(receiverTemp);
-
-                    sideEffects.Add(
-                        new BoundExpressionStatement(
-                            node.Syntax,
-                            new BoundAssignmentExpression(
-                                node.Syntax,
-                                new BoundLocalExpression(node.Syntax, receiverTemp),
-                                receiver)));
-
-                    receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                }
+                BoundExpression? receiver = SpillReceiverForLValueAccess(
+                    node.Syntax,
+                    left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
+                    locals,
+                    sideEffects);
 
                 var getCall = new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty);
 
@@ -3830,23 +3869,11 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
 
-                BoundExpression? receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
-
-                if (receiver is not null && !IsSimpleReceiver(receiver))
-                {
-                    var receiverTemp = CreateTempLocal(receiver.Type);
-                    locals.Add(receiverTemp);
-
-                    sideEffects.Add(
-                        new BoundExpressionStatement(
-                            node.Syntax,
-                            new BoundAssignmentExpression(
-                                node.Syntax,
-                                new BoundLocalExpression(node.Syntax, receiverTemp),
-                                receiver)));
-
-                    receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                }
+                BoundExpression? receiver = SpillReceiverForLValueAccess(
+                    node.Syntax,
+                    left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
+                    locals,
+                    sideEffects);
 
                 var fieldLValue = new BoundMemberAccessExpression(
                     (ExpressionSyntax)node.Syntax,
@@ -3902,23 +3929,11 @@ namespace Cnidaria.Cs
                 {
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
-                            BoundExpression? receiver = ma.ReceiverOpt;
-
-                            if (receiver is not null && !IsSimpleReceiver(receiver))
-                            {
-                                var receiverTemp = CreateTempLocal(receiver.Type);
-                                locals.Add(receiverTemp);
-
-                                sideEffects.Add(
-                                    new BoundExpressionStatement(
-                                        node.Syntax,
-                                        new BoundAssignmentExpression(
-                                            node.Syntax,
-                                            new BoundLocalExpression(node.Syntax, receiverTemp),
-                                            receiver)));
-
-                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                            }
+                            BoundExpression? receiver = SpillReceiverForLValueAccess(
+                                node.Syntax,
+                                ma.ReceiverOpt,
+                                locals,
+                                sideEffects);
 
                             lvalue = new BoundMemberAccessExpression(
                                 (ExpressionSyntax)node.Syntax,
@@ -4048,23 +4063,11 @@ namespace Cnidaria.Cs
                 var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
 
-                BoundExpression? receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
-
-                if (receiver is not null && !IsSimpleReceiver(receiver))
-                {
-                    var receiverTemp = CreateTempLocal(receiver.Type);
-                    locals.Add(receiverTemp);
-
-                    sideEffects.Add(
-                        new BoundExpressionStatement(
-                            node.Syntax,
-                            new BoundAssignmentExpression(
-                                node.Syntax,
-                                new BoundLocalExpression(node.Syntax, receiverTemp),
-                                receiver)));
-
-                    receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                }
+                BoundExpression? receiver = SpillReceiverForLValueAccess(
+                    node.Syntax,
+                    left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
+                    locals,
+                    sideEffects);
 
                 var getCall = new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty);
 
@@ -4163,25 +4166,23 @@ namespace Cnidaria.Cs
 
                             break;
                         }
+                    case BoundArrayElementAccessExpression aea:
+                        {
+                            lvalue = SpillArrayElementAccess(
+                                node.Syntax,
+                                aea,
+                                localsBuilder,
+                                sideEffectsBuilder);
+
+                            break;
+                        }
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
-                            BoundExpression? receiver = ma.ReceiverOpt;
-
-                            if (receiver is not null && !IsSimpleReceiver(receiver))
-                            {
-                                var receiverTemp = CreateTempLocal(receiver.Type);
-                                localsBuilder.Add(receiverTemp);
-
-                                sideEffectsBuilder.Add(
-                                    new BoundExpressionStatement(
-                                        node.Syntax,
-                                        new BoundAssignmentExpression(
-                                            node.Syntax,
-                                            new BoundLocalExpression(node.Syntax, receiverTemp),
-                                            receiver)));
-
-                                receiver = new BoundLocalExpression(node.Syntax, receiverTemp);
-                            }
+                            BoundExpression? receiver = SpillReceiverForLValueAccess(
+                                node.Syntax,
+                                ma.ReceiverOpt,
+                                localsBuilder,
+                                sideEffectsBuilder);
 
                             lvalue = new BoundMemberAccessExpression(
                                 (ExpressionSyntax)node.Syntax,
@@ -4211,7 +4212,48 @@ namespace Cnidaria.Cs
                     sideEffectsBuilder.ToImmutable(),
                     assignment);
             }
+            private BoundArrayElementAccessExpression SpillArrayElementAccess(
+                SyntaxNode syntax,
+                BoundArrayElementAccessExpression arrayElement,
+                ImmutableArray<LocalSymbol>.Builder locals,
+                ImmutableArray<BoundStatement>.Builder sideEffects)
+            {
+                var arrayTemp = CreateTempLocal(arrayElement.Expression.Type);
+                locals.Add(arrayTemp);
 
+                sideEffects.Add(
+                    new BoundExpressionStatement(
+                        syntax,
+                        new BoundAssignmentExpression(
+                            syntax,
+                            new BoundLocalExpression(syntax, arrayTemp),
+                            arrayElement.Expression)));
+
+                var rewrittenIndices = ImmutableArray.CreateBuilder<BoundExpression>(arrayElement.Indices.Length);
+
+                for (int i = 0; i < arrayElement.Indices.Length; i++)
+                {
+                    var index = arrayElement.Indices[i];
+                    var indexTemp = CreateTempLocal(index.Type);
+                    locals.Add(indexTemp);
+
+                    sideEffects.Add(
+                        new BoundExpressionStatement(
+                            syntax,
+                            new BoundAssignmentExpression(
+                                syntax,
+                                new BoundLocalExpression(syntax, indexTemp),
+                                index)));
+
+                    rewrittenIndices.Add(new BoundLocalExpression(syntax, indexTemp));
+                }
+
+                return new BoundArrayElementAccessExpression(
+                    syntax,
+                    arrayElement.Type,
+                    new BoundLocalExpression(syntax, arrayTemp),
+                    rewrittenIndices.ToImmutable());
+            }
             private BoundExpression LowerIndexerAssignment(
                 BoundAssignmentExpression node,
                 BoundIndexerAccessExpression left,
@@ -4821,12 +4863,10 @@ namespace Cnidaria.Cs
                 if (statements.IsDefaultOrEmpty)
                     return statements;
 
-                var firstPass = EliminateDeadLocalStores(statements, terminalValue: null, out var firstChanged);
-                var secondPass = PropagateCopiesInStatements(firstPass, out var secondChanged);
-                var thirdPass = EliminateDeadLocalStores(secondPass, terminalValue: null, out var thirdChanged);
+                var optimized = EliminateDeadLocalStores(statements, terminalValue: null, out var optimizedChanged);
 
-                changed = firstChanged || secondChanged || thirdChanged;
-                return thirdPass;
+                changed = optimizedChanged;
+                return optimized;
             }
 
             private static BoundSequenceExpression OptimizeSequence(
@@ -4838,12 +4878,10 @@ namespace Cnidaria.Cs
                 changed = false;
 
                 var removableLocals = CreateLocalSet(locals);
-                sideEffects = EliminateDeadLocalStores(sideEffects, value, out var firstChanged, removableLocals);
-                sideEffects = PropagateCopiesInSequence(locals, sideEffects, ref value, out var secondChanged);
-                sideEffects = EliminateDeadLocalStores(sideEffects, value, out var thirdChanged, removableLocals);
+                sideEffects = EliminateDeadLocalStores(sideEffects, value, out var storesChanged, removableLocals);
 
                 var prunedLocals = PruneUnusedSequenceLocals(locals, sideEffects, value, out var localsChanged);
-                changed = firstChanged || secondChanged || thirdChanged || localsChanged;
+                changed = storesChanged || localsChanged;
 
                 return new BoundSequenceExpression(value.Syntax, prunedLocals, sideEffects, value);
             }
@@ -5006,204 +5044,6 @@ namespace Cnidaria.Cs
                 return !live.Contains(local);
             }
 
-            private static ImmutableArray<BoundStatement> PropagateCopiesInStatements(
-                ImmutableArray<BoundStatement> statements,
-                out bool changed)
-            {
-                changed = false;
-                if (statements.IsDefaultOrEmpty)
-                    return statements;
-
-                var addressExposed = CollectAddressExposedLocals(statements, terminalValue: null);
-                var copies = new Dictionary<LocalSymbol, BoundExpression>(ReferenceEqualityComparer<LocalSymbol>.Instance);
-                var builder = ImmutableArray.CreateBuilder<BoundStatement>(statements.Length);
-
-                for (int i = 0; i < statements.Length; i++)
-                {
-                    var original = statements[i];
-                    var rewritten = RewriteStatementWithCopies(original, copies);
-                    if (!ReferenceEquals(rewritten, original))
-                        changed = true;
-
-                    builder.Add(rewritten);
-                    UpdateCopyState(copies, rewritten, addressExposed);
-                }
-
-                return changed ? builder.ToImmutable() : statements;
-            }
-
-            private static ImmutableArray<BoundStatement> PropagateCopiesInSequence(
-                ImmutableArray<LocalSymbol> locals,
-                ImmutableArray<BoundStatement> sideEffects,
-                ref BoundExpression value,
-                out bool changed)
-            {
-                changed = false;
-                if (sideEffects.IsDefaultOrEmpty && value is null)
-                    return sideEffects;
-
-                var sequenceLocals = CreateLocalSet(locals);
-                var addressExposed = CollectAddressExposedLocals(sideEffects, value);
-                var copies = new Dictionary<LocalSymbol, BoundExpression>(ReferenceEqualityComparer<LocalSymbol>.Instance);
-                var builder = ImmutableArray.CreateBuilder<BoundStatement>(sideEffects.Length);
-
-                for (int i = 0; i < sideEffects.Length; i++)
-                {
-                    var original = sideEffects[i];
-                    var rewritten = RewriteStatementWithCopies(original, copies);
-                    if (!ReferenceEquals(rewritten, original))
-                        changed = true;
-
-                    builder.Add(rewritten);
-                    UpdateCopyState(copies, rewritten, addressExposed, sequenceLocals);
-                }
-
-                if (!ContainsLocalWrites(value))
-                {
-                    var rewrittenValue = new CopySubstitutionRewriter(FilterCopiesForAllowedTargets(copies, sequenceLocals)).RewriteValue(value);
-                    if (!ReferenceEquals(rewrittenValue, value))
-                    {
-                        value = rewrittenValue;
-                        changed = true;
-                    }
-                }
-
-                return changed ? builder.ToImmutable() : sideEffects;
-            }
-
-            private static BoundStatement RewriteStatementWithCopies(
-                BoundStatement statement,
-                Dictionary<LocalSymbol, BoundExpression> copies)
-            {
-                if (copies.Count == 0)
-                    return statement;
-
-                return new CopySubstitutionRewriter(copies).RewriteStatementForCopy(statement);
-            }
-
-            private static void UpdateCopyState(
-                Dictionary<LocalSymbol, BoundExpression> copies,
-                BoundStatement statement,
-                HashSet<LocalSymbol> addressExposed,
-                HashSet<LocalSymbol>? trackableLocals = null)
-            {
-                var writes = new HashSet<LocalSymbol>();
-                CollectWrittenLocals(statement, writes);
-                foreach (var written in writes)
-                    InvalidateCopiesForWrite(copies, written);
-
-                if (TryGetCopyDefinition(statement, addressExposed, trackableLocals, out var local, out var source))
-                {
-                    copies[local] = source;
-                }
-            }
-
-            private static void InvalidateCopiesForWrite(
-                Dictionary<LocalSymbol, BoundExpression> copies,
-                LocalSymbol written)
-            {
-                if (copies.Count == 0)
-                    return;
-
-                List<LocalSymbol>? remove = null;
-                foreach (var pair in copies)
-                {
-                    if (ReferenceEquals(pair.Key, written) || SourceDependsOnLocal(pair.Value, written))
-                    {
-                        (remove ??= new List<LocalSymbol>()).Add(pair.Key);
-                    }
-                }
-
-                if (remove is null)
-                    return;
-
-                for (int i = 0; i < remove.Count; i++)
-                    copies.Remove(remove[i]);
-            }
-
-            private static bool SourceDependsOnLocal(BoundExpression source, LocalSymbol local)
-                => source is BoundLocalExpression localExpression && ReferenceEquals(localExpression.Local, local);
-
-            private static bool TryGetCopyDefinition(
-                BoundStatement statement,
-                HashSet<LocalSymbol> addressExposed,
-                HashSet<LocalSymbol>? trackableLocals,
-                out LocalSymbol local,
-                out BoundExpression source)
-            {
-                local = null!;
-                source = null!;
-
-                switch (statement)
-                {
-                    case BoundLocalDeclarationStatement declaration when
-                        declaration.Initializer is not null &&
-                        CanTrackCopyLocal(declaration.Local, addressExposed, trackableLocals) &&
-                        TryGetCopySource(declaration.Initializer, addressExposed, out source):
-                        local = declaration.Local;
-                        return true;
-
-                    case BoundExpressionStatement expressionStatement when
-                        TryGetTopLevelLocalStore(expressionStatement.Expression, out var assignedLocal, out var assignedValue) &&
-                        CanTrackCopyLocal(assignedLocal, addressExposed, trackableLocals) &&
-                        TryGetCopySource(assignedValue, addressExposed, out source):
-                        local = assignedLocal;
-                        return true;
-
-                    default:
-                        return false;
-                }
-            }
-
-            private static bool CanTrackCopyLocal(
-                LocalSymbol local,
-                HashSet<LocalSymbol> addressExposed,
-                HashSet<LocalSymbol>? trackableLocals)
-                => !local.IsByRef &&
-                   !addressExposed.Contains(local) &&
-                   (trackableLocals is null || trackableLocals.Contains(local));
-
-            private static Dictionary<LocalSymbol, BoundExpression> FilterCopiesForAllowedTargets(
-                Dictionary<LocalSymbol, BoundExpression> copies,
-                HashSet<LocalSymbol> allowedTargets)
-            {
-                if (copies.Count == 0)
-                    return copies;
-
-                var filtered = new Dictionary<LocalSymbol, BoundExpression>(ReferenceEqualityComparer<LocalSymbol>.Instance);
-                foreach (var pair in copies)
-                {
-                    if (allowedTargets.Contains(pair.Key))
-                        filtered.Add(pair.Key, pair.Value);
-                }
-
-                return filtered;
-            }
-
-            private static bool TryGetCopySource(
-                BoundExpression expression,
-                HashSet<LocalSymbol> addressExposed,
-                out BoundExpression source)
-            {
-                source = expression;
-                switch (expression)
-                {
-                    case BoundLiteralExpression:
-                    case BoundThisExpression:
-                        return true;
-
-                    case BoundParameterExpression parameter:
-                        return parameter.Parameter.RefKind == ParameterRefKind.None &&
-                               parameter.Parameter.Type is not ByRefTypeSymbol;
-
-                    case BoundLocalExpression local:
-                        return !local.Local.IsByRef && !addressExposed.Contains(local.Local);
-
-                    default:
-                        return false;
-                }
-            }
-
             private static bool TryGetTopLevelLocalStore(
                 BoundExpression expression,
                 out LocalSymbol local,
@@ -5221,18 +5061,6 @@ namespace Cnidaria.Cs
                 }
 
                 return false;
-            }
-
-            private static HashSet<LocalSymbol> CollectAddressExposedLocals(
-                ImmutableArray<BoundStatement> statements,
-                BoundExpression? terminalValue)
-            {
-                var result = new HashSet<LocalSymbol>();
-                for (int i = 0; i < statements.Length; i++)
-                    CollectAddressExposedLocals(statements[i], result);
-                if (terminalValue is not null)
-                    CollectAddressExposedLocals(terminalValue, result);
-                return result;
             }
 
             private static bool CanDiscardExpressionCompletely(BoundExpression expression)
@@ -5255,13 +5083,6 @@ namespace Cnidaria.Cs
                     default:
                         return false;
                 }
-            }
-
-            private static bool ContainsLocalWrites(BoundExpression expression)
-            {
-                var writes = new HashSet<LocalSymbol>();
-                CollectWrittenLocals(expression, writes);
-                return writes.Count != 0;
             }
 
             private static void CollectMentionedLocals(BoundStatement statement, HashSet<LocalSymbol> locals)
@@ -5896,181 +5717,6 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private sealed class CopySubstitutionRewriter : BoundTreeRewriterWithStackGuard
-            {
-                private readonly Dictionary<LocalSymbol, BoundExpression> _copies;
-
-                public CopySubstitutionRewriter(Dictionary<LocalSymbol, BoundExpression> copies)
-                {
-                    _copies = copies;
-                }
-
-                public BoundStatement RewriteStatementForCopy(BoundStatement statement)
-                {
-                    return statement switch
-                    {
-                        BoundLocalDeclarationStatement localDeclaration => RewriteLocalDeclarationStatement(localDeclaration),
-                        BoundExpressionStatement expressionStatement => RewriteExpressionStatement(expressionStatement),
-                        BoundReturnStatement returnStatement => RewriteReturnStatement(returnStatement),
-                        BoundThrowStatement throwStatement => RewriteThrowStatement(throwStatement),
-                        _ => statement
-                    };
-                }
-
-                public BoundExpression RewriteValue(BoundExpression expression)
-                    => RewriteExpression(expression);
-
-                protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
-                {
-                    if (node.Initializer is null || ContainsLocalWrites(node.Initializer))
-                        return node;
-
-                    var initializer = RewriteExpression(node.Initializer);
-                    if (!ReferenceEquals(initializer, node.Initializer))
-                        return new BoundLocalDeclarationStatement(node.Syntax, node.Local, initializer);
-
-                    return node;
-                }
-
-                protected override BoundStatement RewriteExpressionStatement(BoundExpressionStatement node)
-                {
-                    if (node.Expression is BoundAssignmentExpression assignment &&
-                        assignment.Left is BoundLocalExpression)
-                    {
-                        if (ContainsLocalWrites(assignment.Right))
-                            return node;
-
-                        var rewrittenRight = RewriteExpression(assignment.Right);
-                        if (!ReferenceEquals(rewrittenRight, assignment.Right))
-                        {
-                            return new BoundExpressionStatement(
-                                node.Syntax,
-                                new BoundAssignmentExpression(assignment.Syntax, assignment.Left, rewrittenRight));
-                        }
-
-                        return node;
-                    }
-
-                    if (ContainsLocalWrites(node.Expression))
-                        return node;
-
-                    var expression = RewriteExpression(node.Expression);
-                    if (!ReferenceEquals(expression, node.Expression))
-                        return new BoundExpressionStatement(node.Syntax, expression);
-
-                    return node;
-                }
-
-                protected override BoundStatement RewriteReturnStatement(BoundReturnStatement node)
-                {
-                    if (node.Expression is null || ContainsLocalWrites(node.Expression))
-                        return node;
-
-                    var expression = RewriteExpression(node.Expression);
-                    if (!ReferenceEquals(expression, node.Expression))
-                        return new BoundReturnStatement(node.Syntax, expression);
-
-                    return node;
-                }
-
-                protected override BoundStatement RewriteThrowStatement(BoundThrowStatement node)
-                {
-                    if (node.ExpressionOpt is null || ContainsLocalWrites(node.ExpressionOpt))
-                        return node;
-
-                    var expression = RewriteExpression(node.ExpressionOpt);
-                    if (!ReferenceEquals(expression, node.ExpressionOpt))
-                        return new BoundThrowStatement(node.Syntax, expression);
-
-                    return node;
-                }
-
-                protected override BoundExpression RewriteExpression(BoundExpression node)
-                {
-                    switch (node)
-                    {
-                        case BoundLocalExpression local when _copies.TryGetValue(local.Local, out var replacement):
-                            return replacement;
-
-                        case BoundAssignmentExpression assignment:
-                            return RewriteAssignmentExpression(assignment);
-
-                        case BoundCompoundAssignmentExpression compoundAssignment:
-                            return RewriteCompoundAssignmentExpression(compoundAssignment);
-
-                        case BoundNullCoalescingAssignmentExpression nullCoalescingAssignment:
-                            return RewriteNullCoalescingAssignmentExpression(nullCoalescingAssignment);
-
-                        case BoundIncrementDecrementExpression incrementDecrement:
-                            return RewriteIncrementDecrementExpression(incrementDecrement);
-
-                        case BoundRefExpression refExpression:
-                            return RewriteRefExpression(refExpression);
-
-                        case BoundAddressOfExpression addressOf:
-                            return RewriteAddressOfExpression(addressOf);
-
-                        default:
-                            return base.RewriteExpression(node);
-                    }
-                }
-
-                protected override BoundExpression RewriteAssignmentExpression(BoundAssignmentExpression node)
-                {
-                    var right = RewriteExpression(node.Right);
-                    if (!ReferenceEquals(right, node.Right))
-                        return new BoundAssignmentExpression(node.Syntax, node.Left, right);
-                    return node;
-                }
-
-                protected override BoundExpression RewriteCompoundAssignmentExpression(BoundCompoundAssignmentExpression node)
-                {
-                    var value = RewriteExpression(node.Value);
-                    if (!ReferenceEquals(value, node.Value))
-                        return new BoundCompoundAssignmentExpression(
-                            node.Syntax, node.Left, node.OperatorKind, value,
-                            node.OperatorMethodOpt, node.UsesDirectOperator, node.IsChecked);
-                    return node;
-                }
-
-                protected override BoundExpression RewriteNullCoalescingAssignmentExpression(BoundNullCoalescingAssignmentExpression node)
-                {
-                    var value = RewriteExpression(node.Value);
-                    if (!ReferenceEquals(value, node.Value))
-                        return new BoundNullCoalescingAssignmentExpression(node.Syntax, node.Left, value);
-                    return node;
-                }
-
-                protected override BoundExpression RewriteIncrementDecrementExpression(BoundIncrementDecrementExpression node)
-                {
-                    var read = RewriteExpression(node.Read);
-                    var value = RewriteExpression(node.Value);
-                    if (!ReferenceEquals(read, node.Read) || !ReferenceEquals(value, node.Value))
-                    {
-                        return new BoundIncrementDecrementExpression(
-                            node.Syntax,
-                            node.Target,
-                            read,
-                            value,
-                            node.IsIncrement,
-                            node.IsPostfix,
-                            node.OperatorMethodOpt,
-                            node.UsesDirectOperator,
-                            node.IsChecked);
-                    }
-                    return node;
-                }
-
-                protected override BoundExpression RewriteRefExpression(BoundRefExpression node)
-                {
-                    return node;
-                }
-
-                protected override BoundExpression RewriteAddressOfExpression(BoundAddressOfExpression node)
-                {
-                    return node;
-                }
-            }
         }
 
 

@@ -562,6 +562,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.UnboxAny or
                 GenTreeKind.CastClass or
                 GenTreeKind.IsInst or
+                GenTreeKind.ConstString or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow)
                 return true;
@@ -1220,9 +1221,14 @@ namespace Cnidaria.Cs
                 {
                     node = CreateSsaInitialValueNode(value);
                 }
-                else
+                else if (_ssaDefinitions.TryGetValue(value, out definition) && definition.IsPhi)
                 {
                     node = CreateSsaPlaceholderValueNode(value);
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"SSA value {value} has no lowered defining node.");
                 }
 
                 _ssaValues[value] = node;

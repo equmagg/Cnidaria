@@ -7204,6 +7204,9 @@ namespace Cnidaria.Cs
                 if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister)
                     return false;
 
+                if (node.RegisterResult is not null && node.RegisterResult.LinearValueKey.IsSsaValue)
+                    return true;
+
                 return node.Kind switch
                 {
                     GenTreeKind.Local => false,

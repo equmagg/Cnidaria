@@ -6283,7 +6283,8 @@ namespace Cnidaria.Cs
             private readonly Dictionary<LabelSymbol, ImmutableArray<ExceptionRegionFrame>> _labelRegions = new();
             private readonly List<(GotoStatementSyntax Syntax, LabelSymbol Label,
                 ImmutableArray<ExceptionRegionFrame> SourceRegions)> _gotoRegions = new();
-            private readonly Stack<(LabelSymbol BreakLabel, LabelSymbol ContinueLabel)> _loopStack = new();
+            private readonly Stack<LabelSymbol> _breakStack = new();
+            private readonly Stack<LabelSymbol> _continueStack = new();
             private int _nextGeneratedId;
             private bool _diagnosticsEmitted;
             private int _nextExceptionRegionId;
@@ -6320,12 +6321,24 @@ namespace Cnidaria.Cs
             }
 
             public void PushLoop(LabelSymbol breakLabel, LabelSymbol continueLabel)
-                => _loopStack.Push((breakLabel, continueLabel));
+            {
+                _breakStack.Push(breakLabel);
+                _continueStack.Push(continueLabel);
+            }
 
             public void PopLoop()
             {
-                if (_loopStack.Count != 0)
-                    _loopStack.Pop();
+                if (_breakStack.Count != 0)
+                    _breakStack.Pop();
+                if (_continueStack.Count != 0)
+                    _continueStack.Pop();
+            }
+            public void PushBreak(LabelSymbol breakLabel)
+                => _breakStack.Push(breakLabel);
+            public void PopBreak()
+            {
+                if (_breakStack.Count != 0)
+                    _breakStack.Pop();
             }
             public void PushTryRegion() => PushExceptionRegion(ExceptionRegionKind.Try);
             public void PushCatchRegion() => PushExceptionRegion(ExceptionRegionKind.Catch);
@@ -6370,21 +6383,27 @@ namespace Cnidaria.Cs
                 var dst = ImmutableArray<ExceptionRegionFrame>.Empty; // method exit
                 AddTransferDiagnosticIfInvalid(src, dst, syntax, context, diagnostics);
             }
-            public bool TryGetCurrentLoop(out LabelSymbol breakLabel, out LabelSymbol continueLabel)
+            public bool TryGetCurrentBreak(out LabelSymbol breakLabel)
             {
-                if (_loopStack.Count == 0)
+                if (_breakStack.Count == 0)
                 {
                     breakLabel = null!;
-                    continueLabel = null!;
                     return false;
                 }
 
-                var top = _loopStack.Peek();
-                breakLabel = top.BreakLabel;
-                continueLabel = top.ContinueLabel;
+                breakLabel = _breakStack.Peek();
                 return true;
             }
-
+            public bool TryGetCurrentContinue(out LabelSymbol continueLabel)
+            {
+                if (_continueStack.Count == 0)
+                {
+                    continueLabel = null!;
+                    return false;
+                }
+                continueLabel = _continueStack.Peek();
+                return true;
+            }
             public void ReportUndefinedLabels(BindingContext context, DiagnosticBag diagnostics)
             {
                 if (_diagnosticsEmitted)
@@ -18526,7 +18545,7 @@ namespace Cnidaria.Cs
         }
         private BoundStatement BindBreak(BreakStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            if (!_flow.TryGetCurrentLoop(out var breakLabel, out _))
+            if (!_flow.TryGetCurrentBreak(out var breakLabel))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_FLOW001",
@@ -18542,8 +18561,7 @@ namespace Cnidaria.Cs
 
         private BoundStatement BindContinue(ContinueStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            if (!_flow.TryGetCurrentLoop(out var breakLabel, out var continueLabel)
-                || ReferenceEquals(breakLabel, continueLabel))
+            if (!_flow.TryGetCurrentContinue(out var continueLabel))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_FLOW002",
@@ -21856,7 +21874,7 @@ namespace Cnidaria.Cs
             if (fallbackSection >= 0) stmts.Add(new BoundGotoStatement(node, sectionLabels[fallbackSection]));
             else stmts.Add(new BoundGotoStatement(node, breakLabel));
 
-            _flow.PushLoop(breakLabel, breakLabel); // break only loop marker
+            _flow.PushBreak(breakLabel);
             try
             {
                 for (int i = 0; i < sectionCount; i++)
@@ -21876,7 +21894,7 @@ namespace Cnidaria.Cs
                     stmts.Add(new BoundGotoStatement(sec, breakLabel)); // implicit break
                 }
             }
-            finally { _flow.PopLoop(); }
+            finally { _flow.PopBreak(); }
 
             stmts.Add(new BoundLabelStatement(node, breakLabel));
             return new BoundBlockStatement(node, stmts.ToImmutable());

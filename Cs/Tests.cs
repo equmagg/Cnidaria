@@ -762,6 +762,649 @@ int[] a = new int[] { 10, 20 };
 a[i] = i++;
 Console.WriteLine(a[0] * 100 + a[1] * 10 + i);
 ", "201");
+            // 78 struct value copy isolation
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int A;
+    public int B;
+    public S(int a, int b) { A = a; B = b; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S a = new S(1, 2);
+        S b = a;
+        b.A = 9;
+        b.B = 8;
+        Console.Write(a.A);
+        Console.Write(a.B);
+        Console.Write(b.A);
+        Console.Write(b.B);
+    }
+}
+", "1298");
+            // 79 struct return copy isolation
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int A;
+    public int B;
+    public S(int a, int b) { A = a; B = b; }
+}
+internal class Program
+{
+    static S Make() => new S(3, 4);
+    public static void Main(string[] args)
+    {
+        S x = Make();
+        S y = Make();
+        x.A = 9;
+        Console.Write(x.A);
+        Console.Write(x.B);
+        Console.Write(y.A);
+        Console.Write(y.B);
+    }
+}
+", "9434");
+            // 80 struct field promotion
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+    public Pair(int x, int y) { X = x; Y = y; }
+}
+internal class Program
+{
+    static Pair Make(int a, int b) => new Pair(a + 1, b + 2);
+    static int Sum(Pair p) => p.X * 10 + p.Y;
+    public static void Main(string[] args)
+    {
+        Console.WriteLine(Sum(Make(4, 5)));
+    }
+}
+", "57");
+            // 81 struct argument mutation does not affect caller without ref
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+}
+internal class Program
+{
+    static void Mutate(Pair p)
+    {
+        p.X = 100;
+        p.Y = 200;
+    }
+    public static void Main(string[] args)
+    {
+        Pair p;
+        p.X = 1;
+        p.Y = 2;
+        Mutate(p);
+        Console.Write(p.X);
+        Console.Write(p.Y);
+    }
+}
+", "12");
+            // 82 struct ref argument mutation affects caller
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+}
+internal class Program
+{
+    static void Mutate(ref Pair p)
+    {
+        p.X = 100;
+        p.Y = 200;
+    }
+    public static void Main(string[] args)
+    {
+        Pair p;
+        p.X = 1;
+        p.Y = 2;
+        Mutate(ref p);
+        Console.Write(p.X);
+        Console.Write(p.Y);
+    }
+}
+", "100200");
+            // 83 struct out parameter writes all fields
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+}
+internal class Program
+{
+    static void Make(out Pair p)
+    {
+        p.X = 7;
+        p.Y = 8;
+    }
+    public static void Main(string[] args)
+    {
+        Pair p;
+        Make(out p);
+        Console.Write(p.X);
+        Console.Write(p.Y);
+    }
+}
+", "78");
+            // 84 nested struct field load
+            RunTest(@"
+namespace Ns;
+struct Inner
+{
+    public int A;
+    public int B;
+}
+struct Outer
+{
+    public Inner I;
+    public int C;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Outer o;
+        o.I.A = 1;
+        o.I.B = 2;
+        o.C = 3;
+        Console.WriteLine(o.I.A * 100 + o.I.B * 10 + o.C);
+    }
+}
+", "123");
+            // 85 nested struct field mutation
+            RunTest(@"
+namespace Ns;
+struct Inner
+{
+    public int A;
+    public int B;
+}
+struct Outer
+{
+    public Inner I;
+}
+internal class Program
+{
+    static void Inc(ref Outer o)
+    {
+        o.I.A++;
+        o.I.B += 10;
+    }
+    public static void Main(string[] args)
+    {
+        Outer o;
+        o.I.A = 4;
+        o.I.B = 5;
+        Inc(ref o);
+        Console.Write(o.I.A);
+        Console.Write(o.I.B);
+    }
+}
+", "515");
+            // 86 array of structs stores independent copies
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+    public Pair(int x, int y) { X = x; Y = y; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Pair p = new Pair(1, 2);
+        Pair[] a = new Pair[2];
+        a[0] = p;
+        p.X = 9;
+        a[1] = p;
+        Console.Write(a[0].X);
+        Console.Write(a[0].Y);
+        Console.Write(a[1].X);
+        Console.Write(a[1].Y);
+    }
+}
+", "1292");
+            // 87 array struct element field assignment
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Pair[] a = new Pair[2];
+        a[0].X = 3;
+        a[0].Y = 4;
+        a[1].X = a[0].X + 10;
+        a[1].Y = a[0].Y + 20;
+        Console.Write(a[0].X);
+        Console.Write(a[0].Y);
+        Console.Write(a[1].X);
+        Console.Write(a[1].Y);
+    }
+}
+", "341324");
+            // 88 tuple field promotion with mixed sizes
+            RunTest(@"
+(byte a, int b, short c) Make() => ((byte)2, 300, (short)4);
+int Sum((byte a, int b, short c) p) => p.a * 10000 + p.b * 10 + p.c;
+Console.WriteLine(Sum(Make()));
+", "23004");
+            // 89 tuple field promotion with biger sizes
+            RunTest(@"
+(long a, int b) Make() => (10000000000L, 7);
+long Sum((long a, int b) p) => p.a + p.b;
+Console.WriteLine(Sum(Make()));
+", "10000000007");
+            // 90 tuple mutation local
+            RunTest(@"
+(int a, int b) t = (1, 2);
+t.a += 10;
+t.Item2 += 20;
+Console.Write(t.a);
+Console.Write(t.b);
+", "1122");
+            // 91 tuple passed by ref
+            RunTest(@"
+void Mutate(ref (int a, int b) t)
+{
+    t.a += 3;
+    t.b += 4;
+}
+var t = (10, 20);
+Mutate(ref t);
+Console.Write(t.Item1);
+Console.Write(t.Item2);
+", "1324");
+            // 92 tuple out parameter
+            RunTest(@"
+void Make(out (int a, int b) t)
+{
+    t = (5, 6);
+}
+(int a, int b) x;
+Make(out x);
+Console.Write(x.a);
+Console.Write(x.b);
+", "56");
+            // 93 tuple nested fields
+            RunTest(@"
+var t = ((1, 2), (3, 4));
+Console.Write(t.Item1.Item1);
+Console.Write(t.Item1.Item2);
+Console.Write(t.Item2.Item1);
+Console.Write(t.Item2.Item2);
+", "1234");
+            // 94 tuple deconstruction from method return
+            RunTest(@"
+(int a, int b) Make() => (7, 8);
+var (x, y) = Make();
+Console.Write(x);
+Console.Write(y);
+", "78");
+            // 95 tuple swap with side effecting indexers
+            RunTest(@"
+int[] a = new int[] { 1, 2 };
+int i = 0;
+(a[i++], a[i++]) = (a[1], a[0]);
+Console.Write(a[0]);
+Console.Write(a[1]);
+Console.Write(i);
+", "212");
+            // 96 nested tuple assignment order
+            RunTest(@"
+int a = 1, b = 2, c = 3;
+(a, (b, c)) = (c, (a, b));
+Console.Write(a);
+Console.Write(b);
+Console.Write(c);
+", "312");
+            // 97 local function capture after mutation
+            RunTest(@"
+int x = 1;
+int F() => x;
+x = 9;
+Console.WriteLine(F());
+", "9");
+            // 98 nested local function captures two levels
+            RunTest(@"
+int x = 1;
+int A()
+{
+    int y = 10;
+    int B()
+    {
+        int z = 100;
+        return x + y + z;
+    }
+    return B();
+}
+x = 2;
+Console.WriteLine(A());
+", "112");
+            // 99 capture mutated in loop
+            RunTest(@"
+int x = 0;
+void Add(int v) { x += v; }
+for (int i = 1; i <= 5; i++)
+{
+    Add(i);
+}
+Console.WriteLine(x);
+", "15");
+            // 100 recursive local function with captured accumulator
+            RunTest(@"
+int acc = 0;
+void Walk(int n)
+{
+    if (n == 0) return;
+    acc += n;
+    Walk(n - 1);
+}
+Walk(5);
+Console.WriteLine(acc);
+", "15");
+            // 101 argument evaluation order with mixed ref/out
+            RunTest(@"
+int x = 1;
+int Next() { return x++; }
+void M(int a, ref int b, int c)
+{
+    b = a * 100 + b * 10 + c;
+}
+int y = 2;
+M(Next(), ref y, Next());
+Console.WriteLine(y * 10 + x);
+", "1223");
+
+            // 102 assignment target evaluated before rhs
+            RunTest(@"
+int[] a = new int[] { 10, 20, 30 };
+int i = 0;
+a[i] = (i = 2);
+Console.Write(a[0]);
+Console.Write(a[1]);
+Console.Write(a[2]);
+Console.Write(i);
+", "220302");
+            // 103 compound assignment evaluates once
+            RunTest(@"
+int[] a = new int[] { 10, 20, 30 };
+int i = 0;
+a[i++] += 5;
+Console.Write(a[0]);
+Console.Write(a[1]);
+Console.Write(a[2]);
+Console.Write(i);
+", "1520301");
+            // 104 null coalescing lazy rhs
+            RunTest(@"
+int calls = 0;
+string F()
+{
+    calls++;
+    return ""x"";
+}
+string a = ""a"";
+string b = null;
+Console.Write(a ?? F());
+Console.Write(b ?? F());
+Console.Write(calls);
+", "ax1");
+            // 105 null coalescing assignment
+            RunTest(@"
+string a = null;
+string b = ""b"";
+a ??= ""a"";
+b ??= ""x"";
+Console.Write(a);
+Console.Write(b);
+", "ab");
+            // 106 unchecked overflow wraps
+            RunTest(@"
+int x = unchecked(2147483647 + 1);
+Console.WriteLine(x == -2147483648);
+", "true");
+            // 107 unchecked conversion truncates
+            RunTest(@"
+long x = 300;
+byte b = unchecked((byte)x);
+Console.WriteLine(b);
+", "44");
+            // 108 checked overflow throws
+            RunTest(@"
+try
+{
+    int x = checked(2147483647 + 1);
+    Console.Write(x);
+}
+catch (OverflowException)
+{
+    Console.Write(""overflow"");
+}
+", "overflow");
+            // 109 checked conversion overflow
+            RunTest(@"
+try
+{
+    long x = 300;
+    byte b = checked((byte)x);
+    Console.Write(b);
+}
+catch (OverflowException)
+{
+    Console.Write(""overflow"");
+}
+", "overflow");
+            // 110 switch fallthrough
+            RunTest(@"
+int F(int x)
+{
+    int r = 0;
+    switch (x)
+    {
+        case 1:
+            r += 10;
+            break;
+        case 2:
+        case 3:
+            r += 20;
+            break;
+        default:
+            r += 30;
+            break;
+    }
+    return r + x;
+}
+Console.WriteLine(F(1) + F(2) + F(4));
+", "67");
+            // 111 switch in loop with continue and break
+            RunTest(@"
+int s = 0;
+for (int i = 0; i < 6; i++)
+{
+    switch (i)
+    {
+        case 1:
+            continue;
+        case 4:
+            break;
+        default:
+            s += i;
+            break;
+    }
+    s += 10;
+}
+Console.WriteLine(s);
+", "60");
+            // 112 do while executes once
+            RunTest(@"
+int i = 10;
+int s = 0;
+do
+{
+    s += i;
+    i++;
+}
+while (i < 10);
+Console.WriteLine(s);
+", "10");
+            // 113 for without initializer and iterator
+            RunTest(@"
+int i = 0;
+int s = 0;
+for (; i < 5;)
+{
+    s += i;
+    i++;
+}
+Console.WriteLine(s);
+", "10");
+            // 114 nested break exits only inner loop
+            RunTest(@"
+int s = 0;
+for (int i = 0; i < 3; i++)
+{
+    for (int j = 0; j < 5; j++)
+    {
+        if (j == 2) break;
+        s += i * 10 + j;
+    }
+}
+Console.WriteLine(s);
+", "63");
+            // 115 foreach over struct array
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+    public Pair(int x, int y) { X = x; Y = y; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Pair[] a = new Pair[] { new Pair(1, 2), new Pair(3, 4) };
+        int s = 0;
+        foreach (Pair p in a)
+        {
+            s += p.X * 10 + p.Y;
+        }
+        Console.WriteLine(s);
+    }
+}
+", "46");
+            // 116 double to string shortest round trip
+            RunTest(@"
+Console.WriteLine(Math.PI);
+", "3.141592653589793");
+            // 117 generic struct identity
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+    public Pair(int x, int y) { X = x; Y = y; }
+}
+internal class Program
+{
+    static T Id<T>(T value) => value;
+    public static void Main(string[] args)
+    {
+        Pair p = Id<Pair>(new Pair(5, 6));
+        Console.Write(p.X);
+        Console.Write(p.Y);
+    }
+}
+", "56");
+            // 118 generic struct swap
+            RunTest(@"
+namespace Ns;
+struct Pair
+{
+    public int X;
+    public int Y;
+    public Pair(int x, int y) { X = x; Y = y; }
+}
+internal class Program
+{
+    static void Swap<T>(ref T a, ref T b)
+    {
+        T t = a;
+        a = b;
+        b = t;
+    }
+    public static void Main(string[] args)
+    {
+        Pair a = new Pair(1, 2);
+        Pair b = new Pair(3, 4);
+        Swap<Pair>(ref a, ref b);
+        Console.Write(a.X);
+        Console.Write(a.Y);
+        Console.Write(b.X);
+        Console.Write(b.Y);
+    }
+}
+", "3412");
+            // 119 generic array write/read
+            RunTest(@"
+T First<T>(T[] a)
+{
+    return a[0];
+}
+int[] xs = new int[] { 7, 8 };
+string[] ss = new string[] { ""a"", ""b"" };
+Console.Write(First<int>(xs));
+Console.Write(First<string>(ss));
+", "7a");
+            // 120 virtual dispatch
+            RunTest(@"
+namespace Ns;
+class Base
+{
+    public virtual int F() { return 1; }
+}
+class Derived : Base
+{
+    public override int F() { return 2; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Base b = new Derived();
+        Console.WriteLine(b.F());
+    }
+}
+", "2");
 
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");

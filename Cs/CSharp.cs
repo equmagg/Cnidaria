@@ -300,8 +300,9 @@ namespace Cnidaria.Cs
                 AddUnique(appModule);
 
                 var rts = new RuntimeTypeSystem(modules);
-                int entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
-                var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
+                ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
+                //int entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
                 var backend = BackendPipeline.CompileProgram(genTreeProgram);
                 byte[] registerImage = ImageSerializer.ToBytes(backend.Image);
                 byte[] stackFunctions = BytecodeSerializer.SerializeStackFunctions(builtFuncs);
@@ -314,7 +315,60 @@ namespace Cnidaria.Cs
                 return (null, diagnostics);
             }
         }
+        private static ImmutableArray<int> FindRunnableRegisterRoots(IMetadataView appMeta)
+        {
+            if (appMeta is null)
+                throw new ArgumentNullException(nameof(appMeta));
 
+            var roots = ImmutableArray.CreateBuilder<int>();
+            var seen = new HashSet<int>();
+
+            void Add(int methodToken)
+            {
+                if (MetadataToken.Table(methodToken) != MetadataToken.MethodDef)
+                    return;
+
+                int rid = MetadataToken.Rid(methodToken);
+                if (rid <= 0 || rid > appMeta.GetRowCount(MetadataTableKind.MethodDef))
+                    return;
+
+                if (seen.Add(methodToken))
+                    roots.Add(methodToken);
+            }
+
+            if (BytecodeBuilder.TryFindEntryPointMethodDef(appMeta, out int mainToken))
+                Add(mainToken);
+
+            var attributesByParent = BuildAttributeMap(appMeta);
+
+            foreach (int methodToken in EnumerateMethodDefTokens(appMeta))
+            {
+                if (!attributesByParent.TryGetValue(methodToken, out var attrs))
+                    continue;
+
+                for (int i = 0; i < attrs.Count; i++)
+                {
+                    var attr = attrs[i];
+
+                    if (attr.Target != AttributeApplicationTarget.Method)
+                        continue;
+
+                    string name = NormalizeAttrName(attr.Name);
+
+                    if (StringComparer.Ordinal.Equals(name, "Command") ||
+                        StringComparer.Ordinal.Equals(name, "Button"))
+                    {
+                        Add(methodToken);
+                        break;
+                    }
+                }
+            }
+
+            if (roots.Count == 0)
+                throw new InvalidOperationException("No runnable entry roots found in module metadata.");
+
+            return roots.ToImmutable();
+        }
         public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
             byte[] runnableAppImage,
             CancellationTokenSource cts,
@@ -385,6 +439,7 @@ namespace Cnidaria.Cs
                 }
 
                 var rts = new RuntimeTypeSystem(modules);
+                HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta);
                 var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
 
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + staticRegionLimit);
@@ -435,7 +490,15 @@ namespace Cnidaria.Cs
                 return (output.ToString(), diagnostics, ExecutionContext.Empty);
             }
         }
-
+        private static void HydrateRegisterRuntimeIds(
+            IReadOnlyDictionary<string, RuntimeModule> modules,
+            RuntimeTypeSystem rts,
+            RuntimeModule appModule,
+            IMetadataView appMeta)
+        {
+            ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
+            _ = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
+        }
         private static byte[] SerializeRegisterRunnableApplication(byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage)
         {
             using var ms = new MemoryStream(24 + flatMetadata.Length + stackFunctions.Length + registerImage.Length);

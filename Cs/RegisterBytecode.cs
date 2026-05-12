@@ -438,6 +438,16 @@ namespace Cnidaria.Cs
         ZeroExtendI16ToI32 = 350,
         TruncI32ToI8 = 351,
         TruncI32ToI16 = 352,
+        I32ToI8Ovf = 353,
+        U32ToI8Ovf = 354,
+        I32ToU8Ovf = 355,
+        U32ToU8Ovf = 356,
+        I32ToI16Ovf = 357,
+        U32ToI16Ovf = 358,
+        I32ToU16Ovf = 359,
+        U32ToU16Ovf = 360,
+        I64ToU32Ovf = 361,
+        U64ToU32Ovf = 362,
 
         LdI1 = 384,
         LdU1 = 385,
@@ -1630,7 +1640,7 @@ namespace Cnidaria.Cs
                 or Op.LiTypeHandle or Op.LiMethodHandle or Op.LiFieldHandle or Op.LiStaticBase;
 
         private static bool IsConversionInstruction(Op op)
-            => IsOpInRange(op, Op.I32ToI64, Op.TruncI32ToI16);
+            => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
 
         private static bool IsRuntimeObjectInstruction(Op op)
             => IsOpInRange(op, Op.NewObj, Op.RuntimeTypeEquals);
@@ -1881,7 +1891,7 @@ namespace Cnidaria.Cs
         public void LiF32Bits(MachineRegister rd, int bits) => Emit(InstrDesc.Li(Op.LiF32Bits, rd, bits));
         public void LiF64Bits(MachineRegister rd, long bits) => Emit(InstrDesc.Li(Op.LiF64Bits, rd, bits));
         public void LiNull(MachineRegister rd) => Emit(InstrDesc.Li(Op.LiNull, rd, 0));
-        public void LiString(MachineRegister rd, int userStringRid) => Emit(InstrDesc.Li(Op.LiString, rd, userStringRid));
+        public void LiString(MachineRegister rd, int userStringRid) => Emit(InstrDesc.Li(Op.LiString, rd, userStringRid, Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
         public void LiTypeHandle(MachineRegister rd, int runtimeTypeId) => Emit(InstrDesc.Li(Op.LiTypeHandle, rd, runtimeTypeId));
 
         public void I32Add(MachineRegister rd, MachineRegister a, MachineRegister b) => Emit(InstrDesc.R(Op.I32Add, rd, a, b));
@@ -3115,7 +3125,7 @@ namespace Cnidaria.Cs
             => op is Op.F32IsNaN or Op.F32IsFinite or Op.F64IsNaN or Op.F64IsFinite;
 
         private static bool IsConversion(Op op)
-            => IsOpInRange(op, Op.I32ToI64, Op.TruncI32ToI16);
+            => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
 
         private static bool IsAddressMemoryInstruction(Op op)
             => IsOpInRange(op, Op.LdI1, Op.WriteBarrier);

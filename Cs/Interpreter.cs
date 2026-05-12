@@ -720,6 +720,8 @@ namespace Cnidaria.Cs
                         case Op.I64ToI32: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1))); break;
                         case Op.I64ToI32Ovf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1))); break;
                         case Op.U64ToI32Ovf: SetI32(ins.Rd, checked((int)(ulong)GetGpr(ins.Rs1))); break;
+                        case Op.I64ToU32Ovf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1)))); break;
+                        case Op.U64ToU32Ovf: SetI32(ins.Rd, unchecked((int)checked((uint)(ulong)GetGpr(ins.Rs1)))); break;
                         case Op.I32ToF32: SetF32(ins.Rd, (int)GetGpr(ins.Rs1)); break;
                         case Op.I32ToF64: SetF64(ins.Rd, (int)GetGpr(ins.Rs1)); break;
                         case Op.U32ToF32: SetF32(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
@@ -748,6 +750,14 @@ namespace Cnidaria.Cs
                         case Op.ZeroExtendI16ToI32: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
                         case Op.TruncI32ToI8: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
                         case Op.TruncI32ToI16: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
+                        case Op.I32ToI8Ovf: SetI32(ins.Rd, checked((sbyte)(int)GetGpr(ins.Rs1))); break;
+                        case Op.U32ToI8Ovf: SetI32(ins.Rd, checked((sbyte)(uint)GetGpr(ins.Rs1))); break;
+                        case Op.I32ToU8Ovf: SetI32(ins.Rd, checked((byte)(int)GetGpr(ins.Rs1))); break;
+                        case Op.U32ToU8Ovf: SetI32(ins.Rd, checked((byte)(uint)GetGpr(ins.Rs1))); break;
+                        case Op.I32ToI16Ovf: SetI32(ins.Rd, checked((short)(int)GetGpr(ins.Rs1))); break;
+                        case Op.U32ToI16Ovf: SetI32(ins.Rd, checked((short)(uint)GetGpr(ins.Rs1))); break;
+                        case Op.I32ToU16Ovf: SetI32(ins.Rd, checked((ushort)(int)GetGpr(ins.Rs1))); break;
+                        case Op.U32ToU16Ovf: SetI32(ins.Rd, checked((ushort)(uint)GetGpr(ins.Rs1))); break;
 
                         case Op.LdI1: SetI32(ins.Rd, (sbyte)ReadU8(EA(ins))); break;
                         case Op.LdU1: SetI32(ins.Rd, ReadU8(EA(ins))); break;
@@ -2001,7 +2011,7 @@ namespace Cnidaria.Cs
                 }
                 if (kind == EhRegionKind.Catch && exceptionType is not null)
                 {
-                    var catchType = _rts.GetTypeById(h.CatchTypeId);
+                    var catchType = ResolveCatchType(h.CatchTypeId);
                     if (IsAssignableTo(exceptionType, catchType))
                     {
                         bestSpan = span;
@@ -2012,7 +2022,17 @@ namespace Cnidaria.Cs
             }
             return found;
         }
-
+        private RuntimeType ResolveCatchType(int catchTypeTokenOrId)
+        {
+            int table = MetadataToken.Table(catchTypeTokenOrId);
+            if (table is MetadataToken.TypeDef or MetadataToken.TypeRef or MetadataToken.TypeSpec)
+            {
+                RuntimeMethod method = CurrentFrameMethod();
+                RuntimeModule module = method.BodyModule ?? CurrentModule();
+                return _rts.ResolveTypeInMethodContext(module, catchTypeTokenOrId, method);
+            }
+            return _rts.GetTypeById(catchTypeTokenOrId);
+        }
         private bool TryFindEnclosingFinally(int fromPc, int targetPc, out EhRegionRecord region)
         {
             var m = _image.Methods[_currentMethodIndex];

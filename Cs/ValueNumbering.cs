@@ -527,7 +527,7 @@ namespace Cnidaria.Cs
         }
 
         public ValueNumber VNForFunc(GenStackKind stackKind, RuntimeType? type, ValueNumberFunction function, params ValueNumber[] args)
-            => VNForFunc(stackKind, type, function, args.AsImmutableArray());
+            => VNForFunc(stackKind, type, function, args is null || args.Length == 0 ? ImmutableArray<ValueNumber>.Empty : ImmutableArray.Create(args));
 
         public ValueNumber VNForFunc(GenStackKind stackKind, RuntimeType? type, ValueNumberFunction function, ImmutableArray<ValueNumber> args)
         {
@@ -1094,6 +1094,7 @@ namespace Cnidaria.Cs
                 method.InitialMemoryValues,
                 method.MemoryDefinitions);
             SsaSourceAnnotations.Attach(numbered);
+            SsaVerifier.Verify(numbered);
             return numbered;
         }
 
@@ -1103,15 +1104,19 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.ValueDefinitions.Length; i++)
             {
                 var definition = method.ValueDefinitions[i];
-                if (result.TryGetSsaValue(definition.Name, out var valueNumbers))
-                    definition.Descriptor.SetValueNumbers(valueNumbers);
+                if (!result.TryGetSsaValue(definition.Name, out var valueNumbers))
+                    throw new InvalidOperationException("Value numbering did not assign an SSA descriptor value number for " + definition.Name + ".");
+
+                definition.Descriptor.SetValueNumbers(valueNumbers);
             }
 
             for (int i = 0; i < method.MemoryDefinitions.Length; i++)
             {
                 var definition = method.MemoryDefinitions[i];
-                if (result.TryGetMemoryValue(definition.Name, out var valueNumber))
-                    definition.Descriptor.SetValueNumber(valueNumber);
+                if (!result.TryGetMemoryValue(definition.Name, out var valueNumber))
+                    throw new InvalidOperationException("Value numbering did not assign a memory SSA descriptor value number for " + definition.Name + ".");
+
+                definition.Descriptor.SetValueNumber(valueNumber);
             }
         }
 
@@ -1469,13 +1474,16 @@ namespace Cnidaria.Cs
                     var target = tree.StoreTarget.Value;
                     var info = GetSlotInfo(target.Slot);
                     ValueNumberPair normalized;
-                    if (tree.LocalFieldBaseValue.HasValue && tree.LocalField is not null)
+                    if (tree.IsPartialDefinition)
                     {
-                        if (!tree.LocalFieldBaseValue.Value.Slot.Equals(target.Slot))
-                            throw new InvalidOperationException("Partial SSA definition base slot does not match target slot at node " + tree.Source.Id.ToString() + ".");
+                        if (tree.LocalFieldBaseValue.HasValue)
+                            throw new InvalidOperationException("Partial SSA definition still carries node-level use-def metadata at node " + tree.Source.Id.ToString() + ".");
+                        if (!_ssaDescriptors.TryGetValue(target, out var descriptor) || !descriptor.HasUseDefSsaNum)
+                            throw new InvalidOperationException("Partial SSA definition " + target + " has no descriptor use-def SSA number.");
 
-                        var oldLocal = GetSsaValue(tree.LocalFieldBaseValue.Value);
-                        normalized = NumberPartialLocalDefinition(tree.Source, oldLocal, rhs, info.StackKind, info.Type, tree.LocalField);
+                        var useName = new SsaValueName(target.Slot, descriptor.UseDefSsaNumber);
+                        var oldLocal = GetSsaValue(useName);
+                        normalized = NumberPartialLocalDefinition(tree.Source, oldLocal, rhs, info.StackKind, info.Type, tree.LocalField!);
                     }
                     else
                     {
@@ -1700,21 +1708,31 @@ namespace Cnidaria.Cs
             {
                 var func = BinaryFunction(node.SourceOp);
                 if (func == ValueNumberFunction.None)
-                    return ValueNumberPair.Same(_store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.MemOpaque, ArgsFromPairs(operands, ValueNumberCategory.Liberal)));
+                    return ValueNumberPair.Same(_store.VNForStableUnique(node.Id, node.StackKind,
+                        node.Type, ValueNumberFunction.MemOpaque, ArgsFromPairs(operands, ValueNumberCategory.Liberal)));
 
-                ValueNumber leftLiberal = operands.Length > 0 ? operands[0].Liberal : ValueNumberStore.NoVN;
-                ValueNumber rightLiberal = operands.Length > 1 ? operands[1].Liberal : ValueNumberStore.NoVN;
-                ValueNumber leftConservative = operands.Length > 0 ? operands[0].Conservative : ValueNumberStore.NoVN;
-                ValueNumber rightConservative = operands.Length > 1 ? operands[1].Conservative : ValueNumberStore.NoVN;
+                if (IsCheckedOverflowBinaryOp(node.SourceOp))
+                {
+                    var args = ArgsFromPairs(operands, ValueNumberCategory.Liberal)
+                        .Add(_store.VNForInt32((int)node.SourceOp));
+                    ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, func, args);
+                    return WithException(node, liberal);
+                }
+                {
+                    ValueNumber leftLiberal = operands.Length > 0 ? operands[0].Liberal : ValueNumberStore.NoVN;
+                    ValueNumber rightLiberal = operands.Length > 1 ? operands[1].Liberal : ValueNumberStore.NoVN;
+                    ValueNumber leftConservative = operands.Length > 0 ? operands[0].Conservative : ValueNumberStore.NoVN;
+                    ValueNumber rightConservative = operands.Length > 1 ? operands[1].Conservative : ValueNumberStore.NoVN;
 
-                ValueNumber liberal = _store.VNForFunc(node.StackKind, node.Type, func, leftLiberal, rightLiberal);
-                ValueNumber conservative = leftLiberal == leftConservative && rightLiberal == rightConservative
-                    ? liberal
-                    : _store.VNForFunc(node.StackKind, node.Type, func, leftConservative, rightConservative);
+                    ValueNumber liberal = _store.VNForFunc(node.StackKind, node.Type, func, leftLiberal, rightLiberal);
+                    ValueNumber conservative = leftLiberal == leftConservative && rightLiberal == rightConservative
+                        ? liberal
+                        : _store.VNForFunc(node.StackKind, node.Type, func, leftConservative, rightConservative);
 
-                if (node.CanThrow)
-                    return WithException(node, liberal, conservative);
-                return new ValueNumberPair(liberal, conservative);
+                    if (node.CanThrow)
+                        return WithException(node, liberal, conservative);
+                    return new ValueNumberPair(liberal, conservative);
+                }
             }
 
             private ValueNumberPair Conv(GenTree node, ImmutableArray<ValueNumberPair> operands)
@@ -2148,14 +2166,17 @@ namespace Cnidaria.Cs
                     builder.Add(operands[i][category]);
                 return builder.ToImmutable();
             }
-
+            private static bool IsCheckedOverflowBinaryOp(BytecodeOp op)
+                => op is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
+                    or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
+                    or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
             private static ValueNumberFunction BinaryFunction(BytecodeOp op)
             {
                 return op switch
                 {
-                    BytecodeOp.Add => ValueNumberFunction.Add,
-                    BytecodeOp.Sub => ValueNumberFunction.Sub,
-                    BytecodeOp.Mul => ValueNumberFunction.Mul,
+                    BytecodeOp.Add or BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un => ValueNumberFunction.Add,
+                    BytecodeOp.Sub or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un => ValueNumberFunction.Sub,
+                    BytecodeOp.Mul or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un => ValueNumberFunction.Mul,
                     BytecodeOp.Div => ValueNumberFunction.Div,
                     BytecodeOp.Div_Un => ValueNumberFunction.DivUn,
                     BytecodeOp.Rem => ValueNumberFunction.Rem,
@@ -2248,20 +2269,5 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal static class ImmutableArrayValueNumberExtensions
-    {
-        public static ImmutableArray<T> AsImmutableArray<T>(this T[] values)
-            => values is null || values.Length == 0 ? ImmutableArray<T>.Empty : ImmutableArray.Create(values);
-
-        public static ImmutableArray<T> Add<T>(this ImmutableArray<T> values, T value)
-        {
-            if (values.IsDefaultOrEmpty)
-                return ImmutableArray.Create(value);
-            var builder = ImmutableArray.CreateBuilder<T>(values.Length + 1);
-            builder.AddRange(values);
-            builder.Add(value);
-            return builder.ToImmutable();
-        }
-    }
 
 }

@@ -185,7 +185,7 @@ namespace Cnidaria.Cs
                     hirMethod,
                     hirMethod.Cfg,
                     hirMethod.HirLiveness,
-                    validate: false);
+                    validate: options.ValidateSsa);
                 ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod);
                 hirMethod = ssaMethod.GenTreeMethod;
                 hirMethod.AttachSsa(ssaMethod, optimized: false);
@@ -869,7 +869,10 @@ namespace Cnidaria.Cs
                         EmitConversion(instruction, source);
                         return;
                     case GenTreeKind.Branch:
-                        _asm.J(LabelForTarget(source));
+                        if (source.SourceOp == BytecodeOp.Leave)
+                            _asm.Leave(LabelForTarget(source));
+                        else
+                            _asm.J(LabelForTarget(source));
                         return;
                     case GenTreeKind.BranchTrue:
                     case GenTreeKind.BranchFalse:
@@ -1334,7 +1337,7 @@ namespace Cnidaria.Cs
                 bool f32 = IsFloat32Value(type, kind);
                 bool f64 = IsFloat64Value(type, kind);
                 bool i64 = Is64BitInteger(type, kind);
-                bool unsigned = IsUnsignedInteger(type, kind) || source.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un or BytecodeOp.Div_Un or BytecodeOp.Rem_Un or BytecodeOp.Shr_Un;
+                bool unsigned = IsUnsignedInteger(type, kind) || source.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un or BytecodeOp.Div_Un or BytecodeOp.Rem_Un or BytecodeOp.Shr_Un or BytecodeOp.Add_Ovf_Un or BytecodeOp.Sub_Ovf_Un or BytecodeOp.Mul_Ovf_Un;
 
                 if (TryGetContainedIntegerImmediate(instruction, 1, out long immediate))
                 {
@@ -1384,8 +1387,14 @@ namespace Cnidaria.Cs
                     op = source.SourceOp switch
                     {
                         BytecodeOp.Add => Op.I64Add,
+                        BytecodeOp.Add_Ovf => Op.I64AddOvf,
+                        BytecodeOp.Add_Ovf_Un => Op.U64AddOvf,
                         BytecodeOp.Sub => Op.I64Sub,
+                        BytecodeOp.Sub_Ovf => Op.I64SubOvf,
+                        BytecodeOp.Sub_Ovf_Un => Op.U64SubOvf,
                         BytecodeOp.Mul => Op.I64Mul,
+                        BytecodeOp.Mul_Ovf => Op.I64MulOvf,
+                        BytecodeOp.Mul_Ovf_Un => Op.U64MulOvf,
                         BytecodeOp.Div => unsigned ? Op.U64Div : Op.I64Div,
                         BytecodeOp.Div_Un => Op.U64Div,
                         BytecodeOp.Rem => unsigned ? Op.U64Rem : Op.I64Rem,
@@ -1407,8 +1416,14 @@ namespace Cnidaria.Cs
                     op = source.SourceOp switch
                     {
                         BytecodeOp.Add => Op.I32Add,
+                        BytecodeOp.Add_Ovf => Op.I32AddOvf,
+                        BytecodeOp.Add_Ovf_Un => Op.U32AddOvf,
                         BytecodeOp.Sub => Op.I32Sub,
+                        BytecodeOp.Sub_Ovf => Op.I32SubOvf,
+                        BytecodeOp.Sub_Ovf_Un => Op.U32SubOvf,
                         BytecodeOp.Mul => Op.I32Mul,
+                        BytecodeOp.Mul_Ovf => Op.I32MulOvf,
+                        BytecodeOp.Mul_Ovf_Un => Op.U32MulOvf,
                         BytecodeOp.Div => unsigned ? Op.U32Div : Op.I32Div,
                         BytecodeOp.Div_Un => Op.U32Div,
                         BytecodeOp.Rem => unsigned ? Op.U32Rem : Op.I32Rem,
@@ -1562,10 +1577,14 @@ namespace Cnidaria.Cs
                 switch (source.ConvKind)
                 {
                     case NumericConvKind.I4:
-                    case NumericConvKind.U4:
                     case NumericConvKind.NativeInt:
-                    case NumericConvKind.NativeUInt:
                         if (fromI64) op = CheckedI64ToI32Op(checkedConversion, fromUnsigned);
+                        else if (fromF32) op = checkedConversion ? Op.F32ToI32Ovf : Op.F32ToI32;
+                        else if (fromF64) op = checkedConversion ? Op.F64ToI32Ovf : Op.F64ToI32;
+                        break;
+                    case NumericConvKind.U4:
+                    case NumericConvKind.NativeUInt:
+                        if (fromI64) op = CheckedI64ToU32Op(checkedConversion, fromUnsigned);
                         else if (fromF32) op = checkedConversion ? Op.F32ToI32Ovf : Op.F32ToI32;
                         else if (fromF64) op = checkedConversion ? Op.F64ToI32Ovf : Op.F64ToI32;
                         break;
@@ -1658,6 +1677,12 @@ namespace Cnidaria.Cs
                     src32 = rd;
                 }
 
+                if (checkedConversion)
+                {
+                    EmitR(source, CheckedNarrowI32Op(width, signedResult, fromUnsigned), rd, src32, MachineRegister.Invalid);
+                    return;
+                }
+
                 if (width == 1)
                 {
                     EmitR(source, Op.TruncI32ToI8, rd, src32, MachineRegister.Invalid);
@@ -1674,6 +1699,29 @@ namespace Cnidaria.Cs
                 if (!checkedConversion)
                     return Op.I64ToI32;
                 return sourceUnsigned ? Op.U64ToI32Ovf : Op.I64ToI32Ovf;
+            }
+
+            private static Op CheckedI64ToU32Op(bool checkedConversion, bool sourceUnsigned)
+            {
+                if (!checkedConversion)
+                    return Op.I64ToI32;
+                return sourceUnsigned ? Op.U64ToU32Ovf : Op.I64ToU32Ovf;
+            }
+
+            private static Op CheckedNarrowI32Op(int width, bool signedResult, bool sourceUnsigned)
+            {
+                return (width, signedResult, sourceUnsigned) switch
+                {
+                    (1, true, false) => Op.I32ToI8Ovf,
+                    (1, true, true) => Op.U32ToI8Ovf,
+                    (1, false, false) => Op.I32ToU8Ovf,
+                    (1, false, true) => Op.U32ToU8Ovf,
+                    (2, true, false) => Op.I32ToI16Ovf,
+                    (2, true, true) => Op.U32ToI16Ovf,
+                    (2, false, false) => Op.I32ToU16Ovf,
+                    (2, false, true) => Op.U32ToU16Ovf,
+                    _ => throw new ArgumentOutOfRangeException(nameof(width)),
+                };
             }
 
             private void EmitConditionalBranch(GenTree instruction, GenTree source)
@@ -2740,6 +2788,9 @@ namespace Cnidaria.Cs
                     Op.I64AddOvf or Op.I64SubOvf or Op.I64MulOvf or
                     Op.U64AddOvf or Op.U64SubOvf or Op.U64MulOvf or
                     Op.I64ToI32Ovf or Op.U64ToI32Ovf or
+                    Op.I64ToU32Ovf or Op.U64ToU32Ovf or
+                    Op.I32ToI8Ovf or Op.U32ToI8Ovf or Op.I32ToU8Ovf or Op.U32ToU8Ovf or
+                    Op.I32ToI16Ovf or Op.U32ToI16Ovf or Op.I32ToU16Ovf or Op.U32ToU16Ovf or
                     Op.F32ToI32Ovf or Op.F32ToI64Ovf or
                     Op.F64ToI32Ovf or Op.F64ToI64Ovf)
                     return true;
@@ -3532,6 +3583,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.UnboxAny or
                     GenTreeKind.CastClass or
                     GenTreeKind.IsInst or
+                    GenTreeKind.ConstString or
                     GenTreeKind.Throw or
                     GenTreeKind.Rethrow;
             }

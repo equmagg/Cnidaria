@@ -511,13 +511,31 @@ namespace Cnidaria.Cs
                         case BytecodeOp.Add:
                             ExecAdd();
                             break;
+                        case BytecodeOp.Add_Ovf:
+                            ExecAddChecked(unsigned: false);
+                            break;
+                        case BytecodeOp.Add_Ovf_Un:
+                            ExecAddChecked(unsigned: true);
+                            break;
 
                         case BytecodeOp.Sub:
                             ExecSubtract();
                             break;
+                        case BytecodeOp.Sub_Ovf:
+                            ExecSubtractChecked(unsigned: false);
+                            break;
+                        case BytecodeOp.Sub_Ovf_Un:
+                            ExecSubtractChecked(unsigned: true);
+                            break;
 
                         case BytecodeOp.Mul:
                             ExecMultiply();
+                            break;
+                        case BytecodeOp.Mul_Ovf:
+                            ExecMultiplyChecked(unsigned: false);
+                            break;
+                        case BytecodeOp.Mul_Ovf_Un:
+                            ExecMultiplyChecked(unsigned: true);
                             break;
 
                         case BytecodeOp.Div:
@@ -602,18 +620,16 @@ namespace Cnidaria.Cs
                             break;
 
                         case BytecodeOp.Br:
-                            if (!TryBeginFinallyForJump(fn, fromPc: pc, targetPc: ins.Operand0))
-                                _curPc = ins.Operand0;
+                            _curPc = ins.Operand0;
                             break;
-
+                        case BytecodeOp.Leave:
+                            ExecLeave(fn, fromPc: pc, targetPc: ins.Operand0);
+                            break;
                         case BytecodeOp.Brtrue:
                             {
                                 var cond = PopSlot();
                                 if (ToBool(cond))
-                                {
-                                    if (!TryBeginFinallyForJump(fn, fromPc: pc, targetPc: ins.Operand0))
-                                        _curPc = ins.Operand0;
-                                }
+                                    _curPc = ins.Operand0;
                             }
                             break;
 
@@ -621,10 +637,7 @@ namespace Cnidaria.Cs
                             {
                                 var cond = PopSlot();
                                 if (!ToBool(cond))
-                                {
-                                    if (!TryBeginFinallyForJump(fn, fromPc: pc, targetPc: ins.Operand0))
-                                        _curPc = ins.Operand0;
-                                }
+                                    _curPc = ins.Operand0;
                             }
                             break;
 
@@ -3082,6 +3095,12 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("No active catch context.");
             return _catchStack[_catchStack.Count - 1].Exception;
         }
+        private void ExecLeave(BytecodeFunction fn, int fromPc, int targetPc)
+        {
+            ResetEvalStackForExceptionHandler();
+            if (!TryBeginFinallyForJump(fn, fromPc: fromPc, targetPc: targetPc))
+                _curPc = targetPc;
+        }
         private void ExecEndfinally(int pc)
         {
             if (_finallyStack.Count == 0 || _finallyStack[_finallyStack.Count - 1].FrameBase != _frameBase)
@@ -4072,6 +4091,43 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
         }
+        private void ExecAddChecked(bool unsigned)
+        {
+            var b = PopSlot();
+            var a = PopSlot();
+
+            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
+            {
+                if (unsigned)
+                {
+                    uint res = checked(unchecked((uint)I4Unchecked(in a)) + unchecked((uint)I4Unchecked(in b)));
+                    PushSlot(new Slot(SlotKind.I4, unchecked((int)res)));
+                }
+                else
+                {
+                    int res = checked(I4Unchecked(in a) + I4Unchecked(in b));
+                    PushSlot(new Slot(SlotKind.I4, res));
+                }
+                return;
+            }
+
+            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
+            {
+                if (unsigned)
+                {
+                    ulong res = checked(unchecked((ulong)a.AsI8Checked()) + unchecked((ulong)b.AsI8Checked()));
+                    PushSlot(new Slot(SlotKind.I8, unchecked((long)res)));
+                }
+                else
+                {
+                    long res = checked(a.AsI8Checked() + b.AsI8Checked());
+                    PushSlot(new Slot(SlotKind.I8, res));
+                }
+                return;
+            }
+
+            throw new InvalidOperationException($"Checked add type mismatch: {a.Kind} vs {b.Kind}");
+        }
         private void ExecSubtract()
         {
             var b = PopSlot();
@@ -4106,6 +4162,43 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
         }
+        private void ExecSubtractChecked(bool unsigned)
+        {
+            var b = PopSlot();
+            var a = PopSlot();
+
+            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
+            {
+                if (unsigned)
+                {
+                    uint res = checked(unchecked((uint)I4Unchecked(in a)) - unchecked((uint)I4Unchecked(in b)));
+                    PushSlot(new Slot(SlotKind.I4, unchecked((int)res)));
+                }
+                else
+                {
+                    int res = checked(I4Unchecked(in a) - I4Unchecked(in b));
+                    PushSlot(new Slot(SlotKind.I4, res));
+                }
+                return;
+            }
+
+            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
+            {
+                if (unsigned)
+                {
+                    ulong res = checked(unchecked((ulong)a.AsI8Checked()) - unchecked((ulong)b.AsI8Checked()));
+                    PushSlot(new Slot(SlotKind.I8, unchecked((long)res)));
+                }
+                else
+                {
+                    long res = checked(a.AsI8Checked() - b.AsI8Checked());
+                    PushSlot(new Slot(SlotKind.I8, res));
+                }
+                return;
+            }
+
+            throw new InvalidOperationException($"Checked subtract type mismatch: {a.Kind} vs {b.Kind}");
+        }
         private void ExecMultiply()
         {
             var b = PopSlot();
@@ -4139,6 +4232,43 @@ namespace Cnidaria.Cs
             }
 
             throw new InvalidOperationException($"Numeric op type mismatch: {a.Kind} vs {b.Kind}");
+        }
+        private void ExecMultiplyChecked(bool unsigned)
+        {
+            var b = PopSlot();
+            var a = PopSlot();
+
+            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
+            {
+                if (unsigned)
+                {
+                    uint res = checked(unchecked((uint)I4Unchecked(in a)) * unchecked((uint)I4Unchecked(in b)));
+                    PushSlot(new Slot(SlotKind.I4, unchecked((int)res)));
+                }
+                else
+                {
+                    int res = checked(I4Unchecked(in a) * I4Unchecked(in b));
+                    PushSlot(new Slot(SlotKind.I4, res));
+                }
+                return;
+            }
+
+            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
+            {
+                if (unsigned)
+                {
+                    ulong res = checked(unchecked((ulong)a.AsI8Checked()) * unchecked((ulong)b.AsI8Checked()));
+                    PushSlot(new Slot(SlotKind.I8, unchecked((long)res)));
+                }
+                else
+                {
+                    long res = checked(a.AsI8Checked() * b.AsI8Checked());
+                    PushSlot(new Slot(SlotKind.I8, res));
+                }
+                return;
+            }
+
+            throw new InvalidOperationException($"Checked multiply type mismatch: {a.Kind} vs {b.Kind}");
         }
         private void ExecDivide()
         {
