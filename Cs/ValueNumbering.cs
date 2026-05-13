@@ -1259,7 +1259,7 @@ namespace Cnidaria.Cs
                     NumberPhi(block.Phis[p]);
 
                 for (int s = 0; s < block.Statements.Length; s++)
-                    NumberTree(block.Statements[s], block.Id, s, ref heap, ref byrefExposed, ref stack);
+                    NumberStatement(block.Statements[s], block.StatementTreeLists[s], block.Id, s, ref heap, ref byrefExposed, ref stack);
 
                 PublishBlockMemoryOut(block, ref heap, ref byrefExposed);
 
@@ -1447,7 +1447,33 @@ namespace Cnidaria.Cs
             }
 
 
-            private ValueNumberPair NumberTree(SsaTree tree, int blockId, int statementIndex, ref ValueNumber heap, ref ValueNumber byrefExposed, ref ValueNumber stack)
+            private ValueNumberPair NumberStatement(SsaTree root, ImmutableArray<SsaTree> treeList, int blockId, int statementIndex, ref ValueNumber heap, ref ValueNumber byrefExposed, ref ValueNumber stack)
+            {
+                if (treeList.IsDefaultOrEmpty)
+                    throw new InvalidOperationException("SSA statement root has no linear tree-list node " + root.Source.Id.ToString() + ".");
+
+                var valuesByTree = new Dictionary<SsaTree, ValueNumberPair>(ReferenceEqualityComparer<SsaTree>.Instance);
+                for (int i = 0; i < treeList.Length; i++)
+                {
+                    var tree = treeList[i];
+                    var value = NumberLinearTree(tree, valuesByTree, blockId, statementIndex, ref heap, ref byrefExposed, ref stack);
+                    valuesByTree[tree] = value;
+                }
+
+                if (!valuesByTree.TryGetValue(root, out var result))
+                    throw new InvalidOperationException("SSA statement root was not present in linear tree-list node " + root.Source.Id.ToString() + ".");
+
+                return result;
+            }
+
+            private ValueNumberPair NumberLinearTree(
+                SsaTree tree,
+                Dictionary<SsaTree, ValueNumberPair> valuesByTree,
+                int blockId,
+                int statementIndex,
+                ref ValueNumber heap,
+                ref ValueNumber byrefExposed,
+                ref ValueNumber stack)
             {
                 if (tree.Value.HasValue)
                 {
@@ -1456,10 +1482,7 @@ namespace Cnidaria.Cs
                     return value;
                 }
 
-                var operandPairs = ImmutableArray.CreateBuilder<ValueNumberPair>(tree.Operands.Length);
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    operandPairs.Add(NumberTree(tree.Operands[i], blockId, statementIndex, ref heap, ref byrefExposed, ref stack));
-                var operands = operandPairs.ToImmutable();
+                var operands = GetNumberedOperands(tree, valuesByTree);
 
                 ApplyMemoryUses(tree, ref heap, ref byrefExposed);
                 ValueNumber oldHeap = heap;
@@ -1509,12 +1532,28 @@ namespace Cnidaria.Cs
 
                 if (tree.LocalFieldBaseValue.HasValue || tree.LocalField is not null)
                     throw new InvalidOperationException("Malformed SSA local-field load metadata at node " + tree.Source.Id.ToString() + ".");
+
+                var nonStoreResult = NumberNonStoreTree(tree.Source, operands, blockId, statementIndex, ref heap, ref byrefExposed, ref stack);
+                PublishMemoryDefinitions(tree, operands, blockId, statementIndex, oldHeap, oldByrefExposed, ref heap, ref byrefExposed);
+                Remember(tree.Source, nonStoreResult);
+                return nonStoreResult;
+            }
+
+            private static ImmutableArray<ValueNumberPair> GetNumberedOperands(SsaTree tree, Dictionary<SsaTree, ValueNumberPair> valuesByTree)
+            {
+                if (tree.Operands.Length == 0)
+                    return ImmutableArray<ValueNumberPair>.Empty;
+
+                var operands = ImmutableArray.CreateBuilder<ValueNumberPair>(tree.Operands.Length);
+                for (int i = 0; i < tree.Operands.Length; i++)
                 {
-                    var result = NumberNonStoreTree(tree.Source, operands, blockId, statementIndex, ref heap, ref byrefExposed, ref stack);
-                    PublishMemoryDefinitions(tree, operands, blockId, statementIndex, oldHeap, oldByrefExposed, ref heap, ref byrefExposed);
-                    Remember(tree.Source, result);
-                    return result;
+                    var operand = tree.Operands[i];
+                    if (!valuesByTree.TryGetValue(operand, out var value))
+                        throw new InvalidOperationException("SSA tree-list is not in execution order: node " + tree.Source.Id.ToString() + " operand " + operand.Source.Id.ToString() + " has not been numbered yet.");
+                    operands.Add(value);
                 }
+
+                return operands.ToImmutable();
             }
 
             private ValueNumberPair NumberNonStoreTree(GenTree node, ImmutableArray<ValueNumberPair> operands, int blockId, int statementIndex, ref ValueNumber heap, ref ValueNumber byrefExposed, ref ValueNumber stack)

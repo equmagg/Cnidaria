@@ -807,6 +807,15 @@ namespace Cnidaria.Cs
             if (stackKind == GenStackKind.Void || (type is not null && IsVoid(type)))
                 return new AbiValueInfo(AbiValuePassingKind.Void, RegisterClass.Invalid, 0, 1, containsGcPointers: false);
 
+            if (stackKind is GenStackKind.Ref or GenStackKind.Null)
+                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+
+            if (stackKind == GenStackKind.ByRef)
+                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+
+            if (stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr)
+                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
+
             if (type is not null)
             {
                 if (type.Kind is RuntimeTypeKind.Pointer)
@@ -841,15 +850,6 @@ namespace Cnidaria.Cs
 
             if (stackKind is GenStackKind.I8)
                 return IntegerScalar(8, 8, containsGcPointers: false);
-
-            if (stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
-
-            if (stackKind is GenStackKind.Ref or GenStackKind.Null)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
-
-            if (stackKind == GenStackKind.ByRef)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
 
             if (type is null)
                 return new AbiValueInfo(AbiValuePassingKind.Indirect, RegisterClass.General,
@@ -6475,35 +6475,61 @@ namespace Cnidaria.Cs
                     {
                         var finalLocation = ValueLocationForDefinition(resultValue, definitionPosition, resultAbi);
                         var segments = MachineAbi.GetRegisterSegments(resultAbi);
-                        if (finalLocation.Count != segments.Length)
-                            throw new InvalidOperationException(
-                                $"Multi-register result location count does not match ABI segment count for {resultValue}.");
-
-                        for (int s = 0; s < segments.Length; s++)
+                        if (finalLocation.Count == 0 && RequiresCodegenResultOperand(node, resultAbi))
                         {
-                            var finalFragment = finalLocation[s];
-                            if (finalFragment.IsRegister)
+                            for (int s = 0; s < segments.Length; s++)
                             {
-                                resultOperands.Add(finalFragment);
+                                int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
-                                continue;
                             }
+                        }
+                        else
+                        {
+                            if (finalLocation.Count != segments.Length)
+                                throw new InvalidOperationException(
+                                    $"Multi-register result location count does not match ABI segment count for {resultValue}.");
 
-                            int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                            var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
-                            resultOperands.Add(scratch);
-                            resultGenTrees.Add(resultValue);
-                            if (!finalFragment.IsNone)
-                                postTreeStores.Add(new RegisterResolvedMove(scratch, finalFragment, resultValue, resultValue));
+                            for (int s = 0; s < segments.Length; s++)
+                            {
+                                var finalFragment = finalLocation[s];
+                                if (finalFragment.IsRegister)
+                                {
+                                    resultOperands.Add(finalFragment);
+                                    resultGenTrees.Add(resultValue);
+                                    continue;
+                                }
+
+                                int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                resultOperands.Add(scratch);
+                                resultGenTrees.Add(resultValue);
+                                if (!finalFragment.IsNone)
+                                    postTreeStores.Add(new RegisterResolvedMove(scratch, finalFragment, resultValue, resultValue));
+                            }
                         }
                     }
                     else
                     {
                         RegisterOperand finalResult = HomeForDefinition(resultValue, definitionPosition);
                         RegisterOperand nodeResult;
-                        if (finalResult.IsRegister || finalResult.IsNone)
+                        if (finalResult.IsRegister)
                         {
                             nodeResult = finalResult;
+                        }
+                        else if (finalResult.IsNone)
+                        {
+                            if (RequiresCodegenResultOperand(node, resultAbi))
+                            {
+                                var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
+                                int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
+                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(resultClass, scratchIndex));
+                            }
+                            else
+                            {
+                                nodeResult = RegisterOperand.None;
+                            }
                         }
                         else
                         {
@@ -7049,24 +7075,45 @@ namespace Cnidaria.Cs
                     {
                         var finalLocation = ValueLocationForDefinition(resultValue, definitionPosition, resultAbi);
                         var segments = MachineAbi.GetRegisterSegments(resultAbi);
-                        if (finalLocation.Count != segments.Length)
-                            throw new InvalidOperationException($"Multi-register result location count does not match ABI segment count for {resultValue}.");
-
-                        for (int s = 0; s < segments.Length; s++)
+                        if (finalLocation.Count == 0 && RequiresCodegenResultOperand(node, resultAbi))
                         {
-                            var finalFragment = finalLocation[s];
-                            RegisterOperand nodeFragment = finalFragment;
-                            if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalFragment.IsRegister && !finalFragment.IsNone)
+                            for (int s = 0; s < segments.Length; s++)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
-                                postTreeStores.Add(new RegisterResolvedMove(nodeFragment, finalFragment, resultValue, resultValue));
-                            }
-
-                            if (!nodeFragment.IsNone)
-                            {
-                                resultOperands.Add(nodeFragment);
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
+                            }
+                        }
+                        else
+                        {
+                            if (finalLocation.Count != segments.Length)
+                                throw new InvalidOperationException($"Multi-register result location count does not match ABI segment count for {resultValue}.");
+
+                            for (int s = 0; s < segments.Length; s++)
+                            {
+                                var finalFragment = finalLocation[s];
+                                RegisterOperand nodeFragment = finalFragment;
+                                if (finalFragment.IsNone)
+                                {
+                                    if (RequiresCodegenResultOperand(node, resultAbi))
+                                    {
+                                        int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
+                                        nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                    }
+                                }
+                                else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalFragment.IsRegister)
+                                {
+                                    int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
+                                    nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                    postTreeStores.Add(new RegisterResolvedMove(nodeFragment, finalFragment, resultValue, resultValue));
+                                }
+
+                                if (!nodeFragment.IsNone)
+                                {
+                                    resultOperands.Add(nodeFragment);
+                                    resultGenTrees.Add(resultValue);
+                                }
                             }
                         }
                     }
@@ -7074,7 +7121,16 @@ namespace Cnidaria.Cs
                     {
                         var finalResult = HomeForDefinition(resultValue, definitionPosition);
                         RegisterOperand nodeResult = finalResult;
-                        if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalResult.IsRegister && !finalResult.IsNone)
+                        if (finalResult.IsNone)
+                        {
+                            if (RequiresCodegenResultOperand(node, resultAbi))
+                            {
+                                var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
+                                int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
+                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(resultClass, scratchIndex));
+                            }
+                        }
+                        else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalResult.IsRegister)
                         {
                             var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                             int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
@@ -7197,6 +7253,37 @@ namespace Cnidaria.Cs
                     return false;
 
                 return true;
+            }
+
+            private static bool RequiresCodegenResultOperand(GenTree node, AbiValueInfo abi)
+            {
+                if (node.RegisterResult is null)
+                    return false;
+
+                if (abi.PassingKind == AbiValuePassingKind.Void)
+                    return false;
+
+                return node.Kind switch
+                {
+                    GenTreeKind.StoreLocal => false,
+                    GenTreeKind.StoreArg => false,
+                    GenTreeKind.StoreTemp => false,
+                    GenTreeKind.StoreField => false,
+                    GenTreeKind.StoreStaticField => false,
+                    GenTreeKind.StoreIndirect => false,
+                    GenTreeKind.StoreArrayElement => false,
+
+                    GenTreeKind.Eval => false,
+                    GenTreeKind.Branch => false,
+                    GenTreeKind.BranchTrue => false,
+                    GenTreeKind.BranchFalse => false,
+                    GenTreeKind.Return => false,
+                    GenTreeKind.Throw => false,
+                    GenTreeKind.Rethrow => false,
+                    GenTreeKind.EndFinally => false,
+
+                    _ => true,
+                };
             }
 
             private static bool RequiresCodegenRegisterDefinition(GenTree node, AbiValueInfo abi)
@@ -9703,11 +9790,6 @@ namespace Cnidaria.Cs
                         if (fieldOffset < 0 || fieldEnd > scalarSize)
                             return false;
 
-                        // Small structs can be passed as one scalar ABI register even though
-                        // their promoted fields are smaller than that register. The prolog
-                        // has already materialized the incoming argument into its argument
-                        // home before initial SSA argument values are initialized, so use the
-                        // home slot as the dependent source for those promoted field values.
                         if (_method.StackFrame.TryGetArgumentSlot(parentArgumentIndex, out StackFrameSlot homeSlot))
                         {
                             source = RegisterOperand.ForFrameSlot(

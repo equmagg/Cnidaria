@@ -1007,8 +1007,8 @@ namespace Cnidaria.Cs
         {
             var receiver = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
             var arguments = RewriteExpressions(node.Arguments, out var argsChanged);
-
-            if (node.Method is LocalFunctionSymbol localFunction && TryGetCaptureInfo(localFunction, out var info))
+            var localFunction = node.Method.OriginalDefinition as LocalFunctionSymbol;
+            if (localFunction != null && TryGetCaptureInfo(localFunction, out var info))
             {
                 ImmutableArray<BoundExpression> rewrittenArguments = arguments;
 
@@ -1030,13 +1030,13 @@ namespace Cnidaria.Cs
 
                     rewrittenArguments = builder.ToImmutable();
                 }
-
+                var targetMethod = RewriteLocalFunctionCallTarget(node.Method, localFunction, info.Lowered);
                 if (!ReferenceEquals(receiver, node.ReceiverOpt) ||
                     argsChanged ||
-                    !ReferenceEquals(info.Lowered, node.Method) ||
+                    !ReferenceEquals(targetMethod, node.Method) ||
                     rewrittenArguments.Length != node.Arguments.Length)
                 {
-                    return new BoundCallExpression(node.Syntax, receiver, info.Lowered, rewrittenArguments);
+                    return new BoundCallExpression(node.Syntax, receiver, targetMethod, rewrittenArguments);
                 }
 
                 return node;
@@ -1047,7 +1047,25 @@ namespace Cnidaria.Cs
 
             return node;
         }
+        private MethodSymbol RewriteLocalFunctionCallTarget(
+            MethodSymbol method,
+            LocalFunctionSymbol original,
+            LocalFunctionSymbol lowered)
+        {
+            if (ReferenceEquals(method, original))
+                return lowered;
 
+            if (method is ConstructedMethodSymbol constructed &&
+                ReferenceEquals(constructed.OriginalDefinition, original))
+            {
+                return new ConstructedMethodSymbol(
+                    lowered,
+                    constructed.TypeArguments,
+                    _compilation.TypeManager);
+            }
+
+            return lowered;
+        }
         private ImmutableArray<BoundStatement> RewriteScopedStatements(
             ImmutableArray<BoundStatement> statements,
             out bool changed)
@@ -1146,6 +1164,7 @@ namespace Cnidaria.Cs
                 original.Locations,
                 original.IsStatic,
                 original.IsAsync);
+            lowered.SetTypeParameters(original.TypeParameters);
 
             var allParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(original.Parameters.Length + capturedSymbols.Length);
             allParameters.AddRange(original.Parameters);

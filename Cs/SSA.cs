@@ -1781,6 +1781,123 @@ namespace Cnidaria.Cs
         public override string ToString() => SsaDumper.FormatTree(this);
     }
 
+
+    internal readonly struct SsaTreeLinearNode
+    {
+        public readonly SsaTree Tree;
+        public readonly int StatementIndex;
+        public readonly int TreeIndex;
+        public readonly int BlockOrdinal;
+
+        public SsaTreeLinearNode(SsaTree tree, int statementIndex, int treeIndex, int blockOrdinal)
+        {
+            Tree = tree ?? throw new ArgumentNullException(nameof(tree));
+            StatementIndex = statementIndex;
+            TreeIndex = treeIndex;
+            BlockOrdinal = blockOrdinal;
+        }
+    }
+
+    internal static class SsaTreeLinearOrder
+    {
+        public static ImmutableArray<SsaTree> BuildStatement(SsaTree root)
+        {
+            if (root is null)
+                throw new ArgumentNullException(nameof(root));
+
+            // This is the SSA projection of the HIR Statement::TreeList() equivalent.
+            // The source GenTree linear ordinal is the primary execution order; a recursive
+            // postorder here would silently undo the importer/TreeLifeUpdater order.
+            var builder = ImmutableArray.CreateBuilder<SsaTree>();
+            var seen = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+            CollectUnique(root, seen, builder);
+            builder.Sort(static (left, right) => CompareSourceOrder(left.Source, right.Source));
+
+            var result = builder.ToImmutable();
+            ValidateStatementTreeList(root, result);
+            return result;
+        }
+
+        public static ImmutableArray<ImmutableArray<SsaTree>> BuildStatements(ImmutableArray<SsaTree> statements)
+        {
+            if (statements.IsDefaultOrEmpty)
+                return ImmutableArray<ImmutableArray<SsaTree>>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(statements.Length);
+            for (int i = 0; i < statements.Length; i++)
+                builder.Add(BuildStatement(statements[i]));
+            return builder.ToImmutable();
+        }
+
+        public static ImmutableArray<SsaTreeLinearNode> BuildBlock(ImmutableArray<ImmutableArray<SsaTree>> statementTreeLists)
+        {
+            if (statementTreeLists.IsDefaultOrEmpty)
+                return ImmutableArray<SsaTreeLinearNode>.Empty;
+
+            int count = 0;
+            for (int i = 0; i < statementTreeLists.Length; i++)
+                count += statementTreeLists[i].Length;
+
+            var builder = ImmutableArray.CreateBuilder<SsaTreeLinearNode>(count);
+            int ordinal = 0;
+            for (int s = 0; s < statementTreeLists.Length; s++)
+            {
+                var list = statementTreeLists[s];
+                for (int t = 0; t < list.Length; t++)
+                    builder.Add(new SsaTreeLinearNode(list[t], s, t, ordinal++));
+            }
+            return builder.ToImmutable();
+        }
+
+        private static void CollectUnique(SsaTree tree, HashSet<SsaTree> seen, ImmutableArray<SsaTree>.Builder builder)
+        {
+            if (!seen.Add(tree))
+                return;
+
+            builder.Add(tree);
+            for (int i = 0; i < tree.Operands.Length; i++)
+                CollectUnique(tree.Operands[i], seen, builder);
+        }
+
+        private static int CompareSourceOrder(GenTree left, GenTree right)
+        {
+            int block = left.LinearBlockId.CompareTo(right.LinearBlockId);
+            if (block != 0) return block;
+
+            int ordinal = left.LinearOrdinal.CompareTo(right.LinearOrdinal);
+            if (ordinal != 0) return ordinal;
+
+            return left.Id.CompareTo(right.Id);
+        }
+
+        private static void ValidateStatementTreeList(SsaTree root, ImmutableArray<SsaTree> treeList)
+        {
+            if (treeList.IsDefaultOrEmpty)
+                throw new InvalidOperationException("SSA statement tree-list is empty for root " + root.Source.Id.ToString() + ".");
+
+            if (!ReferenceEquals(treeList[treeList.Length - 1], root))
+                throw new InvalidOperationException("SSA statement tree-list root is not last in source execution order for root " + root.Source.Id.ToString() + ".");
+
+            var ordinalByTree = new Dictionary<SsaTree, int>(ReferenceEqualityComparer<SsaTree>.Instance);
+            for (int i = 0; i < treeList.Length; i++)
+            {
+                if (!ordinalByTree.TryAdd(treeList[i], i))
+                    throw new InvalidOperationException("SSA statement tree-list contains duplicate source node " + treeList[i].Source.Id.ToString() + ".");
+            }
+
+            for (int i = 0; i < treeList.Length; i++)
+            {
+                var tree = treeList[i];
+                for (int op = 0; op < tree.Operands.Length; op++)
+                {
+                    var operand = tree.Operands[op];
+                    if (!ordinalByTree.TryGetValue(operand, out int operandOrdinal))
+                        throw new InvalidOperationException("SSA statement tree-list for root " + root.Source.Id.ToString() + " does not contain operand " + operand.Source.Id.ToString() + " of node " + tree.Source.Id.ToString() + ".");
+                }
+            }
+        }
+    }
+
     internal sealed class SsaBlock
     {
         public CfgBlock CfgBlock { get; }
@@ -1789,6 +1906,8 @@ namespace Cnidaria.Cs
         public ImmutableArray<SsaMemoryValueName> MemoryIn { get; }
         public ImmutableArray<SsaMemoryValueName> MemoryOut { get; }
         public ImmutableArray<SsaTree> Statements { get; }
+        public ImmutableArray<ImmutableArray<SsaTree>> StatementTreeLists { get; }
+        public ImmutableArray<SsaTreeLinearNode> TreeList { get; }
 
         public int Id => CfgBlock.Id;
 
@@ -1798,7 +1917,8 @@ namespace Cnidaria.Cs
             ImmutableArray<SsaTree> statements,
             ImmutableArray<SsaMemoryPhi> memoryPhis = default,
             ImmutableArray<SsaMemoryValueName> memoryIn = default,
-            ImmutableArray<SsaMemoryValueName> memoryOut = default)
+            ImmutableArray<SsaMemoryValueName> memoryOut = default,
+            ImmutableArray<ImmutableArray<SsaTree>> statementTreeLists = default)
         {
             CfgBlock = cfgBlock ?? throw new ArgumentNullException(nameof(cfgBlock));
             Phis = phis.IsDefault ? ImmutableArray<SsaPhi>.Empty : phis;
@@ -1806,6 +1926,47 @@ namespace Cnidaria.Cs
             MemoryIn = memoryIn.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryIn;
             MemoryOut = memoryOut.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryOut;
             Statements = statements.IsDefault ? ImmutableArray<SsaTree>.Empty : statements;
+            StatementTreeLists = statementTreeLists.IsDefault
+                ? SsaTreeLinearOrder.BuildStatements(Statements)
+                : ValidateStatementTreeLists(Statements, statementTreeLists);
+            TreeList = SsaTreeLinearOrder.BuildBlock(StatementTreeLists);
+        }
+
+        private static ImmutableArray<ImmutableArray<SsaTree>> ValidateStatementTreeLists(
+            ImmutableArray<SsaTree> statements,
+            ImmutableArray<ImmutableArray<SsaTree>> statementTreeLists)
+        {
+            if (statementTreeLists.Length != statements.Length)
+                throw new InvalidOperationException("SSA block statement tree-list count does not match statement count.");
+
+            for (int s = 0; s < statements.Length; s++)
+            {
+                var list = statementTreeLists[s];
+                if (list.IsDefaultOrEmpty)
+                    throw new InvalidOperationException("SSA statement tree-list is empty for statement " + s.ToString() + ".");
+
+                if (!ReferenceEquals(list[list.Length - 1], statements[s]))
+                    throw new InvalidOperationException("SSA statement tree-list root is not last for statement " + s.ToString() + ".");
+
+                var ordinalByTree = new Dictionary<SsaTree, int>(ReferenceEqualityComparer<SsaTree>.Instance);
+                for (int i = 0; i < list.Length; i++)
+                {
+                    if (!ordinalByTree.TryAdd(list[i], i))
+                        throw new InvalidOperationException("SSA statement tree-list contains duplicate node " + list[i].Source.Id.ToString() + ".");
+                }
+
+                for (int i = 0; i < list.Length; i++)
+                {
+                    var tree = list[i];
+                    for (int op = 0; op < tree.Operands.Length; op++)
+                    {
+                        if (!ordinalByTree.TryGetValue(tree.Operands[op], out int operandOrdinal))
+                            throw new InvalidOperationException("SSA statement tree-list does not contain operand " + tree.Operands[op].Source.Id.ToString() + " of node " + tree.Source.Id.ToString() + ".");
+                    }
+                }
+            }
+
+            return statementTreeLists;
         }
 
         public bool TryGetMemoryIn(SsaMemoryKind kind, out SsaMemoryValueName value)
@@ -2654,9 +2815,9 @@ namespace Cnidaria.Cs
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 int weight = 1 + 8 * LoopDepth(cfg, b);
-                var statements = method.Blocks[b].Statements;
-                for (int s = 0; s < statements.Length; s++)
-                    CountSlotUses(statements[s], result, weight);
+                var nodes = method.Blocks[b].LinearNodes;
+                for (int n = 0; n < nodes.Length; n++)
+                    CountSlotUses(nodes[n], result, weight);
             }
             return result;
         }
@@ -2689,13 +2850,6 @@ namespace Cnidaria.Cs
                 {
                     AddDef(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight, partial: false);
                 }
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                {
-                    if (i == fieldAccess.ReceiverOperandIndex)
-                        continue;
-                    CountSlotUses(node.Operands[i], counts, weight);
-                }
                 return;
             }
 
@@ -2707,14 +2861,9 @@ namespace Cnidaria.Cs
 
             if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
             {
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CountSlotUses(node.Operands[i], counts, weight);
                 AddDef(storeSlot, node.LocalDescriptor, weight, partial: false);
                 return;
             }
-
-            for (int i = 0; i < node.Operands.Length; i++)
-                CountSlotUses(node.Operands[i], counts, weight);
 
             GenLocalDescriptor? DescriptorForFieldAccess(SsaLocalAccess access, GenTree node)
             {
@@ -2753,11 +2902,7 @@ namespace Cnidaria.Cs
             var touched = NewSetArray(blockCount);
 
             for (int b = 0; b < blockCount; b++)
-            {
-                var statements = cfg.Blocks[b].SourceBlock.Statements;
-                for (int s = 0; s < statements.Length; s++)
-                    CollectUseDefAndTouch(statements[s], uses[b], defs[b], touched[b]);
-            }
+                CollectUseDefAndTouch(cfg.Blocks[b].SourceBlock.LinearNodes, uses[b], defs[b], touched[b]);
 
             var liveIn = NewSetArray(blockCount);
             var liveOut = NewSetArray(blockCount);
@@ -2834,46 +2979,37 @@ namespace Cnidaria.Cs
                     ? 0
                     : block.HandlerRegionIndexes[block.HandlerRegionIndexes.Length - 1] + 1;
 
-            static void CollectUseDefAndTouch(GenTree node, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
+            static void CollectUseDefAndTouch(ImmutableArray<GenTree> treeList, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
             {
-                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                for (int i = 0; i < treeList.Length; i++)
                 {
-                    for (int i = 0; i < node.Operands.Length; i++)
+                    var node = treeList[i];
+                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                     {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
+                            uses.Add(fieldAccess.Slot);
+                        if (fieldAccess.IsDefinition)
+                            defs.Add(fieldAccess.Slot);
+                        touched.Add(fieldAccess.Slot);
+                        continue;
                     }
 
-                    if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
-                        uses.Add(fieldAccess.Slot);
-                    if (fieldAccess.IsDefinition)
-                        defs.Add(fieldAccess.Slot);
-                    touched.Add(fieldAccess.Slot);
-                    return;
+                    if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
+                    {
+                        defs.Add(storeSlot);
+                        touched.Add(storeSlot);
+                        continue;
+                    }
+
+                    if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+                    {
+                        if (!defs.Contains(loadSlot))
+                            uses.Add(loadSlot);
+                        touched.Add(loadSlot);
+                    }
                 }
-
-                if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
-                {
-                    for (int i = 0; i < node.Operands.Length; i++)
-                        CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
-
-                    defs.Add(storeSlot);
-                    touched.Add(storeSlot);
-                    return;
-                }
-
-                if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
-                {
-                    if (!defs.Contains(loadSlot))
-                        uses.Add(loadSlot);
-                    touched.Add(loadSlot);
-                    return;
-                }
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
             }
+
         }
 
         private static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind)
@@ -3054,8 +3190,7 @@ namespace Cnidaria.Cs
                         defs[block.Id].Add(block.Phis[p].Slot);
                 }
 
-                for (int s = 0; s < block.Statements.Length; s++)
-                    CollectStatementEvents(block.Statements[s], block.Id, s, partialUseByDefinition, table, eventsByBlock[block.Id]);
+                CollectStatementEvents(block, partialUseByDefinition, table, eventsByBlock[block.Id]);
 
                 for (int e = 0; e < eventsByBlock[block.Id].Count; e++)
                 {
@@ -3181,30 +3316,32 @@ namespace Cnidaria.Cs
         }
 
         private static void CollectStatementEvents(
-            SsaTree tree,
-            int blockId,
-            int statementIndex,
+            SsaBlock block,
             IReadOnlyDictionary<SsaValueName, SsaValueName> partialUseByDefinition,
             TrackedLocalTable table,
             List<SsaLocalLivenessEvent> events)
         {
-            for (int i = 0; i < tree.Operands.Length; i++)
-                CollectStatementEvents(tree.Operands[i], blockId, statementIndex, partialUseByDefinition, table, events);
-
-            if (tree.Value.HasValue && table.Contains(tree.Value.Value.Slot))
-                events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, tree.Value.Value.Slot));
-
-            if (tree.LocalFieldBaseValue.HasValue && table.Contains(tree.LocalFieldBaseValue.Value.Slot))
-                events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, tree.LocalFieldBaseValue.Value.Slot));
-
-            if (tree.StoreTarget.HasValue)
+            for (int i = 0; i < block.TreeList.Length; i++)
             {
-                var target = tree.StoreTarget.Value;
-                if (partialUseByDefinition.TryGetValue(target, out var previous) && table.Contains(previous.Slot))
-                    events.Add(SsaLocalLivenessEvent.Use(blockId, statementIndex, tree.Source.Id, previous.Slot));
+                var item = block.TreeList[i];
+                var tree = item.Tree;
+                int statementIndex = item.StatementIndex;
 
-                if (table.Contains(target.Slot))
-                    events.Add(SsaLocalLivenessEvent.Definition(blockId, statementIndex, tree.Source.Id, target.Slot));
+                if (tree.Value.HasValue && table.Contains(tree.Value.Value.Slot))
+                    events.Add(SsaLocalLivenessEvent.Use(block.Id, statementIndex, tree.Source.Id, tree.Value.Value.Slot));
+
+                if (tree.LocalFieldBaseValue.HasValue && table.Contains(tree.LocalFieldBaseValue.Value.Slot))
+                    events.Add(SsaLocalLivenessEvent.Use(block.Id, statementIndex, tree.Source.Id, tree.LocalFieldBaseValue.Value.Slot));
+
+                if (tree.StoreTarget.HasValue)
+                {
+                    var target = tree.StoreTarget.Value;
+                    if (partialUseByDefinition.TryGetValue(target, out var previous) && table.Contains(previous.Slot))
+                        events.Add(SsaLocalLivenessEvent.Use(block.Id, statementIndex, tree.Source.Id, previous.Slot));
+
+                    if (table.Contains(target.Slot))
+                        events.Add(SsaLocalLivenessEvent.Definition(block.Id, statementIndex, tree.Source.Id, target.Slot));
+                }
             }
         }
 
@@ -3320,12 +3457,9 @@ namespace Cnidaria.Cs
 
             for (int b = 0; b < blockCount; b++)
             {
-                var statements = cfg.Blocks[b].SourceBlock.Statements;
-                for (int s = 0; s < statements.Length; s++)
-                {
-                    ClearLocalDataflowFlags(statements[s]);
-                    CollectUseDef(statements[s], trackedLocals, uses[b], defs[b]);
-                }
+                var nodes = cfg.Blocks[b].SourceBlock.LinearNodes;
+                ClearLocalDataflowFlags(nodes);
+                CollectUseDef(nodes, trackedLocals, uses[b], defs[b]);
             }
 
             bool changed;
@@ -3377,10 +3511,7 @@ namespace Cnidaria.Cs
             {
                 var live = liveOut[b].Clone();
                 var events = new List<LocalLivenessEvent>();
-                var statements = cfg.Blocks[b].SourceBlock.Statements;
-
-                for (int s = 0; s < statements.Length; s++)
-                    CollectLivenessEvents(statements[s], trackedLocals, events);
+                CollectLivenessEvents(cfg.Blocks[b].SourceBlock.LinearNodes, trackedLocals, events);
 
                 for (int i = events.Count - 1; i >= 0; i--)
                 {
@@ -3414,47 +3545,37 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void CollectLivenessEvents(GenTree node, TrackedLocalTable trackedLocals, List<LocalLivenessEvent> events)
+        private static void CollectLivenessEvents(ImmutableArray<GenTree> treeList, TrackedLocalTable trackedLocals, List<LocalLivenessEvent> events)
         {
-            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+            for (int i = 0; i < treeList.Length; i++)
             {
-                for (int i = 0; i < node.Operands.Length; i++)
+                var node = treeList[i];
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                 {
-                    if (i == fieldAccess.ReceiverOperandIndex)
-                        continue;
-                    CollectLivenessEvents(node.Operands[i], trackedLocals, events);
+                    if (trackedLocals.Contains(fieldAccess.Slot))
+                    {
+                        events.Add(new LocalLivenessEvent(
+                            node,
+                            fieldAccess.Slot,
+                            isUse: fieldAccess.Kind != SsaLocalAccessKind.FullDefinition,
+                            isDefinition: fieldAccess.IsDefinition));
+                    }
+                    continue;
                 }
 
-                if (trackedLocals.Contains(fieldAccess.Slot))
+                if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
                 {
-                    events.Add(new LocalLivenessEvent(
-                        node,
-                        fieldAccess.Slot,
-                        isUse: fieldAccess.Kind != SsaLocalAccessKind.FullDefinition,
-                        isDefinition: fieldAccess.IsDefinition));
+                    if (trackedLocals.Contains(storeSlot))
+                        events.Add(new LocalLivenessEvent(node, storeSlot, isUse: false, isDefinition: true));
+                    continue;
                 }
-                return;
+
+                if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
+                {
+                    if (trackedLocals.Contains(loadSlot))
+                        events.Add(new LocalLivenessEvent(node, loadSlot, isUse: true, isDefinition: false));
+                }
             }
-
-            if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
-            {
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CollectLivenessEvents(node.Operands[i], trackedLocals, events);
-
-                if (trackedLocals.Contains(storeSlot))
-                    events.Add(new LocalLivenessEvent(node, storeSlot, isUse: false, isDefinition: true));
-                return;
-            }
-
-            if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
-            {
-                if (trackedLocals.Contains(loadSlot))
-                    events.Add(new LocalLivenessEvent(node, loadSlot, isUse: true, isDefinition: false));
-                return;
-            }
-
-            for (int i = 0; i < node.Operands.Length; i++)
-                CollectLivenessEvents(node.Operands[i], trackedLocals, events);
         }
 
         private static bool Contains(ImmutableArray<TrackedLocalSet> sets, int blockId, SsaSlot slot)
@@ -3464,38 +3585,30 @@ namespace Cnidaria.Cs
             return sets[blockId].Contains(slot);
         }
 
-        private static void ClearLocalDataflowFlags(GenTree node)
+        private static void ClearLocalDataflowFlags(ImmutableArray<GenTree> nodes)
         {
-            node.Flags &= ~(GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath);
-            for (int i = 0; i < node.Operands.Length; i++)
-                ClearLocalDataflowFlags(node.Operands[i]);
+            for (int i = 0; i < nodes.Length; i++)
+                nodes[i].Flags &= ~(GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath);
         }
 
-        private static void CollectUseDef(GenTree node, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
+        private static void CollectUseDef(ImmutableArray<GenTree> treeList, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
+        {
+            for (int i = 0; i < treeList.Length; i++)
+                CollectUseDefNode(treeList[i], trackedLocals, uses, defs);
+        }
+
+        private static void CollectUseDefNode(GenTree node, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
         {
             if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
             {
                 if (fieldAccess.Kind == SsaLocalAccessKind.Use)
                 {
                     MarkUse(node, fieldAccess.Slot, trackedLocals, uses, defs);
-                    for (int i = 0; i < node.Operands.Length; i++)
-                    {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
-                    }
                     return;
                 }
 
                 if (fieldAccess.Kind == SsaLocalAccessKind.PartialDefinition)
                 {
-                    for (int i = 0; i < node.Operands.Length; i++)
-                    {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
-                    }
-
                     MarkUse(node, fieldAccess.Slot, trackedLocals, uses, defs);
                     if (trackedLocals.Contains(fieldAccess.Slot))
                         defs.Add(fieldAccess.Slot);
@@ -3505,13 +3618,6 @@ namespace Cnidaria.Cs
 
                 if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
                 {
-                    for (int i = 0; i < node.Operands.Length; i++)
-                    {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
-                    }
-
                     if (trackedLocals.Contains(fieldAccess.Slot))
                         defs.Add(fieldAccess.Slot);
                     node.Flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef;
@@ -3521,9 +3627,6 @@ namespace Cnidaria.Cs
 
             if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
             {
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
-
                 if (trackedLocals.Contains(storeSlot))
                     defs.Add(storeSlot);
                 node.Flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef;
@@ -3535,9 +3638,6 @@ namespace Cnidaria.Cs
                 MarkUse(node, loadSlot, trackedLocals, uses, defs);
                 return;
             }
-
-            for (int i = 0; i < node.Operands.Length; i++)
-                CollectUseDef(node.Operands[i], trackedLocals, uses, defs);
         }
 
         private static void MarkUse(GenTree node, SsaSlot slot, TrackedLocalTable trackedLocals, TrackedLocalSet uses, TrackedLocalSet defs)
@@ -3804,18 +3904,15 @@ namespace Cnidaria.Cs
                         phiDescriptor: phi)));
                 }
 
-                for (int s = 0; s < block.Statements.Length; s++)
-                    CollectStatementDefinitions(block.Statements[s], block, s);
+                for (int i = 0; i < block.TreeList.Length; i++)
+                    CollectTreeDefinition(block.TreeList[i].Tree, block, block.TreeList[i].StatementIndex);
             }
 
             definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
             return definitions.ToImmutableArray();
 
-            void CollectStatementDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
+            void CollectTreeDefinition(SsaTree tree, SsaBlock block, int statementIndex)
             {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectStatementDefinitions(tree.Operands[i], block, statementIndex);
-
                 int blockId = block.Id;
 
                 if (tree.StoreTarget.HasValue)
@@ -3891,8 +3988,8 @@ namespace Cnidaria.Cs
                         phi: phi)));
                 }
 
-                for (int s = 0; s < block.Statements.Length; s++)
-                    CollectStatementMemoryDefinitions(block.Statements[s], block, s);
+                for (int i = 0; i < block.TreeList.Length; i++)
+                    CollectTreeMemoryDefinitions(block.TreeList[i].Tree, block, block.TreeList[i].StatementIndex);
 
                 for (int i = 0; i < block.MemoryOut.Length; i++)
                 {
@@ -3914,11 +4011,8 @@ namespace Cnidaria.Cs
             definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
             return definitions.ToImmutableArray();
 
-            void CollectStatementMemoryDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
+            void CollectTreeMemoryDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
             {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectStatementMemoryDefinitions(tree.Operands[i], block, statementIndex);
-
                 for (int i = 0; i < tree.MemoryDefinitions.Length; i++)
                 {
                     var name = tree.MemoryDefinitions[i];
@@ -3988,8 +4082,8 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                for (int s = 0; s < block.Statements.Length; s++)
-                    AnnotateTreeUses(block.Statements[s], block.Id, descriptors, memoryDescriptors);
+                for (int i = 0; i < block.TreeList.Length; i++)
+                    AnnotateTreeUses(block.TreeList[i].Tree, block.Id, descriptors, memoryDescriptors);
             }
 
             static void AnnotateTreeUses(
@@ -4009,9 +4103,6 @@ namespace Cnidaria.Cs
                     if (memoryDescriptors.TryGetValue(tree.MemoryUses[i], out var memoryDescriptor))
                         memoryDescriptor.AddUse(blockId);
                 }
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    AnnotateTreeUses(tree.Operands[i], blockId, descriptors, memoryDescriptors);
             }
         }
 
@@ -4425,9 +4516,9 @@ namespace Cnidaria.Cs
                 for (int b = 0; b < method.Blocks.Length; b++)
                 {
                     int weight = 1 + 8 * LoopDepth(cfg, b);
-                    var statements = method.Blocks[b].Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        CountSlotUses(statements[s], result, weight);
+                    var nodes = method.Blocks[b].LinearNodes;
+                    for (int n = 0; n < nodes.Length; n++)
+                        CountSlotUses(nodes[n], result, weight);
                 }
                 return result;
             }
@@ -4449,24 +4540,13 @@ namespace Cnidaria.Cs
                 {
                     if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition)
                         Add(fieldAccess.Slot);
-
                     if (fieldAccess.IsDefinition)
                         Add(fieldAccess.Slot);
-
-                    for (int i = 0; i < node.Operands.Length; i++)
-                    {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CountSlotUses(node.Operands[i], counts, weight);
-                    }
                     return;
                 }
 
                 if (TryGetDirectLoadSlot(node, out var loadSlot) || TryGetDirectStoreSlot(node, out loadSlot))
                     Add(loadSlot);
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CountSlotUses(node.Operands[i], counts, weight);
 
                 void Add(SsaSlot slot)
                 {
@@ -4548,9 +4628,7 @@ namespace Cnidaria.Cs
 
                 for (int b = 0; b < blockCount; b++)
                 {
-                    var statements = cfg.Blocks[b].SourceBlock.Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        CollectUseDefAndTouch(statements[s], uses[b], defs[b], touched[b]);
+                    CollectUseDefAndTouch(cfg.Blocks[b].SourceBlock.LinearNodes, uses[b], defs[b], touched[b]);
                 }
 
                 var liveIn = NewSetArray(blockCount);
@@ -4633,47 +4711,35 @@ namespace Cnidaria.Cs
                         ? 0
                         : block.HandlerRegionIndexes[block.HandlerRegionIndexes.Length - 1] + 1;
 
-                static void CollectUseDefAndTouch(GenTree node, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
+                static void CollectUseDefAndTouch(ImmutableArray<GenTree> treeList, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
                 {
-                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                    for (int i = 0; i < treeList.Length; i++)
                     {
-                        for (int i = 0; i < node.Operands.Length; i++)
+                        var node = treeList[i];
+                        if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                         {
-                            if (i == fieldAccess.ReceiverOperandIndex)
-                                continue;
-                            CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
+                            if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
+                                uses.Add(fieldAccess.Slot);
+                            if (fieldAccess.IsDefinition)
+                                defs.Add(fieldAccess.Slot);
+                            touched.Add(fieldAccess.Slot);
+                            continue;
                         }
 
-                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
-                            uses.Add(fieldAccess.Slot);
+                        if (TryGetDirectStoreSlot(node, out var storeSlot))
+                        {
+                            defs.Add(storeSlot);
+                            touched.Add(storeSlot);
+                            continue;
+                        }
 
-                        if (fieldAccess.IsDefinition)
-                            defs.Add(fieldAccess.Slot);
-
-                        touched.Add(fieldAccess.Slot);
-                        return;
+                        if (TryGetDirectLoadSlot(node, out var loadSlot))
+                        {
+                            if (!defs.Contains(loadSlot))
+                                uses.Add(loadSlot);
+                            touched.Add(loadSlot);
+                        }
                     }
-
-                    if (TryGetDirectStoreSlot(node, out var storeSlot))
-                    {
-                        for (int i = 0; i < node.Operands.Length; i++)
-                            CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
-
-                        defs.Add(storeSlot);
-                        touched.Add(storeSlot);
-                        return;
-                    }
-
-                    if (TryGetDirectLoadSlot(node, out var loadSlot))
-                    {
-                        if (!defs.Contains(loadSlot))
-                            uses.Add(loadSlot);
-                        touched.Add(loadSlot);
-                        return;
-                    }
-
-                    for (int i = 0; i < node.Operands.Length; i++)
-                        CollectUseDefAndTouch(node.Operands[i], uses, defs, touched);
                 }
             }
 
@@ -4721,9 +4787,7 @@ namespace Cnidaria.Cs
 
                 for (int b = 0; b < n; b++)
                 {
-                    var statements = cfg.Blocks[b].SourceBlock.Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        CollectUseDef(statements[s], table, uses[b], defs[b]);
+                    CollectUseDef(cfg.Blocks[b].SourceBlock.LinearNodes, table, uses[b], defs[b]);
                 }
 
                 bool changed;
@@ -4769,43 +4833,33 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            private static void CollectUseDef(GenTree node, TrackedLocalTable promotable, TrackedLocalSet uses, TrackedLocalSet defs)
+            private static void CollectUseDef(ImmutableArray<GenTree> treeList, TrackedLocalTable promotable, TrackedLocalSet uses, TrackedLocalSet defs)
             {
-                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                for (int i = 0; i < treeList.Length; i++)
                 {
-                    for (int i = 0; i < node.Operands.Length; i++)
+                    var node = treeList[i];
+                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                     {
-                        if (i == fieldAccess.ReceiverOperandIndex)
-                            continue;
-                        CollectUseDef(node.Operands[i], promotable, uses, defs);
+                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && promotable.Contains(fieldAccess.Slot) && !defs.Contains(fieldAccess.Slot))
+                            uses.Add(fieldAccess.Slot);
+                        if (fieldAccess.IsDefinition && promotable.Contains(fieldAccess.Slot))
+                            defs.Add(fieldAccess.Slot);
+                        continue;
                     }
 
-                    if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && promotable.Contains(fieldAccess.Slot) && !defs.Contains(fieldAccess.Slot))
-                        uses.Add(fieldAccess.Slot);
-                    if (fieldAccess.IsDefinition && promotable.Contains(fieldAccess.Slot))
-                        defs.Add(fieldAccess.Slot);
-                    return;
+                    if (TryGetDirectStoreSlot(node, out var storeSlot))
+                    {
+                        if (promotable.Contains(storeSlot))
+                            defs.Add(storeSlot);
+                        continue;
+                    }
+
+                    if (TryGetDirectLoadSlot(node, out var loadSlot))
+                    {
+                        if (promotable.Contains(loadSlot) && !defs.Contains(loadSlot))
+                            uses.Add(loadSlot);
+                    }
                 }
-
-                if (TryGetDirectStoreSlot(node, out var storeSlot))
-                {
-                    for (int i = 0; i < node.Operands.Length; i++)
-                        CollectUseDef(node.Operands[i], promotable, uses, defs);
-
-                    if (promotable.Contains(storeSlot))
-                        defs.Add(storeSlot);
-                    return;
-                }
-
-                if (TryGetDirectLoadSlot(node, out var loadSlot))
-                {
-                    if (promotable.Contains(loadSlot) && !defs.Contains(loadSlot))
-                        uses.Add(loadSlot);
-                    return;
-                }
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                    CollectUseDef(node.Operands[i], promotable, uses, defs);
             }
         }
 
@@ -4834,9 +4888,7 @@ namespace Cnidaria.Cs
 
                 for (int b = 0; b < n; b++)
                 {
-                    var statements = cfg.Blocks[b].SourceBlock.Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        CollectMemoryUseDef(statements[s], slots, ref uses[b], ref defs[b]);
+                    CollectMemoryUseDef(cfg.Blocks[b].SourceBlock.LinearNodes, slots, ref uses[b], ref defs[b]);
                 }
 
                 bool changed;
@@ -4885,15 +4937,15 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void CollectMemoryUseDef(GenTree node, SlotTable slots, ref SsaMemoryKindSet uses, ref SsaMemoryKindSet defs)
+        private static void CollectMemoryUseDef(ImmutableArray<GenTree> treeList, SlotTable slots, ref SsaMemoryKindSet uses, ref SsaMemoryKindSet defs)
         {
-            for (int i = 0; i < node.Operands.Length; i++)
-                CollectMemoryUseDef(node.Operands[i], slots, ref uses, ref defs);
-
-            var effects = GetMemoryEffects(node, slots);
-            SsaMemoryKindSet nodeUses = effects.Uses | effects.Definitions;
-            uses |= nodeUses & ~defs;
-            defs |= effects.Definitions;
+            for (int i = 0; i < treeList.Length; i++)
+            {
+                var effects = GetMemoryEffects(treeList[i], slots);
+                SsaMemoryKindSet nodeUses = effects.Uses | effects.Definitions;
+                uses |= nodeUses & ~defs;
+                defs |= effects.Definitions;
+            }
         }
 
         private static MemoryEffects GetMemoryEffects(GenTree node, SlotTable slots)
@@ -5040,6 +5092,7 @@ namespace Cnidaria.Cs
             private readonly List<SsaMemoryValueName> _initialMemoryValues = new();
             private readonly Dictionary<SsaValueName, SsaUseDefLink> _useDefLinks = new();
             private readonly List<SsaTree>[] _renamedStatements;
+            private readonly List<ImmutableArray<SsaTree>>[] _renamedStatementTreeLists;
             private readonly ImmutableArray<SsaMemoryValueName>[] _memoryIn;
             private readonly ImmutableArray<SsaMemoryValueName>[] _memoryOut;
             private readonly bool[] _visited;
@@ -5057,11 +5110,15 @@ namespace Cnidaria.Cs
                 _localLiveness = localLiveness;
                 _memoryLiveness = memoryLiveness;
                 _renamedStatements = new List<SsaTree>[cfg.Blocks.Length];
+                _renamedStatementTreeLists = new List<ImmutableArray<SsaTree>>[cfg.Blocks.Length];
                 _memoryIn = new ImmutableArray<SsaMemoryValueName>[cfg.Blocks.Length];
                 _memoryOut = new ImmutableArray<SsaMemoryValueName>[cfg.Blocks.Length];
                 _visited = new bool[cfg.Blocks.Length];
                 for (int i = 0; i < _renamedStatements.Length; i++)
+                {
                     _renamedStatements[i] = new List<SsaTree>();
+                    _renamedStatementTreeLists[i] = new List<ImmutableArray<SsaTree>>();
+                }
 
                 for (int i = 0; i < slots.PromotableSlots.Length; i++)
                 {
@@ -5117,7 +5174,8 @@ namespace Cnidaria.Cs
                         _renamedStatements[b].ToImmutableArray(),
                         memoryPhiBuilder.ToImmutable(),
                         _memoryIn[b],
-                        _memoryOut[b]));
+                        _memoryOut[b],
+                        statementTreeLists: _renamedStatementTreeLists[b].ToImmutableArray()));
                 }
                 return blocks.ToImmutable();
             }
@@ -5141,11 +5199,12 @@ namespace Cnidaria.Cs
                     pushed.Add(phi.Slot);
                 }
 
-                var statements = _cfg.Blocks[blockId].SourceBlock.Statements;
-                for (int i = 0; i < statements.Length; i++)
+                var sourceBlock = _cfg.Blocks[blockId].SourceBlock;
+                for (int i = 0; i < sourceBlock.Statements.Length; i++)
                 {
-                    var renamed = RenameTree(statements[i], blockId, pushed, pushedMemory);
-                    _renamedStatements[blockId].Add(renamed);
+                    var renamed = RenameStatement(sourceBlock.Statements[i], sourceBlock.StatementTreeLists[i], blockId, pushed, pushedMemory);
+                    _renamedStatements[blockId].Add(renamed.Root);
+                    _renamedStatementTreeLists[blockId].Add(renamed.TreeList);
                 }
 
                 RenameOutgoingMemoryStates(blockId, pushedMemory);
@@ -5362,7 +5421,32 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private SsaTree RenameTree(GenTree node, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            private (SsaTree Root, ImmutableArray<SsaTree> TreeList) RenameStatement(GenTree root, ImmutableArray<GenTree> treeList, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            {
+                if (treeList.IsDefaultOrEmpty)
+                    throw new InvalidOperationException("Statement root has no HIR tree-list node " + root.Id.ToString() + ".");
+
+                var renamedByNode = new Dictionary<GenTree, SsaTree>(ReferenceEqualityComparer<GenTree>.Instance);
+                var renamedTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length);
+                for (int i = 0; i < treeList.Length; i++)
+                {
+                    var node = treeList[i];
+                    var renamed = RenameLinearNode(node, renamedByNode, blockId, pushed, pushedMemory);
+                    renamedByNode[node] = renamed;
+                    renamedTreeList.Add(renamed);
+                }
+
+                if (!renamedByNode.TryGetValue(root, out var result))
+                    throw new InvalidOperationException("Statement root was not present in HIR tree-list node " + root.Id.ToString() + ".");
+
+                var resultTreeList = renamedTreeList.ToImmutable();
+                if (!ReferenceEquals(resultTreeList[resultTreeList.Length - 1], result))
+                    throw new InvalidOperationException("Renamed SSA statement tree-list root is not last for HIR root " + root.Id.ToString() + ".");
+
+                return (result, resultTreeList);
+            }
+
+            private SsaTree RenameLinearNode(GenTree node, Dictionary<GenTree, SsaTree> renamedByNode, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
             {
                 if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
                 {
@@ -5370,13 +5454,13 @@ namespace Cnidaria.Cs
                     {
                         if (fieldAccess.IsPromotedFieldAccess && _slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
                             return AttachMemory(node, operands, blockId, pushedMemory, value: Top(fieldAccess.Slot));
                         }
 
                         if (!fieldAccess.IsPromotedFieldAccess && fieldAccess.Field is not null && _slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
                             return AttachMemory(node, operands, blockId, pushedMemory, localFieldBaseValue: Top(fieldAccess.BaseSlot), localField: fieldAccess.Field);
                         }
                     }
@@ -5384,7 +5468,7 @@ namespace Cnidaria.Cs
                     {
                         if (_slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
                             var target = NewVersion(fieldAccess.Slot);
                             Push(fieldAccess.Slot, target);
                             pushed.Add(fieldAccess.Slot);
@@ -5396,7 +5480,7 @@ namespace Cnidaria.Cs
                     {
                         if (_slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = RenameLocalFieldNonReceiverOperands(node, fieldAccess, blockId, pushed, pushedMemory);
+                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
                             var previous = Top(fieldAccess.BaseSlot);
                             var target = NewVersion(fieldAccess.BaseSlot);
                             SetUseDefSsaNum(target, previous);
@@ -5411,22 +5495,18 @@ namespace Cnidaria.Cs
                 if (TryGetDirectLoadSlot(node, out var loadSlot) && _slots.IsPromotable(loadSlot))
                     return AttachMemory(node, ImmutableArray<SsaTree>.Empty, blockId, pushedMemory, value: Top(loadSlot));
 
+                var allOperands = GetRenamedOperands(node, renamedByNode);
+
+                if (TryGetDirectStoreSlot(node, out var storeSlot) && _slots.IsPromotable(storeSlot))
                 {
-                    var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
-                    for (int i = 0; i < node.Operands.Length; i++)
-                        operands.Add(RenameTree(node.Operands[i], blockId, pushed, pushedMemory));
-
-                    if (TryGetDirectStoreSlot(node, out var storeSlot) && _slots.IsPromotable(storeSlot))
-                    {
-                        var target = NewVersion(storeSlot);
-                        Push(storeSlot, target);
-                        pushed.Add(storeSlot);
-                        AddDefToEHSuccessorPhis(blockId, storeSlot, target);
-                        return AttachMemory(node, operands.ToImmutable(), blockId, pushedMemory, storeTarget: target);
-                    }
-
-                    return AttachMemory(node, operands.ToImmutable(), blockId, pushedMemory);
+                    var target = NewVersion(storeSlot);
+                    Push(storeSlot, target);
+                    pushed.Add(storeSlot);
+                    AddDefToEHSuccessorPhis(blockId, storeSlot, target);
+                    return AttachMemory(node, allOperands, blockId, pushedMemory, storeTarget: target);
                 }
+
+                return AttachMemory(node, allOperands, blockId, pushedMemory);
             }
 
             private SsaTree AttachMemory(
@@ -5473,18 +5553,36 @@ namespace Cnidaria.Cs
                     memoryDefs.ToImmutable());
             }
 
-            private ImmutableArray<SsaTree> RenameLocalFieldNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, int blockId, List<SsaSlot> pushed, List<SsaMemoryKind> pushedMemory)
+            private static ImmutableArray<SsaTree> GetRenamedOperands(GenTree node, Dictionary<GenTree, SsaTree> renamedByNode)
+            {
+                if (node.Operands.Length == 0)
+                    return ImmutableArray<SsaTree>.Empty;
+
+                var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
+                for (int i = 0; i < node.Operands.Length; i++)
+                    operands.Add(GetRenamedOperand(node, i, renamedByNode));
+                return operands.ToImmutable();
+            }
+
+            private static ImmutableArray<SsaTree> GetRenamedNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, Dictionary<GenTree, SsaTree> renamedByNode)
             {
                 var operands = ImmutableArray.CreateBuilder<SsaTree>(Math.Max(0, node.Operands.Length - 1));
                 for (int i = 0; i < node.Operands.Length; i++)
                 {
                     if (i == fieldAccess.ReceiverOperandIndex)
                         continue;
-                    operands.Add(RenameTree(node.Operands[i], blockId, pushed, pushedMemory));
+                    operands.Add(GetRenamedOperand(node, i, renamedByNode));
                 }
                 return operands.ToImmutable();
             }
 
+            private static SsaTree GetRenamedOperand(GenTree node, int operandIndex, Dictionary<GenTree, SsaTree> renamedByNode)
+            {
+                var operand = node.Operands[operandIndex];
+                if (!renamedByNode.TryGetValue(operand, out var renamed))
+                    throw new InvalidOperationException("HIR tree-list is not in execution order: node " + node.Id.ToString() + " operand " + operand.Id.ToString() + " has not been renamed yet.");
+                return renamed;
+            }
 
             private void SetUseDefSsaNum(SsaValueName definition, SsaValueName use)
             {
@@ -5798,6 +5896,7 @@ namespace Cnidaria.Cs
         public bool FoldConstants { get; set; } = true;
         public bool SimplifyAlgebraicIdentities { get; set; } = true;
         public bool RemoveDeadDefinitions { get; set; } = true;
+        public bool CopyPropagate { get; set; } = true;
         public int MaxIterations { get; set; } = 8;
     }
 
@@ -5926,17 +6025,26 @@ namespace Cnidaria.Cs
                 {
                     current = EnsureValueNumbers(current);
 
-                    var facts = ComputeFacts(current);
                     var pointLiveness = SsaLocalLiveness.Build(current);
-                    var rewrite = Rewrite(current, facts, pointLiveness);
-                    var afterRewrite = WithBlocks(current, rewrite.Blocks);
+                    OptimizationResult copyProp = _options.CopyPropagate
+                        ? CopyPropagate(current, pointLiveness)
+                        : new OptimizationResult(current.Blocks, changed: false);
+
+                    var afterCopyProp = copyProp.Changed
+                        ? EnsureValueNumbers(WithBlocks(current, copyProp.Blocks))
+                        : current;
+
+                    pointLiveness = SsaLocalLiveness.Build(afterCopyProp);
+                    var facts = ComputeFacts(afterCopyProp);
+                    var rewrite = Rewrite(afterCopyProp, facts, pointLiveness);
+                    var afterRewrite = WithBlocks(afterCopyProp, rewrite.Blocks);
 
                     OptimizationResult dce = _options.RemoveDeadDefinitions
                         ? EliminateDeadDefinitions(afterRewrite)
                         : new OptimizationResult(afterRewrite.Blocks, changed: false);
 
                     var next = WithBlocks(afterRewrite, dce.Blocks);
-                    bool changed = rewrite.Changed || dce.Changed;
+                    bool changed = copyProp.Changed || rewrite.Changed || dce.Changed;
 
                     if (!changed)
                     {
@@ -5966,6 +6074,576 @@ namespace Cnidaria.Cs
                 return SsaValueNumbering.BuildMethod(finalWithoutVn);
             }
 
+
+
+            private readonly struct CopyPropSsaDef
+            {
+                public readonly SsaValueName Name;
+                public readonly SsaDescriptor Descriptor;
+                public readonly SsaTree? DefTree;
+
+                public CopyPropSsaDef(SsaValueName name, SsaDescriptor descriptor, SsaTree? defTree)
+                {
+                    Name = name;
+                    Descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
+                    DefTree = defTree;
+                }
+            }
+
+            private sealed class SsaAvailability
+            {
+                private readonly SsaMethod _method;
+                private readonly Dictionary<SsaValueName, SsaValueDefinition> _definitions = new();
+                private readonly Dictionary<(int blockId, int statementIndex, int treeId), int> _treeOrder = new();
+
+                public SsaAvailability(SsaMethod method)
+                {
+                    _method = method ?? throw new ArgumentNullException(nameof(method));
+                    for (int i = 0; i < method.ValueDefinitions.Length; i++)
+                        _definitions[method.ValueDefinitions[i].Name] = method.ValueDefinitions[i];
+                    BuildTreeOrder();
+                }
+
+                public bool IsAvailableAt(SsaValueName name, int useBlockId, int useStatementIndex, int useTreeId)
+                {
+                    if (!_definitions.TryGetValue(name, out var definition))
+                        return false;
+
+                    if (definition.IsInitial)
+                        return true;
+
+                    if (definition.DefBlockId < 0)
+                        return false;
+
+                    if (definition.DefBlockId == useBlockId)
+                    {
+                        if (definition.IsPhi)
+                            return true;
+
+                        if (definition.DefStatementIndex < 0)
+                            return false;
+
+                        if (definition.DefStatementIndex < useStatementIndex)
+                            return true;
+
+                        if (definition.DefStatementIndex > useStatementIndex)
+                            return false;
+
+                        int defOrder = GetTreeOrder(definition.DefBlockId, definition.DefStatementIndex, definition.DefTreeId);
+                        int useOrder = GetTreeOrder(useBlockId, useStatementIndex, useTreeId);
+                        return defOrder >= 0 && useOrder >= 0 && defOrder < useOrder;
+                    }
+
+                    return Dominates(definition.DefBlockId, useBlockId);
+                }
+
+                private void BuildTreeOrder()
+                {
+                    for (int b = 0; b < _method.Blocks.Length; b++)
+                    {
+                        var block = _method.Blocks[b];
+                        for (int i = 0; i < block.TreeList.Length; i++)
+                        {
+                            var item = block.TreeList[i];
+                            _treeOrder[(block.Id, item.StatementIndex, item.Tree.Source.Id)] = item.TreeIndex;
+                        }
+                    }
+                }
+
+                private int GetTreeOrder(int blockId, int statementIndex, int treeId)
+                {
+                    return _treeOrder.TryGetValue((blockId, statementIndex, treeId), out int order) ? order : -1;
+                }
+
+                private bool Dominates(int definitionBlockId, int useBlockId)
+                {
+                    if (definitionBlockId == useBlockId)
+                        return true;
+
+                    if ((uint)definitionBlockId >= (uint)_method.Cfg.Blocks.Length || (uint)useBlockId >= (uint)_method.Cfg.Blocks.Length)
+                        return false;
+
+                    int current = useBlockId;
+                    while (current >= 0)
+                    {
+                        current = _method.Cfg.ImmediateDominators[current];
+                        if (current == definitionBlockId)
+                            return true;
+                    }
+
+                    return false;
+                }
+            }
+
+            private sealed class SsaTreeLifeUpdater
+            {
+                private readonly SsaLocalLiveness _liveness;
+                private TrackedLocalSet _currentLife;
+                private int _currentBlockId;
+
+                public SsaTreeLifeUpdater(SsaLocalLiveness liveness)
+                {
+                    _liveness = liveness ?? throw new ArgumentNullException(nameof(liveness));
+                    _currentLife = _liveness.Table.NewEmptySet();
+                    _currentBlockId = -1;
+                }
+
+                public void BeginBlock(int blockId)
+                {
+                    if ((uint)blockId >= (uint)_liveness.LiveInBits.Length)
+                        throw new ArgumentOutOfRangeException(nameof(blockId));
+
+                    _currentBlockId = blockId;
+                    _currentLife = _liveness.LiveInBits[blockId].Clone();
+                }
+
+                public bool IsLive(SsaSlot slot) => _currentLife.Contains(slot);
+
+                public void UpdatePhiDefinition(SsaSlot slot)
+                {
+                    if (_currentBlockId < 0)
+                        throw new InvalidOperationException("Tree liveness updater has not been positioned at a block.");
+
+                    if (_liveness.Table.Contains(slot))
+                        _currentLife.Add(slot);
+                }
+
+                public void UpdateLife(SsaTree tree)
+                {
+                    if (tree is null)
+                        throw new ArgumentNullException(nameof(tree));
+
+                    if (tree.Value.HasValue)
+                        UpdateUse(tree.Value.Value.Slot, tree.Source);
+
+                    if (tree.LocalFieldBaseValue.HasValue)
+                        UpdateUse(tree.LocalFieldBaseValue.Value.Slot, tree.Source);
+
+                    if (tree.StoreTarget.HasValue)
+                        UpdateDefinition(tree.StoreTarget.Value.Slot, tree.Source);
+                }
+
+                private void UpdateUse(SsaSlot slot, GenTree source)
+                {
+                    UpdateLifeBit(slot, isBorn: false, isDying: (source.Flags & GenTreeFlags.VarDeath) != 0);
+                }
+
+                private void UpdateDefinition(SsaSlot slot, GenTree source)
+                {
+                    bool isBorn = (source.Flags & GenTreeFlags.VarDef) != 0 && (source.Flags & GenTreeFlags.VarUseAsg) == 0;
+                    bool isDying = (source.Flags & GenTreeFlags.VarDeath) != 0;
+                    UpdateLifeBit(slot, isBorn, isDying);
+                }
+
+                private void UpdateLifeBit(SsaSlot slot, bool isBorn, bool isDying)
+                {
+                    if (!_liveness.Table.Contains(slot))
+                        return;
+
+                    if (isDying)
+                        _currentLife.Remove(slot);
+                    else if (isBorn)
+                        _currentLife.Add(slot);
+                }
+            }
+
+            private OptimizationResult CopyPropagate(SsaMethod method, SsaLocalLiveness pointLiveness)
+            {
+                if (method.ValueNumbers is null)
+                    return new OptimizationResult(method.Blocks, changed: false);
+
+                var availability = new SsaAvailability(method);
+                var life = new SsaTreeLifeUpdater(pointLiveness);
+                var blocks = new SsaBlock[method.Blocks.Length];
+                for (int i = 0; i < method.Blocks.Length; i++)
+                    blocks[method.Blocks[i].Id] = method.Blocks[i];
+
+                var stacks = new Dictionary<SsaSlot, Stack<CopyPropSsaDef>>();
+                var visited = new bool[method.Blocks.Length];
+                bool changed = false;
+
+                var roots = method.Cfg.DominatorRoots.IsDefaultOrEmpty
+                    ? ImmutableArray.Create(method.Blocks.Length == 0 ? -1 : method.Blocks[0].Id)
+                    : method.Cfg.DominatorRoots;
+
+                for (int i = 0; i < roots.Length; i++)
+                {
+                    int root = roots[i];
+                    if ((uint)root < (uint)blocks.Length)
+                        VisitBlock(root);
+                }
+
+                for (int i = 0; i < blocks.Length; i++)
+                {
+                    if (blocks[i] is null)
+                        blocks[i] = method.Blocks[i];
+                }
+
+                return new OptimizationResult(ImmutableArray.Create(blocks), changed);
+
+                void VisitBlock(int blockId)
+                {
+                    if ((uint)blockId >= (uint)blocks.Length || visited[blockId])
+                        return;
+
+                    visited[blockId] = true;
+                    var originalBlock = blocks[blockId];
+                    var pushedInBlock = new List<SsaSlot>();
+                    life.BeginBlock(blockId);
+
+                    for (int p = 0; p < originalBlock.Phis.Length; p++)
+                    {
+                        var phi = originalBlock.Phis[p];
+                        life.UpdatePhiDefinition(phi.Slot);
+                        PushAvailableDefinition(method, phi.Target, null, stacks, pushedInBlock);
+                    }
+
+                    bool blockChanged = false;
+                    var statements = ImmutableArray.CreateBuilder<SsaTree>(originalBlock.Statements.Length);
+                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(originalBlock.Statements.Length);
+                    bool skipCopyProp = BlockIsFinallyOrFaultHandler(method, originalBlock);
+
+                    for (int s = 0; s < originalBlock.Statements.Length; s++)
+                    {
+                        var rewritten = RewriteCopyPropStatement(
+                            method,
+                            originalBlock.Statements[s],
+                            originalBlock.StatementTreeLists[s],
+                            availability,
+                            life,
+                            stacks,
+                            pushedInBlock,
+                            blockId,
+                            s,
+                            skipCopyProp,
+                            ref changed);
+
+                        if (!ReferenceEquals(rewritten.Root, originalBlock.Statements[s]))
+                            blockChanged = true;
+
+                        statements.Add(rewritten.Root);
+                        statementTreeLists.Add(rewritten.TreeList);
+                    }
+
+                    if (blockChanged)
+                        blocks[blockId] = new SsaBlock(
+                            originalBlock.CfgBlock,
+                            originalBlock.Phis,
+                            statements.ToImmutable(),
+                            originalBlock.MemoryPhis,
+                            originalBlock.MemoryIn,
+                            originalBlock.MemoryOut,
+                            statementTreeLists: statementTreeLists.ToImmutable());
+
+                    var children = method.Cfg.DominatorTreeChildren[blockId];
+                    for (int i = 0; i < children.Length; i++)
+                        VisitBlock(children[i]);
+
+                    for (int i = pushedInBlock.Count - 1; i >= 0; i--)
+                        PopAvailableDefinition(stacks, pushedInBlock[i]);
+                }
+            }
+
+            private (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteCopyPropStatement(
+                SsaMethod method,
+                SsaTree root,
+                ImmutableArray<SsaTree> treeList,
+                SsaAvailability availability,
+                SsaTreeLifeUpdater life,
+                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
+                List<SsaSlot> pushedInBlock,
+                int blockId,
+                int statementIndex,
+                bool skipCopyProp,
+                ref bool changed)
+            {
+                if (treeList.IsDefaultOrEmpty)
+                    return (root, treeList);
+
+                var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                var rewrittenTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length);
+                bool statementChanged = false;
+
+                for (int i = 0; i < treeList.Length; i++)
+                {
+                    var tree = treeList[i];
+                    var candidate = RebuildSsaTreeWithRewrittenOperands(tree, rewrittenByTree, ref statementChanged);
+
+                    life.UpdateLife(candidate);
+
+                    SsaTree rewritten = candidate;
+                    if (candidate.StoreTarget.HasValue)
+                    {
+                        PushAvailableDefinition(method, candidate.StoreTarget.Value, candidate, stacks, pushedInBlock);
+                    }
+                    else if (!skipCopyProp && candidate.Value.HasValue && IsPureLocalSsaUse(candidate))
+                    {
+                        EnsureInitialParameterDefinition(method, candidate.Value.Value, stacks);
+                        if (TryCopyPropagateUse(method, candidate, availability, life, stacks, blockId, statementIndex, out var replacement))
+                        {
+                            rewritten = replacement;
+                            statementChanged = true;
+                            changed = true;
+                        }
+                    }
+
+                    rewrittenByTree[tree] = rewritten;
+                    rewrittenTreeList.Add(rewritten);
+                }
+
+                if (statementChanged)
+                    changed = true;
+
+                var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : root;
+                var resultTreeList = rewrittenTreeList.ToImmutable();
+                if (!ReferenceEquals(resultTreeList[resultTreeList.Length - 1], rewrittenRoot))
+                    throw new InvalidOperationException("Copy propagation changed SSA statement tree-list root ordering for node " + root.Source.Id.ToString() + ".");
+
+                return (rewrittenRoot, resultTreeList);
+            }
+
+            private static SsaTree RebuildSsaTreeWithRewrittenOperands(
+                SsaTree tree,
+                Dictionary<SsaTree, SsaTree> rewrittenByTree,
+                ref bool changed)
+            {
+                if (tree.Operands.Length == 0)
+                    return tree;
+
+                ImmutableArray<SsaTree>.Builder? operands = null;
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (!rewrittenByTree.TryGetValue(tree.Operands[i], out var rewrittenOperand))
+                        throw new InvalidOperationException("SSA tree list is not in execution order: operand appears after parent at node " + tree.Source.Id.ToString() + ".");
+
+                    if (!ReferenceEquals(rewrittenOperand, tree.Operands[i]) && operands is null)
+                    {
+                        operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
+                        for (int j = 0; j < i; j++)
+                            operands.Add(tree.Operands[j]);
+                    }
+
+                    operands?.Add(rewrittenOperand);
+                }
+
+                if (operands is null)
+                    return tree;
+
+                changed = true;
+                return new SsaTree(tree.Source, operands.ToImmutable(), tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
+            }
+
+            private bool TryCopyPropagateUse(
+                SsaMethod method,
+                SsaTree useSite,
+                SsaAvailability availability,
+                SsaTreeLifeUpdater life,
+                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
+                int blockId,
+                int statementIndex,
+                out SsaTree replacement)
+            {
+                replacement = null!;
+                if (!useSite.Value.HasValue)
+                    return false;
+                var useName = useSite.Value.Value;
+                if (!method.TryGetSsaDescriptor(useName, out var useDescriptor))
+                    return false;
+
+                var useVN = useDescriptor.ValueNumbers.Conservative;
+                if (!useVN.IsValid)
+                    return false;
+
+                var candidateSlots = new List<SsaSlot>(stacks.Keys);
+                candidateSlots.Sort();
+
+                for (int i = 0; i < candidateSlots.Count; i++)
+                {
+                    var candidateSlot = candidateSlots[i];
+                    if (candidateSlot.Equals(useName.Slot))
+                        continue;
+
+                    if (!life.IsLive(candidateSlot))
+                        continue;
+
+                    var stack = stacks[candidateSlot];
+                    if (stack.Count == 0)
+                        continue;
+
+                    var candidate = stack.Peek();
+                    if (!availability.IsAvailableAt(candidate.Name, blockId, statementIndex, useSite.Source.Id))
+                        continue;
+
+                    if (candidate.Descriptor.ValueNumbers.Conservative != useVN)
+                        continue;
+
+                    if (!CanSubstituteLocal(method, useDescriptor, candidate.Descriptor, useSite.Source))
+                        continue;
+
+                    replacement = CreateSsaLocalUse(useSite.Source, candidate.Name, candidate.Descriptor);
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool CanSubstituteLocal(SsaMethod method, SsaDescriptor useDescriptor, SsaDescriptor candidateDescriptor, GenTree useSource)
+            {
+                if (useDescriptor.BaseLocal.Equals(candidateDescriptor.BaseLocal))
+                    return false;
+
+                if (!SameStorageShape(useDescriptor.Type, useDescriptor.StackKind, candidateDescriptor.Type, candidateDescriptor.StackKind))
+                    return false;
+
+                if (_slotInfos.TryGetValue(useDescriptor.BaseLocal, out var useInfo) &&
+                    _slotInfos.TryGetValue(candidateDescriptor.BaseLocal, out var candidateInfo))
+                {
+                    if (useInfo.LocalDescriptor is not null && candidateInfo.LocalDescriptor is not null &&
+                        useInfo.LocalDescriptor.DoNotEnregister != candidateInfo.LocalDescriptor.DoNotEnregister)
+                    {
+                        return false;
+                    }
+
+                    if (CopyPropLocalScore(useInfo, candidateInfo, preferCandidate: true) <= 0)
+                        return false;
+                }
+
+                return true;
+            }
+
+            private static int CopyPropLocalScore(SsaSlotInfo useInfo, SsaSlotInfo candidateInfo, bool preferCandidate)
+            {
+                int score = preferCandidate ? 1 : -1;
+
+                if (useInfo.LocalDescriptor is { IsCompilerTemp: true })
+                    score += 2;
+                if (candidateInfo.LocalDescriptor is { IsCompilerTemp: true })
+                    score -= 2;
+
+                if (useInfo.LocalDescriptor is { DoNotEnregister: true })
+                    score += 1;
+                if (candidateInfo.LocalDescriptor is { DoNotEnregister: true })
+                    score -= 1;
+
+                return score;
+            }
+
+            private SsaTree CreateSsaLocalUse(GenTree template, SsaValueName value, SsaDescriptor descriptor)
+            {
+                var kind = value.Slot.Kind switch
+                {
+                    SsaSlotKind.Arg => GenTreeKind.Arg,
+                    SsaSlotKind.Local => GenTreeKind.Local,
+                    SsaSlotKind.Temp => GenTreeKind.Temp,
+                    _ => template.Kind,
+                };
+
+                var flags = (template.Flags & ~(GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow | GenTreeFlags.AddressExposed | GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath)) | GenTreeFlags.LocalUse;
+                var source = new GenTree(
+                    _nextSyntheticTreeId++,
+                    kind,
+                    template.Pc,
+                    template.SourceOp,
+                    descriptor.Type,
+                    descriptor.StackKind,
+                    flags,
+                    ImmutableArray<GenTree>.Empty,
+                    int32: value.Slot.Index);
+
+                source.AttachSsaUse(value);
+                if (_slotInfos.TryGetValue(value.Slot, out var info))
+                    source.LocalDescriptor = info.LocalDescriptor;
+
+                return new SsaTree(source, ImmutableArray<SsaTree>.Empty, value: value);
+            }
+
+            private static bool IsPureLocalSsaUse(SsaTree tree)
+            {
+                if (!tree.Value.HasValue || tree.StoreTarget.HasValue || tree.LocalFieldBaseValue.HasValue || tree.HasMemoryEffects)
+                    return false;
+
+                if (tree.Operands.Length != 0)
+                    return false;
+
+                return tree.Source.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp or GenTreeKind.Field;
+            }
+
+            private static bool SameStorageShape(RuntimeType? leftType, GenStackKind leftStackKind, RuntimeType? rightType, GenStackKind rightStackKind)
+            {
+                if (leftStackKind != rightStackKind)
+                    return false;
+
+                if (ReferenceEquals(leftType, rightType))
+                    return true;
+
+                if (leftType is null || rightType is null)
+                    return leftType is null && rightType is null;
+
+                return leftType.TypeId == rightType.TypeId;
+            }
+
+            private static bool BlockIsFinallyOrFaultHandler(SsaMethod method, SsaBlock block)
+            {
+                var handlers = block.CfgBlock.HandlerRegionIndexes;
+                for (int i = 0; i < handlers.Length; i++)
+                {
+                    int regionIndex = handlers[i];
+                    if ((uint)regionIndex >= (uint)method.Cfg.ExceptionRegions.Length)
+                        continue;
+
+                    var region = method.Cfg.ExceptionRegions[regionIndex];
+                    if (region.Kind is CfgExceptionRegionKind.Finally or CfgExceptionRegionKind.Fault)
+                        return true;
+                }
+
+                return false;
+            }
+
+            private static void EnsureInitialParameterDefinition(SsaMethod method, SsaValueName value, Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks)
+            {
+                if (value.Version != SsaConfig.FirstSsaNumber || value.Slot.Kind != SsaSlotKind.Arg)
+                    return;
+
+                if (stacks.TryGetValue(value.Slot, out var existing) && existing.Count != 0)
+                    return;
+
+                if (!method.TryGetSsaDescriptor(value, out var descriptor) || !descriptor.IsInitial)
+                    return;
+
+                var stack = new Stack<CopyPropSsaDef>();
+                stack.Push(new CopyPropSsaDef(value, descriptor, null));
+                stacks[value.Slot] = stack;
+            }
+
+            private static void PushAvailableDefinition(
+                SsaMethod method,
+                SsaValueName value,
+                SsaTree? defTree,
+                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
+                List<SsaSlot> pushedInBlock)
+            {
+                if (!method.TryGetSsaDescriptor(value, out var descriptor))
+                    return;
+
+                if (!stacks.TryGetValue(value.Slot, out var stack))
+                {
+                    stack = new Stack<CopyPropSsaDef>();
+                    stacks[value.Slot] = stack;
+                }
+
+                stack.Push(new CopyPropSsaDef(value, descriptor, defTree));
+                pushedInBlock.Add(value.Slot);
+            }
+
+            private static void PopAvailableDefinition(Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks, SsaSlot slot)
+            {
+                if (!stacks.TryGetValue(slot, out var stack) || stack.Count == 0)
+                    throw new InvalidOperationException("Copy-prop SSA stack underflow for " + slot + ".");
+
+                stack.Pop();
+                if (stack.Count == 0)
+                    stacks.Remove(slot);
+            }
 
 
             private Dictionary<SsaValueName, ValueFact> ComputeFacts(SsaMethod method)
@@ -6176,7 +6854,7 @@ namespace Cnidaria.Cs
                         for (int i = 0; i < phi.Inputs.Length; i++)
                         {
                             var input = phi.Inputs[i];
-                            var fact = NormalizeValue(input.Value, facts);
+                            _ = NormalizeValue(input.Value, facts);
                             newInputs.Add(input);
                         }
 
@@ -6197,13 +6875,22 @@ namespace Cnidaria.Cs
                     }
 
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
+                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
                     for (int s = 0; s < block.Statements.Length; s++)
                     {
-                        var rewritten = RewriteTree(method, block.Statements[s], facts, pointLiveness, block.Id, s, ref changed);
-                        statements.Add(rewritten);
+                        var rewritten = RewriteStatement(method, block.Statements[s], block.StatementTreeLists[s], facts, pointLiveness, block.Id, s, ref changed);
+                        statements.Add(rewritten.Root);
+                        statementTreeLists.Add(rewritten.TreeList);
                     }
 
-                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
+                    blocks.Add(new SsaBlock(
+                        block.CfgBlock,
+                        phis.ToImmutable(),
+                        statements.ToImmutable(),
+                        block.MemoryPhis,
+                        block.MemoryIn,
+                        block.MemoryOut,
+                        statementTreeLists: statementTreeLists.ToImmutable()));
                 }
 
                 return new OptimizationResult(blocks.ToImmutable(), changed);
@@ -6218,34 +6905,90 @@ namespace Cnidaria.Cs
                 return fact.Kind == ValueFactKind.Constant;
             }
 
-            private SsaTree RewriteTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, SsaLocalLiveness pointLiveness, int blockId, int statementIndex, ref bool changed)
+            private (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteStatement(
+                SsaMethod method,
+                SsaTree root,
+                ImmutableArray<SsaTree> treeList,
+                Dictionary<SsaValueName, ValueFact> facts,
+                SsaLocalLiveness pointLiveness,
+                int blockId,
+                int statementIndex,
+                ref bool changed)
             {
-                if (tree.Value.HasValue)
+                if (treeList.IsDefaultOrEmpty)
                 {
-                    var fact = NormalizeValue(tree.Value.Value, facts);
-                    if (_options.PropagateConstants && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(tree.Source, fact.Constant))
-                    {
-                        changed = true;
-                        return new SsaTree(CreateConstantTree(tree.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
-                    }
-
-                    return tree;
+                    var recursivelyRewritten = RewriteTreeRecursive(method, root, facts, pointLiveness, blockId, statementIndex, ref changed);
+                    return (recursivelyRewritten, SsaTreeLinearOrder.BuildStatement(recursivelyRewritten));
                 }
 
+                var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                var draftTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length + 4);
+                var appended = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                bool statementChanged = false;
+
+                for (int i = 0; i < treeList.Length; i++)
+                {
+                    var tree = treeList[i];
+                    var candidate = RebuildSsaTreeWithRewrittenOperands(tree, rewrittenByTree, ref statementChanged);
+                    var rewritten = RewriteTreeNode(method, candidate, facts, pointLiveness, blockId, statementIndex, ref statementChanged);
+                    rewrittenByTree[tree] = rewritten;
+                    AppendTreePreservingExistingOrder(rewritten, appended, draftTreeList);
+                }
+
+                if (statementChanged)
+                    changed = true;
+
+                var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : root;
+                var finalTreeList = ProjectReachableTreeList(rewrittenRoot, draftTreeList.ToImmutable());
+                return (rewrittenRoot, finalTreeList);
+            }
+
+            private SsaTree RewriteTreeRecursive(
+                SsaMethod method,
+                SsaTree tree,
+                Dictionary<SsaValueName, ValueFact> facts,
+                SsaLocalLiveness pointLiveness,
+                int blockId,
+                int statementIndex,
+                ref bool changed)
+            {
                 var operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
                 bool operandChanged = false;
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
-                    var rewritten = RewriteTree(method, tree.Operands[i], facts, pointLiveness, blockId, statementIndex, ref changed);
+                    var rewritten = RewriteTreeRecursive(method, tree.Operands[i], facts, pointLiveness, blockId, statementIndex, ref changed);
                     if (!ReferenceEquals(rewritten, tree.Operands[i]))
                         operandChanged = true;
                     operands.Add(rewritten);
                 }
 
-                var newOperands = operandChanged ? operands.ToImmutable() : tree.Operands;
                 var candidate = operandChanged
-                    ? new SsaTree(tree.Source, newOperands, tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions)
+                    ? new SsaTree(tree.Source, operands.ToImmutable(), tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions)
                     : tree;
+
+                return RewriteTreeNode(method, candidate, facts, pointLiveness, blockId, statementIndex, ref changed);
+            }
+
+            private SsaTree RewriteTreeNode(
+                SsaMethod method,
+                SsaTree candidate,
+                Dictionary<SsaValueName, ValueFact> facts,
+                SsaLocalLiveness pointLiveness,
+                int blockId,
+                int statementIndex,
+                ref bool changed)
+            {
+                if (candidate.Value.HasValue)
+                {
+                    var fact = NormalizeValue(candidate.Value.Value, facts);
+                    if (_options.PropagateConstants && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(candidate.Source, fact.Constant))
+                    {
+                        changed = true;
+                        return new SsaTree(CreateConstantTree(candidate.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
+                    }
+
+                    return candidate;
+                }
 
                 if (_options.SimplifyAlgebraicIdentities && TrySimplifyTree(method, candidate, facts, out var simplified))
                 {
@@ -6256,7 +6999,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (_options.FoldConstants && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source))
+                if (_options.FoldConstants && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source) && !HasObservableEffect(candidate))
                 {
                     var fact = EvaluateTree(method, candidate, facts);
                     if (fact.Kind == ValueFactKind.Constant &&
@@ -6268,12 +7011,78 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (operandChanged)
-                    changed = true;
-
                 return candidate;
             }
 
+            private static void AppendTreePreservingExistingOrder(
+                SsaTree tree,
+                HashSet<SsaTree> appended,
+                ImmutableArray<SsaTree>.Builder builder)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    AppendTreePreservingExistingOrder(tree.Operands[i], appended, builder);
+
+                if (appended.Add(tree))
+                    builder.Add(tree);
+            }
+
+            private static ImmutableArray<SsaTree> ProjectReachableTreeList(SsaTree root, ImmutableArray<SsaTree> candidateOrder)
+            {
+                var reachable = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                MarkReachable(root, reachable);
+
+                var builder = ImmutableArray.CreateBuilder<SsaTree>(reachable.Count);
+                var appended = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+
+                for (int i = 0; i < candidateOrder.Length; i++)
+                {
+                    var tree = candidateOrder[i];
+                    if (reachable.Contains(tree) && appended.Add(tree))
+                        builder.Add(tree);
+                }
+
+                AppendMissingReachable(root, reachable, appended, builder);
+
+                if (builder.Count == 0 || !ReferenceEquals(builder[builder.Count - 1], root))
+                {
+                    if (!appended.Contains(root))
+                    {
+                        appended.Add(root);
+                        builder.Add(root);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("SSA rewritten statement tree-list root is not last for node " + root.Source.Id.ToString() + ".");
+                    }
+                }
+
+                return builder.ToImmutable();
+            }
+
+            private static void MarkReachable(SsaTree tree, HashSet<SsaTree> reachable)
+            {
+                if (!reachable.Add(tree))
+                    return;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    MarkReachable(tree.Operands[i], reachable);
+            }
+
+            private static void AppendMissingReachable(
+                SsaTree tree,
+                HashSet<SsaTree> reachable,
+                HashSet<SsaTree> appended,
+                ImmutableArray<SsaTree>.Builder builder)
+            {
+                if (!reachable.Contains(tree) || appended.Contains(tree))
+                    return;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    AppendMissingReachable(tree.Operands[i], reachable, appended, builder);
+
+                if (appended.Add(tree))
+                    builder.Add(tree);
+            }
 
             private bool CanUseReplacementTreeAt(
                 SsaMethod method,
@@ -6332,20 +7141,26 @@ namespace Cnidaria.Cs
                     }
 
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
+                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
                     for (int s = 0; s < block.Statements.Length; s++)
                     {
                         var statement = block.Statements[s];
+                        var oldTreeList = block.StatementTreeLists[s];
                         if (statement.StoreTarget.HasValue && !live.Contains(statement.StoreTarget.Value))
                         {
                             if (MustPreserveDeadStore(statement.StoreTarget.Value))
                             {
                                 statements.Add(statement);
+                                statementTreeLists.Add(oldTreeList);
                                 continue;
                             }
 
                             var sideEffects = ExtractSideEffects(statement);
                             if (sideEffects is not null)
+                            {
                                 statements.Add(sideEffects);
+                                statementTreeLists.Add(ProjectReachableTreeList(sideEffects, oldTreeList.Add(sideEffects)));
+                            }
                             changed = true;
                             continue;
                         }
@@ -6357,9 +7172,17 @@ namespace Cnidaria.Cs
                         }
 
                         statements.Add(statement);
+                        statementTreeLists.Add(oldTreeList);
                     }
 
-                    blocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
+                    blocks.Add(new SsaBlock(
+                        block.CfgBlock,
+                        phis.ToImmutable(),
+                        statements.ToImmutable(),
+                        block.MemoryPhis,
+                        block.MemoryIn,
+                        block.MemoryOut,
+                        statementTreeLists: statementTreeLists.ToImmutable()));
                 }
 
                 return new OptimizationResult(blocks.ToImmutable(), changed);
@@ -7344,8 +8167,12 @@ namespace Cnidaria.Cs
                     for (int p = 0; p < block.Phis.Length; p++)
                         AssignDefinition(block.Phis[p].Target);
 
-                    for (int s = 0; s < block.Statements.Length; s++)
-                        AssignDefinitions(block.Statements[s]);
+                    for (int n = 0; n < block.TreeList.Length; n++)
+                    {
+                        var tree = block.TreeList[n].Tree;
+                        if (tree.StoreTarget.HasValue)
+                            AssignDefinition(tree.StoreTarget.Value);
+                    }
                 }
 
                 var compactedBlocks = ImmutableArray.CreateBuilder<SsaBlock>(blocks.Length);
@@ -7367,10 +8194,22 @@ namespace Cnidaria.Cs
                     }
 
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
+                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
                     for (int s = 0; s < block.Statements.Length; s++)
-                        statements.Add(RewriteTree(block.Statements[s]));
+                    {
+                        var rewritten = RewriteStatement(block.Statements[s], block.StatementTreeLists[s]);
+                        statements.Add(rewritten.Root);
+                        statementTreeLists.Add(rewritten.TreeList);
+                    }
 
-                    compactedBlocks.Add(new SsaBlock(block.CfgBlock, phis.ToImmutable(), statements.ToImmutable(), block.MemoryPhis, block.MemoryIn, block.MemoryOut));
+                    compactedBlocks.Add(new SsaBlock(
+                        block.CfgBlock,
+                        phis.ToImmutable(),
+                        statements.ToImmutable(),
+                        block.MemoryPhis,
+                        block.MemoryIn,
+                        block.MemoryOut,
+                        statementTreeLists: statementTreeLists.ToImmutable()));
                 }
 
                 var initialList = new List<SsaValueName>(compactedInitialValues.Count);
@@ -7428,11 +8267,31 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("SSA " + context + " uses removed or never-defined value " + oldName + ".");
                 }
 
-                SsaTree RewriteTree(SsaTree tree)
+                (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteStatement(SsaTree root, ImmutableArray<SsaTree> treeList)
+                {
+                    var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                    var rewrittenTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length);
+
+                    for (int i = 0; i < treeList.Length; i++)
+                    {
+                        var rewritten = RewriteNode(treeList[i], rewrittenByTree);
+                        rewrittenByTree[treeList[i]] = rewritten;
+                        rewrittenTreeList.Add(rewritten);
+                    }
+
+                    var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : RewriteNode(root, rewrittenByTree);
+                    return (rewrittenRoot, ProjectReachableTreeList(rewrittenRoot, rewrittenTreeList.ToImmutable()));
+                }
+
+                SsaTree RewriteNode(SsaTree tree, Dictionary<SsaTree, SsaTree> rewrittenByTree)
                 {
                     var operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
                     for (int i = 0; i < tree.Operands.Length; i++)
-                        operands.Add(RewriteTree(tree.Operands[i]));
+                    {
+                        if (!rewrittenByTree.TryGetValue(tree.Operands[i], out var rewrittenOperand))
+                            rewrittenOperand = RewriteNode(tree.Operands[i], rewrittenByTree);
+                        operands.Add(rewrittenOperand);
+                    }
 
                     SsaValueName? value = tree.Value.HasValue
                         ? MapUse(tree.Value.Value, "tree use")
@@ -7514,18 +8373,15 @@ namespace Cnidaria.Cs
                         phiDescriptor: phi)));
                     }
 
-                    for (int s = 0; s < block.Statements.Length; s++)
-                        CollectDefinitions(block.Statements[s], block, s);
+                    for (int i = 0; i < block.TreeList.Length; i++)
+                        CollectDefinition(block.TreeList[i].Tree, block, block.TreeList[i].StatementIndex);
                 }
 
                 definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
                 return definitions.ToImmutableArray();
 
-                void CollectDefinitions(SsaTree tree, SsaBlock block, int statementIndex)
+                void CollectDefinition(SsaTree tree, SsaBlock block, int statementIndex)
                 {
-                    for (int i = 0; i < tree.Operands.Length; i++)
-                        CollectDefinitions(tree.Operands[i], block, statementIndex);
-
                     int blockId = block.Id;
 
                     if (!tree.StoreTarget.HasValue)

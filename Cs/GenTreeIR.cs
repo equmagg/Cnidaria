@@ -1118,6 +1118,91 @@ namespace Cnidaria.Cs
         }
     }
 
+
+    internal static class GenTreeTreeOrder
+    {
+        public static ImmutableArray<GenTree> BuildStatement(GenTree root)
+        {
+            if (root is null)
+                throw new ArgumentNullException(nameof(root));
+
+            var builder = ImmutableArray.CreateBuilder<GenTree>();
+            var seen = new HashSet<GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
+            CollectUnique(root, seen, builder);
+            builder.Sort(static (left, right) => left.Id.CompareTo(right.Id));
+
+            var result = builder.ToImmutable();
+            ValidateStatementTreeList(root, result);
+            return result;
+        }
+
+        public static ImmutableArray<ImmutableArray<GenTree>> BuildStatements(ImmutableArray<GenTree> statements)
+        {
+            if (statements.IsDefaultOrEmpty)
+                return ImmutableArray<ImmutableArray<GenTree>>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<ImmutableArray<GenTree>>(statements.Length);
+            for (int i = 0; i < statements.Length; i++)
+                builder.Add(BuildStatement(statements[i]));
+            return builder.ToImmutable();
+        }
+
+        public static ImmutableArray<GenTree> Flatten(ImmutableArray<ImmutableArray<GenTree>> statementTreeLists)
+        {
+            if (statementTreeLists.IsDefaultOrEmpty)
+                return ImmutableArray<GenTree>.Empty;
+
+            int count = 0;
+            for (int i = 0; i < statementTreeLists.Length; i++)
+                count += statementTreeLists[i].Length;
+
+            var builder = ImmutableArray.CreateBuilder<GenTree>(count);
+            for (int i = 0; i < statementTreeLists.Length; i++)
+                builder.AddRange(statementTreeLists[i]);
+            return builder.ToImmutable();
+        }
+
+        public static ImmutableArray<GenTree> BuildBlock(ImmutableArray<GenTree> statements)
+            => Flatten(BuildStatements(statements));
+
+        private static void CollectUnique(GenTree node, HashSet<GenTree> seen, ImmutableArray<GenTree>.Builder builder)
+        {
+            if (!seen.Add(node))
+                return;
+
+            builder.Add(node);
+            for (int i = 0; i < node.Operands.Length; i++)
+                CollectUnique(node.Operands[i], seen, builder);
+        }
+
+        private static void ValidateStatementTreeList(GenTree root, ImmutableArray<GenTree> treeList)
+        {
+            if (treeList.IsDefaultOrEmpty)
+                throw new InvalidOperationException("Statement tree-list is empty for root " + root.Id.ToString() + ".");
+
+            if (!ReferenceEquals(treeList[treeList.Length - 1], root))
+                throw new InvalidOperationException("Statement tree-list root is not last in execution order for root " + root.Id.ToString() + ".");
+
+            var ordinalByNode = new Dictionary<GenTree, int>(ReferenceEqualityComparer<GenTree>.Instance);
+            for (int i = 0; i < treeList.Length; i++)
+            {
+                if (!ordinalByNode.TryAdd(treeList[i], i))
+                    throw new InvalidOperationException("Statement tree-list contains duplicate node " + treeList[i].Id.ToString() + ".");
+            }
+
+            for (int i = 0; i < treeList.Length; i++)
+            {
+                var node = treeList[i];
+                for (int op = 0; op < node.Operands.Length; op++)
+                {
+                    var operand = node.Operands[op];
+                    if (!ordinalByNode.TryGetValue(operand, out int operandOrdinal))
+                        throw new InvalidOperationException("Statement tree-list for root " + root.Id.ToString() + " does not contain operand " + operand.Id.ToString() + " of node " + node.Id.ToString() + ".");
+                }
+            }
+        }
+    }
+
     internal sealed class GenTreeBlock
     {
         public int Id { get; }
@@ -1128,6 +1213,7 @@ namespace Cnidaria.Cs
         public GenTreeBlockJumpKind JumpKind { get; }
         public GenTreeBlockFlags Flags { get; }
         public ImmutableArray<GenTree> Statements { get; }
+        public ImmutableArray<ImmutableArray<GenTree>> StatementTreeLists { get; }
         public ImmutableArray<GenTree> LinearNodes { get; private set; }
         public GenTree? FirstNode { get; private set; }
         public GenTree? LastNode { get; private set; }
@@ -1154,7 +1240,8 @@ namespace Cnidaria.Cs
             JumpKind = jumpKind;
             Flags = flags;
             Statements = statements.IsDefault ? ImmutableArray<GenTree>.Empty : statements;
-            SetLinearNodes(Statements);
+            StatementTreeLists = GenTreeTreeOrder.BuildStatements(Statements);
+            SetLinearNodes(GenTreeTreeOrder.Flatten(StatementTreeLists));
             SuccessorBlockIds = successorBlockIds.IsDefault ? ImmutableArray<int>.Empty : successorBlockIds;
             SuccessorPcs = successorPcs.IsDefault ? ImmutableArray<int>.Empty : successorPcs;
         }
@@ -2793,7 +2880,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.CastClass:
                 case BytecodeOp.Isinst:
                     operandType = ResolveType(ins.Operand0);
-                    type = operandType;
+                    type = operandType.IsValueType ? _rts.SystemObject : operandType;
                     stackKind = GenStackKind.Ref;
                     break;
 
@@ -3417,7 +3504,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.CastClass:
                 case BytecodeOp.Isinst:
                     operandType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                    type = operandType;
+                    type = operandType.IsValueType ? _rts.SystemObject : operandType;
                     stackKind = GenStackKind.Ref;
                     break;
 

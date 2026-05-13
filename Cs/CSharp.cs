@@ -1097,7 +1097,7 @@ namespace Cnidaria.Cs
             IMetadataView viewFlat = new FlatMetadataView(flatMd);
             return (viewFlat, builtFuncs, diagnostics);
         }
-        private static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction>? funcs, List<IDiagnostic> diags)
+        internal static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction>? funcs, List<IDiagnostic> diags)
             CompileLibraryCore(string source, string moduleName)
         {
             var diagnostics = new List<IDiagnostic>();

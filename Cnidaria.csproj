@@ -15,7 +15,7 @@
 	
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>2.2.7</Version>
+    <Version>2.3.0</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe interpreter collection</Description>
 

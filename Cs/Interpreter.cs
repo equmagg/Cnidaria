@@ -3573,6 +3573,10 @@ namespace Cnidaria.Cs
 
         private int BoxValue(RuntimeType type, byte sourceReg)
         {
+            if (type.IsReferenceType)
+            {
+                return checked((int)GetGpr(sourceReg));
+            }
             int obj = AllocBoxedValueObject(type);
             int payload = obj + ObjectHeaderSize;
             int size = StorageSizeOf(type);

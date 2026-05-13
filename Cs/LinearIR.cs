@@ -277,8 +277,8 @@ namespace Cnidaria.Cs
             if (IsGcSafePoint(source, blockId))
                 flags |= GenTreeLinearFlags.GcSafePoint;
 
-            byte internalGeneral = InternalGeneralRegisterCount(source, memoryAccess);
-            byte internalFloat = InternalFloatRegisterCount(source);
+            byte internalGeneral = InternalGeneralRegisterCount(source, result, memoryAccess);
+            byte internalFloat = InternalFloatRegisterCount(source, result);
 
             return new GenTreeLinearLoweringInfo(flags, internalGeneral, internalFloat);
         }
@@ -601,17 +601,26 @@ namespace Cnidaria.Cs
             };
         }
 
-        private static byte InternalGeneralRegisterCount(GenTree source, LinearMemoryAccess memoryAccess)
+        private static byte InternalGeneralRegisterCount(GenTree source, GenTree? result, LinearMemoryAccess memoryAccess)
         {
             int count = source.Kind switch
             {
-                GenTreeKind.ArrayElement => 1,
+                GenTreeKind.ArrayElement => ArrayElementLoadGeneralScratchCount(result),
                 GenTreeKind.ArrayElementAddr => 1,
-                GenTreeKind.StoreArrayElement => 1,
-                GenTreeKind.ArrayDataRef => 0,
+                GenTreeKind.StoreArrayElement => StoreArrayElementGeneralScratchCount(source),
                 GenTreeKind.PointerElementAddr => 1,
                 GenTreeKind.PointerDiff => 1,
                 GenTreeKind.StackAlloc => 1,
+                GenTreeKind.UnboxAny => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
+                GenTreeKind.Field => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
+                GenTreeKind.StaticField => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
+                GenTreeKind.LoadIndirect => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
+                GenTreeKind.StoreIndirect => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
+                GenTreeKind.StoreField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
+                GenTreeKind.StoreStaticField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true),
+
+                GenTreeKind.Box => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true),
+
                 _ => 0,
             };
 
@@ -624,10 +633,128 @@ namespace Cnidaria.Cs
             return (byte)count;
         }
 
-        private static byte InternalFloatRegisterCount(GenTree source)
+        private static byte InternalFloatRegisterCount(GenTree source, GenTree? result)
         {
-            return 0;
+            int count = source.Kind switch
+            {
+                GenTreeKind.ArrayElement => MultiRegisterLoadFloatScratchCount(result),
+                GenTreeKind.UnboxAny => MultiRegisterLoadFloatScratchCount(result),
+                GenTreeKind.Field => MultiRegisterLoadFloatScratchCount(result),
+                GenTreeKind.StaticField => MultiRegisterLoadFloatScratchCount(result),
+                GenTreeKind.LoadIndirect => MultiRegisterLoadFloatScratchCount(result),
+                GenTreeKind.StoreArrayElement => MultiRegisterStoreFloatScratchCount(MultiRegisterOperandValue(source, 2)),
+                GenTreeKind.StoreIndirect => MultiRegisterStoreFloatScratchCount(MultiRegisterOperandValue(source, 1)),
+                GenTreeKind.StoreField => MultiRegisterStoreFloatScratchCount(MultiRegisterOperandValue(source, 1)),
+                GenTreeKind.StoreStaticField => MultiRegisterStoreFloatScratchCount(MultiRegisterOperandValue(source, 0)),
+                GenTreeKind.Box => MultiRegisterStoreFloatScratchCount(MultiRegisterOperandValue(source, 0)),
+                _ => 0,
+            };
+
+            if (count > byte.MaxValue)
+                throw new InvalidOperationException($"Node {source.Id} requires too many internal float registers.");
+
+            return (byte)count;
         }
+
+        private static GenTree? MultiRegisterOperandValue(GenTree node, int operandIndex)
+        {
+            if ((uint)operandIndex >= (uint)node.Operands.Length)
+                return null;
+
+            var operand = node.Operands[operandIndex];
+            var value = operand.RegisterResult ?? operand;
+            return IsMultiRegisterValue(value) ? value : null;
+        }
+
+        private static bool IsMultiRegisterValue(GenTree? value)
+        {
+            if (value is null)
+                return false;
+
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            return abi.PassingKind == AbiValuePassingKind.MultiRegister;
+        }
+
+        private static bool MultiRegisterValueHasRegisterClass(GenTree? value, RegisterClass registerClass)
+        {
+            if (value is null)
+                return false;
+
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
+                return false;
+
+            var segments = MachineAbi.GetRegisterSegments(abi);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                if (segments[i].RegisterClass == registerClass)
+                    return true;
+            }
+
+            return false;
+        }
+
+
+        private static int ArrayElementLoadGeneralScratchCount(GenTree? result)
+        {
+            int count = MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true);
+            if (count != 0)
+                return count;
+
+            if (result is null)
+                return 0;
+
+            var abi = MachineAbi.ClassifyStorageValue(result.Type, result.StackKind);
+            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
+        }
+
+        private static int MultiRegisterLoadGeneralScratchCount(GenTree? result, bool needsAddressScratch)
+        {
+            if (!IsMultiRegisterValue(result))
+                return 0;
+
+            int count = needsAddressScratch ? 1 : 0;
+            if (MultiRegisterValueHasRegisterClass(result, RegisterClass.General))
+                count++;
+            return count;
+        }
+
+        private static int MultiRegisterLoadFloatScratchCount(GenTree? result)
+            => MultiRegisterValueHasRegisterClass(result, RegisterClass.Float) ? 1 : 0;
+        private static int StoreArrayElementGeneralScratchCount(GenTree source)
+        {
+            var value = StoreArrayElementOperandValue(source);
+
+            int count = MultiRegisterStoreGeneralScratchCount(value, needsAddressScratch: true);
+            if (count != 0)
+                return count;
+            if (value is null)
+                return 0;
+
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
+        }
+        private static GenTree? StoreArrayElementOperandValue(GenTree node)
+        {
+            if ((uint)2 >= (uint)node.Operands.Length)
+                return null;
+
+            var operand = node.Operands[2];
+            return operand.RegisterResult ?? operand;
+        }
+        private static int MultiRegisterStoreGeneralScratchCount(GenTree? value, bool needsAddressScratch)
+        {
+            if (!IsMultiRegisterValue(value))
+                return 0;
+
+            int count = needsAddressScratch ? 1 : 0;
+            if (MultiRegisterValueHasRegisterClass(value, RegisterClass.General))
+                count++;
+            return count;
+        }
+
+        private static int MultiRegisterStoreFloatScratchCount(GenTree? value)
+            => MultiRegisterValueHasRegisterClass(value, RegisterClass.Float) ? 1 : 0;
     }
 
     internal readonly struct LinearLiveRange

@@ -282,7 +282,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        private static void BindOwnerConstraintClauses(
+        internal static void BindOwnerConstraintClauses(
             SyntaxTree tree,
             SyntaxList<TypeParameterConstraintClauseSyntax> clauses,
             ImmutableArray<TypeParameterSymbol> typeParameters,
@@ -7155,12 +7155,6 @@ namespace Cnidaria.Cs
                 }
             }
 
-            if (lf.TypeParameterList != null)
-            {
-                diagnostics.Add(new Diagnostic("CN_LFUNC004", DiagnosticSeverity.Error,
-                    "Generic local functions are not supported.",
-                    new Location(tree, lf.TypeParameterList.Span)));
-            }
 
             var isStatic =
                 HasModifier(lf.Modifiers, SyntaxKind.StaticKeyword) ||
@@ -7170,6 +7164,10 @@ namespace Cnidaria.Cs
 
             var locations = ImmutableArray.Create(new Location(tree, lf.Identifier.Span));
             var sym = new LocalFunctionSymbol(name, _containing, lf, tree, locations, isStatic, isAsync);
+            var typeParameters = DeclareLocalFunctionTypeParameters(lf, sym, tree, context, diagnostics);
+            sym.SetTypeParameters(typeParameters);
+            GenericConstraintBinder.BindOwnerConstraintClauses(
+                tree, lf.ConstraintClauses, sym.TypeParameters, sym, diagnostics);
 
             _localFunctions.Add(name, sym);
             context.Recorder.RecordDeclared(lf, sym);
@@ -7177,8 +7175,8 @@ namespace Cnidaria.Cs
                 isUnsafe && (Flags & BinderFlags.UnsafeRegion) == 0
                 ? new LocalScopeBinder(parent: this, flags: Flags | BinderFlags.UnsafeRegion, containing: _containing)
                 : this;
-
-            var returnType = sigBinder.BindType(lf.ReturnType, context, diagnostics);
+            var sigContext = new BindingContext(context.Compilation, context.SemanticModel, sym, context.Recorder);
+            var returnType = sigBinder.BindType(lf.ReturnType, sigContext, diagnostics);
 
             var pars = lf.ParameterList.Parameters;
             var pb = ImmutableArray.CreateBuilder<ParameterSymbol>(pars.Count);
@@ -7197,7 +7195,7 @@ namespace Cnidaria.Cs
 
                 TypeSymbol pt;
                 if (p.Type != null)
-                    pt = sigBinder.BindType(p.Type, context, diagnostics);
+                    pt = sigBinder.BindType(p.Type, sigContext, diagnostics);
                 else
                 {
                     diagnostics.Add(new Diagnostic("CN_LFUNC006", DiagnosticSeverity.Error,
@@ -7207,7 +7205,7 @@ namespace Cnidaria.Cs
                 }
                 var pRefKind = DeclarationBuilder.GetParameterRefKind(p);
                 if (pRefKind != ParameterRefKind.None && pt is not ByRefTypeSymbol)
-                    pt = context.Compilation.CreateByRefType(pt);
+                    pt = sigContext.Compilation.CreateByRefType(pt);
                 pb.Add(new ParameterSymbol(
                     pn,
                     sym,
@@ -7221,6 +7219,57 @@ namespace Cnidaria.Cs
 
             sym.SetSignature(returnType, pb.ToImmutable());
             return sym;
+        }
+        private ImmutableArray<TypeParameterSymbol> DeclareLocalFunctionTypeParameters(
+        LocalFunctionStatementSyntax lf,
+        LocalFunctionSymbol owner,
+        SyntaxTree tree,
+        BindingContext context,
+        DiagnosticBag diagnostics)
+        {
+            var list = lf.TypeParameterList;
+            if (list == null || list.Parameters.Count == 0)
+                return ImmutableArray<TypeParameterSymbol>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<TypeParameterSymbol>(list.Parameters.Count);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            for (int i = 0; i < list.Parameters.Count; i++)
+            {
+                var p = list.Parameters[i];
+                var name = p.Identifier.ValueText ?? "";
+
+                if (name.Length == 0)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LFUNC_TP000",
+                        DiagnosticSeverity.Error,
+                        "Local function type parameter name is missing.",
+                        new Location(tree, p.Span)));
+
+                    name = "error";
+                }
+
+                if (!seen.Add(name))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LFUNC_TP001",
+                        DiagnosticSeverity.Error,
+                        $"Duplicate type parameter name '{name}'.",
+                        new Location(tree, p.Identifier.Span)));
+                }
+
+                var tp = new TypeParameterSymbol(
+                    name,
+                    owner,
+                    ordinal: i,
+                    locations: ImmutableArray.Create(new Location(tree, p.Span)));
+
+                builder.Add(tp);
+                context.Recorder.RecordDeclared(p, tp);
+            }
+
+            return builder.ToImmutable();
         }
         public override Symbol? GetDeclaredSymbol(SyntaxNode declaration)
             => Parent?.GetDeclaredSymbol(declaration);
@@ -10968,8 +11017,8 @@ namespace Cnidaria.Cs
                     },
                     context,
                     diagnostics);
-            }    
-                
+            }
+
 
             return BindExpression(argSyntax.Expression, context, diagnostics);
         }
@@ -10994,7 +11043,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(argSyntax);
             }
 
-            if (isOutArgument && argSyntax.Expression is IdentifierNameSyntax id 
+            if (isOutArgument && argSyntax.Expression is IdentifierNameSyntax id
                 && string.Equals(id.Identifier.ValueText, "_", StringComparison.Ordinal))
             {
                 if (!IsNameDeclaredInEnclosingScopes("_"))
@@ -11180,20 +11229,6 @@ namespace Cnidaria.Cs
                         new Location(context.SemanticModel.SyntaxTree, id.Span)));
                     return new BoundBadExpression(inv);
                 }
-                var nonGeneric = candidates.Where(m => m.TypeParameters.IsDefaultOrEmpty).ToImmutableArray();
-                if (!nonGeneric.IsDefaultOrEmpty)
-                {
-                    candidates = nonGeneric;
-                }
-                else
-                {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALL014",
-                        DiagnosticSeverity.Error,
-                        $"Generic method '{name}' requires explicit type arguments (type inference is not implemented).",
-                        new Location(context.SemanticModel.SyntaxTree, id.Span)));
-                    return new BoundBadExpression(inv);
-                }
                 if (!TryResolveOverload(
                     candidates: candidates,
                     args: args,
@@ -11317,20 +11352,7 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    var nonGeneric = candidates.Where(m => m.TypeParameters.IsDefaultOrEmpty).ToImmutableArray();
-                    if (!nonGeneric.IsDefaultOrEmpty)
-                    {
-                        candidates = nonGeneric;
-                    }
-                    else
-                    {
-                        diagnostics.Add(new Diagnostic(
-                            "CN_CALLG011",
-                            DiagnosticSeverity.Error,
-                            $"Generic method '{name}' requires explicit type arguments (type inference is not implemented).",
-                            new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
-                        return new BoundBadExpression(inv);
-                    }
+                    // Generic methods without explicit type arguments are handled by overload resolution.
                 }
                 if (TryResolveOverload(
                     candidates: candidates,
@@ -11398,12 +11420,48 @@ namespace Cnidaria.Cs
 
             if (TryGetLocalFunctionFromEnclosingScopes(name, out var localFunc) && localFunc != null)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_CALLG001",
-                    DiagnosticSeverity.Error,
-                    "Generic local function invocation is not implemented.",
-                    new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
-                return new BoundBadExpression(inv);
+                var localArity = explicitTypeArgs.Length;
+                if (localFunc.TypeParameters.Length != localArity)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_CALLG001",
+                        DiagnosticSeverity.Error,
+                        $"Local function '{name}' has {localFunc.TypeParameters.Length} type parameter(s), but {localArity} type argument(s) were supplied.",
+                        new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                    return new BoundBadExpression(inv);
+                }
+
+                if (!GenericConstraintChecker.CheckMethodInstantiation(
+                    methodDefinition: localFunc,
+                    typeArguments: explicitTypeArgs,
+                    getArgSpan: a => nameSyntax.TypeArgumentList.Arguments[a].Span,
+                    context: context,
+                    diagnostics: diagnostics))
+                {
+                    return new BoundBadExpression(inv);
+                }
+
+                var constructedLocal = new ConstructedMethodSymbol(
+                    localFunc,
+                    explicitTypeArgs,
+                    context.Compilation.TypeManager);
+
+                if (!TryResolveOverload(
+                    candidates: ImmutableArray.Create<MethodSymbol>(constructedLocal),
+                    args: args,
+                    getArgExprSyntax: i => argSyntaxes[i].Expression,
+                    getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                    getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
+                    chosen: out var localChosen,
+                    convertedArgs: out var localConvertedArgs,
+                    context: context,
+                    diagnostics: diagnostics,
+                    diagnosticNode: inv))
+                {
+                    return new BoundBadExpression(inv);
+                }
+
+                return new BoundCallExpression(inv, receiverOpt: null, method: localChosen!, arguments: localConvertedArgs);
             }
 
             var methodCtx = context.ContainingSymbol as MethodSymbol;
@@ -11944,6 +12002,14 @@ namespace Cnidaria.Cs
 
                     if (m.Parameters.Length == 0)
                         continue;
+
+                    if (!m.TypeParameters.IsDefaultOrEmpty)
+                    {
+                        // For generic extension methods, the receiver conversion can only be
+                        // classified after method type inference has constructed the method.
+                        b.Add(m);
+                        continue;
+                    }
 
                     var firstParamType = m.Parameters[0].Type;
                     var conv = ClassifyConversion(receiver, firstParamType, context);
@@ -12608,21 +12674,8 @@ namespace Cnidaria.Cs
 
             if (!instanceCandidates.IsDefaultOrEmpty)
             {
-                var nonGenericInstanceCandidates = instanceCandidates
-                    .Where(m => m.TypeParameters.IsDefaultOrEmpty)
-                    .ToImmutableArray();
-
-                if (nonGenericInstanceCandidates.IsDefaultOrEmpty)
-                {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALLG011",
-                        DiagnosticSeverity.Error,
-                        "Generic method 'Add' requires explicit type arguments.",
-                        new Location(context.SemanticModel.SyntaxTree, elementSyntax.Span)));
-                    return new BoundBadExpression(elementSyntax);
-                }
                 if (TryResolveOverload(
-                    candidates: nonGenericInstanceCandidates,
+                    candidates: instanceCandidates,
                     args: boundArgs,
                     getArgExprSyntax: i => argSyntaxes[i],
                     chosen: out var chosen,
@@ -12640,20 +12693,6 @@ namespace Cnidaria.Cs
             var extensionCandidates = LookupExtensionMethods("Add", receiver, context);
             if (!extensionCandidates.IsDefaultOrEmpty)
             {
-                var nonGenericExtensionCandidates = extensionCandidates
-                    .Where(m => m.TypeParameters.IsDefaultOrEmpty)
-                    .ToImmutableArray();
-
-                if (nonGenericExtensionCandidates.IsDefaultOrEmpty)
-                {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_CALLG011",
-                        DiagnosticSeverity.Error,
-                        "Generic method 'Add' requires explicit type arguments.",
-                        new Location(context.SemanticModel.SyntaxTree, elementSyntax.Span)));
-                    return new BoundBadExpression(elementSyntax);
-                }
-
                 var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(boundArgs.Length + 1);
                 extArgsBuilder.Add(receiver);
                 extArgsBuilder.AddRange(boundArgs);
@@ -12662,7 +12701,7 @@ namespace Cnidaria.Cs
                 var receiverArgSyntax = receiver.Syntax as ExpressionSyntax ?? elementSyntax;
 
                 if (TryResolveOverload(
-                    candidates: nonGenericExtensionCandidates,
+                    candidates: extensionCandidates,
                     args: extArgs,
                     getArgExprSyntax: i => i == 0 ? receiverArgSyntax : argSyntaxes[i - 1],
                     getArgRefKindKeyword: i => null,
@@ -12933,6 +12972,329 @@ namespace Cnidaria.Cs
                 prop.Type,
                 isLValue: canWriteProperty || allowCtorAutoPropWrite);
         }
+        private bool TryInferAndConstructGenericMethodCandidate(
+            MethodSymbol candidate,
+            ImmutableArray<BoundExpression> args,
+            int[] argToParamMap,
+            bool usesParamsExpansion,
+            int[]? paramsElementArgIndices,
+            BindingContext context,
+            SyntaxNode diagnosticNode,
+            out MethodSymbol constructed)
+        {
+            constructed = candidate;
+
+            var typeParameters = candidate.TypeParameters;
+            if (typeParameters.IsDefaultOrEmpty)
+                return true;
+
+            if (candidate is ConstructedMethodSymbol)
+            {
+                return GenericConstraintChecker.CheckMethodInstantiation(
+                    methodDefinition: candidate.OriginalDefinition,
+                    typeArguments: candidate.TypeArguments,
+                    getArgSpan: _ => diagnosticNode.Span,
+                    context: context,
+                    diagnostics: new DiagnosticBag());
+            }
+
+            var existingTypeArguments = candidate.TypeArguments;
+            if (existingTypeArguments.Length == typeParameters.Length)
+            {
+                bool alreadyConstructed = false;
+                for (int i = 0; i < typeParameters.Length; i++)
+                {
+                    if (!ReferenceEquals(existingTypeArguments[i], typeParameters[i]))
+                    {
+                        alreadyConstructed = true;
+                        break;
+                    }
+                }
+
+                if (alreadyConstructed)
+                {
+                    return GenericConstraintChecker.CheckMethodInstantiation(
+                        methodDefinition: candidate.OriginalDefinition,
+                        typeArguments: existingTypeArguments,
+                        getArgSpan: _ => diagnosticNode.Span,
+                        context: context,
+                        diagnostics: new DiagnosticBag());
+                }
+            }
+
+            var inferences = new TypeSymbol?[typeParameters.Length];
+            var parameters = candidate.Parameters;
+            int paramsIndex = usesParamsExpansion ? parameters.Length - 1 : -1;
+            var expandedParamsArgs = paramsElementArgIndices is null
+                ? null
+                : new HashSet<int>(paramsElementArgIndices);
+
+            for (int a = 0; a < args.Length; a++)
+            {
+                if (ShouldSuppressCascade(args[a]))
+                    continue;
+
+                int p = argToParamMap[a];
+                if ((uint)p >= (uint)parameters.Length)
+                    return false;
+
+                var parameterType = parameters[p].Type;
+
+                if (usesParamsExpansion && p == paramsIndex &&
+                    expandedParamsArgs is not null && expandedParamsArgs.Contains(a))
+                {
+                    if (parameterType is not ArrayTypeSymbol paramsArray || paramsArray.Rank != 1)
+                        return false;
+
+                    parameterType = paramsArray.ElementType;
+                }
+
+                InferMethodTypeArgumentsFromParameter(
+                    parameterType,
+                    args[a],
+                    typeParameters,
+                    inferences);
+            }
+
+            var typeArguments = ImmutableArray.CreateBuilder<TypeSymbol>(typeParameters.Length);
+            for (int i = 0; i < typeParameters.Length; i++)
+            {
+                var inferred = inferences[i];
+                if (inferred is null || inferred is DefaultLiteralTypeSymbol)
+                    return false;
+
+                typeArguments.Add(inferred);
+            }
+
+            var inferredTypeArguments = typeArguments.ToImmutable();
+
+            // Constraint failures make the candidate inapplicable. Do not report these
+            // diagnostics while overload resolution is still considering other candidates.
+            if (!GenericConstraintChecker.CheckMethodInstantiation(
+                methodDefinition: candidate,
+                typeArguments: inferredTypeArguments,
+                getArgSpan: _ => diagnosticNode.Span,
+                context: context,
+                diagnostics: new DiagnosticBag()))
+            {
+                return false;
+            }
+
+            constructed = new ConstructedMethodSymbol(
+                candidate,
+                inferredTypeArguments,
+                context.Compilation.TypeManager);
+
+            return true;
+        }
+
+        private static void InferMethodTypeArgumentsFromParameter(
+            TypeSymbol parameterType,
+            BoundExpression argument,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            TypeSymbol?[] inferences)
+        {
+            if (argument.Type is NullTypeSymbol or DefaultLiteralTypeSymbol or ThrowTypeSymbol)
+                return;
+
+            if (IsTrueErrorType(argument.Type))
+                return;
+
+            InferMethodTypeArgumentsFromTypes(parameterType, argument.Type, typeParameters, inferences);
+        }
+
+        private static void InferMethodTypeArgumentsFromTypes(
+            TypeSymbol parameterType,
+            TypeSymbol argumentType,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            TypeSymbol?[] inferences)
+        {
+            if (TryGetMethodTypeParameterOrdinal(parameterType, typeParameters, out int ordinal))
+            {
+                AddMethodTypeInference(ordinal, argumentType, inferences);
+                return;
+            }
+
+            switch (parameterType)
+            {
+                case ByRefTypeSymbol parameterByRef:
+                    if (argumentType is ByRefTypeSymbol argumentByRef)
+                        InferMethodTypeArgumentsFromTypes(parameterByRef.ElementType, argumentByRef.ElementType, typeParameters, inferences);
+                    return;
+
+                case ArrayTypeSymbol parameterArray:
+                    if (argumentType is ArrayTypeSymbol argumentArray && parameterArray.Rank == argumentArray.Rank)
+                        InferMethodTypeArgumentsFromTypes(parameterArray.ElementType, argumentArray.ElementType, typeParameters, inferences);
+                    return;
+
+                case PointerTypeSymbol parameterPointer:
+                    if (argumentType is PointerTypeSymbol argumentPointer)
+                        InferMethodTypeArgumentsFromTypes(parameterPointer.PointedAtType, argumentPointer.PointedAtType, typeParameters, inferences);
+                    return;
+
+                case TupleTypeSymbol parameterTuple:
+                    if (argumentType is TupleTypeSymbol argumentTuple &&
+                        parameterTuple.ElementTypes.Length == argumentTuple.ElementTypes.Length)
+                    {
+                        for (int i = 0; i < parameterTuple.ElementTypes.Length; i++)
+                        {
+                            InferMethodTypeArgumentsFromTypes(
+                                parameterTuple.ElementTypes[i],
+                                argumentTuple.ElementTypes[i],
+                                typeParameters,
+                                inferences);
+                        }
+                    }
+                    return;
+
+                case NamedTypeSymbol parameterNamed:
+                    if (!ContainsAnyMethodTypeParameter(parameterNamed, typeParameters))
+                        return;
+
+                    if (TryFindMatchingInferenceNamedType(argumentType, parameterNamed.OriginalDefinition, out var matchingArgumentNamed))
+                    {
+                        var parameterArgs = parameterNamed.TypeArguments;
+                        var argumentArgs = matchingArgumentNamed.TypeArguments;
+
+                        int n = Math.Min(parameterArgs.Length, argumentArgs.Length);
+                        for (int i = 0; i < n; i++)
+                        {
+                            InferMethodTypeArgumentsFromTypes(
+                                parameterArgs[i],
+                                argumentArgs[i],
+                                typeParameters,
+                                inferences);
+                        }
+                    }
+                    return;
+            }
+        }
+
+        private static bool TryGetMethodTypeParameterOrdinal(
+            TypeSymbol type,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            out int ordinal)
+        {
+            if (type is TypeParameterSymbol tp)
+            {
+                for (int i = 0; i < typeParameters.Length; i++)
+                {
+                    if (ReferenceEquals(tp, typeParameters[i]))
+                    {
+                        ordinal = i;
+                        return true;
+                    }
+                }
+            }
+
+            ordinal = -1;
+            return false;
+        }
+
+        private static void AddMethodTypeInference(
+            int ordinal,
+            TypeSymbol inferredType,
+            TypeSymbol?[] inferences)
+        {
+            var existing = inferences[ordinal];
+            if (existing is null)
+            {
+                inferences[ordinal] = inferredType;
+                return;
+            }
+
+            if (AreSameType(existing, inferredType))
+                return;
+
+            inferences[ordinal] = DefaultLiteralTypeSymbol.Instance;
+        }
+
+        private static bool ContainsAnyMethodTypeParameter(
+            TypeSymbol type,
+            ImmutableArray<TypeParameterSymbol> typeParameters)
+        {
+            if (TryGetMethodTypeParameterOrdinal(type, typeParameters, out _))
+                return true;
+
+            switch (type)
+            {
+                case ByRefTypeSymbol br:
+                    return ContainsAnyMethodTypeParameter(br.ElementType, typeParameters);
+
+                case ArrayTypeSymbol at:
+                    return ContainsAnyMethodTypeParameter(at.ElementType, typeParameters);
+
+                case PointerTypeSymbol pt:
+                    return ContainsAnyMethodTypeParameter(pt.PointedAtType, typeParameters);
+
+                case TupleTypeSymbol tt:
+                    for (int i = 0; i < tt.ElementTypes.Length; i++)
+                    {
+                        if (ContainsAnyMethodTypeParameter(tt.ElementTypes[i], typeParameters))
+                            return true;
+                    }
+                    return false;
+
+                case NamedTypeSymbol nt:
+                    var args = nt.TypeArguments;
+                    for (int i = 0; i < args.Length; i++)
+                    {
+                        if (ContainsAnyMethodTypeParameter(args[i], typeParameters))
+                            return true;
+                    }
+                    return false;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryFindMatchingInferenceNamedType(
+            TypeSymbol argumentType,
+            NamedTypeSymbol parameterDefinition,
+            out NamedTypeSymbol matchingArgumentType)
+        {
+            matchingArgumentType = null!;
+
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+
+            if (argumentType is NamedTypeSymbol argumentNamed)
+                queue.Enqueue(argumentNamed);
+
+            var directInterfaces = argumentType.Interfaces;
+            for (int i = 0; i < directInterfaces.Length; i++)
+            {
+                if (directInterfaces[i] is NamedTypeSymbol iface)
+                    queue.Enqueue(iface);
+            }
+
+            while (queue.Count != 0)
+            {
+                var current = queue.Dequeue();
+                if (!seen.Add(current))
+                    continue;
+
+                if (ReferenceEquals(current.OriginalDefinition, parameterDefinition))
+                {
+                    matchingArgumentType = current;
+                    return true;
+                }
+
+                var interfaces = current.Interfaces;
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    if (interfaces[i] is NamedTypeSymbol iface)
+                        queue.Enqueue(iface);
+                }
+
+                if (current.BaseType is NamedTypeSymbol baseType)
+                    queue.Enqueue(baseType);
+            }
+
+            return false;
+        }
+
         private bool TryResolveOverload(
             ImmutableArray<MethodSymbol> candidates,
             ImmutableArray<BoundExpression> args,
@@ -13042,8 +13404,8 @@ namespace Cnidaria.Cs
                 // Regular form
                 if (args.Length <= ps.Length)
                 {
-                    if (TryScoreRegular(m, args, getArgRefKindKeyword, getArgName, context, out int score, out var map))
-                        ConsiderCandidate(m, usesParamsExpansion: false, score, map, paramsElementArgIndices: null);
+                    if (TryScoreRegular(m, args, getArgRefKindKeyword, getArgName, context, out var scoredMethod, out int score, out var map))
+                        ConsiderCandidate(scoredMethod, usesParamsExpansion: false, score, map, paramsElementArgIndices: null);
                 }
 
                 // Params expansion form
@@ -13051,12 +13413,12 @@ namespace Cnidaria.Cs
                 {
                     int fixedCount = ps.Length - 1;
 
-                    if (TryScoreParamsExpanded(m, args, fixedCount, at.ElementType, getArgRefKindKeyword, getArgName,
-                        context, out int score, out var map, out var paramsElementArgIndices))
+                    if (TryScoreParamsExpanded(m, args, fixedCount, getArgRefKindKeyword, getArgName,
+                        context, out var scoredMethod, out int score, out var map, out var paramsElementArgIndices))
                     {
-                        // Penalize params-expansion so that non-expanded matches win when both are viable.
+                        // Penalize params expansion so that nonexpanded matches win when both are viable
                         score += 5;
-                        ConsiderCandidate(m, usesParamsExpansion: true, score, map, paramsElementArgIndices);
+                        ConsiderCandidate(scoredMethod, usesParamsExpansion: true, score, map, paramsElementArgIndices);
                     }
                 }
             }
@@ -13245,7 +13607,35 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                var tieBreak = CompareOverloadTieBreak(m, best);
+                if (tieBreak < 0)
+                {
+                    best = m;
+                    bestUsesParamsExpansion = usesParamsExpansion;
+                    bestArgToParamMap = argToParamMap;
+                    bestParamsElementArgIndices = paramsElementArgIndices;
+                    ambiguous = false;
+                    return;
+                }
+
+                if (tieBreak > 0)
+                    return;
+
                 ambiguous = true;
+            }
+
+            static int CompareOverloadTieBreak(MethodSymbol left, MethodSymbol? right)
+            {
+                if (right is null)
+                    return -1;
+
+                bool leftGeneric = !left.TypeParameters.IsDefaultOrEmpty;
+                bool rightGeneric = !right.TypeParameters.IsDefaultOrEmpty;
+
+                if (leftGeneric != rightGeneric)
+                    return leftGeneric ? 1 : -1;
+
+                return 0;
             }
 
             bool TryScoreRegular(
@@ -13254,9 +13644,11 @@ namespace Cnidaria.Cs
                 Func<int, SyntaxToken?>? getArgRefKindKeyword,
                 Func<int, string?>? getArgName,
                 BindingContext context,
+                out MethodSymbol scoredMethod,
                 out int score,
                 out int[] argToParamMap)
             {
+                scoredMethod = m;
                 score = 0;
                 argToParamMap = Array.Empty<int>();
 
@@ -13269,6 +13661,21 @@ namespace Cnidaria.Cs
                     if (!assigned[p] && !IsOmittable(ps[p]))
                         return false;
                 }
+
+                if (!TryInferAndConstructGenericMethodCandidate(
+                    m,
+                    args,
+                    map,
+                    usesParamsExpansion: false,
+                    paramsElementArgIndices: null,
+                    context,
+                    diagnosticNode,
+                    out scoredMethod))
+                {
+                    return false;
+                }
+
+                ps = scoredMethod.Parameters;
 
                 for (int a = 0; a < args.Length; a++)
                 {
@@ -13294,17 +13701,18 @@ namespace Cnidaria.Cs
                 return true;
             }
             bool TryScoreParamsExpanded(
-        MethodSymbol m,
-        ImmutableArray<BoundExpression> args,
-        int fixedCount,
-        TypeSymbol elementType,
-        Func<int, SyntaxToken?>? getArgRefKindKeyword,
-        Func<int, string?>? getArgName,
-        BindingContext context,
-        out int score,
-        out int[] argToParamMap,
-        out int[] paramsElementArgIndices)
+                MethodSymbol m,
+                ImmutableArray<BoundExpression> args,
+                int fixedCount,
+                Func<int, SyntaxToken?>? getArgRefKindKeyword,
+                Func<int, string?>? getArgName,
+                BindingContext context,
+                out MethodSymbol scoredMethod,
+                out int score,
+                out int[] argToParamMap,
+                out int[] paramsElementArgIndices)
             {
+                scoredMethod = m;
                 score = 0;
                 argToParamMap = Array.Empty<int>();
                 paramsElementArgIndices = Array.Empty<int>();
@@ -13319,14 +13727,33 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                // Any fixed parameter not assigned by an argument must have a default.
+                // Any fixed parameter not assigned by an argument must have a default
                 for (int p = 0; p < fixedCount; p++)
                 {
                     if (!fixedAssigned[p] && !ps[p].HasExplicitDefault)
                         return false;
                 }
 
+                if (!TryInferAndConstructGenericMethodCandidate(
+                    m,
+                    args,
+                    map,
+                    usesParamsExpansion: true,
+                    paramsElementArgIndices: elems,
+                    context,
+                    diagnosticNode,
+                    out scoredMethod))
+                {
+                    return false;
+                }
+
+                ps = scoredMethod.Parameters;
                 int paramsIndex = ps.Length - 1;
+
+                if (ps[paramsIndex].Type is not ArrayTypeSymbol constructedParamsArray || constructedParamsArray.Rank != 1)
+                    return false;
+
+                var elementType = constructedParamsArray.ElementType;
 
                 for (int a = 0; a < args.Length; a++)
                 {
@@ -15215,6 +15642,12 @@ namespace Cnidaria.Cs
                 return userDefined;
             }
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+
+            if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
+            {
+                var constValue = FoldBooleanBinaryConstant(op, left, right);
+                return new BoundBinaryExpression(bin, op, boolType, left, right, constValue);
+            }
 
             if (!IsNumeric(left.Type.SpecialType) || !IsNumeric(right.Type.SpecialType))
             {
@@ -19585,7 +20018,7 @@ namespace Cnidaria.Cs
             if (type.ContainingSymbol is not NamespaceSymbol ns)
                 return false;
 
-            
+
             var fullNs = GetNamespaceFullName(ns);
             if (!string.Equals(fullNs, "System.Collections.Generic", StringComparison.Ordinal))
                 return false;
@@ -19952,7 +20385,7 @@ namespace Cnidaria.Cs
             var indexTemp = NewTemp("$coll_idx", int32);
             locals.Add(indexTemp);
             sideEffects.Add(new BoundLocalDeclarationStatement(node, indexTemp, zero));
-            
+
             for (int i = 0; i < captured.Count; i++)
             {
                 var capturedItem = captured[i];
@@ -20487,27 +20920,20 @@ namespace Cnidaria.Cs
 
             if (!instanceCandidates.IsDefaultOrEmpty)
             {
-                var nonGenericInstanceCandidates = instanceCandidates
-                    .Where(m => m.TypeParameters.IsDefaultOrEmpty)
-                    .ToImmutableArray();
-
-                if (!nonGenericInstanceCandidates.IsDefaultOrEmpty)
+                var sink = diagnostics ?? new DiagnosticBag();
+                if (TryResolveOverload(
+                    candidates: instanceCandidates,
+                    args: argumentExpressions,
+                    getArgExprSyntax: _ => elementSyntax,
+                    chosen: out var chosen,
+                    convertedArgs: out var convertedArgs,
+                    context: context,
+                    diagnostics: sink,
+                    diagnosticNode: elementSyntax))
                 {
-                    var sink = diagnostics ?? new DiagnosticBag();
-                    if (TryResolveOverload(
-                        candidates: nonGenericInstanceCandidates,
-                        args: argumentExpressions,
-                        getArgExprSyntax: _ => elementSyntax,
-                        chosen: out var chosen,
-                        convertedArgs: out var convertedArgs,
-                        context: context,
-                        diagnostics: sink,
-                        diagnosticNode: elementSyntax))
-                    {
-                        var callReceiver = receiverOpt ?? new BoundThisExpression(receiverSyntax, receiverType);
-                        addCall = new BoundCallExpression(elementSyntax, callReceiver, chosen!, convertedArgs);
-                        return true;
-                    }
+                    var callReceiver = receiverOpt ?? new BoundThisExpression(receiverSyntax, receiverType);
+                    addCall = new BoundCallExpression(elementSyntax, callReceiver, chosen!, convertedArgs);
+                    return true;
                 }
             }
 
@@ -20518,37 +20944,30 @@ namespace Cnidaria.Cs
             var extensionCandidates = LookupExtensionMethods("Add", receiverForExtensions, context);
             if (!extensionCandidates.IsDefaultOrEmpty)
             {
-                var nonGenericExtensionCandidates = extensionCandidates
-                    .Where(m => m.TypeParameters.IsDefaultOrEmpty)
-                    .ToImmutableArray();
+                var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(argumentExpressions.Length + 1);
+                extArgsBuilder.Add(receiverForExtensions);
+                extArgsBuilder.AddRange(argumentExpressions);
+                var extArgs = extArgsBuilder.ToImmutable();
+                var sink = diagnostics ?? new DiagnosticBag();
 
-                if (!nonGenericExtensionCandidates.IsDefaultOrEmpty)
+                if (TryResolveOverload(
+                    candidates: extensionCandidates,
+                    args: extArgs,
+                    getArgExprSyntax: i => i == 0 ? receiverSyntax : elementSyntax,
+                    getArgRefKindKeyword: i => null,
+                    getArgName: i => null,
+                    chosen: out var chosen,
+                    convertedArgs: out var convertedArgs,
+                    context: context,
+                    diagnostics: sink,
+                    diagnosticNode: elementSyntax))
                 {
-                    var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(argumentExpressions.Length + 1);
-                    extArgsBuilder.Add(receiverForExtensions);
-                    extArgsBuilder.AddRange(argumentExpressions);
-                    var extArgs = extArgsBuilder.ToImmutable();
-                    var sink = diagnostics ?? new DiagnosticBag();
-
-                    if (TryResolveOverload(
-                        candidates: nonGenericExtensionCandidates,
-                        args: extArgs,
-                        getArgExprSyntax: i => i == 0 ? receiverSyntax : elementSyntax,
-                        getArgRefKindKeyword: i => null,
-                        getArgName: i => null,
-                        chosen: out var chosen,
-                        convertedArgs: out var convertedArgs,
-                        context: context,
-                        diagnostics: sink,
-                        diagnosticNode: elementSyntax))
-                    {
-                        addCall = new BoundCallExpression(
-                            elementSyntax,
-                            receiverOpt: null,
-                            method: chosen!,
-                            arguments: convertedArgs);
-                        return true;
-                    }
+                    addCall = new BoundCallExpression(
+                        elementSyntax,
+                        receiverOpt: null,
+                        method: chosen!,
+                        arguments: convertedArgs);
+                    return true;
                 }
             }
 

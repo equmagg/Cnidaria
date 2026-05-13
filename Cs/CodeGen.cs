@@ -1946,6 +1946,18 @@ namespace Cnidaria.Cs
             private void EmitBox(GenTree instruction, GenTree source)
             {
                 var boxedType = RequireRuntimeType(source);
+
+                if (boxedType.IsReferenceType)
+                {
+                    EmitRegisterMove(
+                        RequireResultRegister(instruction),
+                        RequireUseRegister(instruction, 0),
+                        boxedType,
+                        GenStackKind.Ref,
+                        RegisterClass.General);
+                    return;
+                }
+
                 GenStackKind boxedKind = StackKindOf(boxedType);
                 MachineRegister value;
                 if (instruction.Uses.Length == 1 && !IsAggregateStorage(instruction.Uses[0], boxedType, boxedKind))
@@ -1967,28 +1979,46 @@ namespace Cnidaria.Cs
 
             private void EmitUnboxAny(GenTree instruction, GenTree source)
             {
-                var type = RequireRuntimeType(source);
+                var type = ResultRuntimeType(instruction, source);
+                var kind = ResultStackKind(instruction, source, type);
+
                 if (instruction.Results.Length > 1)
                 {
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
                     _asm.Emit(new InstrDesc(Op.UnboxAddr, RegisterVmIsa.EncodeRegister(address),
-                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: type.TypeId));
-                    EmitMultiRegisterLoadFromAddress(instruction, type, StackKindOf(type), address);
+                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                        aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                        imm: type.TypeId));
+
+                    EmitMultiRegisterLoadFromAddress(instruction, type, kind, address);
                     return;
                 }
 
-                if (RequireSingleResult(instruction).IsFrameSlot && IsAggregateStorage(RequireSingleResult(instruction), type, StackKindOf(type)))
+                if (RequireSingleResult(instruction).IsFrameSlot &&
+                    IsAggregateStorage(RequireSingleResult(instruction), type, kind))
                 {
-                    _asm.Emit(new InstrDesc(Op.UnboxAddr, RegisterVmIsa.EncodeRegister(MachineRegisters.ParallelCopyScratch1),
-                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: type.TypeId));
+                    _asm.Emit(new InstrDesc(Op.UnboxAddr,
+                        RegisterVmIsa.EncodeRegister(MachineRegisters.ParallelCopyScratch1),
+                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                        aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                        imm: type.TypeId));
+
                     EmitAddressOf(MachineRegisters.BackendScratch, RequireSingleResult(instruction));
-                    EmitCopyAddressToAddress(type, StackKindOf(type), MachineRegisters.BackendScratch, MachineRegisters.ParallelCopyScratch1,
-                        StorageSizeOf(type, StackKindOf(type), RequireSingleResult(instruction)), InstructionFlags.MayThrow);
+                    EmitCopyAddressToAddress(
+                        type,
+                        kind,
+                        MachineRegisters.BackendScratch,
+                        MachineRegisters.ParallelCopyScratch1,
+                        StorageSizeOf(type, kind, RequireSingleResult(instruction)),
+                        InstructionFlags.MayThrow);
                     return;
                 }
 
-                _asm.Emit(new InstrDesc(Op.UnboxAny, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
-                    RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: type.TypeId));
+                _asm.Emit(new InstrDesc(Op.UnboxAny,
+                    RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                    RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                    aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                    imm: type.TypeId));
             }
 
             private void EmitField(GenTree instruction, GenTree source)
@@ -2264,9 +2294,12 @@ namespace Cnidaria.Cs
 
                         if (RequireSingleResult(instruction).IsFrameSlot && IsAggregateStorage(RequireSingleResult(instruction), elem, source.StackKind))
                         {
-                            EmitAddressOf(MachineRegisters.BackendScratch, RequireSingleResult(instruction));
-                            _asm.Emit(InstrDesc.Array(Op.LdElemObj, MachineRegisters.BackendScratch,
-                                RequireUseRegister(instruction, 0), RequireUseRegister(instruction, 1), elemTypeId, Aux.Instruction(InstructionFlags.MayThrow)));
+                            var array = RequireUseRegister(instruction, 0);
+                            var index = RequireUseRegister(instruction, 1);
+                            MachineRegister destinationAddress = PickScratchRegister(instruction, RegisterClass.General, array, index);
+                            EmitAddressOf(destinationAddress, RequireSingleResult(instruction));
+                            _asm.Emit(InstrDesc.Array(Op.LdElemObj, destinationAddress,
+                                array, index, elemTypeId, Aux.Instruction(InstructionFlags.MayThrow)));
                             return;
                         }
                         _asm.Emit(InstrDesc.Array(SelectLoadElementOp(elem, source.StackKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction),
@@ -2310,9 +2343,12 @@ namespace Cnidaria.Cs
                             var valueOperand = instruction.Uses[valueUseIndex];
                             if (IsAggregateStorage(valueOperand, valueType, valueKind))
                             {
-                                EmitAddressOf(MachineRegisters.BackendScratch, valueOperand);
-                                _asm.Emit(InstrDesc.Array(Op.StElemObj, MachineRegisters.BackendScratch,
-                                    RequireUseRegister(instruction, arrayUseIndex), RequireUseRegister(instruction, indexUseIndex), elemTypeId, ElementStoreAux(valueType)));
+                                var array = RequireUseRegister(instruction, arrayUseIndex);
+                                var index = RequireUseRegister(instruction, indexUseIndex);
+                                MachineRegister valueAddress = PickScratchRegister(instruction, RegisterClass.General, array, index);
+                                EmitAddressOf(valueAddress, valueOperand);
+                                _asm.Emit(InstrDesc.Array(Op.StElemObj, valueAddress,
+                                    array, index, elemTypeId, ElementStoreAux(valueType)));
                                 return;
                             }
 
@@ -2837,6 +2873,26 @@ namespace Cnidaria.Cs
 
             private RuntimeType RequireRuntimeType(GenTree source)
                 => source.RuntimeType ?? source.Type ?? throw new InvalidOperationException($"GenTree has no runtime type: {source}");
+
+            private RuntimeType ResultRuntimeType(GenTree instruction, GenTree source)
+            {
+                if (!instruction.RegisterResults.IsDefaultOrEmpty)
+                {
+                    var type = _method.GetValueInfo(instruction.RegisterResults[0]).Type;
+                    if (type is not null)
+                        return type;
+                }
+
+                return RequireRuntimeType(source);
+            }
+
+            private GenStackKind ResultStackKind(GenTree instruction, GenTree source, RuntimeType? resultType)
+            {
+                if (!instruction.RegisterResults.IsDefaultOrEmpty)
+                    return _method.GetValueInfo(instruction.RegisterResults[0]).StackKind;
+
+                return resultType is not null ? StackKindOf(resultType) : source.StackKind;
+            }
 
             private Exception Unsupported(GenTree instruction, string message)
                 => new NotSupportedException($"Codegen: {message} at method {_method.RuntimeMethod.MethodId}, " +

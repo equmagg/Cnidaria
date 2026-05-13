@@ -1140,10 +1140,11 @@ namespace Cnidaria.Cs
 
         private TypeSymbol _returnType;
         private ImmutableArray<ParameterSymbol> _parameters;
-
+        private ImmutableArray<TypeParameterSymbol> _typeParameters;
         public override TypeSymbol ReturnType => _returnType;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
-        public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+        public override ImmutableArray<TypeParameterSymbol> TypeParameters
+            => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
 
         public override bool IsStatic { get; }
         public override bool IsConstructor => false;
@@ -1179,6 +1180,14 @@ namespace Cnidaria.Cs
         {
             _returnType = returnType;
             _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
+        }
+        internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
+        {
+            if (!_typeParameters.IsDefault)
+                throw new InvalidOperationException("TypeParameters already set.");
+            _typeParameters = typeParameters.IsDefault
+                ? ImmutableArray<TypeParameterSymbol>.Empty
+                : typeParameters;
         }
     }
     internal sealed class SourceMethodSymbol : MethodSymbol
@@ -1675,6 +1684,7 @@ namespace Cnidaria.Cs
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped,
+                    isParams: p.IsParams,
                     hasExplicitDefault: p.HasExplicitDefault,
                     defaultValueOpt: p.DefaultValueOpt));
             }

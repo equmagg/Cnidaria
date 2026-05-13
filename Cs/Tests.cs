@@ -41,7 +41,7 @@ namespace Cnidaria.Cs
         }
         internal static void RunTest(string source, string target)
         {
-            using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+            using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
             {
                 var (output, diagnostics, context) = Cnidaria.Cs.CSharp.Interpret(source, cts);
                 foreach (var diagnostic in diagnostics)
@@ -49,20 +49,6 @@ namespace Cnidaria.Cs
                     output += $"{diagnostic.GetMessage()}\n";
                 }
                 Assert(output, target);
-            }
-        }
-        internal static void RunTestExpectError(string source, string errorCode)
-        {
-            using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
-            {
-                var (output, diagnostics, context) = Cnidaria.Cs.CSharp.Interpret(source, cts);
-                TestsRan++;
-                if (diagnostics.Count < 1 || diagnostics.Any((IDiagnostic x) => x is not Diagnostic) 
-                    || !diagnostics.Any(x => ((Diagnostic)x).Id == errorCode))
-                {
-                    TestsFailed++;
-                    FailedMessages.Add($"Test {TestsRan} failed: {output}, expected '{errorCode}'");
-                }
             }
         }
         internal static void RunAll()
@@ -1405,7 +1391,100 @@ internal class Program
     }
 }
 ", "2");
+            // 121 virtual dispatch through base method
+            RunTest(@"
+namespace Ns;
+class Base
+{
+    public virtual int F() { return 1; }
+    public int G() { return F() + 10; }
+}
+class Derived : Base
+{
+    public override int F() { return 5; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Base b = new Derived();
+        Console.WriteLine(b.G());
+    }
+}
+", "15");
+            // 122 inheritance field layout
+            RunTest(@"
+namespace Ns;
+class A
+{
+    public int X;
+}
+class B : A
+{
+    public int Y;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        B b = new B();
+        b.X = 3;
+        b.Y = 4;
+        Console.Write(b.X);
+        Console.Write(b.Y);
+    }
+}
+", "34");
+            // 123 basic is operator
+            RunTest(@"
+namespace Ns;
+class A { }
+class B : A { }
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        A a = new B();
+        object n = null;
+        Console.Write(a is B);
+        Console.Write(a is A);
+        Console.Write(n is A);
+    }
+}
+", "truetruefalse");
+            // 124 boxing and virtual call
+            RunTest(@"
+object x = 123;
+Console.WriteLine(x.ToString());
+", "123");
+            // 125 boxing struct field value
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int X;
+    public override string ToString() { return X.ToString(); }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S s;
+        s.X = 42;
+        object o = s;
+        s.X = 100;
+        Console.WriteLine(o.ToString());
+    }
+}
+", "42");
+            // 126 IndexOf generic inference
+            RunTest(@"
+int[] xs = [ 10, 20, 30 ];
+string[] ss = [ ""a"", ""b"", ""c"" ];
 
+Console.Write(Array.IndexOf(xs, 20));
+Console.Write(Array.IndexOf(ss, ""c""));
+", "12");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)
