@@ -274,12 +274,40 @@ namespace Cnidaria.Cs
 
         private DefaultLiteralTypeSymbol() { }
     }
+    internal sealed class UnboundLambdaTypeSymbol : TypeSymbol
+    {
+        public static readonly UnboundLambdaTypeSymbol Instance = new();
+
+        public override SymbolKind Kind => SymbolKind.Error;
+        public override string Name => "<lambda>";
+        public override Symbol? ContainingSymbol => null;
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+
+        public override bool IsReferenceType => false;
+        public override bool IsValueType => false;
+
+        private UnboundLambdaTypeSymbol() { }
+    }
+    internal sealed class UnboundMethodGroupTypeSymbol : TypeSymbol
+    {
+        public static readonly UnboundMethodGroupTypeSymbol Instance = new();
+
+        public override SymbolKind Kind => SymbolKind.Error;
+        public override string Name => "<method group>";
+        public override Symbol? ContainingSymbol => null;
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+
+        public override bool IsReferenceType => false;
+        public override bool IsValueType => false;
+
+        private UnboundMethodGroupTypeSymbol() { }
+    }
     internal sealed class ThrowTypeSymbol : TypeSymbol
     {
         public static readonly ThrowTypeSymbol Instance = new();
         public override SymbolKind Kind => SymbolKind.Error;
         public override string Name => "<throw>";
-        public override Symbol? ContainingSymbol => null; 
+        public override Symbol? ContainingSymbol => null;
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
         public override bool IsReferenceType => false;
         public override bool IsValueType => false;
@@ -319,7 +347,7 @@ namespace Cnidaria.Cs
         None = 0,
         UnmanagedConstraint = 1 << 0,
         NotNullConstraint = 1 << 1,
-        StructConstraint = 1 << 2, 
+        StructConstraint = 1 << 2,
         AllowsRefStruct = 1 << 3,
     }
 
@@ -640,10 +668,10 @@ namespace Cnidaria.Cs
         public override TypeSymbol Type => _type;
 
         public SynthesizedBackingFieldSymbol(
-            string name, 
-            Symbol containing, 
-            TypeSymbol placeholderType, 
-            bool isStatic, 
+            string name,
+            Symbol containing,
+            TypeSymbol placeholderType,
+            bool isStatic,
             bool isReadOnly)
         {
             Name = name;
@@ -677,10 +705,10 @@ namespace Cnidaria.Cs
         public bool HasExplicitDefault { get; internal set; }
         public Optional<object> DefaultValueOpt { get; internal set; }
         public ParameterSymbol(
-            string name, 
-            Symbol containing, 
-            TypeSymbol type, 
-            ImmutableArray<Location> locations, 
+            string name,
+            Symbol containing,
+            TypeSymbol type,
+            ImmutableArray<Location> locations,
             bool isReadOnlyRef = false,
             ParameterRefKind refKind = ParameterRefKind.None,
             bool isScoped = false,
@@ -1072,9 +1100,9 @@ namespace Cnidaria.Cs
             _typeParameters = tps;
         }
         public SourceNamedTypeSymbol(
-            string name, 
-            Symbol? containing, 
-            TypeKind typeKind, 
+            string name,
+            Symbol? containing,
+            TypeKind typeKind,
             int arity,
             Accessibility declaredAccessibility,
             bool isFromMetadata = false,
@@ -1680,7 +1708,7 @@ namespace Cnidaria.Cs
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
                 b.Add(new ParameterSymbol(
-                    p.Name, this, pt, p.Locations, 
+                    p.Name, this, pt, p.Locations,
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped,
@@ -1739,10 +1767,10 @@ namespace Cnidaria.Cs
                 var p = ps[i];
                 var pt = TypeSubstituter.Substitute(p.Type, types, map);
                 b.Add(new ParameterSymbol(
-                    p.Name, 
-                    this, 
-                    pt, 
-                    p.Locations, 
+                    p.Name,
+                    this,
+                    pt,
+                    p.Locations,
                     isReadOnlyRef: p.IsReadOnlyRef,
                     refKind: p.RefKind,
                     isScoped: p.IsScoped,
@@ -2007,9 +2035,9 @@ namespace Cnidaria.Cs
             {
                 var p = parameters[i];
                 ps.Add(new ParameterSymbol(
-                    p.name, 
-                    this, 
-                    p.type, 
+                    p.name,
+                    this,
+                    p.type,
                     ImmutableArray<Location>.Empty));
             }
             Parameters = ps.ToImmutable();

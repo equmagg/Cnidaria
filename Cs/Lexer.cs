@@ -1550,7 +1550,7 @@ namespace Cnidaria.Cs
             if (Current() == '0' && (Peek(1) == 'x' || Peek(1) == 'X'))
             {
                 _pos += 2;
-                ReadDigitsWithSeparators(baseKind: 16, requireAtLeastOneDigit: true);
+                ReadDigitsWithSeparators(baseKind: 16, requireAtLeastOneDigit: true, allowLeadingSeparator: true);
                 ReadIntegerSuffixIfAny();
                 goto ComputeTokenValue;
             }
@@ -1558,7 +1558,7 @@ namespace Cnidaria.Cs
             if (Current() == '0' && (Peek(1) == 'b' || Peek(1) == 'B'))
             {
                 _pos += 2;
-                ReadDigitsWithSeparators(baseKind: 2, requireAtLeastOneDigit: true);
+                ReadDigitsWithSeparators(baseKind: 2, requireAtLeastOneDigit: true, allowLeadingSeparator: true);
                 ReadIntegerSuffixIfAny();
                 goto ComputeTokenValue;
             }
@@ -1602,7 +1602,7 @@ namespace Cnidaria.Cs
 
             return new SyntaxToken(SyntaxKind.NumericLiteralToken, span, vt, val, leadingTrivia, Array.Empty<SyntaxTrivia>());
         }
-        private void ReadDigitsWithSeparators(int baseKind, bool requireAtLeastOneDigit)
+        private void ReadDigitsWithSeparators(int baseKind, bool requireAtLeastOneDigit, bool allowLeadingSeparator = false)
         {
             int digits = 0;
             bool lastWasUnderscore = false;
@@ -1612,21 +1612,22 @@ namespace Cnidaria.Cs
                 char c = Current();
                 if (c == '_')
                 {
-                    // underscore must be between digits
-                    if (digits == 0 || lastWasUnderscore)
+                    if (digits == 0)
+                    {
+                        if (!allowLeadingSeparator || lastWasUnderscore || !IsDigitForBase(Peek(1), baseKind))
+                            break;
+                        lastWasUnderscore = true;
+                        _pos++;
+                        continue;
+                    }
+                    if (lastWasUnderscore)
                         break;
                     lastWasUnderscore = true;
                     _pos++;
                     continue;
                 }
 
-                bool isDigit = baseKind switch
-                {
-                    10 => char.IsDigit(c),
-                    16 => IsHexDigit(c),
-                    2 => (c == '0' || c == '1'),
-                    _ => false
-                };
+                bool isDigit = IsDigitForBase(c, baseKind);
 
                 if (!isDigit)
                     break;
@@ -1646,6 +1647,15 @@ namespace Cnidaria.Cs
 
             if (requireAtLeastOneDigit && digits == 0)
                 Diagnostics.Add(new SyntaxDiagnostic(_pos, "Expected digits in numeric literal."));
+
+            static bool IsDigitForBase(char c, int baseKind) => baseKind switch
+            {
+                10 => char.IsDigit(c),
+                16 => IsHexDigit(c),
+                2 => (c == '0' || c == '1'),
+                _ => false
+            };
+
         }
         private bool ReadExponentPartIfAny()
         {

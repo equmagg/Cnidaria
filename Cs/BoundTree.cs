@@ -102,6 +102,150 @@ namespace Cnidaria.Cs
 
         internal void SetType(TypeSymbol type) => Type = type;
     }
+    internal sealed class BoundUnboundLambdaExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.UnboundLambda;
+
+        public BoundUnboundLambdaExpression(ExpressionSyntax syntax)
+            : base(syntax)
+        {
+            Type = UnboundLambdaTypeSymbol.Instance;
+            ConstantValueOpt = Optional<object>.None;
+        }
+    }
+
+    internal sealed class BoundMethodGroupExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.MethodGroup;
+
+        public string Name { get; }
+        public BoundExpression? ReceiverOpt { get; }
+        public ImmutableArray<MethodSymbol> Methods { get; }
+
+        public BoundMethodGroupExpression(
+            ExpressionSyntax syntax,
+            string name,
+            BoundExpression? receiverOpt,
+            ImmutableArray<MethodSymbol> methods,
+            bool hasErrors = false)
+            : base(syntax)
+        {
+            Name = name;
+            ReceiverOpt = receiverOpt;
+            Methods = methods.IsDefault ? ImmutableArray<MethodSymbol>.Empty : methods;
+            Type = UnboundMethodGroupTypeSymbol.Instance;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = hasErrors || (receiverOpt?.HasErrors ?? false) || Methods.IsDefaultOrEmpty;
+        }
+    }
+
+    internal sealed class BoundLambdaExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.Lambda;
+
+        public MethodSymbol Method { get; }
+        public MethodSymbol InvokeMethod { get; }
+        public BoundStatement Body { get; }
+        public BoundExpression? TargetOpt { get; }
+        public bool IsStatic { get; }
+        public bool IsAsync { get; }
+
+        public BoundLambdaExpression(
+            ExpressionSyntax syntax,
+            NamedTypeSymbol delegateType,
+            MethodSymbol method,
+            MethodSymbol invokeMethod,
+            BoundStatement body,
+            bool isStatic,
+            bool isAsync,
+            BoundExpression? targetOpt = null)
+            : base(syntax)
+        {
+            Type = delegateType;
+            Method = method;
+            InvokeMethod = invokeMethod;
+            Body = body;
+            TargetOpt = targetOpt;
+            IsStatic = isStatic;
+            IsAsync = isAsync;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = body.HasErrors || (targetOpt?.HasErrors ?? false);
+        }
+    }
+
+    internal sealed class BoundClosureCellCreationExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ClosureCellCreation;
+        public TypeSymbol ValueType { get; }
+        public BoundExpression InitialValue { get; }
+
+        public BoundClosureCellCreationExpression(SyntaxNode syntax, NamedTypeSymbol objectType, TypeSymbol valueType, BoundExpression initialValue)
+            : base(syntax)
+        {
+            Type = objectType;
+            ValueType = valueType;
+            InitialValue = initialValue;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = initialValue.HasErrors;
+        }
+    }
+
+    internal sealed class BoundClosureCreationExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ClosureCreation;
+        public ImmutableArray<BoundExpression> Cells { get; }
+
+        public BoundClosureCreationExpression(SyntaxNode syntax, NamedTypeSymbol objectType, ImmutableArray<BoundExpression> cells)
+            : base(syntax)
+        {
+            Type = objectType;
+            Cells = cells.IsDefault ? ImmutableArray<BoundExpression>.Empty : cells;
+            ConstantValueOpt = Optional<object>.None;
+
+            for (int i = 0; i < Cells.Length; i++)
+            {
+                if (Cells[i].HasErrors)
+                {
+                    HasErrors = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    internal sealed class BoundClosureSlotExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ClosureSlot;
+        public BoundExpression Closure { get; }
+        public int SlotIndex { get; }
+
+        public BoundClosureSlotExpression(SyntaxNode syntax, NamedTypeSymbol objectType, BoundExpression closure, int slotIndex)
+            : base(syntax)
+        {
+            Type = objectType;
+            Closure = closure;
+            SlotIndex = slotIndex;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = closure.HasErrors;
+        }
+    }
+
+    internal sealed class BoundClosureAccessExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.ClosureAccess;
+        public override bool IsLValue => true;
+        public BoundExpression Cell { get; }
+
+        public BoundClosureAccessExpression(SyntaxNode syntax, TypeSymbol valueType, BoundExpression cell)
+            : base(syntax)
+        {
+            Type = valueType is ByRefTypeSymbol br ? br.ElementType : valueType;
+            Cell = cell;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = cell.HasErrors;
+        }
+    }
+
     internal sealed class BoundTupleExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.TupleExpression;
@@ -123,7 +267,6 @@ namespace Cnidaria.Cs
 
             HasErrors = hasErrors;
 
-            // Tuples are never constant in C#.
             ConstantValueOpt = Optional<object>.None;
 
             for (int i = 0; i < elements.Length; i++)
@@ -235,6 +378,34 @@ namespace Cnidaria.Cs
             ElementType = elementType;
             Count = count;
             InitializerOpt = initializerOpt;
+        }
+    }
+    internal sealed class BoundSpanCollectionExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.SpanCollection;
+        public TypeSymbol ElementType { get; }
+        public ImmutableArray<BoundExpression> Elements { get; }
+
+        public BoundSpanCollectionExpression(
+            CollectionExpressionSyntax syntax,
+            NamedTypeSymbol spanType,
+            TypeSymbol elementType,
+            ImmutableArray<BoundExpression> elements)
+            : base(syntax)
+        {
+            Type = spanType;
+            ElementType = elementType;
+            Elements = elements.IsDefault ? ImmutableArray<BoundExpression>.Empty : elements;
+            ConstantValueOpt = Optional<object>.None;
+
+            for (int i = 0; i < Elements.Length; i++)
+            {
+                if (Elements[i].HasErrors)
+                {
+                    HasErrors = true;
+                    break;
+                }
+            }
         }
     }
     internal sealed class BoundRefExpression : BoundExpression
@@ -1547,7 +1718,7 @@ namespace Cnidaria.Cs
             }
         }
     }
-    // =rewriter nodes=
+
     internal sealed class BoundSequenceExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.Sequence;

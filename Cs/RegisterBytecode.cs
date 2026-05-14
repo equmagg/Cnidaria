@@ -572,6 +572,8 @@ namespace Cnidaria.Cs
         RefEq = 652,
         RefNe = 653,
         RuntimeTypeEquals = 654,
+        NewDelegate = 655,
+        NewDelegateClosed = 656,
 
         CallVoid = 704,
         CallI = 705,
@@ -1485,9 +1487,15 @@ namespace Cnidaria.Cs
             switch (inst.Op)
             {
                 case Op.NewObj:
+                case Op.NewDelegate:
                 case Op.SizeOf:
                 case Op.DefaultValue:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    return;
+
+                case Op.NewDelegateClosed:
+                    RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
                     return;
 
                 case Op.NewSZArray:
@@ -1643,7 +1651,7 @@ namespace Cnidaria.Cs
             => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
 
         private static bool IsRuntimeObjectInstruction(Op op)
-            => IsOpInRange(op, Op.NewObj, Op.RuntimeTypeEquals);
+            => IsOpInRange(op, Op.NewObj, Op.NewDelegateClosed);
 
         private static bool IsPointerInstruction(Op op)
             => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
@@ -1994,6 +2002,19 @@ namespace Cnidaria.Cs
         public void NewSZArray(MachineRegister rd, MachineRegister length, int runtimeElementTypeId)
             => Emit(new InstrDesc(Op.NewSZArray, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(length),
                 aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: runtimeElementTypeId));
+
+        public void NewDelegate(MachineRegister rd, int runtimeDelegateTypeId, int runtimeTargetMethodId)
+            => Emit(new InstrDesc(Op.NewDelegate, RegisterVmIsa.EncodeRegister(rd),
+                aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                imm: PackDelegateDescriptor(runtimeDelegateTypeId, runtimeTargetMethodId)));
+
+        public void NewDelegateClosed(MachineRegister rd, MachineRegister target, int runtimeDelegateTypeId, int runtimeTargetMethodId)
+            => Emit(new InstrDesc(Op.NewDelegateClosed, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(target),
+                aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                imm: PackDelegateDescriptor(runtimeDelegateTypeId, runtimeTargetMethodId)));
+
+        private static long PackDelegateDescriptor(int runtimeDelegateTypeId, int runtimeTargetMethodId)
+            => ((long)(uint)runtimeDelegateTypeId << 32) | (uint)runtimeTargetMethodId;
         public void CastClass(MachineRegister rd, MachineRegister source, int runtimeTypeId)
             => Emit(new InstrDesc(Op.CastClass, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(source),
                 aux: Aux.Instruction(InstructionFlags.MayThrow), imm: runtimeTypeId));

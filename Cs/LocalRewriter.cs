@@ -159,6 +159,13 @@ namespace Cnidaria.Cs
                 BoundBaseExpression e => e,
                 BoundLabelExpression e => e,
                 BoundSizeOfExpression e => e,
+                BoundUnboundLambdaExpression e => e,
+                BoundMethodGroupExpression e => e,
+                BoundLambdaExpression e => RewriteLambdaExpression(e),
+                BoundClosureCellCreationExpression e => RewriteClosureCellCreationExpression(e),
+                BoundClosureCreationExpression e => RewriteClosureCreationExpression(e),
+                BoundClosureSlotExpression e => RewriteClosureSlotExpression(e),
+                BoundClosureAccessExpression e => RewriteClosureAccessExpression(e),
 
 
                 BoundThrowExpression e => RewriteThrowExpression(e),
@@ -179,6 +186,7 @@ namespace Cnidaria.Cs
                 BoundBinaryExpression e => RewriteBinaryExpression(e),
                 BoundConditionalExpression e => RewriteConditionalExpression(e),
                 BoundUnboundCollectionExpression e => e,
+                BoundSpanCollectionExpression e => RewriteSpanCollectionExpression(e),
                 BoundAssignmentExpression e => RewriteAssignmentExpression(e),
                 BoundCompoundAssignmentExpression e => RewriteCompoundAssignmentExpression(e),
                 BoundNullCoalescingAssignmentExpression e => RewriteNullCoalescingAssignmentExpression(e),
@@ -587,6 +595,20 @@ namespace Cnidaria.Cs
                 return new BoundArrayElementAccessExpression(node.Syntax, node.Type, expr, indices);
             return node;
         }
+        protected virtual BoundExpression RewriteSpanCollectionExpression(BoundSpanCollectionExpression node)
+        {
+            var elements = RewriteExpressions(node.Elements, out var changed);
+            if (changed)
+            {
+                return new BoundSpanCollectionExpression(
+                    (CollectionExpressionSyntax)node.Syntax,
+                    (NamedTypeSymbol)node.Type,
+                    node.ElementType,
+                    elements);
+            }
+
+            return node;
+        }
         protected virtual BoundExpression RewriteStackAllocArrayCreationExpression(BoundStackAllocArrayCreationExpression node)
         {
             var count = RewriteExpression(node.Count);
@@ -637,6 +659,62 @@ namespace Cnidaria.Cs
 
             if (!ReferenceEquals(expr, node.Expression) || !ReferenceEquals(idx, node.Index))
                 return new BoundPointerElementAccessExpression(node.Syntax, node.Type, expr, idx);
+
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+        {
+            var target = node.TargetOpt is null ? null : RewriteExpression(node.TargetOpt);
+            var body = RewriteStatement(node.Body);
+            if (!ReferenceEquals(body, node.Body) || !ReferenceEquals(target, node.TargetOpt))
+            {
+                return new BoundLambdaExpression(
+                    (ExpressionSyntax)node.Syntax,
+                    (NamedTypeSymbol)node.Type,
+                    node.Method,
+                    node.InvokeMethod,
+                    body,
+                    node.IsStatic,
+                    node.IsAsync,
+                    target);
+            }
+
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteClosureCellCreationExpression(BoundClosureCellCreationExpression node)
+        {
+            var initial = RewriteExpression(node.InitialValue);
+            if (!ReferenceEquals(initial, node.InitialValue))
+                return new BoundClosureCellCreationExpression(node.Syntax, (NamedTypeSymbol)node.Type, node.ValueType, initial);
+
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteClosureCreationExpression(BoundClosureCreationExpression node)
+        {
+            var cells = RewriteExpressions(node.Cells, out var changed);
+            if (changed)
+                return new BoundClosureCreationExpression(node.Syntax, (NamedTypeSymbol)node.Type, cells);
+
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteClosureSlotExpression(BoundClosureSlotExpression node)
+        {
+            var closure = RewriteExpression(node.Closure);
+            if (!ReferenceEquals(closure, node.Closure))
+                return new BoundClosureSlotExpression(node.Syntax, (NamedTypeSymbol)node.Type, closure, node.SlotIndex);
+
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteClosureAccessExpression(BoundClosureAccessExpression node)
+        {
+            var cell = RewriteExpression(node.Cell);
+            if (!ReferenceEquals(cell, node.Cell))
+                return new BoundClosureAccessExpression(node.Syntax, node.Type, cell);
 
             return node;
         }
@@ -827,6 +905,352 @@ namespace Cnidaria.Cs
 
     }
 
+
+    internal sealed class LambdaClosureRewriter : BoundTreeRewriterWithStackGuard
+    {
+        private readonly Compilation _compilation;
+        private readonly NamedTypeSymbol _objectType;
+        private readonly Dictionary<Symbol, BoundExpression> _cellByCapturedSymbol =
+            new(ReferenceEqualityComparer<Symbol>.Instance);
+        private int _tempId;
+
+        private sealed class ClosureLambdaMethodSymbol : MethodSymbol
+        {
+            public override string Name { get; }
+            public override Symbol? ContainingSymbol { get; }
+            public override ImmutableArray<Location> Locations { get; }
+            public override TypeSymbol ReturnType { get; }
+            private ImmutableArray<ParameterSymbol> _parameters;
+            public override ImmutableArray<ParameterSymbol> Parameters => _parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : _parameters;
+            public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+            public override bool IsStatic => true;
+            public override bool IsConstructor => false;
+            public override bool IsAsync { get; }
+
+            public ClosureLambdaMethodSymbol(MethodSymbol original)
+            {
+                Name = original.Name;
+                ContainingSymbol = original.ContainingSymbol;
+                Locations = original.Locations;
+                ReturnType = original.ReturnType;
+                _parameters = ImmutableArray<ParameterSymbol>.Empty;
+                IsAsync = original.IsAsync;
+            }
+
+            public void SetParameters(ImmutableArray<ParameterSymbol> parameters)
+                => _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
+        }
+
+        private sealed class LambdaCaptureCollector : BoundTreeRewriter
+        {
+            private readonly MethodSymbol _lambdaMethod;
+            private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
+            private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
+
+            private LambdaCaptureCollector(MethodSymbol lambdaMethod)
+            {
+                _lambdaMethod = lambdaMethod;
+            }
+
+            public static ImmutableArray<Symbol> Collect(MethodSymbol lambdaMethod, BoundStatement body)
+            {
+                var c = new LambdaCaptureCollector(lambdaMethod);
+                c.RewriteStatement(body);
+                return c._captures.ToImmutable();
+            }
+
+            protected override BoundExpression RewriteExpression(BoundExpression node)
+            {
+                switch (node)
+                {
+                    case BoundLocalExpression local when !ReferenceEquals(local.Local.ContainingSymbol, _lambdaMethod):
+                        Add(local.Local);
+                        return node;
+
+                    case BoundParameterExpression parameter when !ReferenceEquals(parameter.Parameter.ContainingSymbol, _lambdaMethod):
+                        Add(parameter.Parameter);
+                        return node;
+
+                    case BoundThisExpression:
+                    case BoundBaseExpression:
+                        throw new NotSupportedException("Capturing 'this' in lambdas is not implemented by this closure lowering pass yet.");
+
+                    default:
+                        return base.RewriteExpression(node);
+                }
+            }
+
+            private void Add(Symbol symbol)
+            {
+                if (symbol is LocalSymbol { IsConst: true })
+                    return;
+
+                if (_seen.Add(symbol))
+                    _captures.Add(symbol);
+            }
+        }
+
+        private sealed class OwnCapturedSymbolCollector : BoundTreeRewriter
+        {
+            private readonly MethodSymbol _owner;
+            private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
+            private readonly ImmutableArray<Symbol>.Builder _symbols = ImmutableArray.CreateBuilder<Symbol>();
+
+            private OwnCapturedSymbolCollector(MethodSymbol owner)
+            {
+                _owner = owner;
+            }
+
+            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            {
+                var c = new OwnCapturedSymbolCollector(owner);
+                c.RewriteStatement(body);
+                return c._symbols.ToImmutable();
+            }
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+            {
+                var captures = LambdaCaptureCollector.Collect(node.Method, node.Body);
+                for (int i = 0; i < captures.Length; i++)
+                {
+                    var s = captures[i];
+                    if (ReferenceEquals(s.ContainingSymbol, _owner) && _seen.Add(s))
+                        _symbols.Add(s);
+                }
+
+                return base.RewriteLambdaExpression(node);
+            }
+        }
+
+        private readonly struct SavedCell
+        {
+            public readonly Symbol Symbol;
+            public readonly bool HadOld;
+            public readonly BoundExpression? Old;
+
+            public SavedCell(Symbol symbol, bool hadOld, BoundExpression? old)
+            {
+                Symbol = symbol;
+                HadOld = hadOld;
+                Old = old;
+            }
+        }
+
+        public LambdaClosureRewriter(Compilation compilation)
+        {
+            _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
+            _objectType = (NamedTypeSymbol)_compilation.GetSpecialType(SpecialType.System_Object);
+        }
+
+        protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
+        {
+            var body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameterOpt: null, externalCaptures: ImmutableArray<Symbol>.Empty, out _);
+            if (!ReferenceEquals(body, node.Body))
+                return new BoundMethodBody(node.Syntax, node.Method, body);
+
+            return node;
+        }
+
+        protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+        {
+            var externalCaptures = LambdaCaptureCollector.Collect(node.Method, node.Body);
+            if (node.IsStatic && !externalCaptures.IsDefaultOrEmpty)
+                throw new NotSupportedException("Static lambdas cannot capture locals or parameters.");
+
+            ParameterSymbol? closureParameter = null;
+            MethodSymbol targetMethod = node.Method;
+            BoundExpression? target = node.TargetOpt;
+
+            if (!externalCaptures.IsDefaultOrEmpty)
+            {
+                var closureMethod = new ClosureLambdaMethodSymbol(node.Method);
+                closureParameter = new ParameterSymbol(
+                    name: "<>closure",
+                    containing: closureMethod,
+                    type: _objectType,
+                    locations: ImmutableArray<Location>.Empty);
+
+                var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(node.Method.Parameters.Length + 1);
+                parameters.Add(closureParameter);
+                parameters.AddRange(node.Method.Parameters);
+                closureMethod.SetParameters(parameters.ToImmutable());
+                targetMethod = closureMethod;
+
+                var cells = ImmutableArray.CreateBuilder<BoundExpression>(externalCaptures.Length);
+                for (int i = 0; i < externalCaptures.Length; i++)
+                {
+                    if (!_cellByCapturedSymbol.TryGetValue(externalCaptures[i], out var cell))
+                    {
+                        throw new NotSupportedException(
+                            $"Cannot build closure for captured symbol '{externalCaptures[i].Name}'. The defining scope has not been closure-lowered.");
+                    }
+                    cells.Add(cell);
+                }
+
+                target = new BoundClosureCreationExpression(node.Syntax, _objectType, cells.ToImmutable());
+            }
+
+            var body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameter, externalCaptures, out _);
+
+            if (!ReferenceEquals(body, node.Body) || !ReferenceEquals(targetMethod, node.Method) || !ReferenceEquals(target, node.TargetOpt))
+            {
+                return new BoundLambdaExpression(
+                    (ExpressionSyntax)node.Syntax,
+                    (NamedTypeSymbol)node.Type,
+                    targetMethod,
+                    node.InvokeMethod,
+                    body,
+                    node.IsStatic,
+                    node.IsAsync,
+                    target);
+            }
+
+            return node;
+        }
+
+        protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
+        {
+            if (_cellByCapturedSymbol.TryGetValue(node.Local, out var cell) && cell is BoundLocalExpression cellLocal)
+            {
+                var init = node.Initializer is null
+                    ? MakeDefaultValue(node.Syntax, node.Local.Type)
+                    : RewriteExpression(node.Initializer);
+
+                var cellInit = new BoundClosureCellCreationExpression(node.Syntax, _objectType, node.Local.Type, init);
+                return new BoundLocalDeclarationStatement(node.Syntax, cellLocal.Local, cellInit);
+            }
+
+            return base.RewriteLocalDeclarationStatement(node);
+        }
+
+        protected override BoundExpression RewriteExpression(BoundExpression node)
+        {
+            switch (node)
+            {
+                case BoundLocalExpression local when _cellByCapturedSymbol.TryGetValue(local.Local, out var localCell):
+                    return new BoundClosureAccessExpression(local.Syntax, local.Local.Type, localCell);
+
+                case BoundParameterExpression parameter when _cellByCapturedSymbol.TryGetValue(parameter.Parameter, out var parameterCell):
+                    return new BoundClosureAccessExpression(parameter.Syntax, parameter.Parameter.Type, parameterCell);
+
+                default:
+                    return base.RewriteExpression(node);
+            }
+        }
+
+        private BoundStatement RewriteMethodLike(
+            SyntaxNode syntax,
+            MethodSymbol method,
+            BoundStatement body,
+            ParameterSymbol? closureParameterOpt,
+            ImmutableArray<Symbol> externalCaptures,
+            out bool changed)
+        {
+            changed = false;
+            var saved = new List<SavedCell>();
+            var prologue = ImmutableArray.CreateBuilder<BoundStatement>();
+
+            void PushCell(Symbol symbol, BoundExpression cell)
+            {
+                bool hadOld = _cellByCapturedSymbol.TryGetValue(symbol, out var old);
+                saved.Add(new SavedCell(symbol, hadOld, old));
+                _cellByCapturedSymbol[symbol] = cell;
+            }
+
+            try
+            {
+                if (closureParameterOpt is not null)
+                {
+                    var closureExpr = new BoundParameterExpression(syntax, closureParameterOpt);
+                    for (int i = 0; i < externalCaptures.Length; i++)
+                    {
+                        PushCell(
+                            externalCaptures[i],
+                            new BoundClosureSlotExpression(syntax, _objectType, closureExpr, i));
+                    }
+                }
+
+                var ownCaptured = OwnCapturedSymbolCollector.Collect(method, body);
+                for (int i = 0; i < ownCaptured.Length; i++)
+                {
+                    var symbol = ownCaptured[i];
+                    var cellLocal = new LocalSymbol(
+                        name: $"<>cell{_tempId++}_{symbol.Name}",
+                        containing: method,
+                        type: _objectType,
+                        locations: ImmutableArray<Location>.Empty);
+                    var cellExpr = new BoundLocalExpression(syntax, cellLocal);
+                    PushCell(symbol, cellExpr);
+
+                    if (symbol is ParameterSymbol parameter)
+                    {
+                        var init = new BoundParameterExpression(syntax, parameter);
+                        var cellInit = new BoundClosureCellCreationExpression(syntax, _objectType, parameter.Type, init);
+                        prologue.Add(new BoundLocalDeclarationStatement(syntax, cellLocal, cellInit));
+                    }
+                }
+
+                var rewrittenBody = RewriteStatement(body);
+
+                if (prologue.Count != 0)
+                {
+                    if (rewrittenBody is BoundBlockStatement block)
+                    {
+                        var statements = ImmutableArray.CreateBuilder<BoundStatement>(prologue.Count + block.Statements.Length);
+                        statements.AddRange(prologue);
+                        statements.AddRange(block.Statements);
+                        rewrittenBody = new BoundBlockStatement(block.Syntax, statements.ToImmutable());
+                    }
+                    else
+                    {
+                        var statements = ImmutableArray.CreateBuilder<BoundStatement>(prologue.Count + 1);
+                        statements.AddRange(prologue);
+                        statements.Add(rewrittenBody);
+                        rewrittenBody = new BoundBlockStatement(syntax, statements.ToImmutable());
+                    }
+                }
+
+                changed = !ReferenceEquals(rewrittenBody, body) || prologue.Count != 0 || closureParameterOpt is not null;
+                return rewrittenBody;
+            }
+            finally
+            {
+                for (int i = saved.Count - 1; i >= 0; i--)
+                {
+                    var item = saved[i];
+                    if (item.HadOld)
+                        _cellByCapturedSymbol[item.Symbol] = item.Old!;
+                    else
+                        _cellByCapturedSymbol.Remove(item.Symbol);
+                }
+            }
+        }
+
+        private BoundExpression MakeDefaultValue(SyntaxNode syntax, TypeSymbol type)
+        {
+            if (type.IsReferenceType || type is PointerTypeSymbol || type is ByRefTypeSymbol)
+                return new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null);
+
+            return type.SpecialType switch
+            {
+                SpecialType.System_Boolean => new BoundLiteralExpression(syntax, type, false),
+                SpecialType.System_Char => new BoundLiteralExpression(syntax, type, '\0'),
+                SpecialType.System_Int8 => new BoundLiteralExpression(syntax, type, (sbyte)0),
+                SpecialType.System_UInt8 => new BoundLiteralExpression(syntax, type, (byte)0),
+                SpecialType.System_Int16 => new BoundLiteralExpression(syntax, type, (short)0),
+                SpecialType.System_UInt16 => new BoundLiteralExpression(syntax, type, (ushort)0),
+                SpecialType.System_Int32 => new BoundLiteralExpression(syntax, type, 0),
+                SpecialType.System_UInt32 => new BoundLiteralExpression(syntax, type, 0u),
+                SpecialType.System_Int64 => new BoundLiteralExpression(syntax, type, 0L),
+                SpecialType.System_UInt64 => new BoundLiteralExpression(syntax, type, 0UL),
+                SpecialType.System_Single => new BoundLiteralExpression(syntax, type, 0f),
+                SpecialType.System_Double => new BoundLiteralExpression(syntax, type, 0d),
+                _ when type is NamedTypeSymbol named && named.IsValueType
+                    => new BoundObjectCreationExpression(syntax, named, constructorOpt: null, ImmutableArray<BoundExpression>.Empty),
+                _ => new BoundLiteralExpression(syntax, type, 0),
+            };
+        }
+    }
 
     internal sealed class LocalFunctionClosureRewriter : BoundTreeRewriterWithStackGuard
     {
@@ -1269,8 +1693,12 @@ namespace Cnidaria.Cs
             if (compilation is null) throw new ArgumentNullException(nameof(compilation));
             if (methodBody is null) throw new ArgumentNullException(nameof(methodBody));
 
+            var lambdaClosureRewriter = new LambdaClosureRewriter(compilation);
+            var lambdaClosureLoweredBody = lambdaClosureRewriter.RewriteNode(methodBody) as BoundMethodBody
+                ?? throw new InvalidOperationException("Unexpected lambda closure conversion result.");
+
             var closureRewriter = new LocalFunctionClosureRewriter(compilation);
-            var closureLoweredBody = closureRewriter.RewriteNode(methodBody) as BoundMethodBody
+            var closureLoweredBody = closureRewriter.RewriteNode(lambdaClosureLoweredBody) as BoundMethodBody
                 ?? throw new InvalidOperationException("Unexpected closure conversion result.");
 
             var rewriter = new LocalRewriter(compilation, closureLoweredBody.Method);
@@ -1327,6 +1755,7 @@ namespace Cnidaria.Cs
             private int _labelId;
             private int _tempId;
             private bool? _checkedContextOverride;
+            private HashSet<LocalSymbol>? _spanCollectionStackAllocLocals;
             private NamespaceSymbol? _systemNsCache;
             private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
             private IDisposable PushCheckedContext(bool value)
@@ -1601,29 +2030,40 @@ namespace Cnidaria.Cs
             }
             protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
             {
-                var rewritten = base.RewriteMethodBody(node);
-                if (!_method.IsConstructor || _method.IsStatic)
+                var previousSpanCollectionStackAllocLocals = _spanCollectionStackAllocLocals;
+                _spanCollectionStackAllocLocals = SpanCollectionEscapeAnalysis.ComputeStackAllocLocals(_method, node.Body);
+
+                try
+                {
+                    var rewritten = base.RewriteMethodBody(node);
+                    if (!_method.IsConstructor || _method.IsStatic)
+                        return rewritten;
+                    if (_method.ContainingSymbol is not NamedTypeSymbol containingType)
+                        return rewritten;
+                    if (containingType.TypeKind != TypeKind.Class)
+                        return rewritten;
+                    var baseType = containingType.BaseType as NamedTypeSymbol;
+                    if (baseType is null)
+                        return rewritten;
+                    if (BodyStartsWithConstructorInitializer(rewritten.Body))
+                        return rewritten;
+                    var baseCtor = FindParameterlessInstanceConstructor(baseType);
+                    if (baseCtor is null)
+                        return rewritten;
+                    var thisExpr = new BoundThisExpression(new ThisExpressionSyntax(default), containingType);
+                    var call = new BoundCallExpression(node.Syntax, thisExpr, baseCtor, ImmutableArray<BoundExpression>.Empty);
+                    var stmt = new BoundExpressionStatement(node.Syntax, call);
+                    var newBody = PrependStatement(rewritten.Body, stmt);
+                    if (!ReferenceEquals(newBody, rewritten.Body))
+                        return new BoundMethodBody(rewritten.Syntax, rewritten.Method, newBody);
                     return rewritten;
-                if (_method.ContainingSymbol is not NamedTypeSymbol containingType)
-                    return rewritten;
-                if (containingType.TypeKind != TypeKind.Class)
-                    return rewritten;
-                var baseType = containingType.BaseType as NamedTypeSymbol;
-                if (baseType is null)
-                    return rewritten;
-                if (BodyStartsWithConstructorInitializer(rewritten.Body))
-                    return rewritten;
-                var baseCtor = FindParameterlessInstanceConstructor(baseType);
-                if (baseCtor is null)
-                    return rewritten;
-                var thisExpr = new BoundThisExpression(new ThisExpressionSyntax(default), containingType);
-                var call = new BoundCallExpression(node.Syntax, thisExpr, baseCtor, ImmutableArray<BoundExpression>.Empty);
-                var stmt = new BoundExpressionStatement(node.Syntax, call);
-                var newBody = PrependStatement(rewritten.Body, stmt);
-                if (!ReferenceEquals(newBody, rewritten.Body))
-                    return new BoundMethodBody(rewritten.Syntax, rewritten.Method, newBody);
-                return rewritten;
+                }
+                finally
+                {
+                    _spanCollectionStackAllocLocals = previousSpanCollectionStackAllocLocals;
+                }
             }
+
             private static BoundStatement PrependStatement(BoundStatement body, BoundStatement statement)
             {
                 if (body is BoundBlockStatement block)
@@ -1664,6 +2104,160 @@ namespace Cnidaria.Cs
                 }
                 return null;
             }
+            protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
+            {
+                if (node.Initializer is BoundSpanCollectionExpression spanCollection)
+                {
+                    var useStackAlloc =
+                        _spanCollectionStackAllocLocals is not null &&
+                        _spanCollectionStackAllocLocals.Contains(node.Local);
+
+                    var lowered = useStackAlloc
+                        ? LowerSpanCollectionToStackAlloc(spanCollection)
+                        : LowerSpanCollectionToHeapArray(spanCollection);
+
+                    return new BoundLocalDeclarationStatement(node.Syntax, node.Local, lowered);
+                }
+
+                return base.RewriteLocalDeclarationStatement(node);
+            }
+
+            protected override BoundExpression RewriteSpanCollectionExpression(BoundSpanCollectionExpression node)
+                => LowerSpanCollectionToHeapArray(node);
+
+            private BoundExpression LowerSpanCollectionToStackAlloc(BoundSpanCollectionExpression node)
+            {
+                var spanLikeType = (NamedTypeSymbol)node.Type;
+                if (!GenericConstraintFacts.IsUnmanagedType(node.ElementType))
+                    return LowerSpanCollectionToHeapArray(node);
+
+                if (!TryFindSpanPointerCtor(spanLikeType, _compilation, out var ctor))
+                    return LowerSpanCollectionToHeapArray(node);
+
+                var elements = RewriteExpressions(node.Elements, out _);
+                var int32 = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var pointerType = _compilation.CreatePointerType(node.ElementType);
+
+                var lengthLocal = CreateTempLocal(int32);
+                var pointerLocal = CreateTempLocal(pointerType);
+
+                var lengthValue = new BoundLiteralExpression(node.Syntax, int32, elements.Length);
+                var lengthDeclaration = new BoundLocalDeclarationStatement(node.Syntax, lengthLocal, lengthValue);
+                var lengthReadForStackAlloc = new BoundLocalExpression(node.Syntax, lengthLocal);
+
+                var initializer = new BoundArrayInitializerExpression(node.Syntax, node.ElementType, elements);
+                var stackAlloc = new BoundStackAllocArrayCreationExpression(
+                    node.Syntax,
+                    pointerType,
+                    node.ElementType,
+                    lengthReadForStackAlloc,
+                    initializer);
+
+                var pointerDeclaration = new BoundLocalDeclarationStatement(node.Syntax, pointerLocal, stackAlloc);
+                BoundExpression pointerArgument = new BoundLocalExpression(node.Syntax, pointerLocal);
+                if (!ReferenceEquals(pointerArgument.Type, ctor.Parameters[0].Type))
+                {
+                    pointerArgument = new BoundConversionExpression(
+                        node.Syntax,
+                        ctor.Parameters[0].Type,
+                        pointerArgument,
+                        new Conversion(ConversionKind.ImplicitNumeric),
+                        isChecked: false);
+                }
+
+                BoundExpression lengthArgument = new BoundLocalExpression(node.Syntax, lengthLocal);
+                if (!ReferenceEquals(lengthArgument.Type, ctor.Parameters[1].Type))
+                {
+                    lengthArgument = new BoundConversionExpression(
+                        node.Syntax,
+                        ctor.Parameters[1].Type,
+                        lengthArgument,
+                        LocalScopeBinder.ClassifyConversion(lengthArgument, ctor.Parameters[1].Type),
+                        isChecked: false);
+                }
+
+                var spanCreation = new BoundObjectCreationExpression(
+                    node.Syntax,
+                    spanLikeType,
+                    ctor,
+                    ImmutableArray.Create(pointerArgument, lengthArgument));
+
+                return new BoundSequenceExpression(
+                    node.Syntax,
+                    ImmutableArray.Create(lengthLocal, pointerLocal),
+                    ImmutableArray.Create<BoundStatement>(lengthDeclaration, pointerDeclaration),
+                    spanCreation);
+            }
+
+            private BoundExpression LowerSpanCollectionToHeapArray(BoundSpanCollectionExpression node)
+            {
+                var spanLikeType = (NamedTypeSymbol)node.Type;
+                var arrayType = _compilation.CreateArrayType(node.ElementType, rank: 1);
+                if (!TryFindSpanArrayCtor(spanLikeType, arrayType, out var ctor))
+                    throw new InvalidOperationException($"Missing '{spanLikeType.Name}' constructor ({node.ElementType.Name}[]). ");
+
+                var elements = RewriteExpressions(node.Elements, out _);
+                var int32 = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var length = new BoundLiteralExpression(node.Syntax, int32, elements.Length);
+                var initializer = new BoundArrayInitializerExpression(node.Syntax, node.ElementType, elements);
+                var arrayCreation = new BoundArrayCreationExpression(
+                    node.Syntax,
+                    arrayType,
+                    node.ElementType,
+                    length,
+                    initializer);
+
+                return new BoundObjectCreationExpression(
+                    node.Syntax,
+                    spanLikeType,
+                    ctor,
+                    ImmutableArray.Create<BoundExpression>(arrayCreation));
+            }
+
+            private static bool TryFindSpanPointerCtor(NamedTypeSymbol spanLikeType, Compilation compilation, out MethodSymbol ctor)
+            {
+                ctor = null!;
+                var int32 = compilation.GetSpecialType(SpecialType.System_Int32);
+                var voidType = compilation.GetSpecialType(SpecialType.System_Void);
+                var voidPointer = compilation.CreatePointerType(voidType);
+
+                foreach (var member in spanLikeType.GetMembers())
+                {
+                    if (member is not MethodSymbol method || !method.IsConstructor || method.IsStatic)
+                        continue;
+                    if (method.Parameters.Length != 2)
+                        continue;
+                    if (ReferenceEquals(method.Parameters[0].Type, voidPointer) &&
+                        ReferenceEquals(method.Parameters[1].Type, int32))
+                    {
+                        ctor = method;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private static bool TryFindSpanArrayCtor(NamedTypeSymbol spanLikeType, ArrayTypeSymbol arrayType, out MethodSymbol ctor)
+            {
+                ctor = null!;
+
+                foreach (var member in spanLikeType.GetMembers())
+                {
+                    if (member is not MethodSymbol method || !method.IsConstructor || method.IsStatic)
+                        continue;
+                    if (method.Parameters.Length != 1)
+                        continue;
+                    if (ReferenceEquals(method.Parameters[0].Type, arrayType))
+                    {
+                        ctor = method;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
             protected override BoundStatement RewriteIfStatement(BoundIfStatement node)
             {
                 var condition = RewriteExpression(node.Condition);
@@ -2829,6 +3423,625 @@ namespace Cnidaria.Cs
 
                 return node;
             }
+            private static class SpanCollectionEscapeAnalysis
+            {
+                public static HashSet<LocalSymbol> ComputeStackAllocLocals(MethodSymbol method, BoundStatement body)
+                {
+                    var result = new HashSet<LocalSymbol>(ReferenceEqualityComparer<LocalSymbol>.Instance);
+                    if (method.IsAsync)
+                        return result;
+
+                    var candidates = ImmutableArray.CreateBuilder<LocalSymbol>();
+                    CollectCandidateLocals(body, candidates);
+
+                    for (int i = 0; i < candidates.Count; i++)
+                    {
+                        var local = candidates[i];
+                        if (!EscapesFromStatement(body, local))
+                            result.Add(local);
+                    }
+
+                    return result;
+                }
+
+                private static void CollectCandidateLocals(BoundStatement statement, ImmutableArray<LocalSymbol>.Builder result)
+                {
+                    switch (statement)
+                    {
+                        case BoundLocalDeclarationStatement localDeclaration:
+                            if (localDeclaration.Initializer is BoundSpanCollectionExpression spanCollection &&
+                                !spanCollection.HasErrors &&
+                                GenericConstraintFacts.IsUnmanagedType(spanCollection.ElementType))
+                            {
+                                result.Add(localDeclaration.Local);
+                            }
+                            return;
+
+                        case BoundBlockStatement block:
+                            for (int i = 0; i < block.Statements.Length; i++)
+                                CollectCandidateLocals(block.Statements[i], result);
+                            return;
+
+                        case BoundStatementList list:
+                            for (int i = 0; i < list.Statements.Length; i++)
+                                CollectCandidateLocals(list.Statements[i], result);
+                            return;
+
+                        case BoundIfStatement ifStatement:
+                            CollectCandidateLocals(ifStatement.Then, result);
+                            if (ifStatement.ElseOpt is not null)
+                                CollectCandidateLocals(ifStatement.ElseOpt, result);
+                            return;
+
+                        case BoundWhileStatement whileStatement:
+                            CollectCandidateLocals(whileStatement.Body, result);
+                            return;
+
+                        case BoundDoWhileStatement doWhileStatement:
+                            CollectCandidateLocals(doWhileStatement.Body, result);
+                            return;
+
+                        case BoundForStatement forStatement:
+                            for (int i = 0; i < forStatement.Initializers.Length; i++)
+                                CollectCandidateLocals(forStatement.Initializers[i], result);
+                            for (int i = 0; i < forStatement.Incrementors.Length; i++)
+                                CollectCandidateLocals(forStatement.Incrementors[i], result);
+                            CollectCandidateLocals(forStatement.Body, result);
+                            return;
+
+                        case BoundForEachStatement forEachStatement:
+                            CollectCandidateLocals(forEachStatement.Body, result);
+                            return;
+
+                        case BoundTryStatement tryStatement:
+                            CollectCandidateLocals(tryStatement.TryBlock, result);
+                            for (int i = 0; i < tryStatement.CatchBlocks.Length; i++)
+                                CollectCandidateLocals(tryStatement.CatchBlocks[i].Body, result);
+                            if (tryStatement.FinallyBlockOpt is not null)
+                                CollectCandidateLocals(tryStatement.FinallyBlockOpt, result);
+                            return;
+
+                        case BoundCheckedStatement checkedStatement:
+                            CollectCandidateLocals(checkedStatement.Statement, result);
+                            return;
+
+                        case BoundUncheckedStatement uncheckedStatement:
+                            CollectCandidateLocals(uncheckedStatement.Statement, result);
+                            return;
+
+                        case BoundFixedStatement fixedStatement:
+                            for (int i = 0; i < fixedStatement.Declarations.Length; i++)
+                                CollectCandidateLocals(fixedStatement.Declarations[i], result);
+                            CollectCandidateLocals(fixedStatement.Body, result);
+                            return;
+
+                        case BoundLocalFunctionStatement:
+                            return;
+                    }
+                }
+
+                private static bool EscapesFromStatement(BoundStatement statement, LocalSymbol local)
+                {
+                    switch (statement)
+                    {
+                        case BoundBadStatement:
+                        case BoundEmptyStatement:
+                        case BoundLabelStatement:
+                        case BoundGotoStatement:
+                        case BoundBreakStatement:
+                        case BoundContinueStatement:
+                            return false;
+
+                        case BoundExpressionStatement expressionStatement:
+                            return ExpressionEscapes(expressionStatement.Expression, local);
+
+                        case BoundLocalDeclarationStatement localDeclaration:
+                            if (ReferenceEquals(localDeclaration.Local, local))
+                                return false;
+                            if (localDeclaration.Initializer is null)
+                                return false;
+                            if (localDeclaration.Local.IsByRef && ContainsLocal(localDeclaration.Initializer, local))
+                                return true;
+                            return ExpressionEscapes(localDeclaration.Initializer, local);
+
+                        case BoundReturnStatement returnStatement:
+                            if (returnStatement.Expression is null)
+                                return false;
+                            if (returnStatement.Expression.IsLValue && ContainsLocal(returnStatement.Expression, local))
+                                return true;
+                            return ExpressionEscapes(returnStatement.Expression, local);
+
+                        case BoundThrowStatement throwStatement:
+                            return throwStatement.ExpressionOpt is not null && ContainsLocal(throwStatement.ExpressionOpt, local);
+
+                        case BoundBlockStatement block:
+                            for (int i = 0; i < block.Statements.Length; i++)
+                            {
+                                if (EscapesFromStatement(block.Statements[i], local))
+                                    return true;
+                            }
+                            return false;
+
+                        case BoundStatementList list:
+                            for (int i = 0; i < list.Statements.Length; i++)
+                            {
+                                if (EscapesFromStatement(list.Statements[i], local))
+                                    return true;
+                            }
+                            return false;
+
+                        case BoundIfStatement ifStatement:
+                            return ExpressionEscapes(ifStatement.Condition, local) ||
+                                   EscapesFromStatement(ifStatement.Then, local) ||
+                                   (ifStatement.ElseOpt is not null && EscapesFromStatement(ifStatement.ElseOpt, local));
+
+                        case BoundWhileStatement whileStatement:
+                            return ExpressionEscapes(whileStatement.Condition, local) ||
+                                   EscapesFromStatement(whileStatement.Body, local);
+
+                        case BoundDoWhileStatement doWhileStatement:
+                            return EscapesFromStatement(doWhileStatement.Body, local) ||
+                                   ExpressionEscapes(doWhileStatement.Condition, local);
+
+                        case BoundForStatement forStatement:
+                            for (int i = 0; i < forStatement.Initializers.Length; i++)
+                                if (EscapesFromStatement(forStatement.Initializers[i], local))
+                                    return true;
+                            if (forStatement.ConditionOpt is not null && ExpressionEscapes(forStatement.ConditionOpt, local))
+                                return true;
+                            for (int i = 0; i < forStatement.Incrementors.Length; i++)
+                                if (EscapesFromStatement(forStatement.Incrementors[i], local))
+                                    return true;
+                            return EscapesFromStatement(forStatement.Body, local);
+
+                        case BoundForEachStatement forEachStatement:
+                            return ExpressionEscapes(forEachStatement.Collection, local) ||
+                                   EscapesFromStatement(forEachStatement.Body, local);
+
+                        case BoundTryStatement tryStatement:
+                            if (EscapesFromStatement(tryStatement.TryBlock, local))
+                                return true;
+                            for (int i = 0; i < tryStatement.CatchBlocks.Length; i++)
+                            {
+                                var catchBlock = tryStatement.CatchBlocks[i];
+                                if (catchBlock.FilterOpt is not null && ExpressionEscapes(catchBlock.FilterOpt, local))
+                                    return true;
+                                if (EscapesFromStatement(catchBlock.Body, local))
+                                    return true;
+                            }
+                            return tryStatement.FinallyBlockOpt is not null && EscapesFromStatement(tryStatement.FinallyBlockOpt, local);
+
+                        case BoundCheckedStatement checkedStatement:
+                            return EscapesFromStatement(checkedStatement.Statement, local);
+
+                        case BoundUncheckedStatement uncheckedStatement:
+                            return EscapesFromStatement(uncheckedStatement.Statement, local);
+
+                        case BoundFixedStatement fixedStatement:
+                            for (int i = 0; i < fixedStatement.Declarations.Length; i++)
+                            {
+                                if (ContainsLocalInStatement(fixedStatement.Declarations[i], local))
+                                    return true;
+                            }
+                            return EscapesFromStatement(fixedStatement.Body, local);
+
+                        case BoundLocalFunctionStatement localFunction:
+                            return ContainsLocalInStatement(localFunction.Body, local);
+
+                        default:
+                            return ContainsLocalInStatement(statement, local);
+                    }
+                }
+
+                private static bool ExpressionEscapes(BoundExpression expression, LocalSymbol local, bool allowRefExpression = false)
+                {
+                    switch (expression)
+                    {
+                        case BoundBadExpression:
+                        case BoundLiteralExpression:
+                        case BoundParameterExpression:
+                        case BoundThisExpression:
+                        case BoundBaseExpression:
+                        case BoundLabelExpression:
+                        case BoundSizeOfExpression:
+                        case BoundUnboundLambdaExpression:
+                        case BoundMethodGroupExpression:
+                            return false;
+
+                        case BoundLocalExpression localExpression:
+                            return ReferenceEquals(localExpression.Local, local);
+
+                        case BoundThrowExpression throwExpression:
+                            return ContainsLocal(throwExpression.Exception, local);
+
+                        case BoundTupleExpression tuple:
+                            for (int i = 0; i < tuple.Elements.Length; i++)
+                                if (ExpressionEscapes(tuple.Elements[i], local))
+                                    return true;
+                            return false;
+
+                        case BoundArrayInitializerExpression arrayInitializer:
+                            for (int i = 0; i < arrayInitializer.Elements.Length; i++)
+                                if (ExpressionEscapes(arrayInitializer.Elements[i], local))
+                                    return true;
+                            return false;
+
+                        case BoundArrayCreationExpression arrayCreation:
+                            for (int i = 0; i < arrayCreation.DimensionSizes.Length; i++)
+                                if (ExpressionEscapes(arrayCreation.DimensionSizes[i], local))
+                                    return true;
+                            return arrayCreation.InitializerOpt is not null && ExpressionEscapes(arrayCreation.InitializerOpt, local);
+
+                        case BoundArrayElementAccessExpression arrayElementAccess:
+                            return ExpressionEscapes(arrayElementAccess.Expression, local) ||
+                                   AnyExpressionEscapes(arrayElementAccess.Indices, local);
+
+                        case BoundStackAllocArrayCreationExpression stackAlloc:
+                            return ExpressionEscapes(stackAlloc.Count, local) ||
+                                   (stackAlloc.InitializerOpt is not null && ExpressionEscapes(stackAlloc.InitializerOpt, local));
+
+                        case BoundRefExpression refExpression:
+                            if (!allowRefExpression && ContainsLocal(refExpression.Operand, local))
+                                return true;
+                            return ExpressionEscapesInKnownSafeUse(refExpression.Operand, local);
+
+                        case BoundAddressOfExpression addressOf:
+                            return ContainsLocal(addressOf.Operand, local);
+
+                        case BoundPointerIndirectionExpression pointerIndirection:
+                            return ExpressionEscapes(pointerIndirection.Operand, local);
+
+                        case BoundPointerElementAccessExpression pointerElementAccess:
+                            return ExpressionEscapes(pointerElementAccess.Expression, local) ||
+                                   ExpressionEscapes(pointerElementAccess.Index, local);
+
+                        case BoundConversionExpression conversion:
+                            return ExpressionEscapes(conversion.Operand, local);
+
+                        case BoundAsExpression asExpression:
+                            return ExpressionEscapes(asExpression.Operand, local);
+
+                        case BoundCheckedExpression checkedExpression:
+                            return ExpressionEscapes(checkedExpression.Expression, local);
+
+                        case BoundUncheckedExpression uncheckedExpression:
+                            return ExpressionEscapes(uncheckedExpression.Expression, local);
+
+                        case BoundUnaryExpression unary:
+                            return ExpressionEscapes(unary.Operand, local);
+
+                        case BoundBinaryExpression binary:
+                            return ExpressionEscapes(binary.Left, local) ||
+                                   ExpressionEscapes(binary.Right, local);
+
+                        case BoundConditionalExpression conditional:
+                            return ExpressionEscapes(conditional.Condition, local) ||
+                                   ExpressionEscapes(conditional.WhenTrue, local) ||
+                                   ExpressionEscapes(conditional.WhenFalse, local);
+
+                        case BoundIncrementDecrementExpression increment:
+                            return ContainsLocal(increment.Target, local) ||
+                                   ExpressionEscapes(increment.Read, local) ||
+                                   ExpressionEscapes(increment.Value, local);
+
+                        case BoundCompoundAssignmentExpression compound:
+                            return ContainsLocal(compound.Left, local) ||
+                                   ExpressionEscapes(compound.Value, local);
+
+                        case BoundNullCoalescingAssignmentExpression nullCoalescing:
+                            return ContainsLocal(nullCoalescing.Left, local) ||
+                                   ExpressionEscapes(nullCoalescing.Value, local);
+
+                        case BoundAssignmentExpression assignment:
+                            return ContainsLocal(assignment.Left, local) ||
+                                   ExpressionEscapes(assignment.Right, local);
+
+                        case BoundCallExpression call:
+                            if (!ContainsLocal(call, local))
+                                return false;
+                            if (call.ReceiverOpt is not null && ExpressionEscapesInKnownSafeUse(call.ReceiverOpt, local))
+                                return true;
+                            for (int i = 0; i < call.Arguments.Length; i++)
+                                if (ExpressionEscapesInKnownSafeUse(call.Arguments[i], local))
+                                    return true;
+                            return false;
+
+                        case BoundObjectCreationExpression objectCreation:
+                            return ContainsLocal(objectCreation, local);
+
+                        case BoundUnboundImplicitObjectCreationExpression objectCreation:
+                            return AnyExpressionEscapes(objectCreation.Arguments, local);
+
+                        case BoundUnboundCollectionExpression collection:
+                            for (int i = 0; i < collection.Elements.Length; i++)
+                                if (ExpressionEscapes(collection.Elements[i].Expression, local))
+                                    return true;
+                            return false;
+
+                        case BoundSpanCollectionExpression spanCollection:
+                            return AnyExpressionEscapes(spanCollection.Elements, local);
+
+                        case BoundSequenceExpression sequence:
+                            for (int i = 0; i < sequence.SideEffects.Length; i++)
+                                if (EscapesFromStatement(sequence.SideEffects[i], local))
+                                    return true;
+                            return ExpressionEscapes(sequence.Value, local);
+
+                        case BoundIndexerAccessExpression indexer:
+                            if (IsDirectLocal(indexer.Receiver, local) && IsSpanLikeType(indexer.Receiver.Type))
+                                return AnyExpressionEscapes(indexer.Arguments, local);
+                            return ContainsLocal(indexer, local);
+
+                        case BoundMemberAccessExpression memberAccess:
+                            if (memberAccess.ReceiverOpt is null)
+                                return false;
+                            if (IsDirectLocal(memberAccess.ReceiverOpt, local) && IsAllowedSpanMemberRead(memberAccess.Member))
+                                return false;
+                            return ContainsLocal(memberAccess, local);
+
+                        case BoundFixedInitializerExpression fixedInitializer:
+                            return ContainsLocal(fixedInitializer, local);
+
+                        case BoundIsPatternExpression isPattern:
+                            return ExpressionEscapes(isPattern.Operand, local);
+
+                        default:
+                            return ContainsLocal(expression, local);
+                    }
+                }
+
+                private static bool ExpressionEscapesInKnownSafeUse(BoundExpression expression, LocalSymbol local)
+                {
+                    if (IsDirectLocal(expression, local))
+                        return false;
+
+                    if (expression is BoundRefExpression refExpression)
+                        return ExpressionEscapesInKnownSafeUse(refExpression.Operand, local);
+
+                    return ExpressionEscapes(expression, local, allowRefExpression: true);
+                }
+
+                private static bool AnyExpressionEscapes(ImmutableArray<BoundExpression> expressions, LocalSymbol local)
+                {
+                    for (int i = 0; i < expressions.Length; i++)
+                        if (ExpressionEscapes(expressions[i], local))
+                            return true;
+                    return false;
+                }
+
+                private static bool IsDirectLocal(BoundExpression expression, LocalSymbol local)
+                    => expression is BoundLocalExpression localExpression && ReferenceEquals(localExpression.Local, local);
+
+                private static bool IsSpanLikeType(TypeSymbol type)
+                {
+                    if (type is not NamedTypeSymbol named)
+                        return false;
+
+                    var definition = named.OriginalDefinition;
+                    if (definition.Arity != 1)
+                        return false;
+                    if (!string.Equals(definition.Name, "Span", StringComparison.Ordinal) &&
+                        !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                        return false;
+
+                    return definition.ContainingSymbol is NamespaceSymbol ns &&
+                           string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                }
+
+                private static bool IsAllowedSpanMemberRead(Symbol member)
+                {
+                    if (member is not PropertySymbol property || property.IsStatic)
+                        return false;
+
+                    return string.Equals(property.Name, "Length", StringComparison.Ordinal) ||
+                           string.Equals(property.Name, "IsEmpty", StringComparison.Ordinal);
+                }
+
+                private static bool IsNamespace(Symbol? symbol, params string[] names)
+                {
+                    for (int i = names.Length - 1; i >= 0; i--)
+                    {
+                        if (symbol is not NamespaceSymbol ns || !string.Equals(ns.Name, names[i], StringComparison.Ordinal))
+                            return false;
+                        symbol = ns.ContainingSymbol;
+                    }
+
+                    return true;
+                }
+
+                private static bool ContainsLocalInStatement(BoundStatement statement, LocalSymbol local)
+                {
+                    switch (statement)
+                    {
+                        case BoundExpressionStatement expressionStatement:
+                            return ContainsLocal(expressionStatement.Expression, local);
+                        case BoundLocalDeclarationStatement localDeclaration:
+                            return localDeclaration.Initializer is not null && ContainsLocal(localDeclaration.Initializer, local);
+                        case BoundReturnStatement returnStatement:
+                            return returnStatement.Expression is not null && ContainsLocal(returnStatement.Expression, local);
+                        case BoundThrowStatement throwStatement:
+                            return throwStatement.ExpressionOpt is not null && ContainsLocal(throwStatement.ExpressionOpt, local);
+                        case BoundBlockStatement block:
+                            for (int i = 0; i < block.Statements.Length; i++)
+                                if (ContainsLocalInStatement(block.Statements[i], local))
+                                    return true;
+                            return false;
+                        case BoundStatementList list:
+                            for (int i = 0; i < list.Statements.Length; i++)
+                                if (ContainsLocalInStatement(list.Statements[i], local))
+                                    return true;
+                            return false;
+                        case BoundIfStatement ifStatement:
+                            return ContainsLocal(ifStatement.Condition, local) ||
+                                   ContainsLocalInStatement(ifStatement.Then, local) ||
+                                   (ifStatement.ElseOpt is not null && ContainsLocalInStatement(ifStatement.ElseOpt, local));
+                        case BoundWhileStatement whileStatement:
+                            return ContainsLocal(whileStatement.Condition, local) ||
+                                   ContainsLocalInStatement(whileStatement.Body, local);
+                        case BoundDoWhileStatement doWhileStatement:
+                            return ContainsLocalInStatement(doWhileStatement.Body, local) ||
+                                   ContainsLocal(doWhileStatement.Condition, local);
+                        case BoundForStatement forStatement:
+                            for (int i = 0; i < forStatement.Initializers.Length; i++)
+                                if (ContainsLocalInStatement(forStatement.Initializers[i], local))
+                                    return true;
+                            if (forStatement.ConditionOpt is not null && ContainsLocal(forStatement.ConditionOpt, local))
+                                return true;
+                            for (int i = 0; i < forStatement.Incrementors.Length; i++)
+                                if (ContainsLocalInStatement(forStatement.Incrementors[i], local))
+                                    return true;
+                            return ContainsLocalInStatement(forStatement.Body, local);
+                        case BoundForEachStatement forEachStatement:
+                            return ContainsLocal(forEachStatement.Collection, local) ||
+                                   ContainsLocalInStatement(forEachStatement.Body, local);
+                        case BoundTryStatement tryStatement:
+                            if (ContainsLocalInStatement(tryStatement.TryBlock, local))
+                                return true;
+                            for (int i = 0; i < tryStatement.CatchBlocks.Length; i++)
+                            {
+                                var catchBlock = tryStatement.CatchBlocks[i];
+                                var filter = catchBlock.FilterOpt;
+                                if (filter is not null && ContainsLocal(filter, local))
+                                    return true;
+                                if (ContainsLocalInStatement(catchBlock.Body, local))
+                                    return true;
+                            }
+                            return tryStatement.FinallyBlockOpt is not null && ContainsLocalInStatement(tryStatement.FinallyBlockOpt, local);
+                        case BoundCheckedStatement checkedStatement:
+                            return ContainsLocalInStatement(checkedStatement.Statement, local);
+                        case BoundUncheckedStatement uncheckedStatement:
+                            return ContainsLocalInStatement(uncheckedStatement.Statement, local);
+                        case BoundFixedStatement fixedStatement:
+                            for (int i = 0; i < fixedStatement.Declarations.Length; i++)
+                                if (ContainsLocalInStatement(fixedStatement.Declarations[i], local))
+                                    return true;
+                            return ContainsLocalInStatement(fixedStatement.Body, local);
+                        case BoundLocalFunctionStatement localFunction:
+                            return ContainsLocalInStatement(localFunction.Body, local);
+                        default:
+                            return false;
+                    }
+                }
+
+                private static bool ContainsLocal(BoundExpression expression, LocalSymbol local)
+                {
+                    switch (expression)
+                    {
+                        case BoundLocalExpression localExpression:
+                            return ReferenceEquals(localExpression.Local, local);
+                        case BoundThrowExpression throwExpression:
+                            return ContainsLocal(throwExpression.Exception, local);
+                        case BoundTupleExpression tuple:
+                            for (int i = 0; i < tuple.Elements.Length; i++)
+                                if (ContainsLocal(tuple.Elements[i], local))
+                                    return true;
+                            return false;
+                        case BoundArrayInitializerExpression arrayInitializer:
+                            for (int i = 0; i < arrayInitializer.Elements.Length; i++)
+                                if (ContainsLocal(arrayInitializer.Elements[i], local))
+                                    return true;
+                            return false;
+                        case BoundArrayCreationExpression arrayCreation:
+                            for (int i = 0; i < arrayCreation.DimensionSizes.Length; i++)
+                                if (ContainsLocal(arrayCreation.DimensionSizes[i], local))
+                                    return true;
+                            return arrayCreation.InitializerOpt is not null && ContainsLocal(arrayCreation.InitializerOpt, local);
+                        case BoundArrayElementAccessExpression arrayElementAccess:
+                            if (ContainsLocal(arrayElementAccess.Expression, local))
+                                return true;
+                            for (int i = 0; i < arrayElementAccess.Indices.Length; i++)
+                                if (ContainsLocal(arrayElementAccess.Indices[i], local))
+                                    return true;
+                            return false;
+                        case BoundStackAllocArrayCreationExpression stackAlloc:
+                            return ContainsLocal(stackAlloc.Count, local) ||
+                                   (stackAlloc.InitializerOpt is not null && ContainsLocal(stackAlloc.InitializerOpt, local));
+                        case BoundRefExpression refExpression:
+                            return ContainsLocal(refExpression.Operand, local);
+                        case BoundAddressOfExpression addressOf:
+                            return ContainsLocal(addressOf.Operand, local);
+                        case BoundPointerIndirectionExpression pointerIndirection:
+                            return ContainsLocal(pointerIndirection.Operand, local);
+                        case BoundPointerElementAccessExpression pointerElementAccess:
+                            return ContainsLocal(pointerElementAccess.Expression, local) ||
+                                   ContainsLocal(pointerElementAccess.Index, local);
+                        case BoundConversionExpression conversion:
+                            return ContainsLocal(conversion.Operand, local);
+                        case BoundAsExpression asExpression:
+                            return ContainsLocal(asExpression.Operand, local);
+                        case BoundCheckedExpression checkedExpression:
+                            return ContainsLocal(checkedExpression.Expression, local);
+                        case BoundUncheckedExpression uncheckedExpression:
+                            return ContainsLocal(uncheckedExpression.Expression, local);
+                        case BoundUnaryExpression unary:
+                            return ContainsLocal(unary.Operand, local);
+                        case BoundBinaryExpression binary:
+                            return ContainsLocal(binary.Left, local) || ContainsLocal(binary.Right, local);
+                        case BoundConditionalExpression conditional:
+                            return ContainsLocal(conditional.Condition, local) ||
+                                   ContainsLocal(conditional.WhenTrue, local) ||
+                                   ContainsLocal(conditional.WhenFalse, local);
+                        case BoundIncrementDecrementExpression increment:
+                            return ContainsLocal(increment.Target, local) ||
+                                   ContainsLocal(increment.Read, local) ||
+                                   ContainsLocal(increment.Value, local);
+                        case BoundCompoundAssignmentExpression compound:
+                            return ContainsLocal(compound.Left, local) || ContainsLocal(compound.Value, local);
+                        case BoundNullCoalescingAssignmentExpression nullCoalescing:
+                            return ContainsLocal(nullCoalescing.Left, local) || ContainsLocal(nullCoalescing.Value, local);
+                        case BoundAssignmentExpression assignment:
+                            return ContainsLocal(assignment.Left, local) || ContainsLocal(assignment.Right, local);
+                        case BoundCallExpression call:
+                            if (call.ReceiverOpt is not null && ContainsLocal(call.ReceiverOpt, local))
+                                return true;
+                            for (int i = 0; i < call.Arguments.Length; i++)
+                                if (ContainsLocal(call.Arguments[i], local))
+                                    return true;
+                            return false;
+                        case BoundObjectCreationExpression objectCreation:
+                            for (int i = 0; i < objectCreation.Arguments.Length; i++)
+                                if (ContainsLocal(objectCreation.Arguments[i], local))
+                                    return true;
+                            return false;
+                        case BoundUnboundImplicitObjectCreationExpression objectCreation:
+                            for (int i = 0; i < objectCreation.Arguments.Length; i++)
+                                if (ContainsLocal(objectCreation.Arguments[i], local))
+                                    return true;
+                            return false;
+                        case BoundUnboundCollectionExpression collection:
+                            for (int i = 0; i < collection.Elements.Length; i++)
+                                if (ContainsLocal(collection.Elements[i].Expression, local))
+                                    return true;
+                            return false;
+                        case BoundSpanCollectionExpression spanCollection:
+                            for (int i = 0; i < spanCollection.Elements.Length; i++)
+                                if (ContainsLocal(spanCollection.Elements[i], local))
+                                    return true;
+                            return false;
+                        case BoundSequenceExpression sequence:
+                            for (int i = 0; i < sequence.SideEffects.Length; i++)
+                                if (ContainsLocalInStatement(sequence.SideEffects[i], local))
+                                    return true;
+                            return ContainsLocal(sequence.Value, local);
+                        case BoundIndexerAccessExpression indexer:
+                            if (ContainsLocal(indexer.Receiver, local))
+                                return true;
+                            for (int i = 0; i < indexer.Arguments.Length; i++)
+                                if (ContainsLocal(indexer.Arguments[i], local))
+                                    return true;
+                            return false;
+                        case BoundMemberAccessExpression memberAccess:
+                            return memberAccess.ReceiverOpt is not null && ContainsLocal(memberAccess.ReceiverOpt, local);
+                        case BoundFixedInitializerExpression fixedInitializer:
+                            return ContainsLocal(fixedInitializer.Expression, local);
+                        case BoundIsPatternExpression isPattern:
+                            return ContainsLocal(isPattern.Operand, local);
+                        default:
+                            return false;
+                    }
+                }
+            }
+
             private static MethodSymbol? FindStructCtorByParamCount(NamedTypeSymbol type, int paramCount)
             {
                 if (paramCount == 0)
@@ -5147,6 +6360,9 @@ namespace Cnidaria.Cs
                     case BoundThisExpression:
                     case BoundLabelExpression:
                     case BoundSizeOfExpression:
+                    case BoundUnboundLambdaExpression:
+                    case BoundMethodGroupExpression:
+                    case BoundLambdaExpression:
                         return;
 
                     case BoundLocalExpression local:

@@ -522,7 +522,7 @@ namespace Cnidaria.Cs
         public MethodDefRow GetMethodDef(int rid) => _md.Methods[rid - 1];
         public ParamRow GetParam(int rid) => _md.Params[rid - 1];
         public MemberRefRow GetMemberRef(int rid) => _md.MemberRefs[rid - 1];
-        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1]; 
+        public TypeSpecRow GetTypeSpec(int rid) => _md.TypeSpecs[rid - 1];
         public MethodSpecRow GetMethodSpec(int rid) => _md.MethodSpecs[rid - 1];
         public ConstantRow GetConstant(int rid) => _md.Constants[rid - 1];
         public PropertyRow GetProperty(int rid) => _md.Properties[rid - 1];
@@ -546,7 +546,7 @@ namespace Cnidaria.Cs
         TypeRefTable = 101,
         TypeDefTable = 102,
         NestedClassTable = 103,
-        InterfaceImplTable = 104, 
+        InterfaceImplTable = 104,
         MethodImplTable = 105,
         FieldTable = 106,
         MethodDefTable = 107,
@@ -821,7 +821,7 @@ namespace Cnidaria.Cs
             Add(ref i, FlatMdSection.PropertyTable, elemSize: 18, count: md.Properties.Count, size: checked(md.Properties.Count * 18), ref cursor, sections);
             Add(ref i, FlatMdSection.MethodSpecTable, elemSize: 8, count: md.MethodSpecs.Count, size: checked(md.MethodSpecs.Count * 8), ref cursor, sections);
 
-            Add(ref i, FlatMdSection.CustomAttributeTable, elemSize: 16, count: md.CustomAttributes.Count, 
+            Add(ref i, FlatMdSection.CustomAttributeTable, elemSize: 16, count: md.CustomAttributes.Count,
                 size: checked(md.CustomAttributes.Count * 16), ref cursor, sections);
 
             return new LayoutPlan(
@@ -1801,7 +1801,7 @@ namespace Cnidaria.Cs
             if (_methodDefTokens.TryGetValue(method, out var defTok))
                 return defTok;
 
-            if (method is LocalFunctionSymbol)
+            if (method is LocalFunctionSymbol || method.ContainingSymbol is not NamedTypeSymbol)
                 return GetOrAddLocalFunctionMethodDef(method);
 
             return GetOrAddMemberRef(method);
@@ -1846,7 +1846,7 @@ namespace Cnidaria.Cs
             _assemblyRefTokenByName[name] = tok;
             return tok;
         }
-        
+
         private ImmutableArray<NamedTypeSymbol> CollectAllModuleTypes(NamespaceSymbol root)
         {
             var set = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
@@ -2006,7 +2006,7 @@ namespace Cnidaria.Cs
                         mflags |= (ushort)System.Reflection.MethodAttributes.Static;
                     if (m.IsExtensionMethod)
                         mflags |= MetadataFlagBits.Extension;
-                    
+
                     ushort implFlags = MethodAttributeFacts.GetMethodImplFlags(m);
                     Image.Methods.Add(new MethodDefRow(implFlags: implFlags, flags: mflags, name: mNameIdx, signature: sigIdx, paramList: paramListRid));
                     if (isExplicitInterfaceImpl)
@@ -2043,6 +2043,8 @@ namespace Cnidaria.Cs
             int typeFlags = MapTypeVisibility(type);
             if (type.TypeKind == TypeKind.Interface)
                 typeFlags |= (int)System.Reflection.TypeAttributes.Interface | (int)System.Reflection.TypeAttributes.Abstract;
+            else if (type.TypeKind == TypeKind.Delegate)
+                typeFlags |= (int)System.Reflection.TypeAttributes.Sealed;
 
             Image.TypeDefs[typeDefIndex] = new TypeDefRow(
                 flags: typeFlags,
@@ -2221,7 +2223,7 @@ namespace Cnidaria.Cs
             {
                 var def = type.OriginalDefinition;
                 string asm =
-                    _externalAssemblyResolver?.Invoke(def) 
+                    _externalAssemblyResolver?.Invoke(def)
                     ?? Image.DefaultExternalAssemblyName; // fallback to default
 
                 scopeTok = EnsureAssemblyRef(asm);
@@ -2347,6 +2349,9 @@ namespace Cnidaria.Cs
         }
         private int GetOrAddLocalFunctionMethodDef(MethodSymbol method)
         {
+            if (_methodDefTokens.TryGetValue(method, out var existing))
+                return existing;
+
             _ = GetOrAddLocalFunctionHostTypeDef();
 
             int methodRid = Image.Methods.Count + 1;
@@ -2508,7 +2513,7 @@ namespace Cnidaria.Cs
                         w.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(tok));
                         return;
                     }
-                    
+
 
                 default:
                     throw new NotSupportedException($"TypeSig not supported: {type.GetType().Name}");

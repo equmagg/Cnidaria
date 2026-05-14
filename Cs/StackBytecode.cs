@@ -132,6 +132,16 @@ namespace Cnidaria.Cs
         PtrDiff, // operand0: elementSize, stack: ptrA, ptrB -> nint
         Isinst, // operand0: type token, stack: obj -> obj
 
+        // Delegates / closures
+        NewClosureCell, // operand0: value type token, stack: initialValue -> cell
+        LdClosureCell,  // operand0: value type token, stack: cell -> value
+        StClosureCell,  // operand0: value type token, stack: cell,value ->
+        NewClosure,     // operand0: cell count, stack: cells... -> closure
+        LdClosureSlot,  // operand0: slot index, stack: closure -> cell
+        NewDelegate,    // operand0: delegate type token, operand1: target method token, stack: -> delegate
+        NewDelegateClosed, // operand0: delegate type token, operand1: target method token, stack: target -> delegate
+        DelegateInvoke, // operand0: delegate Invoke method token, operand1: argCount, stack: delegate,args -> return?
+
     }
     internal enum NumericConvKind : byte
     {
@@ -480,6 +490,47 @@ namespace Cnidaria.Cs
             private readonly Dictionary<LabelSymbol, BcLabel> _labelsBySymbol;
             private readonly List<ExceptionHandlerSpec> _ehSpecs = new();
             private int _spillId;
+
+            private sealed class LambdaCaptureDetector : BoundTreeRewriter
+            {
+                private readonly HashSet<Symbol> _owned = new(ReferenceEqualityComparer<Symbol>.Instance);
+                public bool HasCapture { get; private set; }
+
+                private LambdaCaptureDetector(MethodSymbol lambdaMethod)
+                {
+                    for (int i = 0; i < lambdaMethod.Parameters.Length; i++)
+                        _owned.Add(lambdaMethod.Parameters[i]);
+                }
+
+                public static bool ContainsCapture(BoundLambdaExpression lambda)
+                {
+                    var detector = new LambdaCaptureDetector(lambda.Method);
+                    detector.RewriteStatement(lambda.Body);
+                    return detector.HasCapture;
+                }
+
+                protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
+                {
+                    _owned.Add(node.Local);
+                    return base.RewriteLocalDeclarationStatement(node);
+                }
+
+                protected override BoundExpression RewriteExpression(BoundExpression node)
+                {
+                    switch (node)
+                    {
+                        case BoundLocalExpression local when !_owned.Contains(local.Local):
+                        case BoundParameterExpression parameter when !_owned.Contains(parameter.Parameter):
+                        case BoundThisExpression:
+                        case BoundBaseExpression:
+                            HasCapture = true;
+                            return node;
+                        default:
+                            return base.RewriteExpression(node);
+                    }
+                }
+            }
+
             public Emitter(ITokenProvider tokens, EmitterModule module, MethodSymbol method)
             {
                 _tokens = tokens;
@@ -989,6 +1040,26 @@ namespace Cnidaria.Cs
                             return;
                         }
                         EmitCall(call, mode);
+                        return;
+
+                    case BoundLambdaExpression lambda:
+                        EmitLambda(lambda, mode);
+                        return;
+
+                    case BoundClosureCellCreationExpression closureCell:
+                        EmitClosureCellCreation(closureCell, mode);
+                        return;
+
+                    case BoundClosureCreationExpression closure:
+                        EmitClosureCreation(closure, mode);
+                        return;
+
+                    case BoundClosureSlotExpression closureSlot:
+                        EmitClosureSlot(closureSlot, mode);
+                        return;
+
+                    case BoundClosureAccessExpression closureAccess:
+                        EmitClosureAccess(closureAccess, mode);
                         return;
 
                     case BoundObjectCreationExpression obj:
@@ -1607,6 +1678,25 @@ namespace Cnidaria.Cs
                     _il.Emit(BytecodeOp.Stfld, operand0: tok, pop: 2, push: 0);
                     return;
                 }
+                if (assignment.Left is BoundClosureAccessExpression closureAccess)
+                {
+                    EmitExpression(closureAccess.Cell, EmitMode.Value);
+                    EmitExpression(assignment.Right, EmitMode.Value);
+
+                    if (mode == EmitMode.Value)
+                    {
+                        int spill = AllocateSpillLocal(assignment.Type);
+                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                        _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0);
+                        _il.Emit(BytecodeOp.StClosureCell, operand0: _tokens.GetTypeToken(closureAccess.Type), pop: 2, push: 0);
+                        _il.Emit(BytecodeOp.Ldloc, operand0: spill, pop: 0, push: 1);
+                    }
+                    else
+                    {
+                        _il.Emit(BytecodeOp.StClosureCell, operand0: _tokens.GetTypeToken(closureAccess.Type), pop: 2, push: 0);
+                    }
+                    return;
+                }
                 if (assignment.Left is BoundLocalExpression leftLocal)
                 {
                     int idx = GetOrCreateLocal(leftLocal.Local);
@@ -1741,10 +1831,110 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            private void EmitLambda(BoundLambdaExpression lambda, EmitMode mode)
+            {
+                if (mode == EmitMode.Discard)
+                    return;
+
+                if (lambda.Method is null)
+                    throw new InvalidOperationException("Lambda has no synthesized target method.");
+
+                if (!lambda.Method.IsStatic)
+                    throw new NotSupportedException("Only lowered static lambda target methods are supported by the stack bytecode emitter.");
+
+                if (LambdaCaptureDetector.ContainsCapture(lambda))
+                    throw new NotSupportedException("Lambda closure lowering left raw captured locals in the lambda body.");
+
+                var lambdaBody = new BoundMethodBody(lambda.Syntax, lambda.Method, lambda.Body);
+                _module.EmitNonRoot(lambdaBody);
+
+                int delegateTypeToken = _tokens.GetTypeToken(lambda.Type);
+                int targetMethodToken = _tokens.GetMethodToken(lambda.Method);
+
+                if (lambda.TargetOpt is not null)
+                {
+                    EmitExpression(lambda.TargetOpt, EmitMode.Value);
+                    _il.Emit(BytecodeOp.NewDelegateClosed, operand0: delegateTypeToken, operand1: targetMethodToken, pop: 1, push: 1);
+                    return;
+                }
+
+                _il.Emit(BytecodeOp.NewDelegate, operand0: delegateTypeToken, operand1: targetMethodToken, pop: 0, push: 1);
+            }
+
+            private void EmitClosureCellCreation(BoundClosureCellCreationExpression cell, EmitMode mode)
+            {
+                EmitExpression(cell.InitialValue, EmitMode.Value);
+                _il.Emit(BytecodeOp.NewClosureCell, operand0: _tokens.GetTypeToken(cell.ValueType), pop: 1, push: 1);
+
+                if (mode == EmitMode.Discard)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
+
+            private void EmitClosureCreation(BoundClosureCreationExpression closure, EmitMode mode)
+            {
+                for (int i = 0; i < closure.Cells.Length; i++)
+                    EmitExpression(closure.Cells[i], EmitMode.Value);
+
+                _il.Emit(BytecodeOp.NewClosure, operand0: closure.Cells.Length, pop: checked((short)closure.Cells.Length), push: 1);
+
+                if (mode == EmitMode.Discard)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
+
+            private void EmitClosureSlot(BoundClosureSlotExpression slot, EmitMode mode)
+            {
+                if (mode == EmitMode.Discard)
+                    return;
+
+                EmitExpression(slot.Closure, EmitMode.Value);
+                _il.Emit(BytecodeOp.LdClosureSlot, operand0: slot.SlotIndex, pop: 1, push: 1);
+            }
+
+            private void EmitClosureAccess(BoundClosureAccessExpression access, EmitMode mode)
+            {
+                if (mode == EmitMode.Discard)
+                    return;
+
+                EmitExpression(access.Cell, EmitMode.Value);
+                _il.Emit(BytecodeOp.LdClosureCell, operand0: _tokens.GetTypeToken(access.Type), pop: 1, push: 1);
+            }
+
+            private static bool IsDelegateInvokeCall(BoundCallExpression call)
+                => !call.Method.IsStatic
+                   && StringComparer.Ordinal.Equals(call.Method.Name, "Invoke")
+                   && call.Method.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Delegate };
+
+            private void EmitDelegateInvoke(BoundCallExpression call, EmitMode mode)
+            {
+                if (call.ReceiverOpt is null)
+                    throw new InvalidOperationException("Delegate invocation must have a receiver.");
+
+                EmitExpression(call.ReceiverOpt, EmitMode.Value);
+
+                var args = call.Arguments;
+                for (int i = 0; i < args.Length; i++)
+                    EmitExpression(args[i], EmitMode.Value);
+
+                int invokeToken = _tokens.GetMethodToken(call.Method);
+                short pop = checked((short)(args.Length + 1));
+                short push = (short)(IsVoid(call.Method.ReturnType) ? 0 : 1);
+
+                _il.Emit(BytecodeOp.DelegateInvoke, operand0: invokeToken, operand1: args.Length, pop: pop, push: push);
+
+                if (mode == EmitMode.Discard && push == 1)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
+
             private void EmitCall(BoundCallExpression call, EmitMode mode)
             {
                 if (TryEmitIntrinsic(call, mode))
                     return;
+
+                if (IsDelegateInvokeCall(call))
+                {
+                    EmitDelegateInvoke(call, mode);
+                    return;
+                }
 
                 int argCount = 0;
                 int hasThis = call.Method.IsStatic ? 0 : 1;

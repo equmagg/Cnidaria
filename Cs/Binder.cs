@@ -275,6 +275,10 @@ namespace Cnidaria.Cs
                             BindOwnerConstraintClauses(tree, id.ConstraintClauses, nt.TypeParameters, nt, diagnostics);
                             break;
 
+                        case DelegateDeclarationSyntax dd when kv.Value is NamedTypeSymbol nt:
+                            BindOwnerConstraintClauses(tree, dd.ConstraintClauses, nt.TypeParameters, nt, diagnostics);
+                            break;
+
                         case MethodDeclarationSyntax md when kv.Value is MethodSymbol ms:
                             BindOwnerConstraintClauses(tree, md.ConstraintClauses, ms.TypeParameters, ms, diagnostics);
                             break;
@@ -447,7 +451,11 @@ namespace Cnidaria.Cs
                     compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
                 foreach (var kv in declMap)
                 {
-                    if (kv.Key is MethodDeclarationSyntax md && kv.Value is SourceMethodSymbol sm)
+                    if (kv.Key is DelegateDeclarationSyntax dd && kv.Value is SourceNamedTypeSymbol delegateType)
+                    {
+                        BindDelegateSignature(compilation, tree, dd, delegateType, stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, pendingOptionalParameters);
+                    }
+                    else if (kv.Key is MethodDeclarationSyntax md && kv.Value is SourceMethodSymbol sm)
                     {
                         var ctx = new BindingContext(compilation, stubModel, sm, NullRecorder.Instance);
 
@@ -640,6 +648,64 @@ namespace Cnidaria.Cs
             }
             BindPendingConstFields(compilation, pendingConstFields, diagnostics);
             BindPendingOptionalParameters(compilation, pendingOptionalParameters, diagnostics);
+        }
+
+
+        private static void BindDelegateSignature(
+            Compilation compilation,
+            SyntaxTree tree,
+            DelegateDeclarationSyntax syntax,
+            SourceNamedTypeSymbol delegateType,
+            SemanticModel stubModel,
+            TypeBinder safeTypeBinder,
+            TypeBinder unsafeTypeBinder,
+            DiagnosticBag diagnostics,
+            List<PendingOptionalParameter> pendingOptionalParameters)
+        {
+            var typeBinder = HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword)
+                ? unsafeTypeBinder
+                : safeTypeBinder;
+
+            var invoke = FindSourceMethod(delegateType, "Invoke");
+            if (invoke is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DELEGATE001",
+                    DiagnosticSeverity.Error,
+                    $"Delegate type '{delegateType.Name}' is missing synthesized Invoke method.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            var ctx = new BindingContext(compilation, stubModel, invoke, NullRecorder.Instance);
+            var returnType = typeBinder.BindType(syntax.ReturnType, ctx, diagnostics);
+            invoke.SetReturnType(returnType);
+
+            var pars = syntax.ParameterList.Parameters;
+            for (int i = 0; i < pars.Count && i < invoke.Parameters.Length; i++)
+            {
+                var pt = BindParameterType(typeBinder, pars[i], ctx, diagnostics, out var isReadOnlyRef);
+                invoke.Parameters[i].Type = pt;
+                invoke.Parameters[i].IsReadOnlyRef = isReadOnlyRef;
+
+                if (pars[i].Default is not null)
+                {
+                    pendingOptionalParameters.Add(
+                        new PendingOptionalParameter(tree, pars[i], invoke.Parameters[i], invoke, typeBinder, stubModel));
+                }
+            }
+        }
+
+        private static SourceMethodSymbol? FindSourceMethod(NamedTypeSymbol type, string name)
+        {
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is SourceMethodSymbol m && StringComparer.Ordinal.Equals(m.Name, name))
+                    return m;
+            }
+
+            return null;
         }
 
 
@@ -1125,6 +1191,7 @@ namespace Cnidaria.Cs
                 _ => 0
             };
         }
+
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
             for (int i = 0; i < mods.Count; i++)
@@ -1353,6 +1420,12 @@ namespace Cnidaria.Cs
                         case EnumDeclarationSyntax eds when symbol is Symbol:
                             BindAttributeListsOnOwner(
                                 compilation, tree, eds.AttributeLists, ownerSyntax: eds, ownerSymbol: symbol,
+                                stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
+                            break;
+
+                        case DelegateDeclarationSyntax dds when symbol is Symbol:
+                            BindAttributeListsOnOwner(
+                                compilation, tree, dds.AttributeLists, ownerSyntax: dds, ownerSymbol: symbol,
                                 stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
                             break;
 
@@ -3726,6 +3799,7 @@ namespace Cnidaria.Cs
                 _declByTree[tree] = new Dictionary<SyntaxNode, Symbol>();
                 DeclareCompilationUnit(tree, tree.Root, _global);
             }
+            CompleteDelegateBaseTypes();
             SynthesizeDefaultConstructors();
             SynthesizeTypeInitializers();
             var immutable = _declByTree.ToImmutableDictionary(
@@ -3927,6 +4001,7 @@ namespace Cnidaria.Cs
                 TypeKind.Class => _types.GetSpecialType(SpecialType.System_Object),
                 TypeKind.Struct => _types.GetSpecialType(SpecialType.System_ValueType),
                 TypeKind.Enum => _types.GetSpecialType(SpecialType.System_Enum),
+                TypeKind.Delegate => GetDelegateBaseType(),
                 _ => null
             };
         }
@@ -3952,6 +4027,10 @@ namespace Cnidaria.Cs
 
                 case EnumDeclarationSyntax e:
                     DeclareEnumDeclaration(tree, e, container);
+                    return;
+
+                case DelegateDeclarationSyntax d:
+                    DeclareDelegateDeclaration(tree, d, container);
                     return;
 
                 case GlobalStatementSyntax gs:
@@ -4185,6 +4264,9 @@ namespace Cnidaria.Cs
                     case EnumDeclarationSyntax e:
                         DeclareEnumDeclaration(tree, e, type);
                         break;
+                    case DelegateDeclarationSyntax d:
+                        DeclareDelegateDeclaration(tree, d, type);
+                        break;
                     case MethodDeclarationSyntax md:
                         DeclareMethodDeclaration(tree, md, type);
                         break;
@@ -4213,6 +4295,203 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        private void CompleteDelegateBaseTypes()
+        {
+            var delegateBase = GetDelegateBaseType();
+            foreach (var kv in _typeCache)
+            {
+                if (kv.Value is not SourceNamedTypeSymbol type || type.TypeKind != TypeKind.Delegate)
+                    continue;
+
+                if (delegateBase is null || ReferenceEquals(type.BaseType, delegateBase))
+                    continue;
+
+                if (ReferenceEquals(type, delegateBase))
+                    continue;
+
+                type.SetDeclaredBaseType(delegateBase);
+            }
+        }
+
+        private NamedTypeSymbol GetDelegateBaseType()
+        {
+            if (TryFindSystemType(_global, "MulticastDelegate", arity: 0, out var multicastDelegate))
+                return multicastDelegate;
+
+            if (TryFindSystemType(_types.CoreGlobalNamespace, "MulticastDelegate", arity: 0, out multicastDelegate))
+                return multicastDelegate;
+
+            if (TryFindSystemType(_global, "Delegate", arity: 0, out var delegateType))
+                return delegateType;
+
+            if (TryFindSystemType(_types.CoreGlobalNamespace, "Delegate", arity: 0, out delegateType))
+                return delegateType;
+
+            return _types.GetSpecialType(SpecialType.System_Object);
+        }
+
+        internal static bool TryFindSystemType(NamespaceSymbol global, string name, int arity, out NamedTypeSymbol type)
+        {
+            type = null!;
+            NamespaceSymbol? systemNs = null;
+            var namespaces = global.GetNamespaceMembers();
+            for (int i = 0; i < namespaces.Length; i++)
+            {
+                if (StringComparer.Ordinal.Equals(namespaces[i].Name, "System"))
+                {
+                    systemNs = namespaces[i];
+                    break;
+                }
+            }
+
+            if (systemNs is null)
+                return false;
+
+            var candidates = systemNs.GetTypeMembers(name, arity);
+            if (candidates.IsDefaultOrEmpty)
+                return false;
+
+            type = candidates[0];
+            return true;
+        }
+
+        private void DeclareDelegateDeclaration(SyntaxTree tree, DelegateDeclarationSyntax syntax, Symbol container)
+        {
+            var name = syntax.Identifier.ValueText ?? "";
+            var arity = syntax.TypeParameterList?.Parameters.Count ?? 0;
+            var key = (container, name, arity);
+            var typeDefaultAcc = container is NamedTypeSymbol
+                ? Accessibility.Private
+                : Accessibility.Internal;
+            var declaredAcc = DecodeDeclaredAccessibility(
+                syntax.Modifiers,
+                typeDefaultAcc,
+                allowProtected: container is NamedTypeSymbol,
+                allowInternal: true,
+                diagLocation: new Location(tree, syntax.Span));
+
+            NamedTypeSymbol type;
+            if (!_typeCache.TryGetValue(key, out var existing))
+            {
+                var sourceType = new SourceNamedTypeSymbol(
+                    name,
+                    container,
+                    TypeKind.Delegate,
+                    arity,
+                    declaredAcc,
+                    isFromMetadata: false);
+
+                sourceType.SetDefaultBaseType(GetDefaultBaseType(TypeKind.Delegate));
+                sourceType.SetTypeParameters(DeclareTypeParameters(tree, sourceType, syntax.TypeParameterList));
+
+                type = sourceType;
+                _typeCache.Add(key, type);
+
+                if (container is SourceNamespaceSymbol ns)
+                    ns.AddType(type);
+                else if (container is NamedTypeSymbol nt)
+                    AddNestedTypeToType(nt, type);
+                else
+                    throw new InvalidOperationException($"Invalid container for delegate: {container.Kind}");
+            }
+            else
+            {
+                type = existing;
+                if (type.TypeKind != TypeKind.Delegate)
+                {
+                    _diagnostics.Add(new Diagnostic(
+                        id: "CN0003",
+                        severity: DiagnosticSeverity.Error,
+                        message: $"Type '{name}' conflicts with delegate declaration.",
+                        location: new Location(tree, syntax.Span)));
+                }
+            }
+
+            if (type is SourceNamedTypeSymbol srcType)
+            {
+                srcType.AddDeclaration(tree, syntax);
+
+                if (!HasDelegateInvokeMethod(srcType))
+                    AddSynthesizedDelegateMembers(tree, syntax, srcType);
+            }
+
+            RecordDeclared(tree, syntax, type);
+        }
+
+        private static bool HasDelegateInvokeMethod(NamedTypeSymbol type)
+        {
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is MethodSymbol m && StringComparer.Ordinal.Equals(m.Name, "Invoke"))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void AddSynthesizedDelegateMembers(SyntaxTree tree, DelegateDeclarationSyntax syntax, SourceNamedTypeSymbol delegateType)
+        {
+            var voidType = _types.GetSpecialType(SpecialType.System_Void);
+            var objectType = _types.GetSpecialType(SpecialType.System_Object);
+            var intPtrType = _types.GetSpecialType(SpecialType.System_IntPtr);
+            var placeholderReturn = new ErrorTypeSymbol("unbound-delegate-return", containing: null, ImmutableArray<Location>.Empty);
+
+            var ctor = new SourceMethodSymbol(
+                name: ".ctor",
+                containing: delegateType,
+                returnType: voidType,
+                typeParameters: default,
+                isStatic: false,
+                isConstructor: true,
+                isAsync: false,
+                locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
+                declaredAccessibility: Accessibility.Public);
+            ctor.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+            ctor.SetParameters(ImmutableArray.Create(
+                new ParameterSymbol("target", ctor, objectType, ImmutableArray<Location>.Empty),
+                new ParameterSymbol("method", ctor, intPtrType, ImmutableArray<Location>.Empty)));
+            ctor.AddDeclaration(new SyntaxReference(tree, syntax));
+            AddMemberToType(delegateType, ctor);
+
+            var invoke = new SourceMethodSymbol(
+                name: "Invoke",
+                containing: delegateType,
+                returnType: placeholderReturn,
+                typeParameters: default,
+                isStatic: false,
+                isConstructor: false,
+                isAsync: false,
+                locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
+                declaredAccessibility: Accessibility.Public);
+            invoke.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+            invoke.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: false);
+
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
+            for (int i = 0; i < syntax.ParameterList.Parameters.Count; i++)
+            {
+                var p = syntax.ParameterList.Parameters[i];
+                var pName = p.Identifier.ValueText ?? "";
+                var pType = new ErrorTypeSymbol("unbound-delegate-param", containing: null, ImmutableArray<Location>.Empty);
+                var parameter = new ParameterSymbol(
+                    name: pName,
+                    containing: invoke,
+                    type: pType,
+                    locations: ImmutableArray.Create(new Location(tree, p.Span)),
+                    isReadOnlyRef: IsReadOnlyByRefParameter(p),
+                    refKind: GetParameterRefKind(p),
+                    isScoped: IsScopedParameter(p),
+                    isParams: IsParamsParameter(p));
+
+                parameters.Add(parameter);
+                RecordDeclared(tree, p, parameter);
+            }
+
+            invoke.SetParameters(parameters.ToImmutable());
+            invoke.AddDeclaration(new SyntaxReference(tree, syntax));
+            AddMemberToType(delegateType, invoke);
+        }
+
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
         {
             for (int i = 0; i < mods.Count; i++)
@@ -4913,7 +5192,7 @@ namespace Cnidaria.Cs
                 location: new Location(tree, syntax.Span),
                 declarationRef: new SyntaxReference(tree, syntax));
 
-            // Property parameters (for property signature / metadata).
+            // Property parameters
             var propParams = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
             for (int i = 0; i < syntax.ParameterList.Parameters.Count; i++)
             {
@@ -4936,7 +5215,7 @@ namespace Cnidaria.Cs
 
             prop.SetParameters(propParams.ToImmutable());
 
-            // Getter parameters mirror indexer parameters.
+            // Getter parameters mirror indexer parameters
             if (getMethod is not null)
             {
                 var getParams = ImmutableArray.CreateBuilder<ParameterSymbol>(propParams.Count);
@@ -4953,7 +5232,7 @@ namespace Cnidaria.Cs
                 getMethod.SetParameters(getParams.ToImmutable());
             }
 
-            // Setter parameters: indexer parameters + implicit value.
+            // Setter parameters indexer parameters + implicit value
             if (setMethod is not null)
             {
                 var setParams = ImmutableArray.CreateBuilder<ParameterSymbol>(propParams.Count + 1);
@@ -5079,7 +5358,7 @@ namespace Cnidaria.Cs
                     locations: ImmutableArray.Create(loc),
                     declaredAccessibility: declaredAcc);
 
-                // Implicit value parameter.
+                // Implicit value parameter
                 var valueParam = new ParameterSymbol(
                     name: "value",
                     containing: setMethod,
@@ -6501,6 +6780,40 @@ namespace Cnidaria.Cs
                 ConstantValueOpt = Optional<object>.None;
             }
         }
+        private sealed class LambdaMethodSymbol : MethodSymbol
+        {
+            public override string Name { get; }
+            public override Symbol? ContainingSymbol { get; }
+            public override ImmutableArray<Location> Locations { get; }
+            public override TypeSymbol ReturnType { get; }
+            private ImmutableArray<ParameterSymbol> _parameters;
+            public override ImmutableArray<ParameterSymbol> Parameters => _parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : _parameters;
+            public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+            public override bool IsStatic { get; }
+            public override bool IsConstructor => false;
+            public override bool IsAsync { get; }
+
+            public LambdaMethodSymbol(
+                string name,
+                Symbol containing,
+                TypeSymbol returnType,
+                ImmutableArray<ParameterSymbol> parameters,
+                ImmutableArray<Location> locations,
+                bool isStatic,
+                bool isAsync)
+            {
+                Name = name;
+                ContainingSymbol = containing;
+                ReturnType = returnType;
+                _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
+                Locations = locations.IsDefault ? ImmutableArray<Location>.Empty : locations;
+                IsStatic = isStatic;
+                IsAsync = isAsync;
+            }
+
+            public void SetParameters(ImmutableArray<ParameterSymbol> parameters)
+                => _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
+        }
         private sealed class BoundOutDiscardExpression : BoundExpression
         {
             public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
@@ -7402,6 +7715,9 @@ namespace Cnidaria.Cs
                 case IdentifierNameSyntax id:
                     result = BindIdentifier(id, context, diagnostics);
                     break;
+                case GenericNameSyntax g:
+                    result = BindGenericMethodGroup(g, context, diagnostics);
+                    break;
                 case MemberAccessExpressionSyntax ma:
                     result = BindMemberAccess(ma, BindValueKind.RValue, context, diagnostics);
                     break;
@@ -7486,6 +7802,11 @@ namespace Cnidaria.Cs
                 case ThrowExpressionSyntax te:
                     result = BindThrowExpression(te, context, diagnostics);
                     break;
+                case SimpleLambdaExpressionSyntax:
+                case ParenthesizedLambdaExpressionSyntax:
+                case AnonymousMethodExpressionSyntax:
+                    result = new BoundUnboundLambdaExpression(node);
+                    break;
                 case IsPatternExpressionSyntax ip:
                     result = BindIsPatternExpression(ip, context, diagnostics);
                     break;
@@ -7520,6 +7841,589 @@ namespace Cnidaria.Cs
 
             return Record(node, result, context);
         }
+
+        private static bool TryGetAnonymousFunctionParts(
+            ExpressionSyntax syntax,
+            out ImmutableArray<ParameterSyntax> parameters,
+            out bool hasExplicitParameterList,
+            out SyntaxNode body,
+            out bool isStatic,
+            out bool isAsync)
+        {
+            switch (syntax)
+            {
+                case SimpleLambdaExpressionSyntax simple:
+                    parameters = ImmutableArray.Create(simple.Parameter);
+                    hasExplicitParameterList = true;
+                    body = simple.Body;
+                    isStatic = simple.StaticKeyword.Span.Length != 0;
+                    isAsync = simple.AsyncKeyword.Span.Length != 0;
+                    return true;
+
+                case ParenthesizedLambdaExpressionSyntax parenthesized:
+                    parameters = parenthesized.ParameterList.Parameters.ToImmutableArray();
+                    hasExplicitParameterList = true;
+                    body = parenthesized.Body;
+                    isStatic = parenthesized.StaticKeyword.Span.Length != 0;
+                    isAsync = parenthesized.AsyncKeyword.Span.Length != 0;
+                    return true;
+
+                case AnonymousMethodExpressionSyntax anonymous:
+                    parameters = anonymous.ParameterList?.Parameters.ToImmutableArray() ?? ImmutableArray<ParameterSyntax>.Empty;
+                    hasExplicitParameterList = anonymous.ParameterList is not null;
+                    body = anonymous.Block;
+                    isStatic = false;
+                    isAsync = anonymous.AsyncKeyword.Span.Length != 0;
+                    return true;
+
+                default:
+                    parameters = ImmutableArray<ParameterSyntax>.Empty;
+                    hasExplicitParameterList = false;
+                    body = syntax;
+                    isStatic = false;
+                    isAsync = false;
+                    return false;
+            }
+        }
+
+        private static bool TryGetDelegateInvokeMethod(TypeSymbol targetType, out NamedTypeSymbol delegateType, out MethodSymbol invoke)
+        {
+            if (targetType is NamedTypeSymbol named && named.TypeKind == TypeKind.Delegate)
+            {
+                var methods = LookupMethods(named, "Invoke");
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    var m = methods[i];
+                    if (!m.IsStatic && StringComparer.Ordinal.Equals(m.Name, "Invoke"))
+                    {
+                        delegateType = named;
+                        invoke = m;
+                        return true;
+                    }
+                }
+            }
+
+            delegateType = null!;
+            invoke = null!;
+            return false;
+        }
+
+        private bool CanConvertLambdaToDelegate(
+            BoundUnboundLambdaExpression lambda,
+            TypeSymbol targetType,
+            BindingContext context)
+        {
+            if (!TryGetDelegateInvokeMethod(targetType, out _, out var invoke))
+                return false;
+
+            if (!TryGetAnonymousFunctionParts(
+                    (ExpressionSyntax)lambda.Syntax,
+                    out var parameterSyntaxes,
+                    out var hasExplicitParameterList,
+                    out _,
+                    out _,
+                    out _))
+            {
+                return false;
+            }
+
+            if (hasExplicitParameterList && parameterSyntaxes.Length != invoke.Parameters.Length)
+                return false;
+
+            if (!hasExplicitParameterList)
+                return true;
+
+            for (int i = 0; i < parameterSyntaxes.Length; i++)
+            {
+                var sourceParameter = parameterSyntaxes[i];
+                var targetParameter = invoke.Parameters[i];
+
+                if (DeclarationBuilder.GetParameterRefKind(sourceParameter) != targetParameter.RefKind)
+                    return false;
+
+                if (sourceParameter.Type is not null && !IsVar(sourceParameter.Type))
+                {
+                    var probeDiagnostics = new DiagnosticBag();
+                    var sourceType = BindType(sourceParameter.Type, context, probeDiagnostics);
+                    if (!AreSameType(sourceType, targetParameter.Type))
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        private BoundExpression BindLambdaConversion(
+            BoundUnboundLambdaExpression lambda,
+            TypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var syntax = (ExpressionSyntax)lambda.Syntax;
+
+            if (!TryGetDelegateInvokeMethod(targetType, out var delegateType, out var invoke))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LAMBDA001",
+                    DiagnosticSeverity.Error,
+                    $"Cannot convert lambda expression to non-delegate type '{targetType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                var bad = new BoundBadExpression(syntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            if (!TryGetAnonymousFunctionParts(
+                    syntax,
+                    out var parameterSyntaxes,
+                    out var hasExplicitParameterList,
+                    out var bodySyntax,
+                    out var isStatic,
+                    out var isAsync))
+            {
+                var bad = new BoundBadExpression(syntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            if (isAsync)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LAMBDA002",
+                    DiagnosticSeverity.Error,
+                    "Async lambdas are not implemented.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+            }
+
+            if (hasExplicitParameterList && parameterSyntaxes.Length != invoke.Parameters.Length)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LAMBDA003",
+                    DiagnosticSeverity.Error,
+                    $"Delegate '{delegateType.Name}' expects {invoke.Parameters.Length} parameter(s), but the lambda has {parameterSyntaxes.Length}.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+
+                var bad = new BoundBadExpression(syntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            var lambdaMethod = new LambdaMethodSymbol(
+                name: "<lambda>",
+                containing: context.ContainingSymbol,
+                returnType: invoke.ReturnType,
+                parameters: ImmutableArray<ParameterSymbol>.Empty,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
+                isStatic: true,
+                isAsync: isAsync);
+
+            var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length);
+            var seenNames = new HashSet<string>(StringComparer.Ordinal);
+
+            for (int i = 0; i < invoke.Parameters.Length; i++)
+            {
+                ParameterSyntax? sourceParameter = hasExplicitParameterList ? parameterSyntaxes[i] : null;
+                var targetParameter = invoke.Parameters[i];
+                string parameterName = sourceParameter?.Identifier.ValueText ?? targetParameter.Name;
+                if (string.IsNullOrEmpty(parameterName))
+                    parameterName = "arg" + i.ToString();
+
+                if (sourceParameter is not null)
+                {
+                    if (!seenNames.Add(parameterName))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_LAMBDA004",
+                            DiagnosticSeverity.Error,
+                            $"Duplicate lambda parameter name '{parameterName}'.",
+                            new Location(context.SemanticModel.SyntaxTree, sourceParameter.Identifier.Span)));
+                    }
+
+                    var sourceRefKind = DeclarationBuilder.GetParameterRefKind(sourceParameter);
+                    if (sourceRefKind != targetParameter.RefKind)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_LAMBDA005",
+                            DiagnosticSeverity.Error,
+                            $"Lambda parameter '{parameterName}' ref kind does not match delegate parameter ref kind.",
+                            new Location(context.SemanticModel.SyntaxTree, sourceParameter.Span)));
+                    }
+
+                    if (sourceParameter.Type is not null && !IsVar(sourceParameter.Type))
+                    {
+                        var sourceType = BindType(sourceParameter.Type, context, diagnostics);
+                        if (!AreSameType(sourceType, targetParameter.Type))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_LAMBDA006",
+                                DiagnosticSeverity.Error,
+                                $"Lambda parameter '{parameterName}' type '{sourceType.Name}' does not match delegate parameter type '{targetParameter.Type.Name}'.",
+                                new Location(context.SemanticModel.SyntaxTree, sourceParameter.Type.Span)));
+                        }
+                    }
+                }
+
+                parameterBuilder.Add(new ParameterSymbol(
+                    parameterName,
+                    containing: lambdaMethod,
+                    type: targetParameter.Type,
+                    locations: sourceParameter is null
+                        ? ImmutableArray<Location>.Empty
+                        : ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, sourceParameter.Identifier.Span)),
+                    isReadOnlyRef: targetParameter.IsReadOnlyRef,
+                    refKind: targetParameter.RefKind,
+                    isScoped: targetParameter.IsScoped,
+                    isParams: targetParameter.IsParams,
+                    hasExplicitDefault: targetParameter.HasExplicitDefault,
+                    defaultValueOpt: targetParameter.DefaultValueOpt));
+            }
+
+            lambdaMethod.SetParameters(parameterBuilder.ToImmutable());
+
+            for (int i = 0; i < parameterSyntaxes.Length && i < lambdaMethod.Parameters.Length; i++)
+                context.Recorder.RecordDeclared(parameterSyntaxes[i], lambdaMethod.Parameters[i]);
+
+            var bodyBinder = new LocalScopeBinder(
+                parent: this,
+                flags: Flags | BinderFlags.InLambda,
+                containing: lambdaMethod,
+                inheritFlowFromParent: false);
+
+            var bodyContext = new BindingContext(context.Compilation, context.SemanticModel, lambdaMethod, context.Recorder);
+            BoundStatement body;
+
+            if (bodySyntax is BlockSyntax block)
+            {
+                body = bodyBinder.BindStatement(block, bodyContext, diagnostics);
+            }
+            else if (bodySyntax is ExpressionSyntax expressionBody)
+            {
+                var expression = bodyBinder.BindExpression(expressionBody, bodyContext, diagnostics);
+                if (invoke.ReturnType.SpecialType == SpecialType.System_Void)
+                {
+                    body = new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(expressionBody, expression)));
+                }
+                else
+                {
+                    expression = bodyBinder.ApplyConversion(
+                        exprSyntax: expressionBody,
+                        expr: expression,
+                        targetType: invoke.ReturnType,
+                        diagnosticNode: expressionBody,
+                        context: bodyContext,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+
+                    body = new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(new BoundReturnStatement(expressionBody, expression)));
+                }
+            }
+            else
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LAMBDA007",
+                    DiagnosticSeverity.Error,
+                    "Unsupported lambda body.",
+                    new Location(context.SemanticModel.SyntaxTree, bodySyntax.Span)));
+
+                body = new BoundBadStatement(bodySyntax as StatementSyntax ?? new EmptyStatementSyntax(default));
+            }
+
+            bodyBinder.ReportControlFlowDiagnostics(bodyContext, diagnostics);
+
+            return new BoundLambdaExpression(
+                syntax,
+                delegateType,
+                lambdaMethod,
+                invoke,
+                body,
+                isStatic,
+                isAsync);
+        }
+
+        private bool CanConvertMethodGroupToDelegate(
+            BoundMethodGroupExpression methodGroup,
+            TypeSymbol targetType,
+            BindingContext context)
+        {
+            return TryResolveMethodGroupConversion(
+                methodGroup,
+                targetType,
+                context,
+                diagnostics: new DiagnosticBag(),
+                diagnosticNode: methodGroup.Syntax,
+                reportDiagnostics: false,
+                out _,
+                out _,
+                out _);
+        }
+
+        private bool TryResolveMethodGroupConversion(
+            BoundMethodGroupExpression methodGroup,
+            TypeSymbol targetType,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            SyntaxNode diagnosticNode,
+            bool reportDiagnostics,
+            out NamedTypeSymbol? delegateType,
+            out MethodSymbol? invoke,
+            out MethodSymbol? chosen)
+        {
+            delegateType = null;
+            invoke = null;
+            chosen = null;
+
+            if (!TryGetDelegateInvokeMethod(targetType, out var resolvedDelegateType, out var resolvedInvoke))
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV001",
+                        DiagnosticSeverity.Error,
+                        $"Cannot convert method group to non-delegate type '{targetType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
+
+            delegateType = resolvedDelegateType;
+            invoke = resolvedInvoke;
+
+            var invokeForResolution = resolvedInvoke;
+            var arityCandidates = methodGroup.Methods
+                .Where(m => m.Parameters.Length == invokeForResolution.Parameters.Length)
+                .ToImmutableArray();
+
+            if (arityCandidates.IsDefaultOrEmpty)
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV002",
+                        DiagnosticSeverity.Error,
+                        $"No overload of '{methodGroup.Name}' is compatible with delegate '{delegateType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
+
+            var syntax = (ExpressionSyntax)methodGroup.Syntax;
+            var argsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(invoke.Parameters.Length);
+            for (int i = 0; i < invoke.Parameters.Length; i++)
+                argsBuilder.Add(new BoundTypeOnlyExpression(syntax, invoke.Parameters[i].Type));
+
+            var overloadDiagnostics = reportDiagnostics ? diagnostics : new DiagnosticBag();
+            var overloadContext = WithRecorder(context, NullBindingRecorder.Instance);
+
+            if (!TryResolveOverload(
+                candidates: arityCandidates,
+                args: argsBuilder.ToImmutable(),
+                getArgExprSyntax: _ => syntax,
+                getArgRefKindKeyword: i => MakeRefKindToken(invokeForResolution.Parameters[i], syntax.Span),
+                getArgName: null,
+                chosen: out var resolvedMethod,
+                convertedArgs: out _,
+                context: overloadContext,
+                diagnostics: overloadDiagnostics,
+                diagnosticNode: diagnosticNode))
+            {
+                return false;
+            }
+
+            if (resolvedMethod is null)
+                return false;
+
+            if (!IsMethodGroupReturnCompatible(resolvedMethod, invoke, syntax, context))
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV003",
+                        DiagnosticSeverity.Error,
+                        $"Return type of method '{resolvedMethod.Name}' is not compatible with delegate '{delegateType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
+
+            if (!resolvedMethod.IsStatic && methodGroup.ReceiverOpt is null)
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV004",
+                        DiagnosticSeverity.Error,
+                        "An object reference is required for the non-static method group.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
+
+            chosen = resolvedMethod;
+            return true;
+        }
+
+        private static SyntaxToken? MakeRefKindToken(ParameterSymbol parameter, TextSpan span)
+        {
+            var refKind = parameter.RefKind;
+            if (refKind == ParameterRefKind.None && parameter.Type is ByRefTypeSymbol)
+                refKind = parameter.IsReadOnlyRef ? ParameterRefKind.In : ParameterRefKind.Ref;
+
+            return refKind switch
+            {
+                ParameterRefKind.Ref => MakeToken(SyntaxKind.RefKeyword, span),
+                ParameterRefKind.Out => MakeToken(SyntaxKind.OutKeyword, span),
+                ParameterRefKind.In => MakeToken(SyntaxKind.InKeyword, span),
+                _ => null
+            };
+        }
+
+        private bool IsMethodGroupReturnCompatible(
+            MethodSymbol method,
+            MethodSymbol invoke,
+            ExpressionSyntax syntax,
+            BindingContext context)
+        {
+            if (invoke.ReturnType.SpecialType == SpecialType.System_Void)
+                return method.ReturnType.SpecialType == SpecialType.System_Void;
+
+            if (method.ReturnType.SpecialType == SpecialType.System_Void)
+                return false;
+
+            if (method.ReturnType is ByRefTypeSymbol || invoke.ReturnType is ByRefTypeSymbol)
+                return AreSameType(method.ReturnType, invoke.ReturnType);
+
+            var methodReturn = new BoundTypeOnlyExpression(syntax, method.ReturnType);
+            var conversion = ClassifyConversion(methodReturn, invoke.ReturnType, context);
+            return conversion.Kind == ConversionKind.Identity ||
+                   conversion.Kind == ConversionKind.ImplicitReference;
+        }
+
+        private BoundExpression BindMethodGroupConversion(
+            BoundMethodGroupExpression methodGroup,
+            TypeSymbol targetType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var syntax = (ExpressionSyntax)methodGroup.Syntax;
+
+            if (!TryResolveMethodGroupConversion(
+                    methodGroup,
+                    targetType,
+                    context,
+                    diagnostics,
+                    diagnosticNode,
+                    reportDiagnostics: true,
+                    out var delegateType,
+                    out var invoke,
+                    out var chosen))
+            {
+                var bad = new BoundBadExpression(syntax);
+                bad.SetType(targetType);
+                return bad;
+            }
+
+            var lambdaMethod = new LambdaMethodSymbol(
+                name: "<methodgroup>",
+                containing: context.ContainingSymbol,
+                returnType: invoke!.ReturnType,
+                parameters: ImmutableArray<ParameterSymbol>.Empty,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
+                isStatic: true,
+                isAsync: false);
+
+            var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length);
+            for (int i = 0; i < invoke.Parameters.Length; i++)
+            {
+                var delegateParameter = invoke.Parameters[i];
+                var parameterName = string.IsNullOrEmpty(delegateParameter.Name)
+                    ? "arg" + i.ToString()
+                    : delegateParameter.Name;
+
+                parameterBuilder.Add(new ParameterSymbol(
+                    parameterName,
+                    containing: lambdaMethod,
+                    type: delegateParameter.Type,
+                    locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
+                    isReadOnlyRef: delegateParameter.IsReadOnlyRef,
+                    refKind: delegateParameter.RefKind,
+                    isScoped: delegateParameter.IsScoped,
+                    isParams: false,
+                    hasExplicitDefault: false));
+            }
+
+            lambdaMethod.SetParameters(parameterBuilder.ToImmutable());
+
+            var callArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(lambdaMethod.Parameters.Length);
+            for (int i = 0; i < lambdaMethod.Parameters.Length; i++)
+            {
+                BoundExpression arg = new BoundParameterExpression(syntax, lambdaMethod.Parameters[i]);
+                var targetParameter = chosen!.Parameters[i];
+                var refKind = targetParameter.RefKind;
+                if (refKind == ParameterRefKind.None && targetParameter.Type is ByRefTypeSymbol)
+                    refKind = targetParameter.IsReadOnlyRef ? ParameterRefKind.In : ParameterRefKind.Ref;
+
+                if (refKind != ParameterRefKind.None)
+                {
+                    var byRefType = targetParameter.Type is ByRefTypeSymbol
+                        ? targetParameter.Type
+                        : context.Compilation.CreateByRefType(arg.Type);
+                    arg = new BoundRefExpression(syntax, byRefType, arg);
+                }
+
+                callArgsBuilder.Add(arg);
+            }
+
+            BoundExpression? receiver = chosen!.IsStatic ? null : methodGroup.ReceiverOpt;
+            var call = new BoundCallExpression(syntax, receiver, chosen, callArgsBuilder.ToImmutable());
+
+            BoundStatement body;
+            if (invoke.ReturnType.SpecialType == SpecialType.System_Void)
+            {
+                body = new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(syntax, call)));
+            }
+            else
+            {
+                BoundExpression returnValue = call;
+                if (!AreSameType(returnValue.Type, invoke.ReturnType))
+                {
+                    returnValue = ApplyConversion(
+                        exprSyntax: syntax,
+                        expr: returnValue,
+                        targetType: invoke.ReturnType,
+                        diagnosticNode: diagnosticNode,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+                }
+
+                body = new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(new BoundReturnStatement(syntax, returnValue)));
+            }
+
+            return new BoundLambdaExpression(
+                syntax,
+                delegateType!,
+                lambdaMethod,
+                invoke,
+                body,
+                isStatic: true,
+                isAsync: false);
+        }
+
         private BoundExpression BindDefaultExpression(
             DefaultExpressionSyntax node,
             BindingContext context,
@@ -8700,12 +9604,230 @@ namespace Cnidaria.Cs
             if (TryBindImportedStaticMember(id, name, BindValueKind.RValue, context, diagnostics, out var staticMemberExpr))
                 return staticMemberExpr;
 
+            if (TryBindUnqualifiedMethodGroup(id, name, context, diagnostics, out var methodGroup))
+                return methodGroup;
+
             diagnostics.Add(new Diagnostic("CN_BIND003", DiagnosticSeverity.Error,
                 $"Use of undeclared identifier '{name}'.",
                 new Location(context.SemanticModel.SyntaxTree, id.Span)));
 
             return new BoundBadExpression(id);
         }
+        private BoundExpression BindGenericMethodGroup(
+            GenericNameSyntax nameSyntax,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var name = nameSyntax.Identifier.ValueText ?? "";
+            if (TryBindUnqualifiedMethodGroup(nameSyntax, name, context, diagnostics, out var group))
+                return group;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_BIND_METHODGROUP001",
+                DiagnosticSeverity.Error,
+                $"No method group '{name}' found.",
+                new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+            return new BoundBadExpression(nameSyntax);
+        }
+
+        private bool TryBindUnqualifiedMethodGroup(
+            SimpleNameSyntax nameSyntax,
+            string name,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out BoundExpression result)
+        {
+            result = null!;
+
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            if (TryGetLocalFunctionFromEnclosingScopes(name, out var localFunc) && localFunc is not null)
+            {
+                var localMethods = ApplyExplicitTypeArgumentsToMethodGroup(
+                    nameSyntax,
+                    ImmutableArray.Create<MethodSymbol>(localFunc),
+                    context,
+                    diagnostics,
+                    out bool localHadArityMatch);
+
+                if (localMethods.IsDefaultOrEmpty)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_ARITY001",
+                        DiagnosticSeverity.Error,
+                        localHadArityMatch
+                            ? $"No overload of '{name}' satisfies the supplied type arguments."
+                            : $"No overload of '{name}' has the supplied number of type arguments.",
+                        new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+                    result = new BoundBadExpression(nameSyntax);
+                    return true;
+                }
+
+                result = new BoundMethodGroupExpression(nameSyntax, name, receiverOpt: null, localMethods);
+                return true;
+            }
+
+            NamedTypeSymbol? containingType = null;
+            for (Symbol? s = context.ContainingSymbol; s != null; s = s.ContainingSymbol)
+            {
+                if (s is NamedTypeSymbol nt)
+                {
+                    containingType = nt;
+                    break;
+                }
+            }
+
+            bool inStaticContext = context.ContainingSymbol switch
+            {
+                MethodSymbol m => m.IsStatic,
+                FieldSymbol f => f.IsStatic,
+                PropertySymbol p => p.IsStatic,
+                _ => false
+            };
+
+            ImmutableArray<MethodSymbol> candidates = ImmutableArray<MethodSymbol>.Empty;
+            BoundExpression? receiver = null;
+            bool foundInContainingType = false;
+
+            if (containingType is not null)
+            {
+                var typeCandidates = LookupMethods(containingType, name);
+                if (!typeCandidates.IsDefaultOrEmpty)
+                {
+                    foundInContainingType = true;
+                    typeCandidates = typeCandidates
+                        .Where(m => AccessibilityHelper.IsAccessible(m, context))
+                        .ToImmutableArray();
+
+                    if (typeCandidates.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_CALL_ACC_MG001",
+                            DiagnosticSeverity.Error,
+                            $"No accessible overload of '{name}' found in type '{containingType.Name}'.",
+                            new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+                        result = new BoundBadExpression(nameSyntax);
+                        return true;
+                    }
+
+                    if (inStaticContext)
+                        typeCandidates = typeCandidates.Where(m => m.IsStatic).ToImmutableArray();
+
+                    if (typeCandidates.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MG_STATIC001",
+                            DiagnosticSeverity.Error,
+                            "An object reference is required for the non-static method group.",
+                            new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+                        result = new BoundBadExpression(nameSyntax);
+                        return true;
+                    }
+
+                    candidates = ApplyExplicitTypeArgumentsToMethodGroup(
+                        nameSyntax,
+                        typeCandidates,
+                        context,
+                        diagnostics,
+                        out bool typeHadArityMatch);
+
+                    if (candidates.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MG_ARITY002",
+                            DiagnosticSeverity.Error,
+                            typeHadArityMatch
+                                ? $"No overload of '{name}' satisfies the supplied type arguments."
+                                : $"No overload of '{name}' has the supplied number of type arguments.",
+                            new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+                        result = new BoundBadExpression(nameSyntax);
+                        return true;
+                    }
+
+                    if (candidates.Any(m => !m.IsStatic))
+                        receiver = new BoundThisExpression(nameSyntax, containingType);
+                }
+            }
+
+            if (candidates.IsDefaultOrEmpty && !foundInContainingType)
+            {
+                var importedStatic = LookupImportedStaticMethods(name, context);
+                if (!importedStatic.IsDefaultOrEmpty)
+                {
+                    candidates = ApplyExplicitTypeArgumentsToMethodGroup(
+                        nameSyntax,
+                        importedStatic,
+                        context,
+                        diagnostics,
+                        out bool importedHadArityMatch);
+
+                    if (candidates.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MG_ARITY003",
+                            DiagnosticSeverity.Error,
+                            importedHadArityMatch
+                                ? $"No imported overload of '{name}' satisfies the supplied type arguments."
+                                : $"No imported overload of '{name}' has the supplied number of type arguments.",
+                            new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+
+                        result = new BoundBadExpression(nameSyntax);
+                        return true;
+                    }
+                }
+            }
+
+            if (candidates.IsDefaultOrEmpty)
+                return false;
+
+            result = new BoundMethodGroupExpression(nameSyntax, name, receiver, candidates);
+            return true;
+        }
+
+        private ImmutableArray<MethodSymbol> ApplyExplicitTypeArgumentsToMethodGroup(
+            SimpleNameSyntax nameSyntax,
+            ImmutableArray<MethodSymbol> candidates,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out bool hadArityMatch)
+        {
+            hadArityMatch = true;
+            if (nameSyntax is not GenericNameSyntax genericName)
+                return candidates;
+
+            var explicitTypeArgs = BindTypeArguments(genericName.TypeArgumentList.Arguments, context, diagnostics);
+            int arity = explicitTypeArgs.Length;
+            var arityMatches = candidates.Where(m => m.TypeParameters.Length == arity).ToImmutableArray();
+            hadArityMatch = !arityMatches.IsDefaultOrEmpty;
+            if (arityMatches.IsDefaultOrEmpty)
+                return ImmutableArray<MethodSymbol>.Empty;
+
+            var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
+            for (int i = 0; i < arityMatches.Length; i++)
+            {
+                var def = arityMatches[i];
+                if (!GenericConstraintChecker.CheckMethodInstantiation(
+                    methodDefinition: def,
+                    typeArguments: explicitTypeArgs,
+                    getArgSpan: a => genericName.TypeArgumentList.Arguments[a].Span,
+                    context: context,
+                    diagnostics: diagnostics))
+                {
+                    continue;
+                }
+
+                constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
+            }
+
+            return constructed.Count == 0 ? ImmutableArray<MethodSymbol>.Empty : constructed.ToImmutable();
+        }
+
         private static bool TryBindUnqualifiedMember(
             IdentifierNameSyntax id,
             string name,
@@ -10223,15 +11345,6 @@ namespace Cnidaria.Cs
                             location: new Location(context.SemanticModel.SyntaxTree, interp.AlignmentClause.Span)));
                     }
 
-                    if (interp.FormatClause is not null)
-                    {
-                        diagnostics.Add(new Diagnostic(
-                            id: "CN_INTERP_FMT000",
-                            severity: DiagnosticSeverity.Error,
-                            message: "Interpolation format specifiers are not supported.",
-                            location: new Location(context.SemanticModel.SyntaxTree, interp.FormatClause.Span)));
-                    }
-
                     var expr = BindExpression(interp.Expression, context, diagnostics);
 
                     if (expr.Type.SpecialType == SpecialType.System_Void)
@@ -10244,6 +11357,9 @@ namespace Cnidaria.Cs
 
                         expr = new BoundBadExpression(interp);
                     }
+
+                    if (interp.FormatClause is { } formatClause && !expr.HasErrors)
+                        expr = BindInterpolationFormatSpecifier(interp, formatClause, expr, context, diagnostics);
 
                     parts.Add(expr);
 
@@ -10292,6 +11408,75 @@ namespace Cnidaria.Cs
             }
 
             return acc;
+        }
+        private BoundExpression BindInterpolationFormatSpecifier(
+            InterpolationSyntax interpolation,
+            InterpolationFormatClauseSyntax formatClause,
+            BoundExpression value,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var stringType = context.Compilation.GetSpecialType(SpecialType.System_String);
+
+            var formatText = formatClause.FormatStringToken.Value as string
+                ?? formatClause.FormatStringToken.ValueText
+                ?? string.Empty;
+
+            var receiverType = GetReceiverTypeForMemberLookup(value.Type);
+            if (receiverType is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    id: "CN_INTERP_FMT001",
+                    severity: DiagnosticSeverity.Error,
+                    message: $"Type '{value.Type.Name}' cannot be used with an interpolation format specifier.",
+                    location: new Location(context.SemanticModel.SyntaxTree, formatClause.Span)));
+
+                return new BoundBadExpression(interpolation);
+            }
+
+            var candidates = LookupMethods(receiverType, "ToString")
+                .Where(m =>
+                    !m.IsStatic &&
+                    AccessibilityHelper.IsAccessible(m, context) &&
+                    m.TypeParameters.IsDefaultOrEmpty &&
+                    m.ReturnType.SpecialType == SpecialType.System_String &&
+                    m.Parameters.Length == 1 &&
+                    m.Parameters[0].RefKind == ParameterRefKind.None &&
+                    m.Parameters[0].Type.SpecialType == SpecialType.System_String)
+                .ToImmutableArray();
+
+            if (candidates.IsDefaultOrEmpty)
+            {
+                diagnostics.Add(new Diagnostic(
+                    id: "CN_INTERP_FMT002",
+                    severity: DiagnosticSeverity.Error,
+                    message: $"Interpolation format specifier ':{formatText}' cannot be applied to expression of type '{value.Type.Name}': " +
+                    $"no accessible instance method was found.",
+                    location: new Location(context.SemanticModel.SyntaxTree, formatClause.Span)));
+
+                return new BoundBadExpression(interpolation);
+            }
+
+            var formatArg = new BoundLiteralExpression(formatClause, stringType, formatText);
+
+            if (!TryResolveOverload(
+                candidates: candidates,
+                args: ImmutableArray.Create<BoundExpression>(formatArg),
+                getArgExprSyntax: _ => interpolation.Expression,
+                chosen: out var chosen,
+                convertedArgs: out var convertedArgs,
+                context: context,
+                diagnostics: diagnostics,
+                diagnosticNode: formatClause))
+            {
+                return new BoundBadExpression(interpolation);
+            }
+
+            return new BoundCallExpression(
+                interpolation,
+                receiverOpt: value,
+                method: chosen!,
+                arguments: convertedArgs);
         }
         private BoundExpression BindStringConcatenation(
             ExpressionSyntax syntax,
@@ -10402,6 +11587,13 @@ namespace Cnidaria.Cs
             BindingContext ctx,
             DiagnosticBag diagnostics)
         {
+            if ((op == BoundBinaryOperatorKind.Add || op == BoundBinaryOperatorKind.Subtract) &&
+                left.Type is NamedTypeSymbol { TypeKind: TypeKind.Delegate } &&
+                ClassifyConversion(right, left.Type, ctx) is { Exists: true, IsImplicit: true })
+            {
+                return BindDelegateCompoundAssignment(node, op, left, right, ctx, diagnostics);
+            }
+
             if (TryBindUserDefinedCompoundAssignmentOperator(
                 node: node,
                 op: op,
@@ -10439,6 +11631,93 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(node);
             }
         }
+        private BoundExpression BindDelegateCompoundAssignment(
+            AssignmentExpressionSyntax node,
+            BoundBinaryOperatorKind op,
+            BoundExpression left,
+            BoundExpression right,
+            BindingContext ctx,
+            DiagnosticBag diagnostics)
+        {
+            string methodName = op == BoundBinaryOperatorKind.Add ? "Combine" : "Remove";
+
+            if (!TryFindSystemDelegateMethod(ctx.Compilation, methodName, out var method))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_DELEGATE_COMBINE000",
+                    DiagnosticSeverity.Error,
+                    $"System.Delegate.{methodName}(Delegate, Delegate) is required for delegate compound assignment.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            var delegateParamType = method.Parameters[0].Type;
+
+            var leftArg = ApplyConversion(
+                exprSyntax: node.Left,
+                expr: left,
+                targetType: delegateParamType,
+                diagnosticNode: node,
+                context: ctx,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            var rightAsLeftType = ApplyConversion(
+                exprSyntax: node.Right,
+                expr: right,
+                targetType: left.Type,
+                diagnosticNode: node,
+                context: ctx,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            var rightArg = ApplyConversion(
+                exprSyntax: node.Right,
+                expr: rightAsLeftType,
+                targetType: delegateParamType,
+                diagnosticNode: node,
+                context: ctx,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            if (leftArg.HasErrors || rightArg.HasErrors)
+                return new BoundBadExpression(node);
+
+            return new BoundCallExpression(
+                node,
+                receiverOpt: null,
+                method: method,
+                arguments: ImmutableArray.Create(leftArg, rightArg));
+        }
+
+        private static bool TryFindSystemDelegateMethod(Compilation compilation, string name, out MethodSymbol method)
+        {
+            method = null!;
+
+            if (!DeclarationBuilder.TryFindSystemType(compilation.GlobalNamespace, "Delegate", arity: 0, out var delegateType))
+                return false;
+
+            var methods = LookupMethods(delegateType, name);
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var m = methods[i];
+                if (!m.IsStatic)
+                    continue;
+                if (m.Parameters.Length != 2)
+                    continue;
+                if (!StringComparer.Ordinal.Equals(m.Name, name))
+                    continue;
+                if (ReferenceEquals(m.Parameters[0].Type, delegateType) &&
+                    ReferenceEquals(m.Parameters[1].Type, delegateType))
+                {
+                    method = m;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private BoundExpression BindCompoundNumericBinary(
             AssignmentExpressionSyntax node,
             BoundBinaryOperatorKind op,
@@ -10983,7 +12262,7 @@ namespace Cnidaria.Cs
                 MemberAccessExpressionSyntax ma => BindMemberAccessInvocation(inv, ma, argSyntaxes, boundArgs, context, diagnostics),
                 IdentifierNameSyntax id => BindSimpleInvocation(inv, id, argSyntaxes, boundArgs, context, diagnostics),
                 GenericNameSyntax g => BindGenericSimpleInvocation(inv, g, argSyntaxes, boundArgs, context, diagnostics),
-                _ => BindUnsupportedInvocation(inv, context, diagnostics)
+                _ => BindDelegateOrUnsupportedInvocation(inv, argSyntaxes, boundArgs, context, diagnostics)
             };
         }
         private BoundExpression BindCallArgument(ArgumentSyntax argSyntax, BindingContext context, DiagnosticBag diagnostics)
@@ -11141,6 +12420,56 @@ namespace Cnidaria.Cs
                 return true;
             return argKind == paramKind;
         }
+        private BoundExpression BindDelegateOrUnsupportedInvocation(
+            InvocationExpressionSyntax inv,
+            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes,
+            ImmutableArray<BoundExpression> args,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var receiver = BindExpression(inv.Expression, context, diagnostics);
+            if (!receiver.HasErrors && TryGetDelegateInvokeMethod(receiver.Type, out _, out _))
+                return BindDelegateInvocation(inv, receiver, argSyntaxes, args, context, diagnostics);
+
+            return BindUnsupportedInvocation(inv, context, diagnostics);
+        }
+
+        private BoundExpression BindDelegateInvocation(
+            InvocationExpressionSyntax inv,
+            BoundExpression receiver,
+            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes,
+            ImmutableArray<BoundExpression> args,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (!TryGetDelegateInvokeMethod(receiver.Type, out var delegateType, out var invoke))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CALL_DELEGATE001",
+                    DiagnosticSeverity.Error,
+                    $"Expression of type '{receiver.Type.Name}' is not invocable.",
+                    new Location(context.SemanticModel.SyntaxTree, inv.Expression.Span)));
+                return new BoundBadExpression(inv);
+            }
+
+            if (!TryResolveOverload(
+                candidates: ImmutableArray.Create(invoke),
+                args: args,
+                getArgExprSyntax: i => argSyntaxes[i].Expression,
+                getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
+                chosen: out var chosen,
+                convertedArgs: out var convertedArgs,
+                context: context,
+                diagnostics: diagnostics,
+                diagnosticNode: inv))
+            {
+                return new BoundBadExpression(inv);
+            }
+
+            return new BoundCallExpression(inv, receiver, chosen!, convertedArgs);
+        }
+
         private BoundExpression BindUnsupportedInvocation(InvocationExpressionSyntax inv, BindingContext context, DiagnosticBag diagnostics)
         {
             diagnostics.Add(new Diagnostic("CN_CALL000", DiagnosticSeverity.Error,
@@ -11159,10 +12488,13 @@ namespace Cnidaria.Cs
         {
             var name = id.Identifier.ValueText ?? "";
 
-            if (TryBindSimpleValue(id, out _))
+            if (TryBindSimpleValue(id, out var simpleValue))
             {
+                if (!simpleValue.HasErrors && TryGetDelegateInvokeMethod(simpleValue.Type, out _, out _))
+                    return BindDelegateInvocation(inv, simpleValue, argSyntaxes, args, context, diagnostics);
+
                 diagnostics.Add(new Diagnostic("CN_CALL010", DiagnosticSeverity.Error,
-                    "Delegate invocation is not implemented.",
+                    $"Expression of type '{simpleValue.Type.Name}' is not invocable.",
                     new Location(context.SemanticModel.SyntaxTree, id.Span)));
                 return new BoundBadExpression(inv);
             }
@@ -11352,7 +12684,7 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    // Generic methods without explicit type arguments are handled by overload resolution.
+                    // Generic methods without explicit type arguments are handled by overload resolution
                 }
                 if (TryResolveOverload(
                     candidates: candidates,
@@ -11398,6 +12730,17 @@ namespace Cnidaria.Cs
                     }
 
                     return new BoundBadExpression(inv);
+                }
+            }
+
+            {
+                var probeDiagnostics = new DiagnosticBag();
+                var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+                var probeValue = BindMemberAccess(ma, BindValueKind.RValue, probeContext, probeDiagnostics);
+                if (!probeValue.HasErrors && TryGetDelegateInvokeMethod(probeValue.Type, out _, out _))
+                {
+                    var delegateValue = BindMemberAccess(ma, BindValueKind.RValue, context, diagnostics);
+                    return BindDelegateInvocation(inv, delegateValue, argSyntaxes, args, context, diagnostics);
                 }
             }
 
@@ -11561,7 +12904,7 @@ namespace Cnidaria.Cs
             {
                 EnsureUnsafe(receiverSyntax, context, diagnostics);
 
-                // Pointer member access is always a value receiver; treat it as (*ptr).Member. 
+                // Pointer member access is always a value receiver
                 var ptrValue = receiverSyntax is IdentifierNameSyntax id && TryBindSimpleValue(id, out var v)
                     ? v
                     : BindExpression(receiverSyntax, context, diagnostics);
@@ -11743,10 +13086,45 @@ namespace Cnidaria.Cs
             {
                 if (hasMethod)
                 {
-                    diagnostics.Add(new Diagnostic("CN_MEMACC003", DiagnosticSeverity.Error,
-                        "Method groups are not supported.",
-                        new Location(context.SemanticModel.SyntaxTree, ma.Span)));
-                    return new BoundBadExpression(ma);
+                    var methodBuilder = ImmutableArray.CreateBuilder<MethodSymbol>();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is not MethodSymbol method)
+                            continue;
+
+                        if (receiverValue is null)
+                        {
+                            if (method.IsStatic)
+                                methodBuilder.Add(method);
+                        }
+                        else
+                        {
+                            if (!method.IsStatic)
+                                methodBuilder.Add(method);
+                        }
+                    }
+
+                    var methods = ApplyExplicitTypeArgumentsToMethodGroup(
+                        ma.Name,
+                        methodBuilder.ToImmutable(),
+                        context,
+                        diagnostics,
+                        out bool hadArityMatch);
+
+                    if (methods.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MEMACC_MG001",
+                            DiagnosticSeverity.Error,
+                            hadArityMatch
+                                ? $"No overload of '{name}' satisfies the supplied type arguments or receiver kind."
+                                : $"No overload of '{name}' has the supplied number of type arguments.",
+                            new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
+
+                        return new BoundBadExpression(ma);
+                    }
+
+                    return new BoundMethodGroupExpression(ma, name, receiverValue, methods);
                 }
                 if (hasType)
                 {
@@ -12005,8 +13383,6 @@ namespace Cnidaria.Cs
 
                     if (!m.TypeParameters.IsDefaultOrEmpty)
                     {
-                        // For generic extension methods, the receiver conversion can only be
-                        // classified after method type inference has constructed the method.
                         b.Add(m);
                         continue;
                     }
@@ -13068,8 +14444,7 @@ namespace Cnidaria.Cs
 
             var inferredTypeArguments = typeArguments.ToImmutable();
 
-            // Constraint failures make the candidate inapplicable. Do not report these
-            // diagnostics while overload resolution is still considering other candidates.
+            // Constraint failures make the candidate inapplicable
             if (!GenericConstraintChecker.CheckMethodInstantiation(
                 methodDefinition: candidate,
                 typeArguments: inferredTypeArguments,
@@ -17106,7 +18481,29 @@ namespace Cnidaria.Cs
                 {
                     var rhs = BindExpression(v.Initializer.Value, context, diagnostics);
 
-                    if (rhs.Type is NullTypeSymbol ||
+                    if (rhs is BoundUnboundLambdaExpression)
+                    {
+                        diagnostics.Add(new Diagnostic("CN_VAR_LAMBDA000", DiagnosticSeverity.Error,
+                            "Cannot infer the type of an implicitly-typed local variable from a lambda expression.",
+                            new Location(context.SemanticModel.SyntaxTree, v.Initializer.Value.Span)));
+
+                        localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
+                        var badInit = new BoundBadExpression(v.Initializer.Value);
+                        badInit.SetType(localType);
+                        init = badInit;
+                    }
+                    else if (rhs is BoundMethodGroupExpression)
+                    {
+                        diagnostics.Add(new Diagnostic("CN_VAR_METHODGROUP000", DiagnosticSeverity.Error,
+                            "Cannot infer the type of an implicitly-typed local variable from a method group.",
+                            new Location(context.SemanticModel.SyntaxTree, v.Initializer.Value.Span)));
+
+                        localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
+                        var badInit = new BoundBadExpression(v.Initializer.Value);
+                        badInit.SetType(localType);
+                        init = badInit;
+                    }
+                    else if (rhs.Type is NullTypeSymbol ||
                         (rhs.ConstantValueOpt.HasValue && rhs.ConstantValueOpt.Value is null))
                     {
                         diagnostics.Add(new Diagnostic("CN_VAR002", DiagnosticSeverity.Error,
@@ -19337,6 +20734,20 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
+            // Target typed method group
+            if (expr is BoundMethodGroupExpression methodGroup)
+            {
+                var bound = BindMethodGroupConversion(methodGroup, targetType, diagnosticNode, context, diagnostics);
+                context.Recorder.RecordBound(exprSyntax, bound);
+                return bound;
+            }
+            // Target typed lambda / anonymous method
+            if (expr is BoundUnboundLambdaExpression unboundLambda)
+            {
+                var bound = BindLambdaConversion(unboundLambda, targetType, diagnosticNode, context, diagnostics);
+                context.Recorder.RecordBound(exprSyntax, bound);
+                return bound;
+            }
             // Target typed new expression
             if (exprSyntax is ImplicitObjectCreationExpressionSyntax ioc)
             {
@@ -19895,9 +21306,15 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
-            if (TryGetSpanLikeElementType(targetType, out _, out var spanElementType))
+            if (TryGetSpanLikeElementType(targetType, out var spanLikeType, out var spanElementType))
             {
+                bool hasSpread = false;
+                for (int i = 0; i < unbound.Elements.Length; i++)
+                    hasSpread |= unbound.Elements[i].Kind == BoundCollectionElementKind.Spread;
+                if (!hasSpread)
+                    return BindCollectionExpressionAsSpanCollection(node, spanLikeType, spanElementType, unbound, context, diagnostics);
                 var spanBackingArray = context.Compilation.CreateArrayType(spanElementType, rank: 1);
+
                 var arrayExpr = BindCollectionExpressionAsArray(node, spanBackingArray, spanElementType, unbound, context, diagnostics);
                 if (arrayExpr.HasErrors)
                     return arrayExpr;
@@ -19973,6 +21390,7 @@ namespace Cnidaria.Cs
             return badExpr;
 
         }
+
         private bool TryGetArrayLikeCollectionTarget(
             TypeSymbol targetType,
             Compilation compilation,
@@ -20218,6 +21636,39 @@ namespace Cnidaria.Cs
             }
 
             return false;
+        }
+        private BoundExpression BindCollectionExpressionAsSpanCollection(
+            CollectionExpressionSyntax node,
+            NamedTypeSymbol spanLikeType,
+            TypeSymbol elementType,
+            BoundUnboundCollectionExpression unbound,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var converted = ImmutableArray.CreateBuilder<BoundExpression>(unbound.Elements.Length);
+
+            for (int i = 0; i < unbound.Elements.Length; i++)
+            {
+                var element = unbound.Elements[i];
+                if (element.Kind != BoundCollectionElementKind.Expression)
+                    throw new InvalidOperationException("Spread element reached span collection fast path.");
+
+                var exprSyntax = ((ExpressionElementSyntax)element.Syntax).Expression;
+                converted.Add(ApplyConversion(
+                    exprSyntax: exprSyntax,
+                    expr: element.Expression,
+                    targetType: elementType,
+                    diagnosticNode: element.Syntax,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true));
+            }
+
+            return new BoundSpanCollectionExpression(
+                node,
+                spanLikeType,
+                elementType,
+                converted.ToImmutable());
         }
         private BoundExpression BindCollectionExpressionAsListSpecialCase(
             CollectionExpressionSyntax node,
@@ -21052,6 +22503,14 @@ namespace Cnidaria.Cs
                 return CanBindTargetTypedCollectionExpression(unboundCollection, target, context)
                     ? new Conversion(ConversionKind.Identity)
                     : new Conversion(ConversionKind.None);
+            if (expr is BoundUnboundLambdaExpression unboundLambda)
+                return CanConvertLambdaToDelegate(unboundLambda, target, context)
+                    ? new Conversion(ConversionKind.Identity)
+                    : new Conversion(ConversionKind.None);
+            if (expr is BoundMethodGroupExpression methodGroup)
+                return CanConvertMethodGroupToDelegate(methodGroup, target, context)
+                    ? new Conversion(ConversionKind.Identity)
+                    : new Conversion(ConversionKind.None);
             if (expr is BoundStackAllocArrayCreationExpression sa &&
                 TryGetSpanLikeElementType(target, out _, out var spanElemType) &&
                 ReferenceEquals(sa.ElementType, spanElemType))
@@ -21247,6 +22706,9 @@ namespace Cnidaria.Cs
 
             if (expr is BoundOutDiscardExpression discard)
                 return ClassifyOutDiscardConversion(discard, target);
+
+            if (expr is BoundUnboundLambdaExpression || expr is BoundMethodGroupExpression)
+                return new Conversion(ConversionKind.None);
 
             if (AreSameType(expr.Type, target))
                 return new Conversion(ConversionKind.Identity);
@@ -23357,6 +24819,19 @@ namespace Cnidaria.Cs
 
                 var bad = new BoundBadExpression(node);
                 bad.SetType(new ErrorTypeSymbol("collection", containing: null, ImmutableArray<Location>.Empty));
+                return bad;
+            }
+
+            if (expr is BoundMethodGroupExpression)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_MG_NOTARGET001",
+                    DiagnosticSeverity.Error,
+                    "Method group has no target type in this context.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(new ErrorTypeSymbol("method group", containing: null, ImmutableArray<Location>.Empty));
                 return bad;
             }
 

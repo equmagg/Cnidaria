@@ -1613,9 +1613,11 @@ namespace Cnidaria.Cs
                     case GenTreeKind.NewArray:
                         return NewArray(node, operands, ref heap);
                     case GenTreeKind.NewObject:
+                    case GenTreeKind.NewDelegate:
                         return NewObject(node, operands, ref heap);
                     case GenTreeKind.Call:
                     case GenTreeKind.VirtualCall:
+                    case GenTreeKind.DelegateInvoke:
                         return Call(node, operands, ref heap, ref byrefExposed);
                     case GenTreeKind.CastClass:
                         return FuncWithException(node, ValueNumberFunction.CastClass, operands);

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -10,6 +11,7 @@ namespace Cnidaria.Cs
         internal static int TestsRan;
         internal static int TestsFailed;
         internal static List<string> FailedMessages = new();
+        internal static List<long> InstructionsExecuted = new();
 
         internal static bool Assert(string result, string target)
         {
@@ -47,6 +49,14 @@ namespace Cnidaria.Cs
                 foreach (var diagnostic in diagnostics)
                 {
                     output += $"{diagnostic.GetMessage()}\n";
+                }
+                if(diagnostics.All(x => x.GetSeverity() != DiagnosticSeverity.Error))
+                {
+                    InstructionsExecuted.Add(context.InstructionsCount);
+                }
+                else
+                {
+                    InstructionsExecuted.Add(-1);
                 }
                 Assert(output, target);
             }
@@ -1485,8 +1495,21 @@ string[] ss = [ ""a"", ""b"", ""c"" ];
 Console.Write(Array.IndexOf(xs, 20));
 Console.Write(Array.IndexOf(ss, ""c""));
 ", "12");
+            // 127 interpolated string format specifier
+            RunTest(@"
+int val = 65;
+Console.Write($""0x{val:X8}"");
+", "0x00000041");
+            // 128 delegate closure capture
+            RunTest(@"
+int x = 65;
+Action a = () => Console.Write(x);
+a();
+", "65");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
+            Console.WriteLine($"Average instructions executed count: " +
+                $"{(InstructionsExecuted.Count > 0 ? (long)InstructionsExecuted.Where(x => x > 0L).Average() : 0L)}");
             foreach (var msg in FailedMessages)
             {
                 Console.WriteLine(msg);

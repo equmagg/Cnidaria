@@ -194,6 +194,23 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("Containing type must be a mutable core type.");
             }
         }
+        private static NamedTypeSymbol? FindSystemType(NamespaceSymbol global, string name, int arity)
+        {
+            NamespaceSymbol? systemNs = null;
+            var namespaces = global.GetNamespaceMembers();
+            for (int i = 0; i < namespaces.Length; i++)
+            {
+                if (StringComparer.Ordinal.Equals(namespaces[i].Name, "System"))
+                {
+                    systemNs = namespaces[i];
+                    break;
+                }
+            }
+            if (systemNs is null)
+                return null;
+            var candidates = systemNs.GetTypeMembers(name, arity);
+            return candidates.IsDefaultOrEmpty ? null : candidates[0];
+        }
         private static void AddNestedTypeToType(NamedTypeSymbol containingType, NamedTypeSymbol nested)
         {
             switch (containingType)
@@ -232,6 +249,9 @@ namespace Cnidaria.Cs
                 TypeKind.Struct => _types.GetSpecialType(SpecialType.System_ValueType),
                 TypeKind.Enum => _types.GetSpecialType(SpecialType.System_Enum),
                 TypeKind.Interface => null,
+                TypeKind.Delegate => FindSystemType(_global, "MulticastDelegate", 0)
+                    ?? FindSystemType(_global, "Delegate", 0)
+                    ?? _types.GetSpecialType(SpecialType.System_Object),
                 _ => _types.GetSpecialType(SpecialType.System_Object),
             };
 
@@ -1660,6 +1680,7 @@ namespace Cnidaria.Cs
 
             if (baseNs == "System" && baseName == "ValueType") return TypeKind.Struct;
             if (baseNs == "System" && baseName == "Enum") return TypeKind.Enum;
+            if (baseNs == "System" && baseName == "MulticastDelegate") return TypeKind.Delegate;
 
             return TypeKind.Class;
         }

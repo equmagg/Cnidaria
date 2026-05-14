@@ -928,6 +928,12 @@ namespace Cnidaria.Cs
                         case Op.NewObj:
                             ExecNewObj(ins, ct, limits);
                             break;
+                        case Op.NewDelegate:
+                            SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, 0));
+                            break;
+                        case Op.NewDelegateClosed:
+                            SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, GetGpr(ins.Rs1)));
+                            break;
                         case Op.NewArr:
                         case Op.NewSZArray:
                             SetGpr(ins.Rd, AllocArray(_rts.GetTypeById(checked((int)ins.Imm)), (int)GetGpr(ins.Rs1)));
@@ -1002,12 +1008,14 @@ namespace Cnidaria.Cs
                         case Op.CallIndirectF:
                         case Op.CallIndirectRef:
                         case Op.CallIndirectValue:
+                            throw new NotSupportedException($"Indirect calls are not supported by this register VM backend yet at PC {executingPc}");
                         case Op.DelegateInvokeVoid:
                         case Op.DelegateInvokeI:
                         case Op.DelegateInvokeF:
                         case Op.DelegateInvokeRef:
                         case Op.DelegateInvokeValue:
-                            throw new NotSupportedException($"Indirect/delegate calls are not supported by this register VM backend yet at PC {executingPc}");
+                            ExecDelegateInvoke(ins, executingPc, ct, limits);
+                            break;
 
                         case Op.StackAlloc:
                             SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
@@ -1455,6 +1463,271 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Configured call depth limit exceeded.");
 
             EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
+        }
+
+        private void ExecDelegateInvoke(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
+        {
+            RuntimeMethod invokeMethod = _rts.GetMethodById(checked((int)ins.Imm));
+            CallFlags callFlags = (CallFlags)ins.Aux;
+
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+
+            long delegateRef;
+            RuntimeMethod target;
+            long targetRef;
+
+            _activeCallFlags = callFlags;
+            _activeCallTargetMethod = invokeMethod;
+            try
+            {
+                delegateRef = ReadThisArgumentReference(invokeMethod);
+                if (delegateRef == 0)
+                    throw new NullReferenceException();
+
+                target = ReadDelegateTargetMethod(delegateRef);
+                targetRef = ReadDelegateTarget(delegateRef);
+            }
+            finally
+            {
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
+            }
+
+            if (RequiresTypeInitializationBeforeCall(target))
+            {
+                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
+                    return;
+            }
+
+            _activeCallFlags = callFlags;
+            _activeCallTargetMethod = target;
+            try
+            {
+                RebindDelegateInvokeArguments(invokeMethod, target, targetRef, callFlags);
+                NormalizeValueTypeThisArgument(target);
+
+                if (TryInvokeHostOverride(target, ct))
+                    return;
+                if (TryInvokeIntrinsic(target, ct))
+                    return;
+            }
+            finally
+            {
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
+            }
+
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
+            {
+                if (target.BodyModule is null || target.Body is null)
+                    throw new MissingMethodException("No body for delegate target M" + target.MethodId.ToString());
+                throw new MissingMethodException("Delegate target method exists in metadata but not in register image: M" + target.MethodId.ToString());
+            }
+
+            if (_frameCount >= MaxCallFramesHard)
+                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+            if (_frameCount >= limits.MaxCallDepth)
+                throw new InvalidOperationException("Configured call depth limit exceeded.");
+
+            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
+        }
+
+        private int AllocDelegateFromDescriptor(long descriptor, long targetRef)
+        {
+            int delegateTypeId = unchecked((int)((ulong)descriptor >> 32));
+            int targetMethodId = unchecked((int)(uint)descriptor);
+            RuntimeType delegateType = _rts.GetTypeById(delegateTypeId);
+            RuntimeMethod targetMethod = _rts.GetMethodById(targetMethodId);
+
+            int obj = AllocObject(delegateType);
+            WriteDelegateField(obj, "_target", targetRef);
+            WriteDelegateField(obj, "_methodPtr", targetMethod.MethodId);
+            WriteDelegateField(obj, "_methodModule", 0);
+            return obj;
+        }
+
+        private RuntimeMethod ReadDelegateTargetMethod(long delegateRef)
+        {
+            long methodId = ReadDelegateField(delegateRef, "_methodPtr");
+            if (methodId == 0)
+                throw new MissingMethodException("Delegate has null target method pointer.");
+            return _rts.GetMethodById(checked((int)methodId));
+        }
+
+        private long ReadDelegateTarget(long delegateRef)
+            => ReadDelegateField(delegateRef, "_target");
+
+        private long ReadDelegateField(long delegateRef, string name)
+        {
+            int obj = checked((int)delegateRef);
+            RuntimeType type = GetObjectTypeFromRef(obj);
+            RuntimeField field = FindInstanceFieldInHierarchy(type, name);
+            return ReadSizedInteger(obj + field.Offset, field.FieldType);
+        }
+
+        private void WriteDelegateField(int delegateRef, string name, long value)
+        {
+            RuntimeType type = GetObjectTypeFromRef(delegateRef);
+            RuntimeField field = FindInstanceFieldInHierarchy(type, name);
+            WriteSizedInteger(delegateRef + field.Offset, field.FieldType, value);
+        }
+
+        private static RuntimeField FindInstanceFieldInHierarchy(RuntimeType type, string name)
+        {
+            for (RuntimeType? cur = type; cur is not null; cur = cur.BaseType)
+            {
+                for (int i = 0; i < cur.InstanceFields.Length; i++)
+                {
+                    RuntimeField field = cur.InstanceFields[i];
+                    if (!field.IsStatic && StringComparer.Ordinal.Equals(field.Name, name))
+                        return field;
+                }
+            }
+            throw new MissingFieldException(type.Name, name);
+        }
+
+        private void RebindDelegateInvokeArguments(RuntimeMethod invokeMethod, RuntimeMethod target, long targetRef, CallFlags callFlags)
+        {
+            int invokeArgCount = LogicalArgumentCount(invokeMethod);
+            int explicitInvokeArgCount = Math.Max(0, invokeArgCount - 1);
+            var captured = new CapturedAbiArgument[explicitInvokeArgCount];
+            for (int i = 0; i < captured.Length; i++)
+                captured[i] = CaptureAbiArgument(invokeMethod, i + 1);
+
+            long hiddenReturnBuffer = 0;
+            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
+                hiddenReturnBuffer = ReadHiddenReturnBufferAddress(invokeMethod);
+
+            int targetArgCount = LogicalArgumentCount(target);
+            bool hasClosedTarget = targetRef != 0 || target.HasThis;
+            int targetExplicitArgBase = hasClosedTarget ? 1 : 0;
+            if (targetArgCount != targetExplicitArgBase + captured.Length)
+            {
+                throw new InvalidOperationException(
+                    "Delegate target signature does not match Invoke signature. InvokeArgs=" + captured.Length.ToString() +
+                    ", TargetArgs=" + targetArgCount.ToString() + ", Closed=" + hasClosedTarget.ToString());
+            }
+
+            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
+                WriteHiddenReturnBufferAddress(target, hiddenReturnBuffer);
+
+            if (hasClosedTarget)
+            {
+                if (targetRef == 0)
+                    throw new NullReferenceException();
+                WriteAbiScalarArgument(target, 0, targetRef);
+            }
+
+            for (int i = 0; i < captured.Length; i++)
+                WriteAbiArgument(target, targetExplicitArgBase + i, captured[i]);
+        }
+
+        private readonly struct CapturedAbiArgument
+        {
+            public readonly RuntimeType Type;
+            public readonly byte[] Data;
+
+            public CapturedAbiArgument(RuntimeType type, byte[] data)
+            {
+                Type = type;
+                Data = data;
+            }
+        }
+
+        private CapturedAbiArgument CaptureAbiArgument(RuntimeMethod method, int logicalIndex)
+        {
+            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
+            int size = Math.Max(1, StorageSizeOf(type));
+            int temp = MaterializeAbiArgumentToStack(method, logicalIndex, type);
+            var data = new byte[size];
+            _mem.AsSpan(temp, size).CopyTo(data);
+            return new CapturedAbiArgument(type, data);
+        }
+
+        private void WriteAbiScalarArgument(RuntimeMethod method, int logicalIndex, long value)
+        {
+            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
+            int size = Math.Max(1, StorageSizeOf(type));
+            var data = new byte[size];
+            WriteRawBitsToSpan(data, value, Math.Min(size, TargetArchitecture.PointerSize));
+            WriteAbiArgument(method, logicalIndex, new CapturedAbiArgument(type, data));
+        }
+
+        private void WriteAbiArgument(RuntimeMethod method, int logicalIndex, CapturedAbiArgument value)
+        {
+            RuntimeType targetType = GetLogicalArgumentType(method, logicalIndex);
+            int targetSize = Math.Max(1, StorageSizeOf(targetType));
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            for (int i = 0; i < slices.Length; i++)
+            {
+                AbiArgumentSlice slice = slices[i];
+                int count = Math.Min(slice.Size, Math.Min(value.Data.Length, targetSize) - slice.Offset);
+                if (count <= 0)
+                    continue;
+
+                if (slice.Location.IsRegister)
+                {
+                    long bits = ReadRawBitsFromSpan(value.Data, slice.Offset, count);
+                    if (slice.RegisterClass == RegisterClass.Float)
+                        SetFpr((byte)slice.Location.Register, bits);
+                    else
+                        X(slice.Location.Register, bits);
+                }
+                else
+                {
+                    int target = GetAbiStackArgumentAddress(method, slice.Location);
+                    value.Data.AsSpan(slice.Offset, count).CopyTo(_mem.AsSpan(target, count));
+                }
+            }
+        }
+
+        private void WriteHiddenReturnBufferAddress(RuntimeMethod method, long address)
+        {
+            int insertion = HiddenReturnBufferInsertionIndex(method);
+            if (insertion < 0)
+                return;
+
+            int general = 0, floating = 0, stack = 0;
+            for (int i = 0; i <= insertion; i++)
+            {
+                if (i == insertion)
+                {
+                    AbiArgumentLocation loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
+                    if (loc.IsRegister)
+                        X(loc.Register, address);
+                    else
+                        WriteNative(GetAbiStackArgumentAddress(method, loc), address);
+                    return;
+                }
+
+                RuntimeType argType = GetLogicalArgumentType(method, i);
+                ConsumeAbiValue(argType, ref general, ref floating, ref stack);
+            }
+        }
+
+        private static long ReadRawBitsFromSpan(byte[] data, int offset, int size)
+        {
+            return size switch
+            {
+                1 => data[offset],
+                2 => BitConverter.ToUInt16(data, offset),
+                4 => BitConverter.ToUInt32(data, offset),
+                8 => BitConverter.ToInt64(data, offset),
+                _ => throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString()),
+            };
+        }
+
+        private static void WriteRawBitsToSpan(byte[] data, long value, int size)
+        {
+            switch (size)
+            {
+                case 1: data[0] = unchecked((byte)value); return;
+                case 2: BitConverter.GetBytes(unchecked((ushort)value)).CopyTo(data, 0); return;
+                case 4: BitConverter.GetBytes(unchecked((uint)value)).CopyTo(data, 0); return;
+                case 8: BitConverter.GetBytes(value).CopyTo(data, 0); return;
+                default: throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString());
+            }
         }
 
         private void ExecNewObj(InstrDesc ins, CancellationToken ct, ExecutionLimits limits)

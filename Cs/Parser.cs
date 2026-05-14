@@ -1712,7 +1712,7 @@ namespace Cnidaria.Cs
                 _tokens.Peek(1).Kind == SyntaxKind.EqualsGreaterThanToken)
             {
                 var id = _tokens.EatToken();
-                var parameter = new ParameterSyntax(default, SyntaxTokenList.Empty, type: null, identifier: id, @default: null);
+                var parameter = new ParameterSyntax(SyntaxList<AttributeListSyntax>.Empty, SyntaxTokenList.Empty, type: null, identifier: id, @default: null);
                 var arrow = _tokens.EatToken();
 
                 using var __ = _ctx.Push(asyncKeyword.Span.Length != 0 ? ParseContext.Async : ParseContext.None);
@@ -4921,7 +4921,10 @@ namespace Cnidaria.Cs
             // x =>
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
                 _tokens.Peek(1).Kind == SyntaxKind.EqualsGreaterThanToken)
-                return true;
+            {
+                _tokens.EatToken();
+                return _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken;
+            }    
 
             // ( ... ) =>
             if (_tokens.Current.Kind != SyntaxKind.OpenParenToken)

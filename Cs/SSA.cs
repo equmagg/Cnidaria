@@ -1805,9 +1805,6 @@ namespace Cnidaria.Cs
             if (root is null)
                 throw new ArgumentNullException(nameof(root));
 
-            // This is the SSA projection of the HIR Statement::TreeList() equivalent.
-            // The source GenTree linear ordinal is the primary execution order; a recursive
-            // postorder here would silently undo the importer/TreeLifeUpdater order.
             var builder = ImmutableArray.CreateBuilder<SsaTree>();
             var seen = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
             CollectUnique(root, seen, builder);
@@ -5026,11 +5023,13 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
+                case GenTreeKind.DelegateInvoke:
                     uses = SsaMemoryKindSet.All;
                     defs = SsaMemoryKindSet.All;
                     break;
 
                 case GenTreeKind.NewObject:
+                case GenTreeKind.NewDelegate:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     defs = defs.Add(SsaMemoryKind.GcHeap);
@@ -9676,13 +9675,19 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
-                    sb.Append(tree.Kind == GenTreeKind.VirtualCall ? "callvirt " : "call ")
+                case GenTreeKind.DelegateInvoke:
+                    sb.Append(tree.Kind == GenTreeKind.VirtualCall ? "callvirt " : tree.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ")
                       .Append(MethodName(tree.Source.Method)).Append('(');
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
                 case GenTreeKind.NewObject:
                     sb.Append("newobj ").Append(MethodName(tree.Source.Method)).Append('(');
+                    AppendOperandList(sb, tree);
+                    sb.Append(')');
+                    return;
+                case GenTreeKind.NewDelegate:
+                    sb.Append("newdelegate ").Append(TypeName(tree.Source.RuntimeType)).Append(" -> ").Append(MethodName(tree.Source.Method)).Append('(');
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;

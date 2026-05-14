@@ -10498,6 +10498,7 @@ namespace Cnidaria.Cs
                 {
                     GenTreeKind.Call => true,
                     GenTreeKind.VirtualCall => true,
+                    GenTreeKind.DelegateInvoke => true,
                     GenTreeKind.NewObject => method.DeclaringType.IsValueType,
                     _ => false,
                 };
@@ -11579,7 +11580,7 @@ namespace Cnidaria.Cs
 
                 if (GenTreeLirKinds.IsRealTree(node) && node.Source is not null)
                 {
-                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.NewObject or GenTreeKind.Throw or GenTreeKind.Rethrow)
+                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke or GenTreeKind.NewObject or GenTreeKind.Throw or GenTreeKind.Rethrow)
                     {
                         kind = RegisterGcInterruptibleRangeKind.Call;
                         return true;
@@ -13236,6 +13237,7 @@ namespace Cnidaria.Cs
             => kind is
                 GenTreeKind.Call or
                 GenTreeKind.VirtualCall or
+                GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
 
         private static bool RequiresRegisterOnlyTreeShape(GenTree node)

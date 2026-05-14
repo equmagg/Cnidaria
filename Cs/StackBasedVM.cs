@@ -95,6 +95,59 @@ namespace Cnidaria.Cs
             public static PendingCtorResult ForValue(RuntimeType t, int tempAbs) =>
                 new PendingCtorResult(PendingCtorResultKind.Value, tempAbs, t);
         }
+
+        private sealed class DelegateData
+        {
+            public readonly int ModuleId;
+            public readonly int MethodToken;
+            public readonly Slot Target;
+            public readonly int[]? InvocationList;
+
+            public DelegateData(int moduleId, int methodToken, Slot target, int[]? invocationList = null)
+            {
+                ModuleId = moduleId;
+                MethodToken = methodToken;
+                Target = target;
+                InvocationList = invocationList;
+            }
+        }
+
+        private sealed class ClosureData
+        {
+            public readonly Slot[] Cells;
+
+            public ClosureData(Slot[] cells)
+            {
+                Cells = cells;
+            }
+        }
+
+        private sealed class ClosureCellData
+        {
+            public readonly RuntimeType ValueType;
+            public Slot Value;
+
+            public ClosureCellData(RuntimeType valueType, Slot value)
+            {
+                ValueType = valueType;
+                Value = value;
+            }
+        }
+
+        private sealed class PendingDelegateInvocation
+        {
+            public readonly RuntimeMethod InvokeMethod;
+            public readonly int[] Targets;
+            public readonly Slot[] Arguments;
+            public int NextIndex;
+
+            public PendingDelegateInvocation(RuntimeMethod invokeMethod, int[] targets, Slot[] arguments)
+            {
+                InvokeMethod = invokeMethod;
+                Targets = targets;
+                Arguments = arguments;
+            }
+        }
         private readonly struct CatchContext
         {
             public readonly int FrameBase;
@@ -280,6 +333,10 @@ namespace Cnidaria.Cs
         private readonly RuntimeTypeSystem _rts;
         private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
         private readonly Dictionary<int, PendingCtorResult> _pendingCtorResults = new();
+        private readonly Dictionary<int, DelegateData> _delegateDataByObject = new();
+        private readonly Dictionary<int, ClosureData> _closureDataByObject = new();
+        private readonly Dictionary<int, ClosureCellData> _closureCellDataByObject = new();
+        private readonly Dictionary<int, PendingDelegateInvocation> _pendingDelegateInvocations = new();
         private readonly List<CatchContext> _catchStack = new();
         private readonly List<FinallyContext> _finallyStack = new();
         private readonly Dictionary<int, MethodExecLayout> _methodLayouts = new();
@@ -776,7 +833,7 @@ namespace Cnidaria.Cs
                                 if (TryBeginFinallyForReturn(fn, fromPc: pc, hasRet: hasRet, retVal: retVal))
                                     break;
 
-                                CompleteReturnFromCurrentFrame(hasRet, retVal);
+                                CompleteReturnFromCurrentFrame(hasRet, retVal, ct, limits);
                             }
                             break;
                         case BytecodeOp.Throw:
@@ -795,7 +852,7 @@ namespace Cnidaria.Cs
                             PushSlot(GetCurrentCatchExceptionOrThrow());
                             break;
                         case BytecodeOp.Endfinally:
-                            ExecEndfinally(pc);
+                            ExecEndfinally(pc, ct, limits);
                             break;
                         case BytecodeOp.Ldloca:
                             {
@@ -904,6 +961,38 @@ namespace Cnidaria.Cs
 
                         case BytecodeOp.Isinst:
                             ExecIsinst(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.NewClosureCell:
+                            ExecNewClosureCell(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.LdClosureCell:
+                            ExecLdClosureCell(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.StClosureCell:
+                            ExecStClosureCell(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.NewClosure:
+                            ExecNewClosure(ins.Operand0);
+                            break;
+
+                        case BytecodeOp.LdClosureSlot:
+                            ExecLdClosureSlot(ins.Operand0);
+                            break;
+
+                        case BytecodeOp.NewDelegate:
+                            ExecNewDelegate(mod, ins.Operand0, ins.Operand1);
+                            break;
+
+                        case BytecodeOp.NewDelegateClosed:
+                            ExecNewDelegateClosed(mod, ins.Operand0, ins.Operand1);
+                            break;
+
+                        case BytecodeOp.DelegateInvoke:
+                            ExecDelegateInvoke(mod, ins.Operand0, ins.Operand1, ct, limits);
                             break;
 
                         case BytecodeOp.Box:
@@ -1024,6 +1113,27 @@ namespace Cnidaria.Cs
                 TryMarkObject(objAbs);
             }
 
+            void VisitSlotRoot(Slot slot)
+            {
+                if (slot.Kind == SlotKind.Ref)
+                {
+                    TryMarkObject(checked((int)slot.Payload));
+                    return;
+                }
+
+                if (slot.Kind is SlotKind.ByRef or SlotKind.Ptr)
+                {
+                    TryMarkObjectFromInteriorPointer(checked((int)slot.Payload));
+                    return;
+                }
+
+                if (slot.Kind == SlotKind.Value)
+                {
+                    var vt = _rts.GetTypeById(slot.Aux);
+                    VisitManagedRefCellsInTypedStorage(checked((int)slot.Payload), vt, VisitRefCell, TryMarkObjectFromInteriorPointer);
+                }
+            }
+
             // Mark roots from all active frames
             for (int frame = _frameBase; frame >= 0; frame = ReadI32(frame + 0))
             {
@@ -1104,6 +1214,18 @@ namespace Cnidaria.Cs
                     VisitManagedRefCellsInTypedStorage(checked((int)pending.Payload), pending.Type, VisitRefCell);
                 }
             }
+
+            // Pending multicast delegate invocations keep both invocation list objects and argument values alive
+            foreach (var kv in _pendingDelegateInvocations)
+            {
+                var pending = kv.Value;
+                for (int i = 0; i < pending.Targets.Length; i++)
+                    TryMarkObject(pending.Targets[i]);
+
+                for (int i = 0; i < pending.Arguments.Length; i++)
+                    VisitSlotRoot(pending.Arguments[i]);
+            }
+
             // Active catch contexts
             for (int i = 0; i < _catchStack.Count; i++)
             {
@@ -1176,6 +1298,26 @@ namespace Cnidaria.Cs
                 var objType = _rts.GetTypeById(typeId);
 
                 VisitManagedRefCellsInObject(objAbs, objType, VisitRefCell, TryMarkObjectFromInteriorPointer);
+
+                if (_delegateDataByObject.TryGetValue(objAbs, out var delegateData))
+                {
+                    VisitSlotRoot(delegateData.Target);
+
+                    if (delegateData.InvocationList is { } invocationList)
+                    {
+                        for (int i = 0; i < invocationList.Length; i++)
+                            TryMarkObject(invocationList[i]);
+                    }
+                }
+
+                if (_closureDataByObject.TryGetValue(objAbs, out var closureData))
+                {
+                    for (int i = 0; i < closureData.Cells.Length; i++)
+                        VisitSlotRoot(closureData.Cells[i]);
+                }
+
+                if (_closureCellDataByObject.TryGetValue(objAbs, out var closureCellData))
+                    VisitSlotRoot(closureCellData.Value);
             }
             // Sweep
             var live = new List<int>(_heapObjects.Count);
@@ -1198,6 +1340,9 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
+                    _delegateDataByObject.Remove(objAbs);
+                    _closureDataByObject.Remove(objAbs);
+                    _closureCellDataByObject.Remove(objAbs);
                     Array.Clear(_mem, objAbs, size);
                     AddFreeBlock(objAbs, size);
                 }
@@ -1483,6 +1628,395 @@ namespace Cnidaria.Cs
 
             _heapObjects.Add(abs);
             return abs;
+        }
+
+        private static bool IsSystemDelegateBase(RuntimeType type)
+            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+               (StringComparer.Ordinal.Equals(type.Name, "Delegate") ||
+                StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate"));
+
+        private static bool IsDelegateLikeRuntimeType(RuntimeType type)
+        {
+            for (RuntimeType? t = type; t is not null; t = t.BaseType)
+            {
+                if (IsSystemDelegateBase(t))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsSameRuntimeType(RuntimeType a, RuntimeType b)
+            => a.TypeId == b.TypeId;
+
+        private int AllocClosureCellObject(RuntimeType valueType, Slot value)
+        {
+            if (value.Kind == SlotKind.Value)
+                throw new NotSupportedException("Capturing non-scalar struct values in lambdas is not implemented by closure cells yet.");
+
+            int objAbs = AllocObject(_rts.SystemObject);
+            _closureCellDataByObject[objAbs] = new ClosureCellData(valueType, value);
+            return objAbs;
+        }
+
+        private int AllocClosureObject(Slot[] cells)
+        {
+            int objAbs = AllocObject(_rts.SystemObject);
+            _closureDataByObject[objAbs] = new ClosureData(cells);
+            return objAbs;
+        }
+
+        private int GetObjectAbsFromSlot(Slot slot, string operandName)
+        {
+            if (slot.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+            if (slot.Kind != SlotKind.Ref)
+                throw new InvalidOperationException($"{operandName} must be an object reference.");
+            return checked((int)slot.Payload);
+        }
+
+        private void ExecNewClosureCell(RuntimeModule callerModule, int valueTypeToken)
+        {
+            var valueType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
+            var initialValue = PopSlot();
+            int objAbs = AllocClosureCellObject(valueType, initialValue);
+            PushSlot(new Slot(SlotKind.Ref, objAbs));
+        }
+
+        private void ExecLdClosureCell(RuntimeModule callerModule, int valueTypeToken)
+        {
+            var expectedType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
+            var cellSlot = PopSlot();
+            int cellObjAbs = GetObjectAbsFromSlot(cellSlot, "Closure cell");
+            if (!_closureCellDataByObject.TryGetValue(cellObjAbs, out var cell))
+                throw new InvalidOperationException("Object is not a VM closure cell.");
+
+            if (cell.ValueType.TypeId != expectedType.TypeId)
+                throw new InvalidOperationException($"Closure cell type mismatch: expected {expectedType.Namespace}.{expectedType.Name}, got {cell.ValueType.Namespace}.{cell.ValueType.Name}.");
+
+            PushSlot(cell.Value);
+        }
+
+        private void ExecStClosureCell(RuntimeModule callerModule, int valueTypeToken)
+        {
+            var expectedType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
+            var value = PopSlot();
+            if (value.Kind == SlotKind.Value)
+                throw new NotSupportedException("Capturing non-scalar struct values in lambdas is not implemented by closure cells yet.");
+
+            var cellSlot = PopSlot();
+            int cellObjAbs = GetObjectAbsFromSlot(cellSlot, "Closure cell");
+            if (!_closureCellDataByObject.TryGetValue(cellObjAbs, out var cell))
+                throw new InvalidOperationException("Object is not a VM closure cell.");
+
+            if (cell.ValueType.TypeId != expectedType.TypeId)
+                throw new InvalidOperationException($"Closure cell type mismatch: expected {expectedType.Namespace}.{expectedType.Name}, got {cell.ValueType.Namespace}.{cell.ValueType.Name}.");
+
+            cell.Value = value;
+        }
+
+        private void ExecNewClosure(int cellCount)
+        {
+            if (cellCount < 0)
+                throw new InvalidOperationException("Negative closure cell count.");
+
+            var cells = new Slot[cellCount];
+            for (int i = cellCount - 1; i >= 0; i--)
+            {
+                var cell = PopSlot();
+                int cellObjAbs = GetObjectAbsFromSlot(cell, "Closure cell");
+                if (!_closureCellDataByObject.ContainsKey(cellObjAbs))
+                    throw new InvalidOperationException("Closure can contain only VM closure cells.");
+                cells[i] = cell;
+            }
+
+            int objAbs = AllocClosureObject(cells);
+            PushSlot(new Slot(SlotKind.Ref, objAbs));
+        }
+
+        private void ExecLdClosureSlot(int slotIndex)
+        {
+            var closureSlot = PopSlot();
+            int closureObjAbs = GetObjectAbsFromSlot(closureSlot, "Closure");
+            if (!_closureDataByObject.TryGetValue(closureObjAbs, out var closure))
+                throw new InvalidOperationException("Object is not a VM closure.");
+
+            if ((uint)slotIndex >= (uint)closure.Cells.Length)
+                throw new InvalidOperationException("Closure slot index is out of range.");
+
+            PushSlot(closure.Cells[slotIndex]);
+        }
+
+        private int AllocDelegateObject(RuntimeType delegateType, int moduleId, int methodToken, Slot target, int[]? invocationList = null)
+        {
+            if (!IsDelegateLikeRuntimeType(delegateType))
+                throw new InvalidOperationException($"Type '{delegateType.Namespace}.{delegateType.Name}' is not a delegate type.");
+
+            int objAbs = AllocObject(delegateType);
+            _delegateDataByObject[objAbs] = new DelegateData(moduleId, methodToken, target, invocationList);
+            return objAbs;
+        }
+
+        private void ExecNewDelegate(RuntimeModule callerModule, int delegateTypeToken, int targetMethodToken)
+        {
+            var delegateType = _rts.ResolveTypeInMethodContext(callerModule, delegateTypeToken, _curLayout?.Method);
+            if (!IsDelegateLikeRuntimeType(delegateType))
+                throw new InvalidOperationException($"NewDelegate expects delegate type, got '{delegateType.Namespace}.{delegateType.Name}'.");
+
+            var targetMethod = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
+            if (targetMethod.HasThis)
+                throw new NotSupportedException("Closed instance delegates are not implemented by NewDelegate yet.");
+
+            int moduleId = _moduleIdByName[callerModule.Name];
+            int objAbs = AllocDelegateObject(delegateType, moduleId, targetMethodToken, new Slot(SlotKind.Null, 0));
+            PushSlot(new Slot(SlotKind.Ref, objAbs));
+        }
+
+        private void ExecNewDelegateClosed(RuntimeModule callerModule, int delegateTypeToken, int targetMethodToken)
+        {
+            var target = PopSlot();
+            if (target.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+            if (target.Kind != SlotKind.Ref)
+                throw new InvalidOperationException("Closed delegate target must be an object reference.");
+
+            var delegateType = _rts.ResolveTypeInMethodContext(callerModule, delegateTypeToken, _curLayout?.Method);
+            if (!IsDelegateLikeRuntimeType(delegateType))
+                throw new InvalidOperationException($"NewDelegateClosed expects delegate type, got '{delegateType.Namespace}.{delegateType.Name}'.");
+
+            _ = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
+
+            int moduleId = _moduleIdByName[callerModule.Name];
+            int objAbs = AllocDelegateObject(delegateType, moduleId, targetMethodToken, target);
+            PushSlot(new Slot(SlotKind.Ref, objAbs));
+        }
+
+        private int[] GetFlattenedDelegateTargets(int delegateObjAbs)
+        {
+            if (!_delegateDataByObject.TryGetValue(delegateObjAbs, out var data))
+                throw new InvalidOperationException("Object is not backed by VM delegate data.");
+
+            if (data.InvocationList is { } list)
+                return list;
+
+            return new[] { delegateObjAbs };
+        }
+
+        private void AppendFlattenedDelegateTargets(List<int> dst, int delegateObjAbs)
+        {
+            if (!_delegateDataByObject.TryGetValue(delegateObjAbs, out var data))
+                throw new InvalidOperationException("Object is not backed by VM delegate data.");
+
+            if (data.InvocationList is { } list)
+            {
+                for (int i = 0; i < list.Length; i++)
+                    dst.Add(list[i]);
+                return;
+            }
+
+            dst.Add(delegateObjAbs);
+        }
+
+        private void ValidateDelegateOperand(Slot slot, string operandName)
+        {
+            if (slot.Kind == SlotKind.Null)
+                return;
+
+            if (slot.Kind != SlotKind.Ref)
+                throw new InvalidOperationException($"{operandName} must be a delegate reference or null.");
+
+            int objAbs = checked((int)slot.Payload);
+            var type = GetObjectTypeFromRef(slot);
+            if (!IsDelegateLikeRuntimeType(type) || !_delegateDataByObject.ContainsKey(objAbs))
+                throw new InvalidOperationException($"{operandName} is not a VM delegate object.");
+        }
+
+        private Slot ExecDelegateCombine(Slot a, Slot b)
+        {
+            ValidateDelegateOperand(a, nameof(a));
+            ValidateDelegateOperand(b, nameof(b));
+
+            if (a.Kind == SlotKind.Null)
+                return b;
+            if (b.Kind == SlotKind.Null)
+                return a;
+
+            var aType = GetObjectTypeFromRef(a);
+            var bType = GetObjectTypeFromRef(b);
+            if (!IsSameRuntimeType(aType, bType))
+                throw new InvalidOperationException("Cannot combine delegates of different runtime types.");
+
+            var combined = new List<int>();
+            AppendFlattenedDelegateTargets(combined, checked((int)a.Payload));
+            AppendFlattenedDelegateTargets(combined, checked((int)b.Payload));
+
+            int moduleId = _moduleIdByName[(_curModule ?? throw new InvalidOperationException("No current module.")).Name];
+            int objAbs = AllocDelegateObject(aType, moduleId, methodToken: 0, new Slot(SlotKind.Null, 0), combined.ToArray());
+            return new Slot(SlotKind.Ref, objAbs);
+        }
+
+        private Slot ExecDelegateRemove(Slot source, Slot value)
+        {
+            ValidateDelegateOperand(source, nameof(source));
+            ValidateDelegateOperand(value, nameof(value));
+
+            if (source.Kind == SlotKind.Null || value.Kind == SlotKind.Null)
+                return source;
+
+            var sourceType = GetObjectTypeFromRef(source);
+            var valueType = GetObjectTypeFromRef(value);
+            if (!IsSameRuntimeType(sourceType, valueType))
+                return source;
+
+            var sourceTargets = new List<int>();
+            var valueTargets = new List<int>();
+            AppendFlattenedDelegateTargets(sourceTargets, checked((int)source.Payload));
+            AppendFlattenedDelegateTargets(valueTargets, checked((int)value.Payload));
+
+            if (valueTargets.Count == 0 || sourceTargets.Count < valueTargets.Count)
+                return source;
+
+            int removeAt = -1;
+            for (int i = sourceTargets.Count - valueTargets.Count; i >= 0; i--)
+            {
+                bool match = true;
+                for (int j = 0; j < valueTargets.Count; j++)
+                {
+                    if (sourceTargets[i + j] != valueTargets[j])
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match)
+                {
+                    removeAt = i;
+                    break;
+                }
+            }
+
+            if (removeAt < 0)
+                return source;
+
+            sourceTargets.RemoveRange(removeAt, valueTargets.Count);
+
+            if (sourceTargets.Count == 0)
+                return new Slot(SlotKind.Null, 0);
+
+            if (sourceTargets.Count == 1)
+                return new Slot(SlotKind.Ref, sourceTargets[0]);
+
+            int moduleId = _moduleIdByName[(_curModule ?? throw new InvalidOperationException("No current module.")).Name];
+            int objAbs = AllocDelegateObject(sourceType, moduleId, methodToken: 0, new Slot(SlotKind.Null, 0), sourceTargets.ToArray());
+            return new Slot(SlotKind.Ref, objAbs);
+        }
+
+        private void ExecDelegateInvoke(RuntimeModule callerModule, int invokeMethodToken, int argCount, CancellationToken ct, ExecutionLimits limits)
+        {
+            var invokeMethod = ResolveRuntimeMethodOrThrow(callerModule, invokeMethodToken, _curLayout?.Method);
+            if (!IsDelegateLikeRuntimeType(invokeMethod.DeclaringType) ||
+                !StringComparer.Ordinal.Equals(invokeMethod.Name, "Invoke"))
+            {
+                throw new InvalidOperationException("DelegateInvoke expects a delegate Invoke method token.");
+            }
+
+            var args = new Slot[argCount];
+            for (int i = argCount - 1; i >= 0; i--)
+                args[i] = PopSlot();
+
+            var receiver = PopSlot();
+            if (receiver.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+            if (receiver.Kind != SlotKind.Ref)
+                throw new InvalidOperationException("DelegateInvoke receiver must be a delegate reference.");
+
+            int delegateObjAbs = checked((int)receiver.Payload);
+            var receiverType = GetObjectTypeFromRef(receiver);
+            if (!IsDelegateLikeRuntimeType(receiverType))
+                throw new InvalidOperationException($"DelegateInvoke receiver is not a delegate: {receiverType.Namespace}.{receiverType.Name}.");
+
+            if (argCount != invokeMethod.ParameterTypes.Length)
+                throw new InvalidOperationException($"DelegateInvoke arg count mismatch: expected {invokeMethod.ParameterTypes.Length}, got {argCount}.");
+
+            var targets = GetFlattenedDelegateTargets(delegateObjAbs);
+            if (targets.Length == 0)
+                throw new InvalidOperationException("Delegate invocation list is empty.");
+
+            var context = new PendingDelegateInvocation(invokeMethod, targets, args);
+            StartDelegateInvocationTarget(context, 0, ct, limits);
+        }
+
+        private void StartDelegateInvocationTarget(PendingDelegateInvocation context, int targetIndex, CancellationToken ct, ExecutionLimits limits)
+        {
+            if ((uint)targetIndex >= (uint)context.Targets.Length)
+                throw new InvalidOperationException("Delegate invocation target index out of range.");
+
+            int delegateObjAbs = context.Targets[targetIndex];
+            if (!_delegateDataByObject.TryGetValue(delegateObjAbs, out var delegateData))
+                throw new InvalidOperationException("Delegate target object is missing VM delegate data.");
+
+            if (delegateData.InvocationList is not null)
+                throw new InvalidOperationException("Nested multicast delegate target was not flattened.");
+
+            if ((uint)delegateData.ModuleId >= (uint)_moduleById.Length)
+                throw new InvalidOperationException("Delegate target module id is out of range.");
+
+            var targetModule = _moduleById[delegateData.ModuleId];
+            var targetMethod = ResolveRuntimeMethodOrThrow(targetModule, delegateData.MethodToken);
+
+            bool hasClosedStaticTarget = !targetMethod.HasThis && delegateData.Target.Kind != SlotKind.Null;
+            int expectedParameterCount = context.Arguments.Length + (hasClosedStaticTarget ? 1 : 0);
+            if (targetMethod.ParameterTypes.Length != expectedParameterCount)
+            {
+                throw new InvalidOperationException(
+                    $"Delegate target arg count mismatch: method expects {targetMethod.ParameterTypes.Length}, delegate supplied {context.Arguments.Length} plus {(hasClosedStaticTarget ? 1 : 0)} closed target argument(s).");
+            }
+
+            int totalTargetArgs = context.Arguments.Length + (targetMethod.HasThis || hasClosedStaticTarget ? 1 : 0);
+            var initialArgs = new Slot[totalTargetArgs];
+            int dst = 0;
+            if (targetMethod.HasThis)
+            {
+                if (delegateData.Target.Kind == SlotKind.Null)
+                    throw new InvalidOperationException("Open instance delegate invocation is not implemented.");
+
+                initialArgs[dst++] = delegateData.Target;
+            }
+            else if (hasClosedStaticTarget)
+            {
+                initialArgs[dst++] = delegateData.Target;
+            }
+
+            for (int i = 0; i < context.Arguments.Length; i++)
+                initialArgs[dst++] = context.Arguments[i];
+
+            var targetFn = targetMethod.Body;
+            if (targetMethod.BodyModule is null || targetFn is null)
+            {
+                throw new MissingMethodException(
+                    $"No body for delegate target: {targetMethod.DeclaringType.Namespace}.{targetMethod.DeclaringType.Name}.{targetMethod.Name}");
+            }
+
+            var callerFn = _curFn ?? throw new InvalidOperationException("No current function.");
+            int callerModuleId = ReadI32(_frameBase + 20);
+            int returnPc = _curPc;
+
+            context.NextIndex = targetIndex + 1;
+
+            PushFrame(
+                targetMethod.BodyModule,
+                targetFn,
+                returnPc: returnPc,
+                returnMethodToken: callerFn.MethodToken,
+                returnModuleId: callerModuleId,
+                ct,
+                limits,
+                runtimeMethod: targetMethod,
+                initialArgs: initialArgs);
+
+            if (context.NextIndex < context.Targets.Length)
+                _pendingDelegateInvocations[_frameBase] = context;
         }
 
         private int AllocStringUninitialized(int length)
@@ -1894,6 +2428,12 @@ namespace Cnidaria.Cs
                             Consider(f.FieldType);
                             break;
                         }
+
+                    case BytecodeOp.NewClosureCell:
+                    case BytecodeOp.LdClosureCell:
+                    case BytecodeOp.StClosureCell:
+                        Consider(_rts.ResolveTypeInMethodContext(module, ins.Operand0, rm));
+                        break;
 
                     case BytecodeOp.Newobj:
                         {
@@ -3101,7 +3641,7 @@ namespace Cnidaria.Cs
             if (!TryBeginFinallyForJump(fn, fromPc: fromPc, targetPc: targetPc))
                 _curPc = targetPc;
         }
-        private void ExecEndfinally(int pc)
+        private void ExecEndfinally(int pc, CancellationToken ct, ExecutionLimits limits)
         {
             if (_finallyStack.Count == 0 || _finallyStack[_finallyStack.Count - 1].FrameBase != _frameBase)
                 throw new InvalidOperationException("Endfinally without an active finally context.");
@@ -3133,13 +3673,13 @@ namespace Cnidaria.Cs
                 if (TryBeginFinallyForReturn(fn, fromPc: ctx.NextFromPc, hasRet: ctx.HasReturnValue, retVal: ctx.ReturnValue))
                     return;
 
-                CompleteReturnFromCurrentFrame(ctx.HasReturnValue, ctx.ReturnValue);
+                CompleteReturnFromCurrentFrame(ctx.HasReturnValue, ctx.ReturnValue, ct, limits);
                 return;
             }
 
             throw new InvalidOperationException("Unknown finally continuation kind.");
         }
-        private void CompleteReturnFromCurrentFrame(bool hasRet, Slot retVal)
+        private void CompleteReturnFromCurrentFrame(bool hasRet, Slot retVal, CancellationToken ct, ExecutionLimits limits)
         {
             int finishedFrame = _frameBase;
             ClearCatchContextsForFrame(finishedFrame);
@@ -3168,6 +3708,22 @@ namespace Cnidaria.Cs
                     PushSlot(LoadValueAsSlot((int)pending.Payload, 0, pending.Type!));
                 else
                     throw new InvalidOperationException("Unknown pending ctor result kind.");
+            }
+            else if (_pendingDelegateInvocations.TryGetValue(finishedFrame, out var delegateInvocation))
+            {
+                _pendingDelegateInvocations.Remove(finishedFrame);
+
+                if (_frameBase < 0)
+                    throw new InvalidOperationException("Delegate target returned but there is no caller frame.");
+
+                if (delegateInvocation.NextIndex < delegateInvocation.Targets.Length)
+                {
+                    StartDelegateInvocationTarget(delegateInvocation, delegateInvocation.NextIndex, ct, limits);
+                    return;
+                }
+
+                if (hasRet)
+                    PushSlot(retVal);
             }
             else if (_frameBase >= 0 && hasRet)
             {
@@ -3500,6 +4056,7 @@ namespace Cnidaria.Cs
                 int curBase = _frameBase;
                 ClearCatchContextsForFrame(curBase);
                 _pendingCtorResults.Remove(curBase);
+                _pendingDelegateInvocations.Remove(curBase);
                 if (_pendingTypeInitFrames.TryGetValue(curBase, out int typeId))
                 {
                     _pendingTypeInitFrames.Remove(curBase);
@@ -5498,6 +6055,28 @@ namespace Cnidaria.Cs
         }
         private bool TryInvokeIntrinsic(RuntimeMethod rm, int totalArgs, CancellationToken ct)
         {
+            if (rm.DeclaringType.Namespace == "System" &&
+                rm.DeclaringType.Name == "Delegate" &&
+                !rm.HasThis &&
+                totalArgs == 2)
+            {
+                if (StringComparer.Ordinal.Equals(rm.Name, "Combine"))
+                {
+                    var b = PopSlot();
+                    var a = PopSlot();
+                    PushSlot(ExecDelegateCombine(a, b));
+                    return true;
+                }
+
+                if (StringComparer.Ordinal.Equals(rm.Name, "Remove"))
+                {
+                    var value = PopSlot();
+                    var source = PopSlot();
+                    PushSlot(ExecDelegateRemove(source, value));
+                    return true;
+                }
+            }
+
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
             {
                 // instance int get_Length()

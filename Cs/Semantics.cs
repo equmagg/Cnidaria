@@ -956,7 +956,7 @@ namespace Cnidaria.Cs
             }
 
         }
-        
+
         private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
             Compilation compilation,
             SyntaxTree tree,
@@ -1343,6 +1343,15 @@ namespace Cnidaria.Cs
                     case BoundMemberAccessExpression ma:
                         return new SymbolInfo(ma.Member, ImmutableArray<Symbol>.Empty, CandidateReason.None);
 
+                    case BoundMethodGroupExpression mg:
+                        {
+                            var candidates = mg.Methods.Cast<Symbol>().ToImmutableArray();
+                            return new SymbolInfo(
+                                mg.Methods.Length == 1 ? mg.Methods[0] : null,
+                                candidates,
+                                candidates.IsDefaultOrEmpty ? CandidateReason.None : CandidateReason.OverloadResolutionFailure);
+                        }
+
                     case BoundLabelExpression l:
                         return new SymbolInfo(l.Label, ImmutableArray<Symbol>.Empty, CandidateReason.None);
 
@@ -1364,6 +1373,9 @@ namespace Cnidaria.Cs
         {
             var b = GetBoundNode(expr, cancellationToken);
             if (b is not BoundExpression be)
+                return new TypeInfo(type: null, convertedType: null);
+
+            if (be is BoundMethodGroupExpression)
                 return new TypeInfo(type: null, convertedType: null);
 
             if (be is BoundConversionExpression conv)
@@ -1397,6 +1409,9 @@ namespace Cnidaria.Cs
 
             if (b is BoundFixedInitializerExpression fixedInit)
                 return fixedInit.ElementPointerConversion;
+
+            if (b is BoundMethodGroupExpression)
+                return new Conversion(ConversionKind.None);
 
             if (b is BoundExpression be && be.Type is not null)
                 return new Conversion(ConversionKind.Identity);
@@ -2400,6 +2415,7 @@ namespace Cnidaria.Cs
         ArrayCreation,
         ArrayElementAccess,
         StackAllocArrayCreation,
+        SpanCollection,
         AddressOf,
         RefExpression,
         PointerIndirection,
@@ -2410,6 +2426,13 @@ namespace Cnidaria.Cs
         CheckedExpression,
         UncheckedExpression,
         ThrowExpression,
+        UnboundLambda,
+        MethodGroup,
+        Lambda,
+        ClosureCellCreation,
+        ClosureCreation,
+        ClosureSlot,
+        ClosureAccess,
         IsPatternExpression,
         // Statements
         BadStatement,

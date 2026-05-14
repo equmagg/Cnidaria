@@ -56,6 +56,8 @@ namespace Cnidaria.Cs
         Call,
         VirtualCall,
         NewObject,
+        NewDelegate,
+        DelegateInvoke,
 
         Field,
         FieldAddr,
@@ -2398,6 +2400,35 @@ namespace Cnidaria.Cs
                             break;
                         }
 
+                    case BytecodeOp.NewClosureCell:
+                        EmitNewClosureCell(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.LdClosureCell:
+                        EmitLoadClosureCell(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.StClosureCell:
+                        EmitStoreClosureCell(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.NewClosure:
+                        EmitNewClosure(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.LdClosureSlot:
+                        EmitLoadClosureSlot(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.NewDelegate:
+                    case BytecodeOp.NewDelegateClosed:
+                        EmitNewDelegate(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.DelegateInvoke:
+                        EmitDelegateInvoke(stack, statements, pc, ins);
+                        break;
+
                     case BytecodeOp.Br:
                         {
                             AddSuccessor(successorPcs, ins.Operand0);
@@ -2936,6 +2967,164 @@ namespace Cnidaria.Cs
 
             PushImportedValue(stack, statements, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
                 int32: ins.Operand0, runtimeType: runtimeType));
+        }
+
+        private RuntimeType ObjectArrayType => _rts.GetArrayType(_rts.SystemObject);
+
+        private GenTemp MaterializeImporterValue(List<GenTree> statements, int pc, BytecodeOp sourceOp, GenTree value)
+        {
+            var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
+            statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(value), int32: temp.Index));
+            return temp;
+        }
+
+        private GenTree ConstI4(int pc, BytecodeOp sourceOp, int value)
+            => Node(GenTreeKind.ConstI4, pc, sourceOp, stackKind: GenStackKind.I4, int32: value);
+
+        private GenTree BoxIfNeeded(int pc, BytecodeOp sourceOp, RuntimeType valueType, GenTree value)
+        {
+            if (!valueType.IsValueType)
+                return value;
+
+            return Node(GenTreeKind.Box, pc, BytecodeOp.Box, type: _rts.SystemObject, stackKind: GenStackKind.Ref,
+                operands: One(value), int32: valueType.TypeId, runtimeType: valueType);
+        }
+
+        private GenTree UnboxOrCastCellValue(int pc, BytecodeOp sourceOp, RuntimeType valueType, GenTree boxed)
+        {
+            if (valueType.IsValueType)
+            {
+                return Node(GenTreeKind.UnboxAny, pc, BytecodeOp.UnboxAny, type: valueType, stackKind: StackKindOf(valueType),
+                    operands: One(boxed), int32: valueType.TypeId, runtimeType: valueType);
+            }
+
+            if (ReferenceEquals(valueType, _rts.SystemObject))
+                return boxed;
+
+            return Node(GenTreeKind.CastClass, pc, BytecodeOp.CastClass, type: valueType, stackKind: GenStackKind.Ref,
+                operands: One(boxed), int32: valueType.TypeId, runtimeType: valueType);
+        }
+
+        private GenTemp AllocateObjectArrayTemp(List<GenTree> statements, int pc, BytecodeOp sourceOp, int length)
+        {
+            var len = ConstI4(pc, sourceOp, length);
+            var array = Node(GenTreeKind.NewArray, pc, BytecodeOp.Newarr, type: ObjectArrayType, stackKind: GenStackKind.Ref,
+                operands: One(len), runtimeType: _rts.SystemObject);
+            return MaterializeImporterValue(statements, pc, sourceOp, array);
+        }
+
+        private void StoreObjectArrayElement(List<GenTree> statements, int pc, BytecodeOp sourceOp, GenTree array, int index, GenTree value)
+        {
+            statements.Add(Node(GenTreeKind.StoreArrayElement, pc, BytecodeOp.Stelem,
+                operands: ImmutableArray.Create(array, ConstI4(pc, sourceOp, index), value),
+                runtimeType: _rts.SystemObject));
+        }
+
+        private GenTree LoadObjectArrayElement(int pc, BytecodeOp sourceOp, GenTree array, int index)
+            => Node(GenTreeKind.ArrayElement, pc, BytecodeOp.Ldelem, type: _rts.SystemObject, stackKind: GenStackKind.Ref,
+                operands: Two(array, ConstI4(pc, sourceOp, index)), runtimeType: _rts.SystemObject);
+
+        private void EmitNewClosureCell(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var initial = Pop(stack, pc, ins.Op);
+            var valueType = ResolveType(ins.Operand0);
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
+            GenTree stored = BoxIfNeeded(pc, ins.Op, valueType, initial.Node);
+            if (stored.Kind == GenTreeKind.Box)
+                stored = TempLoad(pc, ins.Op, MaterializeImporterValue(statements, pc, ins.Op, stored)).Node;
+
+            var cellTemp = AllocateObjectArrayTemp(statements, pc, ins.Op, 1);
+            StoreObjectArrayElement(statements, pc, ins.Op, TempLoad(pc, ins.Op, cellTemp).Node, 0, stored);
+
+            Push(stack, new StackValue(TempLoad(pc, ins.Op, cellTemp).Node, _rts.SystemObject, GenStackKind.Ref));
+        }
+
+        private void EmitLoadClosureCell(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var cell = Pop(stack, pc, ins.Op);
+            var valueType = ResolveType(ins.Operand0);
+            var boxed = LoadObjectArrayElement(pc, ins.Op, cell.Node, 0);
+            PushImportedValue(stack, statements, UnboxOrCastCellValue(pc, ins.Op, valueType, boxed));
+        }
+
+        private void EmitStoreClosureCell(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var value = Pop(stack, pc, ins.Op);
+            var cell = Pop(stack, pc, ins.Op);
+            var valueType = ResolveType(ins.Operand0);
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
+            GenTree stored = BoxIfNeeded(pc, ins.Op, valueType, value.Node);
+            if (stored.Kind == GenTreeKind.Box)
+                stored = TempLoad(pc, ins.Op, MaterializeImporterValue(statements, pc, ins.Op, stored)).Node;
+
+            StoreObjectArrayElement(statements, pc, ins.Op, cell.Node, 0, stored);
+        }
+
+        private void EmitNewClosure(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            int count = ins.Operand0;
+            var cells = PopMany(stack, count, pc, ins.Op);
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
+            var closureTemp = AllocateObjectArrayTemp(statements, pc, ins.Op, count);
+            for (int i = 0; i < cells.Length; i++)
+                StoreObjectArrayElement(statements, pc, ins.Op, TempLoad(pc, ins.Op, closureTemp).Node, i, cells[i]);
+
+            Push(stack, new StackValue(TempLoad(pc, ins.Op, closureTemp).Node, _rts.SystemObject, GenStackKind.Ref));
+        }
+
+        private void EmitLoadClosureSlot(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var closure = Pop(stack, pc, ins.Op);
+            PushImportedValue(stack, statements, LoadObjectArrayElement(pc, ins.Op, closure.Node, ins.Operand0));
+        }
+
+        private void EmitNewDelegate(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var delegateType = ResolveType(ins.Operand0);
+            var targetMethod = _rts.ResolveMethodInMethodContext(_module, ins.Operand1, _method);
+            AddDirectDependency(targetMethod);
+            if (targetMethod.IsStatic && !StringComparer.Ordinal.Equals(targetMethod.Name, ".cctor"))
+                AddTypeInitializerDependency(targetMethod.DeclaringType);
+
+            ImmutableArray<GenTree> operands;
+            if (ins.Op == BytecodeOp.NewDelegateClosed)
+                operands = One(Pop(stack, pc, ins.Op).Node);
+            else
+                operands = ImmutableArray<GenTree>.Empty;
+
+            PushImportedValue(stack, statements, Node(GenTreeKind.NewDelegate, pc, ins.Op, type: delegateType, stackKind: GenStackKind.Ref,
+                operands: operands, int64: targetMethod.MethodId, runtimeType: delegateType, method: targetMethod));
+        }
+
+        private void EmitDelegateInvoke(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            int argCount = ins.Operand1;
+            var args = PopMany(stack, checked(argCount + 1), pc, ins.Op);
+            var invoke = _rts.ResolveMethodInMethodContext(_module, ins.Operand0, _method);
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
+            bool returnsVoid = IsVoid(invoke.ReturnType);
+            var call = Node(GenTreeKind.DelegateInvoke,
+                pc,
+                ins.Op,
+                type: returnsVoid ? null : invoke.ReturnType,
+                stackKind: returnsVoid ? GenStackKind.Void : StackKindOf(invoke.ReturnType),
+                operands: args,
+                int32: args.Length,
+                int64: ins.Operand0,
+                method: invoke);
+
+            if (returnsVoid)
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(call)));
+            else
+                PushImportedValue(stack, statements, call);
         }
 
         private void EmitCall(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins, bool isVirtual)
@@ -3849,6 +4038,7 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.ContainsCall | GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
                     break;
 
+                case GenTreeKind.NewDelegate:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
@@ -3888,6 +4078,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
+                case GenTreeKind.DelegateInvoke:
                     flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
                     break;
 
@@ -4240,13 +4431,19 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
-                    sb.Append(node.Kind == GenTreeKind.VirtualCall ? "callvirt " : "call ");
+                case GenTreeKind.DelegateInvoke:
+                    sb.Append(node.Kind == GenTreeKind.VirtualCall ? "callvirt " : node.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ");
                     sb.Append(MethodName(node.Method)).Append('(');
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
                 case GenTreeKind.NewObject:
                     sb.Append("newobj ").Append(MethodName(node.Method)).Append('(');
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
+                case GenTreeKind.NewDelegate:
+                    sb.Append("newdelegate ").Append(TypeName(node.RuntimeType)).Append(" -> ").Append(MethodName(node.Method)).Append('(');
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;

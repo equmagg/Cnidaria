@@ -284,10 +284,12 @@ namespace Cnidaria.Cs
             {
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
+                case GenTreeKind.DelegateInvoke:
                 case GenTreeKind.NewObject:
                     flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
                     break;
 
+                case GenTreeKind.NewDelegate:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
@@ -895,8 +897,12 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.Call:
                     case GenTreeKind.VirtualCall:
+                    case GenTreeKind.DelegateInvoke:
                     case GenTreeKind.NewObject:
                         EmitCallLike(instruction, source);
+                        return;
+                    case GenTreeKind.NewDelegate:
+                        EmitNewDelegate(instruction, source);
                         return;
                     case GenTreeKind.NewArray:
                         _asm.NewSZArray(RequireResultRegister(instruction), RequireUseRegister(instruction, 0), RequireRuntimeType(source).TypeId);
@@ -1851,6 +1857,30 @@ namespace Cnidaria.Cs
                     _asm.RetRef(first.Register);
                 else
                     _asm.RetI(first.Register);
+            }
+
+            private void EmitNewDelegate(GenTree instruction, GenTree source)
+            {
+                var delegateType = source.RuntimeType ?? source.Type ?? throw Unsupported(instruction, "delegate node has no delegate type");
+                var targetMethod = source.Method ?? throw Unsupported(instruction, "delegate node has no target method");
+                var result = RequireResultRegister(instruction);
+                long descriptor = ((long)(uint)delegateType.TypeId << 32) | (uint)targetMethod.MethodId;
+
+                if (instruction.Uses.Length == 0)
+                {
+                    _asm.Emit(new InstrDesc(Op.NewDelegate, RegisterVmIsa.EncodeRegister(result),
+                        aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: descriptor));
+                    return;
+                }
+
+                if (instruction.Uses.Length != 1)
+                    throw Unsupported(instruction, "closed delegate construction requires exactly one target operand");
+
+                _asm.Emit(new InstrDesc(Op.NewDelegateClosed,
+                    RegisterVmIsa.EncodeRegister(result),
+                    RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                    aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
+                    imm: descriptor));
             }
 
             private void EmitCallLike(GenTree instruction, GenTree source)
@@ -3530,8 +3560,18 @@ namespace Cnidaria.Cs
                 bool isFloat = !isValue && (returnAbi.RegisterClass == RegisterClass.Float || resultClass == RegisterClass.Float || returnType.Name is "Single" or "Double");
                 bool isRef = !isValue && (returnAbi.ContainsGcPointers || returnType.IsReferenceType);
                 bool internalCall = method.HasInternalCall;
+                bool delegateInvoke = treeKind == GenTreeKind.DelegateInvoke;
                 bool virt = treeKind == GenTreeKind.VirtualCall;
                 bool iface = virt && method.DeclaringType.Kind == RuntimeTypeKind.Interface;
+
+                if (delegateInvoke)
+                {
+                    if (isVoid) return Op.DelegateInvokeVoid;
+                    if (isValue) return Op.DelegateInvokeValue;
+                    if (isFloat) return Op.DelegateInvokeF;
+                    if (isRef) return Op.DelegateInvokeRef;
+                    return Op.DelegateInvokeI;
+                }
 
                 if (iface)
                 {
@@ -3633,7 +3673,9 @@ namespace Cnidaria.Cs
                 return instruction.TreeKind is
                     GenTreeKind.Call or
                     GenTreeKind.VirtualCall or
+                    GenTreeKind.DelegateInvoke or
                     GenTreeKind.NewObject or
+                    GenTreeKind.NewDelegate or
                     GenTreeKind.NewArray or
                     GenTreeKind.Box or
                     GenTreeKind.UnboxAny or

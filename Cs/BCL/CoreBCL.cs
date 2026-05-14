@@ -244,9 +244,18 @@
         private static bool CopyInternal(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
             => false;
     }
+
     public abstract unsafe class Delegate
     {
+        internal object? _target; // do not rename
+        internal nint _methodPtr; // do not rename
+        internal nint _methodModule;
 
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static Delegate? Combine(Delegate? a, Delegate? b) => null;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static Delegate? Remove(Delegate? source, Delegate? value) => null;
     }
     public abstract class MulticastDelegate : Delegate
     {
@@ -1625,7 +1634,7 @@
             => (System.Globalization.UnicodeCategory)(Latin1CharInfo[c] & UnicodeCategoryMask);
     }
 
-    public struct SByte
+    public readonly struct SByte
     {
         private readonly sbyte m_value;
         public const sbyte MaxValue = (sbyte)0x7F;
@@ -1679,7 +1688,7 @@
             return System.Number.Int32ToString((int)m_value);
         }
     }
-    public struct Byte
+    public readonly struct Byte
     {
         private readonly byte m_value;
         public const byte MaxValue = (byte)0xFF;
@@ -1733,7 +1742,7 @@
             return System.Number.UInt32ToString((uint)m_value);
         }
     }
-    public struct Int16
+    public readonly struct Int16
     {
         private readonly short m_value;
         public const short MaxValue = (short)0x7FFF;
@@ -1784,10 +1793,14 @@
 
         public override string ToString()
         {
-            return System.Number.Int32ToString((int)m_value);
+            return System.Number.FormatInt32((int)m_value, 0, null, null);
+        }
+        public string ToString(string format)
+        {
+            return System.Number.FormatInt32((int)m_value, 0xFFFF, format, null);
         }
     }
-    public struct UInt16
+    public readonly struct UInt16
     {
         private readonly ushort m_value;
         public const ushort MaxValue = (ushort)0xFFFF;
@@ -1840,8 +1853,12 @@
         {
             return System.Number.UInt32ToString((uint)m_value);
         }
+        public string ToString(string format)
+        {
+            return System.Number.FormatInt32(m_value, 0, format, null);
+        }
     }
-    public struct Int32
+    public readonly struct Int32
     {
         private readonly int m_value;
         public const int MaxValue = 0x7fffffff;
@@ -1892,10 +1909,18 @@
 
         public override string ToString()
         {
-            return System.Number.Int32ToString(m_value);
+            return System.Number.FormatInt32(m_value, 0, null, null);
+        }
+        public string ToString(string? format)
+        {
+            return System.Number.FormatInt32(m_value, 0, format, null);
+        }
+        public string ToString(IFormatProvider? provider)
+        {
+            return System.Number.FormatInt32(m_value, 0, null, provider);
         }
     }
-    public struct UInt32
+    public readonly struct UInt32
     {
         private readonly uint m_value;
         public const uint MaxValue = (uint)0xffffffff;
@@ -1926,6 +1951,8 @@
             return 0;
         }
 
+        public static uint Log2(uint value) => (uint)BitOperations.Log2(value);
+
         public static uint Parse(ReadOnlySpan<char> s)
         {
             uint r;
@@ -1954,10 +1981,14 @@
 
         public override string ToString()
         {
-            return System.Number.UInt32ToString(m_value);
+            return System.Number.FormatUInt32(m_value, null, null);
+        }
+        public string ToString(string format)
+        {
+            return System.Number.FormatUInt32(m_value, format, null);
         }
     }
-    public struct Int64
+    public readonly struct Int64
     {
         private readonly long m_value;
         public const long MaxValue = 0x7fffffffffffffffL;
@@ -2017,18 +2048,18 @@
 
         public override string ToString()
         {
-            return System.Number.Int64ToString(m_value, null);
+            return System.Number.FormatInt64(m_value, null, null);
         }
-        public string ToString(IFormatProvider provider)
+        public string ToString(IFormatProvider? provider)
         {
-            return System.Number.Int64ToString(m_value, null);
+            return System.Number.FormatInt64(m_value, null, provider);
         }
         public string ToString(string format)
         {
-            return System.Number.Int64ToString(m_value, format);
+            return System.Number.FormatInt64(m_value, format, null);
         }
     }
-    public struct UInt64
+    public readonly struct UInt64
     {
         private readonly ulong m_value;
         public const ulong MaxValue = (ulong)0xffffffffffffffffL;
@@ -2058,6 +2089,8 @@
             return ((int)m_value) ^ (int)(m_value >> 32);
         }
 
+        public static ulong Log2(ulong value) => (ulong)System.Numerics.BitOperations.Log2(value);
+
         public static ulong Parse(ReadOnlySpan<char> s)
         {
             ulong r;
@@ -2086,7 +2119,15 @@
 
         public override string ToString()
         {
-            return System.Number.UInt64ToString(m_value);
+            return System.Number.FormatUInt64(m_value, null, null);
+        }
+        public string ToString(IFormatProvider? provider)
+        {
+            return System.Number.FormatUInt64(m_value, null, provider);
+        }
+        public string ToString(string format)
+        {
+            return System.Number.FormatUInt64(m_value, format, null);
         }
     }
     public struct Single
@@ -2176,15 +2217,15 @@
 
         public override string ToString()
         {
-            return System.Number.SingleToString(m_value);
+            return System.Number.FormatFloat(m_value, null, null);
         }
-        public string ToString(System.Globalization.CultureInfo cultureInfo)
+        public string ToString(IFormatProvider? provider)
         {
-            return System.Number.SingleToString(m_value);
+            return System.Number.FormatFloat(m_value, null, null);
         }
-        public string ToString(string format, System.Globalization.CultureInfo cultureInfo)
+        public string ToString(string? format)
         {
-            return System.Number.SingleToString(m_value);
+            return System.Number.FormatFloat(m_value, format, null);
         }
         public static float Abs(float value) => MathF.Abs(value);
 
@@ -2275,15 +2316,11 @@
 
         public override string ToString()
         {
-            return System.Number.DoubleToString(m_value);
+            return System.Number.FormatDouble(m_value, null, null);
         }
-        public string ToString(System.Globalization.CultureInfo cultureInfo)
+        public string ToString(string? format)
         {
-            return System.Number.DoubleToString(m_value);
-        }
-        public string ToString(string format, System.Globalization.CultureInfo cultureInfo)
-        {
-            return System.Number.DoubleToString(m_value);
+            return System.Number.FormatDouble(m_value, format, null);
         }
 
         public override bool Equals([NotNullWhen(true)] object? obj)
@@ -2381,7 +2418,7 @@
 
         public override string ToString()
         {
-            return System.Number.DoubleToString((double)m_value);
+            return System.Number.FormatDouble((double)m_value, null, null);
         }
     }
 
@@ -2628,9 +2665,185 @@
                 || (left._upper == right._upper) && (left._lower >= right._lower);
         }
     }
+    internal static class FormattingHelpers
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int CountDigits(ulong value)
+        {
+            // Map the log2(value) to a power of 10.
+            ReadOnlySpan<byte> log2ToPow10 =
+            [
+                1,  1,  1,  2,  2,  2,  3,  3,  3,  4,  4,  4,  4,  5,  5,  5,
+                6,  6,  6,  7,  7,  7,  7,  8,  8,  8,  9,  9,  9,  10, 10, 10,
+                10, 11, 11, 11, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 15, 15,
+                15, 16, 16, 16, 16, 17, 17, 17, 18, 18, 18, 19, 19, 19, 19, 20
+            ];
 
+            nint elementOffset = log2ToPow10[(int)ulong.Log2(value)];
+
+            // Read the associated power of 10.
+            ReadOnlySpan<ulong> powersOf10 =
+            [
+                0, // unused entry to avoid needing to subtract
+                0,
+                10,
+                100,
+                1000,
+                10000,
+                100000,
+                1000000,
+                10000000,
+                100000000,
+                1000000000,
+                10000000000,
+                100000000000,
+                1000000000000,
+                10000000000000,
+                100000000000000,
+                1000000000000000,
+                10000000000000000,
+                100000000000000000,
+                1000000000000000000,
+                10000000000000000000,
+            ];
+
+            ulong powerOf10 = Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference<ulong>(powersOf10), elementOffset);
+
+            // Return the number of digits based on the power of 10, shifted by 1
+            // if it falls below the threshold.
+            int index = (int)elementOffset;
+            return index - (value < powerOf10 ? 1 : 0);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int CountDigits(uint value)
+        {
+            ReadOnlySpan<long> table =
+            [
+                4294967296,
+                8589934582,
+                8589934582,
+                8589934582,
+                12884901788,
+                12884901788,
+                12884901788,
+                17179868184,
+                17179868184,
+                17179868184,
+                21474826480,
+                21474826480,
+                21474826480,
+                21474826480,
+                25769703776,
+                25769703776,
+                25769703776,
+                30063771072,
+                30063771072,
+                30063771072,
+                34349738368,
+                34349738368,
+                34349738368,
+                34349738368,
+                38554705664,
+                38554705664,
+                38554705664,
+                41949672960,
+                41949672960,
+                41949672960,
+                42949672960,
+                42949672960,
+            ];
+
+            long tableValue = table[(int)uint.Log2(value)];
+            return (int)((value + tableValue) >> 32);
+        }
+
+        // Counts the number of trailing '0' digits in a decimal number.
+        // e.g., value =      0 => retVal = 0, valueWithoutTrailingZeros = 0
+        //       value =   1234 => retVal = 0, valueWithoutTrailingZeros = 1234
+        //       value = 320900 => retVal = 2, valueWithoutTrailingZeros = 3209
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int CountDecimalTrailingZeros(uint value, out uint valueWithoutTrailingZeros)
+        {
+            int zeroCount = 0;
+
+            if (value != 0)
+            {
+                while (true)
+                {
+                    uint temp = value / 10;
+                    if (value != (temp * 10))
+                    {
+                        break;
+                    }
+
+                    value = temp;
+                    zeroCount++;
+                }
+            }
+
+            valueWithoutTrailingZeros = value;
+            return zeroCount;
+        }
+    }
+    public sealed class NumberFormatInfo
+    {
+        internal string _positiveSign = "+";
+        internal string _negativeSign = "-";
+        internal string _numberDecimalSeparator = ".";
+        internal string _numberGroupSeparator = ",";
+        internal string _currencyGroupSeparator = ",";
+        internal string _currencyDecimalSeparator = ".";
+        internal string _currencySymbol = "\x00a4"; 
+        internal string _nanSymbol = "NaN";
+        internal string _positiveInfinitySymbol = "Infinity";
+        internal string _negativeInfinitySymbol = "-Infinity";
+        internal string _percentDecimalSeparator = ".";
+        internal string _percentGroupSeparator = ",";
+        internal string _percentSymbol = "%";
+        internal string _perMilleSymbol = "\u2030";
+
+        internal byte[]? _positiveSignUtf8;
+        internal byte[]? _negativeSignUtf8;
+        internal byte[]? _currencySymbolUtf8;
+        internal byte[]? _numberDecimalSeparatorUtf8;
+        internal byte[]? _currencyDecimalSeparatorUtf8;
+        internal byte[]? _currencyGroupSeparatorUtf8;
+        internal byte[]? _numberGroupSeparatorUtf8;
+        internal byte[]? _percentSymbolUtf8;
+        internal byte[]? _percentDecimalSeparatorUtf8;
+        internal byte[]? _percentGroupSeparatorUtf8;
+        internal byte[]? _perMilleSymbolUtf8;
+        internal byte[]? _nanSymbolUtf8;
+        internal byte[]? _positiveInfinitySymbolUtf8;
+        internal byte[]? _negativeInfinitySymbolUtf8;
+
+        internal int _numberDecimalDigits = 2;
+        internal int _currencyDecimalDigits = 2;
+        internal int _currencyPositivePattern;
+        internal int _currencyNegativePattern;
+        internal int _numberNegativePattern = 1;
+        internal int _percentPositivePattern;
+        internal int _percentNegativePattern;
+        internal int _percentDecimalDigits = 2;
+
+        internal int _digitSubstitution = (int)DigitShapes.None;
+
+        internal bool _isReadOnly;
+
+        private bool _hasInvariantNumberSigns = true;
+
+        private bool _allowHyphenDuringParsing;
+
+        public NumberFormatInfo()
+        {
+
+        }
+    }
     internal static unsafe class Number
     {
+        internal const int DecimalPrecision = 29;
+
         internal enum ParseStatus : byte
         {
             OK = 0,
@@ -2644,7 +2857,58 @@
             dst = c;
             return s;
         }
-        internal static unsafe string Int32ToString(int value, string format = null)
+        private static bool TryParseHexFormat(string? format, out bool upperCase, out int precision)
+        {
+            upperCase = true;
+            precision = 0;
+
+            if (string.IsNullOrEmpty(format))
+                return false;
+
+            char specifier = format[0];
+            if (specifier != 'X' && specifier != 'x')
+                return false;
+
+            upperCase = specifier == 'X';
+
+            for (int i = 1; i < format.Length; i++)
+            {
+                char c = format[i];
+                if (c < '0' || c > '9')
+                    return false;
+
+                int digit = c - '0';
+                if (precision > (0x7fffffff - digit) / 10)
+                    throw new FormatException("Format specifier precision is too large.");
+
+                precision = precision * 10 + digit;
+            }
+
+            return true;
+        }
+        private static int CountHexDigits64(ulong value)
+        {
+            int digits = 1;
+            while ((value >>= 4) != 0ul)
+                digits++;
+
+            return digits;
+        }
+        public static string FormatInt32(int value, int hexMask, string? format, IFormatProvider? provider)
+        {
+            // Fast path for default format
+            if (string.IsNullOrEmpty(format))
+            {
+                return Int32ToString(value);
+            }
+            if (TryParseHexFormat(format, out bool upperCase, out int precision))
+            {
+                uint hexValue = hexMask == 0 ? (uint)value : ((uint)value & (uint)hexMask);
+                return UInt32ToHexString(hexValue, precision, upperCase);
+            }
+            throw new NotSupportedException($"format {format} not supported");
+        }
+        internal static unsafe string Int32ToString(int value)
         {
             if (value == unchecked((int)0x80000000))
                 return "-2147483648";
@@ -2672,7 +2936,20 @@
 
             return s;
         }
-        internal static unsafe string UInt32ToString(uint value, string format = null)
+        public static string FormatUInt32(uint value, string? format, IFormatProvider? provider)
+        {
+            // Fast path for default format
+            if (string.IsNullOrEmpty(format))
+            {
+                return UInt32ToString(value);
+            }
+            if (TryParseHexFormat(format, out bool upperCase, out int precision))
+            {
+                return UInt32ToHexString(value, precision, upperCase);
+            }
+            throw new NotSupportedException($"format {format} not supported");
+        }
+        internal static unsafe string UInt32ToString(uint value)
         {
             char* buffer = stackalloc char[11]; // 10 digits + terminator
             char* p = buffer + 11;
@@ -2694,7 +2971,20 @@
 
             return s;
         }
-        internal static unsafe string Int64ToString(long value, string format = null)
+        internal static string FormatInt64(long value, string? format, IFormatProvider? provider)
+        {
+            // Fast path for default format
+            if (string.IsNullOrEmpty(format))
+            {
+                return Int64ToString(value);
+            }
+            if (TryParseHexFormat(format, out bool upperCase, out int precision))
+            {
+                return UInt64ToHexString((ulong)value, precision, upperCase);
+            }
+            throw new NotSupportedException($"format {format} not supported");
+        }
+        private static unsafe string Int64ToString(long value)
         {
             if (value == unchecked((long)0x8000000000000000)) // long.MinValue
                 return "-9223372036854775808";
@@ -2723,7 +3013,21 @@
 
             return s;
         }
-        internal static unsafe string UInt64ToString(ulong value, string format = null)
+        public static string FormatUInt64(ulong value, string? format, IFormatProvider? provider)
+        {
+            // Fast path for default format
+            if (string.IsNullOrEmpty(format))
+            {
+                return UInt64ToString(value);
+            }
+            if (TryParseHexFormat(format, out bool upperCase, out int precision))
+            {
+                return UInt64ToHexString(value, precision, upperCase);
+            }
+            throw new NotSupportedException($"format {format} not supported");
+        }
+
+        internal static unsafe string UInt64ToString(ulong value)
         {
             char* buffer = stackalloc char[21]; // 20 digits + terminator
             char* p = buffer + 21;
@@ -2746,7 +3050,38 @@
             return s;
         }
 
-        internal static string SingleToString(float value)
+        private static string UInt64ToHexString(ulong value, int precision, bool upperCase)
+        {
+            int digitCount = CountHexDigits64(value);
+            int len = precision > digitCount ? precision : digitCount;
+
+            string s = String.FastAllocateString(len);
+            ref char dst = ref s.GetRawStringData();
+
+            int i = len;
+            char alphaBase = upperCase ? 'A' : 'a';
+            ulong v = value;
+
+            do
+            {
+                int digit = (int)(v & 0xFul);
+                v >>= 4;
+
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, --i) =
+                    (char)(digit < 10 ? '0' + digit : alphaBase + (digit - 10));
+            } while (v != 0ul);
+
+            while (i > 0)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, --i) = '0';
+
+            return s;
+        }
+        private static string UInt32ToHexString(uint value, int precision, bool upperCase)
+        {
+            return UInt64ToHexString((ulong)value, precision, upperCase);
+        }
+
+        internal static string FormatFloat(float value, string? format, NumberFormatInfo? info)
         {
             uint bits = BitConverter.SingleToUInt32Bits(value);
             bool negative = (bits & 0x8000_0000U) != 0;
@@ -2770,10 +3105,10 @@
                     return Int32ToString(integerValue);
             }
 
-            return DoubleToString((double)value);
+            return FormatDouble((double)value, format, info);
         }
 
-        internal static unsafe string DoubleToString(double value)
+        internal static unsafe string FormatDouble(double value, string? format, NumberFormatInfo? info)
         {
             const ulong SignMask = 0x8000_0000_0000_0000UL;
             const ulong MantissaMask = 0x000F_FFFF_FFFF_FFFFUL;
@@ -2800,7 +3135,7 @@
             {
                 long integerValue = (long)value;
                 if ((double)integerValue == value)
-                    return Int64ToString(integerValue, null);
+                    return Int64ToString(integerValue);
             }
 
             ulong ieeeMantissa = bits & MantissaMask;
@@ -9760,6 +10095,22 @@ namespace System.Numerics
 {
     public static class BitOperations
     {
+        private static ReadOnlySpan<byte> TrailingZeroCountDeBruijn => // 32
+        [
+            00, 01, 28, 02, 29, 14, 24, 03,
+            30, 22, 20, 15, 25, 17, 04, 08,
+            31, 27, 13, 23, 21, 19, 16, 07,
+            26, 12, 18, 06, 11, 05, 10, 09
+        ];
+
+        private static ReadOnlySpan<byte> Log2DeBruijn => // 32
+        [
+            00, 09, 01, 10, 13, 21, 02, 29,
+            11, 14, 16, 18, 22, 25, 03, 30,
+            08, 12, 20, 28, 15, 17, 24, 07,
+            19, 27, 23, 06, 26, 05, 04, 31
+        ];
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static uint RotateLeft(uint value, int offset)
             => (value << offset) | (value >> (32 - offset));
@@ -9786,6 +10137,140 @@ namespace System.Numerics
         public static bool IsPow2(nint value) => (value & (value - 1)) == 0 && value > 0;
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IsPow2(nuint value) => (value & (value - 1)) == 0 && value != 0;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Log2(nuint value)
+        {
+            if(IntPtr.Size == 8)
+                return Log2((ulong)value);
+            else
+                return Log2((uint)value);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Log2(ulong value)
+        {
+            value |= 1;
+
+            uint hi = (uint)(value >> 32);
+
+            if (hi == 0)
+            {
+                return Log2((uint)value);
+            }
+
+            return 32 + Log2(hi);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Log2(uint value)
+        {
+            // The 0->0 contract is fulfilled by setting the LSB to 1.
+            // Log(1) is 0, and setting the LSB for values > 1 does not change the log2 result.
+            value |= 1;
+
+            // Fill trailing zeros with ones, eg 00010010 becomes 00011111
+            value |= value >> 01;
+            value |= value >> 02;
+            value |= value >> 04;
+            value |= value >> 08;
+            value |= value >> 16;
+
+            // Using deBruijn sequence, k=2, n=5 (2^5=32) : 0b_0000_0111_1100_0100_1010_1100_1101_1101u
+            return Log2DeBruijn[(int)((value * 0x07C4ACDDu) >> 27)];
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int Log2Ceiling(uint value)
+        {
+            int result = Log2(value);
+            if (PopCount(value) != 1)
+            {
+                result++;
+            }
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int Log2Ceiling(ulong value)
+        {
+            int result = Log2(value);
+            if (PopCount(value) != 1)
+            {
+                result++;
+            }
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(uint value)
+        {
+            const uint c1 = 0x_55555555u;
+            const uint c2 = 0x_33333333u;
+            const uint c3 = 0x_0F0F0F0Fu;
+            const uint c4 = 0x_01010101u;
+
+            value -= (value >> 1) & c1;
+            value = (value & c2) + ((value >> 2) & c2);
+            value = (((value + (value >> 4)) & c3) * c4) >> 24;
+
+            return (int)value;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(ulong value)
+        {
+            if (IntPtr.Size == 8)
+            {
+                const ulong c1 = 0x_55555555_55555555ul;
+                const ulong c2 = 0x_33333333_33333333ul;
+                const ulong c3 = 0x_0F0F0F0F_0F0F0F0Ful;
+                const ulong c4 = 0x_01010101_01010101ul;
+
+                value -= (value >> 1) & c1;
+                value = (value & c2) + ((value >> 2) & c2);
+                value = (((value + (value >> 4)) & c3) * c4) >> 56;
+
+                return (int)value;
+            }
+            else
+            {
+                return PopCount((uint)value) // lo
+                + PopCount((uint)(value >> 32)); // hi
+            }
+        }
+        public static int PopCount(nuint value)
+        {
+            if (IntPtr.Size == 8)
+            {
+                return PopCount((ulong)value);
+            }
+            else
+            {
+                return PopCount((uint)value);
+            }
+                
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint ResetLowestSetBit(uint value)
+        {
+            // It's lowered to BLSR on x86
+            return value & (value - 1);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ulong ResetLowestSetBit(ulong value)
+        {
+            return value & (value - 1);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint FlipBit(uint value, int index)
+        {
+            return value ^ (1u << index);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ulong FlipBit(ulong value, int index)
+        {
+            return value ^ (1ul << index);
+        }
     }
 
     public readonly struct BigInteger

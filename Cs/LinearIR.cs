@@ -537,6 +537,7 @@ namespace Cnidaria.Cs
             return source.Kind is
                 GenTreeKind.Call or
                 GenTreeKind.VirtualCall or
+                GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
         }
 
@@ -558,6 +559,7 @@ namespace Cnidaria.Cs
 
             if (source.Kind is
                 GenTreeKind.NewArray or
+                GenTreeKind.NewDelegate or
                 GenTreeKind.Box or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.CastClass or
@@ -1571,7 +1573,9 @@ namespace Cnidaria.Cs
                 return tree.Kind is
                     GenTreeKind.Call or
                     GenTreeKind.VirtualCall or
+                    GenTreeKind.DelegateInvoke or
                     GenTreeKind.NewObject or
+                    GenTreeKind.NewDelegate or
                     GenTreeKind.NewArray or
                     GenTreeKind.StoreIndirect or
                     GenTreeKind.StoreLocal or
@@ -4350,8 +4354,13 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
-                    sb.Append(source.Kind == GenTreeKind.VirtualCall ? "callvirt " : "call ")
+                case GenTreeKind.DelegateInvoke:
+                    sb.Append(source.Kind == GenTreeKind.VirtualCall ? "callvirt " : source.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ")
                       .Append(MethodName(source.Method)).Append(' ');
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.NewDelegate:
+                    sb.Append("new_delegate ").Append(MethodName(source.Method)).Append(' ');
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.NewObject:
