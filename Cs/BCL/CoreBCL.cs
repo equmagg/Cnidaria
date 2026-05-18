@@ -12451,6 +12451,162 @@ namespace System.Collections.Generic
 
             return newCapacity;
         }
+
+        public bool Exists(Predicate<T> match)
+            => FindIndex(match) != -1;
+
+        public T? Find(Predicate<T> match)
+        {
+            if (match == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            for (int i = 0; i < _size; i++)
+            {
+                if (match(_items[i]))
+                {
+                    return _items[i];
+                }
+            }
+            return default;
+        }
+
+        public List<T> FindAll(Predicate<T> match)
+        {
+            if (match == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            List<T> list = new List<T>();
+            for (int i = 0; i < _size; i++)
+            {
+                if (match(_items[i]))
+                {
+                    list.Add(_items[i]);
+                }
+            }
+            return list;
+        }
+
+        public int FindIndex(Predicate<T> match)
+            => FindIndex(0, _size, match);
+
+        public int FindIndex(int startIndex, Predicate<T> match)
+            => FindIndex(startIndex, _size - startIndex, match);
+
+        public int FindIndex(int startIndex, int count, Predicate<T> match)
+        {
+            if ((uint)startIndex > (uint)_size)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            if (count < 0 || startIndex > _size - count)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            if (match == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            int endIndex = startIndex + count;
+            for (int i = startIndex; i < endIndex; i++)
+            {
+                if (match(_items[i])) return i;
+            }
+            return -1;
+        }
+
+        public T? FindLast(Predicate<T> match)
+        {
+            if (match == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            for (int i = _size - 1; i >= 0; i--)
+            {
+                if (match(_items[i]))
+                {
+                    return _items[i];
+                }
+            }
+            return default;
+        }
+
+        public int FindLastIndex(Predicate<T> match)
+            => FindLastIndex(_size - 1, _size, match);
+
+        public int FindLastIndex(int startIndex, Predicate<T> match)
+            => FindLastIndex(startIndex, startIndex + 1, match);
+
+        public int FindLastIndex(int startIndex, int count, Predicate<T> match)
+        {
+            if (match == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            if (_size == 0)
+            {
+                // Special case for 0 length List
+                if (startIndex != -1)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+            }
+            else
+            {
+                // Make sure we're not out of range
+                if ((uint)startIndex >= (uint)_size)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+            }
+
+            // 2nd have of this also catches when startIndex == MAXINT, so MAXINT - 0 + 1 == -1, which is < 0.
+            if (count < 0 || startIndex - count + 1 < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            int endIndex = startIndex - count;
+            for (int i = startIndex; i > endIndex; i--)
+            {
+                if (match(_items[i]))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        public void ForEach(Action<T> action)
+        {
+            if (action == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            int version = _version;
+
+            for (int i = 0; i < _size; i++)
+            {
+                if (version != _version)
+                {
+                    break;
+                }
+                action(_items[i]);
+            }
+
+            if (version != _version)
+                throw new InvalidOperationException();
+        }
+
         public void Insert(int index, T item)
         {
             // Note that insertions at the end are legal.
@@ -12579,5 +12735,26 @@ namespace System.Collections.Generic
                 }
             }
         }
+    }
+}
+namespace System.Diagnostics
+{
+    public static class Debug
+    {
+        public static void Assert(bool condition) =>
+            Assert(condition, string.Empty, string.Empty);
+        public static void Assert(bool condition, string? message = null) =>
+            Assert(condition, message, string.Empty);
+        public static void Assert(bool condition, string? message, string? detailMessage)
+        {
+            if (!condition)
+            {
+                Fail(message, detailMessage);
+            }
+        }
+        public static void Fail(string? message) =>
+            Fail(message, string.Empty);
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static void Fail(string? message, string? detailMessage) => throw new InvalidOperationException(message);
     }
 }

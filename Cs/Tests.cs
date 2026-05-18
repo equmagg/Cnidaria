@@ -12,6 +12,8 @@ namespace Cnidaria.Cs
         internal static int TestsFailed;
         internal static List<string> FailedMessages = new();
         internal static List<long> InstructionsExecuted = new();
+        internal static List<TimeSpan> BuildTime = new();
+        internal static List<TimeSpan> CompilationTime = new();
 
         internal static bool Assert(string result, string target)
         {
@@ -58,6 +60,8 @@ namespace Cnidaria.Cs
                 {
                     InstructionsExecuted.Add(-1);
                 }
+                BuildTime.Add(context.BuildTime);
+                CompilationTime.Add(context.ComlilationTime);
                 Assert(output, target);
             }
         }
@@ -1506,10 +1510,63 @@ int x = 65;
 Action a = () => Console.Write(x);
 a();
 ", "65");
+            // 129 multicast delegate invocation
+            RunTest(@"
+int x = 65;
+int y = 56;
+Action a = () => Console.Write(x);
+a += () => Console.Write(y);
+a();
+", "6556");
+            // 130 predicate invocation
+            RunTest(@"
+List<int> list = [ 1, 2, 3, 4, 5 ];
+Console.Write(list.FindLastIndex(x => x % 2 == 0));
+", "3");
+            // 131 goto case
+            RunTest(@"
+int x = 0;
+switch (x)
+{
+    case 0:
+        Console.Write(0);
+        goto case 2;
+
+    case 1:
+        Console.Write(1);
+        break;
+
+    case 2:
+        Console.Write(2);
+        goto default;
+
+    default:
+        Console.Write(3);
+        break;
+}
+", "023");
+            // 132 yield return
+            RunTest(@"
+foreach (int i in ProduceEvenNumbers(9))
+{
+    Console.Write(i);
+}
+IEnumerable<int> ProduceEvenNumbers(int upto)
+{
+    for (int i = 0; i <= upto; i += 2)
+    {
+        yield return i;
+    }
+}
+", "02468");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             Console.WriteLine($"Average instructions executed count: " +
                 $"{(InstructionsExecuted.Count > 0 ? (long)InstructionsExecuted.Where(x => x > 0L).Average() : 0L)}");
+            Console.WriteLine($"Average build time: " +
+                $"{new TimeSpan((BuildTime.Count > 0 ? Convert.ToInt64(BuildTime.Average(x => x.Ticks)) : 0L))}");
+            Console.WriteLine($"Average compilation time: " +
+                $"{new TimeSpan((CompilationTime.Count > 0 ? Convert.ToInt64(CompilationTime.Average(x => x.Ticks)) : 0L))}");
             foreach (var msg in FailedMessages)
             {
                 Console.WriteLine(msg);

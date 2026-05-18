@@ -756,6 +756,8 @@ namespace Cnidaria.Cs
         internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
             = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
         private readonly Dictionary<(SyntaxTree Tree, bool IgnoreAccessibility), SemanticModel> _semanticModelCache = new();
+        private readonly Dictionary<MethodSymbol, IRLowering.IteratorStateMachineInfo> _iteratorStateMachines =
+            new(ReferenceEqualityComparer<MethodSymbol>.Instance);
         public Compilation(
             ImmutableArray<SyntaxTree> syntaxTrees,
             NamespaceSymbol sourceGlobalNamespace,
@@ -793,6 +795,24 @@ namespace Cnidaria.Cs
             model = new SourceSemanticModel(this, tree, ignoreAccessibility);
             _semanticModelCache.Add(key, model);
             return model;
+        }
+        internal void RegisterIteratorStateMachine(MethodSymbol method, IRLowering.IteratorStateMachineInfo info)
+        {
+            _iteratorStateMachines[method] = info;
+        }
+        internal bool TryGetIteratorStateMachine(MethodSymbol method, out IRLowering.IteratorStateMachineInfo info)
+            => _iteratorStateMachines.TryGetValue(method, out info!);
+        internal ImmutableArray<IRLowering.IteratorStateMachineInfo> GetIteratorStateMachinesForTree(SyntaxTree tree)
+        {
+            var b = ImmutableArray.CreateBuilder<IRLowering.IteratorStateMachineInfo>();
+
+            foreach (var kv in _iteratorStateMachines)
+            {
+                if (ReferenceEquals(kv.Value.SyntaxTree, tree))
+                    b.Add(kv.Value);
+            }
+
+            return b.ToImmutable();
         }
         public IEnumerable<SyntaxNode> EnumerateMethodBodyOwners(SyntaxTree tree)
         {
@@ -879,7 +899,8 @@ namespace Cnidaria.Cs
                 foreach (var diagnostic in diagnostics)
                     Console.WriteLine(diagnostic);
             }
-
+            if (!diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
+                IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
             var rootNs = includeCoreTypesInTypeDefs
                 ? compilation.GlobalNamespace
                 : compilation.SourceGlobalNamespace;
@@ -926,6 +947,11 @@ namespace Cnidaria.Cs
                 {
                     var body = (BoundMethodBody)model.GetBoundNode(owner);
                     EmitBody(body);
+                }
+                foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
+                {
+                    foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
+                        EmitBody(body);
                 }
                 foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(compilation, tree))
                 {
@@ -2444,6 +2470,7 @@ namespace Cnidaria.Cs
         EmptyStatement,
         Throw,
         Return,
+        Yield,
         Break,
         Continue,
         If,

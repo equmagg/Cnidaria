@@ -3545,8 +3545,8 @@ namespace Cnidaria.Cs
                     $"LSRA requires lowered LIR for method {method.RuntimeMethod}. " +
                     "Run GenTreeLinearLowerer.LowerMethod before register allocation.");
             }
-
-            LinearVerifier.VerifyBeforeLsra(method);
+            if (options.Validate)
+                LinearVerifier.VerifyBeforeLsra(method);
 
             var allocator = new MethodAllocator(method, options);
             var result = allocator.Run();
@@ -3892,6 +3892,11 @@ namespace Cnidaria.Cs
             private readonly Dictionary<GenTree, List<AllocationInterval>> _intervalsByNode = new();
             private readonly Dictionary<GenTree, RegisterOperand> _aggregateHomes = new();
             private readonly Dictionary<GenTree, RegisterAllocationInfo> _allocations = new();
+            private readonly Dictionary<GenTree, ImmutableArray<LinearRefPosition>> _refPositionsByValue;
+            private readonly Dictionary<(GenTree value, int abiSegmentIndex), ImmutableArray<LinearRefPosition>> _refPositionsByValueSegment;
+            private readonly Dictionary<(int nodeId, int position, RegisterClass registerClass), ImmutableArray<LinearRefPosition>> _hardUseRefPositions;
+            private readonly Dictionary<int, GenTree> _nodeByLinearId;
+            private readonly ImmutableArray<CfgEdge> _exceptionEdges;
             private readonly List<AllocationInterval> _active = new();
             private readonly List<AllocationInterval> _inactive = new();
             private readonly List<AllocationInterval> _handled = new();
@@ -3910,9 +3915,140 @@ namespace Cnidaria.Cs
                 _nodePositions = BuildPositionLayout(method, _linearBlockOrder, out _blockStartPositions, out _blockEndPositions);
                 _callPositions = BuildCallPositions(method, _nodePositions);
                 _fixedKillRefPositions = BuildFixedKillRefPositions(method, _nodePositions, _options);
+                _refPositionsByValue = BuildRefPositionsByValue(method);
+                _refPositionsByValueSegment = BuildRefPositionsByValueSegment(_refPositionsByValue);
+                _hardUseRefPositions = BuildHardUseRefPositions(method);
+                _nodeByLinearId = BuildNodeByLinearId(method);
+                _exceptionEdges = BuildExceptionEdges(method.Cfg);
                 _nextNodeId = ComputeNextNodeId(method);
             }
+            private static Dictionary<GenTree, ImmutableArray<LinearRefPosition>> BuildRefPositionsByValue(GenTreeMethod method)
+            {
+                var builders = new Dictionary<GenTree, ImmutableArray<LinearRefPosition>.Builder>(ReferenceEqualityComparer<GenTree>.Instance);
 
+                for (int i = 0; i < method.RefPositions.Length; i++)
+                {
+                    var rp = method.RefPositions[i];
+                    if (rp.Value is null)
+                        continue;
+
+                    if (!builders.TryGetValue(rp.Value, out var builder))
+                    {
+                        builder = ImmutableArray.CreateBuilder<LinearRefPosition>();
+                        builders.Add(rp.Value, builder);
+                    }
+
+                    builder.Add(rp);
+                }
+
+                var result = new Dictionary<GenTree, ImmutableArray<LinearRefPosition>>(builders.Count, ReferenceEqualityComparer<GenTree>.Instance);
+                foreach (var item in builders)
+                    result.Add(item.Key, item.Value.ToImmutable());
+
+                return result;
+            }
+
+            private static Dictionary<(GenTree value, int abiSegmentIndex), ImmutableArray<LinearRefPosition>> BuildRefPositionsByValueSegment(
+                Dictionary<GenTree, ImmutableArray<LinearRefPosition>> refPositionsByValue)
+            {
+                var builders = new Dictionary<(GenTree value, int abiSegmentIndex), ImmutableArray<LinearRefPosition>.Builder>();
+
+                foreach (var item in refPositionsByValue)
+                {
+                    var refs = item.Value;
+                    for (int i = 0; i < refs.Length; i++)
+                    {
+                        var rp = refs[i];
+                        int segment = rp.IsAbiSegment ? rp.AbiSegmentIndex : -1;
+                        var key = (item.Key, segment);
+
+                        if (!builders.TryGetValue(key, out var builder))
+                        {
+                            builder = ImmutableArray.CreateBuilder<LinearRefPosition>();
+                            builders.Add(key, builder);
+                        }
+
+                        builder.Add(rp);
+                    }
+                }
+
+                var result = new Dictionary<(GenTree value, int abiSegmentIndex), ImmutableArray<LinearRefPosition>>(builders.Count);
+                foreach (var item in builders)
+                    result.Add(item.Key, item.Value.ToImmutable());
+
+                return result;
+            }
+
+            private static Dictionary<(int nodeId, int position, RegisterClass registerClass), ImmutableArray<LinearRefPosition>> BuildHardUseRefPositions(GenTreeMethod method)
+            {
+                var builders = new Dictionary<(int nodeId, int position, RegisterClass registerClass), ImmutableArray<LinearRefPosition>.Builder>();
+
+                for (int i = 0; i < method.RefPositions.Length; i++)
+                {
+                    var rp = method.RefPositions[i];
+                    if (rp.Kind != LinearRefPositionKind.Use || rp.Value is null)
+                        continue;
+
+                    var key = (rp.NodeId, rp.Position, rp.RegisterClass);
+                    if (!builders.TryGetValue(key, out var builder))
+                    {
+                        builder = ImmutableArray.CreateBuilder<LinearRefPosition>();
+                        builders.Add(key, builder);
+                    }
+
+                    builder.Add(rp);
+                }
+
+                var result = new Dictionary<(int nodeId, int position, RegisterClass registerClass), ImmutableArray<LinearRefPosition>>(builders.Count);
+                foreach (var item in builders)
+                    result.Add(item.Key, item.Value.ToImmutable());
+
+                return result;
+            }
+
+            private static Dictionary<int, GenTree> BuildNodeByLinearId(GenTreeMethod method)
+            {
+                var result = new Dictionary<int, GenTree>(method.LinearNodes.Length);
+
+                for (int i = 0; i < method.LinearNodes.Length; i++)
+                {
+                    var node = method.LinearNodes[i];
+                    int linearId = node.LinearId >= 0 ? node.LinearId : node.Id;
+                    result[linearId] = node;
+
+                    if (node.Id != linearId)
+                        result.TryAdd(node.Id, node);
+                }
+
+                return result;
+            }
+
+            private static ImmutableArray<CfgEdge> BuildExceptionEdges(ControlFlowGraph cfg)
+            {
+                if (cfg.ExceptionRegions.Length == 0)
+                    return ImmutableArray<CfgEdge>.Empty;
+
+                var result = ImmutableArray.CreateBuilder<CfgEdge>();
+                for (int b = 0; b < cfg.Blocks.Length; b++)
+                {
+                    var successors = cfg.Blocks[b].Successors;
+                    for (int s = 0; s < successors.Length; s++)
+                    {
+                        var edge = successors[s];
+                        if (edge.Kind == CfgEdgeKind.Exception)
+                            result.Add(edge);
+                    }
+                }
+
+                return result.ToImmutable();
+            }
+
+            private ImmutableArray<LinearRefPosition> GetRefPositionsForValueSegment(GenTree value, int abiSegmentIndex)
+            {
+                return _refPositionsByValueSegment.TryGetValue((value, abiSegmentIndex), out var refs)
+                    ? refs
+                    : ImmutableArray<LinearRefPosition>.Empty;
+            }
             public RegisterAllocatedMethod Run()
             {
                 AllocateIntervals();
@@ -4202,18 +4338,19 @@ namespace Cnidaria.Cs
 
             private ulong HardUseRegisterMaskAt(int nodeId, int position, RegisterClass registerClass)
             {
-                ulong mask = 0;
+                if (!_hardUseRefPositions.TryGetValue((nodeId, position, registerClass), out var uses))
+                    return 0;
 
-                for (int i = 0; i < _method.RefPositions.Length; i++)
+                ulong mask = 0;
+                for (int i = 0; i < uses.Length; i++)
                 {
-                    var use = _method.RefPositions[i];
-                    if (use.NodeId != nodeId || use.Position != position || use.Kind != LinearRefPositionKind.Use || use.Value is null)
+                    var use = uses[i];
+                    if ((use.Flags & LinearRefPositionFlags.RegOptional) != 0 &&
+                        (use.Flags & LinearRefPositionFlags.RequiresRegister) == 0)
+                    { 
                         continue;
-                    if (use.RegisterClass != registerClass)
-                        continue;
-                    if ((use.Flags & LinearRefPositionFlags.RegOptional) != 0 && (use.Flags & LinearRefPositionFlags.RequiresRegister) == 0)
-                        continue;
-                    if (!TryGetAllocationForValue(use.Value, out var allocation))
+                    }
+                    if (!TryGetAllocationForValue(use.Value!, out var allocation))
                         continue;
 
                     var location = use.IsAbiSegment
@@ -4293,13 +4430,8 @@ namespace Cnidaria.Cs
 
             private GenTree NodeForLinearId(int nodeId)
             {
-                for (int i = 0; i < _method.LinearNodes.Length; i++)
-                {
-                    var node = _method.LinearNodes[i];
-                    int currentId = node.LinearId >= 0 ? node.LinearId : node.Id;
-                    if (currentId == nodeId)
-                        return node;
-                }
+                if (_nodeByLinearId.TryGetValue(nodeId, out var node))
+                    return node;
 
                 throw new InvalidOperationException($"Internal register ref-position points at missing node {nodeId}.");
             }
@@ -4393,23 +4525,16 @@ namespace Cnidaria.Cs
 
             private bool IsLiveAcrossExceptionEdge(LinearLiveInterval interval)
             {
-                if (interval.Ranges.Length == 0)
+                if (interval.Ranges.Length == 0 || _exceptionEdges.Length == 0)
                     return false;
 
-                for (int b = 0; b < _method.Cfg.Blocks.Length; b++)
+                for (int i = 0; i < _exceptionEdges.Length; i++)
                 {
-                    var block = _method.Cfg.Blocks[b];
-                    for (int s = 0; s < block.Successors.Length; s++)
-                    {
-                        var edge = block.Successors[s];
-                        if (edge.Kind != CfgEdgeKind.Exception)
-                            continue;
-
-                        int fromPosition = _blockEndPositions[edge.FromBlockId];
-                        int toPosition = _blockStartPositions[edge.ToBlockId];
-                        if (IsLiveAt(interval, fromPosition) && IsLiveAt(interval, toPosition))
-                            return true;
-                    }
+                    var edge = _exceptionEdges[i];
+                    int fromPosition = _blockEndPositions[edge.FromBlockId];
+                    int toPosition = _blockStartPositions[edge.ToBlockId];
+                    if (IsLiveAt(interval, fromPosition) && IsLiveAt(interval, toPosition))
+                        return true;
                 }
 
                 return false;
@@ -4429,24 +4554,11 @@ namespace Cnidaria.Cs
 
             private bool RefPositionsRequireStackHome(GenTree value, int abiSegmentIndex)
             {
-                for (int i = 0; i < _method.RefPositions.Length; i++)
+                var refs = GetRefPositionsForValueSegment(value, abiSegmentIndex);
+                for (int i = 0; i < refs.Length; i++)
                 {
-                    var rp = _method.RefPositions[i];
-                    if (rp.Value is null || !rp.Value.Equals(value))
-                        continue;
-                    if ((rp.Flags & LinearRefPositionFlags.StackOnly) == 0)
-                        continue;
-                    if (abiSegmentIndex >= 0)
-                    {
-                        if (rp.AbiSegmentIndex != abiSegmentIndex)
-                            continue;
-                    }
-                    else if (rp.IsAbiSegment)
-                    {
-                        continue;
-                    }
-
-                    return true;
+                    if ((refs[i].Flags & LinearRefPositionFlags.StackOnly) != 0)
+                        return true;
                 }
 
                 return false;
@@ -4455,30 +4567,18 @@ namespace Cnidaria.Cs
 
             private ImmutableArray<int> GetAllocationUsePositionsForValueSegment(GenTree value, int abiSegmentIndex, ImmutableArray<int> fallback)
             {
+                var refs = GetRefPositionsForValueSegment(value, abiSegmentIndex);
+                if (refs.Length == 0)
+                    return fallback;
                 var positions = ImmutableArray.CreateBuilder<int>();
                 int last = int.MinValue;
-                bool sawMatchingReference = false;
 
-                for (int i = 0; i < _method.RefPositions.Length; i++)
+                for (int i = 0; i < refs.Length; i++)
                 {
-                    var rp = _method.RefPositions[i];
-                    if (rp.Value is null || !rp.Value.Equals(value))
-                        continue;
+                    var rp = refs[i];
 
                     if (rp.Kind != LinearRefPositionKind.Use && rp.Kind != LinearRefPositionKind.Def)
                         continue;
-
-                    if (abiSegmentIndex >= 0)
-                    {
-                        if (rp.AbiSegmentIndex != abiSegmentIndex)
-                            continue;
-                    }
-                    else if (rp.IsAbiSegment)
-                    {
-                        continue;
-                    }
-
-                    sawMatchingReference = true;
 
                     if (IsAllocationOptionalRefPosition(rp))
                         continue;
@@ -4490,7 +4590,7 @@ namespace Cnidaria.Cs
                     last = rp.Position;
                 }
 
-                return sawMatchingReference ? positions.ToImmutable() : fallback;
+                return positions.ToImmutable();
             }
 
             private static bool IsAllocationOptionalRefPosition(LinearRefPosition refPosition)
@@ -5496,15 +5596,6 @@ namespace Cnidaria.Cs
                 => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
                    GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
 
-            private RegisterOperand GetIncomingArgumentOperand(int argumentIndex, RuntimeType? argumentType, GenStackKind stackKind, RegisterClass argumentClass)
-            {
-                var abi = MachineAbi.ClassifyValue(argumentType, stackKind, isReturn: false);
-                var operands = GetIncomingArgumentOperands(argumentIndex, argumentType, stackKind, argumentClass, abi);
-                if (operands.Length == 1)
-                    return operands[0];
-
-                throw new InvalidOperationException("Incoming aggregate argument requires segment-aware operand enumeration.");
-            }
 
             private ImmutableArray<RegisterOperand> GetIncomingArgumentOperands(
                 int argumentIndex,
@@ -11653,8 +11744,6 @@ namespace Cnidaria.Cs
                 return 0;
             }
 
-            private static bool IsGcHomeSlot(RegisterOperand location)
-                => location.IsFrameSlot && location.FrameSlotKind is StackFrameSlotKind.Argument or StackFrameSlotKind.Local or StackFrameSlotKind.Temp;
 
             private static bool NeedsHomeGcReporting(RuntimeType? type, GenStackKind stackKind)
             {

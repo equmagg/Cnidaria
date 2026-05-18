@@ -98,15 +98,13 @@ namespace Cnidaria.Cs
 
         private sealed class DelegateData
         {
-            public readonly int ModuleId;
-            public readonly int MethodToken;
+            public readonly int TargetMethodId;
             public readonly Slot Target;
             public readonly int[]? InvocationList;
 
-            public DelegateData(int moduleId, int methodToken, Slot target, int[]? invocationList = null)
+            public DelegateData(int targetMethodId, Slot target, int[]? invocationList = null)
             {
-                ModuleId = moduleId;
-                MethodToken = methodToken;
+                TargetMethodId = targetMethodId;
                 Target = target;
                 InvocationList = invocationList;
             }
@@ -991,6 +989,22 @@ namespace Cnidaria.Cs
                             ExecNewDelegateClosed(mod, ins.Operand0, ins.Operand1);
                             break;
 
+                        case BytecodeOp.DelegateCombine:
+                            {
+                                var b = PopSlot();
+                                var a = PopSlot();
+                                PushSlot(ExecDelegateCombine(a, b));
+                                break;
+                            }
+
+                        case BytecodeOp.DelegateRemove:
+                            {
+                                var value = PopSlot();
+                                var source = PopSlot();
+                                PushSlot(ExecDelegateRemove(source, value));
+                                break;
+                            }
+
                         case BytecodeOp.DelegateInvoke:
                             ExecDelegateInvoke(mod, ins.Operand0, ins.Operand1, ct, limits);
                             break;
@@ -1635,8 +1649,13 @@ namespace Cnidaria.Cs
                (StringComparer.Ordinal.Equals(type.Name, "Delegate") ||
                 StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate"));
 
-        private static bool IsDelegateLikeRuntimeType(RuntimeType type)
+        private bool IsDelegateLikeRuntimeType(RuntimeType type)
         {
+            if (type is null)
+                throw new ArgumentNullException(nameof(type));
+
+            _rts.EnsureConstructedMembers(type);
+
             for (RuntimeType? t = type; t is not null; t = t.BaseType)
             {
                 if (IsSystemDelegateBase(t))
@@ -1747,13 +1766,36 @@ namespace Cnidaria.Cs
             PushSlot(closure.Cells[slotIndex]);
         }
 
-        private int AllocDelegateObject(RuntimeType delegateType, int moduleId, int methodToken, Slot target, int[]? invocationList = null)
+        private int AllocDelegateObject(RuntimeType delegateType, RuntimeMethod targetMethod, Slot target)
         {
+            if (targetMethod is null)
+                throw new ArgumentNullException(nameof(targetMethod));
+
             if (!IsDelegateLikeRuntimeType(delegateType))
                 throw new InvalidOperationException($"Type '{delegateType.Namespace}.{delegateType.Name}' is not a delegate type.");
 
             int objAbs = AllocObject(delegateType);
-            _delegateDataByObject[objAbs] = new DelegateData(moduleId, methodToken, target, invocationList);
+            _delegateDataByObject[objAbs] = new DelegateData(targetMethod.MethodId, target);
+            return objAbs;
+        }
+
+        private int AllocMulticastDelegateObject(RuntimeType delegateType, int[] invocationList)
+        {
+            if (invocationList is null)
+                throw new ArgumentNullException(nameof(invocationList));
+
+            if (invocationList.Length == 0)
+                throw new InvalidOperationException("Multicast delegate invocation list cannot be empty.");
+
+            if (!IsDelegateLikeRuntimeType(delegateType))
+                throw new InvalidOperationException($"Type '{delegateType.Namespace}.{delegateType.Name}' is not a delegate type.");
+
+            int objAbs = AllocObject(delegateType);
+            _delegateDataByObject[objAbs] = new DelegateData(
+                targetMethodId: 0,
+                target: new Slot(SlotKind.Null, 0),
+                invocationList: invocationList);
+
             return objAbs;
         }
 
@@ -1767,8 +1809,7 @@ namespace Cnidaria.Cs
             if (targetMethod.HasThis)
                 throw new NotSupportedException("Closed instance delegates are not implemented by NewDelegate yet.");
 
-            int moduleId = _moduleIdByName[callerModule.Name];
-            int objAbs = AllocDelegateObject(delegateType, moduleId, targetMethodToken, new Slot(SlotKind.Null, 0));
+            int objAbs = AllocDelegateObject(delegateType, targetMethod, new Slot(SlotKind.Null, 0));
             PushSlot(new Slot(SlotKind.Ref, objAbs));
         }
 
@@ -1784,10 +1825,9 @@ namespace Cnidaria.Cs
             if (!IsDelegateLikeRuntimeType(delegateType))
                 throw new InvalidOperationException($"NewDelegateClosed expects delegate type, got '{delegateType.Namespace}.{delegateType.Name}'.");
 
-            _ = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
+            var targetMethod = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
 
-            int moduleId = _moduleIdByName[callerModule.Name];
-            int objAbs = AllocDelegateObject(delegateType, moduleId, targetMethodToken, target);
+            int objAbs = AllocDelegateObject(delegateType, targetMethod, target);
             PushSlot(new Slot(SlotKind.Ref, objAbs));
         }
 
@@ -1850,8 +1890,7 @@ namespace Cnidaria.Cs
             AppendFlattenedDelegateTargets(combined, checked((int)a.Payload));
             AppendFlattenedDelegateTargets(combined, checked((int)b.Payload));
 
-            int moduleId = _moduleIdByName[(_curModule ?? throw new InvalidOperationException("No current module.")).Name];
-            int objAbs = AllocDelegateObject(aType, moduleId, methodToken: 0, new Slot(SlotKind.Null, 0), combined.ToArray());
+            int objAbs = AllocMulticastDelegateObject(aType, combined.ToArray());
             return new Slot(SlotKind.Ref, objAbs);
         }
 
@@ -1907,8 +1946,7 @@ namespace Cnidaria.Cs
             if (sourceTargets.Count == 1)
                 return new Slot(SlotKind.Ref, sourceTargets[0]);
 
-            int moduleId = _moduleIdByName[(_curModule ?? throw new InvalidOperationException("No current module.")).Name];
-            int objAbs = AllocDelegateObject(sourceType, moduleId, methodToken: 0, new Slot(SlotKind.Null, 0), sourceTargets.ToArray());
+            int objAbs = AllocMulticastDelegateObject(sourceType, sourceTargets.ToArray());
             return new Slot(SlotKind.Ref, objAbs);
         }
 
@@ -1959,18 +1997,18 @@ namespace Cnidaria.Cs
             if (delegateData.InvocationList is not null)
                 throw new InvalidOperationException("Nested multicast delegate target was not flattened.");
 
-            if ((uint)delegateData.ModuleId >= (uint)_moduleById.Length)
-                throw new InvalidOperationException("Delegate target module id is out of range.");
+            if (delegateData.TargetMethodId == 0)
+                throw new MissingMethodException("Delegate leaf has no target method.");
 
-            var targetModule = _moduleById[delegateData.ModuleId];
-            var targetMethod = ResolveRuntimeMethodOrThrow(targetModule, delegateData.MethodToken);
+            var targetMethod = _rts.GetMethodById(delegateData.TargetMethodId);
 
             bool hasClosedStaticTarget = !targetMethod.HasThis && delegateData.Target.Kind != SlotKind.Null;
             int expectedParameterCount = context.Arguments.Length + (hasClosedStaticTarget ? 1 : 0);
             if (targetMethod.ParameterTypes.Length != expectedParameterCount)
             {
                 throw new InvalidOperationException(
-                    $"Delegate target arg count mismatch: method expects {targetMethod.ParameterTypes.Length}, delegate supplied {context.Arguments.Length} plus {(hasClosedStaticTarget ? 1 : 0)} closed target argument(s).");
+                    $"Delegate target arg count mismatch: method expects {targetMethod.ParameterTypes.Length}, delegate supplied " +
+                    $"{context.Arguments.Length} plus {(hasClosedStaticTarget ? 1 : 0)} closed target argument(s).");
             }
 
             int totalTargetArgs = context.Arguments.Length + (targetMethod.HasThis || hasClosedStaticTarget ? 1 : 0);
@@ -2251,6 +2289,9 @@ namespace Cnidaria.Cs
         }
         private int AllocObject(RuntimeType t)
         {
+            if (t is null)
+                throw new ArgumentNullException(nameof(t));
+
             if (!t.IsReferenceType)
                 throw new InvalidOperationException($"Cannot heap-allocate value type '{t.Namespace}.{t.Name}' as object.");
 
@@ -2259,6 +2300,8 @@ namespace Cnidaria.Cs
 
             if (IsSystemStringType(t))
                 throw new InvalidOperationException("Use string allocation helpers for System.String.");
+
+            _rts.EnsureRuntimeTypeReady(t);
 
             int size = t.InstanceSize;
             if (size < ObjectHeaderSize)
@@ -6055,28 +6098,6 @@ namespace Cnidaria.Cs
         }
         private bool TryInvokeIntrinsic(RuntimeMethod rm, int totalArgs, CancellationToken ct)
         {
-            if (rm.DeclaringType.Namespace == "System" &&
-                rm.DeclaringType.Name == "Delegate" &&
-                !rm.HasThis &&
-                totalArgs == 2)
-            {
-                if (StringComparer.Ordinal.Equals(rm.Name, "Combine"))
-                {
-                    var b = PopSlot();
-                    var a = PopSlot();
-                    PushSlot(ExecDelegateCombine(a, b));
-                    return true;
-                }
-
-                if (StringComparer.Ordinal.Equals(rm.Name, "Remove"))
-                {
-                    var value = PopSlot();
-                    var source = PopSlot();
-                    PushSlot(ExecDelegateRemove(source, value));
-                    return true;
-                }
-            }
-
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
             {
                 // instance int get_Length()

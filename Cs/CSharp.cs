@@ -39,16 +39,26 @@ namespace Cnidaria.Cs
         {
             public readonly long InstructionsCount;
             public readonly TimeSpan TimeElapsed;
+            public readonly TimeSpan BuildTime;
+            public readonly TimeSpan ComlilationTime;
             public readonly long StackMemoryUsed;
             public readonly long HeapMemoryUsed;
-            public ExecutionContext(long instructionsCount, TimeSpan timeElapsed, long stackMemoryUsed, long heapMemoryUsed)
+            public ExecutionContext(
+                long instructionsCount, 
+                TimeSpan timeElapsed, 
+                TimeSpan buildTime, 
+                TimeSpan compilationTime, 
+                long stackMemoryUsed, 
+                long heapMemoryUsed)
             {
                 InstructionsCount = instructionsCount;
                 TimeElapsed = timeElapsed;
                 StackMemoryUsed = stackMemoryUsed;
                 HeapMemoryUsed = heapMemoryUsed;
+                BuildTime = buildTime;
+                ComlilationTime = compilationTime;
             }
-            public static ExecutionContext Empty => new ExecutionContext(-1, TimeSpan.MinValue, -1, -1);
+            public static ExecutionContext Empty => new ExecutionContext(-1, TimeSpan.MinValue, TimeSpan.MinValue, TimeSpan.MinValue, -1, -1);
         }
         public static (byte[]? image, List<IDiagnostic> diagnostics) CompileStackApplicationToRunnableBytes(
             string source,
@@ -221,7 +231,7 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, stVm.StackPeakBytes, stVm.HeapPeakBytes));
+                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -390,6 +400,7 @@ namespace Cnidaria.Cs
 
             try
             {
+                var swBuild = Stopwatch.StartNew();
                 var app = DeserializeRegisterRunnableApplication(runnableAppImage);
                 var appMeta = new FlatMetadataView(app.flatMetadata);
                 var appFuncs = BytecodeSerializer.DeserializeFunctions(app.stackFunctions);
@@ -437,10 +448,10 @@ namespace Cnidaria.Cs
                         return (output.ToString(), diagnostics, ExecutionContext.Empty);
                     }
                 }
-
                 var rts = new RuntimeTypeSystem(modules);
                 HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta);
                 var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
+                swBuild.Stop();
 
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + staticRegionLimit);
                 int staticEnd = staticRegionLimit;
@@ -482,7 +493,7 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, swBuild.Elapsed, swBuild.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -725,7 +736,7 @@ namespace Cnidaria.Cs
                         return (string.Empty, diagnostics, ExecutionContext.Empty);
                     external = (extMeta, extFuncs);
                 }
-
+                var swBuild = Stopwatch.StartNew();
                 var parser = new Parser(source);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
@@ -797,12 +808,13 @@ namespace Cnidaria.Cs
                         return (output.ToString(), diagnostics, ExecutionContext.Empty);
                     }
                 }
-
                 var rts = new RuntimeTypeSystem(modules);
+                swBuild.Stop();
+                var swCompile = Stopwatch.StartNew();
                 var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
                 var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
                 var backend = BackendPipeline.CompileProgram(genTreeProgram);
-
+                swCompile.Stop();
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + metaSize);
                 int staticEnd = metaSize;
                 int stackBase = staticEnd;
@@ -843,7 +855,8 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+                    new ExecutionContext(
+                        regVm.InctructionsElapsed, sw.Elapsed, swBuild.Elapsed, swCompile.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -1003,7 +1016,8 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, stVm.StackPeakBytes, stVm.HeapPeakBytes));
+                    new ExecutionContext(
+                        stVm.InctructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {

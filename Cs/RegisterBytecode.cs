@@ -574,6 +574,8 @@ namespace Cnidaria.Cs
         RuntimeTypeEquals = 654,
         NewDelegate = 655,
         NewDelegateClosed = 656,
+        DelegateCombine = 657,
+        DelegateRemove = 658,
 
         CallVoid = 704,
         CallI = 705,
@@ -1115,7 +1117,8 @@ namespace Cnidaria.Cs
             ImmutableArray<GcRootRecord> gcRoots = default,
             ImmutableArray<UnwindRecord> unwind = default,
             ImmutableArray<SwitchTableRecord> switchTable = default,
-            ImmutableArray<byte> blob = default)
+            ImmutableArray<byte> blob = default,
+            bool validate = true)
         {
             Flags = flags;
             Code = code.IsDefault ? ImmutableArray<InstrDesc>.Empty : code;
@@ -1128,14 +1131,15 @@ namespace Cnidaria.Cs
             SwitchTable = switchTable.IsDefault ? ImmutableArray<SwitchTableRecord>.Empty : switchTable;
             Blob = blob.IsDefault ? ImmutableArray<byte>.Empty : blob;
 
-            var map = new Dictionary<int, int>();
+            var map = new Dictionary<int, int>(Methods.Length);
             for (int i = 0; i < Methods.Length; i++)
             {
                 if (!map.TryAdd(Methods[i].RuntimeMethodId, i))
                     throw new InvalidOperationException("Duplicate runtime method id in RVM image: " + Methods[i].RuntimeMethodId.ToString());
             }
             MethodIndexByRuntimeMethodId = map;
-            Validate();
+            if (validate)
+                Validate();
         }
 
         public MethodRecord GetMethod(int runtimeMethodId)
@@ -1498,6 +1502,13 @@ namespace Cnidaria.Cs
                     RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
                     return;
 
+                case Op.DelegateCombine:
+                case Op.DelegateRemove:
+                    RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
+                    RequireGpr(inst.Rs2, pc, nameof(inst.Rs2));
+                    return;
+
                 case Op.NewSZArray:
                 case Op.FastAllocateString:
                 case Op.CastClass:
@@ -1651,7 +1662,7 @@ namespace Cnidaria.Cs
             => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
 
         private static bool IsRuntimeObjectInstruction(Op op)
-            => IsOpInRange(op, Op.NewObj, Op.NewDelegateClosed);
+            => IsOpInRange(op, Op.NewObj, Op.DelegateRemove);
 
         private static bool IsPointerInstruction(Op op)
             => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
@@ -2013,6 +2024,14 @@ namespace Cnidaria.Cs
                 aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
                 imm: PackDelegateDescriptor(runtimeDelegateTypeId, runtimeTargetMethodId)));
 
+        public void DelegateCombine(MachineRegister rd, MachineRegister left, MachineRegister right)
+            => Emit(InstrDesc.R(Op.DelegateCombine, rd, left, right,
+                Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
+
+        public void DelegateRemove(MachineRegister rd, MachineRegister source, MachineRegister value)
+            => Emit(InstrDesc.R(Op.DelegateRemove, rd, source, value,
+                Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
+
         private static long PackDelegateDescriptor(int runtimeDelegateTypeId, int runtimeTargetMethodId)
             => ((long)(uint)runtimeDelegateTypeId << 32) | (uint)runtimeTargetMethodId;
         public void CastClass(MachineRegister rd, MachineRegister source, int runtimeTypeId)
@@ -2058,7 +2077,7 @@ namespace Cnidaria.Cs
             _fixups.Add(new Fixup(pc, target.Id, FixupKind.InstructionImmediate, -1));
         }
 
-        public CodeImage Build(ImageFlags flags)
+        public CodeImage Build(ImageFlags flags, bool validate = true)
         {
             if (_currentMethod is not null)
                 throw new InvalidOperationException("Active RVM method is not ended.");
@@ -2102,7 +2121,8 @@ namespace Cnidaria.Cs
                 _gcRoots.ToImmutableArray(),
                 _unwind.ToImmutableArray(),
                 _switchTable.ToImmutableArray(),
-                _blob.ToImmutableArray());
+                _blob.ToImmutableArray(),
+                validate: validate);
         }
 
         private void ResolveFixups()

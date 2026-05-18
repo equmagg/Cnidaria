@@ -233,7 +233,8 @@ namespace Cnidaria.Cs
             TypeKind kind,
             int arity,
             Accessibility declaredAccessibility,
-            bool isFromMetadata)
+            bool isFromMetadata,
+            bool isSealed)
         {
             var t = new SourceNamedTypeSymbol(
                 name,
@@ -241,7 +242,8 @@ namespace Cnidaria.Cs
                 kind,
                 arity: arity,
                 declaredAccessibility: declaredAccessibility,
-                isFromMetadata: isFromMetadata);
+                isFromMetadata: isFromMetadata,
+                isSealed: isSealed);
 
             TypeSymbol? defaultBase = kind switch
             {
@@ -294,7 +296,8 @@ namespace Cnidaria.Cs
             TypeKind kind,
             int arity = 0,
             Accessibility declaredAccessibility = Accessibility.Public,
-            bool isFromMetadata = false)
+            bool isFromMetadata = false,
+            bool isSealed = false)
         {
             var ns = (SyntheticNamespaceSymbol)EnsureNamespace(@namespace);
             return CreateTypeCore(
@@ -303,7 +306,8 @@ namespace Cnidaria.Cs
                 kind,
                 arity,
                 declaredAccessibility,
-                isFromMetadata);
+                isFromMetadata,
+                isSealed);
         }
 
         public NamedTypeSymbol AddNestedType(
@@ -312,7 +316,8 @@ namespace Cnidaria.Cs
             TypeKind kind,
             int arity = 0,
             Accessibility declaredAccessibility = Accessibility.Public,
-            bool isFromMetadata = false)
+            bool isFromMetadata = false,
+            bool isSealed = false)
         {
             if (containingType is null) throw new ArgumentNullException(nameof(containingType));
 
@@ -322,7 +327,8 @@ namespace Cnidaria.Cs
                 kind,
                 arity,
                 declaredAccessibility,
-                isFromMetadata);
+                isFromMetadata,
+                isSealed);
         }
         public NamedTypeSymbol AddClass(string @namespace, string name)
             => AddType(@namespace, name, TypeKind.Class);
@@ -432,16 +438,19 @@ namespace Cnidaria.Cs
                 if (string.IsNullOrEmpty(name))
                     throw new BadImageFormatException($"TypeDef #{rid} has empty name.");
 
+                bool isSealed = ((System.Reflection.TypeAttributes)td.Flags & System.Reflection.TypeAttributes.Sealed) != 0;
+
                 if (TryMapSpecialType(ns, name, out var st) && !enclosingByRid.ContainsKey(rid))
                 {
                     var special = core.GetSpecialType(st);
+                    if (isSealed && special is SpecialNamedTypeSymbol specialNamed)
+                        specialNamed.MarkSealed();
                     typeByRid[rid] = special;
                     return special;
                 }
 
                 var kind = InferKind(td);
                 NamedTypeSymbol created;
-
                 if (enclosingByRid.TryGetValue(rid, out int enclosingRid))
                 {
                     var enclosing = EnsureType(enclosingRid);
@@ -451,7 +460,8 @@ namespace Cnidaria.Cs
                         kind,
                         arity: arity,
                         declaredAccessibility: DecodeTypeAccessibility(td.Flags),
-                        isFromMetadata: true);
+                        isFromMetadata: true,
+                        isSealed: isSealed);
                 }
                 else
                 {
@@ -461,7 +471,8 @@ namespace Cnidaria.Cs
                         kind,
                         arity: arity,
                         declaredAccessibility: DecodeTypeAccessibility(td.Flags),
-                        isFromMetadata: true);
+                        isFromMetadata: true, 
+                        isSealed: isSealed);
                 }
 
                 typeByRid[rid] = created;

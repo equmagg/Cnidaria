@@ -806,8 +806,7 @@ namespace Cnidaria.Cs
             if (method.Blocks.Length == 0)
                 return method;
 
-            var cfg = ControlFlowGraph.Build(method, includeExceptionEdges: false);
-            var splitEdges = FindCriticalNormalEdges(cfg);
+            var splitEdges = FindCriticalNormalEdges(method);
             if (splitEdges.Count == 0)
                 return method;
 
@@ -846,28 +845,48 @@ namespace Cnidaria.Cs
                 method.VirtualDependencies);
         }
 
-        private static List<CfgEdge> FindCriticalNormalEdges(ControlFlowGraph cfg)
+        private static List<CfgEdge> FindCriticalNormalEdges(GenTreeMethod method)
         {
-            var result = new List<CfgEdge>();
-            var seen = new HashSet<(int from, int to)>();
+            int n = method.Blocks.Length;
+            var successorCounts = new int[n];
+            var predecessorCounts = new int[n];
+            var seenEdges = new HashSet<CfgEdge>();
 
-            for (int b = 0; b < cfg.Blocks.Length; b++)
+            for (int b = 0; b < n; b++)
             {
-                var from = cfg.Blocks[b];
-                if (from.Successors.Length <= 1)
-                    continue;
-
-                for (int s = 0; s < from.Successors.Length; s++)
+                var block = method.Blocks[b];
+                if (block.Id != b)
+                    throw new InvalidOperationException($"Critical edge splitting requires dense block ids. B{b} expected, found B{block.Id}.");
+                for (int s = 0; s < block.SuccessorBlockIds.Length; s++)
                 {
-                    var edge = from.Successors[s];
-                    if (edge.Kind == CfgEdgeKind.Exception)
-                        continue;
+                    int to = block.SuccessorBlockIds[s];
+                    if ((uint)to >= (uint)n)
+                        throw new InvalidOperationException($"Invalid CFG edge B{block.Id} -> B{to}.");
 
-                    var to = cfg.Blocks[edge.ToBlockId];
-                    if (to.Predecessors.Length <= 1)
-                        continue;
+                    var edge = new CfgEdge(block.Id, to, ClassifyNormalEdge(block, to));
+                    if (seenEdges.Add(edge))
+                    {
+                        successorCounts[block.Id]++;
+                        predecessorCounts[to]++;
+                    }
+                }
+            }
 
-                    if (seen.Add((edge.FromBlockId, edge.ToBlockId)))
+            var result = new List<CfgEdge>();
+            var seenPairs = new HashSet<(int from, int to)>();
+
+            for (int b = 0; b < n; b++)
+            {
+                if (successorCounts[b] <= 1)
+                    continue;
+                var block = method.Blocks[b];
+                for (int s = 0; s < block.SuccessorBlockIds.Length; s++)
+                {
+                    int to = block.SuccessorBlockIds[s];
+                    if (predecessorCounts[to] <= 1)
+                        continue;
+                    var edge = new CfgEdge(block.Id, to, ClassifyNormalEdge(block, to));
+                    if (seenPairs.Add((edge.FromBlockId, edge.ToBlockId)))
                         result.Add(edge);
                 }
             }
@@ -879,7 +898,19 @@ namespace Cnidaria.Cs
             });
             return result;
         }
-
+        private static CfgEdgeKind ClassifyNormalEdge(GenTreeBlock block, int successorBlockId)
+        {
+            if (block.Statements.Length == 0)
+                return CfgEdgeKind.FallThrough;
+            var last = block.Statements[block.Statements.Length - 1];
+            return last.Kind switch
+            {
+                GenTreeKind.Branch => CfgEdgeKind.Branch,
+                GenTreeKind.BranchTrue => last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchTrue : CfgEdgeKind.FallThrough,
+                GenTreeKind.BranchFalse => last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchFalse : CfgEdgeKind.FallThrough,
+                _ => CfgEdgeKind.FallThrough
+            };
+        }
         private static GenTreeBlock RewriteOriginalBlock(
             GenTreeBlock block,
             Dictionary<(int from, int to), SplitEdgeInfo> splitInfo,
@@ -2398,6 +2429,29 @@ namespace Cnidaria.Cs
             Array.Copy(_bits, copy, _bits.Length);
             return new TrackedLocalSet(Table, copy);
         }
+        public void Clear()
+        {
+            Array.Clear(_bits, 0, _bits.Length);
+        }
+
+        public void CopyFrom(TrackedLocalSet other)
+        {
+            CheckCompatible(other);
+            Array.Copy(other._bits, _bits, _bits.Length);
+        }
+
+        public bool CopyFromIfChanged(TrackedLocalSet other)
+        {
+            CheckCompatible(other);
+            bool changed = false;
+            for (int i = 0; i < _bits.Length; i++)
+            {
+                ulong next = other._bits[i];
+                changed |= _bits[i] != next;
+                _bits[i] = next;
+            }
+            return changed;
+        }
 
         public bool Add(SsaSlot slot)
         {
@@ -2886,129 +2940,6 @@ namespace Cnidaria.Cs
                     descriptor?.AddFullDefinition(w);
             }
         }
-
-        private static HashSet<SsaSlot> BuildEhExposedSlots(ControlFlowGraph cfg)
-        {
-            var exposed = new HashSet<SsaSlot>();
-            if (cfg.ExceptionRegions.Length == 0)
-                return exposed;
-
-            int blockCount = cfg.Blocks.Length;
-            var uses = NewSetArray(blockCount);
-            var defs = NewSetArray(blockCount);
-            var touched = NewSetArray(blockCount);
-
-            for (int b = 0; b < blockCount; b++)
-                CollectUseDefAndTouch(cfg.Blocks[b].SourceBlock.LinearNodes, uses[b], defs[b], touched[b]);
-
-            var liveIn = NewSetArray(blockCount);
-            var liveOut = NewSetArray(blockCount);
-            bool changed;
-            do
-            {
-                changed = false;
-                for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
-                {
-                    int b = cfg.ReversePostOrder[r];
-                    var newOut = new HashSet<SsaSlot>();
-                    var successors = cfg.Blocks[b].Successors;
-                    for (int i = 0; i < successors.Length; i++)
-                        newOut.UnionWith(liveIn[successors[i].ToBlockId]);
-
-                    var newIn = new HashSet<SsaSlot>(newOut);
-                    newIn.ExceptWith(defs[b]);
-                    newIn.UnionWith(uses[b]);
-
-                    if (!liveOut[b].SetEquals(newOut))
-                    {
-                        liveOut[b] = newOut;
-                        changed = true;
-                    }
-
-                    if (!liveIn[b].SetEquals(newIn))
-                    {
-                        liveIn[b] = newIn;
-                        changed = true;
-                    }
-                }
-            }
-            while (changed);
-
-            for (int b = 0; b < blockCount; b++)
-            {
-                var successors = cfg.Blocks[b].Successors;
-                for (int i = 0; i < successors.Length; i++)
-                {
-                    var edge = successors[i];
-                    if (edge.Kind != CfgEdgeKind.Exception)
-                        continue;
-
-                    exposed.UnionWith(liveOut[b]);
-                    exposed.UnionWith(liveIn[edge.ToBlockId]);
-                }
-            }
-
-            var touchedFunclets = new Dictionary<SsaSlot, int>();
-            for (int b = 0; b < blockCount; b++)
-            {
-                int funcletId = FuncletIdentity(cfg.Blocks[b]);
-                foreach (var slot in touched[b])
-                {
-                    if (!touchedFunclets.TryGetValue(slot, out int previous))
-                        touchedFunclets.Add(slot, funcletId);
-                    else if (previous != funcletId)
-                        exposed.Add(slot);
-                }
-            }
-
-            return exposed;
-
-            static HashSet<SsaSlot>[] NewSetArray(int count)
-            {
-                var result = new HashSet<SsaSlot>[count];
-                for (int i = 0; i < result.Length; i++)
-                    result[i] = new HashSet<SsaSlot>();
-                return result;
-            }
-
-            static int FuncletIdentity(CfgBlock block)
-                => block.HandlerRegionIndexes.Length == 0
-                    ? 0
-                    : block.HandlerRegionIndexes[block.HandlerRegionIndexes.Length - 1] + 1;
-
-            static void CollectUseDefAndTouch(ImmutableArray<GenTree> treeList, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
-            {
-                for (int i = 0; i < treeList.Length; i++)
-                {
-                    var node = treeList[i];
-                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
-                    {
-                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
-                            uses.Add(fieldAccess.Slot);
-                        if (fieldAccess.IsDefinition)
-                            defs.Add(fieldAccess.Slot);
-                        touched.Add(fieldAccess.Slot);
-                        continue;
-                    }
-
-                    if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
-                    {
-                        defs.Add(storeSlot);
-                        touched.Add(storeSlot);
-                        continue;
-                    }
-
-                    if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
-                    {
-                        if (!defs.Contains(loadSlot))
-                            uses.Add(loadSlot);
-                        touched.Add(loadSlot);
-                    }
-                }
-            }
-
-        }
-
         private static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind)
         {
             if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
@@ -3039,58 +2970,6 @@ namespace Cnidaria.Cs
             return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind);
         }
 
-        private static GenStackKind StackKindOf(RuntimeType? type)
-        {
-            if (type is null)
-                return GenStackKind.Unknown;
-
-            if (type.Namespace == "System" && type.Name == "Void")
-                return GenStackKind.Void;
-
-            if (type.IsReferenceType)
-                return GenStackKind.Ref;
-
-            if (type.Kind == RuntimeTypeKind.Pointer)
-                return GenStackKind.Ptr;
-
-            if (type.Kind == RuntimeTypeKind.ByRef)
-                return GenStackKind.ByRef;
-
-            if (type.Kind == RuntimeTypeKind.TypeParam)
-                return GenStackKind.Value;
-
-            if (type.Kind == RuntimeTypeKind.Enum)
-                return type.SizeOf <= 4 ? GenStackKind.I4 : GenStackKind.I8;
-
-            if (type.Namespace == "System")
-            {
-                switch (type.Name)
-                {
-                    case "Boolean":
-                    case "Char":
-                    case "SByte":
-                    case "Byte":
-                    case "Int16":
-                    case "UInt16":
-                    case "Int32":
-                    case "UInt32":
-                        return GenStackKind.I4;
-                    case "Int64":
-                    case "UInt64":
-                        return GenStackKind.I8;
-                    case "Single":
-                        return GenStackKind.R4;
-                    case "Double":
-                        return GenStackKind.R8;
-                    case "IntPtr":
-                        return GenStackKind.NativeInt;
-                    case "UIntPtr":
-                        return GenStackKind.NativeUInt;
-                }
-            }
-
-            return GenStackKind.Value;
-        }
     }
 
 
@@ -3198,7 +3077,8 @@ namespace Cnidaria.Cs
                         defs[block.Id].Add(ev.Slot);
                 }
             }
-
+            var scratchOut = table.NewEmptySet();
+            var scratchIn = table.NewEmptySet();
             bool changed;
             do
             {
@@ -3210,30 +3090,21 @@ namespace Cnidaria.Cs
                     if (block is null)
                         continue;
 
-                    var newOut = table.NewEmptySet();
+                    scratchOut.Clear();
                     var successors = method.Cfg.Blocks[blockId].Successors;
                     for (int i = 0; i < successors.Length; i++)
                     {
                         int succ = successors[i].ToBlockId;
-                        newOut.UnionWith(liveIn[succ]);
-                        AddPhiEdgeUses(blockById[succ], blockId, newOut, table);
+                        scratchOut.UnionWith(liveIn[succ]);
+                        AddPhiEdgeUses(blockById[succ], blockId, scratchOut, table);
                     }
 
-                    var newIn = newOut.Clone();
-                    newIn.ExceptWith(defs[blockId]);
-                    newIn.UnionWith(uses[blockId]);
+                    scratchIn.CopyFrom(scratchOut);
+                    scratchIn.ExceptWith(defs[blockId]);
+                    scratchIn.UnionWith(uses[blockId]);
 
-                    if (!liveOut[blockId].SetEquals(newOut))
-                    {
-                        liveOut[blockId] = newOut;
-                        changed = true;
-                    }
-
-                    if (!liveIn[blockId].SetEquals(newIn))
-                    {
-                        liveIn[blockId] = newIn;
-                        changed = true;
-                    }
+                    changed |= liveOut[blockId].CopyFromIfChanged(scratchOut);
+                    changed |= liveIn[blockId].CopyFromIfChanged(scratchIn);
                 }
             }
             while (changed);
@@ -3458,7 +3329,8 @@ namespace Cnidaria.Cs
                 ClearLocalDataflowFlags(nodes);
                 CollectUseDef(nodes, trackedLocals, uses[b], defs[b]);
             }
-
+            var scratchOut = trackedLocals.NewEmptySet();
+            var scratchIn = trackedLocals.NewEmptySet();
             bool changed;
             do
             {
@@ -3466,26 +3338,17 @@ namespace Cnidaria.Cs
                 for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
                 {
                     int blockId = cfg.ReversePostOrder[r];
-                    var newOut = trackedLocals.NewEmptySet();
+                    scratchOut.Clear();
                     var successors = cfg.Blocks[blockId].Successors;
                     for (int i = 0; i < successors.Length; i++)
-                        newOut.UnionWith(liveIn[successors[i].ToBlockId]);
+                        scratchOut.UnionWith(liveIn[successors[i].ToBlockId]);
 
-                    var newIn = newOut.Clone();
-                    newIn.ExceptWith(defs[blockId]);
-                    newIn.UnionWith(uses[blockId]);
+                    scratchIn.CopyFrom(scratchOut);
+                    scratchIn.ExceptWith(defs[blockId]);
+                    scratchIn.UnionWith(uses[blockId]);
 
-                    if (!liveOut[blockId].SetEquals(newOut))
-                    {
-                        liveOut[blockId] = newOut;
-                        changed = true;
-                    }
-
-                    if (!liveIn[blockId].SetEquals(newIn))
-                    {
-                        liveIn[blockId] = newIn;
-                        changed = true;
-                    }
+                    changed |= liveOut[blockId].CopyFromIfChanged(scratchOut);
+                    changed |= liveIn[blockId].CopyFromIfChanged(scratchIn);
                 }
             }
             while (changed);
@@ -3671,6 +3534,35 @@ namespace Cnidaria.Cs
 
     internal static class SsaSourceAnnotations
     {
+        private sealed class AttachContext
+        {
+            public readonly SsaMethod Method;
+            public readonly Dictionary<SsaSlot, SsaSlotInfo> SlotInfoBySlot;
+            public readonly Dictionary<SsaSlot, GenLocalDescriptor> DescriptorBySlot;
+
+            public AttachContext(SsaMethod method)
+            {
+                Method = method;
+                SlotInfoBySlot = new Dictionary<SsaSlot, SsaSlotInfo>(method.Slots.Length);
+                DescriptorBySlot = new Dictionary<SsaSlot, GenLocalDescriptor>();
+
+                for (int i = 0; i < method.Slots.Length; i++)
+                    SlotInfoBySlot[method.Slots[i].Slot] = method.Slots[i];
+
+                AddDescriptors(method.GenTreeMethod.ArgDescriptors);
+                AddDescriptors(method.GenTreeMethod.LocalDescriptors);
+                AddDescriptors(method.GenTreeMethod.TempDescriptors);
+            }
+
+            private void AddDescriptors(ImmutableArray<GenLocalDescriptor> descriptors)
+            {
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var descriptor = descriptors[i];
+                    DescriptorBySlot[new SsaSlot(descriptor)] = descriptor;
+                }
+            }
+        }
         public static void Clear(GenTreeMethod method)
         {
             if (method is null)
@@ -3691,13 +3583,16 @@ namespace Cnidaria.Cs
 
             Clear(method.GenTreeMethod);
 
+            var context = new AttachContext(method);
+
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 var statements = method.Blocks[b].Statements;
                 for (int s = 0; s < statements.Length; s++)
-                    AttachTree(method, statements[s]);
+                    AttachTree(context, statements[s]);
             }
         }
+
 
         private static void ClearTree(GenTree node)
         {
@@ -3706,43 +3601,46 @@ namespace Cnidaria.Cs
                 ClearTree(node.Operands[i]);
         }
 
-        private static void AttachTree(SsaMethod method, SsaTree tree)
+        private static void AttachTree(AttachContext context, SsaTree tree)
         {
             if (tree.Value.HasValue)
             {
                 tree.Source.AttachSsaUse(tree.Value.Value);
-                AttachDescriptor(method.GenTreeMethod, tree.Source, tree.Value.Value.Slot);
+                AttachDescriptor(context, tree.Source, tree.Value.Value.Slot);
             }
 
             for (int i = 0; i < tree.Operands.Length; i++)
-                AttachTree(method, tree.Operands[i]);
+                AttachTree(context, tree.Operands[i]);
 
             if (tree.StoreTarget.HasValue)
             {
                 var target = tree.StoreTarget.Value;
-                var info = GetSlotInfo(method, target.Slot);
+                var info = GetSlotInfo(context, target.Slot);
                 tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
-                AttachDescriptor(method.GenTreeMethod, tree.Source, target.Slot);
+                AttachDescriptor(context, tree.Source, target.Slot);
             }
         }
 
-        private static SsaSlotInfo GetSlotInfo(SsaMethod method, SsaSlot slot)
+        private static SsaSlotInfo GetSlotInfo(AttachContext context, SsaSlot slot)
         {
-            for (int i = 0; i < method.Slots.Length; i++)
-            {
-                if (method.Slots[i].Slot.Equals(slot))
-                    return method.Slots[i];
-            }
+            if (context.SlotInfoBySlot.TryGetValue(slot, out var info))
+                return info;
 
-            return new SsaSlotInfo(slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
+            return new SsaSlotInfo(
+                slot,
+                null,
+                GenStackKind.Unknown,
+                addressExposed: true,
+                memoryAliased: true,
+                category: GenLocalCategory.AddressExposedLocal);
         }
 
-        private static void AttachDescriptor(GenTreeMethod method, GenTree node, SsaSlot slot)
+        private static void AttachDescriptor(AttachContext context, GenTree node, SsaSlot slot)
         {
             if (node.LocalDescriptor is not null)
                 return;
 
-            if (TryGetDescriptor(method, slot, out var descriptor))
+            if (context.DescriptorBySlot.TryGetValue(slot, out var descriptor))
                 node.LocalDescriptor = descriptor;
         }
 
@@ -3820,7 +3718,7 @@ namespace Cnidaria.Cs
             SsaSourceAnnotations.Clear(method);
 
             var slotTable = SlotTable.Build(method, cfg, hirLiveness);
-            var liveness = Liveness.Build(cfg, slotTable.PromotableSlots);
+            var liveness = Liveness.FromHirLiveness(cfg, slotTable.PromotableSlots, hirLiveness);
             var memoryLiveness = MemoryLiveness.Build(cfg, slotTable);
             var phis = InsertPhis(cfg, slotTable.PromotableSlots, liveness);
             var memoryPhis = InsertMemoryPhis(cfg, memoryLiveness);
@@ -4506,20 +4404,6 @@ namespace Cnidaria.Cs
                     return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind);
                 }
             }
-
-            private static Dictionary<SsaSlot, int> ComputeWeightedSlotUses(GenTreeMethod method, ControlFlowGraph cfg)
-            {
-                var result = new Dictionary<SsaSlot, int>();
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    int weight = 1 + 8 * LoopDepth(cfg, b);
-                    var nodes = method.Blocks[b].LinearNodes;
-                    for (int n = 0; n < nodes.Length; n++)
-                        CountSlotUses(nodes[n], result, weight);
-                }
-                return result;
-            }
-
             private static int LoopDepth(ControlFlowGraph cfg, int blockId)
             {
                 int depth = 0;
@@ -4552,199 +4436,6 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private static bool NeedsDescriptorHomeGcReporting(RuntimeType? type, GenStackKind stackKind)
-            {
-                if (type is not null)
-                {
-                    if (type.Kind == RuntimeTypeKind.ByRef || type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType)
-                        return true;
-                    if (type.IsValueType && type.ContainsGcPointers)
-                        return true;
-                }
-
-                return stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
-            }
-
-            private static void ApplyTrackedSlotBudget(
-                List<SsaSlot> promotable,
-                Dictionary<SsaSlot, GenLocalDescriptor> descriptorBySlot,
-                Dictionary<SsaSlot, int> weightedUses)
-            {
-                if (promotable.Count <= MaxTrackedPromotableSlots)
-                    return;
-
-                promotable.Sort((a, b) =>
-                {
-                    weightedUses.TryGetValue(a, out int aw);
-                    weightedUses.TryGetValue(b, out int bw);
-                    int c = bw.CompareTo(aw);
-                    return c != 0 ? c : a.CompareTo(b);
-                });
-
-                var kept = new HashSet<SsaSlot>();
-                for (int i = 0; i < MaxTrackedPromotableSlots; i++)
-                    kept.Add(promotable[i]);
-
-                for (int i = promotable.Count - 1; i >= 0; i--)
-                {
-                    var slot = promotable[i];
-                    if (kept.Contains(slot))
-                        continue;
-
-                    promotable.RemoveAt(i);
-                    if (descriptorBySlot.TryGetValue(slot, out var descriptor))
-                    {
-                        descriptor.MarkUntracked();
-                    }
-                }
-            }
-
-            private static void ResetSsaPromotionState(GenTreeMethod method)
-            {
-                Reset(method.ArgDescriptors);
-                Reset(method.LocalDescriptors);
-                Reset(method.TempDescriptors);
-
-                static void Reset(ImmutableArray<GenLocalDescriptor> descriptors)
-                {
-                    for (int i = 0; i < descriptors.Length; i++)
-                        descriptors[i].ResetTrackingAndLivenessState();
-                }
-            }
-
-            private static HashSet<SsaSlot> BuildEhExposedSlots(ControlFlowGraph cfg)
-            {
-                var exposed = new HashSet<SsaSlot>();
-                if (cfg.ExceptionRegions.Length == 0)
-                    return exposed;
-
-                int blockCount = cfg.Blocks.Length;
-                var uses = NewSetArray(blockCount);
-                var defs = NewSetArray(blockCount);
-                var touched = NewSetArray(blockCount);
-
-                for (int b = 0; b < blockCount; b++)
-                {
-                    CollectUseDefAndTouch(cfg.Blocks[b].SourceBlock.LinearNodes, uses[b], defs[b], touched[b]);
-                }
-
-                var liveIn = NewSetArray(blockCount);
-                var liveOut = NewSetArray(blockCount);
-                bool changed;
-                do
-                {
-                    changed = false;
-                    for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
-                    {
-                        int b = cfg.ReversePostOrder[r];
-
-                        var newOut = new HashSet<SsaSlot>();
-                        var successors = cfg.Blocks[b].Successors;
-                        for (int i = 0; i < successors.Length; i++)
-                            newOut.UnionWith(liveIn[successors[i].ToBlockId]);
-
-                        var newIn = new HashSet<SsaSlot>(newOut);
-                        newIn.ExceptWith(defs[b]);
-                        newIn.UnionWith(uses[b]);
-
-                        if (!liveOut[b].SetEquals(newOut))
-                        {
-                            liveOut[b] = newOut;
-                            changed = true;
-                        }
-
-                        if (!liveIn[b].SetEquals(newIn))
-                        {
-                            liveIn[b] = newIn;
-                            changed = true;
-                        }
-                    }
-                }
-                while (changed);
-
-                for (int b = 0; b < blockCount; b++)
-                {
-                    var successors = cfg.Blocks[b].Successors;
-                    for (int i = 0; i < successors.Length; i++)
-                    {
-                        var edge = successors[i];
-                        if (edge.Kind != CfgEdgeKind.Exception)
-                            continue;
-
-                        exposed.UnionWith(liveOut[b]);
-                        exposed.UnionWith(liveIn[edge.ToBlockId]);
-                    }
-                }
-
-                var touchedFunclets = new Dictionary<SsaSlot, int>();
-                for (int b = 0; b < blockCount; b++)
-                {
-                    int funcletId = FuncletIdentity(cfg.Blocks[b]);
-                    foreach (var slot in touched[b])
-                    {
-                        if (!touchedFunclets.TryGetValue(slot, out int previous))
-                        {
-                            touchedFunclets.Add(slot, funcletId);
-                        }
-                        else if (previous != funcletId)
-                        {
-                            exposed.Add(slot);
-                        }
-                    }
-                }
-
-                return exposed;
-
-                static HashSet<SsaSlot>[] NewSetArray(int count)
-                {
-                    var result = new HashSet<SsaSlot>[count];
-                    for (int i = 0; i < result.Length; i++)
-                        result[i] = new HashSet<SsaSlot>();
-                    return result;
-                }
-
-                static int FuncletIdentity(CfgBlock block)
-                    => block.HandlerRegionIndexes.Length == 0
-                        ? 0
-                        : block.HandlerRegionIndexes[block.HandlerRegionIndexes.Length - 1] + 1;
-
-                static void CollectUseDefAndTouch(ImmutableArray<GenTree> treeList, HashSet<SsaSlot> uses, HashSet<SsaSlot> defs, HashSet<SsaSlot> touched)
-                {
-                    for (int i = 0; i < treeList.Length; i++)
-                    {
-                        var node = treeList[i];
-                        if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
-                        {
-                            if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && !defs.Contains(fieldAccess.Slot))
-                                uses.Add(fieldAccess.Slot);
-                            if (fieldAccess.IsDefinition)
-                                defs.Add(fieldAccess.Slot);
-                            touched.Add(fieldAccess.Slot);
-                            continue;
-                        }
-
-                        if (TryGetDirectStoreSlot(node, out var storeSlot))
-                        {
-                            defs.Add(storeSlot);
-                            touched.Add(storeSlot);
-                            continue;
-                        }
-
-                        if (TryGetDirectLoadSlot(node, out var loadSlot))
-                        {
-                            if (!defs.Contains(loadSlot))
-                                uses.Add(loadSlot);
-                            touched.Add(loadSlot);
-                        }
-                    }
-                }
-            }
-
-            private static void CollectAddressExposed(GenTree node, HashSet<SsaSlot> addressExposed)
-            {
-                CollectAddressExposed(node, parent: null, operandIndex: -1, addressExposed);
-            }
-
             private static void CollectAddressExposed(GenTree node, GenTree? parent, int operandIndex, HashSet<SsaSlot> addressExposed)
             {
                 if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out var slot) &&
@@ -4773,90 +4464,55 @@ namespace Cnidaria.Cs
                 LiveOut = liveOut;
             }
 
-            public static Liveness Build(ControlFlowGraph cfg, ImmutableArray<SsaSlot> promotableSlots)
+            public static Liveness FromHirLiveness(
+                ControlFlowGraph cfg,
+                ImmutableArray<SsaSlot> promotableSlots,
+                GenTreeLocalLiveness hirLiveness)
             {
+                if (cfg is null)
+                    throw new ArgumentNullException(nameof(cfg));
+                if (hirLiveness is null)
+                    throw new ArgumentNullException(nameof(hirLiveness));
+                if (!ReferenceEquals(hirLiveness.Cfg, cfg))
+                    throw new InvalidOperationException("SSA liveness projection requires HIR liveness for the same CFG.");
+
                 int n = cfg.Blocks.Length;
                 var table = new TrackedLocalTable(promotableSlots);
-                var uses = NewSetArray(n, table);
-                var defs = NewSetArray(n, table);
-                var liveIn = NewSetArray(n, table);
-                var liveOut = NewSetArray(n, table);
 
-                for (int b = 0; b < n; b++)
-                {
-                    CollectUseDef(cfg.Blocks[b].SourceBlock.LinearNodes, table, uses[b], defs[b]);
-                }
-
-                bool changed;
-                do
-                {
-                    changed = false;
-                    for (int r = cfg.ReversePostOrder.Length - 1; r >= 0; r--)
-                    {
-                        int b = cfg.ReversePostOrder[r];
-
-                        var newOut = table.NewEmptySet();
-                        var successors = cfg.Blocks[b].Successors;
-                        for (int i = 0; i < successors.Length; i++)
-                            newOut.UnionWith(liveIn[successors[i].ToBlockId]);
-
-                        var newIn = newOut.Clone();
-                        newIn.ExceptWith(defs[b]);
-                        newIn.UnionWith(uses[b]);
-
-                        if (!liveOut[b].SetEquals(newOut))
-                        {
-                            liveOut[b] = newOut;
-                            changed = true;
-                        }
-
-                        if (!liveIn[b].SetEquals(newIn))
-                        {
-                            liveIn[b] = newIn;
-                            changed = true;
-                        }
-                    }
-                }
-                while (changed);
+                var uses = ProjectSets(hirLiveness.UseBits, table, promotableSlots, n);
+                var defs = ProjectSets(hirLiveness.DefBits, table, promotableSlots, n);
+                var liveIn = ProjectSets(hirLiveness.LiveInBits, table, promotableSlots, n);
+                var liveOut = ProjectSets(hirLiveness.LiveOutBits, table, promotableSlots, n);
 
                 return new Liveness(table, uses, defs, liveIn, liveOut);
             }
-
-            private static TrackedLocalSet[] NewSetArray(int count, TrackedLocalTable table)
+            private static TrackedLocalSet[] ProjectSets(
+                ImmutableArray<TrackedLocalSet> source,
+                TrackedLocalTable targetTable,
+                ImmutableArray<SsaSlot> slots,
+                int blockCount)
             {
-                var result = new TrackedLocalSet[count];
-                for (int i = 0; i < result.Length; i++)
-                    result[i] = table.NewEmptySet();
-                return result;
-            }
+                if (source.Length != blockCount)
+                    throw new InvalidOperationException("HIR liveness block count does not match CFG block count.");
 
-            private static void CollectUseDef(ImmutableArray<GenTree> treeList, TrackedLocalTable promotable, TrackedLocalSet uses, TrackedLocalSet defs)
-            {
-                for (int i = 0; i < treeList.Length; i++)
+                var result = new TrackedLocalSet[blockCount];
+
+                for (int b = 0; b < blockCount; b++)
                 {
-                    var node = treeList[i];
-                    if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess))
+                    var set = targetTable.NewEmptySet();
+                    var sourceSet = source[b];
+
+                    for (int i = 0; i < slots.Length; i++)
                     {
-                        if (fieldAccess.Kind != SsaLocalAccessKind.FullDefinition && promotable.Contains(fieldAccess.Slot) && !defs.Contains(fieldAccess.Slot))
-                            uses.Add(fieldAccess.Slot);
-                        if (fieldAccess.IsDefinition && promotable.Contains(fieldAccess.Slot))
-                            defs.Add(fieldAccess.Slot);
-                        continue;
+                        var slot = slots[i];
+                        if (sourceSet.Contains(slot))
+                            set.Add(slot);
                     }
 
-                    if (TryGetDirectStoreSlot(node, out var storeSlot))
-                    {
-                        if (promotable.Contains(storeSlot))
-                            defs.Add(storeSlot);
-                        continue;
-                    }
-
-                    if (TryGetDirectLoadSlot(node, out var loadSlot))
-                    {
-                        if (promotable.Contains(loadSlot) && !defs.Contains(loadSlot))
-                            uses.Add(loadSlot);
-                    }
+                    result[b] = set;
                 }
+
+                return result;
             }
         }
 
@@ -6730,8 +6386,8 @@ namespace Cnidaria.Cs
                     : ValueFact.Unknown;
             }
 
-            private static SsaMethod EnsureValueNumbers(SsaMethod method)
-                => method.ValueNumbers is null ? SsaValueNumbering.BuildMethod(method) : method;
+            private SsaMethod EnsureValueNumbers(SsaMethod method)
+                => method.ValueNumbers is null ? SsaValueNumbering.BuildMethod(method, validate: _options.Validate) : method;
 
             private bool TryGetSsaConstant(SsaMethod method, SsaValueName name, out ConstValue constant)
             {

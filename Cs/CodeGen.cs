@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics;
 
 namespace Cnidaria.Cs
 {
@@ -89,8 +90,10 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(program));
 
             options ??= BackendOptions.Default;
+            var swCompile = Stopwatch.StartNew();
             var lowered = GenTreeBackendPipeline.RunProgram(program, options);
             var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions);
+            swCompile.Stop();
             return new BackendResult(
                 lowered.HirProgram,
                 lowered.SsaProgram,
@@ -186,15 +189,18 @@ namespace Cnidaria.Cs
                     hirMethod.Cfg,
                     hirMethod.HirLiveness,
                     validate: options.ValidateSsa);
-                ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod);
-                hirMethod = ssaMethod.GenTreeMethod;
-                hirMethod.AttachSsa(ssaMethod, optimized: false);
 
                 if (options.OptimizeSsa)
                 {
                     ssaMethod = SsaOptimizer.OptimizeMethod(ssaMethod, options.SsaOptimizationOptions);
-                    ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod);
+                    hirMethod = ssaMethod.GenTreeMethod;
                     hirMethod.AttachSsa(ssaMethod, optimized: true);
+                }
+                else
+                {
+                    ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod, validate: options.ValidateSsa);
+                    hirMethod = ssaMethod.GenTreeMethod;
+                    hirMethod.AttachSsa(ssaMethod, optimized: false);
                 }
 
                 if (options.ValidateSsa)
@@ -290,9 +296,11 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.NewDelegate:
+                case GenTreeKind.DelegateCombine:
+                case GenTreeKind.DelegateRemove:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
-                    flags |= GenTreeFlags.Allocation | GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.Field:
@@ -526,10 +534,7 @@ namespace Cnidaria.Cs
                 method.SetPhase(GenTreeMethodPhase.CodeGenerated);
             }
 
-            var image = asm.Build(flags);
-            if (options.VerifyImage)
-                image.Validate();
-            return image;
+            return asm.Build(flags, validate: options.VerifyImage);
         }
 
         public static byte[] BuildBytes(GenTreeProgram program, CodeGeneratorOptions? options = null)
@@ -903,6 +908,12 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.NewDelegate:
                         EmitNewDelegate(instruction, source);
+                        return;
+                    case GenTreeKind.DelegateCombine:
+                        EmitDelegateBinary(instruction, Op.DelegateCombine);
+                        return;
+                    case GenTreeKind.DelegateRemove:
+                        EmitDelegateBinary(instruction, Op.DelegateRemove);
                         return;
                     case GenTreeKind.NewArray:
                         _asm.NewSZArray(RequireResultRegister(instruction), RequireUseRegister(instruction, 0), RequireRuntimeType(source).TypeId);
@@ -1883,6 +1894,18 @@ namespace Cnidaria.Cs
                     imm: descriptor));
             }
 
+            private void EmitDelegateBinary(GenTree instruction, Op op)
+            {
+                if (instruction.Uses.Length != 2)
+                    throw Unsupported(instruction, "delegate binary op requires two operands");
+
+                var result = RequireResultRegister(instruction);
+                var left = RequireUseRegister(instruction, 0);
+                var right = RequireUseRegister(instruction, 1);
+                _asm.Emit(InstrDesc.R(op, result, left, right,
+                    Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
+            }
+
             private void EmitCallLike(GenTree instruction, GenTree source)
             {
                 RuntimeMethod method = source.Method ?? throw Unsupported(instruction, "call-like node has no runtime method");
@@ -1924,12 +1947,15 @@ namespace Cnidaria.Cs
 
                 if (instruction.TreeKind == GenTreeKind.VirtualCall)
                 {
+                    int dispatchSlot = method.DeclaringType.Kind == RuntimeTypeKind.Interface
+                        ? -1
+                        : method.VTableSlot;
                     var site = new CallSiteRecord(
                         -1,
                         method.MethodId,
                         method.MethodId,
                         method.DeclaringType.TypeId,
-                        method.VTableSlot,
+                        dispatchSlot,
                         (CallFlags)aux);
                     switch (op)
                     {
@@ -3676,6 +3702,8 @@ namespace Cnidaria.Cs
                     GenTreeKind.DelegateInvoke or
                     GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
+                    GenTreeKind.DelegateCombine or
+                    GenTreeKind.DelegateRemove or
                     GenTreeKind.NewArray or
                     GenTreeKind.Box or
                     GenTreeKind.UnboxAny or

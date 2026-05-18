@@ -560,6 +560,8 @@ namespace Cnidaria.Cs
             if (source.Kind is
                 GenTreeKind.NewArray or
                 GenTreeKind.NewDelegate or
+                GenTreeKind.DelegateCombine or
+                GenTreeKind.DelegateRemove or
                 GenTreeKind.Box or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.CastClass or
@@ -1576,6 +1578,8 @@ namespace Cnidaria.Cs
                     GenTreeKind.DelegateInvoke or
                     GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
+                    GenTreeKind.DelegateCombine or
+                    GenTreeKind.DelegateRemove or
                     GenTreeKind.NewArray or
                     GenTreeKind.StoreIndirect or
                     GenTreeKind.StoreLocal or
@@ -2211,9 +2215,10 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
-            var intervals = BuildIntervals(method, out var intervalMap);
+            var layout = PositionLayout.Build(method);
+            var intervals = BuildIntervals(method, layout, out var intervalMap);
             MarkUnusedValueDefinitions(method, intervalMap);
-            var refPositions = BuildRefPositions(method, intervalMap);
+            var refPositions = BuildRefPositions(method, intervalMap, layout);
             method.AttachLiveness(intervals, intervalMap, refPositions);
             return method;
         }
@@ -2221,13 +2226,12 @@ namespace Cnidaria.Cs
 
         public static ImmutableArray<LinearRefPosition> BuildRefPositions(
             GenTreeMethod method,
-            IReadOnlyDictionary<GenTree, LinearLiveInterval>? intervals = null)
+            IReadOnlyDictionary<GenTree, LinearLiveInterval> intervals,
+            PositionLayout layout)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
-            intervals ??= method.LiveIntervalByNode;
-            var layout = PositionLayout.Build(method);
             var result = ImmutableArray.CreateBuilder<LinearRefPosition>();
 
             for (int i = 0; i < method.LinearNodes.Length; i++)
@@ -3060,12 +3064,12 @@ namespace Cnidaria.Cs
 
         public static ImmutableArray<LinearLiveInterval> BuildIntervals(
             GenTreeMethod method,
+            PositionLayout layout,
             out IReadOnlyDictionary<GenTree, LinearLiveInterval> intervalMap)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
-            var layout = PositionLayout.Build(method);
             var liveIn = NewSetArray(method.Blocks.Length);
             var liveOut = NewSetArray(method.Blocks.Length);
             var blockUses = NewSetArray(method.Blocks.Length);
@@ -3148,7 +3152,8 @@ namespace Cnidaria.Cs
             var dataflowOrder = method.LinearBlockOrder.IsDefaultOrEmpty
                 ? LinearBlockOrder.Compute(method.Cfg)
                 : method.LinearBlockOrder;
-
+            var newOut = new HashSet<GenTree>();
+            var newIn = new HashSet<GenTree>();
             bool changed;
             do
             {
@@ -3156,24 +3161,27 @@ namespace Cnidaria.Cs
                 for (int r = dataflowOrder.Length - 1; r >= 0; r--)
                 {
                     int blockId = dataflowOrder[r];
-                    var newOut = new HashSet<GenTree>();
+                    newOut.Clear();
                     var successors = method.Cfg.Blocks[blockId].Successors;
                     for (int s = 0; s < successors.Length; s++)
                         newOut.UnionWith(liveIn[successors[s].ToBlockId]);
 
-                    var newIn = new HashSet<GenTree>(newOut);
+                    newIn.Clear();
+                    newIn.UnionWith(newOut);
                     newIn.ExceptWith(blockDefs[blockId]);
                     newIn.UnionWith(blockUses[blockId]);
 
                     if (!SetEquals(liveOut[blockId], newOut))
                     {
-                        liveOut[blockId] = newOut;
+                        liveOut[blockId].Clear();
+                        liveOut[blockId].UnionWith(newOut);
                         changed = true;
                     }
 
                     if (!SetEquals(liveIn[blockId], newIn))
                     {
-                        liveIn[blockId] = newIn;
+                        liveIn[blockId].Clear();
+                        liveIn[blockId].UnionWith(newIn);
                         changed = true;
                     }
                 }
@@ -3184,19 +3192,20 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.Values.Length; i++)
                 ranges[method.Values[i].RepresentativeNode] = new List<LinearLiveRange>();
 
+            var blockValues = new HashSet<GenTree>();
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 int blockStart = layout.BlockStartPositions[b];
                 int blockEnd = layout.BlockEndPositions[b] + 1;
-                var values = new HashSet<GenTree>();
-                values.UnionWith(liveIn[b]);
-                values.UnionWith(liveOut[b]);
+                blockValues.Clear();
+                blockValues.UnionWith(liveIn[b]);
+                blockValues.UnionWith(liveOut[b]);
                 foreach (var kv in localUseEnds[b])
-                    values.Add(kv.Key);
+                    blockValues.Add(kv.Key);
                 foreach (var kv in localDefStarts[b])
-                    values.Add(kv.Key);
+                    blockValues.Add(kv.Key);
 
-                foreach (var value in values)
+                foreach (var value in blockValues)
                 {
                     bool isLiveIn = liveIn[b].Contains(value);
                     bool isLiveOut = liveOut[b].Contains(value);
@@ -3430,7 +3439,7 @@ namespace Cnidaria.Cs
                 definitions[value] = position;
         }
 
-        private sealed class PositionLayout
+        public sealed class PositionLayout
         {
             public Dictionary<int, int> NodePositions { get; }
             public int[] BlockStartPositions { get; }
@@ -4361,6 +4370,14 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.NewDelegate:
                     sb.Append("new_delegate ").Append(MethodName(source.Method)).Append(' ');
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.DelegateCombine:
+                    sb.Append("delegate_combine ");
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.DelegateRemove:
+                    sb.Append("delegate_remove ");
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.NewObject:

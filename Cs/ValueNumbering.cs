@@ -1075,7 +1075,7 @@ namespace Cnidaria.Cs
 
     internal static class SsaValueNumbering
     {
-        public static SsaMethod BuildMethod(SsaMethod method)
+        public static SsaMethod BuildMethod(SsaMethod method, bool validate = true)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
@@ -1094,7 +1094,8 @@ namespace Cnidaria.Cs
                 method.InitialMemoryValues,
                 method.MemoryDefinitions);
             SsaSourceAnnotations.Attach(numbered);
-            SsaVerifier.Verify(numbered);
+            if (validate)
+                SsaVerifier.Verify(numbered);
             return numbered;
         }
 
@@ -1614,6 +1615,8 @@ namespace Cnidaria.Cs
                         return NewArray(node, operands, ref heap);
                     case GenTreeKind.NewObject:
                     case GenTreeKind.NewDelegate:
+                    case GenTreeKind.DelegateCombine:
+                    case GenTreeKind.DelegateRemove:
                         return NewObject(node, operands, ref heap);
                     case GenTreeKind.Call:
                     case GenTreeKind.VirtualCall:

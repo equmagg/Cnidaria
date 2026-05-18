@@ -127,6 +127,7 @@ namespace Cnidaria.Cs
                 BoundTryStatement s => RewriteTryStatement(s),
                 BoundThrowStatement s => RewriteThrowStatement(s),
                 BoundReturnStatement s => RewriteReturnStatement(s),
+                BoundYieldStatement s => RewriteYieldStatement(s),
                 BoundIfStatement s => RewriteIfStatement(s),
                 BoundWhileStatement s => RewriteWhileStatement(s),
                 BoundDoWhileStatement s => RewriteDoWhileStatement(s),
@@ -426,12 +427,26 @@ namespace Cnidaria.Cs
 
             return node;
         }
-
         protected virtual BoundStatement RewriteReturnStatement(BoundReturnStatement node)
         {
             var expr = node.Expression is null ? null : RewriteExpression(node.Expression);
             if (!ReferenceEquals(expr, node.Expression))
                 return new BoundReturnStatement(node.Syntax, expr);
+
+            return node;
+        }
+        protected virtual BoundStatement RewriteYieldStatement(BoundYieldStatement node)
+        {
+            var expr = node.ExpressionOpt is null ? null : RewriteExpression(node.ExpressionOpt);
+
+            if (!ReferenceEquals(expr, node.ExpressionOpt))
+            {
+                return new BoundYieldStatement(
+                    (YieldStatementSyntax)node.Syntax,
+                    node.YieldKind,
+                    expr,
+                    node.ElementTypeOpt);
+            }
 
             return node;
         }
@@ -1693,6 +1708,25 @@ namespace Cnidaria.Cs
             if (compilation is null) throw new ArgumentNullException(nameof(compilation));
             if (methodBody is null) throw new ArgumentNullException(nameof(methodBody));
 
+            if (compilation.TryGetIteratorStateMachine(methodBody.Method, out var iteratorInfo))
+            {
+                methodBody = RewriteIteratorLocalFunctions(compilation, methodBody);
+
+                methodBody = IteratorLowering.RewriteOriginalIteratorMethod(compilation, methodBody, iteratorInfo);
+
+                var rewriter = new LocalRewriter(compilation, methodBody.Method);
+                var loweredBody = rewriter.RewriteNode(methodBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected iterator method rewrite result.");
+
+                loweredBody = EnsureBlockBody(loweredBody);
+
+                var cleaner = new CleanupRewriter();
+                loweredBody = cleaner.RewriteNode(loweredBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected iterator cleanup result.");
+
+                return EnsureBlockBody(loweredBody);
+            }
+
             var lambdaClosureRewriter = new LambdaClosureRewriter(compilation);
             var lambdaClosureLoweredBody = lambdaClosureRewriter.RewriteNode(methodBody) as BoundMethodBody
                 ?? throw new InvalidOperationException("Unexpected lambda closure conversion result.");
@@ -1701,19 +1735,23 @@ namespace Cnidaria.Cs
             var closureLoweredBody = closureRewriter.RewriteNode(lambdaClosureLoweredBody) as BoundMethodBody
                 ?? throw new InvalidOperationException("Unexpected closure conversion result.");
 
-            var rewriter = new LocalRewriter(compilation, closureLoweredBody.Method);
-            var loweredBody = rewriter.RewriteNode(closureLoweredBody) as BoundMethodBody
-                ?? throw new InvalidOperationException("Unexpected rewrite result.");
+            closureLoweredBody = RewriteIteratorLocalFunctions(compilation, closureLoweredBody);
 
-            loweredBody = EnsureBlockBody(loweredBody);
+            {
+                var rewriter = new LocalRewriter(compilation, closureLoweredBody.Method);
+                var loweredBody = rewriter.RewriteNode(closureLoweredBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected rewrite result.");
 
-            var cleaner = new CleanupRewriter();
-            loweredBody = cleaner.RewriteNode(loweredBody) as BoundMethodBody
-                ?? throw new InvalidOperationException("Unexpected cleanup result.");
+                loweredBody = EnsureBlockBody(loweredBody);
 
-            loweredBody = EnsureBlockBody(loweredBody);
+                var cleaner = new CleanupRewriter();
+                loweredBody = cleaner.RewriteNode(loweredBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected cleanup result.");
 
-            return loweredBody;
+                loweredBody = EnsureBlockBody(loweredBody);
+
+                return loweredBody;
+            }
         }
 
         private static BoundMethodBody EnsureBlockBody(BoundMethodBody body)
@@ -1734,12 +1772,1172 @@ namespace Cnidaria.Cs
                 body.Method,
                 new BoundBlockStatement(body.Body.Syntax, ImmutableArray.Create<BoundStatement>(body.Body)));
         }
+        internal static void PrepareIteratorStateMachines(Compilation compilation, SyntaxTree tree, SemanticModel model)
+        {
+            var preparer = new IteratorStateMachinePreparer(
+                compilation,
+                tree,
+                compilation.GetIteratorStateMachinesForTree(tree).Length);
 
+            if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
+                cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
+            {
+                preparer.Prepare(topLevelBody);
+            }
+
+            foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
+            {
+                var body = (BoundMethodBody)model.GetBoundNode(owner);
+                preparer.Prepare(body);
+            }
+        }
+
+        internal static ImmutableArray<BoundMethodBody> GetIteratorStateMachineBodies(Compilation compilation, IteratorStateMachineInfo info)
+            => IteratorLowering.BuildBodies(compilation, info);
+        private static BoundMethodBody RewriteIteratorLocalFunctions(
+            Compilation compilation,
+            BoundMethodBody body)
+        {
+            if (!IteratorLocalFunctionYieldFinder.Contains(body.Body))
+                return body;
+
+            var rewriter = new IteratorLocalFunctionRewriter(compilation);
+
+            var rewritten = rewriter.RewriteNode(body) as BoundMethodBody
+                ?? throw new InvalidOperationException("Unexpected iterator local function rewrite result.");
+
+            return EnsureBlockBody(rewritten);
+        }
+
+        private sealed class IteratorLocalCollector : BoundTreeRewriter
+        {
+            private readonly HashSet<LocalSymbol> _seen =
+                new(ReferenceEqualityComparer<LocalSymbol>.Instance);
+
+            private readonly ImmutableArray<LocalSymbol>.Builder _locals =
+                ImmutableArray.CreateBuilder<LocalSymbol>();
+
+            public ImmutableArray<LocalSymbol> Locals => _locals.ToImmutable();
+
+            public void Visit(BoundStatement statement)
+                => RewriteStatement(statement);
+
+            protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
+            {
+                if (_seen.Add(node.Local))
+                    _locals.Add(node.Local);
+
+                return base.RewriteLocalDeclarationStatement(node);
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => node;
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+        }
+
+        private sealed class IteratorYieldFinder : BoundTreeRewriter
+        {
+            public bool Found { get; private set; }
+
+            public void Visit(BoundStatement statement)
+                => RewriteStatement(statement);
+
+            protected override BoundStatement RewriteYieldStatement(BoundYieldStatement node)
+            {
+                Found = true;
+                return node;
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => node;
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+        }
+
+        private sealed class IteratorLocalFunctionYieldFinder : BoundTreeRewriter
+        {
+            public bool Found { get; private set; }
+
+            public static bool Contains(BoundStatement body)
+            {
+                var finder = new IteratorLocalFunctionYieldFinder();
+                finder.RewriteStatement(body);
+                return finder.Found;
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                if (IteratorLowering.ContainsYield(node.Body))
+                {
+                    Found = true;
+                    return node;
+                }
+
+                return base.RewriteLocalFunctionStatement(node);
+            }
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+        }
+
+        private sealed class IteratorStateMachinePreparer : BoundTreeRewriter
+        {
+            private readonly Compilation _compilation;
+            private readonly SyntaxTree _tree;
+            private int _nextOrdinal;
+
+            public IteratorStateMachinePreparer(
+                Compilation compilation,
+                SyntaxTree tree,
+                int nextOrdinal)
+            {
+                _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
+                _tree = tree ?? throw new ArgumentNullException(nameof(tree));
+                _nextOrdinal = nextOrdinal;
+            }
+            public void Prepare(BoundMethodBody body)
+            {
+                RegisterIfIterator(body);
+                RewriteStatement(body.Body);
+            }
+
+            private void RegisterIfIterator(BoundMethodBody body)
+            {
+                if (!IteratorLowering.ContainsYield(body.Body))
+                    return;
+
+                if (_compilation.TryGetIteratorStateMachine(body.Method, out _))
+                    return;
+
+                var preLowered = IteratorLowering.PreLowerIteratorBodyPreservingYield(
+                    _compilation,
+                    body);
+
+                var info = IteratorLowering.Create(
+                    _compilation,
+                    _tree,
+                    body,
+                    preLowered,
+                    _nextOrdinal++);
+
+                _compilation.RegisterIteratorStateMachine(body.Method, info);
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                var body = new BoundMethodBody(
+                    node.Syntax,
+                    node.LocalFunction,
+                    node.Body);
+
+                RegisterIfIterator(body);
+
+                return base.RewriteLocalFunctionStatement(node);
+            }
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+        }
+
+        private sealed class IteratorLocalFunctionRewriter : BoundTreeRewriter
+        {
+            private readonly Compilation _compilation;
+
+            public IteratorLocalFunctionRewriter(Compilation compilation)
+            {
+                _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
+            }
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                var rewrittenBody = RewriteStatement(node.Body);
+                var localFunction = node.LocalFunction;
+
+                if (!IteratorLowering.ContainsYield(rewrittenBody))
+                {
+                    if (!ReferenceEquals(rewrittenBody, node.Body))
+                    {
+                        return new BoundLocalFunctionStatement(
+                            (LocalFunctionStatementSyntax)node.Syntax,
+                            localFunction,
+                            rewrittenBody);
+                    }
+
+                    return node;
+                }
+
+                ThrowIfIteratorLocalFunctionHasByRefParameters(localFunction);
+
+                if (!_compilation.TryGetIteratorStateMachine(localFunction, out var info))
+                {
+                    throw new InvalidOperationException(
+                        $"Iterator local function '{localFunction.Name}' was not prepared before metadata snapshot.");
+                }
+
+                var body = new BoundMethodBody(
+                    node.Syntax,
+                    localFunction,
+                    rewrittenBody);
+
+                var loweredOriginal = IteratorLowering.RewriteOriginalIteratorMethod(
+                    _compilation,
+                    body,
+                    info);
+
+                return new BoundLocalFunctionStatement(
+                    (LocalFunctionStatementSyntax)node.Syntax,
+                    localFunction,
+                    loweredOriginal.Body);
+            }
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+
+            private static void ThrowIfIteratorLocalFunctionHasByRefParameters(LocalFunctionSymbol method)
+            {
+                var parameters = method.Parameters;
+
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var p = parameters[i];
+
+                    if (p.RefKind != ParameterRefKind.None || p.Type is ByRefTypeSymbol)
+                    {
+                        throw new NotSupportedException(
+                            $"Iterator local function '{method.Name}' still has by-ref parameter '{p.Name}' after local-function closure lowering. " +
+                            "Captured locals in iterator local functions require direct state-machine capture lifting, not by-ref hidden parameters.");
+                    }
+                }
+            }
+        }
+        internal enum IteratorReturnKind : byte
+        {
+            Enumerable,
+            Enumerator,
+            GenericEnumerable,
+            GenericEnumerator,
+        }
+
+        internal sealed class IteratorStateMachineInfo
+        {
+            public SyntaxTree SyntaxTree { get; }
+            public BoundMethodBody OriginalBody { get; }
+            public BoundMethodBody PreLoweredBody { get; }
+
+            public MethodSymbol OriginalMethod => OriginalBody.Method;
+            public NamedTypeSymbol StateMachineType { get; }
+            public TypeSymbol ElementType { get; }
+            public IteratorReturnKind ReturnKind { get; }
+
+            public SourceMethodSymbol Constructor { get; }
+            public SourceMethodSymbol MoveNext { get; }
+            public SourceMethodSymbol Dispose { get; }
+            public SourceMethodSymbol Reset { get; }
+            public SourceMethodSymbol GenericCurrentGetter { get; }
+            public SourceMethodSymbol ObjectCurrentGetter { get; }
+            public SourceMethodSymbol GenericGetEnumerator { get; }
+            public SourceMethodSymbol ObjectGetEnumerator { get; }
+
+            public FieldSymbol StateField { get; }
+            public FieldSymbol CurrentField { get; }
+            public FieldSymbol? ThisField { get; }
+
+            public ImmutableDictionary<ParameterSymbol, FieldSymbol> ParameterFields { get; }
+            public ImmutableDictionary<LocalSymbol, FieldSymbol> LocalFields { get; }
+
+            public IteratorStateMachineInfo(
+                SyntaxTree syntaxTree,
+                BoundMethodBody originalBody,
+                BoundMethodBody preLoweredBody,
+                NamedTypeSymbol stateMachineType,
+                TypeSymbol elementType,
+                IteratorReturnKind returnKind,
+                SourceMethodSymbol constructor,
+                SourceMethodSymbol moveNext,
+                SourceMethodSymbol dispose,
+                SourceMethodSymbol reset,
+                SourceMethodSymbol genericCurrentGetter,
+                SourceMethodSymbol objectCurrentGetter,
+                SourceMethodSymbol genericGetEnumerator,
+                SourceMethodSymbol objectGetEnumerator,
+                FieldSymbol stateField,
+                FieldSymbol currentField,
+                FieldSymbol? thisField,
+                ImmutableDictionary<ParameterSymbol, FieldSymbol> parameterFields,
+                ImmutableDictionary<LocalSymbol, FieldSymbol> localFields)
+            {
+                SyntaxTree = syntaxTree;
+                OriginalBody = originalBody;
+                PreLoweredBody = preLoweredBody;
+                StateMachineType = stateMachineType;
+                ElementType = elementType;
+                ReturnKind = returnKind;
+                Constructor = constructor;
+                MoveNext = moveNext;
+                Dispose = dispose;
+                Reset = reset;
+                GenericCurrentGetter = genericCurrentGetter;
+                ObjectCurrentGetter = objectCurrentGetter;
+                GenericGetEnumerator = genericGetEnumerator;
+                ObjectGetEnumerator = objectGetEnumerator;
+                StateField = stateField;
+                CurrentField = currentField;
+                ThisField = thisField;
+                ParameterFields = parameterFields;
+                LocalFields = localFields;
+            }
+        }
+
+        private static class IteratorLowering
+        {
+            public static bool ContainsYield(BoundStatement statement)
+            {
+                var finder = new IteratorYieldFinder();
+                finder.Visit(statement);
+                return finder.Found;
+            }
+
+            public static BoundMethodBody PreLowerIteratorBodyPreservingYield(
+                Compilation compilation,
+                BoundMethodBody body)
+            {
+                var rewriter = new LocalRewriter(compilation, body.Method);
+                var lowered = rewriter.RewriteNode(body) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected iterator prelowering result.");
+
+                return EnsureBlockBody(lowered);
+            }
+
+            public static IteratorStateMachineInfo Create(
+                Compilation compilation,
+                SyntaxTree tree,
+                BoundMethodBody originalBody,
+                BoundMethodBody preLoweredBody,
+                int ordinal)
+            {
+                var method = originalBody.Method;
+
+                var containingType = GetContainingSourceType(method);
+
+                var elementType = GetIteratorElementType(compilation, method.ReturnType);
+                var returnKind = GetIteratorReturnKind(method.ReturnType);
+
+                var smType = new SourceNamedTypeSymbol(
+                    name: $"<{method.Name}>d__{ordinal}",
+                    containing: containingType,
+                    typeKind: TypeKind.Class,
+                    arity: 0,
+                    declaredAccessibility: Accessibility.Private,
+                    isSealed: true);
+
+                smType.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+                smType.SetDefaultBaseType(compilation.GetSpecialType(SpecialType.System_Object));
+                smType.AddDeclaration(tree, originalBody.Syntax);
+                containingType.AddNestedType(smType);
+
+                var objectIEnumerator = RequireType(compilation, "System.Collections", "IEnumerator", 0);
+                var objectIEnumerable = RequireType(compilation, "System.Collections", "IEnumerable", 0);
+                var genericIEnumeratorDef = RequireType(compilation, "System.Collections.Generic", "IEnumerator", 1);
+                var genericIEnumerableDef = RequireType(compilation, "System.Collections.Generic", "IEnumerable", 1);
+                var disposable = RequireType(compilation, "System", "IDisposable", 0);
+
+                var genericIEnumerator = compilation.ConstructNamedType(
+                    genericIEnumeratorDef,
+                    ImmutableArray.Create(elementType));
+
+                var genericIEnumerable = compilation.ConstructNamedType(
+                    genericIEnumerableDef,
+                    ImmutableArray.Create(elementType));
+
+                smType.SetDeclaredInterfaces(ImmutableArray.Create<TypeSymbol>(
+                    genericIEnumerable,
+                    genericIEnumerator,
+                    objectIEnumerable,
+                    objectIEnumerator,
+                    disposable));
+
+                var intType = compilation.GetSpecialType(SpecialType.System_Int32);
+                var boolType = compilation.GetSpecialType(SpecialType.System_Boolean);
+                var voidType = compilation.GetSpecialType(SpecialType.System_Void);
+                var objectType = compilation.GetSpecialType(SpecialType.System_Object);
+
+                var stateField = AddField(tree, smType, "<>1__state", intType, originalBody.Syntax);
+                var currentField = AddField(tree, smType, "<>2__current", elementType, originalBody.Syntax);
+
+                FieldSymbol? thisField = null;
+                if (!method.IsStatic && method.ContainingSymbol is NamedTypeSymbol thisType)
+                    thisField = AddField(tree, smType, "<>4__this", thisType, originalBody.Syntax);
+
+                var parameterFields = ImmutableDictionary.CreateBuilder<ParameterSymbol, FieldSymbol>(
+                    ReferenceEqualityComparer<ParameterSymbol>.Instance);
+
+                foreach (var p in method.Parameters)
+                    parameterFields[p] = AddField(tree, smType, "<>3__" + p.Name, p.Type, originalBody.Syntax);
+
+                var collector = new IteratorLocalCollector();
+                collector.Visit(preLoweredBody.Body);
+
+                var localFields = ImmutableDictionary.CreateBuilder<LocalSymbol, FieldSymbol>(
+                    ReferenceEqualityComparer<LocalSymbol>.Instance);
+
+                foreach (var local in collector.Locals)
+                    localFields[local] = AddField(tree, smType, "<>l__" + local.Name, local.Type, originalBody.Syntax);
+
+                var ctor = AddMethod(
+                    tree,
+                    smType,
+                    ".ctor",
+                    voidType,
+                    originalBody.Syntax,
+                    Accessibility.Public,
+                    isConstructor: true);
+
+                ctor.SetParameters(ImmutableArray.Create(
+                    new ParameterSymbol("state", ctor, intType, ImmutableArray<Location>.Empty)));
+
+                var moveNext = AddMethod(
+                    tree,
+                    smType,
+                    "MoveNext",
+                    boolType,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                moveNext.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                moveNext.SetExplicitInterfaceImplementation(RequireMethod(objectIEnumerator, "MoveNext", 0));
+                moveNext.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var dispose = AddMethod(
+                    tree,
+                    smType,
+                    "Dispose",
+                    voidType,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                dispose.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                dispose.SetExplicitInterfaceImplementation(RequireMethod(disposable, "Dispose", 0));
+                dispose.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var reset = AddMethod(
+                    tree,
+                    smType,
+                    "Reset",
+                    voidType,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                reset.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                reset.SetExplicitInterfaceImplementation(RequireMethod(objectIEnumerator, "Reset", 0));
+                reset.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var genericCurrentGetter = AddMethod(
+                    tree,
+                    smType,
+                    "get_Current",
+                    elementType,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                genericCurrentGetter.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                genericCurrentGetter.SetExplicitInterfaceImplementation(
+                    RequireProperty(genericIEnumerator, "Current").GetMethod
+                    ?? throw new InvalidOperationException("IEnumerator<T>.Current getter missing."));
+                genericCurrentGetter.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var objectCurrentGetter = AddMethod(
+                    tree,
+                    smType,
+                    "get_Current",
+                    objectType,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                objectCurrentGetter.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                objectCurrentGetter.SetExplicitInterfaceImplementation(
+                    RequireProperty(objectIEnumerator, "Current").GetMethod
+                    ?? throw new InvalidOperationException("IEnumerator.Current getter missing."));
+                objectCurrentGetter.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var genericGetEnumerator = AddMethod(
+                    tree,
+                    smType,
+                    "GetEnumerator",
+                    genericIEnumerator,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                genericGetEnumerator.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                genericGetEnumerator.SetExplicitInterfaceImplementation(RequireMethod(genericIEnumerable, "GetEnumerator", 0));
+                genericGetEnumerator.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                var objectGetEnumerator = AddMethod(
+                    tree,
+                    smType,
+                    "GetEnumerator",
+                    objectIEnumerator,
+                    originalBody.Syntax,
+                    Accessibility.Private);
+
+                objectGetEnumerator.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                objectGetEnumerator.SetExplicitInterfaceImplementation(RequireMethod(objectIEnumerable, "GetEnumerator", 0));
+                objectGetEnumerator.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: false, isSealed: true);
+
+                return new IteratorStateMachineInfo(
+                    tree,
+                    originalBody,
+                    preLoweredBody,
+                    smType,
+                    elementType,
+                    returnKind,
+                    ctor,
+                    moveNext,
+                    dispose,
+                    reset,
+                    genericCurrentGetter,
+                    objectCurrentGetter,
+                    genericGetEnumerator,
+                    objectGetEnumerator,
+                    stateField,
+                    currentField,
+                    thisField,
+                    parameterFields.ToImmutable(),
+                    localFields.ToImmutable());
+            }
+            private static SourceNamedTypeSymbol GetContainingSourceType(MethodSymbol method)
+            {
+                for (Symbol? s = method.ContainingSymbol; s is not null; s = s.ContainingSymbol)
+                {
+                    if (s is SourceNamedTypeSymbol sourceType)
+                        return sourceType;
+                }
+
+                throw new NotSupportedException(
+                    $"Iterator lowering requires method '{method.Name}' to be nested in a source type.");
+            }
+            public static ImmutableArray<BoundMethodBody> BuildBodies(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                return ImmutableArray.Create(
+                    BuildConstructorBody(compilation, info),
+                    BuildMoveNextBody(compilation, info),
+                    BuildDisposeBody(compilation, info),
+                    BuildResetBody(compilation, info),
+                    BuildGenericCurrentBody(compilation, info),
+                    BuildObjectCurrentBody(compilation, info),
+                    BuildGenericGetEnumeratorBody(compilation, info),
+                    BuildObjectGetEnumeratorBody(compilation, info));
+            }
+
+            public static BoundMethodBody RewriteOriginalIteratorMethod(
+                Compilation compilation,
+                BoundMethodBody body,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = body.Syntax;
+                var smLocal = new LocalSymbol(
+                    "$iterator",
+                    body.Method,
+                    info.StateMachineType,
+                    ImmutableArray<Location>.Empty);
+
+                var smLocalExpr = new BoundLocalExpression(syntax, smLocal);
+
+                var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                statements.Add(new BoundLocalDeclarationStatement(
+                    syntax,
+                    smLocal,
+                    NewStateMachine(compilation, syntax, info, GetInitialIteratorState(info))));
+
+                if (info.ThisField is not null)
+                {
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, info.ThisField),
+                        new BoundThisExpression(syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default), 
+                        (NamedTypeSymbol)body.Method.ContainingSymbol!)));
+                }
+
+                foreach (var p in body.Method.Parameters)
+                {
+                    if (!info.ParameterFields.TryGetValue(p, out var f))
+                        continue;
+
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, f),
+                        new BoundParameterExpression(syntax, p)));
+                }
+
+                statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
+
+                return new BoundMethodBody(
+                    syntax,
+                    body.Method,
+                    new BoundBlockStatement(syntax, statements.ToImmutable()));
+            }
+            private static int GetInitialIteratorState(IteratorStateMachineInfo info)
+            {
+                return info.ReturnKind == IteratorReturnKind.Enumerable ||
+                       info.ReturnKind == IteratorReturnKind.GenericEnumerable
+                    ? -2
+                    : 0;
+            }
+            private static BoundMethodBody BuildConstructorBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+                var stateParam = info.Constructor.Parameters[0];
+
+                var statements = ImmutableArray.Create<BoundStatement>(
+                    AssignStmt(
+                        syntax,
+                        Field(syntax, This(syntax, info), info.StateField),
+                        new BoundParameterExpression(syntax, stateParam)),
+                    new BoundReturnStatement(syntax, null));
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.Constructor,
+                    new BoundBlockStatement(syntax, statements));
+            }
+
+            private static BoundMethodBody BuildMoveNextBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+                var rewriter = new IteratorMoveNextRewriter(compilation, info);
+                var rewrittenOriginal = rewriter.RewriteIteratorBody(info.PreLoweredBody.Body);
+
+                var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                foreach (var resume in rewriter.ResumeLabels)
+                {
+                    statements.Add(new BoundConditionalGotoStatement(
+                        syntax,
+                        Equal(compilation, syntax, Field(syntax, This(syntax, info), info.StateField), Int(compilation, syntax, resume.State)),
+                        resume.Label,
+                        jumpIfTrue: true));
+                }
+
+                var finishedLabel = LabelSymbol.CreateGenerated("<iterator_finished>", info.MoveNext);
+
+                statements.Add(new BoundConditionalGotoStatement(
+                    syntax,
+                    NotEqual(compilation, syntax, Field(syntax, This(syntax, info), info.StateField), Int(compilation, syntax, 0)),
+                    finishedLabel,
+                    jumpIfTrue: true));
+
+                statements.Add(AssignStmt(
+                    syntax,
+                    Field(syntax, This(syntax, info), info.StateField),
+                    Int(compilation, syntax, -1)));
+
+                statements.Add(rewrittenOriginal);
+
+                statements.Add(new BoundLabelStatement(syntax, finishedLabel));
+
+                statements.Add(AssignStmt(
+                    syntax,
+                    Field(syntax, This(syntax, info), info.StateField),
+                    Int(compilation, syntax, -2)));
+
+                statements.Add(new BoundReturnStatement(syntax, Bool(compilation, syntax, false)));
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.MoveNext,
+                    new BoundBlockStatement(syntax, statements.ToImmutable()));
+            }
+
+            private static BoundMethodBody BuildDisposeBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.Dispose,
+                    new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            AssignStmt(
+                                syntax,
+                                Field(syntax, This(syntax, info), info.StateField),
+                                Int(compilation, syntax, -2)),
+                            new BoundReturnStatement(syntax, null))));
+            }
+
+            private static BoundMethodBody BuildResetBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.Reset,
+                    new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            new BoundReturnStatement(syntax, null))));
+            }
+
+            private static BoundMethodBody BuildGenericCurrentBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.GenericCurrentGetter,
+                    new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            new BoundReturnStatement(
+                                syntax,
+                                Field(syntax, This(syntax, info), info.CurrentField)))));
+            }
+
+            private static BoundMethodBody BuildObjectCurrentBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+            {
+                var syntax = info.OriginalBody.Syntax;
+                BoundExpression value = Field(syntax, This(syntax, info), info.CurrentField);
+
+                if (info.ElementType.IsValueType)
+                {
+                    value = new BoundConversionExpression(
+                        syntax,
+                        compilation.GetSpecialType(SpecialType.System_Object),
+                        value,
+                        new Conversion(ConversionKind.Boxing),
+                        isChecked: false);
+                }
+
+                return new BoundMethodBody(
+                    syntax,
+                    info.ObjectCurrentGetter,
+                    new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            new BoundReturnStatement(syntax, value))));
+            }
+
+            private static BoundMethodBody BuildGenericGetEnumeratorBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+                => BuildGetEnumeratorBody(compilation, info, info.GenericGetEnumerator);
+
+            private static BoundMethodBody BuildObjectGetEnumeratorBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info)
+                => BuildGetEnumeratorBody(compilation, info, info.ObjectGetEnumerator);
+
+            private static BoundMethodBody BuildGetEnumeratorBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info,
+                MethodSymbol method)
+            {
+                var syntax = info.OriginalBody.Syntax;
+
+                var smLocal = new LocalSymbol(
+                    "$iterator",
+                    method,
+                    info.StateMachineType,
+                    ImmutableArray<Location>.Empty);
+
+                var smLocalExpr = new BoundLocalExpression(syntax, smLocal);
+
+                var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                statements.Add(new BoundLocalDeclarationStatement(
+                    syntax,
+                    smLocal,
+                    NewStateMachine(compilation, syntax, info, 0)));
+
+                if (info.ThisField is not null)
+                {
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, info.ThisField),
+                        Field(syntax, This(syntax, info), info.ThisField)));
+                }
+
+                foreach (var kv in info.ParameterFields)
+                {
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, kv.Value),
+                        Field(syntax, This(syntax, info), kv.Value)));
+                }
+
+                statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
+
+                return new BoundMethodBody(
+                    syntax,
+                    method,
+                    new BoundBlockStatement(syntax, statements.ToImmutable()));
+            }
+
+            private sealed class IteratorMoveNextRewriter : BoundTreeRewriter
+            {
+                private readonly Compilation _compilation;
+                private readonly IteratorStateMachineInfo _info;
+                private int _nextState = 1;
+                private readonly ImmutableArray<(int State, LabelSymbol Label)>.Builder _resumeLabels =
+                    ImmutableArray.CreateBuilder<(int State, LabelSymbol Label)>();
+
+                public ImmutableArray<(int State, LabelSymbol Label)> ResumeLabels
+                    => _resumeLabels.ToImmutable();
+
+                public IteratorMoveNextRewriter(Compilation compilation, IteratorStateMachineInfo info)
+                {
+                    _compilation = compilation;
+                    _info = info;
+                }
+
+                public BoundStatement RewriteIteratorBody(BoundStatement statement)
+                    => RewriteStatement(statement);
+
+                protected override BoundStatement RewriteYieldStatement(BoundYieldStatement node)
+                {
+                    var syntax = node.Syntax;
+
+                    if (node.YieldKind == BoundYieldStatementKind.Break)
+                        return FinishFalse(syntax);
+
+                    var value = RewriteExpression(node.ExpressionOpt!);
+
+                    int state = _nextState++;
+                    var resume = LabelSymbol.CreateGenerated($"<yield_resume_{state}>", _info.MoveNext);
+                    _resumeLabels.Add((state, resume));
+
+                    return new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            AssignStmt(
+                                syntax,
+                                Field(syntax, This(syntax, _info), _info.CurrentField),
+                                value),
+                            AssignStmt(
+                                syntax,
+                                Field(syntax, This(syntax, _info), _info.StateField),
+                                Int(_compilation, syntax, state)),
+                            new BoundReturnStatement(syntax, Bool(_compilation, syntax, true)),
+                            new BoundLabelStatement(syntax, resume),
+                            AssignStmt(
+                                syntax,
+                                Field(syntax, This(syntax, _info), _info.StateField),
+                                Int(_compilation, syntax, -1))));
+                }
+
+                protected override BoundStatement RewriteReturnStatement(BoundReturnStatement node)
+                    => FinishFalse(node.Syntax);
+
+                protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
+                {
+                    if (!_info.LocalFields.TryGetValue(node.Local, out var field))
+                        return base.RewriteLocalDeclarationStatement(node);
+
+                    if (node.Initializer is null)
+                        return new BoundEmptyStatement(node.Syntax);
+
+                    return AssignStmt(
+                        node.Syntax,
+                        Field(node.Syntax, This(node.Syntax, _info), field),
+                        RewriteExpression(node.Initializer));
+                }
+
+                protected override BoundExpression RewriteExpression(BoundExpression node)
+                {
+                    if (node is BoundLocalExpression local &&
+                        _info.LocalFields.TryGetValue(local.Local, out var localField))
+                    {
+                        return Field(node.Syntax, This(node.Syntax, _info), localField);
+                    }
+
+                    if (node is BoundParameterExpression parameter &&
+                        _info.ParameterFields.TryGetValue(parameter.Parameter, out var parameterField))
+                    {
+                        return Field(node.Syntax, This(node.Syntax, _info), parameterField);
+                    }
+
+                    if (node is BoundThisExpression && _info.ThisField is not null)
+                    {
+                        return Field(node.Syntax, This(node.Syntax, _info), _info.ThisField);
+                    }
+
+                    return base.RewriteExpression(node);
+                }
+
+                protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                    => node;
+
+                protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                    => node;
+
+                private BoundStatement FinishFalse(SyntaxNode syntax)
+                {
+                    return new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(
+                            AssignStmt(
+                                syntax,
+                                Field(syntax, This(syntax, _info), _info.StateField),
+                                Int(_compilation, syntax, -2)),
+                            new BoundReturnStatement(syntax, Bool(_compilation, syntax, false))));
+                }
+            }
+
+            private static BoundObjectCreationExpression NewStateMachine(
+                Compilation compilation,
+                SyntaxNode syntax,
+                IteratorStateMachineInfo info,
+                int state)
+            {
+                return new BoundObjectCreationExpression(
+                    syntax,
+                    info.StateMachineType,
+                    info.Constructor,
+                    ImmutableArray.Create<BoundExpression>(Int(compilation, syntax, state)));
+            }
+
+            private static BoundThisExpression This(SyntaxNode syntax, IteratorStateMachineInfo info)
+                => new BoundThisExpression(syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default), info.StateMachineType);
+
+            private static BoundExpression Field(SyntaxNode syntax, BoundExpression receiver, FieldSymbol field)
+            {
+                return new BoundMemberAccessExpression(
+                    syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default),
+                    receiver,
+                    field,
+                    field.Type,
+                    isLValue: true);
+            }
+
+            private static BoundStatement AssignStmt(SyntaxNode syntax, BoundExpression left, BoundExpression right)
+                => new BoundExpressionStatement(
+                    syntax,
+                    new BoundAssignmentExpression(syntax, left, right));
+
+            private static BoundLiteralExpression Int(Compilation compilation, SyntaxNode syntax, int value)
+                => new BoundLiteralExpression(syntax, compilation.GetSpecialType(SpecialType.System_Int32), value);
+
+            private static BoundLiteralExpression Bool(Compilation compilation, SyntaxNode syntax, bool value)
+                => new BoundLiteralExpression(syntax, compilation.GetSpecialType(SpecialType.System_Boolean), value);
+
+            private static BoundBinaryExpression Equal(
+                Compilation compilation,
+                SyntaxNode syntax,
+                BoundExpression left,
+                BoundExpression right)
+            {
+                return new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.Equals,
+                    compilation.GetSpecialType(SpecialType.System_Boolean),
+                    left,
+                    right,
+                    Optional<object>.None);
+            }
+
+            private static BoundBinaryExpression NotEqual(
+                Compilation compilation,
+                SyntaxNode syntax,
+                BoundExpression left,
+                BoundExpression right)
+            {
+                return new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.NotEquals,
+                    compilation.GetSpecialType(SpecialType.System_Boolean),
+                    left,
+                    right,
+                    Optional<object>.None);
+            }
+
+            private static SourceFieldSymbol AddField(
+                SyntaxTree tree,
+                SourceNamedTypeSymbol owner,
+                string name,
+                TypeSymbol type,
+                SyntaxNode syntax)
+            {
+                var declRef = new SyntaxReference(tree, syntax);
+
+                var field = new SourceFieldSymbol(
+                    name: name,
+                    containing: owner,
+                    declaredTypeSyntax: null,
+                    placeholderType: type,
+                    isStatic: false,
+                    isConst: false,
+                    isReadOnly: false,
+                    isUnsafe: false,
+                    declaredAccessibility: Accessibility.Private,
+                    location: new Location(tree, syntax.Span),
+                    declarationRef: declRef,
+                    attributeOwnerDeclarationRef: declRef);
+
+                owner.AddMember(field);
+                return field;
+            }
+
+            private static SourceMethodSymbol AddMethod(
+                SyntaxTree tree,
+                SourceNamedTypeSymbol owner,
+                string name,
+                TypeSymbol returnType,
+                SyntaxNode syntax,
+                Accessibility accessibility,
+                bool isConstructor = false)
+            {
+                var method = new SourceMethodSymbol(
+                    name: name,
+                    containing: owner,
+                    returnType: returnType,
+                    typeParameters: ImmutableArray<TypeParameterSymbol>.Empty,
+                    isStatic: false,
+                    isConstructor: isConstructor || StringComparer.Ordinal.Equals(name, ".ctor"),
+                    isAsync: false,
+                    locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
+                    declaredAccessibility: accessibility);
+
+                method.AddDeclaration(new SyntaxReference(tree, syntax));
+                owner.AddMember(method);
+                return method;
+            }
+
+            private static NamedTypeSymbol RequireType(
+                Compilation compilation,
+                string ns,
+                string name,
+                int arity)
+            {
+                NamespaceSymbol current = compilation.GlobalNamespace;
+
+                foreach (var part in ns.Split('.', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    NamespaceSymbol? next = null;
+                    foreach (var n in current.GetNamespaceMembers())
+                    {
+                        if (StringComparer.Ordinal.Equals(n.Name, part))
+                        {
+                            next = n;
+                            break;
+                        }
+                    }
+
+                    current = next ?? throw new InvalidOperationException($"Required namespace '{ns}' was not found.");
+                }
+
+                var types = current.GetTypeMembers(name, arity);
+                if (types.IsDefaultOrEmpty)
+                    throw new InvalidOperationException($"Required type '{ns}.{name}`{arity}' was not found.");
+
+                return types[0];
+            }
+
+            private static MethodSymbol RequireMethod(NamedTypeSymbol type, string name, int parameterCount)
+            {
+                foreach (var member in type.GetMembers())
+                {
+                    if (member is MethodSymbol m &&
+                        StringComparer.Ordinal.Equals(m.Name, name) &&
+                        m.Parameters.Length == parameterCount)
+                    {
+                        return m;
+                    }
+                }
+
+                throw new InvalidOperationException($"Required method '{type.Name}.{name}/{parameterCount}' was not found.");
+            }
+
+            private static PropertySymbol RequireProperty(NamedTypeSymbol type, string name)
+            {
+                foreach (var member in type.GetMembers())
+                {
+                    if (member is PropertySymbol p &&
+                        StringComparer.Ordinal.Equals(p.Name, name))
+                    {
+                        return p;
+                    }
+                }
+
+                throw new InvalidOperationException($"Required property '{type.Name}.{name}' was not found.");
+            }
+
+            private static TypeSymbol GetIteratorElementType(Compilation compilation, TypeSymbol returnType)
+            {
+                if (returnType is not NamedTypeSymbol nt)
+                    throw new InvalidOperationException("Iterator return type must be an iterator interface.");
+
+                var ns = GetNamespaceName(nt.OriginalDefinition);
+
+                if (ns == "System.Collections" &&
+                    (nt.OriginalDefinition.Name == "IEnumerable" || nt.OriginalDefinition.Name == "IEnumerator"))
+                {
+                    return compilation.GetSpecialType(SpecialType.System_Object);
+                }
+
+                if (ns == "System.Collections.Generic" &&
+                    (nt.OriginalDefinition.Name == "IEnumerable" || nt.OriginalDefinition.Name == "IEnumerator") &&
+                    nt.TypeArguments.Length == 1)
+                {
+                    return nt.TypeArguments[0];
+                }
+
+                throw new InvalidOperationException("Iterator return type must be IEnumerable/IEnumerator.");
+            }
+
+            private static IteratorReturnKind GetIteratorReturnKind(TypeSymbol returnType)
+            {
+                if (returnType is not NamedTypeSymbol nt)
+                    throw new InvalidOperationException("Iterator return type must be an iterator interface.");
+
+                var ns = GetNamespaceName(nt.OriginalDefinition);
+                var name = nt.OriginalDefinition.Name;
+
+                if (ns == "System.Collections" && name == "IEnumerable")
+                    return IteratorReturnKind.Enumerable;
+
+                if (ns == "System.Collections" && name == "IEnumerator")
+                    return IteratorReturnKind.Enumerator;
+
+                if (ns == "System.Collections.Generic" && name == "IEnumerable")
+                    return IteratorReturnKind.GenericEnumerable;
+
+                if (ns == "System.Collections.Generic" && name == "IEnumerator")
+                    return IteratorReturnKind.GenericEnumerator;
+
+                throw new InvalidOperationException("Iterator return type must be IEnumerable/IEnumerator.");
+            }
+
+            private static string GetNamespaceName(NamedTypeSymbol type)
+            {
+                var parts = new Stack<string>();
+                Symbol? cur = type.ContainingSymbol;
+
+                while (cur is NamespaceSymbol ns && !ns.IsGlobalNamespace)
+                {
+                    parts.Push(ns.Name);
+                    cur = ns.ContainingSymbol;
+                }
+
+                return string.Join(".", parts);
+            }
+        }
         private sealed class LocalRewriter : BoundTreeRewriterWithStackGuard
         {
-
-
-
             private readonly Compilation _compilation;
             private readonly MethodSymbol _method;
             private int _labelId;
@@ -5807,33 +7005,6 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                // Drop unreferenced generated labels
-                var usedLabels = new HashSet<LabelSymbol>();
-                for (int i = 0; i < builder.Count; i++)
-                {
-                    switch (builder[i])
-                    {
-                        case BoundGotoStatement g:
-                            usedLabels.Add(g.TargetLabel);
-                            break;
-                        case BoundConditionalGotoStatement cg:
-                            usedLabels.Add(cg.TargetLabel);
-                            break;
-                    }
-                }
-
-                for (int i = 0; i < builder.Count; i++)
-                {
-                    if (builder[i] is BoundLabelStatement l &&
-                        !usedLabels.Contains(l.Label) &&
-                        IsGeneratedLabel(l.Label))
-                    {
-                        builder.RemoveAt(i);
-                        changed = true;
-                        i--;
-                    }
-                }
-
                 if (!changed)
                     return node;
 
@@ -5845,9 +7016,6 @@ namespace Cnidaria.Cs
 
                 return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
             }
-
-            private static bool IsGeneratedLabel(LabelSymbol label)
-                => label.Locations.IsDefaultOrEmpty && label.DeclaringSyntaxReferences.IsDefaultOrEmpty;
 
             private static bool IsTargetInFollowingLabelRun(
                 ImmutableArray<BoundStatement>.Builder statements,

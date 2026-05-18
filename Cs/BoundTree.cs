@@ -967,6 +967,28 @@ namespace Cnidaria.Cs
             Type = indexer.Type is ByRefTypeSymbol br ? br.ElementType : indexer.Type;
         }
     }
+    internal enum BoundYieldStatementKind : byte { Return, Break }
+    internal sealed class BoundYieldStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.Yield;
+
+        public BoundYieldStatementKind YieldKind { get; }
+        public BoundExpression? ExpressionOpt { get; }
+        public TypeSymbol? ElementTypeOpt { get; }
+
+        public BoundYieldStatement(
+            YieldStatementSyntax syntax,
+            BoundYieldStatementKind yieldKind,
+            BoundExpression? expressionOpt,
+            TypeSymbol? elementTypeOpt)
+            : base(syntax)
+        {
+            YieldKind = yieldKind;
+            ExpressionOpt = expressionOpt;
+            ElementTypeOpt = elementTypeOpt;
+            HasErrors = expressionOpt?.HasErrors ?? false;
+        }
+    }
     internal sealed class BoundReturnStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.Return;

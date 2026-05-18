@@ -31,6 +31,7 @@ namespace Cnidaria.Cs
             Return,
             Throw,
             ReturnFloat,
+            MulticastDelegate,
         }
 
         private const int GprCount = 32;
@@ -69,6 +70,19 @@ namespace Cnidaria.Cs
         private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
         private const int ShadowFrameContinuationKindShift = 16;
         private const int ShadowFramePostReturnRegisterShift = 24;
+
+        private const int McInvokeMethodIdOffset = 0;
+        private const int McNextIndexOffset = 4;
+        private const int McCountOffset = 8;
+        private const int McCallFlagsOffset = 12;
+        private const int McDelegateRefOffset = 16;
+        private const int McHiddenReturnBufferOffset = 24;
+        private const int McArgCountOffset = 32;
+        private const int McArgRecordsOffset = 40;
+        private const int McArgRecordSize = 12;
+        private const int McArgTypeIdOffset = 0;
+        private const int McArgSizeOffset = 4;
+        private const int McArgDataRelOffset = 8;
 
         private readonly byte[] _mem;
         private readonly int _staticEnd;
@@ -111,6 +125,8 @@ namespace Cnidaria.Cs
         private int _currentExceptionThrowPc = -1;
         private CallFlags _activeCallFlags;
         private RuntimeMethod? _activeCallTargetMethod;
+        private CancellationToken _executionCancellationToken;
+        private ExecutionLimits? _executionLimits;
 
         private readonly struct RegisterSnapshot
         {
@@ -215,6 +231,8 @@ namespace Cnidaria.Cs
             _frameStackTop = _stackBase;
             _frameStackPeakTop = _stackBase;
             _registerSnapshots.Clear();
+            _executionCancellationToken = ct;
+            _executionLimits = limits;
             _gcMarkHead = 0;
             _allocDebtBytes = 0;
             _gcRunning = false;
@@ -934,6 +952,12 @@ namespace Cnidaria.Cs
                         case Op.NewDelegateClosed:
                             SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, GetGpr(ins.Rs1)));
                             break;
+                        case Op.DelegateCombine:
+                            SetGpr(ins.Rd, ExecDelegateCombine(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                            break;
+                        case Op.DelegateRemove:
+                            SetGpr(ins.Rd, ExecDelegateRemove(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                            break;
                         case Op.NewArr:
                         case Op.NewSZArray:
                             SetGpr(ins.Rd, AllocArray(_rts.GetTypeById(checked((int)ins.Imm)), (int)GetGpr(ins.Rs1)));
@@ -1358,10 +1382,15 @@ namespace Cnidaria.Cs
                 throw new AccessViolationException("Virtual dispatch receiver is not a managed object reference.");
             }
 
-            if (site.DispatchSlot >= 0)
+            CallFlags siteFlags = (CallFlags)site.Flags;
+            bool interfaceDispatch =
+                (siteFlags & CallFlags.InterfaceDispatch) != 0 ||
+                declared.DeclaringType.Kind == RuntimeTypeKind.Interface;
+            if (!interfaceDispatch && site.DispatchSlot >= 0)
             {
                 if ((uint)site.DispatchSlot >= (uint)receiverType.VTable.Length)
                     throw new MissingMethodException("Invalid virtual dispatch slot " + site.DispatchSlot.ToString());
+
                 return receiverType.VTable[site.DispatchSlot];
             }
 
@@ -1474,8 +1503,8 @@ namespace Cnidaria.Cs
             RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
 
             long delegateRef;
-            RuntimeMethod target;
-            long targetRef;
+            CapturedAbiArgument[] captured;
+            long hiddenReturnBuffer = 0;
 
             _activeCallFlags = callFlags;
             _activeCallTargetMethod = invokeMethod;
@@ -1485,8 +1514,14 @@ namespace Cnidaria.Cs
                 if (delegateRef == 0)
                     throw new NullReferenceException();
 
-                target = ReadDelegateTargetMethod(delegateRef);
-                targetRef = ReadDelegateTarget(delegateRef);
+                int invokeArgCount = LogicalArgumentCount(invokeMethod);
+                int explicitInvokeArgCount = Math.Max(0, invokeArgCount - 1);
+                captured = new CapturedAbiArgument[explicitInvokeArgCount];
+                for (int i = 0; i < captured.Length; i++)
+                    captured[i] = CaptureAbiArgument(invokeMethod, i + 1);
+
+                if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
+                    hiddenReturnBuffer = ReadHiddenReturnBufferAddress(invokeMethod);
             }
             finally
             {
@@ -1494,43 +1529,243 @@ namespace Cnidaria.Cs
                 _activeCallTargetMethod = previousActiveCallTargetMethod;
             }
 
-            if (RequiresTypeInitializationBeforeCall(target))
+            int targetCount = DelegateInvocationCount(delegateRef);
+            if (targetCount <= 0)
+                throw new InvalidOperationException("Delegate invocation list is empty.");
+
+            int continuation = AllocMulticastContinuation(
+                invokeMethod,
+                delegateRef,
+                targetCount,
+                captured,
+                hiddenReturnBuffer,
+                callFlags);
+
+            StartDelegateInvocationTarget(continuation);
+        }
+
+        private int AllocMulticastContinuation(
+            RuntimeMethod invokeMethod,
+            long delegateRef,
+            int targetCount,
+            CapturedAbiArgument[] arguments,
+            long hiddenReturnBuffer,
+            CallFlags callFlags)
+        {
+            if (targetCount <= 0)
+                throw new ArgumentOutOfRangeException(nameof(targetCount));
+            if (arguments is null)
+                throw new ArgumentNullException(nameof(arguments));
+
+            int recordsSize = checked(arguments.Length * McArgRecordSize);
+            int dataCursor = AlignUp(checked(McArgRecordsOffset + recordsSize), TargetArchitecture.PointerSize);
+            for (int i = 0; i < arguments.Length; i++)
+                dataCursor = AlignUp(checked(dataCursor + Math.Max(1, arguments[i].Data.Length)), TargetArchitecture.PointerSize);
+
+            int continuation = StackAllocBytes(dataCursor, TargetArchitecture.PointerSize);
+
+            WriteI32(continuation + McInvokeMethodIdOffset, invokeMethod.MethodId);
+            WriteI32(continuation + McNextIndexOffset, 0);
+            WriteI32(continuation + McCountOffset, targetCount);
+            WriteI32(continuation + McCallFlagsOffset, (int)callFlags);
+            WriteNative(continuation + McDelegateRefOffset, delegateRef);
+            WriteNative(continuation + McHiddenReturnBufferOffset, hiddenReturnBuffer);
+            WriteI32(continuation + McArgCountOffset, arguments.Length);
+
+            int dataRel = AlignUp(checked(McArgRecordsOffset + recordsSize), TargetArchitecture.PointerSize);
+            for (int i = 0; i < arguments.Length; i++)
             {
-                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
-                    return;
+                CapturedAbiArgument arg = arguments[i];
+                int size = Math.Max(1, arg.Data.Length);
+                int rec = continuation + McArgRecordsOffset + i * McArgRecordSize;
+                WriteI32(rec + McArgTypeIdOffset, arg.Type.TypeId);
+                WriteI32(rec + McArgSizeOffset, size);
+                WriteI32(rec + McArgDataRelOffset, dataRel);
+                arg.Data.AsSpan(0, Math.Min(arg.Data.Length, size)).CopyTo(_mem.AsSpan(continuation + dataRel, Math.Min(arg.Data.Length, size)));
+                dataRel = AlignUp(checked(dataRel + size), TargetArchitecture.PointerSize);
             }
 
-            _activeCallFlags = callFlags;
-            _activeCallTargetMethod = target;
-            try
+            return continuation;
+        }
+
+
+        private void SetTopMulticastContinuation(long continuation)
+           => SetTopContinuation(PendingContinuationKind.MulticastDelegate, -1, continuation, 0, false);
+
+        private void StartDelegateInvocationTarget(long continuation)
+        {
+            while (true)
             {
-                RebindDelegateInvokeArguments(invokeMethod, target, targetRef, callFlags);
-                NormalizeValueTypeThisArgument(target);
+                int blob = checked((int)continuation);
+                int nextIndex = ReadI32(blob + McNextIndexOffset);
+                int count = ReadI32(blob + McCountOffset);
+                if ((uint)nextIndex >= (uint)count)
+                    throw new InvalidOperationException("Delegate invocation target index is out of range.");
 
-                if (TryInvokeHostOverride(target, ct))
-                    return;
-                if (TryInvokeIntrinsic(target, ct))
-                    return;
+                long multicastRef = ReadNative(blob + McDelegateRefOffset);
+                long delegateObj = GetDelegateInvocationTargetAt(multicastRef, nextIndex);
+                RuntimeMethod target = ReadDelegateTargetMethod(delegateObj);
+                long targetRef = ReadDelegateTarget(delegateObj);
+
+                if (RequiresTypeInitializationBeforeCall(target))
+                {
+                    ExecutionLimits limits = _executionLimits ?? throw new InvalidOperationException("Execution limits are not initialized.");
+                    if (TryRunTypeInitializer(target.DeclaringType, _pc, _executionCancellationToken, limits))
+                    {
+                        SetTopMulticastContinuation(continuation);
+                        return;
+                    }
+                }
+
+                WriteI32(blob + McNextIndexOffset, nextIndex + 1);
+
+                CallFlags callFlags = (CallFlags)ReadI32(blob + McCallFlagsOffset);
+                RuntimeMethod invokeMethod = _rts.GetMethodById(ReadI32(blob + McInvokeMethodIdOffset));
+                CallFlags previousActiveCallFlags = _activeCallFlags;
+                RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+                _activeCallFlags = callFlags;
+                _activeCallTargetMethod = target;
+                try
+                {
+                    RebindDelegateInvokeArgumentsFromBlob(continuation, invokeMethod, target, targetRef);
+                    NormalizeValueTypeThisArgument(target);
+
+                    int pcBeforeHostOrIntrinsic = _pc;
+                    if (TryInvokeHostOverride(target, _executionCancellationToken) || TryInvokeIntrinsic(target, _executionCancellationToken))
+                    {
+                        if (_pc != pcBeforeHostOrIntrinsic)
+                            return;
+
+                        if (nextIndex + 1 >= count)
+                            return;
+
+                        continue;
+                    }
+                }
+                finally
+                {
+                    _activeCallFlags = previousActiveCallFlags;
+                    _activeCallTargetMethod = previousActiveCallTargetMethod;
+                }
+
+                if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
+                {
+                    if (target.BodyModule is null || target.Body is null)
+                        throw new MissingMethodException("No body for delegate target M" + target.MethodId.ToString());
+                    throw new MissingMethodException("Delegate target method exists in metadata but not in register image: M" + target.MethodId.ToString());
+                }
+
+                ExecutionLimits limitsForDepth = _executionLimits ?? throw new InvalidOperationException("Execution limits are not initialized.");
+                if (_frameCount >= MaxCallFramesHard)
+                    throw new InvalidOperationException("Register VM call stack limit exceeded.");
+                if (_frameCount >= limitsForDepth.MaxCallDepth)
+                    throw new InvalidOperationException("Configured call depth limit exceeded.");
+
+                EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
+
+                if (nextIndex + 1 < count)
+                    SetTopMulticastContinuation(continuation);
+
+                return;
             }
-            finally
+        }
+        private long GetDelegateInvocationTargetAt(long delegateRef, int index)
+        {
+            if (delegateRef == 0)
+                throw new NullReferenceException();
+
+            long listRef = ReadDelegateField(delegateRef, "_invocationList");
+            int count = DelegateInvocationCount(delegateRef);
+            if ((uint)index >= (uint)count)
+                throw new IndexOutOfRangeException();
+
+            if (listRef == 0 || count <= 1)
+                return delegateRef;
+
+            return ReadDelegateArrayEntry(listRef, index);
+        }
+
+        private int DelegateInvocationCount(long delegateRef)
+        {
+            if (delegateRef == 0)
+                return 0;
+
+            RuntimeType type = GetObjectTypeFromRef(delegateRef);
+            if (!IsDelegateLikeRuntimeType(type))
+                throw new InvalidOperationException("Expected delegate object.");
+
+            long listRef = ReadDelegateField(delegateRef, "_invocationList");
+            long count64 = ReadDelegateField(delegateRef, "_invocationCount");
+            if (listRef == 0 || count64 <= 1)
+                return 1;
+            if (count64 > int.MaxValue)
+                throw new InvalidOperationException("Delegate invocation count is too large.");
+            return (int)count64;
+        }
+
+        private void RebindDelegateInvokeArgumentsFromBlob(long continuation, RuntimeMethod invokeMethod, RuntimeMethod target, long targetRef)
+        {
+            int blob = checked((int)continuation);
+            CallFlags callFlags = (CallFlags)ReadI32(blob + McCallFlagsOffset);
+            int capturedCount = ReadI32(blob + McArgCountOffset);
+            int targetArgCount = LogicalArgumentCount(target);
+            bool hasClosedTarget = targetRef != 0 || target.HasThis;
+            int targetExplicitArgBase = hasClosedTarget ? 1 : 0;
+            if (targetArgCount != targetExplicitArgBase + capturedCount)
             {
-                _activeCallFlags = previousActiveCallFlags;
-                _activeCallTargetMethod = previousActiveCallTargetMethod;
+                throw new InvalidOperationException(
+                    "Delegate target signature does not match Invoke signature. InvokeArgs=" + capturedCount.ToString() +
+                    ", TargetArgs=" + targetArgCount.ToString() + ", Closed=" + hasClosedTarget.ToString());
             }
 
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
+            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
+                WriteHiddenReturnBufferAddress(target, ReadNative(blob + McHiddenReturnBufferOffset));
+
+            if (hasClosedTarget)
             {
-                if (target.BodyModule is null || target.Body is null)
-                    throw new MissingMethodException("No body for delegate target M" + target.MethodId.ToString());
-                throw new MissingMethodException("Delegate target method exists in metadata but not in register image: M" + target.MethodId.ToString());
+                if (targetRef == 0)
+                    throw new NullReferenceException();
+                WriteAbiScalarArgument(target, 0, targetRef);
             }
 
-            if (_frameCount >= MaxCallFramesHard)
-                throw new InvalidOperationException("Register VM call stack limit exceeded.");
-            if (_frameCount >= limits.MaxCallDepth)
-                throw new InvalidOperationException("Configured call depth limit exceeded.");
+            for (int i = 0; i < capturedCount; i++)
+            {
+                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
+                int typeId = ReadI32(rec + McArgTypeIdOffset);
+                int size = ReadI32(rec + McArgSizeOffset);
+                int dataRel = ReadI32(rec + McArgDataRelOffset);
+                RuntimeType argType = _rts.GetTypeById(typeId);
+                WriteAbiArgumentFromMemory(target, targetExplicitArgBase + i, argType, blob + dataRel, size);
+            }
+        }
 
-            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
+        private void WriteAbiArgumentFromMemory(RuntimeMethod method, int logicalIndex, RuntimeType valueType, int source, int sourceSize)
+        {
+            RuntimeType targetType = GetLogicalArgumentType(method, logicalIndex);
+            int targetSize = Math.Max(1, StorageSizeOf(targetType));
+            int valueSize = Math.Min(Math.Max(1, sourceSize), Math.Max(1, StorageSizeOf(valueType)));
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            for (int i = 0; i < slices.Length; i++)
+            {
+                AbiArgumentSlice slice = slices[i];
+                int count = Math.Min(slice.Size, Math.Min(valueSize, targetSize) - slice.Offset);
+                if (count <= 0)
+                    continue;
+
+                if (slice.Location.IsRegister)
+                {
+                    long bits = ReadRawBits(source + slice.Offset, count);
+                    if (slice.RegisterClass == RegisterClass.Float)
+                        SetFpr((byte)slice.Location.Register, bits);
+                    else
+                        X(slice.Location.Register, bits);
+                }
+                else
+                {
+                    int target = GetAbiStackArgumentAddress(method, slice.Location);
+                    _mem.AsSpan(source + slice.Offset, count).CopyTo(_mem.AsSpan(target, count));
+                }
+            }
         }
 
         private int AllocDelegateFromDescriptor(long descriptor, long targetRef)
@@ -1540,11 +1775,184 @@ namespace Cnidaria.Cs
             RuntimeType delegateType = _rts.GetTypeById(delegateTypeId);
             RuntimeMethod targetMethod = _rts.GetMethodById(targetMethodId);
 
+            if (!IsDelegateLikeRuntimeType(delegateType))
+                throw new InvalidOperationException("NewDelegate expects a delegate type.");
+
             int obj = AllocObject(delegateType);
             WriteDelegateField(obj, "_target", targetRef);
             WriteDelegateField(obj, "_methodPtr", targetMethod.MethodId);
             WriteDelegateField(obj, "_methodModule", 0);
+            WriteDelegateField(obj, "_invocationList", 0);
+            WriteDelegateField(obj, "_invocationCount", 1);
             return obj;
+        }
+
+        private long ExecDelegateCombine(long a, long b)
+        {
+            if (a == 0)
+                return b;
+            if (b == 0)
+                return a;
+
+            RuntimeType aType = GetObjectTypeFromRef(a);
+            RuntimeType bType = GetObjectTypeFromRef(b);
+            if (!IsDelegateLikeRuntimeType(aType) || !IsDelegateLikeRuntimeType(bType))
+                throw new InvalidOperationException("DelegateCombine expects delegate operands.");
+            if (aType.TypeId != bType.TypeId)
+                throw new InvalidOperationException("Cannot combine delegates of different runtime types.");
+
+            int[] left = FlattenDelegate(a);
+            int[] right = FlattenDelegate(b);
+            int[] merged = new int[checked(left.Length + right.Length)];
+            Array.Copy(left, 0, merged, 0, left.Length);
+            Array.Copy(right, 0, merged, left.Length, right.Length);
+            return AllocMulticastDelegate(aType, merged);
+        }
+
+        private long ExecDelegateRemove(long source, long value)
+        {
+            if (source == 0 || value == 0)
+                return source;
+
+            RuntimeType sourceType = GetObjectTypeFromRef(source);
+            RuntimeType valueType = GetObjectTypeFromRef(value);
+            if (!IsDelegateLikeRuntimeType(sourceType) || !IsDelegateLikeRuntimeType(valueType))
+                throw new InvalidOperationException("DelegateRemove expects delegate operands.");
+            if (sourceType.TypeId != valueType.TypeId)
+                return source;
+
+            int[] sourceTargets = FlattenDelegate(source);
+            int[] valueTargets = FlattenDelegate(value);
+            if (valueTargets.Length == 0 || sourceTargets.Length < valueTargets.Length)
+                return source;
+
+            int removeAt = -1;
+            for (int i = sourceTargets.Length - valueTargets.Length; i >= 0; i--)
+            {
+                bool match = true;
+                for (int j = 0; j < valueTargets.Length; j++)
+                {
+                    if (!SameDelegateLeaf(sourceTargets[i + j], valueTargets[j]))
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match)
+                {
+                    removeAt = i;
+                    break;
+                }
+            }
+
+            if (removeAt < 0)
+                return source;
+
+            int newCount = sourceTargets.Length - valueTargets.Length;
+            if (newCount == 0)
+                return 0;
+
+            int[] result = new int[newCount];
+            if (removeAt != 0)
+                Array.Copy(sourceTargets, 0, result, 0, removeAt);
+
+            int tailStart = removeAt + valueTargets.Length;
+            int tailCount = sourceTargets.Length - tailStart;
+            if (tailCount != 0)
+                Array.Copy(sourceTargets, tailStart, result, removeAt, tailCount);
+
+            return AllocMulticastDelegate(sourceType, result);
+        }
+
+        private int AllocMulticastDelegate(RuntimeType delegateType, ReadOnlySpan<int> targets)
+        {
+            if (targets.Length <= 0)
+                throw new ArgumentOutOfRangeException(nameof(targets));
+            if (targets.Length == 1)
+                return targets[0];
+
+            int obj = AllocObject(delegateType);
+            RuntimeType arrayType = _rts.GetArrayType(delegateType);
+            int list = AllocArray(arrayType, targets.Length);
+
+            for (int i = 0; i < targets.Length; i++)
+                WriteDelegateArrayEntry(list, i, targets[i]);
+
+            WriteDelegateField(obj, "_target", 0);
+            WriteDelegateField(obj, "_methodPtr", 0);
+            WriteDelegateField(obj, "_methodModule", 0);
+            WriteDelegateField(obj, "_invocationList", list);
+            WriteDelegateField(obj, "_invocationCount", targets.Length);
+            return obj;
+        }
+
+        private int[] FlattenDelegate(long delegateRef)
+        {
+            if (delegateRef == 0)
+                return Array.Empty<int>();
+
+            RuntimeType type = GetObjectTypeFromRef(delegateRef);
+            if (!IsDelegateLikeRuntimeType(type))
+                throw new InvalidOperationException("Expected delegate object.");
+
+            long listRef = ReadDelegateField(delegateRef, "_invocationList");
+            long count64 = ReadDelegateField(delegateRef, "_invocationCount");
+            if (listRef == 0 || count64 <= 1)
+                return new[] { checked((int)delegateRef) };
+            if (count64 > int.MaxValue)
+                throw new InvalidOperationException("Delegate invocation count is too large.");
+
+            int count = (int)count64;
+            ValidateArrayRef(listRef, out int listAbs, out RuntimeType listType);
+            RuntimeType elemType = listType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
+            if (!elemType.IsReferenceType)
+                throw new InvalidOperationException("Delegate invocation list must contain references.");
+
+            int len = ReadI32(listAbs + ArrayLengthOffset);
+            if ((uint)count > (uint)len)
+                throw new InvalidOperationException("Delegate invocation count exceeds invocation list length.");
+
+            int[] result = new int[count];
+            for (int i = 0; i < count; i++)
+                result[i] = ReadDelegateArrayEntry(listRef, i);
+            return result;
+        }
+
+        private int ReadDelegateArrayEntry(long arrayRef, int index)
+        {
+            RuntimeType arrayType = ValidateArrayRef(arrayRef);
+            RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
+            int elemAddr = GetArrayElementAddress(arrayRef, index, elemType);
+            long value = ReadSizedInteger(elemAddr, elemType);
+            if (value == 0)
+                throw new InvalidOperationException("Delegate invocation list contains null.");
+            return checked((int)value);
+        }
+
+        private void WriteDelegateArrayEntry(long arrayRef, int index, long delegateRef)
+        {
+            RuntimeType arrayType = ValidateArrayRef(arrayRef);
+            RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
+            int elemAddr = GetArrayElementAddress(arrayRef, index, elemType);
+            WriteSizedInteger(elemAddr, elemType, delegateRef);
+        }
+
+        private bool SameDelegateLeaf(long a, long b)
+        {
+            if (a == b)
+                return true;
+            if (a == 0 || b == 0)
+                return false;
+
+            RuntimeType at = GetObjectTypeFromRef(a);
+            RuntimeType bt = GetObjectTypeFromRef(b);
+            if (at.TypeId != bt.TypeId)
+                return false;
+
+            return ReadDelegateField(a, "_target") == ReadDelegateField(b, "_target") &&
+                   ReadDelegateField(a, "_methodPtr") == ReadDelegateField(b, "_methodPtr") &&
+                   ReadDelegateField(a, "_methodModule") == ReadDelegateField(b, "_methodModule");
         }
 
         private RuntimeMethod ReadDelegateTargetMethod(long delegateRef)
@@ -1587,18 +1995,29 @@ namespace Cnidaria.Cs
             throw new MissingFieldException(type.Name, name);
         }
 
-        private void RebindDelegateInvokeArguments(RuntimeMethod invokeMethod, RuntimeMethod target, long targetRef, CallFlags callFlags)
+        private static bool IsSystemDelegateBase(RuntimeType type)
+            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+               (StringComparer.Ordinal.Equals(type.Name, "Delegate") ||
+                StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate"));
+
+        private static bool IsDelegateLikeRuntimeType(RuntimeType type)
         {
-            int invokeArgCount = LogicalArgumentCount(invokeMethod);
-            int explicitInvokeArgCount = Math.Max(0, invokeArgCount - 1);
-            var captured = new CapturedAbiArgument[explicitInvokeArgCount];
-            for (int i = 0; i < captured.Length; i++)
-                captured[i] = CaptureAbiArgument(invokeMethod, i + 1);
+            for (RuntimeType? t = type; t is not null; t = t.BaseType)
+            {
+                if (IsSystemDelegateBase(t))
+                    return true;
+            }
+            return false;
+        }
 
-            long hiddenReturnBuffer = 0;
-            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
-                hiddenReturnBuffer = ReadHiddenReturnBufferAddress(invokeMethod);
-
+        private void RebindDelegateInvokeArguments(
+            RuntimeMethod invokeMethod,
+            RuntimeMethod target,
+            long targetRef,
+            CallFlags callFlags,
+            CapturedAbiArgument[] captured,
+            long hiddenReturnBuffer)
+        {
             int targetArgCount = LogicalArgumentCount(target);
             bool hasClosedTarget = targetRef != 0 || target.HasThis;
             int targetExplicitArgBase = hasClosedTarget ? 1 : 0;
@@ -1941,6 +2360,8 @@ namespace Cnidaria.Cs
             long postReturnObjectRef = TopPostReturnObjectRef();
             long callerSp = TopCallerSp();
             long callerFp = TopCallerFp();
+            PendingContinuationKind continuationKind = TopContinuationKind();
+            long multicastContinuationRef = continuationKind == PendingContinuationKind.MulticastDelegate ? TopContinuationI0() : 0;
 
             PopFrame();
             if (_frameCount == 0 || retPc < 0 || callerMethod < 0)
@@ -1974,6 +2395,9 @@ namespace Cnidaria.Cs
             if (hasInteger || hasRef || hasValue) SetGpr(MachineRegisters.ReturnValue0, retI0);
             if (postReturnRegister != RegisterVmIsa.InvalidRegister) SetGpr(postReturnRegister, postReturnObjectRef);
             if (returnedFromCctor) _typeInitState[cctorTypeId] = 2;
+
+            if (multicastContinuationRef != 0)
+                StartDelegateInvocationTarget(multicastContinuationRef);
         }
 
         private int SaveRegisterSnapshot()
@@ -4627,14 +5051,79 @@ namespace Cnidaria.Cs
             {
                 long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
                 if (obj != 0) TryMarkObject(checked((int)obj));
+
+                PendingContinuationKind kind = (PendingContinuationKind)((ReadI32(frame + ShadowFramePackedFlags) >> ShadowFrameContinuationKindShift) & 0xFF);
+                if (kind == PendingContinuationKind.MulticastDelegate)
+                {
+                    long continuation = ReadI64(frame + ShadowFrameContinuationI0);
+                    if (continuation != 0)
+                    {
+                        MarkMulticastContinuationRoots(checked((int)continuation));
+                    }
+                }
             }
         }
+
         private void UpdatePendingPostReturnObjectsAfterCompaction()
         {
             for (int frame = _stackBase; frame < _frameStackTop; frame += ShadowFrameSize)
             {
                 long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
                 if (obj != 0) WriteI64(frame + ShadowFramePostReturnObjectRef, TranslateObjectRef(checked((int)obj)));
+
+                PendingContinuationKind kind = (PendingContinuationKind)((ReadI32(frame + ShadowFramePackedFlags) >> ShadowFrameContinuationKindShift) & 0xFF);
+                if (kind == PendingContinuationKind.MulticastDelegate)
+                {
+                    long continuation = ReadI64(frame + ShadowFrameContinuationI0);
+                    if (continuation != 0)
+                    {
+                        UpdateMulticastContinuationRootsBeforeMove(checked((int)continuation));
+                    }
+                }
+            }
+        }
+
+        private void MarkMulticastContinuationRoots(int continuation)
+        {
+            int blob = continuation;
+
+            long delegateRef = ReadNative(blob + McDelegateRefOffset);
+            if (delegateRef != 0)
+                TryMarkObject(checked((int)delegateRef));
+
+            long hiddenReturnBuffer = ReadNative(blob + McHiddenReturnBufferOffset);
+            if (hiddenReturnBuffer != 0)
+                TryMarkObjectFromInteriorPointer(checked((int)hiddenReturnBuffer));
+
+            int argCount = ReadI32(blob + McArgCountOffset);
+            for (int i = 0; i < argCount; i++)
+            {
+                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
+                RuntimeType type = _rts.GetTypeById(ReadI32(rec + McArgTypeIdOffset));
+                int dataRel = ReadI32(rec + McArgDataRelOffset);
+                MarkManagedRefCellsInTypedStorage(blob + dataRel, type);
+            }
+        }
+
+        private void UpdateMulticastContinuationRootsBeforeMove(int continuation)
+        {
+            int blob = continuation;
+
+            long delegateRef = ReadNative(blob + McDelegateRefOffset);
+            if (delegateRef != 0)
+                WriteNative(blob + McDelegateRefOffset, TranslateObjectRef(checked((int)delegateRef)));
+
+            long hiddenReturnBuffer = ReadNative(blob + McHiddenReturnBufferOffset);
+            if (hiddenReturnBuffer != 0)
+                WriteNative(blob + McHiddenReturnBufferOffset, TranslateInteriorPointer(checked((int)hiddenReturnBuffer)));
+
+            int argCount = ReadI32(blob + McArgCountOffset);
+            for (int i = 0; i < argCount; i++)
+            {
+                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
+                RuntimeType type = _rts.GetTypeById(ReadI32(rec + McArgTypeIdOffset));
+                int dataRel = ReadI32(rec + McArgDataRelOffset);
+                UpdateManagedRefCellsInTypedStorage(blob + dataRel, type);
             }
         }
         private int CurrentFrameRootAddress(GcRootRecord root)
@@ -5564,35 +6053,191 @@ namespace Cnidaria.Cs
 
         private RuntimeMethod ResolveVirtualDispatch(RuntimeType actual, RuntimeMethod declared)
         {
-            if (declared.VTableSlot >= 0 && declared.VTableSlot < actual.VTable.Length)
-                return actual.VTable[declared.VTableSlot];
+            if (actual is null) throw new ArgumentNullException(nameof(actual));
+            if (declared is null) throw new ArgumentNullException(nameof(declared));
+
+            if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
+            {
+                for (RuntimeType? t = actual; t is not null; t = t.BaseType)
+                {
+                    RuntimeMethod? explicitImpl = TryResolveExplicitInterfaceImpl(t, declared);
+                    if (explicitImpl is not null)
+                        return explicitImpl;
+                }
+
+                RuntimeMethod? implicitImpl = FindMostDerivedMethodByNameAndSig(actual, declared);
+                if (implicitImpl is not null)
+                    return implicitImpl;
+
+                throw new MissingMethodException(
+                    "Interface method not implemented: " +
+                    declared.DeclaringType.Namespace + "." +
+                    declared.DeclaringType.Name + "." +
+                    declared.Name);
+            }
+
+            int slot = declared.VTableSlot;
+            if (slot >= 0 && (uint)slot < (uint)actual.VTable.Length)
+                return actual.VTable[slot];
+
             return FindMostDerivedMethodByNameAndSig(actual, declared) ?? declared;
         }
-
-        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
+        private RuntimeMethod? TryResolveExplicitInterfaceImpl(RuntimeType implementationType, RuntimeMethod declared)
         {
-            for (RuntimeType? cur = actual; cur != null; cur = cur.BaseType)
+            var map = implementationType.ExplicitInterfaceMethodImpls;
+            if (map is null || map.Count == 0)
+                return null;
+
+            if (map.TryGetValue(declared.MethodId, out RuntimeMethod? exact))
+                return ProjectRuntimeMethodToOwner(implementationType, exact);
+
+            foreach (var kv in map)
             {
-                for (int i = 0; i < cur.Methods.Length; i++)
+                RuntimeMethod ifaceMethod;
+
+                try
                 {
-                    RuntimeMethod m = cur.Methods[i];
-                    if (m.Name != declared.Name) continue;
-                    if (m.ParameterTypes.Length != declared.ParameterTypes.Length) continue;
-                    bool same = true;
-                    for (int p = 0; p < m.ParameterTypes.Length; p++)
-                    {
-                        if (m.ParameterTypes[p].TypeId != declared.ParameterTypes[p].TypeId)
-                        {
-                            same = false;
-                            break;
-                        }
-                    }
-                    if (same) return m;
+                    ifaceMethod = _rts.GetMethodById(kv.Key);
                 }
+                catch
+                {
+                    continue;
+                }
+
+                if (!SameInterfaceMethodIdentity(ifaceMethod, declared))
+                    continue;
+
+                return ProjectRuntimeMethodToOwner(implementationType, kv.Value);
             }
+
             return null;
         }
+        private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
+        {
+            if (method.DeclaringType.TypeId == owner.TypeId)
+                return method;
 
+            _rts.EnsureConstructedMembers(owner);
+
+            RuntimeMethod[] methods = owner.Methods;
+            for (int i = 0; i < methods.Length; i++)
+            {
+                RuntimeMethod candidate = methods[i];
+
+                if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name))
+                    continue;
+
+                if (candidate.GenericArity != method.GenericArity)
+                    continue;
+
+                if (candidate.IsStatic != method.IsStatic)
+                    continue;
+
+                if (candidate.Body is not null &&
+                    method.Body is not null &&
+                    ReferenceEquals(candidate.Body, method.Body))
+                {
+                    return candidate;
+                }
+
+                if (SameSigRuntime(candidate, method))
+                    return candidate;
+            }
+
+            return method;
+        }
+        private static bool SameInterfaceMethodIdentity(RuntimeMethod ifaceMethod, RuntimeMethod declared)
+        {
+            if (!StringComparer.Ordinal.Equals(ifaceMethod.Name, declared.Name))
+                return false;
+
+            if (ifaceMethod.GenericArity != declared.GenericArity)
+                return false;
+
+            if (!SameRuntimeTypeDefinitionOrExact(ifaceMethod.DeclaringType, declared.DeclaringType))
+                return false;
+
+            if (ifaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length)
+                return false;
+
+            if (!CompatibleInterfaceSignatureType(ifaceMethod.ReturnType, declared.ReturnType))
+                return false;
+
+            for (int i = 0; i < ifaceMethod.ParameterTypes.Length; i++)
+            {
+                if (!CompatibleInterfaceSignatureType(ifaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
+                    return false;
+            }
+
+            return true;
+        }
+        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType a, RuntimeType b)
+        {
+            if (a.TypeId == b.TypeId)
+                return true;
+
+            RuntimeType ad = a.GenericTypeDefinition ?? a;
+            RuntimeType bd = b.GenericTypeDefinition ?? b;
+
+            return ad.TypeId == bd.TypeId;
+        }
+        private static bool CompatibleInterfaceSignatureType(RuntimeType a, RuntimeType b)
+        {
+            if (a.TypeId == b.TypeId)
+                return true;
+
+            if (a.Kind == RuntimeTypeKind.TypeParam || b.Kind == RuntimeTypeKind.TypeParam)
+                return true;
+
+            return SameRuntimeTypeDefinitionOrExact(a, b);
+        }
+        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
+        {
+            for (RuntimeType? cur = actual; cur is not null; cur = cur.BaseType)
+            {
+                RuntimeMethod[] methods = cur.Methods;
+
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    RuntimeMethod m = methods[i];
+
+                    if (m.IsStatic)
+                        continue;
+
+                    if (m.IsPrivate)
+                        continue;
+
+                    if (!StringComparer.Ordinal.Equals(m.Name, declared.Name))
+                        continue;
+
+                    if (!SameSigRuntime(m, declared))
+                        continue;
+
+                    return m;
+                }
+            }
+
+            return null;
+        }
+        private static bool SameSigRuntime(RuntimeMethod a, RuntimeMethod b)
+        {
+            if (a.GenericArity != b.GenericArity)
+                return false;
+
+            if (a.ParameterTypes.Length != b.ParameterTypes.Length)
+                return false;
+
+            if (a.ReturnType.TypeId != b.ReturnType.TypeId)
+                return false;
+
+            for (int i = 0; i < a.ParameterTypes.Length; i++)
+            {
+                if (a.ParameterTypes[i].TypeId != b.ParameterTypes[i].TypeId)
+                    return false;
+            }
+
+            return true;
+        }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool TypeIsReferenceOrContainsReferences(RuntimeType type)
         {

@@ -1072,6 +1072,10 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
                 return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
 
+            // event
+            if (_tokens.CurrentKind == SyntaxKind.EventKeyword)
+                return ParseEventDeclarationAfterModifiers(attrs, modifiers);
+
             // nested type
             if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
@@ -1128,6 +1132,45 @@ namespace Cnidaria.Cs
                 return ParsePropertyDeclarationAfterHeader(attrs, modifiers, type, explicitInterface, id);
 
             return ParseFieldDeclarationAfterHeader(attrs, modifiers, type, id);
+        }
+        private MemberDeclarationSyntax ParseEventDeclarationAfterModifiers(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
+        {
+            var eventKeyword = MatchToken(SyntaxKind.EventKeyword);
+            var type = ParseType();
+
+            ExplicitInterfaceSpecifierSyntax? explicitInterface = null;
+            SyntaxToken explicitMemberId = default;
+            SyntaxToken explicitThisKeyword = default;
+            bool hasExplicitInterface = TryParseExplicitInterfaceSpecifier(out explicitInterface, out explicitMemberId, out explicitThisKeyword);
+
+            if (explicitThisKeyword.Kind == SyntaxKind.ThisKeyword)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(
+                    explicitThisKeyword.Span.Start,
+                    "An event declaration cannot use an indexer-style 'this' member name."));
+            }
+
+            var id = hasExplicitInterface
+                ? explicitMemberId
+                : MatchToken(SyntaxKind.IdentifierToken);
+
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken || hasExplicitInterface)
+            {
+                var accessorList = ParseAccessorList();
+                return new EventDeclarationSyntax(
+                    attributeLists,
+                    modifiers,
+                    eventKeyword,
+                    type,
+                    explicitInterface,
+                    id,
+                    accessorList);
+            }
+
+            var vars = ParseVariableDeclarators(id, closeKind: SyntaxKind.SemicolonToken); 
+            var decl = new VariableDeclarationSyntax(type, vars);
+            var semi = MatchToken(SyntaxKind.SemicolonToken);
+            return new EventFieldDeclarationSyntax(attributeLists, modifiers, eventKeyword, decl, semi);
         }
         private PropertyDeclarationSyntax ParsePropertyDeclarationAfterHeader(
             SyntaxList<AttributeListSyntax> attributeLists,
@@ -1219,6 +1262,16 @@ namespace Cnidaria.Cs
             {
                 kw = _tokens.EatToken();
                 kind = SyntaxKind.InitAccessorDeclaration;
+            }
+            else if (IsCurrentContextual(SyntaxKind.AddKeyword))
+            {
+                kw = _tokens.EatToken();
+                kind = SyntaxKind.AddAccessorDeclaration;
+            }
+            else if (IsCurrentContextual(SyntaxKind.RemoveKeyword))
+            {
+                kw = _tokens.EatToken();
+                kind = SyntaxKind.RemoveAccessorDeclaration;
             }
             else
             {
@@ -3608,6 +3661,12 @@ namespace Cnidaria.Cs
         }
         private ExpressionSyntax ParseAssignmentExpression()
         {
+            if (IsAnonymousMethodExpressionStart())
+                return ParseAnonymousMethodExpression();
+
+            if (IsLambdaExpressionStart())
+                return ParseLambdaExpression();
+
             var left = ParseConditionalExpression();
 
             if (IsAssignmentOperator(_tokens.CurrentKind))

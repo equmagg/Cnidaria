@@ -317,6 +317,7 @@ namespace Cnidaria.Cs
     {
         public abstract TypeKind TypeKind { get; }
         public abstract int Arity { get; }
+        public virtual bool IsSealed => false;
         public virtual bool IsReadOnlyStruct => false;
         public abstract ImmutableArray<TypeParameterSymbol> TypeParameters { get; }
         public virtual ImmutableArray<TypeSymbol> TypeArguments
@@ -1002,6 +1003,7 @@ namespace Cnidaria.Cs
     }
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
+        private bool _isSealed;
         private readonly bool _isReadOnlyStruct;
         private readonly bool _isRefLikeType;
         private readonly int _arity;
@@ -1024,6 +1026,7 @@ namespace Cnidaria.Cs
 
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         private readonly List<AttributeData> _attributes = new();
+        public override bool IsSealed => _isSealed;
         public override bool IsRefLikeType => _isRefLikeType;
         public override bool IsReadOnlyStruct => _isReadOnlyStruct;
         public override int Arity => _arity;
@@ -1053,7 +1056,7 @@ namespace Cnidaria.Cs
             => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
 
         public override TypeSymbol? EnumUnderlyingType => _enumUnderlyingTypeSet ? _enumUnderlyingType : null;
-
+        internal void MarkSealed() => _isSealed = true;
         internal void SetEnumUnderlyingType(TypeSymbol underlyingType)
         {
             if (TypeKind != TypeKind.Enum)
@@ -1107,7 +1110,8 @@ namespace Cnidaria.Cs
             Accessibility declaredAccessibility,
             bool isFromMetadata = false,
             bool isReadOnlyStruct = false,
-            bool isRefLikeType = false)
+            bool isRefLikeType = false,
+            bool isSealed = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1119,6 +1123,7 @@ namespace Cnidaria.Cs
             _typeParameters = default;
             _isReadOnlyStruct = isReadOnlyStruct;
             _isRefLikeType = isRefLikeType;
+            _isSealed = isSealed;
         }
 
         public void AddDeclaration(SyntaxTree tree, SyntaxNode node)
@@ -1411,7 +1416,8 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeSymbol> _lazyInterfaces;
         private bool _lazyInterfacesInitialized;
         public override Accessibility DeclaredAccessibility => _originalDefinition.DeclaredAccessibility;
-        public override bool IsFromMetadata => _originalDefinition.IsFromMetadata;
+        public override bool IsFromMetadata => _originalDefinition.IsFromMetadata; 
+        public override bool IsSealed => _originalDefinition.IsSealed;
         public override bool IsRefLikeType => _originalDefinition.IsRefLikeType;
         public override bool IsReadOnlyStruct => _originalDefinition.IsReadOnlyStruct;
         public SubstitutedNamedTypeSymbol(
@@ -1656,6 +1662,10 @@ namespace Cnidaria.Cs
         public override bool IsConstructor => _original.IsConstructor;
         public override bool IsAsync => _original.IsAsync;
         public override bool IsExtensionMethod => _original.IsExtensionMethod;
+        public override bool IsVirtual => _original.IsVirtual;
+        public override bool IsAbstract => _original.IsAbstract;
+        public override bool IsOverride => _original.IsOverride;
+        public override bool IsSealed => _original.IsSealed;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _original.TypeParameters;
         public override TypeSymbol ReturnType => _returnType;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
@@ -1687,7 +1697,23 @@ namespace Cnidaria.Cs
                 return _explicitInterfaceImplementation;
             }
         }
+        public override MethodSymbol? OverriddenMethod
+        {
+            get
+            {
+                var overridden = _original.OverriddenMethod;
+                if (overridden is null)
+                    return null;
 
+                if (overridden.ContainingSymbol is NamedTypeSymbol owner)
+                {
+                    var substitutedOwner = (NamedTypeSymbol)TypeSubstituter.Substitute(owner, _types, _map);
+                    return new SubstitutedMethodSymbol(overridden, substitutedOwner, _types, _map);
+                }
+
+                return overridden;
+            }
+        }
         public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
         public SubstitutedMethodSymbol(
             MethodSymbol original,
@@ -1844,6 +1870,7 @@ namespace Cnidaria.Cs
     }
     internal sealed class SpecialNamedTypeSymbol : NamedTypeSymbol
     {
+        private bool _isSealed;
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -1851,12 +1878,14 @@ namespace Cnidaria.Cs
         public override SpecialType SpecialType { get; }
         public override bool IsReferenceType { get; }
         public override bool IsValueType { get; }
+        public override bool IsSealed => _isSealed;
         public override TypeSymbol? BaseType { get; }
         public override int Arity => 0;
         private readonly List<Symbol> _members = new();
         private readonly Dictionary<(string name, int arity), List<NamedTypeSymbol>> _nestedTypesByName = new();
         public override Accessibility DeclaredAccessibility { get; }
         public override bool IsFromMetadata => true;
+        public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
         public SpecialNamedTypeSymbol(
             string name,
             Symbol containing,
@@ -1874,8 +1903,7 @@ namespace Cnidaria.Cs
             IsValueType = isVal;
             BaseType = baseType;
         }
-
-        public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+        internal void MarkSealed() => _isSealed = true;
         internal void AddMember(Symbol member) => _members.Add(member);
         internal void AddNestedType(NamedTypeSymbol type)
         {

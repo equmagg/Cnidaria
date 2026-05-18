@@ -717,6 +717,10 @@ namespace Cnidaria.Cs
         private readonly Dictionary<(string mod, int tok), RuntimeField> _fieldCache = new();
         private readonly Dictionary<(string mod, int tok), RuntimeMethod> _methodCache = new();
 
+        private readonly Dictionary<(string mod, int token, int contextMethodId), RuntimeType> _typeInMethodContextCache = new();
+        private readonly Dictionary<(string mod, int token, int contextMethodId), RuntimeField> _fieldInMethodContextCache = new();
+        private readonly Dictionary<(string mod, int token, int contextMethodId), RuntimeMethod> _methodInMethodContextCache = new();
+
         private readonly Dictionary<(string asm, string ns, string name), RuntimeType> _namedTypes =
             new Dictionary<(string asm, string ns, string name), RuntimeType>();
 
@@ -915,14 +919,19 @@ namespace Cnidaria.Cs
             if (methodContext is null)
                 return ResolveMethod(module, methodToken);
 
+            var key = (module.Name, methodToken, methodContext.MethodId);
+            if (_methodInMethodContextCache.TryGetValue(key, out var cached))
+                return cached;
+
             int table = MetadataToken.Table(methodToken);
             int rid = MetadataToken.Rid(methodToken);
 
             if (table == MetadataToken.MethodDef)
             {
                 var m = ResolveMethod(module, methodToken);
-
-                return TryProjectMethodDefFromContext(m, methodContext);
+                var method = TryProjectMethodDefFromContext(m, methodContext);
+                _methodInMethodContextCache[key] = method;
+                return method;
             }
 
             if (table == MetadataToken.MethodSpec)
@@ -991,15 +1000,23 @@ namespace Cnidaria.Cs
                         }
 
                         if (same)
+                        {
+                            _methodInMethodContextCache[key] = cand;
                             return cand;
+                        }
                     }
                 }
-
-                return GetOrCreateConstructedMethod(genericMethod, methodArgs);
+                var method = GetOrCreateConstructedMethod(genericMethod, methodArgs);
+                _methodInMethodContextCache[key] = method;
+                return method;
             }
 
             if (table != MetadataToken.MemberRef)
-                return ResolveMethod(module, methodToken);
+            {
+                var method = ResolveMethod(module, methodToken);
+                _methodInMethodContextCache[key] = method;
+                return method;
+            }
 
             {
                 var resolved = ResolveMethod(module, methodToken);
@@ -1021,9 +1038,11 @@ namespace Cnidaria.Cs
                 if (ctxMethodArgs.Length != 0 &&
                     (resolved.GenericArity != 0 || UsesMethodTypeParameters(resolved)))
                 {
-                    return GetOrCreateConstructedMethod(resolved, ctxMethodArgs);
+                    var method = GetOrCreateConstructedMethod(resolved, ctxMethodArgs);
+                    _methodInMethodContextCache[key] = method;
+                    return method;
                 }
-
+                _methodInMethodContextCache[key] = resolved;
                 return resolved;
             }
 
@@ -1409,6 +1428,14 @@ namespace Cnidaria.Cs
                 }
             }
         }
+
+        internal void EnsureRuntimeTypeReady(RuntimeType type)
+        {
+            if (type is null)
+                throw new ArgumentNullException(nameof(type));
+
+            EnsureLayout(type);
+        }
         private void EnsureLayout(RuntimeType? t)
         {
             if (t is null) return;
@@ -1781,6 +1808,10 @@ namespace Cnidaria.Cs
             if (methodContext is null)
                 return ResolveField(contextModule, fieldToken);
 
+            var key = (contextModule.Name, fieldToken, methodContext.MethodId);
+            if (_fieldInMethodContextCache.TryGetValue(key, out var cachedField))
+                return cachedField;
+
             int table = MetadataToken.Table(fieldToken);
             int rid = MetadataToken.Rid(fieldToken);
 
@@ -1793,10 +1824,16 @@ namespace Cnidaria.Cs
                 var field = ResolveField(contextModule, fieldToken);
 
                 if (ctxOwner.GenericTypeDefinition is null)
+                {
+                    _fieldInMethodContextCache[key] = field;
                     return field;
+                }
 
                 if (!ReferenceEquals(field.DeclaringType, ctxOwner.GenericTypeDefinition))
+                {
+                    _fieldInMethodContextCache[key] = field;
                     return field;
+                }
 
                 EnsureConstructedMembers(ctxOwner);
                 EnsureLayout(ctxOwner);
@@ -1812,7 +1849,10 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < defFields.Length && i < actualFields.Length; i++)
                 {
                     if (ReferenceEquals(defFields[i], field))
+                    {
+                        _fieldInMethodContextCache[key] = actualFields[i];
                         return actualFields[i];
+                    }
                 }
 
                 var expectedFieldType = SubstituteRuntimeType(field.FieldType, ownerTypeArgs, methodTypeArgs);
@@ -1824,14 +1864,21 @@ namespace Cnidaria.Cs
                         continue;
                     if (!ReferenceEquals(cand.FieldType, expectedFieldType))
                         continue;
+                    _fieldInMethodContextCache[key] = cand;
                     return cand;
                 }
 
+                _fieldInMethodContextCache[key] = field;
                 return field;
             }
 
             if (table != MetadataToken.MemberRef)
-                return ResolveField(contextModule, fieldToken);
+            {
+                var field = ResolveField(contextModule, fieldToken); 
+                _fieldInMethodContextCache[key] = field;
+                return field;
+            }
+                 
 
             var mr = contextModule.Md.GetMemberRef(rid);
             string fieldName = contextModule.Md.GetString(mr.Name);
@@ -1859,7 +1906,10 @@ namespace Cnidaria.Cs
                 var f = owner.InstanceFields[i];
                 if (StringComparer.Ordinal.Equals(f.Name, fieldName) &&
                     ReferenceEquals(f.FieldType, fieldType))
+                {
+                    _fieldInMethodContextCache[key] = f;
                     return f;
+                }
             }
 
             for (int i = 0; i < owner.StaticFields.Length; i++)
@@ -1867,7 +1917,10 @@ namespace Cnidaria.Cs
                 var f = owner.StaticFields[i];
                 if (StringComparer.Ordinal.Equals(f.Name, fieldName) &&
                     ReferenceEquals(f.FieldType, fieldType))
+                {
+                    _fieldInMethodContextCache[key] = f;
                     return f;
+                }
             }
 
             throw new MissingFieldException($"{owner.Namespace}.{owner.Name}.{fieldName} not found.");
@@ -2663,14 +2716,22 @@ namespace Cnidaria.Cs
         }
         public RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
         {
-            var t = ResolveType(contextModule, typeToken);
             if (methodContext is null)
-                return t;
+                return ResolveType(contextModule, typeToken);
 
-            return SubstituteRuntimeType(
+            var key = (contextModule.Name, typeToken, methodContext.MethodId);
+            if (_typeInMethodContextCache.TryGetValue(key, out var cached))
+                return cached;
+
+            var t = ResolveType(contextModule, typeToken);
+
+            var result = SubstituteRuntimeType(
                 t,
                 methodContext.DeclaringType.GenericTypeArguments,
                 methodContext.MethodGenericArguments);
+
+            _typeInMethodContextCache[key] = result;
+            return result;
         }
         private RuntimeType SubstituteRuntimeType(RuntimeType type, RuntimeType[] ownerTypeArgs)
             => SubstituteRuntimeType(type, ownerTypeArgs, Array.Empty<RuntimeType>());

@@ -3578,7 +3578,16 @@ namespace Cnidaria.Cs
                             new Location(tree, md.Span)));
                         continue;
                     }
-                    var overridden = FindOverridableInBaseChain(bt, m);
+                    var overridden = FindOverridableInBaseChain(bt, m, out var sealedCandidate);
+                    if (sealedCandidate is not null)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_OVR_SEALED001",
+                            DiagnosticSeverity.Error,
+                            $"Cannot override inherited member '{sealedCandidate.Name}' because it is sealed.",
+                            new Location(tree, md.Span)));
+                        continue;
+                    }
                     if (overridden is null)
                     {
                         diagnostics.Add(new Diagnostic(
@@ -3592,18 +3601,28 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        private static MethodSymbol? FindOverridableInBaseChain(NamedTypeSymbol baseType, MethodSymbol overriding)
+        private static MethodSymbol? FindOverridableInBaseChain(NamedTypeSymbol baseType, MethodSymbol overriding, out MethodSymbol? sealedCandidate)
         {
+            sealedCandidate = null;
             for (NamedTypeSymbol? t = baseType; t is not null; t = t.BaseType as NamedTypeSymbol)
             {
                 foreach (var mem in t.GetMembers())
                 {
                     if (mem is not MethodSymbol bm)
                         continue;
+
                     if (!string.Equals(bm.Name, overriding.Name, StringComparison.Ordinal))
                         continue;
+
                     if (!SignatureEquals(bm, overriding))
                         continue;
+
+                    if (bm.IsSealed)
+                    {
+                        sealedCandidate = bm;
+                        return null;
+                    }
+
                     if (bm.IsVirtual || bm.IsAbstract || bm.IsOverride)
                         return bm;
                 }
@@ -3612,15 +3631,24 @@ namespace Cnidaria.Cs
         }
         private static bool SignatureEquals(MethodSymbol a, MethodSymbol b)
         {
-            if (!ReferenceEquals(a.ReturnType, b.ReturnType))
+            if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType))
                 return false;
+
             var ap = a.Parameters;
             var bp = b.Parameters;
+
             if (ap.Length != bp.Length)
                 return false;
+
             for (int i = 0; i < ap.Length; i++)
-                if (!ReferenceEquals(ap[i].Type, bp[i].Type))
+            {
+                if (ap[i].RefKind != bp[i].RefKind)
                     return false;
+
+                if (!LocalScopeBinder.AreSameType(ap[i].Type, bp[i].Type))
+                    return false;
+            }
+
             return true;
         }
         private static bool TryResolveDeclaredBaseClass(
@@ -3671,6 +3699,16 @@ namespace Cnidaria.Cs
                          "CN_BASE004",
                          DiagnosticSeverity.Error,
                          $"Type '{declaringType.Name}' cannot derive from itself.",
+                         new Location(context.SemanticModel.SyntaxTree, sbt.Type.Span)));
+                    continue;
+                }
+
+                if (nt.IsSealed)
+                {
+                    diagnostics.Add(new Diagnostic(
+                         "CN_BASE_SEALED001",
+                         DiagnosticSeverity.Error,
+                         $"'{nt.Name}' is sealed and cannot be used as a base class.",
                          new Location(context.SemanticModel.SyntaxTree, sbt.Type.Span)));
                     continue;
                 }
@@ -4169,6 +4207,8 @@ namespace Cnidaria.Cs
                 : Accessibility.Internal;
             var isReadOnlyStruct = HasModifier(syntax.Modifiers, SyntaxKind.ReadOnlyKeyword);
             var isRefStruct = HasModifier(syntax.Modifiers, SyntaxKind.RefKeyword);
+            var isSealed = HasModifier(syntax.Modifiers, SyntaxKind.SealedKeyword);
+            var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
@@ -4182,6 +4222,22 @@ namespace Cnidaria.Cs
                     "CN_TYPEMOD001",
                     DiagnosticSeverity.Error,
                     "Only structs may be declared with 'readonly' or 'ref'.",
+                    new Location(tree, syntax.Span)));
+            }
+            if (isSealed && kind != TypeKind.Class)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_TYPEMOD002",
+                    DiagnosticSeverity.Error,
+                    "Only classes may be declared with 'sealed'.",
+                    new Location(tree, syntax.Span)));
+            }
+            if (isSealed && isAbstract)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_TYPEMOD003",
+                    DiagnosticSeverity.Error,
+                    "A class cannot be both abstract and sealed.",
                     new Location(tree, syntax.Span)));
             }
             if (!_typeCache.TryGetValue(key, out var type))
@@ -4201,7 +4257,8 @@ namespace Cnidaria.Cs
                         declaredAcc,
                         isFromMetadata: false,
                         isReadOnlyStruct: kind == TypeKind.Struct && isReadOnlyStruct,
-                        isRefLikeType: kind == TypeKind.Struct && isRefStruct);
+                        isRefLikeType: kind == TypeKind.Struct && isRefStruct,
+                        isSealed: kind == TypeKind.Class && isSealed);
                     s.SetDefaultBaseType(GetDefaultBaseType(kind));
                     s.SetTypeParameters(DeclareTypeParameters(tree, s, typeParameterList));
                     type = s;
@@ -4233,6 +4290,19 @@ namespace Cnidaria.Cs
                     }
                 }
 
+            }
+            if (kind == TypeKind.Class && isSealed)
+            {
+                switch (type)
+                {
+                    case SourceNamedTypeSymbol src:
+                        src.MarkSealed();
+                        break;
+
+                    case SpecialNamedTypeSymbol special:
+                        special.MarkSealed();
+                        break;
+                }
             }
             if (type is SourceNamedTypeSymbol srcType)
                 srcType.AddDeclaration(tree, syntax);
@@ -4587,6 +4657,55 @@ namespace Cnidaria.Cs
             => container.TypeKind == TypeKind.Interface
                 ? Accessibility.Public
                 : Accessibility.Private;
+        private void ValidateSealedMethodModifier(
+            SyntaxTree tree,
+            SyntaxNode syntax,
+            bool isStatic,
+            bool isOverride,
+            bool isAbstract,
+            bool isVirtualKeyword,
+            bool isSealed,
+            string memberKind)
+        {
+            if (!isSealed)
+                return;
+
+            if (!isOverride)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_SEALED_MEMBER001",
+                    DiagnosticSeverity.Error,
+                    $"The 'sealed' modifier is only valid on an override {memberKind}.",
+                    new Location(tree, syntax.Span)));
+            }
+
+            if (isAbstract)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_SEALED_MEMBER002",
+                    DiagnosticSeverity.Error,
+                    $"A sealed {memberKind} cannot be abstract.",
+                    new Location(tree, syntax.Span)));
+            }
+
+            if (isVirtualKeyword)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_SEALED_MEMBER003",
+                    DiagnosticSeverity.Error,
+                    $"A sealed {memberKind} cannot also be virtual.",
+                    new Location(tree, syntax.Span)));
+            }
+
+            if (isStatic)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_SEALED_MEMBER004",
+                    DiagnosticSeverity.Error,
+                    $"A static {memberKind} cannot be sealed.",
+                    new Location(tree, syntax.Span)));
+            }
+        }
         private void DeclareMethodDeclaration(SyntaxTree tree, MethodDeclarationSyntax syntax, NamedTypeSymbol container)
         {
             var name = syntax.Identifier.ValueText ?? "";
@@ -4596,6 +4715,8 @@ namespace Cnidaria.Cs
             var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var isVirtualKeyword = HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
             var isSealed = HasModifier(syntax.Modifiers, SyntaxKind.SealedKeyword);
+
+            ValidateSealedMethodModifier(tree, syntax, isStatic, isOverride, isAbstract, isVirtualKeyword, isSealed, "method");
 
             var typeDefaultAcc = GetDefaultTypeMemberAccessibility(container);
             var declaredAcc = DecodeDeclaredAccessibility(
@@ -4706,6 +4827,7 @@ namespace Cnidaria.Cs
             var isVirtualKeyword = HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
             var isSealed = HasModifier(syntax.Modifiers, SyntaxKind.SealedKeyword);
 
+            ValidateSealedMethodModifier(tree, syntax, isStatic, isOverride, isAbstract, isVirtualKeyword, isSealed, "operator");
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 Accessibility.Private,
@@ -5079,14 +5201,12 @@ namespace Cnidaria.Cs
             const string metadataName = "Item";
 
             bool isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
-            var typeDefaultAcc = container is NamedTypeSymbol
-                ? Accessibility.Private
-                : Accessibility.Internal;
+            var typeDefaultAcc = GetDefaultTypeMemberAccessibility(container);
 
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container is NamedTypeSymbol,
+                allowProtected: container.TypeKind != TypeKind.Interface,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
 
@@ -5266,14 +5386,12 @@ namespace Cnidaria.Cs
                 return;
 
             bool isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
-            var typeDefaultAcc = container is NamedTypeSymbol
-                ? Accessibility.Private
-                : Accessibility.Internal;
+            var typeDefaultAcc = GetDefaultTypeMemberAccessibility(container);
 
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container is NamedTypeSymbol,
+                allowProtected: container.TypeKind != TypeKind.Interface,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
             bool hasGet = false;
@@ -5615,15 +5733,24 @@ namespace Cnidaria.Cs
                     return nt;
             return null;
         }
+        private static bool IsSameTypeDefinition(NamedTypeSymbol a, NamedTypeSymbol b)
+        {
+            if (ReferenceEquals(a, b))
+                return true;
 
+            return ReferenceEquals(a.OriginalDefinition, b.OriginalDefinition);
+        }
         private static bool IsSameOrNestedRelation(NamedTypeSymbol a, NamedTypeSymbol b)
-            => ReferenceEquals(a, b) || IsNestedWithin(a, b) || IsNestedWithin(b, a);
+            => IsSameTypeDefinition(a, b) || IsNestedWithin(a, b) || IsNestedWithin(b, a);
 
         private static bool IsNestedWithin(NamedTypeSymbol maybeInner, NamedTypeSymbol maybeOuter)
         {
             for (var cur = maybeInner.ContainingSymbol; cur is not null; cur = cur.ContainingSymbol)
-                if (ReferenceEquals(cur, maybeOuter))
+            {
+                if (cur is NamedTypeSymbol nt && IsSameTypeDefinition(nt, maybeOuter))
                     return true;
+            }
+
             return false;
         }
 
@@ -5631,9 +5758,10 @@ namespace Cnidaria.Cs
         {
             for (TypeSymbol? cur = type; cur is not null; cur = cur.BaseType)
             {
-                if (ReferenceEquals(cur, baseType))
+                if (cur is NamedTypeSymbol nt && IsSameTypeDefinition(nt, baseType))
                     return true;
             }
+
             return false;
         }
     }
@@ -6537,6 +6665,54 @@ namespace Cnidaria.Cs
                 Read = read;
             }
         }
+        private readonly struct SwitchCaseKey : IEquatable<SwitchCaseKey>
+        {
+            private readonly object? _value;
+            private readonly Type? _runtimeType;
+
+            public SwitchCaseKey(object? value)
+            {
+                _value = value;
+                _runtimeType = value?.GetType();
+            }
+
+            public bool Equals(SwitchCaseKey other)
+                => ReferenceEquals(_runtimeType, other._runtimeType)
+                && object.Equals(_value, other._value);
+
+            public override bool Equals(object? obj)
+                => obj is SwitchCaseKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = _runtimeType is null ? 0 : _runtimeType.GetHashCode();
+                    h = (h * 397) ^ (_value is null ? 0 : _value.GetHashCode());
+                    return h;
+                }
+            }
+        }
+        private sealed class SwitchGotoScope
+        {
+            private readonly Dictionary<SwitchCaseKey, LabelSymbol> _caseLabels;
+
+            public TypeSymbol GoverningType { get; }
+            public LabelSymbol? DefaultLabel { get; }
+
+            public SwitchGotoScope(
+                TypeSymbol governingType,
+                Dictionary<SwitchCaseKey, LabelSymbol> caseLabels,
+                LabelSymbol? defaultLabel)
+            {
+                GoverningType = governingType;
+                _caseLabels = caseLabels;
+                DefaultLabel = defaultLabel;
+            }
+
+            public bool TryGetCaseLabel(SwitchCaseKey key, out LabelSymbol? label)
+                => _caseLabels.TryGetValue(key, out label);
+        }
         private sealed class ControlFlowScope
         {
             private enum ExceptionRegionKind : byte
@@ -6547,10 +6723,12 @@ namespace Cnidaria.Cs
             {
                 public int Id { get; }
                 public ExceptionRegionKind Kind { get; }
-                public ExceptionRegionFrame(int id, ExceptionRegionKind kind)
+                public bool TryHasCatch { get; }
+                public ExceptionRegionFrame(int id, ExceptionRegionKind kind, bool tryHasCatch)
                 {
                     Id = id;
                     Kind = kind;
+                    TryHasCatch = tryHasCatch;
                 }
             }
             private readonly Symbol _containing;
@@ -6564,6 +6742,7 @@ namespace Cnidaria.Cs
                 ImmutableArray<ExceptionRegionFrame> SourceRegions)> _gotoRegions = new();
             private readonly Stack<LabelSymbol> _breakStack = new();
             private readonly Stack<LabelSymbol> _continueStack = new();
+            private readonly Stack<SwitchGotoScope> _switchGotoStack = new();
             private int _nextGeneratedId;
             private bool _diagnosticsEmitted;
             private int _nextExceptionRegionId;
@@ -6619,13 +6798,27 @@ namespace Cnidaria.Cs
                 if (_breakStack.Count != 0)
                     _breakStack.Pop();
             }
-            public void PushTryRegion() => PushExceptionRegion(ExceptionRegionKind.Try);
+            public void PushTryRegion(bool hasCatch) => PushExceptionRegion(ExceptionRegionKind.Try, hasCatch);
             public void PushCatchRegion() => PushExceptionRegion(ExceptionRegionKind.Catch);
             public void PushFinallyRegion() => PushExceptionRegion(ExceptionRegionKind.Finally);
             public void PopExceptionRegion()
             {
                 if (_exceptionRegionStack.Count != 0)
                     _exceptionRegionStack.RemoveAt(_exceptionRegionStack.Count - 1);
+            }
+            public bool IsInsideTryWithCatchRegion
+            {
+                get
+                {
+                    for (int i = _exceptionRegionStack.Count - 1; i >= 0; i--)
+                    {
+                        var frame = _exceptionRegionStack[i];
+                        if (frame.Kind == ExceptionRegionKind.Try && frame.TryHasCatch)
+                            return true;
+                    }
+
+                    return false;
+                }
             }
             public bool IsInsideCatchRegion
             {
@@ -6634,6 +6827,17 @@ namespace Cnidaria.Cs
                     for (int i = _exceptionRegionStack.Count - 1; i >= 0; i--)
                         if (_exceptionRegionStack[i].Kind == ExceptionRegionKind.Catch)
                             return true;
+                    return false;
+                }
+            }
+            public bool IsInsideFinallyRegion
+            {
+                get
+                {
+                    for (int i = _exceptionRegionStack.Count - 1; i >= 0; i--)
+                        if (_exceptionRegionStack[i].Kind == ExceptionRegionKind.Finally)
+                            return true;
+
                     return false;
                 }
             }
@@ -6683,6 +6887,17 @@ namespace Cnidaria.Cs
                 continueLabel = _continueStack.Peek();
                 return true;
             }
+            public bool TryGetCurrentSwitchGotoScope(out SwitchGotoScope scope)
+            {
+                if (_switchGotoStack.Count == 0)
+                {
+                    scope = null!;
+                    return false;
+                }
+
+                scope = _switchGotoStack.Peek();
+                return true;
+            }
             public void ReportUndefinedLabels(BindingContext context, DiagnosticBag diagnostics)
             {
                 if (_diagnosticsEmitted)
@@ -6711,8 +6926,16 @@ namespace Cnidaria.Cs
                     AddTransferDiagnosticIfInvalid(srcRegions, dstRegions, syntax, context, diagnostics);
                 }
             }
-            private void PushExceptionRegion(ExceptionRegionKind kind)
-                => _exceptionRegionStack.Add(new ExceptionRegionFrame(_nextExceptionRegionId++, kind));
+            private void PushExceptionRegion(ExceptionRegionKind kind, bool tryHasCatch = false)
+                => _exceptionRegionStack.Add(new ExceptionRegionFrame(_nextExceptionRegionId++, kind, tryHasCatch));
+            public void PushSwitchGotoScope(SwitchGotoScope scope)
+                => _switchGotoStack.Push(scope);
+
+            public void PopSwitchGotoScope()
+            {
+                if (_switchGotoStack.Count != 0)
+                    _switchGotoStack.Pop();
+            }
             private ImmutableArray<ExceptionRegionFrame> SnapshotExceptionRegions()
             {
                 if (_exceptionRegionStack.Count == 0)
@@ -7628,6 +7851,10 @@ namespace Cnidaria.Cs
 
                 case ReturnStatementSyntax rs:
                     result = BindReturn(rs, context, diagnostics);
+                    break;
+
+                case YieldStatementSyntax ys:
+                    result = BindYield(ys, context, diagnostics);
                     break;
 
                 case ThrowStatementSyntax th:
@@ -20299,6 +20526,248 @@ namespace Cnidaria.Cs
                 requireImplicit: true);
             return new BoundReturnStatement(rs, expr);
         }
+        private BoundStatement BindYield(YieldStatementSyntax ys, BindingContext context, DiagnosticBag diagnostics)
+        {
+            bool isYieldReturn = ys.Kind == SyntaxKind.YieldReturnStatement;
+            var yieldKind = isYieldReturn ? BoundYieldStatementKind.Return : BoundYieldStatementKind.Break;
+
+            _flow.ValidateMethodExitTransfer(ys, context, diagnostics);
+            ValidateYieldContext(ys, isYieldReturn, context, diagnostics);
+
+            TypeSymbol? elementTypeOpt = null;
+            bool validIteratorReturn = TryGetIteratorElementType(
+                context.Compilation,
+                context.ContainingSymbol as MethodSymbol,
+                out elementTypeOpt);
+
+            if (!validIteratorReturn)
+            {
+                var method = context.ContainingSymbol as MethodSymbol;
+                var returnType = method?.ReturnType;
+                string target = method is not null && method.IsSpecialName ? "accessor" : "method";
+                string returnTypeName = returnType?.Name ?? "<unknown>";
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_RET001",
+                    DiagnosticSeverity.Error,
+                    $"The body of this {target} cannot be an iterator block because '{returnTypeName}' is not an iterator interface type.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            BoundExpression? expr = null;
+
+            if (isYieldReturn)
+            {
+                if (ys.Expression is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_YIELD_EXPR001",
+                        DiagnosticSeverity.Error,
+                        "Expression expected after 'yield return'.",
+                        new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+                }
+                else
+                {
+                    expr = BindExpression(ys.Expression, context, diagnostics);
+
+                    if (expr.Type is ByRefTypeSymbol)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_YIELD_REF001",
+                            DiagnosticSeverity.Error,
+                            "An iterator cannot yield a value by reference.",
+                            new Location(context.SemanticModel.SyntaxTree, ys.Expression.Span)));
+                    }
+                    else if (validIteratorReturn && elementTypeOpt is not null)
+                    {
+                        if (ContainsUnsafeType(elementTypeOpt))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_YIELD_UNSAFE001",
+                                DiagnosticSeverity.Error,
+                                $"Iterator element type '{elementTypeOpt.Name}' cannot be an unsafe type.",
+                                new Location(context.SemanticModel.SyntaxTree, ys.Expression.Span)));
+                        }
+                        else
+                        {
+                            expr = ApplyConversion(
+                                exprSyntax: ys.Expression,
+                                expr: expr,
+                                targetType: elementTypeOpt,
+                                diagnosticNode: ys,
+                                context: context,
+                                diagnostics: diagnostics,
+                                requireImplicit: true);
+                        }
+                    }
+                }
+            }
+
+            return new BoundYieldStatement(ys, yieldKind, expr, elementTypeOpt);
+        }
+        private void ValidateYieldContext(
+            YieldStatementSyntax ys,
+            bool isYieldReturn,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if ((Flags & BinderFlags.InLambda) != 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_LAMBDA001",
+                    DiagnosticSeverity.Error,
+                    "The yield statement cannot be used inside a lambda expression.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            if ((Flags & BinderFlags.UnsafeRegion) != 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_UNSAFE002",
+                    DiagnosticSeverity.Error,
+                    "The yield statement cannot be used inside an unsafe block.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            if (_flow.IsInsideFinallyRegion)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_FINALLY001",
+                    DiagnosticSeverity.Error,
+                    "The yield statement cannot be used in the body of a finally clause.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            if (isYieldReturn && _flow.IsInsideCatchRegion)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_CATCH001",
+                    DiagnosticSeverity.Error,
+                    "Cannot yield a value in the body of a catch clause.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            if (isYieldReturn && _flow.IsInsideTryWithCatchRegion)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_YIELD_TRY001",
+                    DiagnosticSeverity.Error,
+                    "Cannot yield a value in the body of a try block with a catch clause.",
+                    new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+            }
+
+            if (context.ContainingSymbol is MethodSymbol method)
+            {
+                if (method.IsAsync)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_YIELD_ASYNC001",
+                        DiagnosticSeverity.Error,
+                        "The yield statement is not supported in async methods by this compiler.",
+                        new Location(context.SemanticModel.SyntaxTree, ys.Span)));
+                }
+
+                var parameters = method.Parameters;
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var p = parameters[i];
+                    if (p.RefKind != ParameterRefKind.None || p.Type is ByRefTypeSymbol || ContainsUnsafeType(p.Type))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_YIELD_PARAM001",
+                            DiagnosticSeverity.Error,
+                            "Iterators cannot have in, ref, out, or unsafe parameters.",
+                            new Location(
+                                context.SemanticModel.SyntaxTree,
+                                p.Locations.IsDefaultOrEmpty ? ys.Span : p.Locations[0].Span)));
+                    }
+                }
+            }
+        }
+        private static bool TryGetIteratorElementType(
+            Compilation compilation,
+            MethodSymbol? method,
+            out TypeSymbol elementType)
+        {
+            elementType = null!;
+
+            if (method is null)
+                return false;
+
+            var returnType = method.ReturnType;
+
+            if (returnType is ByRefTypeSymbol || returnType.Kind == SymbolKind.Error)
+                return false;
+
+            if (returnType is not NamedTypeSymbol namedReturn)
+                return false;
+
+            var enumerable = GetWellKnownType(compilation, "System", "Collections", "IEnumerable", 0);
+            var enumerator = GetWellKnownType(compilation, "System", "Collections", "IEnumerator", 0);
+            var genericEnumerable = GetWellKnownType(compilation, "System", "Collections", "Generic", "IEnumerable", 1);
+            var genericEnumerator = GetWellKnownType(compilation, "System", "Collections", "Generic", "IEnumerator", 1);
+
+            if ((enumerable is not null && AreSameType(namedReturn, enumerable)) ||
+                (enumerator is not null && AreSameType(namedReturn, enumerator)))
+            {
+                elementType = compilation.GetSpecialType(SpecialType.System_Object);
+                return true;
+            }
+
+            if (genericEnumerable is not null &&
+                ReferenceEquals(namedReturn.OriginalDefinition, genericEnumerable))
+            {
+                var args = namedReturn.TypeArguments;
+                if (args.Length == 1)
+                {
+                    elementType = args[0];
+                    return true;
+                }
+            }
+
+            if (genericEnumerator is not null &&
+                ReferenceEquals(namedReturn.OriginalDefinition, genericEnumerator))
+            {
+                var args = namedReturn.TypeArguments;
+                if (args.Length == 1)
+                {
+                    elementType = args[0];
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        private static bool ContainsUnsafeType(TypeSymbol type)
+        {
+            switch (type)
+            {
+                case PointerTypeSymbol:
+                case ByRefTypeSymbol:
+                    return true;
+
+                case ArrayTypeSymbol array:
+                    return ContainsUnsafeType(array.ElementType);
+
+                case TupleTypeSymbol tuple:
+                    for (int i = 0; i < tuple.ElementTypes.Length; i++)
+                        if (ContainsUnsafeType(tuple.ElementTypes[i]))
+                            return true;
+
+                    return false;
+
+                case NamedTypeSymbol named:
+                    var args = named.TypeArguments;
+                    for (int i = 0; i < args.Length; i++)
+                        if (ContainsUnsafeType(args[i]))
+                            return true;
+
+                    return false;
+
+                default:
+                    return false;
+            }
+        }
         private BoundExpression BindRefReturningExpression(
             ExpressionSyntax syntax,
             BoundExpression expr,
@@ -23256,7 +23725,7 @@ namespace Cnidaria.Cs
                     "A try statement must have at least one catch clause or a finally clause.",
                     new Location(context.SemanticModel.SyntaxTree, node.Span)));
             }
-            _flow.PushTryRegion();
+            _flow.PushTryRegion(node.Catches.Count != 0);
             BoundStatement tryStmt;
             try
             {
@@ -23551,21 +24020,26 @@ namespace Cnidaria.Cs
             return new BoundIfStatement(node, condition, thenStmt, elseStmt);
         }
         private BoundExpression BindSwitchLabelCondition(
-    SyntaxNode diagnosticNode,
-    ExpressionSyntax tmpExprSyntax,
-    BoundExpression tmpExpr,
-    TypeSymbol governingType,
-    SwitchLabelSyntax label,
-    BindingContext ctx,
-    DiagnosticBag diagnostics,
-    out bool isFallbackLabel)
+            SyntaxNode diagnosticNode,
+            ExpressionSyntax tmpExprSyntax,
+            BoundExpression tmpExpr,
+            TypeSymbol governingType,
+            SwitchLabelSyntax label,
+            BindingContext ctx,
+            DiagnosticBag diagnostics,
+            out bool isFallbackLabel,
+            out bool isDefaultLabel,
+            out SwitchCaseKey? gotoCaseKey)
         {
             isFallbackLabel = false;
+            isDefaultLabel = false;
+            gotoCaseKey = null;
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
 
             if (label is DefaultSwitchLabelSyntax)
             {
                 isFallbackLabel = true;
+                isDefaultLabel = true;
                 return MakeBoolLiteral(label, ctx, value: true);
             }
 
@@ -23581,7 +24055,7 @@ namespace Cnidaria.Cs
                         new Location(ctx.SemanticModel.SyntaxTree, cs.Value.Span)));
                     return MakeBoolLiteral(label, ctx, value: false);
                 }
-
+                gotoCaseKey = new SwitchCaseKey(value.ConstantValueOpt.Value);
                 var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, cs.CaseKeyword.Span);
                 var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, cs.Value);
                 return BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
@@ -23605,7 +24079,8 @@ namespace Cnidaria.Cs
                                 match = MakeBoolLiteral(label, ctx, value: false);
                                 break;
                             }
-
+                            if (cps.WhenClause is null)
+                                gotoCaseKey = new SwitchCaseKey(value.ConstantValueOpt.Value);
                             var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, cps.CaseKeyword.Span);
                             var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, cp.Expression);
                             match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
@@ -23710,6 +24185,8 @@ namespace Cnidaria.Cs
                 sectionLabels[i] = _flow.NewGeneratedLabel("switch_section");
 
             var sectionConds = new BoundExpression[sectionCount];
+            var gotoCaseLabels = new Dictionary<SwitchCaseKey, LabelSymbol>();
+            LabelSymbol? gotoDefaultLabel = null;
             int fallbackSection = -1;
 
             for (int i = 0; i < sectionCount; i++)
@@ -23721,9 +24198,29 @@ namespace Cnidaria.Cs
                 for (int l = 0; l < sec.Labels.Count; l++)
                 {
                     bool isFallback;
-                    var labelCond = BindSwitchLabelCondition(node, tmpSyntax, tmpExpr, governing.Type, sec.Labels[l], ctx, diagnostics, out isFallback);
-                    if (isFallback) secHasFallback = true;
-                    else cond = cond is null ? labelCond : MakeLogicalOr(sec, cond, labelCond, ctx, diagnostics);
+                    bool isDefaultLabel;
+                    SwitchCaseKey? gotoCaseKey;
+                    var labelCond = BindSwitchLabelCondition(
+                        node,
+                        tmpSyntax,
+                        tmpExpr,
+                        governing.Type,
+                        sec.Labels[l],
+                        ctx,
+                        diagnostics,
+                        out isFallback,
+                        out isDefaultLabel,
+                        out gotoCaseKey);
+                    if (isFallback) 
+                        secHasFallback = true;
+                    else 
+                        cond = cond is null ? labelCond : MakeLogicalOr(sec, cond, labelCond, ctx, diagnostics);
+
+                    if (isDefaultLabel)
+                        gotoDefaultLabel ??= sectionLabels[i];
+
+                    if (gotoCaseKey.HasValue && !gotoCaseLabels.ContainsKey(gotoCaseKey.Value))
+                        gotoCaseLabels.Add(gotoCaseKey.Value, sectionLabels[i]);
                 }
 
                 sectionConds[i] = cond ?? MakeBoolLiteral(sec, ctx, value: false);
@@ -23754,13 +24251,16 @@ namespace Cnidaria.Cs
 
             if (fallbackSection >= 0) stmts.Add(new BoundGotoStatement(node, sectionLabels[fallbackSection]));
             else stmts.Add(new BoundGotoStatement(node, breakLabel));
-
+            var switchGotoScope = new SwitchGotoScope(governing.Type, gotoCaseLabels, gotoDefaultLabel);
             _flow.PushBreak(breakLabel);
+            _flow.PushSwitchGotoScope(switchGotoScope);
             try
             {
                 for (int i = 0; i < sectionCount; i++)
                 {
                     var sec = node.Sections[i];
+
+                    _flow.RegisterLabelDefinition(sectionLabels[i]);
                     stmts.Add(new BoundLabelStatement(sec, sectionLabels[i]));
 
                     var sectionBinder = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
@@ -23775,7 +24275,11 @@ namespace Cnidaria.Cs
                     stmts.Add(new BoundGotoStatement(sec, breakLabel)); // implicit break
                 }
             }
-            finally { _flow.PopBreak(); }
+            finally 
+            { 
+                _flow.PopSwitchGotoScope();
+                _flow.PopBreak(); 
+            }
 
             stmts.Add(new BoundLabelStatement(node, breakLabel));
             return new BoundBlockStatement(node, stmts.ToImmutable());
@@ -24519,13 +25023,13 @@ namespace Cnidaria.Cs
             return ForEachResolutionStatus.Success;
         }
         private bool TryValidateEnumeratorShape(
-    SyntaxNode diagnosticNode,
-    TypeSymbol enumeratorTypeSymbol,
-    BindingContext context,
-    DiagnosticBag diagnostics,
-    out TypeSymbol elementType,
-    out PropertySymbol currentProperty,
-    out MethodSymbol moveNextMethod)
+            SyntaxNode diagnosticNode,
+            TypeSymbol enumeratorTypeSymbol,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out TypeSymbol elementType,
+            out PropertySymbol currentProperty,
+            out MethodSymbol moveNextMethod)
         {
             elementType = new ErrorTypeSymbol("foreach", containing: null, ImmutableArray<Location>.Empty);
             currentProperty = null!;
@@ -24545,24 +25049,24 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            var currentCandidates = ImmutableArray.CreateBuilder<PropertySymbol>();
-            var currentMembers = FilterAccessibleMembers(LookupMembers(enumeratorType, "Current"), context);
-            for (int i = 0; i < currentMembers.Length; i++)
-            {
-                if (currentMembers[i] is PropertySymbol property &&
-                    !property.IsStatic &&
-                    property.HasGet)
-                {
-                    currentCandidates.Add(property);
-                }
-            }
+            ImmutableArray<PropertySymbol> currentCandidates = GetClosestReadableInstanceCurrentProperties(enumeratorType, context);
 
-            if (currentCandidates.Count != 1)
+            if (currentCandidates.Length < 1)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_FOREACH003",
                     DiagnosticSeverity.Error,
                     "Enumerator type must contain a readable public instance property named 'Current'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+
+                return false;
+            }
+            if (currentCandidates.Length > 1)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FOREACH003B",
+                    DiagnosticSeverity.Error,
+                    "Enumerator type property is ambiguous.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
 
                 return false;
@@ -24606,10 +25110,80 @@ namespace Cnidaria.Cs
             moveNextMethod = moveNextCandidates[0];
             return true;
         }
+        private static ImmutableArray<PropertySymbol> GetClosestReadableInstanceCurrentProperties(
+            NamedTypeSymbol enumeratorType, BindingContext context)
+        {
+            if (enumeratorType.TypeKind == TypeKind.Interface)
+                return GetClosestReadableInstanceCurrentPropertiesOnInterface(enumeratorType, context);
 
+            var builder = ImmutableArray.CreateBuilder<PropertySymbol>();
+
+            var members = LookupMembers(enumeratorType, "Current");
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is PropertySymbol property &&
+                    IsReadableInstanceProperty(property, context))
+                {
+                    builder.Add(property);
+                }
+            }
+
+            return builder.ToImmutable();
+        }
+        private static ImmutableArray<PropertySymbol> GetClosestReadableInstanceCurrentPropertiesOnInterface(
+            NamedTypeSymbol root, BindingContext context)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            var queue = new Queue<NamedTypeSymbol>();
+            queue.Enqueue(root);
+
+            while (queue.Count != 0)
+            {
+                int levelCount = queue.Count;
+                var builder = ImmutableArray.CreateBuilder<PropertySymbol>();
+
+                for (int n = 0; n < levelCount; n++)
+                {
+                    var current = queue.Dequeue();
+                    if (!seen.Add(current))
+                        continue;
+
+                    var members = current.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is PropertySymbol property &&
+                            StringComparer.Ordinal.Equals(property.Name, "Current") &&
+                            property.ExplicitInterfaceImplementation is null &&
+                            IsReadableInstanceProperty(property, context))
+                        {
+                            builder.Add(property);
+                        }
+                    }
+
+                    var interfaces = current.Interfaces;
+                    for (int i = 0; i < interfaces.Length; i++)
+                    {
+                        if (interfaces[i] is NamedTypeSymbol iface &&
+                            iface.TypeKind == TypeKind.Interface)
+                        {
+                            queue.Enqueue(iface);
+                        }
+                    }
+                }
+
+                if (builder.Count != 0)
+                    return builder.ToImmutable();
+            }
+
+            return ImmutableArray<PropertySymbol>.Empty;
+        }
+        private static bool IsReadableInstanceProperty(PropertySymbol property, BindingContext context)
+            => !property.IsStatic &&
+                   property.GetMethod is not null &&
+                   AccessibilityHelper.IsAccessible(property, context) &&
+                   AccessibilityHelper.IsAccessible(property.GetMethod, context);
         private ImmutableArray<MethodSymbol> GetApplicableGetEnumeratorInstanceCandidates(
-            NamedTypeSymbol receiverType,
-            BindingContext context)
+            NamedTypeSymbol receiverType, BindingContext context)
         {
             var methods = LookupMethods(receiverType, "GetEnumerator");
             var builder = ImmutableArray.CreateBuilder<MethodSymbol>();
@@ -24633,8 +25207,7 @@ namespace Cnidaria.Cs
         }
 
         private ImmutableArray<MethodSymbol> GetApplicableGetEnumeratorExtensionCandidates(
-            BoundExpression collection,
-            BindingContext context)
+            BoundExpression collection, BindingContext context)
         {
             var methods = LookupExtensionMethods("GetEnumerator", collection, context);
             var builder = ImmutableArray.CreateBuilder<MethodSymbol>();
@@ -24658,9 +25231,7 @@ namespace Cnidaria.Cs
         }
 
         private static MethodSymbol? GetSinglePublicParameterlessInstanceMethod(
-            NamedTypeSymbol type,
-            string name,
-            BindingContext context)
+            NamedTypeSymbol type, string name, BindingContext context)
         {
             var methods = LookupMethods(type, name);
             MethodSymbol? found = null;
@@ -24686,8 +25257,7 @@ namespace Cnidaria.Cs
             return found;
         }
         private static ImmutableArray<NamedTypeSymbol> GetImplementedInterfaces(
-    TypeSymbol type,
-    NamedTypeSymbol interfaceDefinition)
+            TypeSymbol type, NamedTypeSymbol interfaceDefinition)
         {
             var builder = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
             var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
@@ -24727,15 +25297,6 @@ namespace Cnidaria.Cs
 
             Visit(type);
             return builder.ToImmutable();
-        }
-
-        private static NamedTypeSymbol? GetWellKnownType(
-            Compilation compilation,
-            string ns0,
-            string typeName,
-            int arity)
-        {
-            return GetWellKnownType(compilation, new[] { ns0 }, typeName, arity);
         }
         private static NamedTypeSymbol? GetWellKnownType(
             Compilation compilation,
@@ -24839,16 +25400,24 @@ namespace Cnidaria.Cs
         }
         private BoundStatement BindGoto(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            if (node.Kind != SyntaxKind.GotoStatement)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_FLOW005",
-                    DiagnosticSeverity.Error,
-                    "Only 'goto identifier;' is supported (goto case/default is not implemented).",
-                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
-                return new BoundBadStatement(node);
-            }
+            if (node.CaseOrDefaultKeyword.Kind == SyntaxKind.CaseKeyword)
+                return BindGotoCase(node, context, diagnostics);
 
+            if (node.CaseOrDefaultKeyword.Kind == SyntaxKind.DefaultKeyword)
+                return BindGotoDefault(node, context, diagnostics);
+
+            if (node.Kind == SyntaxKind.GotoStatement)
+                return BindGotoIdentifier(node, context, diagnostics);
+
+            diagnostics.Add(new Diagnostic(
+                "CN_FLOW005",
+                DiagnosticSeverity.Error,
+                $"Unsupported goto statement kind: {node.Kind}.",
+                new Location(context.SemanticModel.SyntaxTree, node.Span)));
+            return new BoundBadStatement(node);
+        }
+        private BoundStatement BindGotoIdentifier(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
             if (node.Expression is not IdentifierNameSyntax id)
             {
                 diagnostics.Add(new Diagnostic(
@@ -24877,7 +25446,90 @@ namespace Cnidaria.Cs
 
             return new BoundGotoStatement(node, label);
         }
+        private BoundStatement BindGotoCase(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            if (!_flow.TryGetCurrentSwitchGotoScope(out var switchScope))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW010",
+                    DiagnosticSeverity.Error,
+                    "The 'goto case' statement is not within a switch statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadStatement(node);
+            }
 
+            if (node.Expression is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW011",
+                    DiagnosticSeverity.Error,
+                    "Expected a constant expression after 'goto case'.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            var value = BindExpression(node.Expression, context, diagnostics);
+            value = ApplyConversion(
+                exprSyntax: node.Expression,
+                expr: value,
+                targetType: switchScope.GoverningType,
+                diagnosticNode: node,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            if (value.HasErrors)
+                return new BoundBadStatement(node);
+
+            if (!value.ConstantValueOpt.HasValue)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW012",
+                    DiagnosticSeverity.Error,
+                    "The 'goto case' expression must be a constant expression.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            var key = new SwitchCaseKey(value.ConstantValueOpt.Value);
+            if (!switchScope.TryGetCaseLabel(key, out var label))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW013",
+                    DiagnosticSeverity.Error,
+                    "No matching case label exists in the current switch statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            _flow.RegisterGoto(node, label!);
+            return new BoundGotoStatement(node, label!);
+        }
+        private BoundStatement BindGotoDefault(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            if (!_flow.TryGetCurrentSwitchGotoScope(out var switchScope))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW014",
+                    DiagnosticSeverity.Error,
+                    "The 'goto default' statement is not within a switch statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            if (switchScope.DefaultLabel is not LabelSymbol label)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FLOW015",
+                    DiagnosticSeverity.Error,
+                    "No default label exists in the current switch statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadStatement(node);
+            }
+
+            _flow.RegisterGoto(node, label);
+            return new BoundGotoStatement(node, label);
+        }
         private BoundStatement BindLabeledStatement(LabeledStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var name = node.Identifier.ValueText ?? string.Empty;

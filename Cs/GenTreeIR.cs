@@ -57,6 +57,8 @@ namespace Cnidaria.Cs
         VirtualCall,
         NewObject,
         NewDelegate,
+        DelegateCombine,
+        DelegateRemove,
         DelegateInvoke,
 
         Field,
@@ -1540,6 +1542,8 @@ namespace Cnidaria.Cs
 
         private void AttachLocalDescriptorsToTrees(ImmutableArray<GenTreeBlock> blocks)
         {
+            var tempByIndex = BuildTempDescriptorIndex(TempDescriptors);
+
             for (int b = 0; b < blocks.Length; b++)
             {
                 var statements = blocks[b].Statements;
@@ -1555,36 +1559,54 @@ namespace Cnidaria.Cs
                     case GenTreeKind.ArgAddr:
                     case GenTreeKind.StoreArg:
                         if ((uint)node.Int32 < (uint)ArgDescriptors.Length)
-                        {
-                            node.LocalDescriptor = ArgDescriptors[node.Int32];
-                            node.ValueKey = GenTreeValueKey.ForTree(node);
-                        }
+                            AttachDescriptor(node, ArgDescriptors[node.Int32]);
                         break;
+
                     case GenTreeKind.Local:
                     case GenTreeKind.LocalAddr:
                     case GenTreeKind.StoreLocal:
                         if ((uint)node.Int32 < (uint)LocalDescriptors.Length)
-                        {
-                            node.LocalDescriptor = LocalDescriptors[node.Int32];
-                            node.ValueKey = GenTreeValueKey.ForTree(node);
-                        }
+                            AttachDescriptor(node, LocalDescriptors[node.Int32]);
                         break;
+
                     case GenTreeKind.Temp:
                     case GenTreeKind.StoreTemp:
-                        for (int i = 0; i < TempDescriptors.Length; i++)
+                        if ((uint)node.Int32 < (uint)tempByIndex.Length)
                         {
-                            if (TempDescriptors[i].Index == node.Int32)
-                            {
-                                node.LocalDescriptor = TempDescriptors[i];
-                                node.ValueKey = GenTreeValueKey.ForTree(node);
-                                break;
-                            }
+                            var descriptor = tempByIndex[node.Int32];
+                            if (descriptor is not null)
+                                AttachDescriptor(node, descriptor);
                         }
                         break;
                 }
 
                 for (int i = 0; i < node.Operands.Length; i++)
                     Attach(node.Operands[i]);
+            }
+
+            static void AttachDescriptor(GenTree node, GenLocalDescriptor descriptor)
+            {
+                node.LocalDescriptor = descriptor;
+                node.ValueKey = GenTreeValueKey.ForTree(node);
+            }
+
+            static GenLocalDescriptor?[] BuildTempDescriptorIndex(ImmutableArray<GenLocalDescriptor> descriptors)
+            {
+                if (descriptors.IsDefaultOrEmpty)
+                    return Array.Empty<GenLocalDescriptor?>();
+
+                int max = -1;
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    if (descriptors[i].Index > max)
+                        max = descriptors[i].Index;
+                }
+
+                var result = new GenLocalDescriptor?[max + 1];
+                for (int i = 0; i < descriptors.Length; i++)
+                    result[descriptors[i].Index] = descriptors[i];
+
+                return result;
             }
         }
 
@@ -1751,7 +1773,9 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, (RuntimeModule module, BytecodeFunction body, RuntimeMethod method)> _bodyByMethodId = new();
         private readonly Dictionary<int, GenTreeMethod> _built = new();
         private readonly List<RuntimeMethod> _allBodyMethods = new();
-
+        private readonly Dictionary<int, ImmutableArray<RuntimeMethod>> _virtualTargetCache = new();
+        private readonly HashSet<int> _scannedConstructedGenericVirtualTargetTypeIds = new();
+        private readonly HashSet<int> _scannedConstructedGenericCctorTypeIds = new();
         public GenTreeBuilder(IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeTypeSystem rts)
         {
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
@@ -1793,6 +1817,8 @@ namespace Cnidaria.Cs
 
             var queue = new Queue<RuntimeMethod>();
             var scheduledOrBuilt = new HashSet<int>();
+            var virtualDependencies = new List<RuntimeMethod>();
+            var virtualDependencyIds = new HashSet<int>();
 
             foreach (int entryMethodToken in entryMethodTokens)
             {
@@ -1826,12 +1852,16 @@ namespace Cnidaria.Cs
 
                     foreach (RuntimeMethod declaredVirtual in ir.VirtualDependencies)
                     {
-                        foreach (RuntimeMethod target in EnumerateConservativeVirtualTargets(declaredVirtual))
-                            Enqueue(target);
+                        if (virtualDependencyIds.Add(declaredVirtual.MethodId))
+                            virtualDependencies.Add(declaredVirtual);
+                        var targets = GetVirtualTargets(declaredVirtual);
+                        for (int t = 0; t < targets.Length; t++)
+                            Enqueue(targets[t]);
                     }
                 }
+                bool added = EnqueueConstructedGenericBodiesDiscoveredDuringImport();
 
-                if (!EnqueueConstructedGenericTypeInitializersDiscoveredDuringImport())
+                if (!added)
                     break;
             }
 
@@ -1886,9 +1916,10 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            bool EnqueueConstructedGenericTypeInitializersDiscoveredDuringImport()
+            bool EnqueueConstructedGenericBodiesDiscoveredDuringImport()
             {
                 bool added = false;
+                bool discoveredConstructedGenericType = false;
                 RuntimeType[] types = _rts.SnapshotKnownTypes();
 
                 for (int i = 0; i < types.Length; i++)
@@ -1898,16 +1929,39 @@ namespace Cnidaria.Cs
                     if (type.GenericTypeDefinition is null)
                         continue;
 
-                    _rts.EnsureConstructedMembers(type);
+                    bool scanVirtualTargets = _scannedConstructedGenericVirtualTargetTypeIds.Add(type.TypeId);
+                    bool scanCctor = _scannedConstructedGenericCctorTypeIds.Add(type.TypeId);
 
-                    RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(type);
-                    if (cctor is null)
+                    if (!scanVirtualTargets && !scanCctor)
                         continue;
 
-                    added |= Enqueue(cctor);
+                    discoveredConstructedGenericType |= scanVirtualTargets;
+                    _rts.EnsureConstructedMembers(type);
+
+
+                    if (scanCctor)
+                    {
+                        RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(type);
+                        if (cctor is not null)
+                            added |= Enqueue(cctor);
+                    }
                 }
 
-                return added;
+                if (discoveredConstructedGenericType && virtualDependencies.Count != 0)
+                {
+                    _virtualTargetCache.Clear();
+
+                    for (int i = 0; i < virtualDependencies.Count; i++)
+                    {
+                        RuntimeMethod declaredVirtual = virtualDependencies[i];
+                        var targets = GetVirtualTargets(declaredVirtual);
+                        for (int t = 0; t < targets.Length; t++)
+                            added |= Enqueue(targets[t]);
+                    }
+                }
+
+
+                return added || discoveredConstructedGenericType;
             }
         }
 
@@ -1946,52 +2000,223 @@ namespace Cnidaria.Cs
             if (_built.TryGetValue(method.MethodId, out var cached))
                 return cached;
 
-            var builder = new GenTreeMethodBuilder(_modules, _rts, module, body, method, _allBodyMethods);
+            var builder = new GenTreeMethodBuilder(_rts, module, body, method);
             var result = builder.Build();
             _built.Add(method.MethodId, result);
             return result;
         }
-
-        private IEnumerable<RuntimeMethod> EnumerateConservativeVirtualTargets(RuntimeMethod declared)
+        private ImmutableArray<RuntimeMethod> GetVirtualTargets(RuntimeMethod declared)
         {
-            if (declared is null)
-                yield break;
+            if (_virtualTargetCache.TryGetValue(declared.MethodId, out var cached))
+                return cached;
 
-            if (declared.Body is not null)
+            var result = ImmutableArray.CreateBuilder<RuntimeMethod>();
+            var yielded = new HashSet<int>();
+
+            foreach (var target in EnumerateVirtualTargetsCore(declared))
+            {
+                if (target.BodyModule is null || target.Body is null)
+                    continue;
+
+                if (yielded.Add(target.MethodId))
+                    result.Add(target);
+            }
+
+            var frozen = result.ToImmutable();
+            _virtualTargetCache[declared.MethodId] = frozen;
+            return frozen;
+        }
+        private IEnumerable<RuntimeMethod> EnumerateVirtualTargetsCore(RuntimeMethod declared)
+        {
+            if (declared.BodyModule is not null && declared.Body is not null)
                 yield return declared;
 
             for (int i = 0; i < _allBodyMethods.Count; i++)
             {
                 var candidate = _allBodyMethods[i];
-                if (candidate.MethodId == declared.MethodId)
-                    continue;
-                if (candidate.IsStatic)
-                    continue;
-                if (!StringComparer.Ordinal.Equals(candidate.Name, declared.Name))
-                    continue;
-                if (candidate.GenericArity != declared.GenericArity)
-                    continue;
-                if (!SameSignature(candidate, declared))
-                    continue;
-                if (!CanBeVirtualTarget(candidate.DeclaringType, declared.DeclaringType))
+
+                if (IsVirtualTargetCandidate(candidate, declared))
+                    yield return candidate;
+            }
+
+            RuntimeType[] knownTypes = _rts.SnapshotKnownTypes();
+
+            for (int t = 0; t < knownTypes.Length; t++)
+            {
+                RuntimeType candidateOwner = knownTypes[t];
+
+                _rts.EnsureConstructedMembers(candidateOwner);
+
+                if (!CanBeVirtualTarget(candidateOwner, declared.DeclaringType))
                     continue;
 
-                yield return candidate;
+                if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
+                {
+                    foreach (RuntimeMethod explicitTarget in EnumerateExplicitInterfaceTargets(candidateOwner, declared))
+                        yield return explicitTarget;
+                }
+
+                var methods = candidateOwner.Methods;
+                for (int m = 0; m < methods.Length; m++)
+                {
+                    var candidate = methods[m];
+
+                    if (IsVirtualTargetCandidate(candidate, declared))
+                        yield return candidate;
+                }
             }
         }
+        private IEnumerable<RuntimeMethod> EnumerateExplicitInterfaceTargets(RuntimeType candidateOwner, RuntimeMethod declared)
+        {
+            var map = candidateOwner.ExplicitInterfaceMethodImpls;
 
+            if (map is null || map.Count == 0)
+                yield break;
+
+            if (map.TryGetValue(declared.MethodId, out var exact))
+            {
+                yield return ProjectRuntimeMethodToOwner(candidateOwner, exact);
+            }
+
+            foreach (var kv in map)
+            {
+                RuntimeMethod ifaceMethod;
+
+                try
+                {
+                    ifaceMethod = _rts.GetMethodById(kv.Key);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!SameInterfaceMethodIdentity(ifaceMethod, declared))
+                    continue;
+
+                yield return ProjectRuntimeMethodToOwner(candidateOwner, kv.Value);
+            }
+        }
+        private static RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType candidateOwner, RuntimeMethod method)
+        {
+            if (method.DeclaringType.TypeId == candidateOwner.TypeId)
+                return method;
+
+            var methods = candidateOwner.Methods;
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var candidate = methods[i];
+
+                if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name))
+                    continue;
+
+                if (candidate.GenericArity != method.GenericArity)
+                    continue;
+
+                if (candidate.IsStatic != method.IsStatic)
+                    continue;
+
+                if (candidate.Body is not null &&
+                    method.Body is not null &&
+                    ReferenceEquals(candidate.Body, method.Body))
+                {
+                    return candidate;
+                }
+
+                if (SameSignature(candidate, method))
+                    return candidate;
+            }
+
+            return method;
+        }
+        private static bool IsVirtualTargetCandidate(RuntimeMethod candidate, RuntimeMethod declared)
+        {
+            if (candidate.MethodId == declared.MethodId)
+                return false;
+
+            if (candidate.IsStatic)
+                return false;
+
+            if (!StringComparer.Ordinal.Equals(candidate.Name, declared.Name))
+                return false;
+
+            if (candidate.GenericArity != declared.GenericArity)
+                return false;
+
+            if (!SameSignature(candidate, declared))
+                return false;
+
+            if (!CanBeVirtualTarget(candidate.DeclaringType, declared.DeclaringType))
+                return false;
+
+            return true;
+        }
         private static bool SameSignature(RuntimeMethod a, RuntimeMethod b)
         {
-            if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
+            if (!SameRuntimeType(a.ReturnType, b.ReturnType))
+                return false;
+
+            if (a.ParameterTypes.Length != b.ParameterTypes.Length)
+                return false;
+
             for (int i = 0; i < a.ParameterTypes.Length; i++)
             {
-                if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i]))
+                if (!SameRuntimeType(a.ParameterTypes[i], b.ParameterTypes[i]))
                     return false;
             }
+
+            return true;
+        }
+        private static bool SameInterfaceMethodIdentity(RuntimeMethod ifaceMethod, RuntimeMethod declared)
+        {
+            if (!StringComparer.Ordinal.Equals(ifaceMethod.Name, declared.Name))
+                return false;
+
+            if (ifaceMethod.GenericArity != declared.GenericArity)
+                return false;
+
+            if (!SameRuntimeTypeDefinitionOrExact(ifaceMethod.DeclaringType, declared.DeclaringType))
+                return false;
+
+            if (ifaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length)
+                return false;
+
+            if (!CompatibleInterfaceSignatureType(ifaceMethod.ReturnType, declared.ReturnType))
+                return false;
+
+            for (int i = 0; i < ifaceMethod.ParameterTypes.Length; i++)
+            {
+                if (!CompatibleInterfaceSignatureType(ifaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
+                    return false;
+            }
+
             return true;
         }
 
+        private static bool SameRuntimeType(RuntimeType a, RuntimeType b)
+            => a.TypeId == b.TypeId;
+
+        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType a, RuntimeType b)
+        {
+            if (a.TypeId == b.TypeId)
+                return true;
+
+            RuntimeType ad = a.GenericTypeDefinition ?? a;
+            RuntimeType bd = b.GenericTypeDefinition ?? b;
+
+            return ad.TypeId == bd.TypeId;
+        }
+        private static bool CompatibleInterfaceSignatureType(RuntimeType a, RuntimeType b)
+        {
+            if (a.TypeId == b.TypeId)
+                return true;
+
+            if (a.Kind == RuntimeTypeKind.TypeParam || b.Kind == RuntimeTypeKind.TypeParam)
+                return true;
+
+            return SameRuntimeTypeDefinitionOrExact(a, b);
+        }
         private static bool CanBeVirtualTarget(RuntimeType candidateOwner, RuntimeType declaredOwner)
         {
             if (ReferenceEquals(candidateOwner, declaredOwner))
@@ -2004,7 +2229,7 @@ namespace Cnidaria.Cs
                     var interfaces = t.Interfaces;
                     for (int i = 0; i < interfaces.Length; i++)
                     {
-                        if (ReferenceEquals(interfaces[i], declaredOwner))
+                        if (SameInterfaceType(interfaces[i], declaredOwner))
                             return true;
                     }
                 }
@@ -2019,18 +2244,45 @@ namespace Cnidaria.Cs
 
             return false;
         }
+        private static bool SameInterfaceType(RuntimeType implemented, RuntimeType declared)
+        {
+            if (implemented.TypeId == declared.TypeId)
+                return true;
+
+            RuntimeType? implementedDef = implemented.GenericTypeDefinition;
+            RuntimeType? declaredDef = declared.GenericTypeDefinition;
+
+            if (implementedDef is null || declaredDef is null)
+                return false;
+
+            if (implementedDef.TypeId != declaredDef.TypeId)
+                return false;
+
+            RuntimeType[] implementedArgs = implemented.GenericTypeArguments;
+            RuntimeType[] declaredArgs = declared.GenericTypeArguments;
+
+            if (implementedArgs.Length != declaredArgs.Length)
+                return false;
+
+            for (int i = 0; i < implementedArgs.Length; i++)
+            {
+                if (!CompatibleInterfaceSignatureType(implementedArgs[i], declaredArgs[i]))
+                    return false;
+            }
+
+            return true;
+        }
     }
 
     internal sealed class GenTreeMethodBuilder
     {
-        private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
         private readonly RuntimeTypeSystem _rts;
         private readonly RuntimeModule _module;
         private readonly BytecodeFunction _body;
         private readonly RuntimeMethod _method;
-        private readonly IReadOnlyList<RuntimeMethod> _allBodyMethods;
 
         private readonly List<GenTemp> _temps = new();
+        private readonly HashSet<int> _materializedImporterTempIds = new();
         private readonly Dictionary<(int StartPc, int Depth), GenTemp> _stackEntryTemps = new();
         private readonly Dictionary<int, GenTemp> _dupTemps = new();
         private readonly HashSet<int> _createdDupTempIds = new();
@@ -2041,25 +2293,22 @@ namespace Cnidaria.Cs
 
         private RuntimeType[] _argTypes = Array.Empty<RuntimeType>();
         private RuntimeType[] _localTypes = Array.Empty<RuntimeType>();
-        private Dictionary<int, int> _stackDepthAtPc = new();
+        private const int UnreachableStackDepth = -1;
+        private int[] _stackDepthAtPc = Array.Empty<int>();
         private Dictionary<int, int> _pcToBlockId = new();
         private int _nextNodeId;
         private int _nextTempIndex;
 
         public GenTreeMethodBuilder(
-            IReadOnlyDictionary<string, RuntimeModule> modules,
             RuntimeTypeSystem rts,
             RuntimeModule module,
             BytecodeFunction body,
-            RuntimeMethod method,
-            IReadOnlyList<RuntimeMethod> allBodyMethods)
+            RuntimeMethod method)
         {
-            _modules = modules;
             _rts = rts;
             _module = module;
             _body = body;
             _method = method;
-            _allBodyMethods = allBodyMethods;
             _nextTempIndex = 0;
         }
 
@@ -2425,6 +2674,11 @@ namespace Cnidaria.Cs
                         EmitNewDelegate(stack, statements, pc, ins);
                         break;
 
+                    case BytecodeOp.DelegateCombine:
+                    case BytecodeOp.DelegateRemove:
+                        EmitDelegateBinary(stack, statements, pc, ins);
+                        break;
+
                     case BytecodeOp.DelegateInvoke:
                         EmitDelegateInvoke(stack, statements, pc, ins);
                         break;
@@ -2536,7 +2790,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < successorPcs.Count; i++)
                 succBlockIds.Add(BlockIdForPc(successorPcs[i]));
 
-            int entryDepth = _stackDepthAtPc.TryGetValue(startPc, out int depth) ? depth : 0;
+            int entryDepth = TryGetStackDepthAtPc(startPc, out int depth) ? depth : 0;
             var jumpKind = ClassifyBlockJump(statements, successorPcs);
             var flags = ComputeBlockFlags(blockId, startPc, endPc, entryDepth, exitStackDepth, successorPcs.Count);
 
@@ -2577,6 +2831,9 @@ namespace Cnidaria.Cs
             if (entryStackDepth != 0) flags |= GenTreeBlockFlags.HasStackEntry;
             if (successorCount != 0 && exitStackDepth != 0) flags |= GenTreeBlockFlags.HasStackExit;
 
+            if (_body.ExceptionHandlers.Length == 0)
+                return flags;
+
             for (int i = 0; i < _body.ExceptionHandlers.Length; i++)
             {
                 var h = _body.ExceptionHandlers[i];
@@ -2601,10 +2858,20 @@ namespace Cnidaria.Cs
         }
         private static bool RangesIntersect(int aStart, int aEnd, int bStart, int bEnd)
             => aStart < bEnd && bStart < aEnd;
+        private bool TryGetStackDepthAtPc(int pc, out int depth)
+        {
+            if ((uint)pc < (uint)_stackDepthAtPc.Length)
+            {
+                depth = _stackDepthAtPc[pc];
+                return (uint)depth < (uint)_stackDepthAtPc.Length && (_stackDepthAtPc[depth] != UnreachableStackDepth);
+            }
 
+            depth = 0;
+            return false;
+        }
         private List<StackValue> CreateEntryStack(int startPc)
         {
-            if (!_stackDepthAtPc.TryGetValue(startPc, out int depth))
+            if (!TryGetStackDepthAtPc(startPc, out int depth))
                 throw Fail(startPc, BytecodeOp.Nop, "Missing stack-depth state for block entry.");
 
             var stack = new List<StackValue>(Math.Max(depth, 4));
@@ -2692,6 +2959,7 @@ namespace Cnidaria.Cs
             var temp = new GenTemp(_nextTempIndex++, GenTempKind.StackSpill, type, stackKind);
             _stackEntryTemps.Add(key, temp);
             _temps.Add(temp);
+            _materializedImporterTempIds.Add(temp.Index);
             return temp;
         }
 
@@ -2769,19 +3037,37 @@ namespace Cnidaria.Cs
             statements.Add(Node(GenTreeKind.StoreTemp, value.Pc, value.SourceOp, operands: One(value), int32: temp.Index));
             Push(stack, TempLoad(value.Pc, value.SourceOp, temp));
         }
+        private bool IsAlreadyImporterSpillTemp(StackValue value)
+        {
+            GenTree node = value.Node;
+            return node.Kind == GenTreeKind.Temp && _materializedImporterTempIds.Contains(node.Int32);
+        }
+        private StackValue MaterializeForImporterBarrier(
+            List<GenTree> statements,
+            StackValue value,
+            int pc,
+            BytecodeOp sourceOp)
+        {
+            if (IsAlreadyImporterSpillTemp(value))
+                return value;
 
+            var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
+            statements.Add(Node(
+                GenTreeKind.StoreTemp,
+                pc,
+                sourceOp,
+                operands: One(value.Node),
+                int32: temp.Index));
+
+            return TempLoad(pc, sourceOp, temp);
+        }
         private void SpillEvaluationStackForImportBarrier(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp)
         {
             if (stack.Count == 0)
                 return;
 
             for (int i = 0; i < stack.Count; i++)
-            {
-                StackValue value = stack[i];
-                var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
-                statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(value.Node), int32: temp.Index));
-                stack[i] = TempLoad(pc, sourceOp, temp);
-            }
+                stack[i] = MaterializeForImporterBarrier(statements, stack[i], pc, sourceOp);
         }
 
         private GenTemp CreateImporterSpillTemp(RuntimeType? type, GenStackKind stackKind)
@@ -2789,6 +3075,7 @@ namespace Cnidaria.Cs
             int index = _nextTempIndex++;
             var temp = new GenTemp(index, GenTempKind.StackSpill, type, stackKind);
             _temps.Add(temp);
+            _materializedImporterTempIds.Add(index);
             return temp;
         }
 
@@ -2862,6 +3149,7 @@ namespace Cnidaria.Cs
             _dupTemps.Add(index, temp);
             _createdDupTempIds.Add(index);
             _temps.Add(temp);
+            _materializedImporterTempIds.Add(index);
             return temp;
         }
 
@@ -3100,6 +3388,19 @@ namespace Cnidaria.Cs
 
             PushImportedValue(stack, statements, Node(GenTreeKind.NewDelegate, pc, ins.Op, type: delegateType, stackKind: GenStackKind.Ref,
                 operands: operands, int64: targetMethod.MethodId, runtimeType: delegateType, method: targetMethod));
+        }
+
+        private void EmitDelegateBinary(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var args = PopMany(stack, 2, pc, ins.Op);
+            RuntimeType? resultType = args[0].Type ?? args[1].Type;
+            PushImportedValue(stack, statements, Node(
+                ins.Op == BytecodeOp.DelegateCombine ? GenTreeKind.DelegateCombine : GenTreeKind.DelegateRemove,
+                pc,
+                ins.Op,
+                type: resultType,
+                stackKind: GenStackKind.Ref,
+                operands: args));
         }
 
         private void EmitDelegateInvoke(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
@@ -4039,6 +4340,8 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.NewDelegate:
+                case GenTreeKind.DelegateCombine:
+                case GenTreeKind.DelegateRemove:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
@@ -4133,9 +4436,12 @@ namespace Cnidaria.Cs
             successors.Add(pc);
         }
 
-        private Dictionary<int, int> ComputeStackDepths()
+        private int[] ComputeStackDepths()
         {
-            var result = new Dictionary<int, int>();
+            var instructions = _body.Instructions;
+            var result = new int[instructions.Length];
+            Array.Fill(result, UnreachableStackDepth);
+
             var queue = new Queue<int>();
 
             AddEntry(0, 0);
@@ -4145,83 +4451,89 @@ namespace Cnidaria.Cs
             while (queue.Count != 0)
             {
                 int pc = queue.Dequeue();
-                if ((uint)pc >= (uint)_body.Instructions.Length)
+                if ((uint)pc >= (uint)instructions.Length)
                     continue;
 
                 int inDepth = result[pc];
-                var ins = _body.Instructions[pc];
-                int outDepth = ins.Op == BytecodeOp.Leave ? 0 : checked(inDepth - ins.Pop + ins.Push);
+                var ins = instructions[pc];
+
+                int outDepth = ins.Op == BytecodeOp.Leave
+                    ? 0
+                    : checked(inDepth - ins.Pop + ins.Push);
+
                 if (outDepth < 0)
                     throw Fail(pc, ins.Op, $"Negative evaluation stack depth. In={inDepth}, pop={ins.Pop}, push={ins.Push}.");
+
                 if (outDepth > _body.MaxStack)
                     throw Fail(pc, ins.Op, $"Evaluation stack depth {outDepth} exceeds MaxStack {_body.MaxStack}.");
 
-                foreach (int succ in Successors(pc, ins))
-                    AddEntry(succ, outDepth);
+                AddSuccessors(pc, ins, outDepth);
             }
 
             return result;
 
+            void AddSuccessors(int pc, Instruction ins, int outDepth)
+            {
+                switch (ins.Op)
+                {
+                    case BytecodeOp.Br:
+                    case BytecodeOp.Leave:
+                        AddEntry(ins.Operand0, outDepth);
+                        return;
+
+                    case BytecodeOp.Brtrue:
+                    case BytecodeOp.Brfalse:
+                        AddEntry(ins.Operand0, outDepth);
+                        AddEntry(pc + 1, outDepth);
+                        return;
+
+                    case BytecodeOp.Ret:
+                    case BytecodeOp.Throw:
+                    case BytecodeOp.Rethrow:
+                    case BytecodeOp.Endfinally:
+                        return;
+
+                    default:
+                        AddEntry(pc + 1, outDepth);
+                        return;
+                }
+            }
+
             void AddEntry(int pc, int depth)
             {
-                if ((uint)pc >= (uint)_body.Instructions.Length)
+                if ((uint)pc >= (uint)instructions.Length)
                     return;
 
-                if (result.TryGetValue(pc, out int existing))
+                int existing = result[pc];
+                if (existing != UnreachableStackDepth)
                 {
                     if (existing != depth)
                         throw Fail(pc, BytecodeOp.Nop, $"Inconsistent stack depth at pc {pc}: existing={existing}, incoming={depth}.");
                     return;
                 }
 
-                result.Add(pc, depth);
+                result[pc] = depth;
                 queue.Enqueue(pc);
             }
         }
-
-        private IEnumerable<int> Successors(int pc, Instruction ins)
+        private List<int> ComputeLeaders(int[] stackDepthAtPc)
         {
-            switch (ins.Op)
-            {
-                case BytecodeOp.Br:
-                case BytecodeOp.Leave:
-                    yield return ins.Operand0;
-                    yield break;
-
-                case BytecodeOp.Brtrue:
-                case BytecodeOp.Brfalse:
-                    yield return ins.Operand0;
-                    if (pc + 1 < _body.Instructions.Length)
-                        yield return pc + 1;
-                    yield break;
-
-                case BytecodeOp.Ret:
-                case BytecodeOp.Throw:
-                case BytecodeOp.Rethrow:
-                case BytecodeOp.Endfinally:
-                    yield break;
-
-                default:
-                    if (pc + 1 < _body.Instructions.Length)
-                        yield return pc + 1;
-                    yield break;
-            }
-        }
-
-        private List<int> ComputeLeaders(Dictionary<int, int> reachablePcs)
-        {
-            var set = new SortedSet<int>();
-
-            if (_body.Instructions.Length == 0)
+            int instructionCount = _body.Instructions.Length;
+            if (instructionCount == 0)
                 return new List<int>();
 
-            if (reachablePcs.ContainsKey(0))
-                set.Add(0);
+            var isLeader = new bool[instructionCount];
+            int leaderCount = 0;
 
-            foreach (var kv in reachablePcs)
+            AddReachableLeader(0);
+
+            for (int pc = 0; pc < instructionCount; pc++)
             {
-                int pc = kv.Key;
+                if (stackDepthAtPc[pc] == UnreachableStackDepth)
+                    continue;
+
                 var ins = _body.Instructions[pc];
+
                 switch (ins.Op)
                 {
                     case BytecodeOp.Br:
@@ -4248,14 +4560,28 @@ namespace Cnidaria.Cs
                 AddReachableLeader(h.HandlerEndPc);
             }
 
-            return new List<int>(set);
+            var leaders = new List<int>(leaderCount);
+            for (int pc = 0; pc < isLeader.Length; pc++)
+            {
+                if (isLeader[pc])
+                    leaders.Add(pc);
+            }
+
+            return leaders;
 
             void AddReachableLeader(int pc)
             {
-                if ((uint)pc >= (uint)_body.Instructions.Length)
+                if ((uint)pc >= (uint)instructionCount)
                     return;
-                if (reachablePcs.ContainsKey(pc))
-                    set.Add(pc);
+
+                if (stackDepthAtPc[pc] == UnreachableStackDepth)
+                    return;
+
+                if (isLeader[pc])
+                    return;
+
+                isLeader[pc] = true;
+                leaderCount++;
             }
         }
 

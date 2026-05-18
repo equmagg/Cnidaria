@@ -2500,6 +2500,35 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    public sealed class EventFieldDeclarationSyntax : MemberDeclarationSyntax
+    {
+        public SyntaxTokenList Modifiers { get; }
+        public SyntaxToken EventKeyword { get; }
+        public VariableDeclarationSyntax Declaration { get; }
+        public SyntaxToken SemicolonToken { get; }
+
+        public EventFieldDeclarationSyntax(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken eventKeyword,
+            VariableDeclarationSyntax declaration,
+            SyntaxToken semicolonToken)
+            : base(
+                SyntaxKind.EventFieldDeclaration,
+                attributeLists,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    eventKeyword.Span,
+                    declaration.Span,
+                    semicolonToken.Span))
+        {
+            Modifiers = modifiers;
+            EventKeyword = eventKeyword;
+            Declaration = declaration;
+            SemicolonToken = semicolonToken;
+        }
+    }
     public sealed class IfStatementSyntax : StatementSyntax
     {
         public SyntaxToken IfKeyword { get; }
@@ -3375,6 +3404,43 @@ namespace Cnidaria.Cs
             ExpressionBody = expressionBody;
             Initializer = initializer;
             SemicolonToken = semicolonToken;
+        }
+    }
+    public sealed class EventDeclarationSyntax : MemberDeclarationSyntax
+    {
+        public SyntaxTokenList Modifiers { get; }
+        public SyntaxToken EventKeyword { get; }
+        public TypeSyntax Type { get; }
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
+        public SyntaxToken Identifier { get; }
+        public AccessorListSyntax AccessorList { get; }
+
+        public EventDeclarationSyntax(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken eventKeyword,
+            TypeSyntax type,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
+            SyntaxToken identifier,
+            AccessorListSyntax accessorList)
+            : base(
+                SyntaxKind.EventDeclaration,
+                attributeLists,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    eventKeyword.Span,
+                    type.Span,
+                    explicitInterfaceSpecifier?.Span,
+                    identifier.Span,
+                    accessorList.Span))
+        {
+            Modifiers = modifiers;
+            EventKeyword = eventKeyword;
+            Type = type;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
+            Identifier = identifier;
+            AccessorList = accessorList;
         }
     }
     public sealed class IndexerDeclarationSyntax : MemberDeclarationSyntax

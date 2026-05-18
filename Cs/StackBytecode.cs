@@ -140,6 +140,8 @@ namespace Cnidaria.Cs
         LdClosureSlot,  // operand0: slot index, stack: closure -> cell
         NewDelegate,    // operand0: delegate type token, operand1: target method token, stack: -> delegate
         NewDelegateClosed, // operand0: delegate type token, operand1: target method token, stack: target -> delegate
+        DelegateCombine, // stack: delegate?,delegate? -> delegate?
+        DelegateRemove,  // stack: delegate?,delegate? -> delegate?
         DelegateInvoke, // operand0: delegate Invoke method token, operand1: argCount, stack: delegate,args -> return?
 
     }
@@ -1431,6 +1433,9 @@ namespace Cnidaria.Cs
                 EmitBinaryOperator(bin);
             }
 
+            private static bool IsDelegateType(TypeSymbol type)
+                => type is NamedTypeSymbol { TypeKind: TypeKind.Delegate };
+
             private void EmitBinaryOperator(BoundBinaryExpression bin)
             {
                 var op = bin.OperatorKind;
@@ -1450,6 +1455,13 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+
+                if (IsDelegateType(bin.Type) &&
+                    op is BoundBinaryOperatorKind.Add or BoundBinaryOperatorKind.Subtract)
+                {
+                    _il.Emit(op == BoundBinaryOperatorKind.Add ? BytecodeOp.DelegateCombine : BytecodeOp.DelegateRemove, pop: 2, push: 1);
+                    return;
+                }
 
                 if (bin.Type is PointerTypeSymbol ptrType &&
                     op is BoundBinaryOperatorKind.Add or BoundBinaryOperatorKind.Subtract)
@@ -1898,7 +1910,11 @@ namespace Cnidaria.Cs
                 EmitExpression(access.Cell, EmitMode.Value);
                 _il.Emit(BytecodeOp.LdClosureCell, operand0: _tokens.GetTypeToken(access.Type), pop: 1, push: 1);
             }
-
+            private static bool IsInterfaceInstanceCall(BoundCallExpression call)
+            {
+                return !call.Method.IsStatic &&
+                       call.Method.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Interface };
+            }
             private static bool IsDelegateInvokeCall(BoundCallExpression call)
                 => !call.Method.IsStatic
                    && StringComparer.Ordinal.Equals(call.Method.Name, "Invoke")
@@ -1925,9 +1941,52 @@ namespace Cnidaria.Cs
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
 
+            private static bool IsSystemDelegateCombineRemoveCall(BoundCallExpression call, out bool combine)
+            {
+                combine = false;
+
+                if (!call.Method.IsStatic || call.Method.ContainingSymbol is not NamedTypeSymbol containingType)
+                    return false;
+
+                if (!StringComparer.Ordinal.Equals(containingType.Name, "Delegate"))
+                    return false;
+
+                if (StringComparer.Ordinal.Equals(call.Method.Name, "Combine"))
+                {
+                    combine = true;
+                    return call.Arguments.Length == 2;
+                }
+
+                if (StringComparer.Ordinal.Equals(call.Method.Name, "Remove"))
+                {
+                    combine = false;
+                    return call.Arguments.Length == 2;
+                }
+
+                return false;
+            }
+
+            private bool TryEmitDelegateCombineRemoveCall(BoundCallExpression call, EmitMode mode)
+            {
+                if (!IsSystemDelegateCombineRemoveCall(call, out bool combine))
+                    return false;
+
+                EmitExpression(call.Arguments[0], EmitMode.Value);
+                EmitExpression(call.Arguments[1], EmitMode.Value);
+                _il.Emit(combine ? BytecodeOp.DelegateCombine : BytecodeOp.DelegateRemove, pop: 2, push: 1);
+
+                if (mode == EmitMode.Discard)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                return true;
+            }
+
             private void EmitCall(BoundCallExpression call, EmitMode mode)
             {
                 if (TryEmitIntrinsic(call, mode))
+                    return;
+
+                if (TryEmitDelegateCombineRemoveCall(call, mode))
                     return;
 
                 if (IsDelegateInvokeCall(call))
@@ -2042,10 +2101,17 @@ namespace Cnidaria.Cs
 
                 bool isBaseReceiver = call.ReceiverOpt is BoundBaseExpression;
 
+                bool requiresVirtualDispatch =
+                    !call.Method.IsStatic &&
+                    (IsInterfaceInstanceCall(call) ||
+                    call.Method.IsVirtual ||
+                    call.Method.IsAbstract ||
+                    call.Method.IsOverride);
+
                 BytecodeOp op =
                     thisIsManagedByRef || isBaseReceiver
                         ? BytecodeOp.Call
-                        : (!call.Method.IsStatic && (call.Method.IsVirtual || call.Method.IsAbstract || call.Method.IsOverride))
+                        : requiresVirtualDispatch
                             ? BytecodeOp.CallVirt
                             : BytecodeOp.Call;
 

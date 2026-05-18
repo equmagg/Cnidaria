@@ -2042,9 +2042,14 @@ namespace Cnidaria.Cs
             }
             int typeFlags = MapTypeVisibility(type);
             if (type.TypeKind == TypeKind.Interface)
-                typeFlags |= (int)System.Reflection.TypeAttributes.Interface | (int)System.Reflection.TypeAttributes.Abstract;
-            else if (type.TypeKind == TypeKind.Delegate)
+            {
+                typeFlags |= (int)System.Reflection.TypeAttributes.Interface |
+                             (int)System.Reflection.TypeAttributes.Abstract;
+            }
+            else if (type.TypeKind == TypeKind.Delegate || type.IsSealed)
+            {
                 typeFlags |= (int)System.Reflection.TypeAttributes.Sealed;
+            }
 
             Image.TypeDefs[typeDefIndex] = new TypeDefRow(
                 flags: typeFlags,
