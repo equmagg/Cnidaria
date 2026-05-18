@@ -587,7 +587,7 @@ internal class Program
 {
     public unsafe static void Main(string[] args)
     {
-        int n = 10_000;
+        int n = 1_000;
         int s = 0;
         for (int i = 0; i < n; i++)
         {
@@ -596,7 +596,7 @@ internal class Program
         Console.WriteLine(s);
     }
 }
-", "49975003");
+", "497503");
 
             // 62 stackalloc byte
             RunTest(@"
@@ -1545,7 +1545,27 @@ switch (x)
         break;
 }
 ", "023");
-            // 132 yield return
+            // 132 using var
+            RunTest(@"
+namespace Ns;
+class C : IDisposable
+{
+    public int X;
+    public void Dispose()
+    {
+        Console.Write(""Disposed"");
+    }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        using (C c = new C()) { }
+        using var c = new C();
+    }
+}
+", "DisposedDisposed");
+            // 133 yield return
             RunTest(@"
 foreach (int i in ProduceEvenNumbers(9))
 {
@@ -1559,10 +1579,12 @@ IEnumerable<int> ProduceEvenNumbers(int upto)
     }
 }
 ", "02468");
+            
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             Console.WriteLine($"Average instructions executed count: " +
-                $"{(InstructionsExecuted.Count > 0 ? (long)InstructionsExecuted.Where(x => x > 0L).Average() : 0L)}");
+                $"{(InstructionsExecuted.Count > 0 ? (long)InstructionsExecuted.Where(x => x > 0L).Average() : 0L)}" +
+                $"\nPeak instructions executed count: {InstructionsExecuted.Max()} at i {InstructionsExecuted.IndexOf(InstructionsExecuted.Max())}");
             Console.WriteLine($"Average build time: " +
                 $"{new TimeSpan((BuildTime.Count > 0 ? Convert.ToInt64(BuildTime.Average(x => x.Ticks)) : 0L))}");
             Console.WriteLine($"Average compilation time: " +

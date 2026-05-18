@@ -760,6 +760,19 @@ namespace Cnidaria.Cs
             HasErrors = operand.HasErrors || !conversion.Exists;
         }
     }
+    internal sealed class BoundTypeOfExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.TypeOfExpression;
+        public TypeSymbol OperandType { get; }
+        public BoundTypeOfExpression(TypeOfExpressionSyntax syntax, TypeSymbol resultType, TypeSymbol operandType)
+            : base(syntax)
+        {
+            Type = resultType;
+            OperandType = operandType;
+            ConstantValueOpt = Optional<object>.None;
+            HasErrors = resultType.Kind == SymbolKind.Error || operandType.Kind == SymbolKind.Error;
+        }
+    }
     internal sealed class BoundSizeOfExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.SizeOfExpression;
@@ -1016,11 +1029,42 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.LocalDeclaration;
         public LocalSymbol Local { get; }
         public BoundExpression? Initializer { get; }
-        public BoundLocalDeclarationStatement(SyntaxNode syntax, LocalSymbol local, BoundExpression? initializer)
+        public bool IsUsing { get; }
+        public BoundLocalDeclarationStatement(SyntaxNode syntax, LocalSymbol local, BoundExpression? initializer, bool isUsing = false)
             : base(syntax)
         {
             Local = local;
             Initializer = initializer;
+            IsUsing = isUsing;
+            HasErrors = initializer?.HasErrors ?? false;
+        }
+    }
+    internal sealed class BoundUsingStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.UsingStatement;
+        public ImmutableArray<BoundLocalDeclarationStatement> Declarations { get; }
+        public BoundExpression? ExpressionOpt { get; }
+        public BoundStatement Body { get; }
+        public BoundUsingStatement(
+            UsingStatementSyntax syntax,
+            ImmutableArray<BoundLocalDeclarationStatement> declarations,
+            BoundExpression? expressionOpt,
+            BoundStatement body)
+            : base(syntax)
+        {
+            Declarations = declarations.IsDefault
+                ? ImmutableArray<BoundLocalDeclarationStatement>.Empty
+                : declarations;
+            ExpressionOpt = expressionOpt;
+            Body = body;
+            HasErrors = expressionOpt?.HasErrors ?? false;
+            if (body.HasErrors)
+                HasErrors = true;
+            for (int i = 0; i < Declarations.Length; i++)
+            {
+                if (Declarations[i].HasErrors)
+                    HasErrors = true;
+            }
         }
     }
     internal sealed class BoundEmptyStatement : BoundStatement
@@ -1052,7 +1096,7 @@ namespace Cnidaria.Cs
         public BoundStatement Then { get; }
         public BoundStatement? ElseOpt { get; }
 
-        public BoundIfStatement(IfStatementSyntax syntax, BoundExpression condition, BoundStatement thenStatement, BoundStatement? elseOpt)
+        public BoundIfStatement(SyntaxNode syntax, BoundExpression condition, BoundStatement thenStatement, BoundStatement? elseOpt)
             : base(syntax)
         {
             Condition = condition;
@@ -1211,6 +1255,7 @@ namespace Cnidaria.Cs
     {
         Array,
         String,
+        Span,
         Pattern,
         Interface
     }
@@ -1280,7 +1325,8 @@ namespace Cnidaria.Cs
                 !iterationConversion.Exists;
 
             if (enumeratorKind != BoundForEachEnumeratorKind.Array &&
-                enumeratorKind != BoundForEachEnumeratorKind.String)
+                enumeratorKind != BoundForEachEnumeratorKind.String &&
+                enumeratorKind != BoundForEachEnumeratorKind.Span)
             {
                 if (GetEnumeratorMethodOpt is null || CurrentPropertyOpt is null || MoveNextMethodOpt is null)
                     HasErrors = true;
@@ -1440,7 +1486,7 @@ namespace Cnidaria.Cs
         public BoundExpression WhenFalse { get; }
 
         public BoundConditionalExpression(
-            ConditionalExpressionSyntax syntax,
+            SyntaxNode syntax,
             TypeSymbol type,
             BoundExpression condition,
             BoundExpression whenTrue,

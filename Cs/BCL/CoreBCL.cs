@@ -4584,7 +4584,6 @@
 
         private DateOnly(uint dayNumber)
         {
-            //Debug.Assert(dayNumber <= MaxDayNumber);
             _dayNumber = dayNumber;
         }
         
@@ -4748,7 +4747,6 @@
 
         private DateTime(ulong dateData)
         {
-            //Debug.Assert((dateData & TicksMask) <= MaxTicks);
             _dateData = dateData;
         }
 
@@ -4773,7 +4771,6 @@
         internal DateTime(long ticks, DateTimeKind kind, bool isAmbiguousDst)
         {
             if ((ulong)ticks > MaxTicks) ThrowTicksOutOfRange();
-            //Debug.Assert(kind == DateTimeKind.Local, "Internal Constructor is for local times only");
             _dateData = ((ulong)ticks | (isAmbiguousDst ? KindLocalAmbiguousDst : KindLocal));
         }
 
@@ -5128,8 +5125,6 @@
 
             ticks += (uint)millisecond * (uint)TimeSpan.TicksPerMillisecond;
 
-            ///Debug.Assert(ticks <= MaxTicks, "Input parameters validated already");
-
             return ticks;
         }
 
@@ -5140,8 +5135,6 @@
             if ((uint)microsecond >= TimeSpan.MicrosecondsPerMillisecond) ThrowMicrosecondOutOfRange();
 
             ticks += (uint)microsecond * (uint)TimeSpan.TicksPerMicrosecond;
-
-            //Debug.Assert(ticks <= MaxTicks, "Input parameters validated already");
 
             return ticks;
         }
@@ -5825,10 +5818,116 @@
     }
     public static class MathF
     {
+        public const float E = 2.71828183f;
+
+        public const float PI = 3.14159265f;
+
+        public const float Tau = 6.283185307f;
+
+        private const int maxRoundingDigits = 6;
+
+        private const float singleRoundLimit = 1e8f;
+
+        private const float SCALEB_C1 = 1.7014118E+38f; // 0x1p127f
+
+        private const float SCALEB_C2 = 1.1754944E-38f; // 0x1p-126f
+
+        private const float SCALEB_C3 = 16777216f; // 0x1p24f
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float Abs(float x)
         {
             return Math.Abs(x);
+        }
+
+        public static float Sqrt(float x)
+        {
+            const uint SignMask = 0x8000_0000u;
+            const uint ExponentMask = 0x7F80_0000u;
+            const uint SignificandMask = 0x007F_FFFFu;
+            const uint HiddenBit = 0x0080_0000u;
+            const uint PositiveInfinityBits = 0x7F80_0000u;
+
+            uint ix = BitConverter.SingleToUInt32Bits(x);
+
+            // NaN / infinities
+            if ((ix & ExponentMask) == ExponentMask)
+            {
+                // NaN
+                if ((ix & SignificandMask) != 0)
+                    return x + x;
+
+                // +Infinity to +Infinity, -Infinity to NaN
+                return (ix & SignMask) == 0 ? x : float.NaN;
+            }
+
+            // Negative values
+            if ((ix & SignMask) != 0)
+            {
+                // sqrt(-0.0f) == -0.0f
+                if ((ix & ~SignMask) == 0)
+                    return x;
+
+                return float.NaN;
+            }
+
+            // +0.0f
+            if (ix == 0)
+                return x;
+
+            int m = (int)(ix >> 23);
+
+            // Normalize subnormal input
+            if (m == 0)
+            {
+                int i = 0;
+
+                while ((ix & HiddenBit) == 0)
+                {
+                    i++;
+                    ix <<= 1;
+                }
+
+                m -= i - 1;
+            }
+
+            m -= 127;
+            ix = (ix & SignificandMask) | HiddenBit;
+
+            if ((m & 1) != 0)
+                ix += ix;
+
+            m >>= 1;
+
+            ix += ix;
+
+            uint q = 0;
+            uint s = 0;
+            uint r = 0x0100_0000u;
+
+            while (r != 0)
+            {
+                uint t = s + r;
+
+                if (t <= ix)
+                {
+                    s = t + r;
+                    ix -= t;
+                    q += r;
+                }
+
+                ix += ix;
+                r >>= 1;
+            }
+
+            // Round to nearest even
+            if (ix != 0)
+                q += q & 1u;
+
+            ix = (q >> 1) + 0x3F00_0000u;
+            ix += unchecked((uint)(m << 23));
+
+            return BitConverter.UInt32BitsToSingle(ix);
         }
     }
     public static class Math
@@ -6115,7 +6214,6 @@
             return BitConverter.UInt32BitsToSingle(raw & mask);
         }
 
-
         public static double Truncate(double value)
         {
             ulong bits = BitConverter.DoubleToUInt64Bits(value);
@@ -6188,6 +6286,170 @@
             // Remove the sign from x, and remove everything but the sign from y
             // Then, simply OR them to get the correct sign
             return BitConverter.UInt64BitsToDouble((xbits & ~double.SignMask) | (ybits & double.SignMask));
+        }
+
+        public static double Sqrt(double d)
+        {
+            const uint Sign32 = 0x8000_0000u;
+
+            ulong bits = BitConverter.DoubleToUInt64Bits(d);
+            uint hx = (uint)(bits >> 32);
+            uint lx = (uint)bits;
+
+            // NaN / infinities
+            if ((hx & 0x7FF0_0000u) == 0x7FF0_0000u)
+            {
+                // NaN
+                if ((hx & 0x000F_FFFFu) != 0 || lx != 0)
+                    return d + d;
+
+                // +Infinity to +Infinity, -Infinity to NaN.
+                return (hx & Sign32) == 0 ? d : double.NaN;
+            }
+
+            // Negative values
+            if ((hx & Sign32) != 0)
+            {
+                // sqrt(-0.0) == -0.0
+                if (((hx & 0x7FFF_FFFFu) | lx) == 0)
+                    return d;
+
+                return double.NaN;
+            }
+
+            // +0.0
+            if (((hx & 0x7FFF_FFFFu) | lx) == 0)
+                return d;
+
+            int m = (int)(hx >> 20);
+            // Normalize subnormal input
+            if (m == 0)
+            {
+                while (hx == 0)
+                {
+                    m -= 21;
+                    hx |= lx >> 11;
+                    lx <<= 21;
+                }
+
+                int i = 0;
+                while ((hx & 0x0010_0000u) == 0)
+                {
+                    i++;
+                    hx <<= 1;
+                }
+
+                m -= i - 1;
+                hx |= lx >> (32 - i);
+                lx <<= i;
+            }
+
+            // Unbias exponent and restore the hidden significand bit
+            m -= 1023;
+            hx = (hx & 0x000F_FFFFu) | 0x0010_0000u;
+
+            // Make exponent even
+            if ((m & 1) != 0)
+            {
+                hx = hx + hx + (lx >> 31);
+                lx += lx;
+            }
+
+            m >>= 1;
+
+            hx = hx + hx + (lx >> 31);
+            lx += lx;
+
+            uint q = 0;
+            uint q1 = 0;
+            uint s0 = 0;
+            uint s1 = 0;
+
+            uint r = 0x0020_0000u;
+
+            while (r != 0)
+            {
+                uint t = s0 + r;
+
+                if (t <= hx)
+                {
+                    s0 = t + r;
+                    hx -= t;
+                    q += r;
+                }
+
+                hx = hx + hx + (lx >> 31);
+                lx += lx;
+                r >>= 1;
+            }
+
+            r = Sign32;
+            while (r != 0)
+            {
+                uint t1 = s1 + r;
+                uint t = s0;
+
+                if ((t < hx) || ((t == hx) && (t1 <= lx)))
+                {
+                    s1 = t1 + r;
+
+                    if (((t1 & Sign32) != 0) && ((s1 & Sign32) == 0))
+                        s0++;
+
+                    hx -= t;
+
+                    if (lx < t1)
+                        hx--;
+
+                    lx -= t1;
+                    q1 += r;
+                }
+
+                hx = hx + hx + (lx >> 31);
+                lx += lx;
+                r >>= 1;
+            }
+
+            // Round to nearest even
+            if ((hx | lx) != 0)
+            {
+                const double One = 1.0;
+                const double Tiny = 1.0e-300;
+
+                double z = One - Tiny;
+
+                if (z >= One)
+                {
+                    z = One + Tiny;
+
+                    if (q1 == 0xFFFF_FFFFu)
+                    {
+                        q1 = 0;
+                        q++;
+                    }
+                    else if (z > One)
+                    {
+                        if (q1 == 0xFFFF_FFFEu)
+                            q++;
+
+                        q1 += 2;
+                    }
+                    else
+                    {
+                        q1 += q1 & 1u;
+                    }
+                }
+            }
+
+            hx = (q >> 1) + 0x3FE0_0000u;
+            lx = q1 >> 1;
+
+            if ((q & 1) != 0)
+                lx |= Sign32;
+
+            hx += (uint)(m << 20);
+
+            return BitConverter.UInt64BitsToDouble(((ulong)hx << 32) | lx);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -6869,7 +7131,13 @@
 
     public abstract class Type : System.Reflection.MemberInfo, System.Reflection.IReflect
     {
+        protected Type() { }
 
+        public abstract string? Namespace { get; }
+        public abstract string? AssemblyQualifiedName { get; }
+        public abstract string? FullName { get; }
+
+        public abstract Type UnderlyingSystemType { get; }
     }
 
     public enum AttributeTargets
@@ -7031,6 +7299,20 @@
 
         public InvalidOperationException(string message, Exception innerException)
             : base(message, innerException)
+        { }
+    }
+    public class NotImplementedException : SystemException
+    {
+        public NotImplementedException()
+        : base("Arg_NotImplementedException")
+        { }
+
+        public NotImplementedException(string message)
+        : base(message)
+        { }
+
+        public NotImplementedException(string message, Exception inner)
+        : base(message, inner)
         { }
     }
     public class NotSupportedException : SystemException
@@ -7569,7 +7851,6 @@ namespace System.Runtime.InteropServices
             {
                 int size = list._size;
                 T[] items = list._items;
-                //Debug.Assert(items is not null, ""Implementation depends on List<T> always having an array."");
 
                 if ((uint)size > (uint)items.Length)
                 {
@@ -7868,13 +8149,120 @@ namespace System.Runtime.Intrinsics
 }
 namespace System.Reflection
 {
+    [Flags]
+    public enum MemberTypes
+    {
+        Constructor = 0x01,
+        Event = 0x02,
+        Field = 0x04,
+        Method = 0x08,
+        Property = 0x10,
+        TypeInfo = 0x20,
+        Custom = 0x40,
+        NestedType = 0x80,
+        All = Constructor | Event | Field | Method | Property | TypeInfo | NestedType,
+    }
+    [Flags]
+    public enum TypeAttributes
+    {
+        VisibilityMask = 0x00000007,
+        NotPublic = 0x00000000,     // Class is not public scope.
+        Public = 0x00000001,     // Class is public scope.
+        NestedPublic = 0x00000002,     // Class is nested with public visibility.
+        NestedPrivate = 0x00000003,     // Class is nested with private visibility.
+        NestedFamily = 0x00000004,     // Class is nested with family visibility.
+        NestedAssembly = 0x00000005,     // Class is nested with assembly visibility.
+        NestedFamANDAssem = 0x00000006,     // Class is nested with family and assembly visibility.
+        NestedFamORAssem = 0x00000007,     // Class is nested with family or assembly visibility.
+
+        // Use this mask to retrieve class layout information
+        // 0 is AutoLayout, 0x2 is SequentialLayout, 4 is ExplicitLayout
+        LayoutMask = 0x00000018,
+        AutoLayout = 0x00000000,     // Class fields are auto-laid out
+        SequentialLayout = 0x00000008,     // Class fields are laid out sequentially
+        ExplicitLayout = 0x00000010,     // Layout is supplied explicitly
+                                         // end layout mask
+
+        // Use this mask to distinguish whether a type declaration is an interface.  (Class vs. ValueType done based on whether it subclasses S.ValueType)
+        ClassSemanticsMask = 0x00000020,
+        Class = 0x00000000,     // Type is a class (or a value type).
+        Interface = 0x00000020,     // Type is an interface.
+
+        // Special semantics in addition to class semantics.
+        Abstract = 0x00000080,     // Class is abstract
+        Sealed = 0x00000100,     // Class is concrete and may not be extended
+        SpecialName = 0x00000400,     // Class name is special.  Name describes how.
+
+        // Implementation attributes.
+        Import = 0x00001000,     // Class / interface is imported
+
+        // Use tdStringFormatMask to retrieve string information for native interop
+        StringFormatMask = 0x00030000,
+        AnsiClass = 0x00000000,     // LPTSTR is interpreted as ANSI in this class
+        UnicodeClass = 0x00010000,     // LPTSTR is interpreted as UNICODE
+        AutoClass = 0x00020000,     // LPTSTR is interpreted automatically
+        CustomFormatClass = 0x00030000,     // A non-standard encoding specified by CustomFormatMask
+        CustomFormatMask = 0x00C00000,     // Use this mask to retrieve non-standard encoding information for native interop. The meaning of the values of these 2 bits is unspecified.
+
+        // end string format mask
+
+        BeforeFieldInit = 0x00100000,     // Initialize the class any time before first static field access.
+
+        RTSpecialName = 0x00000800,     // Runtime should check name encoding.
+        HasSecurity = 0x00040000,     // Class has security associate with it.
+
+        ReservedMask = 0x00040800,
+    }
+    [Flags]
+    public enum BindingFlags
+    {
+        // a place holder for no flag specified
+        Default = 0x00,
+
+        // These flags indicate what to search for when binding
+        IgnoreCase = 0x01,          // Ignore the case of Names while searching
+        DeclaredOnly = 0x02,        // Only look at the members declared on the Type
+        Instance = 0x04,            // Include Instance members in search
+        Static = 0x08,              // Include Static members in search
+        Public = 0x10,              // Include Public members in search
+        NonPublic = 0x20,           // Include Non-Public members in search
+        FlattenHierarchy = 0x40,    // Rollup the statics into the class.
+
+        // BindingAccess = 0xFF00;
+        InvokeMethod = 0x0100,
+        CreateInstance = 0x0200,
+        GetField = 0x0400,
+        SetField = 0x0800,
+        GetProperty = 0x1000,
+        SetProperty = 0x2000,
+
+        PutDispProperty = 0x4000,
+        PutRefDispProperty = 0x8000,
+
+        ExactBinding = 0x010000,
+        SuppressChangeType = 0x020000,
+
+        OptionalParamBinding = 0x040000,
+
+        IgnoreReturn = 0x01000000, 
+        DoNotWrapExceptions = 0x02000000, 
+    }
+    [Flags]
+    public enum CallingConventions
+    {
+        Standard = 0x0001,
+        VarArgs = 0x0002,
+        Any = Standard | VarArgs,
+        HasThis = 0x0020,
+        ExplicitThis = 0x0040,
+    }
     public interface IReflect
     {
-
+        Type UnderlyingSystemType { get; }
     }
     public abstract class MemberInfo
     {
-
+        internal virtual bool CacheEquals(object? o) { throw new NotImplementedException(); }
     }
 }
 namespace System.Globalization
@@ -12193,6 +12581,91 @@ namespace System.Collections
         void Remove(object value);
         void RemoveAt(int index);
     }
+    public interface IEqualityComparer
+    {
+        bool Equals(object? x, object? y);
+        int GetHashCode(object obj);
+    }
+    internal static class HashHelpers
+    {
+        public const uint HashCollisionThreshold = 100;
+
+        // This is the maximum prime smaller than Array.MaxLength.
+        public const int MaxPrimeArrayLength = 0x7FFFFFC3;
+
+        public const int HashPrime = 101;
+
+        // Table of prime numbers to use as hash table sizes.
+        internal static ReadOnlySpan<int> Primes =>
+        [
+            3, 7, 11, 17, 23, 29, 37, 47, 59, 71, 89, 107, 131, 163, 197, 239, 293, 353, 431, 521, 631, 761, 919,
+            1103, 1327, 1597, 1931, 2333, 2801, 3371, 4049, 4861, 5839, 7013, 8419, 10103, 12143, 14591,
+            17519, 21023, 25229, 30293, 36353, 43627, 52361, 62851, 75431, 90523, 108631, 130363, 156437,
+            187751, 225307, 270371, 324449, 389357, 467237, 560689, 672827, 807403, 968897, 1162687, 1395263,
+            1674319, 2009191, 2411033, 2893249, 3471899, 4166287, 4999559, 5999471, 7199369
+        ];
+
+        public static bool IsPrime(int candidate)
+        {
+            if ((candidate & 1) != 0)
+            {
+                int limit = (int)Math.Sqrt(candidate);
+                for (int divisor = 3; divisor <= limit; divisor += 2)
+                {
+                    if ((candidate % divisor) == 0)
+                        return false;
+                }
+                return true;
+            }
+            return candidate == 2;
+        }
+
+        public static int GetPrime(int min)
+        {
+            if (min < 0)
+                throw new ArgumentException();
+
+            foreach (int prime in Primes)
+            {
+                if (prime >= min)
+                    return prime;
+            }
+
+            // Outside of our predefined table. Compute the hard way.
+            for (int i = (min | 1); i < int.MaxValue; i += 2)
+            {
+                if (IsPrime(i) && ((i - 1) % HashPrime != 0))
+                    return i;
+            }
+            return min;
+        }
+        // Returns size of hashtable to grow to.
+        public static int ExpandPrime(int oldSize)
+        {
+            int newSize = 2 * oldSize;
+
+            if ((uint)newSize > MaxPrimeArrayLength && MaxPrimeArrayLength > oldSize)
+            {
+                return MaxPrimeArrayLength;
+            }
+
+            return GetPrime(newSize);
+        }
+        /// <summary>Returns approximate reciprocal of the divisor: ceil(2**64 / divisor).</summary>
+        /// <remarks>This should only be used on 64-bit.</remarks>
+        public static ulong GetFastModMultiplier(uint divisor) =>
+            ulong.MaxValue / divisor + 1;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint FastMod(uint value, uint divisor, ulong multiplier)
+        {
+            // This is equivalent of (uint)Math.BigMul(multiplier * value, divisor, out _).
+            // This version is faster than BigMul because we only need the high bits.
+            uint highbits = (uint)(((((multiplier * value) >> 32) + 1) * divisor) >> 32);
+
+            return highbits;
+        }
+    }
 }
 namespace System.Collections.Generic
 {
@@ -12734,6 +13207,201 @@ namespace System.Collections.Generic
                     Array.Clear(_items, _size, count);
                 }
             }
+        }
+    }
+    public interface IDictionary<TKey, TValue> : ICollection<KeyValuePair<TKey, TValue>>
+    {
+        TValue this[TKey key]
+        {
+            get;
+            set;
+        }
+
+        // Returns a collections of the keys in this dictionary.
+        ICollection<TKey> Keys
+        {
+            get;
+        }
+
+        // Returns a collections of the values in this dictionary.
+        ICollection<TValue> Values
+        {
+            get;
+        }
+
+        // Returns whether this dictionary contains a particular key.
+        //
+        bool ContainsKey(TKey key);
+
+        // Adds a key-value pair to the dictionary.
+        //
+        void Add(TKey key, TValue value);
+
+        // Removes a particular key from the dictionary.
+        //
+        bool Remove(TKey key);
+
+        bool TryGetValue(TKey key, out TValue value);
+    }
+    public interface IReadOnlyDictionary<TKey, TValue> : IReadOnlyCollection<KeyValuePair<TKey, TValue>>
+    {
+        bool ContainsKey(TKey key);
+        bool TryGetValue(TKey key, out TValue value);
+
+        TValue this[TKey key] { get; }
+        IEnumerable<TKey> Keys { get; }
+        IEnumerable<TValue> Values { get; }
+    }
+    public interface IEqualityComparer<in T> where T : allows ref struct
+    {
+        bool Equals(T? x, T? y);
+        int GetHashCode(T obj);
+    }
+    public abstract class EqualityComparer<T> : IEqualityComparer, IEqualityComparer<T>
+    {
+        public static EqualityComparer<T> Default { get; } = null;
+    }
+    public static class KeyValuePair
+    {
+        // Creates a new KeyValuePair<TKey, TValue> from the given values.
+        public static KeyValuePair<TKey, TValue> Create<TKey, TValue>(TKey key, TValue value) =>
+            new KeyValuePair<TKey, TValue>(key, value);
+
+        internal static string PairToString(object? key, object? value)
+        {
+            return $"[{key}, {value}]";
+        }
+    }
+    public struct KeyValuePair<TKey, TValue>
+    {
+        private readonly TKey key; // Do not rename
+        private readonly TValue value; // Do not rename
+
+        public KeyValuePair(TKey key, TValue value)
+        {
+            this.key = key;
+            this.value = value;
+        }
+
+        public TKey Key => key;
+
+        public TValue Value => value;
+
+        public override string ToString()
+        {
+            return KeyValuePair.PairToString(Key, Value);
+        }
+
+        public void Deconstruct(out TKey key, out TValue value)
+        {
+            key = Key;
+            value = Value;
+        }
+    }
+    public class Dictionary<TKey, TValue>
+    {
+        // constants for serialization
+        private const string VersionName = "Version"; // Do not rename
+        private const string HashSizeName = "HashSize"; // Do not rename
+        private const string KeyValuePairsName = "KeyValuePairs"; // Do not rename
+        private const string ComparerName = "Comparer"; // Do not rename
+
+        private int[]? _buckets;
+        private Entry[]? _entries;
+        private ulong _fastModMultiplier;
+        private int _count;
+        private int _freeList;
+        private int _freeCount;
+        private int _version;
+        private IEqualityComparer<TKey>? _comparer;
+        private KeyCollection? _keys;
+        private ValueCollection? _values;
+        private const int StartOfFreeList = -3;
+
+        public Dictionary() : this(0, null) { }
+
+        public Dictionary(int capacity) : this(capacity, null) { }
+
+        public Dictionary(IEqualityComparer<TKey>? comparer) : this(0, comparer) { }
+
+        public Dictionary(int capacity, IEqualityComparer<TKey>? comparer)
+        {
+            if (capacity < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            if (capacity > 0)
+            {
+                Initialize(capacity);
+            }
+
+        }
+
+        private int Initialize(int capacity)
+        {
+            int size = HashHelpers.GetPrime(capacity);
+            int[] buckets = new int[size];
+            Entry[] entries = new Entry[size];
+
+            _freeList = -1;
+            _fastModMultiplier = HashHelpers.GetFastModMultiplier((uint)size); //#if TARGET_64BIT
+            _buckets = buckets;
+            _entries = entries;
+
+
+            return size;
+        }
+
+        public int Count => _count - _freeCount;
+
+        /// <summary>
+        /// Gets the total numbers of elements the internal data structure can hold without resizing.
+        /// </summary>
+        public int Capacity => _entries?.Length ?? 0;
+
+        private struct Entry
+        {
+            public uint hashCode;
+            /// <summary>
+            /// 0-based index of next entry in chain: -1 means end of chain
+            /// also encodes whether this entry _itself_ is part of the free list by changing sign and subtracting 3,
+            /// so -2 means end of free list, -3 means index 0 but on free list, -4 means index 1 but on free list, etc.
+            /// </summary>
+            public int next;
+            public TKey key;     // Key of entry
+            public TValue value; // Value of entry
+        }
+        public sealed class KeyCollection
+        {
+            private readonly Dictionary<TKey, TValue> _dictionary;
+
+            public KeyCollection(Dictionary<TKey, TValue> dictionary)
+            {
+                if (dictionary == null)
+                {
+                    throw new ArgumentNullException();
+                }
+
+                _dictionary = dictionary;
+            }
+
+            public int Count => _dictionary.Count;
+        }
+        public sealed class ValueCollection
+        {
+            private readonly Dictionary<TKey, TValue> _dictionary;
+
+            public ValueCollection(Dictionary<TKey, TValue> dictionary)
+            {
+                if (dictionary == null)
+                {
+                    throw new ArgumentNullException();
+                }
+
+                _dictionary = dictionary;
+            }
+
+            public int Count => _dictionary.Count;
         }
     }
 }

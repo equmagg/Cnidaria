@@ -63,7 +63,11 @@ namespace Cnidaria.Cs
     internal enum GenTreeLinearKind : byte
     {
         Tree,
+
         Copy,
+
+        PhiCopy,
+
         GcPoll,
     }
 
@@ -941,27 +945,93 @@ namespace Cnidaria.Cs
 
             var result = ImmutableArray.CreateBuilder<int>(cfg.Blocks.Length);
             var seen = new bool[cfg.Blocks.Length];
+            var loopDepth = BuildLoopDepthMap(cfg);
 
-            void Add(int blockId)
+            void AddTrace(int blockId)
             {
                 if ((uint)blockId >= (uint)cfg.Blocks.Length)
                     throw new InvalidOperationException($"CFG block order contains invalid block id B{blockId}.");
                 if (seen[blockId])
                     return;
+
                 seen[blockId] = true;
                 result.Add(blockId);
+
+                var successors = OrderSuccessorsForLayout(cfg, blockId, loopDepth);
+                for (int i = 0; i < successors.Length; i++)
+                    AddTrace(successors[i]);
             }
 
             if (cfg.Blocks.Length != 0)
-                Add(0);
+                AddTrace(0);
 
             for (int i = 0; i < cfg.ReversePostOrder.Length; i++)
-                Add(cfg.ReversePostOrder[i]);
+                AddTrace(cfg.ReversePostOrder[i]);
 
             for (int blockId = 0; blockId < cfg.Blocks.Length; blockId++)
-                Add(blockId);
+                AddTrace(blockId);
 
             return result.ToImmutable();
+        }
+
+        private static int[] BuildLoopDepthMap(ControlFlowGraph cfg)
+        {
+            var depth = new int[cfg.Blocks.Length];
+            for (int i = 0; i < cfg.NaturalLoops.Length; i++)
+            {
+                var loop = cfg.NaturalLoops[i];
+                int loopDepth = Math.Max(1, loop.Depth + 1);
+                for (int b = 0; b < loop.Blocks.Length; b++)
+                {
+                    int blockId = loop.Blocks[b];
+                    if ((uint)blockId < (uint)depth.Length && loopDepth > depth[blockId])
+                        depth[blockId] = loopDepth;
+                }
+            }
+            return depth;
+        }
+
+        private static ImmutableArray<int> OrderSuccessorsForLayout(ControlFlowGraph cfg, int blockId, int[] loopDepth)
+        {
+            var successors = cfg.Blocks[blockId].Successors;
+            if (successors.Length == 0)
+                return ImmutableArray<int>.Empty;
+
+            var normal = ImmutableArray.CreateBuilder<CfgEdge>(successors.Length);
+            var exceptional = ImmutableArray.CreateBuilder<CfgEdge>();
+            for (int i = 0; i < successors.Length; i++)
+            {
+                var edge = successors[i];
+                if (edge.Kind == CfgEdgeKind.Exception)
+                    exceptional.Add(edge);
+                else
+                    normal.Add(edge);
+            }
+
+            normal.Sort((left, right) => CompareLayoutEdges(left, right, loopDepth));
+            exceptional.Sort((left, right) => left.ToBlockId.CompareTo(right.ToBlockId));
+
+            var ordered = ImmutableArray.CreateBuilder<int>(successors.Length);
+            for (int i = 0; i < normal.Count; i++)
+                ordered.Add(normal[i].ToBlockId);
+            for (int i = 0; i < exceptional.Count; i++)
+                ordered.Add(exceptional[i].ToBlockId);
+            return ordered.ToImmutable();
+        }
+
+        private static int CompareLayoutEdges(CfgEdge left, CfgEdge right, int[] loopDepth)
+        {
+            int leftFallThrough = left.Kind == CfgEdgeKind.FallThrough ? 0 : 1;
+            int rightFallThrough = right.Kind == CfgEdgeKind.FallThrough ? 0 : 1;
+            if (leftFallThrough != rightFallThrough)
+                return leftFallThrough.CompareTo(rightFallThrough);
+
+            int leftDepth = (uint)left.ToBlockId < (uint)loopDepth.Length ? loopDepth[left.ToBlockId] : 0;
+            int rightDepth = (uint)right.ToBlockId < (uint)loopDepth.Length ? loopDepth[right.ToBlockId] : 0;
+            if (leftDepth != rightDepth)
+                return rightDepth.CompareTo(leftDepth);
+
+            return left.ToBlockId.CompareTo(right.ToBlockId);
         }
 
         public static ImmutableArray<int> Normalize(ControlFlowGraph cfg, ImmutableArray<int> order)
@@ -1001,6 +1071,7 @@ namespace Cnidaria.Cs
         public static LinearRationalizationOptions Default => new LinearRationalizationOptions();
 
         public bool IncludeExceptionEdges { get; set; } = true;
+
 
         public bool Validate { get; set; } = true;
     }
@@ -1156,7 +1227,7 @@ namespace Cnidaria.Cs
                     for (int p = 0; p < block.Phis.Length; p++)
                     {
                         var phi = block.Phis[p];
-                        if (!_ssaValues.ContainsKey(phi.Target))
+                        if (IsSsaValueDemanded(phi.Target) && !_ssaValues.ContainsKey(phi.Target))
                             _ssaValues[phi.Target] = CreateSsaPlaceholderValueNode(phi.Target);
                     }
 
@@ -1170,31 +1241,134 @@ namespace Cnidaria.Cs
                 if (_ssa is null)
                     return;
 
+                var phiByTarget = new Dictionary<SsaValueName, SsaPhi>();
+                var storeByTarget = new Dictionary<SsaValueName, SsaTree>();
+                var work = new Queue<SsaValueName>();
+
                 for (int b = 0; b < _ssa.Blocks.Length; b++)
                 {
                     var block = _ssa.Blocks[b];
                     for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                            _usedSsaValues.Add(phi.Inputs[i].Value);
-                    }
+                        phiByTarget[block.Phis[p].Target] = block.Phis[p];
 
                     for (int s = 0; s < block.Statements.Length; s++)
-                        CollectUsedSsaValues(block.Statements[s]);
+                        CollectSsaStoreDefinitions(block.Statements[s], storeByTarget);
+                }
+
+                for (int b = 0; b < _ssa.Blocks.Length; b++)
+                {
+                    var block = _ssa.Blocks[b];
+                    for (int s = 0; s < block.Statements.Length; s++)
+                    {
+                        var statement = block.Statements[s];
+                        if (statement.StoreTarget.HasValue)
+                        {
+                            if (StoreRhsHasObservableSsaEffect(statement))
+                                MarkSsaUses(statement, work, includeStoreTarget: false);
+                        }
+                        else if (HasObservableSsaEffect(statement))
+                        {
+                            MarkSsaUses(statement, work, includeStoreTarget: false);
+                        }
+                    }
+                }
+
+                while (work.Count != 0)
+                {
+                    var value = work.Dequeue();
+
+                    if (storeByTarget.TryGetValue(value, out var definingStore))
+                    {
+                        MarkSsaUses(definingStore, work, includeStoreTarget: false);
+                        continue;
+                    }
+
+                    if (phiByTarget.TryGetValue(value, out var phi))
+                    {
+                        for (int i = 0; i < phi.Inputs.Length; i++)
+                            MarkUsedSsaValue(phi.Inputs[i].Value, work);
+                    }
                 }
             }
 
-            private void CollectUsedSsaValues(SsaTree tree)
+            private void CollectSsaStoreDefinitions(SsaTree tree, Dictionary<SsaValueName, SsaTree> storeByTarget)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    CollectSsaStoreDefinitions(tree.Operands[i], storeByTarget);
+
+                if (tree.StoreTarget.HasValue)
+                    storeByTarget[tree.StoreTarget.Value] = tree;
+            }
+
+            private void MarkSsaUses(SsaTree tree, Queue<SsaValueName> work, bool includeStoreTarget)
             {
                 if (tree.Value.HasValue)
-                    _usedSsaValues.Add(tree.Value.Value);
+                    MarkUsedSsaValue(tree.Value.Value, work);
 
                 if (tree.LocalFieldBaseValue.HasValue)
-                    _usedSsaValues.Add(tree.LocalFieldBaseValue.Value);
+                    MarkUsedSsaValue(tree.LocalFieldBaseValue.Value, work);
+
+                if (includeStoreTarget && tree.StoreTarget.HasValue)
+                    MarkUsedSsaValue(tree.StoreTarget.Value, work);
 
                 for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectUsedSsaValues(tree.Operands[i]);
+                    MarkSsaUses(tree.Operands[i], work, includeStoreTarget: true);
+            }
+
+            private void MarkUsedSsaValue(SsaValueName value, Queue<SsaValueName> work)
+            {
+                if (_usedSsaValues.Add(value))
+                    work.Enqueue(value);
+            }
+
+            private bool StoreRhsHasObservableSsaEffect(SsaTree tree)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (HasObservableSsaEffect(tree.Operands[i]))
+                        return true;
+                }
+
+                return false;
+            }
+
+            private bool HasObservableSsaEffect(SsaTree tree)
+            {
+                if (tree.HasMemoryEffects)
+                    return true;
+
+                if (tree.Value.HasValue)
+                    return false;
+
+                if (tree.StoreTarget.HasValue)
+                    return StoreRhsHasObservableSsaEffect(tree);
+
+                switch (tree.Kind)
+                {
+                    case GenTreeKind.ConstI4:
+                    case GenTreeKind.ConstI8:
+                    case GenTreeKind.ConstR4Bits:
+                    case GenTreeKind.ConstR8Bits:
+                    case GenTreeKind.ConstNull:
+                    case GenTreeKind.ConstString:
+                    case GenTreeKind.DefaultValue:
+                    case GenTreeKind.SizeOf:
+                    case GenTreeKind.Local:
+                    case GenTreeKind.Arg:
+                    case GenTreeKind.Temp:
+                        return false;
+                }
+
+                if (MustMaterializeForSideEffects(tree.Source))
+                    return true;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (HasObservableSsaEffect(tree.Operands[i]))
+                        return true;
+                }
+
+                return false;
             }
 
             private void AttachSsaAnnotations(SsaTree tree)
@@ -1210,11 +1384,14 @@ namespace Cnidaria.Cs
                 if (tree.StoreTarget.HasValue)
                 {
                     var target = tree.StoreTarget.Value;
-                    var info = GetSsaSlotInfo(target.Slot);
-                    tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
-                    AttachSsaDescriptor(tree.Source, target.Slot);
-                    _ssaValues[target] = tree.Source;
-                    EnsureSsaValueInfo(target, tree.Source);
+                    if (IsSsaValueDemanded(target))
+                    {
+                        var info = GetSsaSlotInfo(target.Slot);
+                        tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
+                        AttachSsaDescriptor(tree.Source, target.Slot);
+                        _ssaValues[target] = tree.Source;
+                        EnsureSsaValueInfo(target, tree.Source);
+                    }
                 }
             }
 
@@ -1224,6 +1401,9 @@ namespace Cnidaria.Cs
                     return info;
                 return new SsaSlotInfo(slot, type: null, stackKind: GenStackKind.Unknown, addressExposed: false);
             }
+
+            private bool IsSsaValueDemanded(SsaValueName value)
+                => _ssa is null || _usedSsaValues.Contains(value);
 
             private bool TryGetSsaDescriptor(SsaSlot slot, out GenLocalDescriptor descriptor)
             {
@@ -1504,6 +1684,12 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                if (tree.StoreTarget.HasValue && !IsSsaValueDemanded(tree.StoreTarget.Value))
+                {
+                    LowerDeadSsaDefinitionForSideEffects(tree);
+                    return;
+                }
+
                 if (tree.StoreTarget.HasValue || MustMaterializeForSideEffects(tree.Source))
                 {
                     _ = LowerValueOrVoid(tree);
@@ -1548,6 +1734,12 @@ namespace Cnidaria.Cs
                 if (tree.Value.HasValue)
                     return;
 
+                if (tree.StoreTarget.HasValue && !IsSsaValueDemanded(tree.StoreTarget.Value))
+                {
+                    LowerDeadSsaDefinitionForSideEffects(tree);
+                    return;
+                }
+
                 if (IsControlTransfer(tree.Source))
                 {
                     LowerControlTransfer(tree);
@@ -1562,6 +1754,54 @@ namespace Cnidaria.Cs
 
                 for (int i = 0; i < tree.Operands.Length; i++)
                     LowerForSideEffects(tree.Operands[i]);
+            }
+
+            private void LowerDeadSsaDefinitionForSideEffects(SsaTree tree)
+            {
+                var uses = LowerOperands(tree);
+
+                if (!MustMaterializeDeadSsaDefinitionSource(tree.Source))
+                    return;
+
+                GenTree? result = RequiresCodegenResultForDeadDefinition(tree.Source)
+                    ? NewTemp(tree.Source)
+                    : null;
+
+                EmitTree(tree.Source, uses, result);
+            }
+
+            private static bool MustMaterializeDeadSsaDefinitionSource(GenTree tree)
+            {
+                if (!MustMaterializeForSideEffects(tree))
+                    return false;
+
+                return tree.Kind is not (
+                    GenTreeKind.StoreLocal or
+                    GenTreeKind.StoreArg or
+                    GenTreeKind.StoreTemp or
+                    GenTreeKind.StoreField or
+                    GenTreeKind.StoreStaticField or
+                    GenTreeKind.StoreIndirect or
+                    GenTreeKind.StoreArrayElement);
+            }
+
+            private static bool RequiresCodegenResultForDeadDefinition(GenTree tree)
+            {
+                if (!ProducesValue(tree))
+                    return false;
+
+                if (tree.Kind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+                {
+                    var method = tree.Method;
+                    if (method is null)
+                        return true;
+
+                    var returnKind = MachineAbi.StackKindForType(method.ReturnType);
+                    var returnAbi = MachineAbi.ClassifyValue(method.ReturnType, returnKind, isReturn: true);
+                    return returnAbi.PassingKind is AbiValuePassingKind.Indirect or AbiValuePassingKind.Stack;
+                }
+
+                return true;
             }
 
             private static bool MustMaterializeForSideEffects(GenTree tree)
@@ -1956,6 +2196,9 @@ namespace Cnidaria.Cs
                     for (int p = 0; p < block.Phis.Length; p++)
                     {
                         var phi = block.Phis[p];
+                        if (!IsSsaValueDemanded(phi.Target))
+                            continue;
+
                         var target = GetOrCreateSsaValue(phi.Target);
 
                         for (int i = 0; i < phi.Inputs.Length; i++)
@@ -1993,7 +2236,7 @@ namespace Cnidaria.Cs
                     _nextNodeId++,
                     placementBlockId,
                     ordinal: 0,
-                    GenTreeLinearKind.Copy,
+                    GenTreeLinearKind.PhiCopy,
                     destination,
                     ImmutableArray<LirOperandFlags>.Empty,
                     uses,
@@ -2199,12 +2442,111 @@ namespace Cnidaria.Cs
             if (rationalizedMethod.LinearNodes.IsDefaultOrEmpty && rationalizedMethod.Blocks.Length != 0)
                 throw new InvalidOperationException("Lowering requires rationalized LIR nodes. Call GenTreeLinearIrRationalizer.RationalizeMethod first.");
 
+            LinearLoweringRefiner.Refine(rationalizedMethod);
             var result = LinearLiveness.Attach(rationalizedMethod);
 
             if (options.Validate)
                 LinearVerifier.Verify(result);
 
             return result;
+        }
+    }
+
+    internal static class LinearLoweringRefiner
+    {
+        public static void Refine(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            for (int i = 0; i < method.LinearNodes.Length; i++)
+            {
+                var node = method.LinearNodes[i];
+                if (node.LinearKind == GenTreeLinearKind.Tree)
+                    RefineTreeNode(node);
+            }
+        }
+
+        private static void RefineTreeNode(GenTree node)
+        {
+            var memoryAccess = GenTreeLinearLoweringClassifier.ClassifyMemoryAccess(node);
+            var operands = RefineOperandFlags(node, memoryAccess);
+            var uses = BuildUses(node, operands);
+            var lowering = GenTreeLinearLoweringClassifier.Classify(node, node.RegisterResult, uses, node.LinearBlockId, memoryAccess);
+
+            node.SetLinearState(
+                node.LinearId,
+                node.LinearBlockId,
+                node.LinearOrdinal,
+                node.LinearKind,
+                node.RegisterResults,
+                operands,
+                uses,
+                lowering,
+                memoryAccess,
+                node.LinearPhiCopyFromBlockId,
+                node.LinearPhiCopyToBlockId);
+        }
+
+        private static ImmutableArray<LirOperandFlags> RefineOperandFlags(GenTree node, LinearMemoryAccess memoryAccess)
+        {
+            if (node.Operands.IsDefaultOrEmpty)
+                return ImmutableArray<LirOperandFlags>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<LirOperandFlags>(node.Operands.Length);
+            int existingCount = node.OperandFlags.IsDefaultOrEmpty ? 0 : node.OperandFlags.Length;
+            for (int i = 0; i < node.Operands.Length; i++)
+            {
+                var flags = i < existingCount ? node.OperandFlags[i] : LirOperandFlags.None;
+
+                if ((flags & LirOperandFlags.Contained) == 0 &&
+                    memoryAccess.HasValueOperand(i) &&
+                    CanUseValueOperandFromHome(node, i, memoryAccess))
+                {
+                    flags |= LirOperandFlags.RegOptional;
+                }
+
+                builder.Add(flags);
+            }
+
+            return builder.ToImmutable();
+        }
+
+        private static bool CanUseValueOperandFromHome(GenTree node, int operandIndex, LinearMemoryAccess memoryAccess)
+        {
+            if (node.HasLoweringFlag(GenTreeLinearFlags.RequiresRegisterOperands))
+                return false;
+
+            if (memoryAccess.HasAddressOperand(operandIndex))
+                return false;
+
+            if (memoryAccess.IsBlockCopy)
+                return true;
+
+            var operand = node.Operands[operandIndex];
+            var abi = MachineAbi.ClassifyStorageValue(operand.Type, operand.StackKind);
+            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister;
+        }
+
+        private static ImmutableArray<GenTree> BuildUses(GenTree tree, ImmutableArray<LirOperandFlags> operandFlags)
+        {
+            if (tree.Operands.IsDefaultOrEmpty)
+                return ImmutableArray<GenTree>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
+            int flagCount = operandFlags.IsDefaultOrEmpty ? 0 : operandFlags.Length;
+            for (int i = 0; i < tree.Operands.Length; i++)
+            {
+                var flags = i < flagCount ? operandFlags[i] : LirOperandFlags.None;
+                if ((flags & LirOperandFlags.Contained) != 0)
+                    continue;
+
+                var operandTree = tree.Operands[i];
+                if (operandTree.RegisterResult is not null)
+                    builder.Add(operandTree.RegisterResult);
+            }
+
+            return builder.ToImmutable();
         }
     }
 
@@ -2218,11 +2560,11 @@ namespace Cnidaria.Cs
             var layout = PositionLayout.Build(method);
             var intervals = BuildIntervals(method, layout, out var intervalMap);
             MarkUnusedValueDefinitions(method, intervalMap);
+
             var refPositions = BuildRefPositions(method, intervalMap, layout);
             method.AttachLiveness(intervals, intervalMap, refPositions);
             return method;
         }
-
 
         public static ImmutableArray<LinearRefPosition> BuildRefPositions(
             GenTreeMethod method,
@@ -2242,7 +2584,7 @@ namespace Cnidaria.Cs
 
                 AddInternalRegisterRefPositions(result, node, usePosition);
 
-                if (node.LinearKind == GenTreeLinearKind.Copy)
+                if (node.LinearKind is GenTreeLinearKind.Copy or GenTreeLinearKind.PhiCopy)
                 {
                     if (node.RegisterResult is null || node.RegisterUses.Length != 1)
                         throw new InvalidOperationException("linear IR copy node must have one source and one destination value.");
@@ -2334,10 +2676,6 @@ namespace Cnidaria.Cs
             if (destinationAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
                 destinationFlags |= LinearRefPositionFlags.StackOnly | LinearRefPositionFlags.ExposedMemory;
 
-            if (IsSsaLocalValue(sourceValue) && sourceAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
-                sourceFlags |= LinearRefPositionFlags.RequiresRegister;
-            if (IsSsaLocalValue(destinationValue) && destinationAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
-                destinationFlags |= LinearRefPositionFlags.RequiresRegister;
 
             if (sourceAbi.PassingKind == AbiValuePassingKind.MultiRegister ||
                 destinationAbi.PassingKind == AbiValuePassingKind.MultiRegister)
@@ -2581,9 +2919,6 @@ namespace Cnidaria.Cs
             if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister)
                 return false;
 
-            if (node.RegisterResult is not null && IsSsaLocalValue(node.RegisterResult))
-                return true;
-
             return node.Kind switch
             {
                 GenTreeKind.Local => false,
@@ -2596,9 +2931,6 @@ namespace Cnidaria.Cs
                 _ => true,
             };
         }
-
-        private static bool IsSsaLocalValue(GenTree value)
-            => value.LinearValueKey.IsSsaValue;
 
         private static void ApplyMemoryUseFlags(LinearMemoryAccess memory, int operandIndex, ref LinearRefPositionFlags flags)
         {
@@ -4260,13 +4592,13 @@ namespace Cnidaria.Cs
         {
             sb.Append('#').Append(node.LinearId).Append(' ');
 
-            if (node.LinearKind == GenTreeLinearKind.Copy)
+            if (node.LinearKind is GenTreeLinearKind.Copy or GenTreeLinearKind.PhiCopy)
             {
                 sb.Append(node.RegisterResult is not null ? node.RegisterResult.ToString() : "<none>")
-                  .Append(" <- copy ")
+                  .Append(node.IsPhiCopy ? " <- phi " : " <- copy ")
                   .Append(node.RegisterUses.Length == 0 ? "<missing>" : node.RegisterUses[0].ToString());
                 if (node.IsPhiCopy)
-                    sb.Append(" ; phi-edge B").Append(node.LinearPhiCopyFromBlockId).Append("->B").Append(node.LinearPhiCopyToBlockId);
+                    sb.Append(" ; edge B").Append(node.LinearPhiCopyFromBlockId).Append("->B").Append(node.LinearPhiCopyToBlockId);
                 return;
             }
 

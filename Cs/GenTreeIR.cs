@@ -421,7 +421,6 @@ namespace Cnidaria.Cs
             SsaPromoted &&
             Tracked &&
             VarIndex >= 0 &&
-            !DoNotEnregister &&
             !HasMemoryAlias &&
             (
                 (!IsStructField && (Category == GenLocalCategory.RegularPromotedScalarLocal || Category == GenLocalCategory.CompilerTemp)) ||
@@ -463,6 +462,13 @@ namespace Cnidaria.Cs
 
         internal void ResetPreSsaClassification()
         {
+            bool wasPromotedField = IsStructField && ParentLclNum >= 0 && PromotedField is not null;
+            int oldParentLclNum = ParentLclNum;
+            int oldFieldOrdinal = FieldOrdinal;
+            int oldFieldOffset = FieldOffset;
+            int oldFieldSize = FieldSize;
+            RuntimeField? oldPromotedField = PromotedField;
+
             LocalFlags = GenLocalFlags.None;
             Category = GenLocalCategory.Unclassified;
             ParentLclNum = -1;
@@ -472,10 +478,22 @@ namespace Cnidaria.Cs
             PromotedField = null;
             _promotedFieldsByFieldId.Clear();
             _promotedFieldsByOffset.Clear();
+
+            if (wasPromotedField)
+            {
+                MarkPromotedStructField(
+                    oldParentLclNum,
+                    oldFieldOrdinal,
+                    oldFieldOffset,
+                    oldFieldSize,
+                    oldPromotedField);
+            }
+
             if (Kind == GenLocalKind.Temporary)
             {
                 IsCompilerTemp = true;
-                Category = GenLocalCategory.CompilerTemp;
+                if (!wasPromotedField)
+                    Category = GenLocalCategory.CompilerTemp;
             }
             ClassifySpecialStorage();
             ResetTrackingAndLivenessState();
@@ -907,7 +925,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        public bool IsPhiCopy => LinearKind == GenTreeLinearKind.Copy && LinearPhiCopyFromBlockId >= 0 && LinearPhiCopyToBlockId >= 0;
+        public bool IsPhiCopy => LinearKind == GenTreeLinearKind.PhiCopy && LinearPhiCopyFromBlockId >= 0 && LinearPhiCopyToBlockId >= 0;
 
         public bool HasLoweringFlag(GenTreeLinearFlags flag) => LinearLowering.HasFlag(flag);
 
@@ -1476,28 +1494,59 @@ namespace Cnidaria.Cs
                         if (!CanPromoteField(field))
                             continue;
 
-                        var stackKind = StackKindForDescriptor(field.FieldType);
-                        int fieldIndex = descriptors.Count;
-                        var fieldDescriptor = new GenLocalDescriptor(
-                            nextLclNum++,
-                            kind,
-                            fieldIndex,
-                            field.FieldType,
-                            stackKind,
-                            GenLocalCategory.PromotedStructField);
+                        if (!TryFindExistingPromotedFieldDescriptor(descriptors, parent, field, out var fieldDescriptor))
+                        {
+                            var stackKind = StackKindForDescriptor(field.FieldType);
+                            int fieldIndex = descriptors.Count;
+                            fieldDescriptor = new GenLocalDescriptor(
+                                nextLclNum++,
+                                kind,
+                                fieldIndex,
+                                field.FieldType,
+                                stackKind,
+                                GenLocalCategory.PromotedStructField);
 
-                        fieldDescriptor.MarkPromotedStructField(
-                            parent.LclNum,
-                            ordinal: f,
-                            offset: field.Offset,
-                            size: Math.Max(1, field.FieldType.SizeOf),
-                            field: field);
+                            fieldDescriptor.MarkPromotedStructField(
+                                parent.LclNum,
+                                ordinal: f,
+                                offset: field.Offset,
+                                size: Math.Max(1, field.FieldType.SizeOf),
+                                field: field);
 
-                        descriptors.Add(fieldDescriptor);
+                            descriptors.Add(fieldDescriptor);
+                            changed = true;
+                        }
+
                         parent.AddPromotedField(field, fieldDescriptor);
-                        changed = true;
                     }
                 }
+            }
+
+            static bool TryFindExistingPromotedFieldDescriptor(
+                ImmutableArray<GenLocalDescriptor>.Builder descriptors,
+                GenLocalDescriptor parent,
+                RuntimeField field,
+                out GenLocalDescriptor descriptor)
+            {
+                for (int i = 0; i < descriptors.Count; i++)
+                {
+                    var candidate = descriptors[i];
+                    if (!candidate.IsStructField)
+                        continue;
+                    if (candidate.ParentLclNum != parent.LclNum)
+                        continue;
+                    if (!ReferenceEquals(candidate.PromotedField, field))
+                        continue;
+                    if (candidate.FieldOffset != field.Offset)
+                        throw new InvalidOperationException("Promoted field descriptor has stale field offset.");
+                    if (candidate.FieldSize != Math.Max(1, field.FieldType.SizeOf))
+                        throw new InvalidOperationException("Promoted field descriptor has stale field size.");
+                    descriptor = candidate;
+                    return true;
+                }
+
+                descriptor = null!;
+                return false;
             }
 
             static bool CanPromoteStruct(RuntimeType? type)

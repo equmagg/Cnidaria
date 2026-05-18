@@ -2164,7 +2164,6 @@ namespace Cnidaria.Cs
         public static RegisterStackLayoutOptions Default => new RegisterStackLayoutOptions();
 
         public int FrameAlignment { get; set; } = 16;
-        public bool HomeIncomingArguments { get; set; } = true;
         public bool AllocateLocalSlots { get; set; } = true;
         public bool AllocateTempSlots { get; set; } = true;
         public bool SaveUsedCalleeSavedRegisters { get; set; } = true;
@@ -2721,9 +2720,13 @@ namespace Cnidaria.Cs
             node.LinearId = linearId >= 0 ? linearId : id;
             node.LinearBlockId = blockId;
             node.LinearOrdinal = ordinal;
+            bool isPhiEdgeMove = phiCopyFromBlockId >= 0 || phiCopyToBlockId >= 0;
+            if (isPhiEdgeMove && (phiCopyFromBlockId < 0 || phiCopyToBlockId < 0))
+                throw new InvalidOperationException("Phi edge moves must carry both source and destination block ids.");
+
             node.LinearKind = node.Kind switch
             {
-                GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill => GenTreeLinearKind.Copy,
+                GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill => (isPhiEdgeMove ? GenTreeLinearKind.PhiCopy : GenTreeLinearKind.Copy),
                 GenTreeKind.GcPoll => GenTreeLinearKind.GcPoll,
                 _ => GenTreeLinearKind.Tree,
             };
@@ -2887,6 +2890,35 @@ namespace Cnidaria.Cs
                 moveFlags: moveFlags,
                 phiCopyFromBlockId: phiCopyFromBlockId,
                 phiCopyToBlockId: phiCopyToBlockId);
+        }
+
+        public static GenTree DefaultValue(
+            int id,
+            int blockId,
+            int ordinal,
+            RegisterOperand destination,
+            RuntimeType? type,
+            GenStackKind stackKind,
+            string? comment = null)
+        {
+            if (destination.IsNone)
+                throw new ArgumentException("Default value emission requires a concrete destination.", nameof(destination));
+
+            var node = SyntheticNode(id, GenTreeKind.DefaultValue, stackKind, type);
+            return Attach(
+                node,
+                id,
+                blockId,
+                ordinal,
+                OneResult(destination),
+                ImmutableArray<RegisterOperand>.Empty,
+                ImmutableArray<GenTree>.Empty,
+                ImmutableArray<GenTree>.Empty,
+                ImmutableArray<LirOperandFlags>.Empty,
+                linearId: id,
+                FrameOperation.None,
+                immediate: 0,
+                comment: comment);
         }
 
         public static GenTree Frame(
@@ -3606,11 +3638,15 @@ namespace Cnidaria.Cs
                     node.AttachLsraInfo(BuildLsraInfo(registerMethod, node));
                     int phiCopyFromBlockId = node.LinearPhiCopyFromBlockId;
                     int phiCopyToBlockId = node.LinearPhiCopyToBlockId;
+                    bool isPhiEdgeMove = phiCopyFromBlockId >= 0 || phiCopyToBlockId >= 0;
+                    var linearKind = GenTreeLirKinds.IsCopyKind(node.Kind)
+                        ? (isPhiEdgeMove ? GenTreeLinearKind.PhiCopy : GenTreeLinearKind.Copy)
+                        : node.Kind == GenTreeKind.GcPoll ? GenTreeLinearKind.GcPoll : GenTreeLinearKind.Tree;
                     node.SetLinearState(
                         node.LinearId >= 0 ? node.LinearId : node.Id,
                         block.Id,
                         i,
-                        GenTreeLirKinds.IsCopyKind(node.Kind) ? GenTreeLinearKind.Copy : node.Kind == GenTreeKind.GcPoll ? GenTreeLinearKind.GcPoll : GenTreeLinearKind.Tree,
+                        linearKind,
                         node.RegisterResults,
                         node.OperandFlags,
                         node.RegisterUses,
@@ -3880,6 +3916,7 @@ namespace Cnidaria.Cs
         {
             private readonly GenTreeMethod _method;
             private readonly RegisterAllocatorOptions _options;
+            private readonly Dictionary<GenTree, List<GenTree>> _phiPreferences;
             private readonly Dictionary<GenTree, List<GenTree>> _preferences;
             private readonly Dictionary<AllocationPreferenceKey, List<MachineRegister>> _registerPreferences;
             private readonly Dictionary<int, int> _nodePositions;
@@ -3910,6 +3947,7 @@ namespace Cnidaria.Cs
                 _linearBlockOrder = method.LinearBlockOrder.IsDefaultOrEmpty
                     ? LinearBlockOrder.Compute(method.Cfg)
                     : method.LinearBlockOrder;
+                _phiPreferences = BuildPhiPreferences(method);
                 _preferences = BuildPreferences(method);
                 _registerPreferences = BuildRegisterPreferences(method);
                 _nodePositions = BuildPositionLayout(method, _linearBlockOrder, out _blockStartPositions, out _blockEndPositions);
@@ -4347,7 +4385,7 @@ namespace Cnidaria.Cs
                     var use = uses[i];
                     if ((use.Flags & LinearRefPositionFlags.RegOptional) != 0 &&
                         (use.Flags & LinearRefPositionFlags.RequiresRegister) == 0)
-                    { 
+                    {
                         continue;
                     }
                     if (!TryGetAllocationForValue(use.Value!, out var allocation))
@@ -4650,10 +4688,20 @@ namespace Cnidaria.Cs
                 if (TryAllocatePreferredMachineRegister(current))
                     return true;
 
+                if (TryAllocatePreferredValueRegister(current, _phiPreferences))
+                    return true;
+
                 if (!_options.PreferCopySourceRegister)
                     return false;
 
-                if (!_preferences.TryGetValue(current.Value, out var preferredValues))
+                return TryAllocatePreferredValueRegister(current, _preferences);
+            }
+
+            private bool TryAllocatePreferredValueRegister(
+                AllocationInterval current,
+                Dictionary<GenTree, List<GenTree>> preferences)
+            {
+                if (!preferences.TryGetValue(current.Value, out var preferredValues))
                     return false;
 
                 for (int i = 0; i < preferredValues.Count; i++)
@@ -5566,6 +5614,250 @@ namespace Cnidaria.Cs
                     allNodes);
             }
 
+            private void AppendMoveNode(
+                int blockId,
+                GenTree node,
+                ImmutableArray<GenTree>.Builder blockLinearNodes,
+                ImmutableArray<GenTree>.Builder allNodes)
+            {
+                if (!IsMoveNode(node))
+                {
+                    var placed = node.WithPlacement(blockId, blockLinearNodes.Count);
+                    blockLinearNodes.Add(placed);
+                    allNodes.Add(placed);
+                    return;
+                }
+
+                node = node.WithPlacement(blockId, blockLinearNodes.Count);
+                if (IsRedundantMove(node))
+                    return;
+
+                if (blockLinearNodes.Count != 0 &&
+                    TryFoldMoveWithPrevious(
+                        blockLinearNodes[blockLinearNodes.Count - 1],
+                        node,
+                        blockId,
+                        blockLinearNodes.Count - 1,
+                        out var previousReplacement,
+                        out var currentReplacement))
+                {
+                    ReplacePreviousNode(previousReplacement, blockLinearNodes, allNodes);
+
+                    if (currentReplacement is null || IsRedundantMove(currentReplacement))
+                        return;
+
+                    node = currentReplacement.WithPlacement(blockId, blockLinearNodes.Count);
+                }
+
+                if (blockLinearNodes.Count != 0 &&
+                    TryRewriteAfterPreviousMove(blockLinearNodes[blockLinearNodes.Count - 1], node, blockId, blockLinearNodes.Count, out var rewritten))
+                {
+                    if (rewritten is null || IsRedundantMove(rewritten))
+                        return;
+
+                    node = rewritten;
+                }
+
+                blockLinearNodes.Add(node);
+                allNodes.Add(node);
+            }
+
+            private static void ReplacePreviousNode(
+                GenTree? replacement,
+                ImmutableArray<GenTree>.Builder blockLinearNodes,
+                ImmutableArray<GenTree>.Builder allNodes)
+            {
+                if (blockLinearNodes.Count == 0 || allNodes.Count == 0)
+                    throw new InvalidOperationException("Cannot replace previous node in an empty LIR builder.");
+
+                if (replacement is null)
+                {
+                    blockLinearNodes.RemoveAt(blockLinearNodes.Count - 1);
+                    allNodes.RemoveAt(allNodes.Count - 1);
+                    return;
+                }
+
+                blockLinearNodes[blockLinearNodes.Count - 1] = replacement;
+                allNodes[allNodes.Count - 1] = replacement;
+            }
+
+            private static bool IsMoveNode(GenTree node)
+                => (node.Kind == GenTreeKind.Copy || node.Kind == GenTreeKind.Reload || node.Kind == GenTreeKind.Spill) &&
+                   node.Results.Length == 1 &&
+                   node.Uses.Length == 1;
+
+            private static bool IsRedundantMove(GenTree node)
+                => IsMoveNode(node) && node.Results[0].Equals(node.Uses[0]);
+
+            private static bool TryFoldMoveWithPrevious(
+                GenTree previous,
+                GenTree current,
+                int blockId,
+                int previousOrdinal,
+                out GenTree? previousReplacement,
+                out GenTree? currentReplacement)
+            {
+                previousReplacement = previous;
+                currentReplacement = current;
+
+                if (!IsMoveNode(previous) || !IsMoveNode(current))
+                    return false;
+
+                if (previous.IsPhiCopy || current.IsPhiCopy)
+                    return false;
+
+                if (previous.Results[0].Equals(current.Results[0]) &&
+                    previous.Uses[0].Equals(current.Uses[0]))
+                {
+                    currentReplacement = null;
+                    return true;
+                }
+
+                if (!previous.Results[0].IsRegister || !current.Uses[0].IsRegister)
+                    return false;
+
+                if (previous.Results[0].Register != current.Uses[0].Register)
+                    return false;
+
+                if (!IsScratchRegister(previous.Results[0].Register))
+                    return false;
+
+                if (previous.MoveKind == MoveKind.Load && current.MoveKind == MoveKind.Register)
+                {
+                    previousReplacement = GenTreeLirFactory.Move(
+                        previous.LinearId >= 0 ? previous.LinearId : previous.Id,
+                        blockId,
+                        previousOrdinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current),
+                        comment: MergeMoveComments(previous.Comment, current.Comment, "fold scratch reload"),
+                        moveFlags: StripReloadSpill(previous.MoveFlags | current.MoveFlags));
+                    currentReplacement = null;
+                    return true;
+                }
+
+                if (previous.MoveKind == MoveKind.LoadAddress && current.MoveKind == MoveKind.Register)
+                {
+                    previousReplacement = GenTreeLirFactory.Move(
+                        previous.LinearId >= 0 ? previous.LinearId : previous.Id,
+                        blockId,
+                        previousOrdinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current),
+                        comment: MergeMoveComments(previous.Comment, current.Comment, "fold scratch address"),
+                        moveFlags: StripReloadSpill(previous.MoveFlags | current.MoveFlags));
+                    currentReplacement = null;
+                    return true;
+                }
+
+                if (previous.MoveKind == MoveKind.Register && current.MoveKind == MoveKind.Register)
+                {
+                    previousReplacement = GenTreeLirFactory.Move(
+                        previous.LinearId >= 0 ? previous.LinearId : previous.Id,
+                        blockId,
+                        previousOrdinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current),
+                        comment: MergeMoveComments(previous.Comment, current.Comment, "fold scratch copy"),
+                        moveFlags: StripReloadSpill(previous.MoveFlags | current.MoveFlags));
+                    currentReplacement = null;
+                    return true;
+                }
+
+                if (previous.MoveKind == MoveKind.Register && current.MoveKind == MoveKind.Store)
+                {
+                    previousReplacement = GenTreeLirFactory.Move(
+                        previous.LinearId >= 0 ? previous.LinearId : previous.Id,
+                        blockId,
+                        previousOrdinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current),
+                        comment: MergeMoveComments(previous.Comment, current.Comment, "fold scratch store"),
+                        moveFlags: current.MoveFlags & ~MoveFlags.Reload);
+                    currentReplacement = null;
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static bool IsScratchRegister(MachineRegister register)
+            {
+                return register == MachineRegisters.BackendScratch ||
+                       register == MachineRegisters.TreeScratch3 ||
+                       register == MachineRegisters.ParallelCopyScratch0 ||
+                       register == MachineRegisters.ParallelCopyScratch1 ||
+                       register == MachineRegisters.FloatBackendScratch ||
+                       register == MachineRegisters.FloatTreeScratch3 ||
+                       register == MachineRegisters.FloatParallelCopyScratch0 ||
+                       register == MachineRegisters.FloatParallelCopyScratch1;
+            }
+
+            private static string MergeMoveComments(string? left, string? right, string fallback)
+            {
+                if (string.IsNullOrEmpty(left))
+                    return string.IsNullOrEmpty(right) ? fallback : right + "; " + fallback;
+                if (string.IsNullOrEmpty(right))
+                    return left + "; " + fallback;
+                return left + "; " + right + "; " + fallback;
+            }
+
+            private static bool TryRewriteAfterPreviousMove(
+                GenTree previous,
+                GenTree current,
+                int blockId,
+                int ordinal,
+                out GenTree? rewritten)
+            {
+                rewritten = current;
+
+                if (!IsMoveNode(previous) || !IsMoveNode(current))
+                    return false;
+
+                if (previous.IsPhiCopy || current.IsPhiCopy)
+                    return false;
+
+                if (previous.MoveKind == MoveKind.Store &&
+                    current.MoveKind == MoveKind.Load &&
+                    previous.Results[0].Equals(current.Uses[0]) &&
+                    previous.Uses[0].IsRegister &&
+                    current.Results[0].IsRegister)
+                {
+                    rewritten = GenTreeLirFactory.Move(
+                        current.LinearId >= 0 ? current.LinearId : current.Id,
+                        blockId,
+                        ordinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current),
+                        comment: current.Comment is null ? "forward adjacent store/load" : current.Comment + "; forward adjacent store/load",
+                        moveFlags: StripReloadSpill(current.MoveFlags),
+                        phiCopyFromBlockId: current.LinearPhiCopyFromBlockId,
+                        phiCopyToBlockId: current.LinearPhiCopyToBlockId);
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static MoveFlags StripReloadSpill(MoveFlags flags)
+                => flags & ~(MoveFlags.Reload | MoveFlags.Spill);
+
+            private static GenTree? SingleRegisterResultValue(GenTree node)
+                => node.RegisterResults.Length == 1 ? node.RegisterResults[0] : node.RegisterResult;
+
+            private static GenTree? SingleRegisterUseValue(GenTree node)
+                => node.RegisterUses.Length == 1 ? node.RegisterUses[0] : null;
+
             private void EmitResolvedSplitMoves(
                 int insertionBlockId,
                 int toBlockId,
@@ -5585,11 +5877,7 @@ namespace Cnidaria.Cs
                     CanEmitDirectMemoryMove);
 
                 for (int i = 0; i < resolved.Length; i++)
-                {
-                    var node = resolved[i].WithOrdinal(blockLinearNodes.Count);
-                    blockLinearNodes.Add(node);
-                    allNodes.Add(node);
-                }
+                    AppendMoveNode(insertionBlockId, resolved[i], blockLinearNodes, allNodes);
             }
 
             private static bool IsBlockTerminatorNode(GenTree node)
@@ -5866,15 +6154,10 @@ namespace Cnidaria.Cs
                     ref _nextNodeId,
                     CanEmitDirectMemoryMove,
                     phiCopyFromBlockId: fromBlockId,
-                    phiCopyToBlockId: toBlockId,
-                    preserveIdentityMoves: true);
+                    phiCopyToBlockId: toBlockId);
 
                 for (int i = 0; i < resolved.Length; i++)
-                {
-                    var node = resolved[i].WithPlacement(blockId, blockLinearNodes.Count);
-                    blockLinearNodes.Add(node);
-                    allNodes.Add(node);
-                }
+                    AppendMoveNode(blockId, resolved[i], blockLinearNodes, allNodes);
             }
 
             private void EmitResolvedCopyMoves(
@@ -5898,11 +6181,7 @@ namespace Cnidaria.Cs
                     CanEmitDirectMemoryMove);
 
                 for (int i = 0; i < resolved.Length; i++)
-                {
-                    var node = resolved[i].WithOrdinal(blockLinearNodes.Count);
-                    blockLinearNodes.Add(node);
-                    allNodes.Add(node);
-                }
+                    AppendMoveNode(blockId, resolved[i], blockLinearNodes, allNodes);
             }
 
             private bool TryBuildPhiCopyMoves(
@@ -6110,8 +6389,7 @@ namespace Cnidaria.Cs
                         sourceValue,
                         comment,
                         moveFlags);
-                    blockLinearNodes.Add(direct);
-                    allNodes.Add(direct);
+                    AppendMoveNode(blockId, direct, blockLinearNodes, allNodes);
                     return;
                 }
 
@@ -6127,8 +6405,7 @@ namespace Cnidaria.Cs
                     sourceValue: sourceValue,
                     comment: comment + " reload",
                     moveFlags: moveFlags | MoveFlags.Reload);
-                blockLinearNodes.Add(load);
-                allNodes.Add(load);
+                AppendMoveNode(blockId, load, blockLinearNodes, allNodes);
 
                 var store = GenTreeLirFactory.Move(
                     _nextNodeId++,
@@ -6140,8 +6417,7 @@ namespace Cnidaria.Cs
                     sourceValue: null,
                     comment: comment + " store",
                     moveFlags: moveFlags | MoveFlags.Spill);
-                blockLinearNodes.Add(store);
-                allNodes.Add(store);
+                AppendMoveNode(blockId, store, blockLinearNodes, allNodes);
             }
 
             private void EmitAggregateHomeStores(
@@ -6712,13 +6988,14 @@ namespace Cnidaria.Cs
                     var resultValue = node.RegisterResult;
                     resultValueOpt = resultValue;
                     finalResult = HomeForDefinition(resultValue, definitionPosition);
-                    if (finalResult.IsNone && resultAbi.PassingKind == AbiValuePassingKind.Indirect)
+                    if (finalResult.IsNone &&
+                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || valueTypeNewObject))
                     {
                         finalResult = RegisterOperand.ForSpillSlot(
                             RegisterClass.General,
                             _nextSpillSlot++,
                             0,
-                            Math.Max(MachineAbi.StackArgumentSlotSize, resultAbi.Size));
+                            Math.Max(MachineAbi.StackArgumentSlotSize, Math.Max(1, resultAbi.Size)));
                     }
 
                     if (valueTypeNewObject)
@@ -6757,6 +7034,27 @@ namespace Cnidaria.Cs
                             nodeResultValue = resultValue;
                         }
                     }
+                    else if (RequiresCallLikeCodegenResultOperand(node, resultAbi))
+                    {
+                        callResult = RegisterOperand.ForRegister(GetCallLikeScratchResultRegister(resultAbi));
+                        nodeResultValue = resultValue;
+                    }
+                }
+
+                if (valueTypeNewObject && !valueTypeNewObjectBuffer.IsNone)
+                {
+                    RuntimeType returnBufferType = node.Method?.DeclaringType
+                        ?? throw new InvalidOperationException("Value-type newobj has no declaring type.");
+                    var initBuffer = GenTreeLirFactory.DefaultValue(
+                        _nextNodeId++,
+                        node.LinearBlockId,
+                        blockLinearNodes.Count,
+                        valueTypeNewObjectBuffer,
+                        returnBufferType,
+                        MachineAbi.StackKindForType(returnBufferType),
+                        "newobj value return buffer init");
+                    blockLinearNodes.Add(initBuffer);
+                    allNodes.Add(initBuffer);
                 }
 
                 for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
@@ -6844,11 +7142,7 @@ namespace Cnidaria.Cs
                         CanEmitDirectMemoryMove);
 
                     for (int i = 0; i < setup.Length; i++)
-                    {
-                        var setupNode = setup[i].WithOrdinal(blockLinearNodes.Count);
-                        blockLinearNodes.Add(setupNode);
-                        allNodes.Add(setupNode);
-                    }
+                        AppendMoveNode(node.LinearBlockId, setup[i], blockLinearNodes, allNodes);
                 }
 
                 var callNode = GenTreeLirFactory.Tree(
@@ -7377,6 +7671,25 @@ namespace Cnidaria.Cs
                 };
             }
 
+
+            private static bool RequiresCallLikeCodegenResultOperand(GenTree node, AbiValueInfo abi)
+            {
+                if (node.RegisterResult is null)
+                    return false;
+
+                return node.Kind == GenTreeKind.NewObject &&
+                       node.Method?.DeclaringType.IsValueType != true &&
+                       abi.PassingKind == AbiValuePassingKind.ScalarRegister;
+            }
+
+            private static MachineRegister GetCallLikeScratchResultRegister(AbiValueInfo abi)
+            {
+                if (abi.RegisterClass == RegisterClass.Float)
+                    return MachineRegisters.FloatBackendScratch;
+
+                return MachineRegisters.BackendScratch;
+            }
+
             private static bool RequiresCodegenRegisterDefinition(GenTree node, AbiValueInfo abi)
             {
                 if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister)
@@ -7683,6 +7996,21 @@ namespace Cnidaria.Cs
 
                 if (!list.Contains(register))
                     list.Add(register);
+            }
+
+            private static Dictionary<GenTree, List<GenTree>> BuildPhiPreferences(GenTreeMethod method)
+            {
+                var result = new Dictionary<GenTree, List<GenTree>>();
+
+                foreach (var node in method.LinearNodes)
+                {
+                    if (!node.IsPhiCopy || node.RegisterResult is null || node.RegisterUses.Length != 1)
+                        continue;
+
+                    AddClassCompatiblePreference(method, result, node.RegisterResult, node.RegisterUses[0]);
+                }
+
+                return result;
             }
 
             private static Dictionary<GenTree, List<GenTree>> BuildPreferences(GenTreeMethod method)
@@ -8607,8 +8935,7 @@ namespace Cnidaria.Cs
                 cursor = AlignUp(cursor, frameAlignment);
                 int argHomeOffset = cursor;
                 var argSlots = ImmutableArray.CreateBuilder<StackFrameSlot>();
-                if (_options.HomeIncomingArguments)
-                    AllocateTypedSlots(StackFrameSlotKind.Argument, _method.GenTreeMethod.ArgTypes, argSlots, ref cursor);
+                AllocateArgumentSlots(argSlots, ref cursor);
                 int argHomeSize = cursor - argHomeOffset;
 
                 cursor = AlignUp(cursor, frameAlignment);
@@ -8870,6 +9197,207 @@ namespace Cnidaria.Cs
                 }
             }
 
+            private void AllocateArgumentSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
+            {
+                var argTypes = _method.GenTreeMethod.ArgTypes;
+                for (int i = 0; i < argTypes.Length; i++)
+                {
+                    if (!RequiresIncomingArgumentHome(i))
+                        continue;
+
+                    var storage = StorageForType(argTypes[i]);
+                    cursor = AlignUp(cursor, storage.Alignment);
+                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Argument, i, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, argTypes[i]));
+                    cursor = checked(cursor + storage.Size);
+                }
+            }
+
+            private bool RequiresIncomingArgumentHome(int index)
+            {
+                if (!TryGetTopLevelArgumentDescriptor(index, out var descriptor))
+                    return true;
+
+                if (descriptor.AddressExposed || descriptor.DoNotEnregister || descriptor.MemoryAliased)
+                    return true;
+
+                if (!descriptor.SsaPromoted)
+                    return true;
+
+                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind))
+                    return true;
+
+                if (descriptor.Type is not null && descriptor.Type.IsValueType && descriptor.Type.ContainsGcPointers)
+                    return true;
+
+                if (RequiresIncomingArgumentHomeForPromotedFields(index, descriptor))
+                    return true;
+
+                return false;
+            }
+
+            private bool TryGetTopLevelArgumentDescriptor(int index, out GenLocalDescriptor descriptor)
+            {
+                var descriptors = _method.GenTreeMethod.ArgDescriptors;
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var candidate = descriptors[i];
+                    if (candidate.Kind == GenLocalKind.Argument && !candidate.IsStructField && candidate.Index == index)
+                    {
+                        descriptor = candidate;
+                        return true;
+                    }
+                }
+
+                descriptor = null!;
+                return false;
+            }
+
+            private bool RequiresIncomingArgumentHomeForPromotedFields(int index, GenLocalDescriptor parentDescriptor)
+            {
+                var descriptors = _method.GenTreeMethod.ArgDescriptors;
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var fieldDescriptor = descriptors[i];
+                    if (!fieldDescriptor.IsStructField || fieldDescriptor.ParentLclNum != parentDescriptor.LclNum)
+                        continue;
+
+                    if (!fieldDescriptor.SsaPromoted)
+                        return true;
+
+                    if (PromotedArgumentFieldRequiresParentHome(index, parentDescriptor, fieldDescriptor))
+                        return true;
+                }
+
+                return false;
+            }
+
+            private bool PromotedArgumentFieldRequiresParentHome(
+                int parentArgumentIndex,
+                GenLocalDescriptor parentDescriptor,
+                GenLocalDescriptor fieldDescriptor)
+            {
+                int fieldOffset = fieldDescriptor.FieldOffset;
+                int fieldSize = Math.Max(1, fieldDescriptor.FieldSize);
+                if (fieldOffset < 0)
+                    return true;
+
+                RuntimeType? parentType = parentDescriptor.Type;
+                GenStackKind parentStackKind = parentDescriptor.StackKind == GenStackKind.Unknown
+                    ? MachineAbi.StackKindForType(parentType)
+                    : parentDescriptor.StackKind;
+                var parentAbi = MachineAbi.ClassifyValue(parentType, parentStackKind, isReturn: false);
+
+                if (parentAbi.PassingKind == AbiValuePassingKind.Void)
+                    return false;
+
+                if (parentAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                {
+                    int scalarSize = Math.Max(1, parentAbi.Size <= 0 ? TargetArchitecture.PointerSize : parentAbi.Size);
+                    return fieldOffset != 0 || fieldSize != scalarSize;
+                }
+
+                if (parentAbi.PassingKind != AbiValuePassingKind.MultiRegister)
+                    return false;
+
+                var segments = MachineAbi.GetRegisterSegments(parentAbi);
+                int fieldEnd = fieldOffset + fieldSize;
+                for (int s = 0; s < segments.Length; s++)
+                {
+                    var segment = segments[s];
+                    int segmentStart = segment.Offset;
+                    int segmentEnd = segment.Offset + Math.Max(1, segment.Size);
+                    if (fieldOffset < segmentStart || fieldEnd > segmentEnd)
+                        continue;
+
+                    if (!TryGetIncomingAggregateSegmentLocation(parentArgumentIndex, parentAbi, s, out var location))
+                        return true;
+
+                    if (!location.IsRegister)
+                        return false;
+
+                    return fieldOffset != segment.Offset || fieldSize != Math.Max(1, segment.Size);
+                }
+
+                return true;
+            }
+
+            private bool TryGetIncomingAggregateSegmentLocation(
+                int argumentIndex,
+                AbiValueInfo argumentAbi,
+                int requestedSegmentIndex,
+                out AbiArgumentLocation location)
+            {
+                location = default;
+                if (argumentIndex < 0 || requestedSegmentIndex < 0)
+                    return false;
+
+                int generalArgumentIndex = 0;
+                int floatArgumentIndex = 0;
+                int incomingStackArgumentIndex = 0;
+                int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
+                    _method.GenTreeMethod.RuntimeMethod,
+                    _method.GenTreeMethod.ArgTypes.Length);
+
+                for (int i = 0; i <= argumentIndex; i++)
+                {
+                    if (hiddenReturnBufferIndex == i)
+                        _ = MachineAbi.AssignScalarArgumentLocation(
+                            RegisterClass.General,
+                            TargetArchitecture.PointerSize,
+                            ref generalArgumentIndex,
+                            ref floatArgumentIndex,
+                            ref incomingStackArgumentIndex);
+
+                    RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
+                    GenStackKind currentStackKind = MachineAbi.StackKindForType(currentType);
+                    var abi = i == argumentIndex
+                        ? argumentAbi
+                        : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
+
+                    if (abi.PassingKind == AbiValuePassingKind.Void)
+                        continue;
+
+                    if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                    {
+                        var registerClass = abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass;
+                        _ = MachineAbi.AssignScalarArgumentLocation(
+                            registerClass,
+                            abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size,
+                            ref generalArgumentIndex,
+                            ref floatArgumentIndex,
+                            ref incomingStackArgumentIndex);
+                        continue;
+                    }
+
+                    if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                    {
+                        int aggregateStackSlot = -1;
+                        int aggregateStackBaseOffset = 0;
+                        var segments = MachineAbi.GetRegisterSegments(abi);
+                        for (int s = 0; s < segments.Length; s++)
+                        {
+                            var segmentLocation = MachineAbi.AssignAggregateSegmentArgumentLocation(
+                                segments[s],
+                                ref generalArgumentIndex,
+                                ref floatArgumentIndex,
+                                ref incomingStackArgumentIndex,
+                                ref aggregateStackSlot,
+                                ref aggregateStackBaseOffset);
+
+                            if (i == argumentIndex && s == requestedSegmentIndex)
+                            {
+                                location = segmentLocation;
+                                return true;
+                            }
+                        }
+                        continue;
+                    }
+
+                    incomingStackArgumentIndex++;
+                }
+
+                return false;
+            }
             private void AllocateTempSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
                 var temps = _method.GenTreeMethod.Temps;
@@ -9465,16 +9993,49 @@ namespace Cnidaria.Cs
             }
             private void AppendGcHomeSlotZeroInit(int blockId, ImmutableArray<GenTree>.Builder nodes)
             {
-                ZeroFrameSlots(blockId, nodes, _method.StackFrame.LocalSlots);
-                ZeroFrameSlots(blockId, nodes, _method.StackFrame.TempSlots);
-                ZeroFrameSlots(blockId, nodes, _method.StackFrame.SpillSlots);
-                ZeroFrameSlots(blockId, nodes, _method.StackFrame.OutgoingArgumentSlots);
+                ZeroGcDescriptorHomes(blockId, nodes, _method.StackFrame.LocalSlots, _method.GenTreeMethod.LocalDescriptors);
+                ZeroGcDescriptorHomes(blockId, nodes, _method.StackFrame.TempSlots, _method.GenTreeMethod.TempDescriptors);
             }
 
-            private void ZeroFrameSlots(int blockId, ImmutableArray<GenTree>.Builder nodes, ImmutableArray<StackFrameSlot> slots)
+            private void ZeroGcDescriptorHomes(
+                int blockId,
+                ImmutableArray<GenTree>.Builder nodes,
+                ImmutableArray<StackFrameSlot> slots,
+                ImmutableArray<GenLocalDescriptor> descriptors)
             {
                 for (int i = 0; i < slots.Length; i++)
-                    EmitZeroFrameSlot(blockId, nodes, slots[i]);
+                {
+                    var slot = slots[i];
+                    if (!ShouldZeroGcHomeSlot(slot, descriptors))
+                        continue;
+
+                    EmitZeroFrameSlot(blockId, nodes, slot);
+                }
+            }
+
+            private static bool ShouldZeroGcHomeSlot(StackFrameSlot slot, ImmutableArray<GenLocalDescriptor> descriptors)
+            {
+                if (!NeedsHomeGcReporting(slot.Type, StackKindForType(slot.Type)))
+                    return false;
+
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var descriptor = descriptors[i];
+                    if (descriptor.Index != slot.Index)
+                        continue;
+
+                    return ShouldReportDescriptorHome(descriptor);
+                }
+
+                return true;
+            }
+
+            private static bool ShouldReportDescriptorHome(GenLocalDescriptor descriptor)
+            {
+                if (!NeedsHomeGcReporting(descriptor.Type, descriptor.StackKind))
+                    return false;
+
+                return descriptor.AddressExposed || descriptor.DoNotEnregister || descriptor.MemoryAliased || !descriptor.SsaPromoted;
             }
 
             private void EmitZeroFrameSlot(int blockId, ImmutableArray<GenTree>.Builder nodes, StackFrameSlot slot)
@@ -9564,8 +10125,7 @@ namespace Cnidaria.Cs
                     if (argAbi.PassingKind == AbiValuePassingKind.Void)
                         continue;
 
-                    if (!_method.StackFrame.TryGetArgumentSlot(i, out StackFrameSlot homeSlot))
-                        continue;
+                    bool hasHomeSlot = _method.StackFrame.TryGetArgumentSlot(i, out StackFrameSlot homeSlot);
 
                     if (argAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
                     {
@@ -9576,8 +10136,8 @@ namespace Cnidaria.Cs
                             ref generalArgumentIndex,
                             ref floatArgumentIndex,
                             ref incomingStackArgumentIndex);
-
-                        EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, source, 0, registerClass, source.Size);
+                        if (hasHomeSlot)
+                            EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, source, 0, registerClass, source.Size);
                         continue;
                     }
 
@@ -9596,8 +10156,8 @@ namespace Cnidaria.Cs
                                 ref incomingStackArgumentIndex,
                                 ref aggregateStackSlot,
                                 ref aggregateStackBaseOffset);
-
-                            EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, source, segment.Offset, segment.RegisterClass, segment.Size);
+                            if (hasHomeSlot)
+                                EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, source, segment.Offset, segment.RegisterClass, segment.Size);
                         }
                         continue;
                     }
@@ -9608,8 +10168,8 @@ namespace Cnidaria.Cs
                         incomingStackArgumentIndex++,
                         0,
                         stackSize);
-
-                    EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, stackSource, 0, RegisterClass.General, stackSize);
+                    if (hasHomeSlot)
+                        EmitIncomingArgumentHomeStore(blockId, nodes, homeSlot, stackSource, 0, RegisterClass.General, stackSize);
                 }
 
                 if (hiddenReturnBufferIndex == argTypes.Length)
@@ -13417,16 +13977,24 @@ namespace Cnidaria.Cs
                         if (node.Results.Length != 1)
                             throw new InvalidOperationException("Scalar call-like result must have exactly one register result operand.");
 
-                        var expectedReturn = RegisterOperand.ForRegister(
-                            abi.RegisterClass == RegisterClass.Float
-                                ? MachineRegisters.FloatReturnValue0
-                                : MachineRegisters.ReturnValue0);
-
-                        if (!node.Results[0].Equals(expectedReturn))
+                        if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType != true)
                         {
-                            throw new InvalidOperationException(
-                                "Call-like node result is not in the ABI return register. Actual: " +
-                                node.Results[0] + ", expected: " + expectedReturn + ".");
+                            if (!node.Results[0].IsRegister)
+                                throw new InvalidOperationException("Reference newobj result must be a register result operand.");
+                        }
+                        else
+                        {
+                            var expectedReturn = RegisterOperand.ForRegister(
+                                abi.RegisterClass == RegisterClass.Float
+                                    ? MachineRegisters.FloatReturnValue0
+                                    : MachineRegisters.ReturnValue0);
+
+                            if (!node.Results[0].Equals(expectedReturn))
+                            {
+                                throw new InvalidOperationException(
+                                    "Call-like node result is not in the ABI return register. Actual: " +
+                                    node.Results[0] + ", expected: " + expectedReturn + ".");
+                            }
                         }
                     }
                 }

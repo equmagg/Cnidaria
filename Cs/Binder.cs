@@ -5979,7 +5979,7 @@ namespace Cnidaria.Cs
             return def.ContainingSymbol is NamespaceSymbol ns
                 && string.Equals(ns.Name, "System", StringComparison.Ordinal);
         }
-        private NamedTypeSymbol GetSystemNullableDefinitionOrReport(
+        internal static NamedTypeSymbol GetSystemNullableDefinitionOrReport(
             BindingContext context, DiagnosticBag diagnostics, SyntaxNode diagnosticNode)
         {
             var global = context.Compilation.GlobalNamespace;
@@ -7821,6 +7821,12 @@ namespace Cnidaria.Cs
 
                 case ExpressionStatementSyntax es:
                     {
+                        if (TryBindConditionalAccessExpressionStatement(es.Expression, context, diagnostics, out var conditionalStatement))
+                        {
+                            result = conditionalStatement;
+                            break;
+                        }
+
                         BoundExpression expr;
                         if (es.Expression is ImplicitObjectCreationExpressionSyntax ioc)
                             expr = BindImplicitObjectCreation(ioc, context, diagnostics);
@@ -7847,6 +7853,10 @@ namespace Cnidaria.Cs
 
                 case LocalDeclarationStatementSyntax ld:
                     result = BindLocalDeclaration(ld, context, diagnostics);
+                    break;
+
+                case UsingStatementSyntax us:
+                    result = BindUsingStatement(us, context, diagnostics);
                     break;
 
                 case ReturnStatementSyntax rs:
@@ -7987,6 +7997,9 @@ namespace Cnidaria.Cs
                 case ConditionalExpressionSyntax cond:
                     result = BindConditional(cond, context, diagnostics);
                     break;
+                case ConditionalAccessExpressionSyntax ca:
+                    result = BindConditionalAccess(ca, context, diagnostics);
+                    break;
                 case AssignmentExpressionSyntax assign:
                     result = BindAssignment(assign, context, diagnostics);
                     break;
@@ -8019,6 +8032,9 @@ namespace Cnidaria.Cs
                     break;
                 case CheckedExpressionSyntax chk:
                     result = BindCheckedExpression(chk, context, diagnostics);
+                    break;
+                case TypeOfExpressionSyntax tof:
+                    result = BindTypeOf(tof, context, diagnostics);
                     break;
                 case SizeOfExpressionSyntax sz:
                     result = BindSizeOf(sz, context, diagnostics);
@@ -8681,6 +8697,38 @@ namespace Cnidaria.Cs
             }
 
             return MakeDefaultValue(node, type);
+        }
+        private BoundExpression BindTypeOf(TypeOfExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            var operandType = BindType(node.Type, context, diagnostics);
+
+            if(!DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "Type", arity: 0, out var systemType))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_TYPEOF000",
+                    DiagnosticSeverity.Error,
+                    "Required type 'System.Type' was not found.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(new ErrorTypeSymbol("System.Type", containing: null, ImmutableArray<Location>.Empty));
+                return bad;
+            }
+            
+            if(operandType is ByRefTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_TYPEOF001",
+                    DiagnosticSeverity.Error,
+                    "The typeof operator cannot be applied to a by-ref type.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+
+                var bad = new BoundBadExpression(node);
+                bad.SetType(systemType);
+                return bad;
+            }
+
+            return new BoundTypeOfExpression(node, systemType, operandType);
         }
         private BoundExpression BindSizeOf(SizeOfExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -10385,8 +10433,1001 @@ namespace Cnidaria.Cs
 
             return new BoundPointerIndirectionExpression(node, pt.PointedAtType, operand);
         }
+
+        private bool TryBindConditionalAccessExpressionStatement(
+            ExpressionSyntax expression,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out BoundStatement statement)
+        {
+            if (expression is ParenthesizedExpressionSyntax paren)
+                return TryBindConditionalAccessExpressionStatement(paren.Expression, context, diagnostics, out statement);
+
+            if (expression is AssignmentExpressionSyntax assignment &&
+                assignment.Left is ConditionalAccessExpressionSyntax conditionalLeft)
+            {
+                statement = BindConditionalAssignmentStatement(assignment, conditionalLeft, context, diagnostics);
+                return true;
+            }
+
+            if (expression is ConditionalAccessExpressionSyntax conditionalAccess)
+            {
+                statement = BindConditionalAccessStatement(conditionalAccess, context, diagnostics);
+                return true;
+            }
+
+            statement = null!;
+            return false;
+        }
+
+        private BoundStatement BindConditionalAccessStatement(
+            ConditionalAccessExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var receiver = BindExpression(node.Expression, context, diagnostics);
+            if (receiver.HasErrors)
+                return new BoundExpressionStatement(node, new BoundBadExpression(node));
+
+            if (!TryPrepareConditionalReceiver(node, receiver, allowNullableValueTypeReceiver: true, context, diagnostics,
+                    out var receiverTemp, out var receiverDecl, out var accessReceiver, out var condition))
+            {
+                return new BoundExpressionStatement(node, new BoundBadExpression(node));
+            }
+
+            var whenNotNull = BindConditionalWhenNotNull(node.WhenNotNull, accessReceiver, BindValueKind.RValue, context, diagnostics);
+            if (whenNotNull is BoundMethodGroupExpression)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDACCESS_MG001",
+                    DiagnosticSeverity.Error,
+                    "Conditional access to a method group must be invoked or converted to a delegate.",
+                    new Location(context.SemanticModel.SyntaxTree, node.WhenNotNull.Span)));
+                whenNotNull = new BoundBadExpression(node.WhenNotNull);
+            }
+
+            var thenStatement = new BoundExpressionStatement(node.WhenNotNull, whenNotNull);
+            var ifStatement = new BoundIfStatement(node, condition, thenStatement, elseOpt: null);
+
+            return new BoundBlockStatement(
+                node,
+                ImmutableArray.Create<BoundStatement>(receiverDecl, ifStatement));
+        }
+
+        private BoundStatement BindConditionalAssignmentStatement(
+            AssignmentExpressionSyntax assignment,
+            ConditionalAccessExpressionSyntax conditionalLeft,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var receiver = BindExpression(conditionalLeft.Expression, context, diagnostics);
+            if (receiver.HasErrors)
+                return new BoundExpressionStatement(assignment, new BoundBadExpression(assignment));
+
+            return BindConditionalAssignmentStatementCore(assignment, conditionalLeft, receiver, context, diagnostics);
+        }
+
+        private BoundStatement BindConditionalAssignmentStatementCore(
+            AssignmentExpressionSyntax assignment,
+            ConditionalAccessExpressionSyntax conditionalLeft,
+            BoundExpression receiver,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (!TryPrepareConditionalReceiver(conditionalLeft, receiver, allowNullableValueTypeReceiver: false, context, diagnostics,
+                    out var receiverTemp, out var receiverDecl, out var accessReceiver, out var condition))
+            {
+                return new BoundExpressionStatement(assignment, new BoundBadExpression(assignment));
+            }
+
+            BoundStatement thenStatement;
+            if (conditionalLeft.WhenNotNull is ConditionalAccessExpressionSyntax nested)
+            {
+                var nestedReceiver = BindConditionalWhenNotNull(nested.Expression, accessReceiver, BindValueKind.RValue, context, diagnostics);
+                thenStatement = BindConditionalAssignmentStatementCore(assignment, nested, nestedReceiver, context, diagnostics);
+            }
+            else
+            {
+                var lv = BindConditionalLValue(
+                    conditionalLeft.WhenNotNull,
+                    accessReceiver,
+                    requireReadable: assignment.Kind != SyntaxKind.SimpleAssignmentExpression,
+                    context,
+                    diagnostics);
+
+                var right = BindExpression(assignment.Right, context, diagnostics);
+                var boundAssignment = BindAssignmentToLValue(assignment, lv, right, context, diagnostics);
+                thenStatement = new BoundExpressionStatement(assignment, boundAssignment);
+            }
+
+            var ifStatement = new BoundIfStatement(conditionalLeft, condition, thenStatement, elseOpt: null);
+            return new BoundBlockStatement(
+                conditionalLeft,
+                ImmutableArray.Create<BoundStatement>(receiverDecl, ifStatement));
+        }
+
+        private BoundExpression BindConditionalAccess(
+            ConditionalAccessExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var receiver = BindExpression(node.Expression, context, diagnostics);
+            if (receiver.HasErrors)
+                return new BoundBadExpression(node);
+
+            return BindConditionalAccessCore(
+                node,
+                receiver,
+                accessReceiver => BindConditionalWhenNotNull(node.WhenNotNull, accessReceiver, BindValueKind.RValue, context, diagnostics),
+                context,
+                diagnostics);
+        }
+
+        private BoundExpression BindConditionalAssignment(
+            AssignmentExpressionSyntax assignment,
+            ConditionalAccessExpressionSyntax conditionalLeft,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var receiver = BindExpression(conditionalLeft.Expression, context, diagnostics);
+            if (receiver.HasErrors)
+                return new BoundBadExpression(assignment);
+
+            return BindConditionalAssignmentCore(assignment, conditionalLeft, receiver, context, diagnostics);
+        }
+
+        private BoundExpression BindConditionalAssignmentCore(
+            AssignmentExpressionSyntax assignment,
+            ConditionalAccessExpressionSyntax conditionalLeft,
+            BoundExpression receiver,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            return BindConditionalAccessCore(
+                conditionalLeft,
+                receiver,
+                accessReceiver =>
+                {
+                    if (conditionalLeft.WhenNotNull is ConditionalAccessExpressionSyntax nested)
+                    {
+                        var nestedReceiver = BindConditionalWhenNotNull(nested.Expression, accessReceiver, BindValueKind.RValue, context, diagnostics);
+                        return BindConditionalAssignmentCore(assignment, nested, nestedReceiver, context, diagnostics);
+                    }
+
+                    var lv = BindConditionalLValue(
+                        conditionalLeft.WhenNotNull,
+                        accessReceiver,
+                        requireReadable: assignment.Kind != SyntaxKind.SimpleAssignmentExpression,
+                        context,
+                        diagnostics);
+
+                    var right = BindExpression(assignment.Right, context, diagnostics);
+                    return BindAssignmentToLValue(assignment, lv, right, context, diagnostics);
+                },
+                context,
+                diagnostics,
+                allowNullableValueTypeReceiver: false,
+                diagnosticNode: assignment);
+        }
+
+        private BoundExpression BindConditionalAccessCore(
+            SyntaxNode syntax,
+            BoundExpression receiver,
+            Func<BoundExpression, BoundExpression> bindWhenNotNull,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            bool allowNullableValueTypeReceiver = true,
+            SyntaxNode? diagnosticNode = null)
+        {
+            diagnosticNode ??= syntax;
+
+            if (!TryPrepareConditionalReceiver(diagnosticNode, receiver, allowNullableValueTypeReceiver, context, diagnostics,
+                    out var receiverTemp, out var receiverDecl, out var accessReceiver, out var condition))
+            {
+                return new BoundBadExpression(syntax);
+            }
+
+            var whenNotNull = bindWhenNotNull(accessReceiver);
+            if (whenNotNull.HasErrors)
+                return new BoundBadExpression(syntax);
+
+            if (whenNotNull is BoundMethodGroupExpression)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDACCESS_MG001",
+                    DiagnosticSeverity.Error,
+                    "Conditional access to a method group must be invoked or converted to a delegate.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            var resultType = GetConditionalAccessResultType(syntax, whenNotNull.Type, context, diagnostics);
+            if (resultType is null || resultType is ErrorTypeSymbol)
+                return new BoundBadExpression(syntax);
+
+            var whenTrue = ApplyConversion(
+                exprSyntax: (ExpressionSyntax)whenNotNull.Syntax,
+                expr: whenNotNull,
+                targetType: resultType,
+                diagnosticNode: syntax,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            var whenFalse = MakeNullConditionalDefaultValue(syntax, resultType, context, diagnostics);
+            if (whenTrue.HasErrors || whenFalse.HasErrors)
+                return new BoundBadExpression(syntax);
+
+            var conditional = new BoundConditionalExpression(
+                syntax,
+                resultType,
+                condition,
+                whenTrue,
+                whenFalse,
+                Optional<object>.None);
+
+            return new BoundSequenceExpression(
+                syntax,
+                ImmutableArray.Create(receiverTemp),
+                ImmutableArray.Create<BoundStatement>(receiverDecl),
+                conditional);
+        }
+
+        private bool TryPrepareConditionalReceiver(
+            SyntaxNode syntax,
+            BoundExpression receiver,
+            bool allowNullableValueTypeReceiver,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out LocalSymbol receiverTemp,
+            out BoundLocalDeclarationStatement receiverDecl,
+            out BoundExpression accessReceiver,
+            out BoundExpression condition)
+        {
+            receiverTemp = null!;
+            receiverDecl = null!;
+            accessReceiver = null!;
+            condition = null!;
+
+            if (receiver.Type.SpecialType == SpecialType.System_Void || receiver.Type is PointerTypeSymbol or ByRefTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDACCESS001",
+                    DiagnosticSeverity.Error,
+                    $"Operator '?' cannot be applied to operand of type '{receiver.Type.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return false;
+            }
+
+            bool isNullableReceiver = TryGetSystemNullableInfo(receiver.Type, out var nullableReceiverType, out var nullableUnderlyingType);
+            if (receiver.Type.IsValueType && !isNullableReceiver)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDACCESS001",
+                    DiagnosticSeverity.Error,
+                    $"Operator '?' cannot be applied to operand of type '{receiver.Type.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return false;
+            }
+
+            if (isNullableReceiver && !allowNullableValueTypeReceiver)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDASG_NULLABLE001",
+                    DiagnosticSeverity.Error,
+                    "The receiver of a null-conditional assignment cannot be a nullable value type because the unwrapped value is not a variable.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return false;
+            }
+
+            receiverTemp = NewTemp("$cond_recv", receiver.Type);
+            receiverDecl = new BoundLocalDeclarationStatement(syntax, receiverTemp, receiver);
+            var receiverTempExpr = new BoundLocalExpression(syntax, receiverTemp);
+            var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
+
+            if (isNullableReceiver)
+            {
+                var hasValue = FindNullableHasValueGetter(nullableReceiverType);
+                var getValueOrDefault = FindNullableGetValueOrDefault(nullableReceiverType, nullableUnderlyingType);
+                if (hasValue is null || getValueOrDefault is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_CONDACCESS_NULLABLE000",
+                        DiagnosticSeverity.Error,
+                        "Missing Nullable<T> members (HasValue / GetValueOrDefault).",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return false;
+                }
+
+                condition = new BoundCallExpression(syntax, receiverTempExpr, hasValue, ImmutableArray<BoundExpression>.Empty);
+                accessReceiver = new BoundCallExpression(syntax, receiverTempExpr, getValueOrDefault, ImmutableArray<BoundExpression>.Empty);
+                return true;
+            }
+
+            condition = new BoundBinaryExpression(
+                syntax,
+                BoundBinaryOperatorKind.NotEquals,
+                boolType,
+                receiverTempExpr,
+                new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
+                Optional<object>.None);
+            accessReceiver = receiverTempExpr;
+            return true;
+        }
+
+        private TypeSymbol? GetConditionalAccessResultType(
+            SyntaxNode syntax,
+            TypeSymbol whenNotNullType,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (whenNotNullType.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_CONDACCESS_VOID001",
+                    DiagnosticSeverity.Error,
+                    "A null-conditional access to a void-returning member can only be used as an expression statement.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return null;
+            }
+
+            if (whenNotNullType.IsReferenceType || TryGetSystemNullableInfo(whenNotNullType, out _, out _))
+                return whenNotNullType;
+
+            if (whenNotNullType.IsValueType)
+                return MakeNullableType(syntax, whenNotNullType, context, diagnostics);
+
+            diagnostics.Add(new Diagnostic(
+                "CN_CONDACCESS_TYPE001",
+                DiagnosticSeverity.Error,
+                $"The result type '{whenNotNullType.Name}' of a conditional access cannot be made nullable.",
+                new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+            return null;
+        }
+
+        private BoundExpression MakeNullConditionalDefaultValue(
+            SyntaxNode syntax,
+            TypeSymbol resultType,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (TryGetSystemNullableInfo(resultType, out _, out _))
+                return MakeDefaultValue(syntax, resultType);
+
+            var nullLiteral = new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null);
+            return ApplyConversion(
+                exprSyntax: (ExpressionSyntax)syntax,
+                expr: nullLiteral,
+                targetType: resultType,
+                diagnosticNode: syntax,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+        }
+
+        private NamedTypeSymbol MakeNullableType(
+            SyntaxNode syntax,
+            TypeSymbol underlyingType,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var nullableDefinition = TypeBinder.GetSystemNullableDefinitionOrReport(context, diagnostics, syntax);
+            if (nullableDefinition.Kind == SymbolKind.Error)
+                return (NamedTypeSymbol)nullableDefinition;
+
+            var args = ImmutableArray.Create(underlyingType);
+            var nullableType = context.Compilation.ConstructNamedType(nullableDefinition, args);
+            GenericConstraintChecker.CheckNamedTypeInstantiation(
+                nullableType,
+                args,
+                _ => syntax.Span,
+                context,
+                diagnostics);
+            return nullableType;
+        }
+
+        private LValue BindConditionalLValue(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            bool requireReadable,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var target = BindConditionalWhenNotNull(syntax, receiver, BindValueKind.LValue, context, diagnostics);
+            if (!requireReadable || target.HasErrors)
+                return new LValue(target, target);
+
+            if (target is BoundMemberAccessExpression { Member: PropertySymbol })
+            {
+                var read = BindConditionalWhenNotNull(syntax, receiver, BindValueKind.RValue, context, diagnostics);
+                return new LValue(target, read);
+            }
+
+            if (target is BoundIndexerAccessExpression)
+            {
+                var read = BindConditionalWhenNotNull(syntax, receiver, BindValueKind.RValue, context, diagnostics);
+                return new LValue(target, read);
+            }
+
+            return new LValue(target, target);
+        }
+
+        private BoundExpression BindConditionalWhenNotNull(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            BindValueKind valueKind,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            switch (syntax)
+            {
+                case MemberBindingExpressionSyntax memberBinding:
+                    return BindMemberOnBoundReceiver(memberBinding, receiver, memberBinding.Name, valueKind, context, diagnostics);
+
+                case ElementBindingExpressionSyntax elementBinding:
+                    return BindElementOnBoundReceiver(elementBinding, receiver, elementBinding.ArgumentList, valueKind, context, diagnostics);
+
+                case MemberAccessExpressionSyntax memberAccess:
+                    {
+                        var boundReceiver = BindConditionalWhenNotNull(memberAccess.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        if (boundReceiver.HasErrors)
+                            return new BoundBadExpression(memberAccess);
+                        return BindMemberOnBoundReceiver(memberAccess, boundReceiver, memberAccess.Name, valueKind, context, diagnostics);
+                    }
+
+                case ElementAccessExpressionSyntax elementAccess:
+                    {
+                        var boundReceiver = BindConditionalWhenNotNull(elementAccess.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        if (boundReceiver.HasErrors)
+                            return new BoundBadExpression(elementAccess);
+                        return BindElementOnBoundReceiver(elementAccess, boundReceiver, elementAccess.ArgumentList, valueKind, context, diagnostics);
+                    }
+
+                case InvocationExpressionSyntax invocation:
+                    return BindConditionalInvocation(invocation, receiver, context, diagnostics);
+
+                case ConditionalAccessExpressionSyntax nestedConditional:
+                    {
+                        var nestedReceiver = BindConditionalWhenNotNull(nestedConditional.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        if (nestedReceiver.HasErrors)
+                            return new BoundBadExpression(nestedConditional);
+                        return BindConditionalAccessCore(
+                            nestedConditional,
+                            nestedReceiver,
+                            accessReceiver => BindConditionalWhenNotNull(nestedConditional.WhenNotNull, accessReceiver, BindValueKind.RValue, context, diagnostics),
+                            context,
+                            diagnostics);
+                    }
+
+                default:
+                    diagnostics.Add(new Diagnostic(
+                        "CN_CONDACCESS002",
+                        DiagnosticSeverity.Error,
+                        $"Unsupported expression in conditional access: {syntax.Kind}.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+            }
+        }
+
+        private BoundExpression BindConditionalInvocation(
+            InvocationExpressionSyntax invocation,
+            BoundExpression receiver,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var argSyntaxes = invocation.ArgumentList.Arguments;
+            var args = ImmutableArray.CreateBuilder<BoundExpression>(argSyntaxes.Count);
+            for (int i = 0; i < argSyntaxes.Count; i++)
+                args.Add(BindCallArgument(argSyntaxes[i], context, diagnostics));
+            var boundArgs = args.ToImmutable();
+
+            switch (invocation.Expression)
+            {
+                case MemberBindingExpressionSyntax memberBinding:
+                    return BindMemberInvocationOnBoundReceiver(invocation, receiver, memberBinding.Name, argSyntaxes, boundArgs, context, diagnostics);
+
+                case MemberAccessExpressionSyntax memberAccess:
+                    {
+                        var boundReceiver = BindConditionalWhenNotNull(memberAccess.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        if (boundReceiver.HasErrors)
+                            return new BoundBadExpression(invocation);
+                        return BindMemberInvocationOnBoundReceiver(invocation, boundReceiver, memberAccess.Name, argSyntaxes, boundArgs, context, diagnostics);
+                    }
+
+                case ElementBindingExpressionSyntax elementBinding:
+                    {
+                        var delegateValue = BindElementOnBoundReceiver(elementBinding, receiver, elementBinding.ArgumentList, BindValueKind.RValue, context, diagnostics);
+                        return BindDelegateInvocation(invocation, delegateValue, argSyntaxes, boundArgs, context, diagnostics);
+                    }
+
+                case ElementAccessExpressionSyntax elementAccess:
+                    {
+                        var boundReceiver = BindConditionalWhenNotNull(elementAccess.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        if (boundReceiver.HasErrors)
+                            return new BoundBadExpression(invocation);
+                        var delegateValue = BindElementOnBoundReceiver(elementAccess, boundReceiver, elementAccess.ArgumentList, BindValueKind.RValue, context, diagnostics);
+                        return BindDelegateInvocation(invocation, delegateValue, argSyntaxes, boundArgs, context, diagnostics);
+                    }
+
+                default:
+                    {
+                        var delegateValue = BindConditionalWhenNotNull(invocation.Expression, receiver, BindValueKind.RValue, context, diagnostics);
+                        return BindDelegateInvocation(invocation, delegateValue, argSyntaxes, boundArgs, context, diagnostics);
+                    }
+            }
+        }
+
+        private BoundExpression BindMemberInvocationOnBoundReceiver(
+            InvocationExpressionSyntax invocation,
+            BoundExpression receiver,
+            SimpleNameSyntax nameSyntax,
+            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes,
+            ImmutableArray<BoundExpression> args,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var name = GetSimpleName(nameSyntax);
+            if (string.IsNullOrEmpty(name))
+            {
+                diagnostics.Add(new Diagnostic("CN_CALL020", DiagnosticSeverity.Error,
+                    "Invalid member name in invocation.",
+                    new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                return new BoundBadExpression(invocation);
+            }
+
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverType is null)
+            {
+                diagnostics.Add(new Diagnostic("CN_CALL021", DiagnosticSeverity.Error,
+                    "Receiver is not a type or a value with members.",
+                    new Location(context.SemanticModel.SyntaxTree, invocation.Expression.Span)));
+                return new BoundBadExpression(invocation);
+            }
+
+            var candidates = LookupMethods(receiverType, name)
+                .Where(m => !m.IsStatic && AccessibilityHelper.IsAccessible(m, context))
+                .ToImmutableArray();
+
+            if (!candidates.IsDefaultOrEmpty)
+            {
+                if (nameSyntax is GenericNameSyntax genericName)
+                {
+                    var explicitTypeArgs = BindTypeArguments(genericName.TypeArgumentList.Arguments, context, diagnostics);
+                    var arity = explicitTypeArgs.Length;
+                    var arityMatches = candidates.Where(m => m.TypeParameters.Length == arity).ToImmutableArray();
+                    if (arityMatches.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_CALLG010",
+                            DiagnosticSeverity.Error,
+                            $"No overload of '{name}' has {arity} type parameter(s).",
+                            new Location(context.SemanticModel.SyntaxTree, genericName.Span)));
+                        return new BoundBadExpression(invocation);
+                    }
+
+                    var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
+                    for (int i = 0; i < arityMatches.Length; i++)
+                    {
+                        var def = arityMatches[i];
+                        if (!GenericConstraintChecker.CheckMethodInstantiation(
+                            def,
+                            explicitTypeArgs,
+                            a => genericName.TypeArgumentList.Arguments[a].Span,
+                            context,
+                            diagnostics))
+                        {
+                            continue;
+                        }
+
+                        constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
+                    }
+
+                    candidates = constructed.ToImmutable();
+                }
+
+                if (TryResolveOverload(
+                    candidates: candidates,
+                    args: args,
+                    getArgExprSyntax: i => argSyntaxes[i].Expression,
+                    getArgRefKindKeyword: i => argSyntaxes[i].RefKindKeyword,
+                    getArgName: i => argSyntaxes[i].NameColon?.Name.Identifier.ValueText,
+                    chosen: out var chosen,
+                    convertedArgs: out var convertedArgs,
+                    context: context,
+                    diagnostics: diagnostics,
+                    diagnosticNode: invocation))
+                {
+                    return new BoundCallExpression(invocation, receiver, chosen!, convertedArgs);
+                }
+
+                return new BoundBadExpression(invocation);
+            }
+
+            var extensionCandidates = LookupExtensionMethods(name, receiver, context);
+            if (!extensionCandidates.IsDefaultOrEmpty)
+            {
+                var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(args.Length + 1);
+                extArgsBuilder.Add(receiver);
+                extArgsBuilder.AddRange(args);
+                var extArgs = extArgsBuilder.ToImmutable();
+
+                if (TryResolveOverload(
+                    candidates: extensionCandidates,
+                    args: extArgs,
+                    getArgExprSyntax: i => i == 0 ? invocation.Expression : argSyntaxes[i - 1].Expression,
+                    getArgRefKindKeyword: i => i == 0 ? null : argSyntaxes[i - 1].RefKindKeyword,
+                    getArgName: i => i == 0 ? null : argSyntaxes[i - 1].NameColon?.Name.Identifier.ValueText,
+                    chosen: out var chosen,
+                    convertedArgs: out var convertedArgs,
+                    context: context,
+                    diagnostics: diagnostics,
+                    diagnosticNode: invocation))
+                {
+                    return new BoundCallExpression(invocation, receiverOpt: null, method: chosen!, arguments: convertedArgs);
+                }
+
+                return new BoundBadExpression(invocation);
+            }
+
+            var memberValue = BindMemberOnBoundReceiver(invocation.Expression, receiver, nameSyntax, BindValueKind.RValue, context, diagnostics);
+            if (!memberValue.HasErrors && TryGetDelegateInvokeMethod(memberValue.Type, out _, out _))
+                return BindDelegateInvocation(invocation, memberValue, argSyntaxes, args, context, diagnostics);
+
+            diagnostics.Add(new Diagnostic("CN_CALL022", DiagnosticSeverity.Error,
+                $"No method '{name}' found on type '{receiverType.Name}'.",
+                new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+            return new BoundBadExpression(invocation);
+        }
+
+        private BoundExpression BindMemberOnBoundReceiver(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            SimpleNameSyntax nameSyntax,
+            BindValueKind valueKind,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var name = GetSimpleName(nameSyntax);
+            if (string.IsNullOrEmpty(name))
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC000", DiagnosticSeverity.Error,
+                    "Invalid member name in member access.",
+                    new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverType is null)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC001", DiagnosticSeverity.Error,
+                    "Receiver is not a type or a value with members.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            var members = FilterAccessibleMembers(LookupMembers(receiverType, name), context);
+            if (members.IsDefaultOrEmpty)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC002", DiagnosticSeverity.Error,
+                    $"No member '{name}' found on type '{receiverType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            FieldSymbol? field = null;
+            PropertySymbol? prop = null;
+            bool hasMethod = false;
+            bool hasType = false;
+            for (int i = 0; i < members.Length; i++)
+            {
+                switch (members[i])
+                {
+                    case FieldSymbol f: field ??= f; break;
+                    case PropertySymbol p: prop ??= p; break;
+                    case MethodSymbol: hasMethod = true; break;
+                    case NamedTypeSymbol: hasType = true; break;
+                }
+            }
+
+            if (field is null && prop is null)
+            {
+                if (hasMethod)
+                {
+                    var methodBuilder = ImmutableArray.CreateBuilder<MethodSymbol>();
+                    for (int i = 0; i < members.Length; i++)
+                        if (members[i] is MethodSymbol method && !method.IsStatic)
+                            methodBuilder.Add(method);
+
+                    var methods = ApplyExplicitTypeArgumentsToMethodGroup(
+                        nameSyntax,
+                        methodBuilder.ToImmutable(),
+                        context,
+                        diagnostics,
+                        out bool hadArityMatch);
+
+                    if (methods.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MEMACC_MG001",
+                            DiagnosticSeverity.Error,
+                            hadArityMatch
+                                ? $"No overload of '{name}' satisfies the supplied type arguments or receiver kind."
+                                : $"No overload of '{name}' has the supplied number of type arguments.",
+                            new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    return new BoundMethodGroupExpression(syntax, name, receiver, methods);
+                }
+
+                diagnostics.Add(new Diagnostic(
+                    hasType ? "CN_MEMACC004" : "CN_MEMACC005",
+                    DiagnosticSeverity.Error,
+                    hasType ? "A type name is not a value." : "Member access does not resolve to a value member.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (field is not null && prop is not null)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC006", DiagnosticSeverity.Error,
+                    $"Member name '{name}' is ambiguous between a field and a property.",
+                    new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (field is not null)
+            {
+                if (valueKind == BindValueKind.LValue && field.IsConst)
+                {
+                    diagnostics.Add(new Diagnostic("CN_MEMACC010", DiagnosticSeverity.Error,
+                        "Cannot assign to a const field.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                if (field.IsStatic)
+                {
+                    diagnostics.Add(new Diagnostic("CN_MEMACC012", DiagnosticSeverity.Error,
+                        "A static field cannot be accessed with an instance reference.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                bool isRefField = field.Type is ByRefTypeSymbol;
+                TypeSymbol fieldValueType = isRefField ? ((ByRefTypeSymbol)field.Type).ElementType : field.Type;
+
+                if (valueKind == BindValueKind.LValue && IsReadOnlyValueReceiver(receiver, context) && !isRefField)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_READONLY_THIS001",
+                        DiagnosticSeverity.Error,
+                        "Cannot assign to instance members of 'this' in a readonly struct instance member.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                bool allowCtorReadonlyWrite =
+                    valueKind == BindValueKind.LValue &&
+                    field.IsReadOnly &&
+                    CanAssignReadOnlyFieldInConstructor(field, receiver, context);
+
+                if (valueKind == BindValueKind.LValue && field.IsReadOnly && !allowCtorReadonlyWrite && !isRefField)
+                {
+                    diagnostics.Add(new Diagnostic("CN_MEMACC013", DiagnosticSeverity.Error,
+                        "Cannot assign to a readonly field except in a constructor of the same type.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                bool canWriteField = !field.IsConst && (isRefField || !field.IsReadOnly || allowCtorReadonlyWrite);
+                return new BoundMemberAccessExpression(
+                    syntax,
+                    receiver,
+                    field,
+                    fieldValueType,
+                    isLValue: canWriteField,
+                    constantValueOpt: field.IsConst ? field.ConstantValueOpt : Optional<object>.None);
+            }
+
+            bool canReadProperty = prop!.GetMethod is not null && AccessibilityHelper.IsAccessible(prop.GetMethod, context);
+            bool canWriteProperty = prop.SetMethod is not null && AccessibilityHelper.IsAccessible(prop.SetMethod, context);
+
+            if (valueKind == BindValueKind.RValue && !canReadProperty)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC020", DiagnosticSeverity.Error,
+                    "Property has no accessible getter.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            bool allowCtorAutoPropWrite =
+                valueKind == BindValueKind.LValue &&
+                !canWriteProperty &&
+                CanAssignReadOnlyAutoPropertyInConstructor(prop, receiver, context);
+
+            if (valueKind == BindValueKind.LValue && !canWriteProperty && !allowCtorAutoPropWrite)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC021", DiagnosticSeverity.Error,
+                    "Property has no accessible setter.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (prop.IsStatic)
+            {
+                diagnostics.Add(new Diagnostic("CN_MEMACC023", DiagnosticSeverity.Error,
+                    "A static property cannot be accessed with an instance reference.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (valueKind == BindValueKind.LValue && IsReadOnlyValueReceiver(receiver, context))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_READONLY_THIS002",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign to instance properties of 'this' in a readonly struct instance member.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            return new BoundMemberAccessExpression(
+                syntax,
+                receiver,
+                prop,
+                prop.Type,
+                isLValue: canWriteProperty || allowCtorAutoPropWrite);
+        }
+
+        private BoundExpression BindElementOnBoundReceiver(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            BracketedArgumentListSyntax argumentList,
+            BindValueKind valueKind,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (argumentList.Arguments.Count == 1 && argumentList.Arguments[0].Expression is RangeExpressionSyntax)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SLICE000",
+                    DiagnosticSeverity.Error,
+                    valueKind == BindValueKind.LValue ? "Cannot assign to a slice." : "Conditional slicing is not implemented.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (receiver.Type is ArrayTypeSymbol arrayType)
+            {
+                if (argumentList.Arguments.Count != arrayType.Rank)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ELEM002",
+                        DiagnosticSeverity.Error,
+                        arrayType.Rank == 1
+                            ? "Array element access expects exactly one index argument."
+                            : $"Array element access expects exactly {arrayType.Rank} index arguments.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentList.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                var indices = ImmutableArray.CreateBuilder<BoundExpression>(argumentList.Arguments.Count);
+                for (int i = 0; i < argumentList.Arguments.Count; i++)
+                {
+                    var arg = argumentList.Arguments[i];
+                    var index = BindExpression(arg.Expression, context, diagnostics);
+                    index = ApplyConversion(arg.Expression, index, intType, syntax, context, diagnostics, requireImplicit: true);
+                    indices.Add(index);
+                }
+
+                return new BoundArrayElementAccessExpression(syntax, arrayType.ElementType, receiver, indices.ToImmutable());
+            }
+
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverType is not null)
+            {
+                var indexers = FilterAccessibleIndexers(LookupIndexers(receiverType), context)
+                    .Where(p => !p.IsStatic)
+                    .ToImmutableArray();
+
+                if (!indexers.IsDefaultOrEmpty)
+                {
+                    var rawArgs = ImmutableArray.CreateBuilder<BoundExpression>(argumentList.Arguments.Count);
+                    bool hasArgErrors = false;
+                    for (int i = 0; i < argumentList.Arguments.Count; i++)
+                    {
+                        var arg = BindExpression(argumentList.Arguments[i].Expression, context, diagnostics);
+                        rawArgs.Add(arg);
+                        if (arg.HasErrors)
+                            hasArgErrors = true;
+                    }
+
+                    if (hasArgErrors)
+                        return new BoundBadExpression(syntax);
+
+                    var fakeSyntax = new ElementAccessExpressionSyntax((ExpressionSyntax)receiver.Syntax, argumentList);
+                    if (!TryResolveIndexerOverload(indexers, fakeSyntax, rawArgs.ToImmutable(), context, diagnostics,
+                            out var chosenIndexer, out var convertedArgs))
+                    {
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    bool canReadIndexer = chosenIndexer!.GetMethod is not null && AccessibilityHelper.IsAccessible(chosenIndexer.GetMethod, context);
+                    bool canWriteIndexer = chosenIndexer.SetMethod is not null && AccessibilityHelper.IsAccessible(chosenIndexer.SetMethod, context);
+                    bool isRefReturnIndexer = chosenIndexer.GetMethod is MethodSymbol getMethod && getMethod.ReturnType is ByRefTypeSymbol;
+
+                    if (valueKind == BindValueKind.RValue && !canReadIndexer)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MEMACC024",
+                            DiagnosticSeverity.Error,
+                            "Indexer has no accessible getter.",
+                            new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    if (valueKind == BindValueKind.LValue && isRefReturnIndexer && !canReadIndexer)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MEMACC024",
+                            DiagnosticSeverity.Error,
+                            "Indexer has no accessible getter.",
+                            new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    if (valueKind == BindValueKind.LValue && IsReadOnlyValueReceiver(receiver, context))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_READONLY_THIS002",
+                            DiagnosticSeverity.Error,
+                            "Cannot assign to instance properties of 'this' in a readonly struct instance member.",
+                            new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    bool allowCtorAutoPropWrite =
+                        valueKind == BindValueKind.LValue &&
+                        !canWriteIndexer &&
+                        CanAssignReadOnlyAutoPropertyInConstructor(chosenIndexer, receiver, context);
+
+                    if (valueKind == BindValueKind.LValue &&
+                        !canWriteIndexer &&
+                        !allowCtorAutoPropWrite &&
+                        !(isRefReturnIndexer && canReadIndexer))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MEMACC025",
+                            DiagnosticSeverity.Error,
+                            "Indexer has no accessible setter.",
+                            new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    return new BoundIndexerAccessExpression(
+                        syntax,
+                        receiver,
+                        chosenIndexer,
+                        convertedArgs,
+                        isLValue: canWriteIndexer || allowCtorAutoPropWrite || (isRefReturnIndexer && canReadIndexer));
+                }
+            }
+
+            diagnostics.Add(new Diagnostic(
+                "CN_ELEM000",
+                DiagnosticSeverity.Error,
+                "Element access is not implemented for this type.",
+                new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+            return new BoundBadExpression(syntax);
+        }
+
         private BoundExpression BindAssignment(AssignmentExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
+            if (node.Left is ConditionalAccessExpressionSyntax conditionalLeft)
+                return BindConditionalAssignment(node, conditionalLeft, context, diagnostics);
+
             if (node.Kind == SyntaxKind.SimpleAssignmentExpression && IsDeconstructionTargetSyntax(node.Left))
                 return BindDeconstructionAssignment(node, context, diagnostics);
 
@@ -10395,6 +11436,16 @@ namespace Cnidaria.Cs
 
             var right = BindExpression(node.Right, context, diagnostics);
 
+            return BindAssignmentToLValue(node, lv, right, context, diagnostics);
+        }
+        private BoundExpression BindAssignmentToLValue(
+            AssignmentExpressionSyntax node,
+            LValue lv,
+            BoundExpression right,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var leftTarget = lv.Target;
             bool hasErrors = leftTarget.HasErrors || right.HasErrors;
 
             // const local assignment check
@@ -18569,6 +19620,16 @@ namespace Cnidaria.Cs
         {
             var decl = ld.Declaration;
 
+            var isUsingDeclaration = ld.UsingKeyword.Span.Length != 0;
+            if (ld.AwaitKeyword.Span.Length != 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_AWAIT000",
+                    DiagnosticSeverity.Error,
+                    "await using is not supported.",
+                    new Location(context.SemanticModel.SyntaxTree, ld.AwaitKeyword.Span)));
+            }
+
             var isConst = HasModifier(ld.Modifiers, SyntaxKind.ConstKeyword);
             var isRefLocal = HasModifier(ld.Modifiers, SyntaxKind.RefKeyword);
             var isVar = IsVar(decl.Type);
@@ -18588,7 +19649,18 @@ namespace Cnidaria.Cs
                     "A ref local cannot be const.",
                     new Location(context.SemanticModel.SyntaxTree, ld.Span)));
             }
-
+            if (isUsingDeclaration && isConst)
+            {
+                diagnostics.Add(new Diagnostic("CN_USING_CONST000", DiagnosticSeverity.Error,
+                    "A using local cannot be const.",
+                    new Location(context.SemanticModel.SyntaxTree, ld.Span)));
+            }
+            if (isUsingDeclaration && isRefLocal)
+            {
+                diagnostics.Add(new Diagnostic("CN_USING_REF000", DiagnosticSeverity.Error,
+                    "A using local cannot be a ref local.",
+                    new Location(context.SemanticModel.SyntaxTree, ld.Span)));
+            }
             if (isRefLocal && decl.Variables.Count != 1)
             {
                 diagnostics.Add(new Diagnostic("CN_REFLOC001", DiagnosticSeverity.Error,
@@ -18601,11 +19673,13 @@ namespace Cnidaria.Cs
                 explicitType = BindType(decl.Type, context, diagnostics);
 
             if (decl.Variables.Count == 1)
-                return BindSingleDeclarator(ld, decl.Variables[0], isVar, explicitType, isRefLocal, isConst, context, diagnostics);
+                return BindSingleDeclarator(
+                    ld, decl.Variables[0], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, context, diagnostics);
 
             var list = ImmutableArray.CreateBuilder<BoundStatement>(decl.Variables.Count);
             for (int i = 0; i < decl.Variables.Count; i++)
-                list.Add(BindSingleDeclarator(ld, decl.Variables[i], isVar, explicitType, isRefLocal, isConst, context, diagnostics));
+                list.Add(BindSingleDeclarator(
+                    ld, decl.Variables[i], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, context, diagnostics));
 
             return new BoundStatementList(ld, list.ToImmutable());
         }
@@ -18616,6 +19690,7 @@ namespace Cnidaria.Cs
             TypeSymbol? explicitType,
             bool isRefLocal,
             bool isConst,
+            bool isUsing,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -18686,13 +19761,17 @@ namespace Cnidaria.Cs
                     type: localType,
                     locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, v.Span)),
                     isConst: false,
+                    isReadOnly: isUsing,
                     constantValueOpt: Optional<object>.None,
                     isByRef: true);
 
                 _locals[name] = refLocal;
                 context.Recorder.RecordDeclared(v, refLocal);
 
-                return new BoundLocalDeclarationStatement(ownerSyntax, refLocal, init);
+                var result = new BoundLocalDeclarationStatement(ownerSyntax, refLocal, init, isUsing);
+                if (isUsing)
+                    ValidateUsingResource(refLocal.Type, v.Initializer?.Value, v, context, diagnostics);
+                return result;
             }
             if (isVar)
             {
@@ -18835,12 +19914,18 @@ namespace Cnidaria.Cs
                 type: localType,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, v.Span)),
                 isConst: isConst,
+                isReadOnly: isUsing,
                 constantValueOpt: constValueOpt);
 
             _locals[name] = local;
             context.Recorder.RecordDeclared(v, local);
 
-            return new BoundLocalDeclarationStatement(ownerSyntax, local, init);
+            {
+                var result = new BoundLocalDeclarationStatement(ownerSyntax, local, init, isUsing);
+                if (isUsing)
+                    ValidateUsingResource(local.Type, v.Initializer?.Value, v, context, diagnostics);
+                return result;
+            }
         }
         private BoundExpression BindElementAccess(
             ElementAccessExpressionSyntax node,
@@ -23715,6 +24800,199 @@ namespace Cnidaria.Cs
             underlying = null!;
             return false;
         }
+        private BoundStatement BindUsingStatement(UsingStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            if (node.AwaitKeyword.Span.Length != 0)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_AWAIT000",
+                    DiagnosticSeverity.Error,
+                    "await using is not supported.",
+                    new Location(context.SemanticModel.SyntaxTree, node.AwaitKeyword.Span)));
+            }
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+
+            if (node.Declaration is not null)
+            {
+                var declarations = scope.BindUsingResourceDeclaration(node, node.Declaration, context, diagnostics);
+                var body = scope.BindStatement(node.Statement, context, diagnostics);
+                return new BoundUsingStatement(node, declarations, expressionOpt: null, body);
+            }
+
+            if (node.Expression is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING000",
+                    DiagnosticSeverity.Error,
+                    "A using statement requires a resource expression or resource declaration.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+
+                var body = scope.BindStatement(node.Statement, context, diagnostics);
+                return new BoundUsingStatement(
+                    node,
+                    ImmutableArray<BoundLocalDeclarationStatement>.Empty,
+                    new BoundBadExpression(node),
+                    body);
+            }
+
+            var expression = BindExpression(node.Expression, context, diagnostics);
+            if (expression.Type is NullTypeSymbol or DefaultLiteralTypeSymbol &&
+                DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "IDisposable", 0, out var disposableType))
+            {
+                expression = ApplyConversion(
+                    exprSyntax: node.Expression,
+                    expr: expression,
+                    targetType: disposableType,
+                    diagnosticNode: node.Expression,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+            }
+            ValidateUsingResource(expression.Type, node.Expression, node.Expression, context, diagnostics);
+
+            var expressionBody = scope.BindStatement(node.Statement, context, diagnostics);
+            return new BoundUsingStatement(node, ImmutableArray<BoundLocalDeclarationStatement>.Empty, expression, expressionBody);
+        }
+        private ImmutableArray<BoundLocalDeclarationStatement> BindUsingResourceDeclaration(
+            UsingStatementSyntax ownerSyntax,
+            VariableDeclarationSyntax declaration,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var isVar = IsVar(declaration.Type);
+            TypeSymbol? explicitType = null;
+            if (!isVar)
+                explicitType = BindType(declaration.Type, context, diagnostics);
+
+            var builder = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(declaration.Variables.Count);
+            for (int i = 0; i < declaration.Variables.Count; i++)
+            {
+                var v = declaration.Variables[i];
+                if (v.Initializer is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_USING_INIT000",
+                        DiagnosticSeverity.Error,
+                        "A using resource declaration must be initialized.",
+                        new Location(context.SemanticModel.SyntaxTree, v.Span)));
+                }
+
+                var bound = BindSingleDeclarator(
+                    ownerSyntax,
+                    v,
+                    isVar,
+                    explicitType,
+                    isRefLocal: false,
+                    isConst: false,
+                    isUsing: true,
+                    context,
+                    diagnostics);
+
+                if (bound is BoundLocalDeclarationStatement localDeclaration)
+                    builder.Add(localDeclaration);
+            }
+
+            return builder.ToImmutable();
+        }
+        private void ValidateUsingResource(
+            TypeSymbol resourceType,
+            ExpressionSyntax? resourceExpressionSyntax,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (resourceType.Kind == SymbolKind.Error)
+                return;
+
+            if (resourceType.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_DISPOSE000",
+                    DiagnosticSeverity.Error,
+                    "A using resource cannot be of type 'void'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return;
+            }
+
+            if (resourceType is NamedTypeSymbol nt && nt.IsRefLikeType && FindAccessibleDisposeMethod(resourceType) is not null)
+                return;
+
+            if (!DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "IDisposable", 0, out var disposableType))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_DISPOSE001",
+                    DiagnosticSeverity.Error,
+                    "Type 'System.IDisposable' is required for using statements.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return;
+            }
+
+            var conversionSyntax = resourceExpressionSyntax
+                ?? MakeIdentifierName(resourceType.Name, diagnosticNode.Span);
+            var dummy = new BoundTypeOnlyExpression(conversionSyntax, resourceType);
+            var conversion = ClassifyConversion(dummy, disposableType, context);
+            if (conversion.Exists && conversion.IsImplicit)
+                return;
+            diagnostics.Add(new Diagnostic(
+                "CN_USING_DISPOSE002",
+                DiagnosticSeverity.Error,
+                $"Type '{resourceType.Name}' used in a using statement must be implicitly convertible to 'System.IDisposable' " +
+                $"or be a ref-like type with an accessible parameterless instance Dispose method.",
+                new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+        }
+        private static MethodSymbol? FindAccessibleDisposeMethod(TypeSymbol type)
+        {
+            var method = FindParameterlessInstanceMethod(type, "Dispose", null);
+            return method is not null && method.ReturnType.SpecialType == SpecialType.System_Void
+                ? method
+                : null;
+        }
+        private static MethodSymbol? FindParameterlessInstanceMethod(TypeSymbol type, string name, TypeSymbol? returnType)
+        {
+            var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
+
+            MethodSymbol? Visit(TypeSymbol current)
+            {
+                if (!seen.Add(current))
+                    return null;
+                if (current is not NamedTypeSymbol nt)
+                    return null;
+
+                var members = nt.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is not MethodSymbol method)
+                        continue;
+                    if (method.IsStatic)
+                        continue;
+                    if (!string.Equals(method.Name, name, StringComparison.Ordinal))
+                        continue;
+                    if (method.TypeParameters.Length != 0)
+                        continue;
+                    if (method.Parameters.Length != 0)
+                        continue;
+                    if (returnType is not null && !ReferenceEquals(method.ReturnType, returnType))
+                        continue;
+                    return method;
+                }
+
+                var interfaces = nt.Interfaces;
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    var m = Visit(interfaces[i]);
+                    if (m is not null)
+                        return m;
+                }
+
+                if (nt.BaseType is TypeSymbol baseType)
+                    return Visit(baseType);
+
+                return null;
+            }
+
+            return Visit(type);
+        }
         private BoundStatement BindTry(TryStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             if (node.Catches.Count == 0 && node.Finally == null)
@@ -24211,9 +25489,9 @@ namespace Cnidaria.Cs
                         out isFallback,
                         out isDefaultLabel,
                         out gotoCaseKey);
-                    if (isFallback) 
+                    if (isFallback)
                         secHasFallback = true;
-                    else 
+                    else
                         cond = cond is null ? labelCond : MakeLogicalOr(sec, cond, labelCond, ctx, diagnostics);
 
                     if (isDefaultLabel)
@@ -24275,10 +25553,10 @@ namespace Cnidaria.Cs
                     stmts.Add(new BoundGotoStatement(sec, breakLabel)); // implicit break
                 }
             }
-            finally 
-            { 
+            finally
+            {
                 _flow.PopSwitchGotoScope();
-                _flow.PopBreak(); 
+                _flow.PopBreak();
             }
 
             stmts.Add(new BoundLabelStatement(node, breakLabel));
@@ -24739,6 +26017,8 @@ namespace Cnidaria.Cs
                 return true;
             if (TryResolveStringForEach(collection, context, out result))
                 return true;
+            if (TryResolveSpanForEach(collection, out result))
+                return true;
 
             var patternStatus = TryResolvePatternForEach(node, collection, context, diagnostics, out result);
             if (patternStatus == ForEachResolutionStatus.Success)
@@ -24818,6 +26098,30 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        private bool TryResolveSpanForEach(
+            BoundExpression collection,
+            out ForEachResolution result)
+        {
+            if (!TryGetSpanLikeElementType(collection.Type, out var spanLikeType, out var elementType))
+            {
+                result = default;
+                return false;
+            }
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.Span,
+                collectionType: spanLikeType,
+                enumeratorType: spanLikeType,
+                elementType: elementType,
+                collectionConversion: new Conversion(ConversionKind.Identity),
+                getEnumeratorMethodOpt: null,
+                getEnumeratorIsExtensionMethod: false,
+                currentPropertyOpt: null,
+                moveNextMethodOpt: null);
+
+            return true;
+        }
+
         private ForEachResolutionStatus TryResolvePatternForEach(
             ForEachStatementSyntax node,
             BoundExpression collection,
@@ -25357,6 +26661,9 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
+            if (node is ParenthesizedExpressionSyntax paren)
+                return BindDiscardedExpression(paren.Expression, context, diagnostics);
+
             if (node is PostfixUnaryExpressionSyntax post)
             {
                 if (post.Kind == SyntaxKind.PostIncrementExpression)
@@ -25584,14 +26891,14 @@ namespace Cnidaria.Cs
             if (decl.Variables.Count == 1)
             {
                 var s = BindSingleDeclarator(
-                    ownerSyntax, decl.Variables[0], isVar, explicitType, isRefLocal: false, isConst: false, context, diagnostics);
+                    ownerSyntax, decl.Variables[0], isVar, explicitType, isRefLocal: false, isConst: false, isUsing: false, context, diagnostics);
                 return ImmutableArray.Create(s);
             }
 
             var list = ImmutableArray.CreateBuilder<BoundStatement>(decl.Variables.Count);
             for (int i = 0; i < decl.Variables.Count; i++)
                 list.Add(BindSingleDeclarator(
-                    ownerSyntax, decl.Variables[i], isVar, explicitType, isRefLocal: false, isConst: false, context, diagnostics));
+                    ownerSyntax, decl.Variables[i], isVar, explicitType, isRefLocal: false, isConst: false, isUsing: false, context, diagnostics));
 
             return list.ToImmutable();
         }

@@ -123,6 +123,7 @@ namespace Cnidaria.Cs
                 BoundBlockStatement s => RewriteBlockStatement(s),
                 BoundExpressionStatement s => RewriteExpressionStatement(s),
                 BoundLocalDeclarationStatement s => RewriteLocalDeclarationStatement(s),
+                BoundUsingStatement s => RewriteUsingStatement(s),
                 BoundEmptyStatement s => s,
                 BoundTryStatement s => RewriteTryStatement(s),
                 BoundThrowStatement s => RewriteThrowStatement(s),
@@ -159,6 +160,7 @@ namespace Cnidaria.Cs
                 BoundThisExpression e => e,
                 BoundBaseExpression e => e,
                 BoundLabelExpression e => e,
+                BoundTypeOfExpression e => e,
                 BoundSizeOfExpression e => e,
                 BoundUnboundLambdaExpression e => e,
                 BoundMethodGroupExpression e => e,
@@ -423,7 +425,39 @@ namespace Cnidaria.Cs
         {
             var init = node.Initializer is null ? null : RewriteExpression(node.Initializer);
             if (!ReferenceEquals(init, node.Initializer))
-                return new BoundLocalDeclarationStatement(node.Syntax, node.Local, init);
+                return new BoundLocalDeclarationStatement(node.Syntax, node.Local, init, node.IsUsing);
+
+            return node;
+        }
+        protected virtual BoundStatement RewriteUsingStatement(BoundUsingStatement node)
+        {
+            var declarations = node.Declarations;
+            bool declarationsChanged = false;
+            if (!declarations.IsDefaultOrEmpty)
+            {
+                var builder = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(declarations.Length);
+                for (int i = 0; i < declarations.Length; i++)
+                {
+                    var rewritten = (BoundLocalDeclarationStatement)RewriteLocalDeclarationStatement(declarations[i]);
+                    if (!ReferenceEquals(rewritten, declarations[i]))
+                        declarationsChanged = true;
+                    builder.Add(rewritten);
+                }
+                if (declarationsChanged)
+                    declarations = builder.ToImmutable();
+            }
+
+            var expression = node.ExpressionOpt is null ? null : RewriteExpression(node.ExpressionOpt);
+            var body = RewriteStatement(node.Body);
+
+            if (declarationsChanged || !ReferenceEquals(expression, node.ExpressionOpt) || !ReferenceEquals(body, node.Body))
+            {
+                return new BoundUsingStatement(
+                    (UsingStatementSyntax)node.Syntax,
+                    declarations,
+                    expression,
+                    body);
+            }
 
             return node;
         }
@@ -467,7 +501,7 @@ namespace Cnidaria.Cs
                 !ReferenceEquals(thenStmt, node.Then) ||
                 !ReferenceEquals(elseStmt, node.ElseOpt))
             {
-                return new BoundIfStatement((IfStatementSyntax)node.Syntax, condition, thenStmt, elseStmt);
+                return new BoundIfStatement(node.Syntax, condition, thenStmt, elseStmt);
             }
 
             return node;
@@ -782,7 +816,7 @@ namespace Cnidaria.Cs
                 !ReferenceEquals(whenTrue, node.WhenTrue) ||
                 !ReferenceEquals(whenFalse, node.WhenFalse))
             {
-                return new BoundConditionalExpression((ConditionalExpressionSyntax)node.Syntax, node.Type, cond, whenTrue, whenFalse, node.ConstantValueOpt);
+                return new BoundConditionalExpression(node.Syntax, node.Type, cond, whenTrue, whenFalse, node.ConstantValueOpt);
             }
 
             return node;
@@ -2357,7 +2391,7 @@ namespace Cnidaria.Cs
                     statements.Add(AssignStmt(
                         syntax,
                         Field(syntax, smLocalExpr, info.ThisField),
-                        new BoundThisExpression(syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default), 
+                        new BoundThisExpression(syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default),
                         (NamedTypeSymbol)body.Method.ContainingSymbol!)));
                 }
 
@@ -3292,6 +3326,150 @@ namespace Cnidaria.Cs
                 }
                 return null;
             }
+            protected override BoundStatement RewriteBlockStatement(BoundBlockStatement node)
+            {
+                if (!ContainsUsingDeclarations(node.Statements))
+                    return base.RewriteBlockStatement(node);
+
+                BoundStatement tail = new BoundEmptyStatement(node.Syntax);
+
+                for (int i = node.Statements.Length - 1; i >= 0; i--)
+                {
+                    var statement = node.Statements[i];
+
+                    if (TryGetUsingDeclarations(statement, out var usingDeclarations))
+                    {
+                        tail = LowerUsingDeclarations(node.Syntax, usingDeclarations, tail);
+                        continue;
+                    }
+
+                    var rewritten = RewriteStatement(statement);
+                    tail = IsNoOpStatement(tail)
+                        ? rewritten
+                        : PrependStatement(tail, rewritten);
+                }
+
+                return tail;
+            }
+
+            protected override BoundStatement RewriteUsingStatement(BoundUsingStatement node)
+            {
+                BoundStatement body = RewriteStatement(node.Body);
+
+                if (!node.Declarations.IsDefaultOrEmpty)
+                {
+                    var rewrittenDeclarations = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(node.Declarations.Length);
+                    for (int i = 0; i < node.Declarations.Length; i++)
+                    {
+                        var rewritten = (BoundLocalDeclarationStatement)RewriteLocalDeclarationStatement(node.Declarations[i]);
+                        rewrittenDeclarations.Add(new BoundLocalDeclarationStatement(
+                            rewritten.Syntax,
+                            rewritten.Local,
+                            rewritten.Initializer,
+                            isUsing: false));
+                    }
+
+                    return LowerUsingDeclarations(node.Syntax, rewrittenDeclarations.ToImmutable(), body);
+                }
+
+                if (node.ExpressionOpt is null)
+                    return body;
+
+                var expression = RewriteExpression(node.ExpressionOpt);
+                var temp = CreateTempLocal(expression.Type);
+                var declaration = new BoundLocalDeclarationStatement(node.Syntax, temp, expression);
+                return LowerUsingLocal(node.Syntax, declaration, body);
+            }
+
+            private static bool ContainsUsingDeclarations(ImmutableArray<BoundStatement> statements)
+            {
+                for (int i = 0; i < statements.Length; i++)
+                    if (TryGetUsingDeclarations(statements[i], out _))
+                        return true;
+                return false;
+            }
+
+            private static bool TryGetUsingDeclarations(
+                BoundStatement statement,
+                out ImmutableArray<BoundLocalDeclarationStatement> declarations)
+            {
+                if (statement is BoundLocalDeclarationStatement local && local.IsUsing)
+                {
+                    declarations = ImmutableArray.Create(local);
+                    return true;
+                }
+
+                if (statement is BoundStatementList list && !list.Statements.IsDefaultOrEmpty)
+                {
+                    var builder = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(list.Statements.Length);
+                    for (int i = 0; i < list.Statements.Length; i++)
+                    {
+                        if (list.Statements[i] is not BoundLocalDeclarationStatement d || !d.IsUsing)
+                        {
+                            declarations = default;
+                            return false;
+                        }
+                        builder.Add(d);
+                    }
+
+                    declarations = builder.ToImmutable();
+                    return true;
+                }
+
+                declarations = default;
+                return false;
+            }
+
+            private BoundStatement LowerUsingDeclarations(
+                SyntaxNode syntax,
+                ImmutableArray<BoundLocalDeclarationStatement> declarations,
+                BoundStatement body)
+            {
+                BoundStatement current = body;
+                for (int i = declarations.Length - 1; i >= 0; i--)
+                {
+                    var d = declarations[i];
+                    var nonUsingDeclaration = new BoundLocalDeclarationStatement(
+                        d.Syntax,
+                        d.Local,
+                        d.Initializer,
+                        isUsing: false);
+                    current = LowerUsingLocal(syntax, nonUsingDeclaration, current);
+                }
+                return current;
+            }
+
+            private BoundStatement LowerUsingLocal(
+                SyntaxNode syntax,
+                BoundLocalDeclarationStatement declaration,
+                BoundStatement body)
+            {
+                if (!TryCreateForEachFinally(syntax, declaration.Local, out var finallyBlock))
+                {
+                    return new BoundBlockStatement(
+                        syntax,
+                        ImmutableArray.Create<BoundStatement>(declaration, body));
+                }
+
+                var tryBlock = body is BoundBlockStatement block
+                    ? block
+                    : new BoundBlockStatement(
+                        body.Syntax,
+                        IsNoOpStatement(body)
+                            ? ImmutableArray<BoundStatement>.Empty
+                            : ImmutableArray.Create(body));
+
+                var tryStatement = new BoundTryStatement(
+                    CreateSyntheticTryStatementSyntax(),
+                    tryBlock,
+                    ImmutableArray<BoundCatchBlock>.Empty,
+                    finallyBlock);
+
+                return new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(declaration, tryStatement));
+            }
+
             protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
             {
                 if (node.Initializer is BoundSpanCollectionExpression spanCollection)
@@ -3304,7 +3482,7 @@ namespace Cnidaria.Cs
                         ? LowerSpanCollectionToStackAlloc(spanCollection)
                         : LowerSpanCollectionToHeapArray(spanCollection);
 
-                    return new BoundLocalDeclarationStatement(node.Syntax, node.Local, lowered);
+                    return new BoundLocalDeclarationStatement(node.Syntax, node.Local, lowered, node.IsUsing);
                 }
 
                 return base.RewriteLocalDeclarationStatement(node);
@@ -3616,6 +3794,7 @@ namespace Cnidaria.Cs
                 {
                     BoundForEachEnumeratorKind.Array => LowerArrayForEach(node, collection, body),
                     BoundForEachEnumeratorKind.String => LowerStringForEach(node, collection, body),
+                    BoundForEachEnumeratorKind.Span => LowerSpanForEach(node, collection, body),
                     BoundForEachEnumeratorKind.Pattern or BoundForEachEnumeratorKind.Interface => LowerEnumeratorForEach(node, collection, body),
                     _ => throw new NotSupportedException($"Unexpected foreach enumerator kind: {node.EnumeratorKind}")
                 };
@@ -3751,6 +3930,70 @@ namespace Cnidaria.Cs
 
                 return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
             }
+            private BoundStatement LowerSpanForEach(
+                BoundForEachStatement node,
+                BoundExpression collection,
+                BoundStatement body)
+            {
+                if (!IsSpanLikeType(collection.Type))
+                    throw new InvalidOperationException("Expected Span<T> or ReadOnlySpan<T> expression for foreach span lowering.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var boolType = _compilation.GetSpecialType(SpecialType.System_Boolean);
+
+                var collectionTemp = CreateTempLocal(collection.Type);
+                var indexTemp = CreateTempLocal(intType);
+
+                var collectionExpr = new BoundLocalExpression(node.Syntax, collectionTemp);
+                var indexExpr = new BoundLocalExpression(node.Syntax, indexTemp);
+                var zero = new BoundLiteralExpression(node.Syntax, intType, 0);
+                var one = new BoundLiteralExpression(node.Syntax, intType, 1);
+
+                var lengthExpr = RewriteExpression(MakeSpanLengthRead(node.Syntax, collectionExpr));
+                var condition = new BoundBinaryExpression(
+                    node.Syntax,
+                    BoundBinaryOperatorKind.LessThan,
+                    boolType,
+                    indexExpr,
+                    lengthExpr,
+                    Optional<object>.None);
+
+                BoundExpression current = MakeSpanElementRead(node.Syntax, collectionExpr, indexExpr, node.ElementType);
+                current = ApplyConversionIfNeeded(node.Syntax, current, node.IterationVariable.Type, node.IterationConversion);
+                current = RewriteExpression(current);
+
+                var increment = new BoundAssignmentExpression(
+                    node.Syntax,
+                    indexExpr,
+                    new BoundBinaryExpression(
+                        node.Syntax,
+                        BoundBinaryOperatorKind.Add,
+                        intType,
+                        indexExpr,
+                        one,
+                        Optional<object>.None,
+                        isChecked: GetEffectiveIsChecked(false)));
+
+                var builder = ImmutableArray.CreateBuilder<BoundStatement>();
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, collectionTemp, collection));
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, indexTemp, zero));
+                builder.Add(new BoundLabelStatement(node.Syntax, GenerateLabel("foreach_span_check")));
+
+                var checkLabel = ((BoundLabelStatement)builder[2]).Label;
+                var branch = MakeConditionalGoto(node.Syntax, condition, node.BreakLabel, jumpIfTrue: false);
+                if (branch is not BoundEmptyStatement)
+                    builder.Add(branch);
+
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, node.IterationVariable, current));
+                builder.Add(body);
+                builder.Add(new BoundLabelStatement(node.Syntax, node.ContinueLabel));
+                builder.Add(new BoundExpressionStatement(node.Syntax, RewriteExpression(increment)));
+                builder.Add(new BoundGotoStatement(node.Syntax, checkLabel));
+                builder.Add(new BoundLabelStatement(node.Syntax, node.BreakLabel));
+
+                return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
+            }
+
             private BoundStatement LowerEnumeratorForEach(
                 BoundForEachStatement node,
                 BoundExpression collection,
@@ -3934,6 +4177,86 @@ namespace Cnidaria.Cs
 
                 throw new InvalidOperationException("System.String indexer getter not found.");
             }
+            private BoundExpression MakeSpanLengthRead(SyntaxNode syntax, BoundExpression spanExpr)
+            {
+                if (!IsSpanLikeType(spanExpr.Type))
+                    throw new InvalidOperationException("Expected Span<T> or ReadOnlySpan<T> expression for Length lowering.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                if (spanExpr.Type is not NamedTypeSymbol spanType)
+                    throw new InvalidOperationException("Expected named Span<T> or ReadOnlySpan<T> type.");
+
+                var members = spanType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol prop &&
+                        !prop.IsStatic &&
+                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        ReferenceEquals(prop.Type, intType) &&
+                        prop.Parameters.Length == 0 &&
+                        prop.GetMethod is MethodSymbol getter)
+                    {
+                        return new BoundCallExpression(syntax, spanExpr, getter, ImmutableArray<BoundExpression>.Empty);
+                    }
+                }
+
+                throw new InvalidOperationException($"{spanType.Name}.Length getter not found.");
+            }
+
+            private BoundExpression MakeSpanElementRead(
+                SyntaxNode syntax,
+                BoundExpression spanExpr,
+                BoundExpression indexExpr,
+                TypeSymbol elementType)
+            {
+                if (!IsSpanLikeType(spanExpr.Type))
+                    throw new InvalidOperationException("Expected Span<T> or ReadOnlySpan<T> expression for indexer lowering.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                if (spanExpr.Type is not NamedTypeSymbol spanType)
+                    throw new InvalidOperationException("Expected named Span<T> or ReadOnlySpan<T> type.");
+
+                var members = spanType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is PropertySymbol prop &&
+                        !prop.IsStatic &&
+                        prop.Parameters.Length == 1 &&
+                        ReferenceEquals(prop.Parameters[0].Type, intType) &&
+                        prop.GetMethod is MethodSymbol getter)
+                    {
+                        var propertyType = prop.Type is ByRefTypeSymbol br ? br.ElementType : prop.Type;
+                        if (!ReferenceEquals(propertyType, elementType))
+                            continue;
+
+                        return new BoundCallExpression(
+                            syntax,
+                            spanExpr,
+                            getter,
+                            ImmutableArray.Create(indexExpr));
+                    }
+                }
+
+                throw new InvalidOperationException($"{spanType.Name} indexer getter not found.");
+            }
+
+            private static bool IsSpanLikeType(TypeSymbol type)
+            {
+                if (type is not NamedTypeSymbol named)
+                    return false;
+
+                var definition = named.OriginalDefinition;
+                if (definition.Arity != 1)
+                    return false;
+
+                if (!string.Equals(definition.Name, "Span", StringComparison.Ordinal) &&
+                    !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                    return false;
+
+                return definition.ContainingSymbol is NamespaceSymbol ns &&
+                       string.Equals(ns.Name, "System", StringComparison.Ordinal);
+            }
+
             private bool TryCreateForEachFinally(
                 SyntaxNode syntax,
                 LocalSymbol enumeratorLocal,
@@ -4831,6 +5154,7 @@ namespace Cnidaria.Cs
                         case BoundThisExpression:
                         case BoundBaseExpression:
                         case BoundLabelExpression:
+                        case BoundTypeOfExpression:
                         case BoundSizeOfExpression:
                         case BoundUnboundLambdaExpression:
                         case BoundMethodGroupExpression:

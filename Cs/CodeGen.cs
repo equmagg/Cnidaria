@@ -559,6 +559,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, int> _blockStartPositions = new Dictionary<int, int>();
             private readonly Dictionary<int, int> _blockEndPositions = new Dictionary<int, int>();
             private readonly HashSet<int> _emittedGcSafePointPcs = new HashSet<int>();
+            private int _currentEmitNextBlockId = -1;
 
             public MethodEmitter(Assembler asm, BuildState state, GenTreeMethod method, CodeGeneratorOptions options)
             {
@@ -596,12 +597,14 @@ namespace Cnidaria.Cs
                     int blockId = order[i];
                     int nextBlockId = i + 1 < order.Length ? order[i + 1] : -1;
                     var block = _method.Blocks[blockId];
+                    _currentEmitNextBlockId = nextBlockId;
                     _asm.Bind(_blockLabels[blockId]);
                     _blockStartPc[blockId] = _asm.Pc;
                     for (int j = 0; j < block.LinearNodes.Length; j++)
                         EmitGenTreeNode(block.LinearNodes[j]);
 
                     EmitBlockLayoutFixup(blockId, nextBlockId);
+                    _currentEmitNextBlockId = -1;
 
                     if (_asm.Pc == _blockStartPc[blockId])
                         _asm.Nop();
@@ -877,9 +880,13 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.Branch:
                         if (source.SourceOp == BytecodeOp.Leave)
+                        {
                             _asm.Leave(LabelForTarget(source));
-                        else
+                        }
+                        else if (source.TargetBlockId != _currentEmitNextBlockId)
+                        {
                             _asm.J(LabelForTarget(source));
+                        }
                         return;
                     case GenTreeKind.BranchTrue:
                     case GenTreeKind.BranchFalse:

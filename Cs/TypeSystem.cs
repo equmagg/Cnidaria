@@ -731,7 +731,7 @@ namespace Cnidaria.Cs
         private int _nextFieldId = 1;
         private int _nextMethodId = 1;
 
-        
+
 
         private const int ObjectHeaderSize = TargetArchitecture.PointerSize * 2;
         private readonly HashSet<int> _layoutDone = new();
@@ -1443,8 +1443,9 @@ namespace Cnidaria.Cs
             if (_layoutDone.Contains(t.TypeId)) return;
 
             _layoutDone.Add(t.TypeId);
-            if (TryGetPrimitiveLayout(t, out int primSize, out int primAlign))
+            if (TryGetPrimitiveLayout(t, out int primSize, out int primAlign, out RuntimePrimitiveKind primitiveKind))
             {
+                t.PrimitiveKind = primitiveKind;
                 t.SizeOf = primSize;
                 t.AlignOf = primAlign;
                 t.InstanceSize = t.IsReferenceType ? TargetArchitecture.PointerSize : primSize;
@@ -1773,32 +1774,31 @@ namespace Cnidaria.Cs
 
             return (fieldType.SizeOf, fieldType.AlignOf);
         }
-        private static bool TryGetPrimitiveLayout(RuntimeType t, out int size, out int align)
+        private static bool TryGetPrimitiveLayout(RuntimeType t, out int size, out int align, out RuntimePrimitiveKind primitiveKind)
         {
-            size = 0; align = 0;
+            size = 0;
+            align = 0;
+            primitiveKind = RuntimePrimitiveKind.None;
             if (t.Namespace != "System") return false;
 
             switch (t.Name)
             {
-                case "Void": size = 0; align = 1; return true;
-                case "Boolean": size = 1; align = 1; return true;
-                case "Char": size = 2; align = 2; return true;
-                case "SByte":
-                case "Byte": size = 1; align = 1; return true;
-                case "Int16":
-                case "UInt16": size = 2; align = 2; return true;
-                case "Int32":
-                case "UInt32":
-                case "Single": size = 4; align = 4; return true;
-                case "Int64":
-                case "UInt64":
-                case "Double": size = 8; align = 8; return true;
-                case "Decimal": size = 16; align = 8; return true;
-                case "IntPtr":
-                case "UIntPtr":
-                    size = TargetArchitecture.PointerSize;
-                    align = TargetArchitecture.PointerSize;
-                    return true;
+                case "Void": primitiveKind = RuntimePrimitiveKind.Void; size = 0; align = 1; return true;
+                case "Boolean": primitiveKind = RuntimePrimitiveKind.Boolean; size = 1; align = 1; return true;
+                case "Char": primitiveKind = RuntimePrimitiveKind.Char; size = 2; align = 2; return true;
+                case "SByte": primitiveKind = RuntimePrimitiveKind.Int8; size = 1; align = 1; return true;
+                case "Byte": primitiveKind = RuntimePrimitiveKind.UInt8; size = 1; align = 1; return true;
+                case "Int16": primitiveKind = RuntimePrimitiveKind.Int16; size = 2; align = 2; return true;
+                case "UInt16": primitiveKind = RuntimePrimitiveKind.UInt16; size = 2; align = 2; return true;
+                case "Int32": primitiveKind = RuntimePrimitiveKind.Int32; size = 4; align = 4; return true;
+                case "UInt32": primitiveKind = RuntimePrimitiveKind.UInt32; size = 4; align = 4; return true;
+                case "Single": primitiveKind = RuntimePrimitiveKind.Single; size = 4; align = 4; return true;
+                case "Int64": primitiveKind = RuntimePrimitiveKind.Int64; size = 8; align = 8; return true;
+                case "UInt64": primitiveKind = RuntimePrimitiveKind.UInt64; size = 8; align = 8; return true;
+                case "Double": primitiveKind = RuntimePrimitiveKind.Double; size = 8; align = 8; return true;
+                case "Decimal": primitiveKind = RuntimePrimitiveKind.Decimal; size = 16; align = 8; return true;
+                case "IntPtr": primitiveKind = RuntimePrimitiveKind.IntPtr; size = TargetArchitecture.PointerSize; align = TargetArchitecture.PointerSize; return true;
+                case "UIntPtr": primitiveKind = RuntimePrimitiveKind.UIntPtr; size = TargetArchitecture.PointerSize; align = TargetArchitecture.PointerSize; return true;
                 default:
                     return false;
             }
@@ -1874,11 +1874,11 @@ namespace Cnidaria.Cs
 
             if (table != MetadataToken.MemberRef)
             {
-                var field = ResolveField(contextModule, fieldToken); 
+                var field = ResolveField(contextModule, fieldToken);
                 _fieldInMethodContextCache[key] = field;
                 return field;
             }
-                 
+
 
             var mr = contextModule.Md.GetMemberRef(rid);
             string fieldName = contextModule.Md.GetString(mr.Name);
@@ -2871,16 +2871,10 @@ namespace Cnidaria.Cs
 
             if (table == MetadataToken.TypeSpec)
             {
-                // Not expected for base type in your current emitter.
                 return (contextModule.Name, "", "typespec");
             }
 
             throw new NotSupportedException();
-        }
-
-        private void ComputeFieldLayout(RuntimeType t)
-        {
-
         }
     }
 
@@ -2895,6 +2889,29 @@ namespace Cnidaria.Cs
         ByRef,      // BYREF
         TypeParam,  // VAR/MVAR
     }
+
+    internal enum RuntimePrimitiveKind : byte
+    {
+        None,
+        Void,
+        Boolean,
+        Char,
+        Int8,
+        UInt8,
+        Int16,
+        UInt16,
+        Int32,
+        UInt32,
+        Int64,
+        UInt64,
+        NativeInt,
+        NativeUInt,
+        Single,
+        Double,
+        Decimal,
+        IntPtr = NativeInt,
+        UIntPtr = NativeUInt,
+    }
     internal sealed class RuntimeType
     {
         public int TypeId { get; }
@@ -2902,6 +2919,7 @@ namespace Cnidaria.Cs
         public string AssemblyName { get; }
         public string Namespace { get; }
         public string Name { get; }
+        public RuntimePrimitiveKind PrimitiveKind { get; internal set; }
 
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef);

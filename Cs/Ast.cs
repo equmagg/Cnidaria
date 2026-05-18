@@ -3041,6 +3041,34 @@ namespace Cnidaria.Cs
         }
     }
 
+    public sealed class ConditionalAccessExpressionSyntax : ExpressionSyntax
+    {
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken OperatorToken { get; } // '?'
+        public ExpressionSyntax WhenNotNull { get; }
+
+        public ConditionalAccessExpressionSyntax(ExpressionSyntax expression, SyntaxToken operatorToken, ExpressionSyntax whenNotNull)
+            : base(SyntaxKind.ConditionalAccessExpression, NodeSpan.From(expression.Span, whenNotNull.Span))
+        {
+            Expression = expression;
+            OperatorToken = operatorToken;
+            WhenNotNull = whenNotNull;
+        }
+    }
+
+    public sealed class MemberBindingExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken OperatorToken { get; } // '.'
+        public SimpleNameSyntax Name { get; }
+
+        public MemberBindingExpressionSyntax(SyntaxToken operatorToken, SimpleNameSyntax name)
+            : base(SyntaxKind.MemberBindingExpression, NodeSpan.From(operatorToken.Span, name.Span))
+        {
+            OperatorToken = operatorToken;
+            Name = name;
+        }
+    }
+
     public sealed class NameColonSyntax : SyntaxNode
     {
         public IdentifierNameSyntax Name { get; }
@@ -3131,6 +3159,16 @@ namespace Cnidaria.Cs
 
         public ImplicitElementAccessSyntax(BracketedArgumentListSyntax argumentList)
             : base(SyntaxKind.ImplicitElementAccess, argumentList.Span)
+        {
+            ArgumentList = argumentList;
+        }
+    }
+    public sealed class ElementBindingExpressionSyntax : ExpressionSyntax
+    {
+        public BracketedArgumentListSyntax ArgumentList { get; }
+
+        public ElementBindingExpressionSyntax(BracketedArgumentListSyntax argumentList)
+            : base(SyntaxKind.ElementBindingExpression, argumentList.Span)
         {
             ArgumentList = argumentList;
         }

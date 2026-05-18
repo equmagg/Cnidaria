@@ -61,29 +61,61 @@ namespace Cnidaria.Cs
     internal readonly struct CfgLoop
     {
         public readonly int Index;
-        public readonly int HeaderBlockId;
-        public readonly int LatchBlockId;
-        public readonly ImmutableArray<int> BodyBlockIds;
+        public readonly int Header;
+        public readonly ImmutableArray<int> Latches;
+        public readonly ImmutableArray<int> Blocks;
+        public readonly ImmutableArray<int> Entries;
+        public readonly ImmutableArray<int> Exits;
+        public readonly ImmutableArray<int> ExitDestinations;
+        public readonly int Preheader;
+        public readonly int Parent;
+        public readonly int Depth;
+        public readonly bool IsReducible;
+        public readonly bool IsCanonicalPreheader;
+        public readonly bool HeaderHasExceptionalSuccessorInsideLoop;
 
-        public CfgLoop(int index, int headerBlockId, int latchBlockId, ImmutableArray<int> bodyBlockIds)
+        public CfgLoop(
+            int index,
+            int header,
+            ImmutableArray<int> latches,
+            ImmutableArray<int> blocks,
+            ImmutableArray<int> entries,
+            ImmutableArray<int> exits,
+            ImmutableArray<int> exitDestinations,
+            int preheader,
+            int parent,
+            int depth,
+            bool isReducible,
+            bool isCanonicalPreheader,
+            bool headerHasExceptionalSuccessorInsideLoop)
         {
             Index = index;
-            HeaderBlockId = headerBlockId;
-            LatchBlockId = latchBlockId;
-            BodyBlockIds = bodyBlockIds.IsDefault ? ImmutableArray<int>.Empty : bodyBlockIds;
+            Header = header;
+            Latches = latches.IsDefault ? ImmutableArray<int>.Empty : latches;
+            Blocks = blocks.IsDefault ? ImmutableArray<int>.Empty : blocks;
+            Entries = entries.IsDefault ? ImmutableArray<int>.Empty : entries;
+            Exits = exits.IsDefault ? ImmutableArray<int>.Empty : exits;
+            ExitDestinations = exitDestinations.IsDefault ? ImmutableArray<int>.Empty : exitDestinations;
+            Preheader = preheader;
+            Parent = parent;
+            Depth = depth;
+            IsReducible = isReducible;
+            IsCanonicalPreheader = isCanonicalPreheader;
+            HeaderHasExceptionalSuccessorInsideLoop = headerHasExceptionalSuccessorInsideLoop;
         }
 
         public bool Contains(int blockId)
         {
-            for (int i = 0; i < BodyBlockIds.Length; i++)
+            for (int i = 0; i < Blocks.Length; i++)
             {
-                if (BodyBlockIds[i] == blockId)
+                if (Blocks[i] == blockId)
                     return true;
             }
             return false;
         }
 
-        public override string ToString() => $"L{Index}: header=B{HeaderBlockId}, latch=B{LatchBlockId}";
+        public override string ToString()
+            => $"L{Index}: header=B{Header}, latches={Latches.Length}, preheader={(Preheader >= 0 ? "B" + Preheader.ToString() : "none")}, depth={Depth}";
     }
 
     internal enum CfgExceptionRegionKind : byte
@@ -731,7 +763,10 @@ namespace Cnidaria.Cs
 
         private static ImmutableArray<CfgLoop> ComputeNaturalLoops(ImmutableArray<CfgBlock> blocks, int[] idom)
         {
-            var loops = new List<(int header, int latch, ImmutableArray<int> body)>();
+            if (blocks.IsDefaultOrEmpty)
+                return ImmutableArray<CfgLoop>.Empty;
+
+            var byHeader = new Dictionary<int, LoopAccumulator>();
 
             for (int latch = 0; latch < blocks.Length; latch++)
             {
@@ -743,44 +778,321 @@ namespace Cnidaria.Cs
                         continue;
 
                     int header = edge.ToBlockId;
+                    if ((uint)header >= (uint)blocks.Length)
+                        continue;
+
                     if (!Dominates(header, latch, idom))
                         continue;
 
-                    var body = new SortedSet<int> { header, latch };
-                    var stack = new Stack<int>();
-                    if (latch != header)
-                        stack.Push(latch);
-
-                    while (stack.Count != 0)
+                    if (!byHeader.TryGetValue(header, out var loop))
                     {
-                        int blockId = stack.Pop();
-                        var predecessors = blocks[blockId].Predecessors;
-                        for (int p = 0; p < predecessors.Length; p++)
-                        {
-                            int pred = predecessors[p].FromBlockId;
-                            if (predecessors[p].Kind == CfgEdgeKind.Exception)
-                                continue;
+                        loop = new LoopAccumulator(header);
+                        byHeader.Add(header, loop);
+                    }
 
-                            if (body.Add(pred) && pred != header)
-                                stack.Push(pred);
+                    loop.Latches.Add(latch);
+                    AddNaturalLoopBody(blocks, header, latch, loop.Body);
+                }
+            }
+
+            if (byHeader.Count == 0)
+                return ImmutableArray<CfgLoop>.Empty;
+
+            var loops = new List<LoopShape>(byHeader.Count);
+            foreach (var pair in byHeader)
+            {
+                var accumulator = pair.Value;
+                var body = ToImmutableSorted(accumulator.Body);
+                var latches = ToImmutableSorted(accumulator.Latches);
+                var entryBlocks = new SortedSet<int>();
+                var exitBlocks = new SortedSet<int>();
+                var exitDestinations = new SortedSet<int>();
+                bool reducible = body.Length != 0 && latches.Length != 0;
+                bool headerHasExceptionalSuccessorInsideLoop = false;
+
+                for (int i = 0; i < body.Length; i++)
+                {
+                    int blockId = body[i];
+                    var block = blocks[blockId];
+                    if (!Dominates(accumulator.Header, blockId, idom))
+                        reducible = false;
+
+                    var predecessors = block.Predecessors;
+                    for (int p = 0; p < predecessors.Length; p++)
+                    {
+                        var pred = predecessors[p];
+                        if ((uint)pred.FromBlockId >= (uint)blocks.Length)
+                            continue;
+
+                        if (!accumulator.Body.Contains(pred.FromBlockId))
+                        {
+                            entryBlocks.Add(blockId);
+                            if (blockId != accumulator.Header)
+                                reducible = false;
                         }
                     }
 
-                    loops.Add((header, latch, body.ToImmutableArray()));
+                    var successors = block.Successors;
+                    for (int s = 0; s < successors.Length; s++)
+                    {
+                        var succ = successors[s];
+                        if ((uint)succ.ToBlockId >= (uint)blocks.Length)
+                            continue;
+
+                        bool succInLoop = accumulator.Body.Contains(succ.ToBlockId);
+                        if (!succInLoop)
+                        {
+                            exitBlocks.Add(blockId);
+                            exitDestinations.Add(succ.ToBlockId);
+                        }
+                        else if (blockId == accumulator.Header && succ.Kind == CfgEdgeKind.Exception)
+                        {
+                            headerHasExceptionalSuccessorInsideLoop = true;
+                        }
+                    }
                 }
+
+                int preheader = ComputePreheader(blocks, accumulator.Header, accumulator.Body);
+                bool canonicalPreheader = preheader >= 0 && HeaderHasSingleOutsidePredecessor(blocks, accumulator.Header, accumulator.Body) && BlockAlwaysFallsInto(blocks, preheader, accumulator.Header);
+
+                loops.Add(new LoopShape(
+                    accumulator.Header,
+                    latches,
+                    body,
+                    ToImmutableSorted(entryBlocks),
+                    ToImmutableSorted(exitBlocks),
+                    ToImmutableSorted(exitDestinations),
+                    preheader,
+                    reducible,
+                    canonicalPreheader,
+                    headerHasExceptionalSuccessorInsideLoop));
             }
 
             loops.Sort(static (a, b) =>
             {
-                int c = a.header.CompareTo(b.header);
-                return c != 0 ? c : a.latch.CompareTo(b.latch);
+                int c = a.Header.CompareTo(b.Header);
+                if (c != 0) return c;
+                c = a.Body.Length.CompareTo(b.Body.Length);
+                if (c != 0) return c;
+                return a.Latches.Length.CompareTo(b.Latches.Length);
             });
+
+            var parentIndexes = new int[loops.Count];
+            var depths = new int[loops.Count];
+            for (int i = 0; i < parentIndexes.Length; i++)
+                parentIndexes[i] = -1;
+
+            for (int i = 0; i < loops.Count; i++)
+            {
+                int bestParent = -1;
+                int bestSize = int.MaxValue;
+                for (int j = 0; j < loops.Count; j++)
+                {
+                    if (i == j)
+                        continue;
+                    if (loops[j].Body.Length >= bestSize)
+                        continue;
+                    if (IsStrictSuperset(loops[j].Body, loops[i].Body))
+                    {
+                        bestParent = j;
+                        bestSize = loops[j].Body.Length;
+                    }
+                }
+                parentIndexes[i] = bestParent;
+            }
+
+            for (int i = 0; i < depths.Length; i++)
+                depths[i] = ComputeLoopDepth(i, parentIndexes, new bool[depths.Length]);
 
             var result = ImmutableArray.CreateBuilder<CfgLoop>(loops.Count);
             for (int i = 0; i < loops.Count; i++)
-                result.Add(new CfgLoop(i, loops[i].header, loops[i].latch, loops[i].body));
+            {
+                var loop = loops[i];
+                result.Add(new CfgLoop(
+                    i,
+                    loop.Header,
+                    loop.Latches,
+                    loop.Body,
+                    loop.EntryBlocks,
+                    loop.ExitBlocks,
+                    loop.ExitDestinationBlocks,
+                    loop.Preheader,
+                    parentIndexes[i],
+                    depths[i],
+                    loop.IsReducible,
+                    loop.IsCanonicalPreheader,
+                    loop.HeaderHasExceptionalSuccessorInsideLoop));
+            }
 
             return result.ToImmutable();
+        }
+
+        private sealed class LoopAccumulator
+        {
+            public readonly int Header;
+            public readonly SortedSet<int> Latches = new();
+            public readonly SortedSet<int> Body = new();
+
+            public LoopAccumulator(int header)
+            {
+                Header = header;
+                Body.Add(header);
+            }
+        }
+
+        private readonly struct LoopShape
+        {
+            public readonly int Header;
+            public readonly ImmutableArray<int> Latches;
+            public readonly ImmutableArray<int> Body;
+            public readonly ImmutableArray<int> EntryBlocks;
+            public readonly ImmutableArray<int> ExitBlocks;
+            public readonly ImmutableArray<int> ExitDestinationBlocks;
+            public readonly int Preheader;
+            public readonly bool IsReducible;
+            public readonly bool IsCanonicalPreheader;
+            public readonly bool HeaderHasExceptionalSuccessorInsideLoop;
+
+            public LoopShape(
+                int header,
+                ImmutableArray<int> latches,
+                ImmutableArray<int> body,
+                ImmutableArray<int> entryBlocks,
+                ImmutableArray<int> exitBlocks,
+                ImmutableArray<int> exitDestinationBlocks,
+                int preheader,
+                bool isReducible,
+                bool isCanonicalPreheader,
+                bool headerHasExceptionalSuccessorInsideLoop)
+            {
+                Header = header;
+                Latches = latches;
+                Body = body;
+                EntryBlocks = entryBlocks;
+                ExitBlocks = exitBlocks;
+                ExitDestinationBlocks = exitDestinationBlocks;
+                Preheader = preheader;
+                IsReducible = isReducible;
+                IsCanonicalPreheader = isCanonicalPreheader;
+                HeaderHasExceptionalSuccessorInsideLoop = headerHasExceptionalSuccessorInsideLoop;
+            }
+        }
+
+        private static void AddNaturalLoopBody(ImmutableArray<CfgBlock> blocks, int header, int latch, SortedSet<int> body)
+        {
+            body.Add(header);
+            body.Add(latch);
+
+            var stack = new Stack<int>();
+            if (latch != header)
+                stack.Push(latch);
+
+            while (stack.Count != 0)
+            {
+                int blockId = stack.Pop();
+                if ((uint)blockId >= (uint)blocks.Length)
+                    continue;
+
+                var predecessors = blocks[blockId].Predecessors;
+                for (int p = 0; p < predecessors.Length; p++)
+                {
+                    var edge = predecessors[p];
+                    if (edge.Kind == CfgEdgeKind.Exception)
+                        continue;
+
+                    int pred = edge.FromBlockId;
+                    if ((uint)pred >= (uint)blocks.Length)
+                        continue;
+
+                    if (body.Add(pred) && pred != header)
+                        stack.Push(pred);
+                }
+            }
+        }
+
+        private static ImmutableArray<int> ToImmutableSorted(SortedSet<int> values)
+        {
+            if (values.Count == 0)
+                return ImmutableArray<int>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<int>(values.Count);
+            foreach (int value in values)
+                builder.Add(value);
+            return builder.ToImmutable();
+        }
+
+        private static int ComputePreheader(ImmutableArray<CfgBlock> blocks, int header, SortedSet<int> body)
+        {
+            int preheader = -1;
+            var predecessors = blocks[header].Predecessors;
+            for (int i = 0; i < predecessors.Length; i++)
+            {
+                var edge = predecessors[i];
+                if (edge.Kind == CfgEdgeKind.Exception)
+                    continue;
+
+                int pred = edge.FromBlockId;
+                if ((uint)pred >= (uint)blocks.Length || body.Contains(pred))
+                    continue;
+
+                if (preheader >= 0 && preheader != pred)
+                    return -1;
+                preheader = pred;
+            }
+            return preheader;
+        }
+
+        private static bool HeaderHasSingleOutsidePredecessor(ImmutableArray<CfgBlock> blocks, int header, SortedSet<int> body)
+            => ComputePreheader(blocks, header, body) >= 0;
+
+        private static bool BlockAlwaysFallsInto(ImmutableArray<CfgBlock> blocks, int blockId, int target)
+        {
+            if ((uint)blockId >= (uint)blocks.Length)
+                return false;
+
+            var successors = blocks[blockId].Successors;
+            int normalSuccessors = 0;
+            for (int i = 0; i < successors.Length; i++)
+            {
+                if (successors[i].Kind == CfgEdgeKind.Exception)
+                    continue;
+                normalSuccessors++;
+                if (successors[i].ToBlockId != target)
+                    return false;
+            }
+            return normalSuccessors == 1;
+        }
+
+        private static bool IsStrictSuperset(ImmutableArray<int> possibleParent, ImmutableArray<int> child)
+        {
+            if (possibleParent.Length <= child.Length)
+                return false;
+
+            int pi = 0;
+            for (int ci = 0; ci < child.Length; ci++)
+            {
+                int value = child[ci];
+                while (pi < possibleParent.Length && possibleParent[pi] < value)
+                    pi++;
+                if (pi >= possibleParent.Length || possibleParent[pi] != value)
+                    return false;
+            }
+            return true;
+        }
+
+        private static int ComputeLoopDepth(int loopIndex, int[] parentIndexes, bool[] visiting)
+        {
+            if ((uint)loopIndex >= (uint)parentIndexes.Length)
+                return 0;
+            if (parentIndexes[loopIndex] < 0)
+                return 1;
+            if (visiting[loopIndex])
+                return 1;
+
+            visiting[loopIndex] = true;
+            int depth = 1 + ComputeLoopDepth(parentIndexes[loopIndex], parentIndexes, visiting);
+            visiting[loopIndex] = false;
+            return depth;
         }
     }
 
@@ -2576,8 +2888,6 @@ namespace Cnidaria.Cs
 
     internal static class GenTreeLocalTracking
     {
-        private const int MaxTrackedLocals = 512;
-
         public static GenTreeLocalTrackingResult AssignTrackedLocals(GenTreeMethod method, ControlFlowGraph cfg)
         {
             if (method is null) throw new ArgumentNullException(nameof(method));
@@ -2622,8 +2932,7 @@ namespace Cnidaria.Cs
             });
 
             var tracked = new HashSet<SsaSlot>();
-            int trackedCount = Math.Min(MaxTrackedLocals, trackingCandidates.Count);
-            for (int i = 0; i < trackedCount; i++)
+            for (int i = 0; i < trackingCandidates.Count; i++)
                 tracked.Add(trackingCandidates[i]);
 
             var trackedList = new List<SsaSlot>(tracked);
@@ -2655,16 +2964,13 @@ namespace Cnidaria.Cs
                 else if (descriptor.MemoryAliased)
                     descriptor.MarkMemoryAliased();
                 else if (descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
-                    descriptor.MarkUntracked();
+                    descriptor.MarkMemoryAliased();
                 else if (descriptor.IsCompilerTemp)
-                {
-                    descriptor.MarkUntracked();
-                    descriptor.Category = GenLocalCategory.CompilerTemp;
-                }
+                    descriptor.MarkMemoryAliased();
                 else if (descriptor.Promoted && descriptor.Category == GenLocalCategory.PromotedStruct)
                     descriptor.MarkPromotedStructParent();
                 else
-                    descriptor.MarkUntracked();
+                    descriptor.MarkMemoryAliased();
             }
 
             allSlots.Clear();
@@ -2699,9 +3005,6 @@ namespace Cnidaria.Cs
                 descriptors[slot] = descriptor;
 
                 if (!CanTrackForLiveness(slot, descriptor))
-                    return;
-
-                if (!weightedUses.ContainsKey(slot))
                     return;
 
                 trackingCandidates.Add(slot);
@@ -2744,9 +3047,6 @@ namespace Cnidaria.Cs
             static bool CanTrackAsScalar(SsaSlot slot, GenLocalDescriptor descriptor)
             {
                 if (!CanTrackForLiveness(slot, descriptor))
-                    return false;
-
-                if (descriptor.DoNotEnregister && !descriptor.IsCompilerTemp)
                     return false;
 
                 if (descriptor.Category == GenLocalCategory.PromotedStruct)
@@ -3885,21 +4185,20 @@ namespace Cnidaria.Cs
 
                 for (int i = 0; i < block.TreeList.Length; i++)
                     CollectTreeMemoryDefinitions(block.TreeList[i].Tree, block, block.TreeList[i].StatementIndex);
+            }
 
+            for (int b = 0; b < blocks.Length; b++)
+            {
+                var block = blocks[b];
                 for (int i = 0; i < block.MemoryOut.Length; i++)
                 {
                     var name = block.MemoryOut[i];
-                    if (seen.Contains(name))
-                        continue;
-
-                    Add(new SsaMemoryDefinition(new SsaMemoryDescriptor(
-                        name,
-                        SsaMemoryDefinitionKind.BlockOut,
-                        block.Id,
-                        block.Statements.Length,
-                        -1,
-                        defNode: null,
-                        defBlock: block.CfgBlock)));
+                    if (!seen.Contains(name))
+                    {
+                        throw new InvalidOperationException(
+                            "Block B" + block.Id.ToString() + " has outgoing memory SSA value " + name +
+                            " that is not initial, phi, or real store definition.");
+                    }
                 }
             }
 
@@ -4614,13 +4913,11 @@ namespace Cnidaria.Cs
 
                 if (localFieldAccess.Kind == SsaLocalAccessKind.Use && !_slotsArePromotable(slots, localFieldAccess))
                 {
-                    if (fieldIsByrefExposed)
-                        uses = uses.Add(SsaMemoryKind.ByrefExposed);
+                    uses = uses.Add(SsaMemoryKind.ByrefExposed);
                 }
                 else if (localFieldAccess.IsDefinition && !_slotsArePromotable(slots, localFieldAccess))
                 {
-                    if (fieldIsByrefExposed)
-                        defs = defs.Add(SsaMemoryKind.ByrefExposed);
+                    defs = defs.Add(SsaMemoryKind.ByrefExposed);
                 }
             }
 
@@ -4632,7 +4929,7 @@ namespace Cnidaria.Cs
                     if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out var loadSlot))
                     {
                         var info = slots.GetInfo(loadSlot);
-                        if ((info.AddressExposed || info.MemoryAliased) && !slots.IsPromotable(loadSlot))
+                        if (!slots.IsPromotable(loadSlot))
                             uses = uses.Add(SsaMemoryKind.ByrefExposed);
                     }
                     break;
@@ -4643,7 +4940,7 @@ namespace Cnidaria.Cs
                     if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot))
                     {
                         var info = slots.GetInfo(storeSlot);
-                        if (info.AddressExposed || info.MemoryAliased)
+                        if (!slots.IsPromotable(storeSlot))
                             defs = defs.Add(SsaMemoryKind.ByrefExposed);
                     }
                     break;
@@ -4911,20 +5208,7 @@ namespace Cnidaria.Cs
             {
                 var builder = ImmutableArray.CreateBuilder<SsaMemoryValueName>(SsaMemoryKinds.All.Length);
                 foreach (var kind in SsaMemoryKinds.All)
-                {
-                    if (_memoryLiveness.Defs[blockId].Contains(kind))
-                    {
-                        var outValue = NewMemoryVersion(kind);
-                        PushMemory(kind, outValue);
-                        pushedMemory.Add(kind);
-                        builder.Add(outValue);
-                        AddMemoryDefToEHSuccessorPhis(blockId, kind, outValue);
-                    }
-                    else
-                    {
-                        builder.Add(TopMemory(kind));
-                    }
-                }
+                    builder.Add(TopMemory(kind));
 
                 _memoryOut[blockId] = builder.ToImmutable();
             }
@@ -5736,12 +6020,115 @@ namespace Cnidaria.Cs
                 public readonly SsaValueName Name;
                 public readonly SsaDescriptor Descriptor;
                 public readonly SsaTree? DefTree;
+                public readonly ValueNumber ConservativeValueNumber;
 
-                public CopyPropSsaDef(SsaValueName name, SsaDescriptor descriptor, SsaTree? defTree)
+                public CopyPropSsaDef(SsaValueName name, SsaDescriptor descriptor, SsaTree? defTree, ValueNumber conservativeValueNumber)
                 {
                     Name = name;
                     Descriptor = descriptor ?? throw new ArgumentNullException(nameof(descriptor));
                     DefTree = defTree;
+                    ConservativeValueNumber = conservativeValueNumber;
+                }
+
+                public bool HasValueNumber => ConservativeValueNumber.IsValid;
+            }
+
+            private sealed class CopyPropState
+            {
+                private readonly SsaMethod _method;
+                private readonly Dictionary<SsaSlot, Stack<CopyPropSsaDef>> _defsBySlot = new();
+                private readonly Dictionary<ValueNumber, HashSet<SsaSlot>> _slotsByValueNumber = new();
+                private readonly HashSet<SsaValueName> _pushedInitialDefinitions = new();
+
+                public CopyPropState(SsaMethod method)
+                {
+                    _method = method ?? throw new ArgumentNullException(nameof(method));
+                }
+
+                public bool HasCurrentDefinition(SsaSlot slot)
+                    => _defsBySlot.TryGetValue(slot, out var stack) && stack.Count != 0;
+
+                public bool TryPeek(SsaSlot slot, out CopyPropSsaDef definition)
+                {
+                    if (_defsBySlot.TryGetValue(slot, out var stack) && stack.Count != 0)
+                    {
+                        definition = stack.Peek();
+                        return true;
+                    }
+
+                    definition = default;
+                    return false;
+                }
+
+                public ImmutableArray<SsaSlot> GetCandidateSlots(ValueNumber conservativeValueNumber)
+                {
+                    conservativeValueNumber = NormalValueNumber(_method, conservativeValueNumber);
+                    if (!conservativeValueNumber.IsValid)
+                        return ImmutableArray<SsaSlot>.Empty;
+
+                    if (!_slotsByValueNumber.TryGetValue(conservativeValueNumber, out var set) || set.Count == 0)
+                        return ImmutableArray<SsaSlot>.Empty;
+
+                    var slots = new List<SsaSlot>(set);
+                    slots.Sort();
+                    return slots.ToImmutableArray();
+                }
+
+                public bool TryPushInitialDefinition(SsaValueName name)
+                {
+                    if (!_pushedInitialDefinitions.Add(name))
+                        return false;
+
+                    if (!_method.TryGetSsaDescriptor(name, out var descriptor) || !descriptor.IsInitial)
+                        return false;
+
+                    PushCore(name, descriptor, defTree: null);
+                    return true;
+                }
+
+                public void PushDefinition(SsaValueName name, SsaTree? defTree, List<SsaSlot> pushedInBlock)
+                {
+                    if (!_method.TryGetSsaDescriptor(name, out var descriptor))
+                        return;
+
+                    PushCore(name, descriptor, defTree);
+                    pushedInBlock.Add(name.Slot);
+                }
+
+                public void PopDefinition(SsaSlot slot)
+                {
+                    if (!_defsBySlot.TryGetValue(slot, out var stack) || stack.Count == 0)
+                        throw new InvalidOperationException($"Copy-prop SSA stack underflow for {slot}.");
+
+                    var removed = stack.Pop();
+                    if (stack.Count == 0)
+                        _defsBySlot.Remove(slot);
+
+                    _ = removed;
+                }
+
+                private void PushCore(SsaValueName name, SsaDescriptor descriptor, SsaTree? defTree)
+                {
+                    ValueNumber conservativeValueNumber = NormalValueNumber(_method, descriptor.ValueNumbers.Conservative);
+                    var definition = new CopyPropSsaDef(name, descriptor, defTree, conservativeValueNumber);
+
+                    if (!_defsBySlot.TryGetValue(name.Slot, out var stack))
+                    {
+                        stack = new Stack<CopyPropSsaDef>();
+                        _defsBySlot.Add(name.Slot, stack);
+                    }
+
+                    stack.Push(definition);
+
+                    if (conservativeValueNumber.IsValid)
+                    {
+                        if (!_slotsByValueNumber.TryGetValue(conservativeValueNumber, out var slots))
+                        {
+                            slots = new HashSet<SsaSlot>();
+                            _slotsByValueNumber.Add(conservativeValueNumber, slots);
+                        }
+                        slots.Add(name.Slot);
+                    }
                 }
             }
 
@@ -5806,9 +6193,7 @@ namespace Cnidaria.Cs
                 }
 
                 private int GetTreeOrder(int blockId, int statementIndex, int treeId)
-                {
-                    return _treeOrder.TryGetValue((blockId, statementIndex, treeId), out int order) ? order : -1;
-                }
+                    => _treeOrder.TryGetValue((blockId, statementIndex, treeId), out int order) ? order : -1;
 
                 private bool Dominates(int definitionBlockId, int useBlockId)
                 {
@@ -5830,90 +6215,18 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private sealed class SsaTreeLifeUpdater
-            {
-                private readonly SsaLocalLiveness _liveness;
-                private TrackedLocalSet _currentLife;
-                private int _currentBlockId;
-
-                public SsaTreeLifeUpdater(SsaLocalLiveness liveness)
-                {
-                    _liveness = liveness ?? throw new ArgumentNullException(nameof(liveness));
-                    _currentLife = _liveness.Table.NewEmptySet();
-                    _currentBlockId = -1;
-                }
-
-                public void BeginBlock(int blockId)
-                {
-                    if ((uint)blockId >= (uint)_liveness.LiveInBits.Length)
-                        throw new ArgumentOutOfRangeException(nameof(blockId));
-
-                    _currentBlockId = blockId;
-                    _currentLife = _liveness.LiveInBits[blockId].Clone();
-                }
-
-                public bool IsLive(SsaSlot slot) => _currentLife.Contains(slot);
-
-                public void UpdatePhiDefinition(SsaSlot slot)
-                {
-                    if (_currentBlockId < 0)
-                        throw new InvalidOperationException("Tree liveness updater has not been positioned at a block.");
-
-                    if (_liveness.Table.Contains(slot))
-                        _currentLife.Add(slot);
-                }
-
-                public void UpdateLife(SsaTree tree)
-                {
-                    if (tree is null)
-                        throw new ArgumentNullException(nameof(tree));
-
-                    if (tree.Value.HasValue)
-                        UpdateUse(tree.Value.Value.Slot, tree.Source);
-
-                    if (tree.LocalFieldBaseValue.HasValue)
-                        UpdateUse(tree.LocalFieldBaseValue.Value.Slot, tree.Source);
-
-                    if (tree.StoreTarget.HasValue)
-                        UpdateDefinition(tree.StoreTarget.Value.Slot, tree.Source);
-                }
-
-                private void UpdateUse(SsaSlot slot, GenTree source)
-                {
-                    UpdateLifeBit(slot, isBorn: false, isDying: (source.Flags & GenTreeFlags.VarDeath) != 0);
-                }
-
-                private void UpdateDefinition(SsaSlot slot, GenTree source)
-                {
-                    bool isBorn = (source.Flags & GenTreeFlags.VarDef) != 0 && (source.Flags & GenTreeFlags.VarUseAsg) == 0;
-                    bool isDying = (source.Flags & GenTreeFlags.VarDeath) != 0;
-                    UpdateLifeBit(slot, isBorn, isDying);
-                }
-
-                private void UpdateLifeBit(SsaSlot slot, bool isBorn, bool isDying)
-                {
-                    if (!_liveness.Table.Contains(slot))
-                        return;
-
-                    if (isDying)
-                        _currentLife.Remove(slot);
-                    else if (isBorn)
-                        _currentLife.Add(slot);
-                }
-            }
-
             private OptimizationResult CopyPropagate(SsaMethod method, SsaLocalLiveness pointLiveness)
             {
                 if (method.ValueNumbers is null)
                     return new OptimizationResult(method.Blocks, changed: false);
 
                 var availability = new SsaAvailability(method);
-                var life = new SsaTreeLifeUpdater(pointLiveness);
                 var blocks = new SsaBlock[method.Blocks.Length];
                 for (int i = 0; i < method.Blocks.Length; i++)
                     blocks[method.Blocks[i].Id] = method.Blocks[i];
 
-                var stacks = new Dictionary<SsaSlot, Stack<CopyPropSsaDef>>();
+                var state = new CopyPropState(method);
+
                 var visited = new bool[method.Blocks.Length];
                 bool changed = false;
 
@@ -5944,14 +6257,9 @@ namespace Cnidaria.Cs
                     visited[blockId] = true;
                     var originalBlock = blocks[blockId];
                     var pushedInBlock = new List<SsaSlot>();
-                    life.BeginBlock(blockId);
 
                     for (int p = 0; p < originalBlock.Phis.Length; p++)
-                    {
-                        var phi = originalBlock.Phis[p];
-                        life.UpdatePhiDefinition(phi.Slot);
-                        PushAvailableDefinition(method, phi.Target, null, stacks, pushedInBlock);
-                    }
+                        state.PushDefinition(originalBlock.Phis[p].Target, defTree: null, pushedInBlock);
 
                     bool blockChanged = false;
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(originalBlock.Statements.Length);
@@ -5965,8 +6273,8 @@ namespace Cnidaria.Cs
                             originalBlock.Statements[s],
                             originalBlock.StatementTreeLists[s],
                             availability,
-                            life,
-                            stacks,
+                            pointLiveness,
+                            state,
                             pushedInBlock,
                             blockId,
                             s,
@@ -5995,17 +6303,18 @@ namespace Cnidaria.Cs
                         VisitBlock(children[i]);
 
                     for (int i = pushedInBlock.Count - 1; i >= 0; i--)
-                        PopAvailableDefinition(stacks, pushedInBlock[i]);
+                        state.PopDefinition(pushedInBlock[i]);
                 }
             }
+
 
             private (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteCopyPropStatement(
                 SsaMethod method,
                 SsaTree root,
                 ImmutableArray<SsaTree> treeList,
                 SsaAvailability availability,
-                SsaTreeLifeUpdater life,
-                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
+                SsaLocalLiveness pointLiveness,
+                CopyPropState state,
                 List<SsaSlot> pushedInBlock,
                 int blockId,
                 int statementIndex,
@@ -6024,17 +6333,15 @@ namespace Cnidaria.Cs
                     var tree = treeList[i];
                     var candidate = RebuildSsaTreeWithRewrittenOperands(tree, rewrittenByTree, ref statementChanged);
 
-                    life.UpdateLife(candidate);
-
                     SsaTree rewritten = candidate;
                     if (candidate.StoreTarget.HasValue)
                     {
-                        PushAvailableDefinition(method, candidate.StoreTarget.Value, candidate, stacks, pushedInBlock);
+                        state.PushDefinition(candidate.StoreTarget.Value, candidate, pushedInBlock);
                     }
                     else if (!skipCopyProp && candidate.Value.HasValue && IsPureLocalSsaUse(candidate))
                     {
-                        EnsureInitialParameterDefinition(method, candidate.Value.Value, stacks);
-                        if (TryCopyPropagateUse(method, candidate, availability, life, stacks, blockId, statementIndex, out var replacement))
+                        state.TryPushInitialDefinition(candidate.Value.Value);
+                        if (TryCopyPropagateUse(method, candidate, availability, pointLiveness, state, blockId, statementIndex, out var replacement))
                         {
                             rewritten = replacement;
                             statementChanged = true;
@@ -6052,7 +6359,7 @@ namespace Cnidaria.Cs
                 var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : root;
                 var resultTreeList = rewrittenTreeList.ToImmutable();
                 if (!ReferenceEquals(resultTreeList[resultTreeList.Length - 1], rewrittenRoot))
-                    throw new InvalidOperationException("Copy propagation changed SSA statement tree-list root ordering for node " + root.Source.Id.ToString() + ".");
+                    throw new InvalidOperationException($"Copy propagation changed SSA statement tree-list root ordering for node {root.Source.Id}.");
 
                 return (rewrittenRoot, resultTreeList);
             }
@@ -6069,7 +6376,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
                     if (!rewrittenByTree.TryGetValue(tree.Operands[i], out var rewrittenOperand))
-                        throw new InvalidOperationException("SSA tree list is not in execution order: operand appears after parent at node " + tree.Source.Id.ToString() + ".");
+                        throw new InvalidOperationException($"SSA tree list is not in execution order: operand appears after parent at node {tree.Source.Id}.");
 
                     if (!ReferenceEquals(rewrittenOperand, tree.Operands[i]) && operands is null)
                     {
@@ -6085,15 +6392,30 @@ namespace Cnidaria.Cs
                     return tree;
 
                 changed = true;
-                return new SsaTree(tree.Source, operands.ToImmutable(), tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
+                return new SsaTree(
+                    tree.Source, 
+                    operands.ToImmutable(), 
+                    tree.Value, 
+                    tree.StoreTarget, 
+                    tree.LocalFieldBaseValue, 
+                    tree.LocalField, 
+                    tree.MemoryUses, 
+                    tree.MemoryDefinitions);
+            }
+
+            private static ValueNumber NormalValueNumber(SsaMethod method, ValueNumber value)
+            {
+                if (!value.IsValid || method.ValueNumbers is null)
+                    return value;
+                return method.ValueNumbers.Store.VNNormalValue(value);
             }
 
             private bool TryCopyPropagateUse(
                 SsaMethod method,
                 SsaTree useSite,
                 SsaAvailability availability,
-                SsaTreeLifeUpdater life,
-                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
+                SsaLocalLiveness pointLiveness,
+                CopyPropState state,
                 int blockId,
                 int statementIndex,
                 out SsaTree replacement)
@@ -6101,35 +6423,32 @@ namespace Cnidaria.Cs
                 replacement = null!;
                 if (!useSite.Value.HasValue)
                     return false;
+
                 var useName = useSite.Value.Value;
                 if (!method.TryGetSsaDescriptor(useName, out var useDescriptor))
                     return false;
 
-                var useVN = useDescriptor.ValueNumbers.Conservative;
+                var useVN = NormalValueNumber(method, useDescriptor.ValueNumbers.Conservative);
                 if (!useVN.IsValid)
                     return false;
 
-                var candidateSlots = new List<SsaSlot>(stacks.Keys);
-                candidateSlots.Sort();
-
-                for (int i = 0; i < candidateSlots.Count; i++)
+                var candidateSlots = state.GetCandidateSlots(useVN);
+                for (int i = 0; i < candidateSlots.Length; i++)
                 {
                     var candidateSlot = candidateSlots[i];
                     if (candidateSlot.Equals(useName.Slot))
                         continue;
 
-                    if (!life.IsLive(candidateSlot))
+                    if (!state.TryPeek(candidateSlot, out var candidate))
                         continue;
 
-                    var stack = stacks[candidateSlot];
-                    if (stack.Count == 0)
+                    if (!candidate.HasValueNumber || candidate.ConservativeValueNumber != useVN)
                         continue;
 
-                    var candidate = stack.Peek();
                     if (!availability.IsAvailableAt(candidate.Name, blockId, statementIndex, useSite.Source.Id))
                         continue;
 
-                    if (candidate.Descriptor.ValueNumbers.Conservative != useVN)
+                    if (!pointLiveness.IsLiveBeforeTree(blockId, statementIndex, useSite.Source.Id, candidateSlot))
                         continue;
 
                     if (!CanSubstituteLocal(method, useDescriptor, candidate.Descriptor, useSite.Source))
@@ -6193,7 +6512,11 @@ namespace Cnidaria.Cs
                     _ => template.Kind,
                 };
 
-                var flags = (template.Flags & ~(GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow | GenTreeFlags.AddressExposed | GenTreeFlags.VarDef | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath)) | GenTreeFlags.LocalUse;
+                var flags = (template.Flags & 
+                    ~(GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect 
+                    | GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow 
+                    | GenTreeFlags.ExceptionFlow | GenTreeFlags.AddressExposed | GenTreeFlags.VarDef 
+                    | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath)) | GenTreeFlags.LocalUse;
                 var source = new GenTree(
                     _nextSyntheticTreeId++,
                     kind,
@@ -6253,53 +6576,6 @@ namespace Cnidaria.Cs
 
                 return false;
             }
-
-            private static void EnsureInitialParameterDefinition(SsaMethod method, SsaValueName value, Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks)
-            {
-                if (value.Version != SsaConfig.FirstSsaNumber || value.Slot.Kind != SsaSlotKind.Arg)
-                    return;
-
-                if (stacks.TryGetValue(value.Slot, out var existing) && existing.Count != 0)
-                    return;
-
-                if (!method.TryGetSsaDescriptor(value, out var descriptor) || !descriptor.IsInitial)
-                    return;
-
-                var stack = new Stack<CopyPropSsaDef>();
-                stack.Push(new CopyPropSsaDef(value, descriptor, null));
-                stacks[value.Slot] = stack;
-            }
-
-            private static void PushAvailableDefinition(
-                SsaMethod method,
-                SsaValueName value,
-                SsaTree? defTree,
-                Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks,
-                List<SsaSlot> pushedInBlock)
-            {
-                if (!method.TryGetSsaDescriptor(value, out var descriptor))
-                    return;
-
-                if (!stacks.TryGetValue(value.Slot, out var stack))
-                {
-                    stack = new Stack<CopyPropSsaDef>();
-                    stacks[value.Slot] = stack;
-                }
-
-                stack.Push(new CopyPropSsaDef(value, descriptor, defTree));
-                pushedInBlock.Add(value.Slot);
-            }
-
-            private static void PopAvailableDefinition(Dictionary<SsaSlot, Stack<CopyPropSsaDef>> stacks, SsaSlot slot)
-            {
-                if (!stacks.TryGetValue(slot, out var stack) || stack.Count == 0)
-                    throw new InvalidOperationException("Copy-prop SSA stack underflow for " + slot + ".");
-
-                stack.Pop();
-                if (stack.Count == 0)
-                    stacks.Remove(slot);
-            }
-
 
             private Dictionary<SsaValueName, ValueFact> ComputeFacts(SsaMethod method)
             {
@@ -6365,7 +6641,8 @@ namespace Cnidaria.Cs
                 {
                     var left = EvaluateTree(method, tree.Operands[0], facts);
                     var right = EvaluateTree(method, tree.Operands[1], facts);
-                    if (left.Kind == ValueFactKind.Constant && right.Kind == ValueFactKind.Constant && TryFoldBinary(tree.Source, left.Constant, right.Constant, out var folded))
+                    if (left.Kind == ValueFactKind.Constant 
+                        && right.Kind == ValueFactKind.Constant && TryFoldBinary(tree.Source, left.Constant, right.Constant, out var folded))
                         return ValueFact.ForConstant(folded);
                 }
 
@@ -6413,7 +6690,7 @@ namespace Cnidaria.Cs
                 if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
                     return false;
 
-                return TryGetConstantFromValueNumber(method, pair.Conservative, out constant);
+                return TryGetConstantFromValueNumber(method, NormalValueNumber(method, pair.Conservative), out constant);
             }
 
             private static bool TryGetSsaValueNumber(SsaMethod method, SsaValueName name, out ValueNumber vn)
@@ -6422,7 +6699,7 @@ namespace Cnidaria.Cs
                 if (!method.TryGetSsaDescriptor(name, out var descriptor))
                     return false;
 
-                vn = descriptor.ValueNumbers.Conservative;
+                vn = NormalValueNumber(method, descriptor.ValueNumbers.Conservative);
                 return vn.IsValid;
             }
 
@@ -6439,7 +6716,7 @@ namespace Cnidaria.Cs
                 if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
                     return false;
 
-                vn = pair.Conservative;
+                vn = NormalValueNumber(method, pair.Conservative);
                 return vn.IsValid;
             }
 
@@ -6447,6 +6724,10 @@ namespace Cnidaria.Cs
             {
                 constant = default;
                 if (method.ValueNumbers is null || !vn.IsValid)
+                    return false;
+
+                vn = NormalValueNumber(method, vn);
+                if (!vn.IsValid)
                     return false;
 
                 if (!method.ValueNumbers.Store.TryGetConstant(vn, out var key))
@@ -6618,7 +6899,15 @@ namespace Cnidaria.Cs
                 }
 
                 var candidate = operandChanged
-                    ? new SsaTree(tree.Source, operands.ToImmutable(), tree.Value, tree.StoreTarget, tree.LocalFieldBaseValue, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions)
+                    ? new SsaTree(
+                        tree.Source, 
+                        operands.ToImmutable(), 
+                        tree.Value, 
+                        tree.StoreTarget, 
+                        tree.LocalFieldBaseValue, 
+                        tree.LocalField, 
+                        tree.MemoryUses, 
+                        tree.MemoryDefinitions)
                     : tree;
 
                 return RewriteTreeNode(method, candidate, facts, pointLiveness, blockId, statementIndex, ref changed);
@@ -6707,7 +6996,7 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        throw new InvalidOperationException("SSA rewritten statement tree-list root is not last for node " + root.Source.Id.ToString() + ".");
+                        throw new InvalidOperationException($"SSA rewritten statement tree-list root is not last for node {root.Source.Id}.");
                     }
                 }
 
@@ -7130,10 +7419,20 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Mul:
                         if (IsOne(rightFact)) { simplified = left; return true; }
                         if (IsOne(leftFact)) { simplified = right; return true; }
-                        if (IsZero(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift)) { simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift); return true; }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift)) { simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift); return true; }
+                        if (IsZero(rightFact) && !HasObservableEffect(left)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsZero(leftFact) && !HasObservableEffect(right)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift)) 
+                        { 
+                            simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift); 
+                            return true; 
+                        }
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift)) 
+                        { 
+                            simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift); 
+                            return true; 
+                        }
                         break;
 
                     case BytecodeOp.Div:
@@ -7143,12 +7442,15 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Rem:
                     case BytecodeOp.Rem_Un:
-                        if (IsOne(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsOne(rightFact) && !HasObservableEffect(left)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
                     case BytecodeOp.And:
-                        if (IsZero(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsZero(rightFact) && !HasObservableEffect(left)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (IsZero(leftFact) && !HasObservableEffect(right)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         if (IsAllBitsSet(rightFact)) { simplified = left; return true; }
                         if (IsAllBitsSet(leftFact)) { simplified = right; return true; }
                         if (SameValue(method, left, right, facts)) { simplified = left; return true; }
@@ -7157,15 +7459,18 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Or:
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left)) { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
-                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right)) { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
+                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
+                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
                         if (SameValue(method, left, right, facts)) { simplified = left; return true; }
                         break;
 
                     case BytecodeOp.Xor:
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
+                        if (SameValue(method, left, right, facts)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
                     case BytecodeOp.Shl:
@@ -7175,14 +7480,16 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Ceq:
-                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
+                        if (SameValue(method, left, right, facts)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
                         break;
 
                     case BytecodeOp.Clt:
                     case BytecodeOp.Clt_Un:
                     case BytecodeOp.Cgt:
                     case BytecodeOp.Cgt_Un:
-                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
+                        if (SameValue(method, left, right, facts)) 
+                        { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
                         break;
                 }
 
@@ -7204,7 +7511,8 @@ namespace Cnidaria.Cs
                     BytecodeOp.Shl,
                     template.Type,
                     template.StackKind,
-                    template.Flags & ~(GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow),
+                    template.Flags & ~(GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.MemoryRead | 
+                    GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow),
                     genOperands);
 
                 return new SsaTree(source, operands);
@@ -7346,12 +7654,6 @@ namespace Cnidaria.Cs
 
             private static bool IsIntegerLike(GenStackKind stackKind)
                 => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
-
-            private static bool IsPotentiallyThrowingBinaryOp(BytecodeOp op)
-                => op is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un
-                    or BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
-                    or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
-                    or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
 
             private static bool TryFoldUnary(GenTree source, ConstValue operand, out ConstValue result)
             {
@@ -7800,7 +8102,8 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private static SsaCompactionResult CompactSsaNumbers(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaValueDefinition> previousDefinitions, ImmutableArray<SsaBlock> blocks)
+            private static SsaCompactionResult CompactSsaNumbers(
+                ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaValueDefinition> previousDefinitions, ImmutableArray<SsaBlock> blocks)
             {
                 var map = new Dictionary<SsaValueName, SsaValueName>();
                 var nextBySlot = new Dictionary<SsaSlot, int>();
@@ -7811,7 +8114,7 @@ namespace Cnidaria.Cs
                     var oldInitial = initialValues[i];
                     var newInitial = new SsaValueName(oldInitial.Slot, SsaConfig.FirstSsaNumber);
                     if (!map.TryAdd(oldInitial, newInitial))
-                        throw new InvalidOperationException("Duplicate initial SSA value " + oldInitial + ".");
+                        throw new InvalidOperationException($"Duplicate initial SSA value {oldInitial}.");
                     nextBySlot[oldInitial.Slot] = SsaConfig.FirstSsaNumber;
                     compactedInitialValues.Add(newInitial);
                 }
@@ -7898,9 +8201,9 @@ namespace Cnidaria.Cs
                 void AssignDefinition(SsaValueName oldName)
                 {
                     if (oldName.Version <= SsaConfig.ReservedSsaNumber)
-                        throw new InvalidOperationException("Non-initial SSA definition reused the reserved SSA number: " + oldName + ".");
+                        throw new InvalidOperationException($"Non-initial SSA definition reused the reserved SSA number: {oldName}.");
                     if (map.ContainsKey(oldName))
-                        throw new InvalidOperationException("Duplicate active SSA definition " + oldName + ".");
+                        throw new InvalidOperationException($"Duplicate active SSA definition {oldName}.");
 
                     int next = nextBySlot.TryGetValue(oldName.Slot, out int current) ? current + 1 : SsaConfig.FirstSsaNumber;
                     var newName = new SsaValueName(oldName.Slot, next);
@@ -7912,14 +8215,14 @@ namespace Cnidaria.Cs
                 {
                     if (map.TryGetValue(oldName, out var newName))
                         return newName;
-                    throw new InvalidOperationException("Active SSA definition " + oldName + " was not assigned a compact SSA number.");
+                    throw new InvalidOperationException($"Active SSA definition {oldName} was not assigned a compact SSA number.");
                 }
 
                 SsaValueName MapUse(SsaValueName oldName, string context)
                 {
                     if (map.TryGetValue(oldName, out var newName))
                         return newName;
-                    throw new InvalidOperationException("SSA " + context + " uses removed or never-defined value " + oldName + ".");
+                    throw new InvalidOperationException($"SSA {context} uses removed or never-defined value {oldName}.");
                 }
 
                 (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteStatement(SsaTree root, ImmutableArray<SsaTree> treeList)
@@ -7957,7 +8260,8 @@ namespace Cnidaria.Cs
                     SsaValueName? localFieldBase = tree.LocalFieldBaseValue.HasValue
                         ? MapUse(tree.LocalFieldBaseValue.Value, "local field base")
                         : null;
-                    return new SsaTree(tree.Source, operands.ToImmutable(), value, target, localFieldBase, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
+                    return new SsaTree(
+                        tree.Source, operands.ToImmutable(), value, target, localFieldBase, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
                 }
             }
 
@@ -8132,7 +8436,7 @@ namespace Cnidaria.Cs
                     {
                         var descriptor = descriptors[i];
                         if (table[descriptor.SsaNumber] is not null)
-                            throw new InvalidOperationException("Duplicate SSA descriptor " + descriptor.Name + ".");
+                            throw new InvalidOperationException($"Duplicate SSA descriptor {descriptor.Name}.");
                         table[descriptor.SsaNumber] = descriptor;
                     }
 
@@ -8146,7 +8450,7 @@ namespace Cnidaria.Cs
                         }
 
                         if (table[i] is null)
-                            throw new InvalidOperationException("Missing SSA descriptor " + slot + "_" + i.ToString() + ".");
+                            throw new InvalidOperationException($"Missing SSA descriptor {slot}_{i}.");
                         builder.Add(table[i]!);
                     }
                     return builder.ToImmutable();
@@ -8157,7 +8461,8 @@ namespace Cnidaria.Cs
             {
                 if (infoBySlot.TryGetValue(slot, out var info))
                     return info;
-                return new SsaSlotInfo(slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
+                return new SsaSlotInfo(
+                    slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
             }
 
             private static int MaxTreeId(SsaMethod method)
@@ -8191,6 +8496,7 @@ namespace Cnidaria.Cs
             var definitions = BuildDefinitionMap(method);
             var memoryDefinitions = BuildMemoryDefinitionMap(method);
             var definitionsBySlot = BuildDefinitionsBySlot(definitions);
+            var memoryDefinitionsByKind = BuildMemoryDefinitionsByKind(memoryDefinitions);
             var localLiveness = SsaLocalLiveness.Build(method);
             VerifyDescriptorTables(method, definitions);
             VerifyLclVarDscState(method);
@@ -8203,10 +8509,11 @@ namespace Cnidaria.Cs
                 var block = method.Blocks[b];
                 VerifyPhis(method, definitions, definitionsBySlot, localLiveness, block);
                 VerifyMemoryBlockStates(method, memoryDefinitions, block);
-                VerifyMemoryPhis(method, memoryDefinitions, block);
+                VerifyMemoryPhis(method, memoryDefinitions, memoryDefinitionsByKind, block);
+                VerifyMemoryFlowWithinBlock(memoryDefinitions, block);
 
                 for (int s = 0; s < block.Statements.Length; s++)
-                    VerifyStatement(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, block.Id, s, block.Statements[s]);
+                    VerifyStatement(method, definitions, definitionsBySlot, memoryDefinitions, memoryDefinitionsByKind, localLiveness, block.Id, s, block.Statements[s]);
             }
         }
 
@@ -8275,6 +8582,26 @@ namespace Cnidaria.Cs
             return result;
         }
 
+        private static Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> BuildMemoryDefinitionsByKind(Dictionary<SsaMemoryValueName, SsaMemoryDefinition> definitions)
+        {
+            var result = new Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>>();
+            foreach (var item in definitions)
+            {
+                if (!result.TryGetValue(item.Key.Kind, out var list))
+                {
+                    list = new List<SsaMemoryDefinition>();
+                    result.Add(item.Key.Kind, list);
+                }
+                list.Add(item.Value);
+            }
+
+            foreach (var item in result)
+            {
+                item.Value.Sort(static (a, b) => a.Name.CompareTo(b.Name));
+            }
+            return result;
+        }
+
         private static Dictionary<SsaMemoryValueName, SsaMemoryDefinition> BuildMemoryDefinitionMap(SsaMethod method)
         {
             var result = new Dictionary<SsaMemoryValueName, SsaMemoryDefinition>();
@@ -8283,29 +8610,29 @@ namespace Cnidaria.Cs
             {
                 var definition = method.MemoryDefinitions[i];
                 if (definition.Name.Version <= SsaConfig.ReservedSsaNumber)
-                    throw new InvalidOperationException("Invalid memory SSA version " + definition.Name + ".");
+                    throw new InvalidOperationException($"Invalid memory SSA version {definition.Name}.");
 
                 if (definition.IsInitial)
                 {
                     if (definition.Name.Version != SsaConfig.FirstSsaNumber || definition.DefBlockId != -1)
-                        throw new InvalidOperationException("Malformed initial memory SSA definition " + definition.Name + ".");
+                        throw new InvalidOperationException($"Malformed initial memory SSA definition {definition.Name}.");
                 }
                 else if ((uint)definition.DefBlockId >= (uint)method.Blocks.Length)
                 {
-                    throw new InvalidOperationException("Memory SSA definition " + definition.Name + " has invalid block B" + definition.DefBlockId.ToString() + ".");
+                    throw new InvalidOperationException($"Memory SSA definition {definition.Name} has invalid block B{definition.DefBlockId}.");
                 }
 
                 if (definition.IsPhi && definition.DefStatementIndex != -1)
-                    throw new InvalidOperationException("Memory phi definition " + definition.Name + " has statement index " + definition.DefStatementIndex.ToString() + ".");
+                    throw new InvalidOperationException($"Memory phi definition {definition.Name} has statement index {definition.DefStatementIndex}.");
 
                 if (definition.IsStore && definition.DefStatementIndex < 0)
-                    throw new InvalidOperationException("Memory store definition " + definition.Name + " has no statement index.");
+                    throw new InvalidOperationException($"Memory store definition {definition.Name}1 has no statement index.");
 
                 if (definition.IsBlockOut && definition.DefStatementIndex < 0)
-                    throw new InvalidOperationException("Memory block-out definition " + definition.Name + " has no statement index.");
+                    throw new InvalidOperationException($"Memory block-out definition {definition.Name} has no statement index.");
 
                 if (result.ContainsKey(definition.Name))
-                    throw new InvalidOperationException("Duplicate memory SSA definition " + definition.Name + ".");
+                    throw new InvalidOperationException($"Duplicate memory SSA definition {definition.Name}.");
 
                 result.Add(definition.Name, definition);
             }
@@ -8313,7 +8640,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.InitialMemoryValues.Length; i++)
             {
                 if (!result.TryGetValue(method.InitialMemoryValues[i], out var definition) || !definition.IsInitial)
-                    throw new InvalidOperationException("Initial memory SSA value " + method.InitialMemoryValues[i] + " is missing from definition table.");
+                    throw new InvalidOperationException($"Initial memory SSA value {method.InitialMemoryValues[i]} is missing from definition table.");
             }
 
             return result;
@@ -8326,27 +8653,27 @@ namespace Cnidaria.Cs
             {
                 var local = method.SsaLocalDescriptors[i];
                 if (!local.Slot.HasLclNum)
-                    throw new InvalidOperationException("SSA local descriptor does not carry a concrete lclNum: " + local.Slot + ".");
+                    throw new InvalidOperationException($"SSA local descriptor does not carry a concrete lclNum: {local.Slot}.");
                 if (local.LocalDescriptor is not null && local.LocalDescriptor.LclNum != local.Slot.LclNum)
-                    throw new InvalidOperationException("SSA local descriptor lclNum disagrees with LclVarDsc: " + local.Slot + " vs " + local.LocalDescriptor + ".");
+                    throw new InvalidOperationException($"SSA local descriptor lclNum disagrees with LclVarDsc: {local.Slot} vs {local.LocalDescriptor}.");
                 if (localsBySlot.ContainsKey(local.Slot))
-                    throw new InvalidOperationException("Duplicate SSA local descriptor for " + local.Slot + ".");
+                    throw new InvalidOperationException($"Duplicate SSA local descriptor for {local.Slot}.");
                 localsBySlot.Add(local.Slot, local);
 
                 for (int ssaNum = SsaConfig.FirstSsaNumber; ssaNum < local.PerSsaData.Length; ssaNum++)
                 {
                     var descriptor = local.PerSsaData[ssaNum];
                     if (descriptor is null || !descriptor.BaseLocal.Equals(local.Slot) || descriptor.SsaNumber != ssaNum)
-                        throw new InvalidOperationException("Malformed SSA descriptor table entry for " + local.Slot + " at index " + ssaNum.ToString() + ".");
+                        throw new InvalidOperationException($"Malformed SSA descriptor table entry for {local.Slot} at index {ssaNum}.");
                     if (!definitions.TryGetValue(descriptor.Name, out var definition))
-                        throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " is missing from definition table.");
+                        throw new InvalidOperationException($"SSA descriptor {descriptor.Name} is missing from definition table.");
                     if (!ReferenceEquals(definition.Descriptor, descriptor))
-                        throw new InvalidOperationException("Definition table and descriptor table disagree for " + descriptor.Name + ".");
+                        throw new InvalidOperationException($"Definition table and descriptor table disagree for {descriptor.Name}.");
                     if (descriptor.HasUseDefSsaNum)
                     {
                         var use = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
                         if (!definitions.ContainsKey(use))
-                            throw new InvalidOperationException("SSA use-def link " + descriptor.Name + " references missing use definition " + use + ".");
+                            throw new InvalidOperationException($"SSA use-def link {descriptor.Name} references missing use definition {use}.");
                     }
                 }
             }
@@ -8369,30 +8696,53 @@ namespace Cnidaria.Cs
             {
                 var descriptor = descriptors[i];
                 if (descriptor.LclNum != i)
-                    throw new InvalidOperationException("LclVarDsc table is not dense at lclNum " + i.ToString() + ".");
+                    throw new InvalidOperationException($"LclVarDsc table is not dense at lclNum {i}.");
 
                 if (descriptor.VarIndex >= 0)
                 {
                     if (!descriptor.Tracked)
-                        throw new InvalidOperationException("Untracked LclVarDsc has lvVarIndex: " + descriptor + ".");
+                        throw new InvalidOperationException($"Untracked LclVarDsc has lvVarIndex: {descriptor}.");
 
                     if (descriptor.AddressExposed || descriptor.MemoryAliased)
-                        throw new InvalidOperationException("Address-exposed or memory-aliased LclVarDsc participates in tracked-local liveness: " + descriptor + ".");
+                        throw new InvalidOperationException($"Address-exposed or memory-aliased LclVarDsc participates in tracked-local liveness: {descriptor}.");
 
                     if (seenVarIndex.TryGetValue(descriptor.VarIndex, out var other))
-                        throw new InvalidOperationException("Duplicate dense lvVarIndex " + descriptor.VarIndex.ToString() + " for " + other + " and " + descriptor + ".");
+                        throw new InvalidOperationException($"Duplicate dense lvVarIndex {descriptor.VarIndex} for {other} and {descriptor}.");
 
                     seenVarIndex.Add(descriptor.VarIndex, descriptor);
                 }
 
                 if (descriptor.SsaPromoted && !descriptor.CanBeSsaRenamedAsScalar)
-                    throw new InvalidOperationException("Memory-aliased or non-scalar LclVarDsc is marked lvInSsa: " + descriptor + ".");
+                    throw new InvalidOperationException($"Memory-aliased or non-scalar LclVarDsc is marked lvInSsa: {descriptor}.");
+
+                if (descriptor.Category == GenLocalCategory.PromotedStructField)
+                {
+                    if (!descriptor.IsStructField || descriptor.ParentLclNum < 0 || descriptor.PromotedField is null)
+                        throw new InvalidOperationException($"Malformed promoted struct field descriptor: {descriptor}.");
+
+                    if ((uint)descriptor.ParentLclNum >= (uint)descriptors.Length)
+                        throw new InvalidOperationException($"Promoted struct field {descriptor} has invalid parent lclNum {descriptor.ParentLclNum}.");
+
+                    var parent = descriptors[descriptor.ParentLclNum];
+                    if (parent.Category != GenLocalCategory.PromotedStruct)
+                        throw new InvalidOperationException($"Promoted struct field {descriptor} parent is not a promoted struct: {parent}.");
+
+                    if (!parent.TryGetPromotedField(descriptor.PromotedField, out var registeredField) || !ReferenceEquals(registeredField, descriptor))
+                        throw new InvalidOperationException($"Promoted struct field {descriptor} is not registered in its parent descriptor map.");
+
+                    if (descriptor.FieldOffset != descriptor.PromotedField.Offset)
+                        throw new InvalidOperationException($"Promoted struct field {descriptor} has stale field offset.");
+
+                    int expectedSize = Math.Max(1, descriptor.PromotedField.FieldType.SizeOf);
+                    if (descriptor.FieldSize != expectedSize)
+                        throw new InvalidOperationException($"Promoted struct field {descriptor} has stale field size.");
+                }
             }
 
             for (int i = 0; i < seenVarIndex.Count; i++)
             {
                 if (!seenVarIndex.ContainsKey(i))
-                    throw new InvalidOperationException("lvVarIndex is not dense; missing index " + i.ToString() + ".");
+                    throw new InvalidOperationException($"lvVarIndex is not dense; missing index {i}.");
             }
 
             for (int i = 0; i < method.SsaLocalDescriptors.Length; i++)
@@ -8403,12 +8753,12 @@ namespace Cnidaria.Cs
                     continue;
 
                 if (local.PerSsaData.Length != descriptor.PerSsaData.Length)
-                    throw new InvalidOperationException("SsaLocalDescriptor and LclVarDsc lvPerSsaData length disagree for " + descriptor + ".");
+                    throw new InvalidOperationException($"SsaLocalDescriptor and LclVarDsc lvPerSsaData length disagree for {descriptor}.");
 
                 for (int ssaNum = SsaConfig.ReservedSsaNumber; ssaNum < local.PerSsaData.Length; ssaNum++)
                 {
                     if (!ReferenceEquals(local.PerSsaData[ssaNum], descriptor.PerSsaData[ssaNum]))
-                        throw new InvalidOperationException("SsaLocalDescriptor and LclVarDsc lvPerSsaData entry disagree for " + descriptor + " at " + ssaNum.ToString() + ".");
+                        throw new InvalidOperationException($"SsaLocalDescriptor and LclVarDsc lvPerSsaData entry disagree for {descriptor} at {ssaNum}.");
                 }
             }
         }
@@ -8431,7 +8781,7 @@ namespace Cnidaria.Cs
                 {
                     var phi = block.Phis[p];
                     if (!IsPhiResultLiveAfterDefinition(block, liveness, phi.Slot))
-                        throw new InvalidOperationException("Pruned SSA contains dead phi " + phi.Target + " in B" + block.Id.ToString() + "; phi result is not live after the phi definition.");
+                        throw new InvalidOperationException($"Pruned SSA contains dead phi {phi.Target} in B{block.Id}; phi result is not live after the phi definition.");
                 }
 
                 var successors = block.CfgBlock.Successors;
@@ -8456,7 +8806,7 @@ namespace Cnidaria.Cs
                         }
 
                         if (hasInput && IsPhiResultLiveAfterDefinition(succBlock, liveness, phi.Slot) && !liveness.IsLiveOut(block.Id, phi.Slot))
-                            throw new InvalidOperationException("SSA phi input for " + phi.Target + " from B" + block.Id.ToString() + " uses a slot that is not live-out of the predecessor.");
+                            throw new InvalidOperationException($"SSA phi input for {phi.Target} from B{block.Id} uses a slot that is not live-out of the predecessor.");
                     }
                 }
             }
@@ -8475,44 +8825,59 @@ namespace Cnidaria.Cs
                 var definition = method.ValueDefinitions[i];
                 var descriptor = definition.Descriptor;
                 if (!descriptor.ValueNumbers.Liberal.IsValid || !descriptor.ValueNumbers.Conservative.IsValid)
-                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " has no value-number pair.");
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} has no value-number pair.");
+
+                if (method.ValueNumbers.Store.IsValueWithExc(descriptor.ValueNumbers.Liberal) ||
+                    method.ValueNumbers.Store.IsValueWithExc(descriptor.ValueNumbers.Conservative))
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} stores a ValWithExc VN. " +
+                        $"Persistent SSA names must store normal value VNs only.");
 
                 if (!method.ValueNumbers.TryGetSsaValue(definition.Name, out var resultPair))
-                    throw new InvalidOperationException("SSA VN result table is missing " + definition.Name + ".");
+                    throw new InvalidOperationException($"SSA VN result table is missing {definition.Name}.");
+
+                if (method.ValueNumbers.Store.IsValueWithExc(resultPair.Liberal) ||
+                    method.ValueNumbers.Store.IsValueWithExc(resultPair.Conservative))
+                    throw new InvalidOperationException($"SSA VN result table stores a ValWithExc VN for {definition.Name}. " +
+                        $"Persistent SSA names must store normal value VNs only.");
 
                 if (!resultPair.Equals(descriptor.ValueNumbers))
-                    throw new InvalidOperationException("SSA descriptor VN and VN result table disagree for " + definition.Name + ".");
+                    throw new InvalidOperationException($"SSA descriptor VN and VN result table disagree for {definition.Name}.");
             }
 
             foreach (var item in method.ValueNumbers.SsaValues)
             {
                 if (!definitions.TryGetValue(item.Key, out var definition))
-                    throw new InvalidOperationException("SSA VN result table contains undefined value " + item.Key + ".");
+                    throw new InvalidOperationException($"SSA VN result table contains undefined value {item.Key}.");
+
+                if (method.ValueNumbers.Store.IsValueWithExc(item.Value.Liberal) ||
+                    method.ValueNumbers.Store.IsValueWithExc(item.Value.Conservative))
+                    throw new InvalidOperationException($"SSA VN result table stores a ValWithExc VN for {item.Key}. " +
+                        $"Persistent SSA names must store normal value VNs only.");
 
                 if (!definition.Descriptor.ValueNumbers.Equals(item.Value))
-                    throw new InvalidOperationException("SSA VN result table bypasses descriptor value numbers for " + item.Key + ".");
+                    throw new InvalidOperationException($"SSA VN result table bypasses descriptor value numbers for {item.Key}.");
             }
 
             for (int i = 0; i < method.MemoryDefinitions.Length; i++)
             {
                 var definition = method.MemoryDefinitions[i];
                 if (!definition.Descriptor.ValueNumber.IsValid)
-                    throw new InvalidOperationException("Memory SSA descriptor " + definition.Name + " has no value number.");
+                    throw new InvalidOperationException($"Memory SSA descriptor {definition.Name} has no value number.");
 
                 if (!method.ValueNumbers.TryGetMemoryValue(definition.Name, out var resultVn))
-                    throw new InvalidOperationException("Memory SSA VN result table is missing " + definition.Name + ".");
+                    throw new InvalidOperationException($"Memory SSA VN result table is missing {definition.Name}.");
 
                 if (resultVn != definition.Descriptor.ValueNumber)
-                    throw new InvalidOperationException("Memory SSA descriptor VN and VN result table disagree for " + definition.Name + ".");
+                    throw new InvalidOperationException($"Memory SSA descriptor VN and VN result table disagree for {definition.Name}.");
             }
 
             foreach (var item in method.ValueNumbers.MemoryValues)
             {
                 if (!memoryDefinitions.TryGetValue(item.Key, out var definition))
-                    throw new InvalidOperationException("Memory SSA VN result table contains undefined value " + item.Key + ".");
+                    throw new InvalidOperationException($"Memory SSA VN result table contains undefined value {item.Key}.");
 
                 if (definition.Descriptor.ValueNumber != item.Value)
-                    throw new InvalidOperationException("Memory SSA VN result table bypasses descriptor value number for " + item.Key + ".");
+                    throw new InvalidOperationException($"Memory SSA VN result table bypasses descriptor value number for {item.Key}.");
             }
         }
 
@@ -8549,7 +8914,7 @@ namespace Cnidaria.Cs
 
                 var previous = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
                 if (!definitions.TryGetValue(previous, out var previousDefinition))
-                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " has missing previous definition " + previous + ".");
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} has missing previous definition {previous}.");
 
                 AddLocalUse(localUses, previousDefinition.Descriptor, descriptor.DefBlockId, isPhi: false);
             }
@@ -8565,7 +8930,7 @@ namespace Cnidaria.Cs
                     {
                         var input = phi.Inputs[i].Value;
                         if (!definitions.TryGetValue(input, out var inputDefinition))
-                            throw new InvalidOperationException("Phi " + phi.Target + " uses missing SSA value " + input + ".");
+                            throw new InvalidOperationException($"Phi {phi.Target} uses missing SSA value {input}.");
 
                         AddLocalUse(localUses, inputDefinition.Descriptor, block.Id, isPhi: true);
                     }
@@ -8578,7 +8943,7 @@ namespace Cnidaria.Cs
                     {
                         var input = phi.Inputs[i].Value;
                         if (!memoryDefinitions.TryGetValue(input, out var inputDefinition))
-                            throw new InvalidOperationException("Memory phi " + phi.Target + " uses missing memory SSA value " + input + ".");
+                            throw new InvalidOperationException($"Memory phi {phi.Target} uses missing memory SSA value {input}.");
 
                         AddMemoryUse(memoryUses, inputDefinition.Descriptor, block.Id, isPhi: true);
                     }
@@ -8597,11 +8962,11 @@ namespace Cnidaria.Cs
                 bool expectedGlobalUse = stats?.HasGlobalUse ?? false;
 
                 if (descriptor.UseCount != expectedUseCount)
-                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " use-count mismatch: descriptor=" + descriptor.UseCount.ToString() + ", recomputed=" + expectedUseCount.ToString() + ".");
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} use-count mismatch: descriptor={descriptor.UseCount}, recomputed={expectedUseCount}.");
                 if (descriptor.HasPhiUse != expectedPhiUse)
-                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " phi-use flag mismatch.");
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} phi-use flag mismatch.");
                 if (descriptor.HasGlobalUse != expectedGlobalUse)
-                    throw new InvalidOperationException("SSA descriptor " + descriptor.Name + " global-use flag mismatch.");
+                    throw new InvalidOperationException($"SSA descriptor {descriptor.Name} global-use flag mismatch.");
             }
 
             for (int i = 0; i < method.MemoryDefinitions.Length; i++)
@@ -8613,11 +8978,11 @@ namespace Cnidaria.Cs
                 bool expectedGlobalUse = stats?.HasGlobalUse ?? false;
 
                 if (descriptor.UseCount != expectedUseCount)
-                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " use-count mismatch: descriptor=" + descriptor.UseCount.ToString() + ", recomputed=" + expectedUseCount.ToString() + ".");
+                    throw new InvalidOperationException($"Memory SSA descriptor {descriptor.Name} use-count mismatch: descriptor={descriptor.UseCount}, recomputed={expectedUseCount}.");
                 if (descriptor.HasPhiUse != expectedPhiUse)
-                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " phi-use flag mismatch.");
+                    throw new InvalidOperationException($"Memory SSA descriptor {descriptor.Name} phi-use flag mismatch.");
                 if (descriptor.HasGlobalUse != expectedGlobalUse)
-                    throw new InvalidOperationException("Memory SSA descriptor " + descriptor.Name + " global-use flag mismatch.");
+                    throw new InvalidOperationException($"Memory SSA descriptor {descriptor.Name} global-use flag mismatch.");
             }
         }
 
@@ -8655,7 +9020,7 @@ namespace Cnidaria.Cs
             {
                 var value = tree.Value.Value;
                 if (!definitions.TryGetValue(value, out var definition))
-                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing SSA value " + value + ".");
+                    throw new InvalidOperationException($"Tree node {tree.Source.Id} uses missing SSA value {value}.");
                 AddLocalUse(localUses, definition.Descriptor, blockId, isPhi: false);
             }
 
@@ -8663,7 +9028,7 @@ namespace Cnidaria.Cs
             {
                 var value = tree.LocalFieldBaseValue.Value;
                 if (!definitions.TryGetValue(value, out var definition))
-                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing local-field base SSA value " + value + ".");
+                    throw new InvalidOperationException("Tree node {tree.Source.Id} uses missing local-field base SSA value {value}.");
                 AddLocalUse(localUses, definition.Descriptor, blockId, isPhi: false);
             }
 
@@ -8671,7 +9036,7 @@ namespace Cnidaria.Cs
             {
                 var value = tree.MemoryUses[i];
                 if (!memoryDefinitions.TryGetValue(value, out var definition))
-                    throw new InvalidOperationException("Tree node " + tree.Source.Id.ToString() + " uses missing memory SSA value " + value + ".");
+                    throw new InvalidOperationException("Tree node {tree.Source.Id} uses missing memory SSA value {value}.");
                 AddMemoryUse(memoryUses, definition.Descriptor, blockId, isPhi: false);
             }
 
@@ -8679,7 +9044,12 @@ namespace Cnidaria.Cs
                 AccumulateTreeUseStats(tree.Operands[i], blockId, definitions, memoryDefinitions, localUses, memoryUses);
         }
 
-        private static void VerifyPhis(SsaMethod method, Dictionary<SsaValueName, SsaValueDefinition> definitions, Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot, SsaLocalLiveness localLiveness, SsaBlock block)
+        private static void VerifyPhis(
+            SsaMethod method,
+            Dictionary<SsaValueName, SsaValueDefinition> definitions,
+            Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
+            SsaLocalLiveness localLiveness,
+            SsaBlock block)
         {
             var expectedPreds = new HashSet<int>();
             for (int p = 0; p < block.CfgBlock.Predecessors.Length; p++)
@@ -8705,7 +9075,8 @@ namespace Cnidaria.Cs
                 {
                     var input = phi.Inputs[p];
                     if (!input.Value.Slot.Equals(phi.Slot))
-                        throw new InvalidOperationException($"Phi {phi.Target} in B{block.Id} has cross-slot input {input.Value} from B{input.PredecessorBlockId}; phi operands must remain on the same tracked local slot.");
+                        throw new InvalidOperationException($"Phi {phi.Target} in B{block.Id} has cross-slot input {input.Value} from B{input.PredecessorBlockId}; " +
+                            $"phi operands must remain on the same tracked local slot.");
                     actualPreds.Add(input.PredecessorBlockId);
                     if (block.CfgBlock.IsHandlerEntry)
                     {
@@ -8738,12 +9109,13 @@ namespace Cnidaria.Cs
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
             Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> memoryDefinitionsByKind,
             SsaLocalLiveness localLiveness,
             int blockId,
             int statementIndex,
             SsaTree tree)
         {
-            VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree);
+            VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, memoryDefinitionsByKind, localLiveness, blockId, statementIndex, tree);
             VerifyTreeDefinitions(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree);
         }
 
@@ -8752,6 +9124,7 @@ namespace Cnidaria.Cs
             Dictionary<SsaValueName, SsaValueDefinition> definitions,
             Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> memoryDefinitionsByKind,
             SsaLocalLiveness localLiveness,
             int blockId,
             int statementIndex,
@@ -8764,10 +9137,10 @@ namespace Cnidaria.Cs
                 VerifyLocalUse(method, definitions, definitionsBySlot, localLiveness, tree.LocalFieldBaseValue.Value, blockId, statementIndex, tree.Source.Id);
 
             for (int i = 0; i < tree.MemoryUses.Length; i++)
-                VerifyMemoryUse(method, memoryDefinitions, tree.MemoryUses[i], blockId, statementIndex, tree.Source.Id);
+                VerifyMemoryUse(method, memoryDefinitions, memoryDefinitionsByKind, tree.MemoryUses[i], blockId, statementIndex, tree.Source.Id);
 
             for (int i = 0; i < tree.Operands.Length; i++)
-                VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, localLiveness, blockId, statementIndex, tree.Operands[i]);
+                VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, memoryDefinitionsByKind, localLiveness, blockId, statementIndex, tree.Operands[i]);
         }
 
         private static void VerifyTreeDefinitions(
@@ -8799,9 +9172,10 @@ namespace Cnidaria.Cs
             {
                 var memoryName = tree.MemoryDefinitions[i];
                 if (!memoryDefinitions.TryGetValue(memoryName, out var memoryDefinition))
-                    throw new InvalidOperationException("Memory definition " + memoryName + " at node " + tree.Source.Id.ToString() + " is missing from definition table.");
-                if (!memoryDefinition.IsStore || memoryDefinition.DefBlockId != blockId || memoryDefinition.DefStatementIndex != statementIndex || memoryDefinition.DefTreeId != tree.Source.Id)
-                    throw new InvalidOperationException("Memory definition table entry for " + memoryName + " does not match store node " + tree.Source.Id.ToString() + ".");
+                    throw new InvalidOperationException($"Memory definition {memoryName} at node {tree.Source.Id} is missing from definition table.");
+                if (!memoryDefinition.IsStore || memoryDefinition.DefBlockId != blockId
+                    || memoryDefinition.DefStatementIndex != statementIndex || memoryDefinition.DefTreeId != tree.Source.Id)
+                    throw new InvalidOperationException($"Memory definition table entry for {memoryName} does not match store node {tree.Source.Id}.");
             }
 
             if (!tree.StoreTarget.HasValue)
@@ -8811,7 +9185,8 @@ namespace Cnidaria.Cs
             if (!definitions.TryGetValue(name, out var definition))
                 throw new InvalidOperationException($"Store target {name} at node {tree.Source.Id} is missing from definition table.");
 
-            if (definition.IsInitial || definition.IsPhi || definition.DefBlockId != blockId || definition.DefStatementIndex != statementIndex || definition.DefTreeId != tree.Source.Id)
+            if (definition.IsInitial || definition.IsPhi || definition.DefBlockId != blockId
+                || definition.DefStatementIndex != statementIndex || definition.DefTreeId != tree.Source.Id)
                 throw new InvalidOperationException($"Definition table entry for {name} does not match store node {tree.Source.Id}.");
 
             if (tree.IsPartialDefinition)
@@ -8839,20 +9214,74 @@ namespace Cnidaria.Cs
             {
                 var kind = SsaMemoryKinds.All[k];
                 if (!block.TryGetMemoryIn(kind, out var memoryIn))
-                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has no incoming memory SSA value for " + SsaMemoryKinds.Name(kind) + ".");
+                    throw new InvalidOperationException($"Block B{block.Id} has no incoming memory SSA value for {SsaMemoryKinds.Name(kind)}.");
                 if (!memoryDefinitions.ContainsKey(memoryIn))
-                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has undefined incoming memory SSA value " + memoryIn + ".");
+                    throw new InvalidOperationException($"Block B{block.Id} has undefined incoming memory SSA value {memoryIn}.");
 
                 if (!block.TryGetMemoryOut(kind, out var memoryOut))
-                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has no outgoing memory SSA value for " + SsaMemoryKinds.Name(kind) + ".");
+                    throw new InvalidOperationException($"Block B{block.Id} has no outgoing memory SSA value for {SsaMemoryKinds.Name(kind)}.");
                 if (!memoryDefinitions.ContainsKey(memoryOut))
-                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " has undefined outgoing memory SSA value " + memoryOut + ".");
+                    throw new InvalidOperationException($"Block B{block.Id} has undefined outgoing memory SSA value {memoryIn}.");
+            }
+        }
+
+        private static void VerifyMemoryFlowWithinBlock(
+            Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            SsaBlock block)
+        {
+            var current = new Dictionary<SsaMemoryKind, SsaMemoryValueName>();
+            for (int k = 0; k < SsaMemoryKinds.All.Length; k++)
+            {
+                var kind = SsaMemoryKinds.All[k];
+                if (!block.TryGetMemoryIn(kind, out var memoryIn))
+                    throw new InvalidOperationException($"Block B{block.Id} has no incoming memory SSA value for {SsaMemoryKinds.Name(kind)}.");
+                current[kind] = memoryIn;
+            }
+
+            for (int i = 0; i < block.TreeList.Length; i++)
+            {
+                var item = block.TreeList[i];
+                var tree = item.Tree;
+                for (int u = 0; u < tree.MemoryUses.Length; u++)
+                {
+                    var use = tree.MemoryUses[u];
+                    if (!current.TryGetValue(use.Kind, out var expected) || !expected.Equals(use))
+                    {
+                        string expectedText = current.TryGetValue(use.Kind, out expected) ? expected.ToString() : "<missing>";
+                        throw new InvalidOperationException(
+                            $"Memory SSA use {use} at node {tree.Source.Id} in B{block.Id}" +
+                            $" is not the current {SsaMemoryKinds.Name(use.Kind)} state. Expected {expectedText}.");
+                    }
+                }
+
+                for (int d = 0; d < tree.MemoryDefinitions.Length; d++)
+                {
+                    var definition = tree.MemoryDefinitions[d];
+                    if (!memoryDefinitions.TryGetValue(definition, out var metadata))
+                        throw new InvalidOperationException($"Memory SSA definition {definition} at node {tree.Source.Id} is missing from definition table.");
+                    if (!metadata.IsStore)
+                        throw new InvalidOperationException($"Memory SSA definition {definition} at node {tree.Source.Id} is not a store definition.");
+                    current[definition.Kind] = definition;
+                }
+            }
+
+            for (int k = 0; k < SsaMemoryKinds.All.Length; k++)
+            {
+                var kind = SsaMemoryKinds.All[k];
+                if (!block.TryGetMemoryOut(kind, out var actualOut))
+                    throw new InvalidOperationException($"Block B{block.Id} has no outgoing memory SSA value for {SsaMemoryKinds.Name(kind)}.");
+                var expectedOut = current[kind];
+                if (!expectedOut.Equals(actualOut))
+                    throw new InvalidOperationException(
+                        $"Block B{block.Id} outgoing {SsaMemoryKinds.Name(kind)}" +
+                        $" memory state is {actualOut}, expected last in-block state {expectedOut}.");
             }
         }
 
         private static void VerifyMemoryPhis(
             SsaMethod method,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> memoryDefinitions,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> memoryDefinitionsByKind,
             SsaBlock block)
         {
             var expectedPreds = new HashSet<int>();
@@ -8863,35 +9292,42 @@ namespace Cnidaria.Cs
             {
                 var phi = block.MemoryPhis[i];
                 if (!memoryDefinitions.TryGetValue(phi.Target, out var definition))
-                    throw new InvalidOperationException("Memory phi target " + phi.Target + " in B" + block.Id.ToString() + " is missing from definition table.");
+                    throw new InvalidOperationException(
+                        $"Memory phi target {phi.Target} in B{block.Id} is missing from definition table.");
 
                 if (!definition.IsPhi || definition.DefBlockId != block.Id)
-                    throw new InvalidOperationException("Definition table entry for memory phi " + phi.Target + " does not match B" + block.Id.ToString() + ".");
+                    throw new InvalidOperationException(
+                        $"Definition table entry for memory phi {phi.Target} does not match B{block.Id}.");
 
                 if (!ReferenceEquals(definition.Phi, phi) || !ReferenceEquals(definition.Descriptor.Phi, phi))
-                    throw new InvalidOperationException("Memory SSA descriptor for phi " + phi.Target + " in B" + block.Id.ToString() + " does not point back to its phi node.");
+                    throw new InvalidOperationException(
+                        $"Memory SSA descriptor for phi {phi.Target} in B{block.Id} does not point back to its phi node.");
 
                 if (phi.Target.Kind != phi.Kind)
-                    throw new InvalidOperationException("Memory phi target " + phi.Target + " in B" + block.Id.ToString() + " does not belong to phi kind " + SsaMemoryKinds.Name(phi.Kind) + ".");
+                    throw new InvalidOperationException(
+                        $"Memory phi target {phi.Target} in B{block.Id} does not belong to phi kind {SsaMemoryKinds.Name(phi.Kind)}.");
 
                 if (!block.TryGetMemoryIn(phi.Kind, out var memoryIn) || !memoryIn.Equals(phi.Target))
-                    throw new InvalidOperationException("Block B" + block.Id.ToString() + " incoming memory state for " + SsaMemoryKinds.Name(phi.Kind) + " does not point at its phi target.");
+                    throw new InvalidOperationException(
+                        $"Block B{block.Id} incoming memory state for {SsaMemoryKinds.Name(phi.Kind)} does not point at its phi target.");
 
                 var actualPreds = new HashSet<int>();
                 for (int p = 0; p < phi.Inputs.Length; p++)
                 {
                     var input = phi.Inputs[p];
                     if (input.Value.Kind != phi.Kind)
-                        throw new InvalidOperationException("Memory phi " + phi.Target + " in B" + block.Id.ToString() + " has cross-kind input " + input.Value + " from B" + input.PredecessorBlockId.ToString() + ".");
+                        throw new InvalidOperationException(
+                            $"Memory phi {phi.Target} in B{block.Id} has cross-kind input {input.Value} from B{input.PredecessorBlockId}.");
                     actualPreds.Add(input.PredecessorBlockId);
                     if (block.CfgBlock.IsHandlerEntry)
                     {
                         if (!memoryDefinitions.ContainsKey(input.Value))
-                            throw new InvalidOperationException("Handler memory phi " + phi.Target + " uses undefined value " + input.Value + " from B" + input.PredecessorBlockId.ToString() + ".");
+                            throw new InvalidOperationException(
+                                $"Handler memory phi {phi.Target} uses undefined value {input.Value} from B{input.PredecessorBlockId}.");
                     }
                     else
                     {
-                        VerifyMemoryEdgeUse(method, memoryDefinitions, phi.Target, input.Value, input.PredecessorBlockId);
+                        VerifyMemoryEdgeUse(method, memoryDefinitions, memoryDefinitionsByKind, phi.Target, input.Value, input.PredecessorBlockId);
                     }
                 }
 
@@ -8900,18 +9336,19 @@ namespace Cnidaria.Cs
                     foreach (int expectedPred in expectedPreds)
                     {
                         if (!actualPreds.Contains(expectedPred))
-                            throw new InvalidOperationException("Malformed handler memory phi " + phi.Target + " in B" + block.Id.ToString() + ": missing predecessor B" + expectedPred.ToString() + ".");
+                            throw new InvalidOperationException(
+                                $"Malformed handler memory phi {phi.Target} in B{block.Id}: missing predecessor B{expectedPred}.");
                     }
                 }
                 else if (!expectedPreds.SetEquals(actualPreds))
                 {
-                    throw new InvalidOperationException("Malformed memory phi " + phi.Target + " in B" + block.Id.ToString() + ": predecessor set mismatch.");
+                    throw new InvalidOperationException($"Malformed memory phi {phi.Target} in B{block.Id}: predecessor set mismatch.");
                 }
             }
         }
 
 
-        private static bool DefinitionDominatesUsePoint(SsaMethod method, SsaValueDefinition definition, int useBlockId, int useStatementIndex)
+        private static bool DefinitionDominatesUsePoint(SsaMethod method, SsaValueDefinition definition, int useBlockId, int useStatementIndex, int useTreeId)
         {
             if (definition.IsInitial)
                 return true;
@@ -8925,7 +9362,7 @@ namespace Cnidaria.Cs
             if (definition.IsPhi)
                 return true;
 
-            return definition.DefStatementIndex < useStatementIndex;
+            return ValueDefinitionPrecedesTreeUse(method, definition, useBlockId, useStatementIndex, useTreeId);
         }
 
         private static bool DefinitionDominatesBlockEnd(SsaMethod method, SsaValueDefinition definition, int blockId)
@@ -8957,15 +9394,40 @@ namespace Cnidaria.Cs
             if (right.IsPhi)
                 return false;
 
-            return left.DefStatementIndex < right.DefStatementIndex;
-        }
+            if (left.DefStatementIndex < right.DefStatementIndex)
+                return true;
+            if (left.DefStatementIndex > right.DefStatementIndex)
+                return false;
 
+            int leftOrder = GetTreeOrder(method, left.DefBlockId, left.DefStatementIndex, left.DefTreeId);
+            int rightOrder = GetTreeOrder(method, right.DefBlockId, right.DefStatementIndex, right.DefTreeId);
+            return leftOrder >= 0 && rightOrder >= 0 && leftOrder < rightOrder;
+        }
+        private static bool ValueDefinitionPrecedesTreeUse(
+            SsaMethod method, SsaValueDefinition definition, int useBlockId, int useStatementIndex, int useTreeId)
+        {
+            if (definition.DefBlockId != useBlockId)
+                return true;
+
+            if (definition.DefStatementIndex < useStatementIndex)
+                return true;
+            if (definition.DefStatementIndex > useStatementIndex)
+                return false;
+
+            if (useTreeId < 0)
+                return false;
+
+            int defOrder = GetTreeOrder(method, definition.DefBlockId, definition.DefStatementIndex, definition.DefTreeId);
+            int useOrder = GetTreeOrder(method, useBlockId, useStatementIndex, useTreeId);
+            return defOrder >= 0 && useOrder >= 0 && defOrder < useOrder;
+        }
         private static void VerifyNoInterveningSameSlotDefinition(
             SsaMethod method,
             Dictionary<SsaSlot, List<SsaValueDefinition>> definitionsBySlot,
             SsaValueDefinition chosenDefinition,
             int useBlockId,
             int useStatementIndex,
+            int useTreeId,
             string useDescription)
         {
             if (!definitionsBySlot.TryGetValue(chosenDefinition.Name.Slot, out var sameSlotDefinitions))
@@ -8977,15 +9439,186 @@ namespace Cnidaria.Cs
                 if (candidate.Name.Equals(chosenDefinition.Name))
                     continue;
 
-                if (!DefinitionDominatesUsePoint(method, candidate, useBlockId, useStatementIndex))
+                if (!DefinitionDominatesUsePoint(method, candidate, useBlockId, useStatementIndex, useTreeId))
                     continue;
 
                 if (DefinitionDominatesDefinition(method, chosenDefinition, candidate))
                 {
                     throw new InvalidOperationException(
-                        "SSA use " + chosenDefinition.Name + " at " + useDescription +
-                        " is not the nearest dominating definition for " + chosenDefinition.Name.Slot +
-                        "; intervening definition is " + candidate.Name + ". This would cross a phi/store and violates conventional SSA.");
+                        $"SSA use {chosenDefinition.Name} at {useDescription}" +
+                        $" is not the nearest dominating definition for {chosenDefinition.Name.Slot}" +
+                        $"; intervening definition is {candidate.Name}. This would cross a phi/store and violates conventional SSA.");
+                }
+            }
+        }
+
+        private static bool MemoryDefinitionDominatesUsePoint(
+            SsaMethod method, SsaMemoryDefinition definition, int useBlockId, int useStatementIndex, int useTreeId)
+        {
+            if (definition.IsInitial)
+                return true;
+
+            if (!method.Cfg.Dominates(definition.DefBlockId, useBlockId))
+                return false;
+
+            if (definition.DefBlockId != useBlockId)
+                return true;
+
+            if (definition.IsPhi)
+                return true;
+
+            if (definition.IsBlockOut)
+                return false;
+
+            return MemoryDefinitionPrecedesTreeUse(method, definition, useBlockId, useStatementIndex, useTreeId);
+        }
+
+        private static bool MemoryDefinitionDominatesBlockEnd(SsaMethod method, SsaMemoryDefinition definition, int blockId)
+        {
+            if (definition.IsInitial)
+                return true;
+
+            return method.Cfg.Dominates(definition.DefBlockId, blockId);
+        }
+
+        private static bool MemoryDefinitionDominatesDefinition(SsaMethod method, SsaMemoryDefinition left, SsaMemoryDefinition right)
+        {
+            if (left.Name.Equals(right.Name))
+                return true;
+
+            if (left.IsInitial)
+                return true;
+            if (right.IsInitial)
+                return false;
+
+            if (!method.Cfg.Dominates(left.DefBlockId, right.DefBlockId))
+                return false;
+
+            if (left.DefBlockId != right.DefBlockId)
+                return true;
+
+            if (left.IsPhi)
+                return true;
+            if (right.IsPhi)
+                return false;
+
+            if (left.IsBlockOut || right.IsBlockOut)
+                return false;
+
+            if (left.DefStatementIndex < right.DefStatementIndex)
+                return true;
+            if (left.DefStatementIndex > right.DefStatementIndex)
+                return false;
+
+            int leftOrder = GetTreeOrder(method, left.DefBlockId, left.DefStatementIndex, left.DefTreeId);
+            int rightOrder = GetTreeOrder(method, right.DefBlockId, right.DefStatementIndex, right.DefTreeId);
+            return leftOrder >= 0 && rightOrder >= 0 && leftOrder < rightOrder;
+        }
+        private static bool MemoryDefinitionPrecedesTreeUse(
+            SsaMethod method, SsaMemoryDefinition definition, int useBlockId, int useStatementIndex, int useTreeId)
+        {
+            if (definition.DefBlockId != useBlockId)
+                return true;
+
+            if (definition.DefStatementIndex < useStatementIndex)
+                return true;
+            if (definition.DefStatementIndex > useStatementIndex)
+                return false;
+
+            int defOrder = GetTreeOrder(method, definition.DefBlockId, definition.DefStatementIndex, definition.DefTreeId);
+            int useOrder = GetTreeOrder(method, useBlockId, useStatementIndex, useTreeId);
+            return defOrder >= 0 && useOrder >= 0 && defOrder < useOrder;
+        }
+        private static int GetTreeOrder(SsaMethod method, int blockId, int statementIndex, int treeId)
+        {
+            if (blockId < 0)
+                return -1;
+
+            SsaBlock? block = null;
+            if ((uint)blockId < (uint)method.Blocks.Length && method.Blocks[blockId].Id == blockId)
+            {
+                block = method.Blocks[blockId];
+            }
+            else
+            {
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    if (method.Blocks[b].Id == blockId)
+                    {
+                        block = method.Blocks[b];
+                        break;
+                    }
+                }
+            }
+
+            if (block is null)
+                return -1;
+
+            for (int i = 0; i < block.TreeList.Length; i++)
+            {
+                var item = block.TreeList[i];
+                if (item.StatementIndex == statementIndex && item.Tree.Source.Id == treeId)
+                    return item.BlockOrdinal;
+            }
+
+            return -1;
+        }
+        private static void VerifyNoInterveningSameMemoryDefinition(
+            SsaMethod method,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> definitionsByKind,
+            SsaMemoryDefinition chosenDefinition,
+            int useBlockId,
+            int useStatementIndex,
+            int useTreeId,
+            string useDescription)
+        {
+            if (!definitionsByKind.TryGetValue(chosenDefinition.Name.Kind, out var sameKindDefinitions))
+                return;
+
+            for (int i = 0; i < sameKindDefinitions.Count; i++)
+            {
+                var candidate = sameKindDefinitions[i];
+                if (candidate.Name.Equals(chosenDefinition.Name) || candidate.IsBlockOut)
+                    continue;
+
+                if (!MemoryDefinitionDominatesUsePoint(method, candidate, useBlockId, useStatementIndex, useTreeId))
+                    continue;
+
+                if (MemoryDefinitionDominatesDefinition(method, chosenDefinition, candidate))
+                {
+                    throw new InvalidOperationException(
+                        $"Memory SSA edge use {chosenDefinition.Name} at {useDescription}" +
+                        $" is not the nearest dominating {SsaMemoryKinds.Name(chosenDefinition.Name.Kind)}" +
+                        $" definition; intervening definition is {candidate.Name}.");
+                }
+            }
+        }
+
+        private static void VerifyNoInterveningSameMemoryDefinitionAtBlockEnd(
+            SsaMethod method,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> definitionsByKind,
+            SsaMemoryDefinition chosenDefinition,
+            int predecessorBlockId,
+            string useDescription)
+        {
+            if (!definitionsByKind.TryGetValue(chosenDefinition.Name.Kind, out var sameKindDefinitions))
+                return;
+
+            for (int i = 0; i < sameKindDefinitions.Count; i++)
+            {
+                var candidate = sameKindDefinitions[i];
+                if (candidate.Name.Equals(chosenDefinition.Name) || candidate.IsBlockOut)
+                    continue;
+
+                if (!MemoryDefinitionDominatesBlockEnd(method, candidate, predecessorBlockId))
+                    continue;
+
+                if (MemoryDefinitionDominatesDefinition(method, chosenDefinition, candidate))
+                {
+                    throw new InvalidOperationException(
+                        $"Memory SSA edge use {chosenDefinition.Name} at {useDescription}" +
+                        $" is not the last reaching {SsaMemoryKinds.Name(chosenDefinition.Name.Kind)}" +
+                        $" definition at the end of B{predecessorBlockId}; intervening definition is {candidate.Name}.");
                 }
             }
         }
@@ -8993,39 +9626,50 @@ namespace Cnidaria.Cs
         private static void VerifyMemoryUse(
             SsaMethod method,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> definitions,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> definitionsByKind,
             SsaMemoryValueName use,
             int useBlockId,
             int useStatementIndex,
             int useTreeId)
         {
             if (!definitions.TryGetValue(use, out var definition))
-                throw new InvalidOperationException("Use of undefined memory SSA value " + use + " at node " + useTreeId.ToString() + ".");
+                throw new InvalidOperationException($"Use of undefined memory SSA value {use} at node {useTreeId}.");
 
             if (definition.IsInitial)
                 return;
 
             if (!method.Cfg.Dominates(definition.DefBlockId, useBlockId))
-                throw new InvalidOperationException("Memory SSA definition " + use + " in B" + definition.DefBlockId.ToString() + " does not dominate use at node " + useTreeId.ToString() + " in B" + useBlockId.ToString() + ".");
+                throw new InvalidOperationException($"Memory SSA definition {use} in B{definition.DefBlockId}" +
+                    $" does not dominate use at node {useTreeId} in B{useBlockId}.");
 
-            if (definition.DefBlockId == useBlockId && !definition.IsPhi && definition.DefStatementIndex >= useStatementIndex)
-                throw new InvalidOperationException("Memory SSA definition " + use + " at statement " + definition.DefStatementIndex.ToString() + " does not precede use at statement " + useStatementIndex.ToString() + " in B" + useBlockId.ToString() + ".");
+            if (definition.DefBlockId == useBlockId && !definition.IsPhi
+                && !MemoryDefinitionPrecedesTreeUse(method, definition, useBlockId, useStatementIndex, useTreeId))
+                throw new InvalidOperationException($"Memory SSA definition {use} at statement {definition.DefStatementIndex}, " +
+                    $"node {definition.DefTreeId} does not precede use at statement {useStatementIndex}, node {useTreeId} in B{useBlockId}.");
+
+            VerifyNoInterveningSameMemoryDefinition(method, definitionsByKind, definition, useBlockId, useStatementIndex, useTreeId, $"node {useTreeId} in B{useBlockId}");
         }
 
         private static void VerifyMemoryEdgeUse(
             SsaMethod method,
             Dictionary<SsaMemoryValueName, SsaMemoryDefinition> definitions,
+            Dictionary<SsaMemoryKind, List<SsaMemoryDefinition>> definitionsByKind,
             SsaMemoryValueName phiTarget,
             SsaMemoryValueName use,
             int predecessorBlockId)
         {
             if (!definitions.TryGetValue(use, out var definition))
-                throw new InvalidOperationException("Memory phi " + phiTarget + " uses undefined value " + use + " from B" + predecessorBlockId.ToString() + ".");
+                throw new InvalidOperationException($"Memory phi {phiTarget} uses undefined value {use} from B{predecessorBlockId}.");
 
             if (definition.IsInitial)
                 return;
 
             if (!method.Cfg.Dominates(definition.DefBlockId, predecessorBlockId))
-                throw new InvalidOperationException("Memory phi " + phiTarget + " input " + use + " from B" + predecessorBlockId.ToString() + " is not dominated by its definition in B" + definition.DefBlockId.ToString() + ".");
+                throw new InvalidOperationException(
+                    $"Memory phi {phiTarget} input {use} from B{predecessorBlockId} is not dominated by its definition in B{definition.DefBlockId}.");
+
+            VerifyNoInterveningSameMemoryDefinitionAtBlockEnd(method, definitionsByKind, definition, predecessorBlockId,
+                $"memory phi {phiTarget} input from B{predecessorBlockId}");
         }
 
         private static void VerifyLocalUse(
@@ -9042,12 +9686,12 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Use of undefined SSA value {use} at node {useTreeId}.");
 
             if (!localLiveness.IsLiveBeforeTree(useBlockId, useStatementIndex, useTreeId, use.Slot))
-                throw new InvalidOperationException("Use of " + use + " at node " + useTreeId.ToString() + " occurs where its base local is not live; this is illegal with pruned SSA.");
+                throw new InvalidOperationException($"Use of {use} at node {useTreeId} occurs where its base local is not live; this is illegal with pruned SSA.");
 
-            if (!DefinitionDominatesUsePoint(method, definition, useBlockId, useStatementIndex))
+            if (!DefinitionDominatesUsePoint(method, definition, useBlockId, useStatementIndex, useTreeId))
                 throw new InvalidOperationException($"SSA definition {use} in B{definition.DefBlockId} does not dominate use at node {useTreeId} in B{useBlockId}.");
 
-            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, useBlockId, useStatementIndex, "node " + useTreeId.ToString());
+            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, useBlockId, useStatementIndex, useTreeId, $"node {useTreeId}");
         }
 
         private static void VerifyEdgeUse(
@@ -9064,7 +9708,7 @@ namespace Cnidaria.Cs
             if (!DefinitionDominatesBlockEnd(method, definition, predecessorBlockId))
                 throw new InvalidOperationException($"Phi {phiTarget} input {use} from B{predecessorBlockId} is not dominated by its definition in B{definition.DefBlockId}.");
 
-            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, predecessorBlockId, int.MaxValue, "phi edge B" + predecessorBlockId.ToString() + " -> " + phiTarget.ToString());
+            VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, predecessorBlockId, int.MaxValue, -1, $"phi edge B{predecessorBlockId} -> {phiTarget}");
         }
     }
 
@@ -9155,7 +9799,13 @@ namespace Cnidaria.Cs
                 {
                     if (i != 0) sb.Append(", ");
                     var loop = method.Cfg.NaturalLoops[i];
-                    sb.Append('L').Append(loop.Index).Append("(H=B").Append(loop.HeaderBlockId).Append(", L=B").Append(loop.LatchBlockId).Append(')');
+                    sb.Append('L').Append(loop.Index)
+                        .Append("(H=B").Append(loop.Header)
+                        .Append(", latches=").Append(loop.Latches.Length)
+                        .Append(", pre=").Append(loop.Preheader >= 0 ? "B" + loop.Preheader.ToString() : "none")
+                        .Append(", depth=").Append(loop.Depth)
+                        .Append(", body=").Append(loop.Blocks.Length)
+                        .Append(')');
                 }
                 sb.AppendLine();
             }

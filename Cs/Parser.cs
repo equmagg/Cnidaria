@@ -3797,7 +3797,8 @@ namespace Cnidaria.Cs
                 return new PrefixUnaryExpressionSyntax(kind, op, operand);
             }
             // postfix unary
-            return ParsePostfixExpression();
+            var expr = ParsePrimaryExpression();
+            return ParsePostfixExpression(expr);
         }
         private RefExpressionSyntax ParseRefExpression()
         {
@@ -3852,10 +3853,8 @@ namespace Cnidaria.Cs
                 requireNoNewDiagnostics: true,
                 validateNode: e => e is CastExpressionSyntax);
         }
-        private ExpressionSyntax ParsePostfixExpression()
+        private ExpressionSyntax ParsePostfixExpression(ExpressionSyntax expr)
         {
-            var expr = ParsePrimaryExpression();
-
             while (true)
             {
                 switch (_tokens.CurrentKind)
@@ -3871,6 +3870,12 @@ namespace Cnidaria.Cs
                     case SyntaxKind.DotToken:
                     case SyntaxKind.MinusGreaterThanToken:
                         expr = ParseMemberAccess(expr);
+                        continue;
+
+                    case SyntaxKind.QuestionToken
+                        when _tokens.Peek(1).Kind == SyntaxKind.DotToken ||
+                             _tokens.Peek(1).Kind == SyntaxKind.OpenBracketToken:
+                        expr = ParseConditionalAccess(expr);
                         continue;
 
                     case SyntaxKind.PlusPlusToken:
@@ -4629,6 +4634,39 @@ namespace Cnidaria.Cs
 
             var close = MatchToken(SyntaxKind.CloseBraceToken);
             return new InitializerExpressionSyntax(SyntaxKind.ComplexElementInitializerExpression, open, new SeparatedSyntaxList<ExpressionSyntax>(list.ToArray()), close);
+        }
+        private ConditionalAccessExpressionSyntax ParseConditionalAccess(ExpressionSyntax receiver)
+        {
+            var question = MatchToken(SyntaxKind.QuestionToken);
+
+            ExpressionSyntax whenNotNull;
+            if (_tokens.CurrentKind == SyntaxKind.DotToken)
+            {
+                whenNotNull = ParseMemberBinding();
+            }
+            else if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+            {
+                whenNotNull = new ElementBindingExpressionSyntax(ParseBracketedArgumentList());
+            }
+            else
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(
+                    _tokens.Current.Span.Start,
+                   "Expected '.' or '[' after '?' in conditional access expression."));
+
+                var missingDot = CreateMissingToken(SyntaxKind.DotToken, question.Span.End);
+                var missingName = ParseSimpleNameInExpressionContext();
+                whenNotNull = new MemberBindingExpressionSyntax(missingDot, missingName);
+            }
+
+            whenNotNull = ParsePostfixExpression(whenNotNull);
+            return new ConditionalAccessExpressionSyntax(receiver, question, whenNotNull);
+        }
+        private MemberBindingExpressionSyntax ParseMemberBinding()
+        {
+            var op = MatchToken(SyntaxKind.DotToken);
+            var name = ParseSimpleNameInExpressionContext();
+            return new MemberBindingExpressionSyntax(op, name);
         }
         private MemberAccessExpressionSyntax ParseMemberAccess(ExpressionSyntax receiver)
         {
