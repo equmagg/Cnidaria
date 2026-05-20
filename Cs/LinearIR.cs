@@ -4773,8 +4773,19 @@ namespace Cnidaria.Cs
                     sb.Append("array_data_ref ");
                     AppendUses(sb, node);
                     return;
+                case GenTreeKind.StaticData:
+                    sb.Append("static_data offset=").Append(source.Int32).Append(" length=").Append(source.Int64);
+                    return;
                 case GenTreeKind.StackAlloc:
                     sb.Append("stackalloc elemSize=").Append(source.Int32).Append(' ');
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.AllocHGlobal:
+                    sb.Append("alloc_hglobal ");
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.FreeHGlobal:
+                    sb.Append("free_hglobal ");
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.PointerElementAddr:

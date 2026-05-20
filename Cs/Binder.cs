@@ -7242,6 +7242,48 @@ namespace Cnidaria.Cs
             converted.SetHasErrors();
             return converted;
         }
+
+        private BoundExpression MakeLogicalNot(
+            SyntaxNode syntax,
+            BoundExpression operand,
+            BindingContext ctx,
+            DiagnosticBag diagnostics)
+        {
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+
+            if (operand.HasErrors)
+                return new BoundBadExpression(syntax);
+
+            if (operand.Type.SpecialType != SpecialType.System_Boolean)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SWITCH_BOOL000",
+                    DiagnosticSeverity.Error,
+                    "Internal error: synthesized pattern condition is not boolean.",
+                    new Location(ctx.SemanticModel.SyntaxTree, syntax.Span)));
+
+                return new BoundBadExpression(syntax);
+            }
+
+            if (operand is BoundUnaryExpression u &&
+                u.OperatorKind == BoundUnaryOperatorKind.LogicalNot)
+            {
+                return u.Operand;
+            }
+
+            Optional<object> constantValue = Optional<object>.None;
+            if (operand.ConstantValueOpt.HasValue && operand.ConstantValueOpt.Value is bool b)
+                constantValue = new Optional<object>(!b);
+
+            return new BoundUnaryExpression(
+                syntax,
+                BoundUnaryOperatorKind.LogicalNot,
+                boolType,
+                operand,
+                constantValue,
+                isChecked: false);
+        }
+
         private BoundExpression MakeLogicalAnd(SyntaxNode syntax, BoundExpression left, BoundExpression right, BindingContext ctx, DiagnosticBag diagnostics)
         {
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
@@ -9319,7 +9361,59 @@ namespace Cnidaria.Cs
             var operand = BindExpression(node.Expression, context, diagnostics);
             if (operand.HasErrors)
                 return new BoundBadExpression(node);
+
+            if (PatternInputMayBeTestedMoreThanOnce(node.Pattern) &&
+                operand.Type is not NullTypeSymbol &&
+                operand.Type is not DefaultLiteralTypeSymbol)
+            {
+                return BindIsPatternExpressionWithInputTemp(node, operand, context, diagnostics);
+            }
+
             return BindIsPatternCore(node, operand, node.Pattern, context, diagnostics);
+        }
+        private BoundExpression BindIsPatternExpressionWithInputTemp(
+            IsPatternExpressionSyntax node,
+            BoundExpression operand,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var temp = NewTemp("$patternInput", operand.Type);
+
+            var tempStore = new BoundExpressionStatement(
+                node.Expression,
+                new BoundAssignmentExpression(
+                    node.Expression,
+                    new BoundLocalExpression(node.Expression, temp),
+                    operand));
+
+            var tempRead = new BoundLocalExpression(node.Expression, temp);
+            var value = BindIsPatternCore(node, tempRead, node.Pattern, context, diagnostics);
+
+            if (value.HasErrors)
+                return value;
+
+            return new BoundSequenceExpression(
+                node,
+                locals: ImmutableArray.Create(temp),
+                sideEffects: ImmutableArray.Create<BoundStatement>(tempStore),
+                value: value);
+        }
+
+        private static bool PatternInputMayBeTestedMoreThanOnce(PatternSyntax pattern)
+        {
+            return pattern switch
+            {
+                ParenthesizedPatternSyntax p =>
+                    PatternInputMayBeTestedMoreThanOnce(p.Pattern),
+
+                UnaryPatternSyntax u when u.Kind == SyntaxKind.NotPattern =>
+                    PatternInputMayBeTestedMoreThanOnce(u.Pattern),
+
+                BinaryPatternSyntax b when b.Kind is SyntaxKind.AndPattern or SyntaxKind.OrPattern =>
+                    true,
+
+                _ => false
+            };
         }
         private BoundExpression BindIsPatternCore(
             SyntaxNode wholeSyntax,
@@ -9383,6 +9477,31 @@ namespace Cnidaria.Cs
                         context,
                         diagnostics);
 
+                case BinaryPatternSyntax binaryPattern when binaryPattern.Kind is SyntaxKind.AndPattern or SyntaxKind.OrPattern:
+                    {
+                        var left = BindIsPatternCore(
+                            wholeSyntax,
+                            operand,
+                            binaryPattern.Left,
+                            context,
+                            diagnostics);
+
+                        LocalScopeBinder rightBinder = binaryPattern.Kind == SyntaxKind.AndPattern
+                            ? CreateFlowScopeBinderForTrue(left)
+                            : CreateFlowScopeBinderForFalse(left);
+
+                        var right = rightBinder.BindIsPatternCore(
+                            wholeSyntax,
+                            operand,
+                            binaryPattern.Right,
+                            context,
+                            diagnostics);
+
+                        return binaryPattern.Kind == SyntaxKind.AndPattern
+                            ? MakeLogicalAnd(binaryPattern, left, right, context, diagnostics)
+                            : MakeLogicalOr(binaryPattern, left, right, context, diagnostics);
+                    }
+
                 case UnaryPatternSyntax unaryPattern when unaryPattern.Kind == SyntaxKind.NotPattern:
                     {
                         var inner = BindIsPatternCore(
@@ -9392,27 +9511,22 @@ namespace Cnidaria.Cs
                             context,
                             diagnostics);
 
-                        if (inner is not BoundIsPatternExpression ip)
+                        if (inner is BoundIsPatternExpression ip)
                         {
-                            diagnostics.Add(new Diagnostic(
-                                "CN_PAT_IS013",
-                                DiagnosticSeverity.Error,
-                                "'not' is only supported over bound pattern tests.",
-                                new Location(context.SemanticModel.SyntaxTree, unaryPattern.Span)));
-                            return new BoundBadExpression(wholeSyntax);
+                            return new BoundIsPatternExpression(
+                                syntax: wholeSyntax,
+                                operand: ip.Operand,
+                                boolType: ip.Type,
+                                patternKind: ip.PatternKind,
+                                patternTypeOpt: ip.PatternTypeOpt,
+                                constantOpt: ip.ConstantOpt,
+                                comparisonTypeOpt: ip.ComparisonTypeOpt,
+                                declaredLocalOpt: ip.DeclaredLocalOpt,
+                                isDiscard: ip.IsDiscard,
+                                isNegated: !ip.IsNegated);
                         }
 
-                        return new BoundIsPatternExpression(
-                            syntax: wholeSyntax,
-                            operand: ip.Operand,
-                            boolType: ip.Type,
-                            patternKind: ip.PatternKind,
-                            patternTypeOpt: ip.PatternTypeOpt,
-                            constantOpt: ip.ConstantOpt,
-                            comparisonTypeOpt: ip.ComparisonTypeOpt,
-                            declaredLocalOpt: ip.DeclaredLocalOpt,
-                            isDiscard: ip.IsDiscard,
-                            isNegated: !ip.IsNegated);
+                        return MakeLogicalNot(unaryPattern, inner, context, diagnostics);
                     }
 
                 case VarPatternSyntax:
@@ -9507,6 +9621,17 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(wholeSyntax);
             }
 
+            if (comparisonType.SpecialType == SpecialType.System_String || IsEnumType(comparisonType))
+            {
+                return BindSynthesizedConstantPatternEquality(
+                    wholeSyntax,
+                    left,
+                    right,
+                    pattern.Expression,
+                    context,
+                    diagnostics);
+            }
+
             var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
             return new BoundIsPatternExpression(
                 syntax: wholeSyntax,
@@ -9515,6 +9640,24 @@ namespace Cnidaria.Cs
                 patternKind: BoundIsPatternKind.Constant,
                 constantOpt: right,
                 comparisonTypeOpt: comparisonType);
+        }
+        private BoundExpression BindSynthesizedConstantPatternEquality(
+            SyntaxNode wholeSyntax,
+            BoundExpression left,
+            BoundExpression right,
+            ExpressionSyntax rightSyntax,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var leftSyntax = left.Syntax as ExpressionSyntax ?? rightSyntax;
+            var eqToken = MakeToken(SyntaxKind.EqualsEqualsToken, wholeSyntax.Span);
+            var eqSyntax = new BinaryExpressionSyntax(
+                SyntaxKind.EqualsExpression,
+                leftSyntax,
+                eqToken,
+                rightSyntax);
+
+            return BindEqualityBinary(eqSyntax, left, right, context, diagnostics);
         }
         private TypeSymbol? ChooseBasicConstantPatternComparisonType(
             BoundExpression operand,
@@ -9539,6 +9682,9 @@ namespace Cnidaria.Cs
         }
         private static bool IsBasicConstantPatternType(TypeSymbol type)
         {
+            if (IsEnumType(type))
+                return true;
+
             return type.SpecialType is
                 SpecialType.System_Boolean or
                 SpecialType.System_Char or
@@ -9551,7 +9697,8 @@ namespace Cnidaria.Cs
                 SpecialType.System_Int64 or
                 SpecialType.System_UInt64 or
                 SpecialType.System_Single or
-                SpecialType.System_Double;
+                SpecialType.System_Double or
+                SpecialType.System_String;
         }
         private BoundExpression BindIsNullPattern(
             SyntaxNode wholeSyntax,
@@ -9563,7 +9710,7 @@ namespace Cnidaria.Cs
 
             BoundExpression left = operand;
 
-            if (operand.Type.IsValueType)
+            if (NeedsBoxingForNullTest(operand.Type))
             {
                 var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object);
                 left = new BoundConversionExpression(
@@ -9580,6 +9727,13 @@ namespace Cnidaria.Cs
                 boolType: boolType,
                 patternKind: BoundIsPatternKind.Null,
                 constantOpt: new BoundLiteralExpression(pattern.Expression, NullTypeSymbol.Instance, null));
+        }
+        private static bool NeedsBoxingForNullTest(TypeSymbol type)
+        {
+            if (type is TypeParameterSymbol tp)
+                return (tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) == 0;
+
+            return type.IsValueType;
         }
         private static bool IsNullConstantPattern(BoundExpression expr)
         {
@@ -10743,12 +10897,23 @@ namespace Cnidaria.Cs
                 accessReceiver = new BoundCallExpression(syntax, receiverTempExpr, getValueOrDefault, ImmutableArray<BoundExpression>.Empty);
                 return true;
             }
-
+            BoundExpression conditionReceiver = receiverTempExpr;
+            if (receiver.Type is TypeParameterSymbol tp &&
+                (tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) == 0)
+            {
+                var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object);
+                conditionReceiver = new BoundConversionExpression(
+                    syntax: syntax,
+                    type: objectType,
+                    operand: receiverTempExpr,
+                    conversion: new Conversion(ConversionKind.Boxing),
+                    isChecked: false);
+            }
             condition = new BoundBinaryExpression(
                 syntax,
                 BoundBinaryOperatorKind.NotEquals,
                 boolType,
-                receiverTempExpr,
+                conditionReceiver,
                 new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null),
                 Optional<object>.None);
             accessReceiver = receiverTempExpr;
@@ -10975,7 +11140,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(invocation);
             }
 
-            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type, context);
             if (receiverType is null)
             {
                 diagnostics.Add(new Diagnostic("CN_CALL021", DiagnosticSeverity.Error,
@@ -11037,7 +11202,12 @@ namespace Cnidaria.Cs
                     diagnostics: diagnostics,
                     diagnosticNode: invocation))
                 {
-                    return new BoundCallExpression(invocation, receiver, chosen!, convertedArgs);
+                    var callReceiver = PrepareReceiverForResolvedMemberCall(
+                        invocation.Expression,
+                        receiver,
+                        chosen!,
+                        context);
+                    return new BoundCallExpression(invocation, callReceiver, chosen!, convertedArgs);
                 }
 
                 return new BoundBadExpression(invocation);
@@ -11096,7 +11266,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(syntax);
             }
 
-            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type, context);
             if (receiverType is null)
             {
                 diagnostics.Add(new Diagnostic("CN_MEMACC001", DiagnosticSeverity.Error,
@@ -13776,6 +13946,37 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, id.Span)));
                 return new BoundBadExpression(inv);
             }
+
+            if (!string.IsNullOrEmpty(name) &&
+                TryBindUnqualifiedMember(id, name, BindValueKind.RValue, context, diagnostics, out var memberValue))
+            {
+                if (memberValue.HasErrors)
+                    return new BoundBadExpression(inv);
+
+                if (TryGetDelegateInvokeMethod(memberValue.Type, out _, out _))
+                    return BindDelegateInvocation(inv, memberValue, argSyntaxes, args, context, diagnostics);
+
+                diagnostics.Add(new Diagnostic("CN_CALL010", DiagnosticSeverity.Error,
+                    $"Expression of type '{memberValue.Type.Name}' is not invocable.",
+                    new Location(context.SemanticModel.SyntaxTree, id.Span)));
+                return new BoundBadExpression(inv);
+            }
+
+            if (!string.IsNullOrEmpty(name) &&
+                TryBindImportedStaticMember(id, name, BindValueKind.RValue, context, diagnostics, out var importedStaticMemberValue))
+            {
+                if (importedStaticMemberValue.HasErrors)
+                    return new BoundBadExpression(inv);
+
+                if (TryGetDelegateInvokeMethod(importedStaticMemberValue.Type, out _, out _))
+                    return BindDelegateInvocation(inv, importedStaticMemberValue, argSyntaxes, args, context, diagnostics);
+
+                diagnostics.Add(new Diagnostic("CN_CALL010", DiagnosticSeverity.Error,
+                    $"Expression of type '{importedStaticMemberValue.Type.Name}' is not invocable.",
+                    new Location(context.SemanticModel.SyntaxTree, id.Span)));
+                return new BoundBadExpression(inv);
+            }
+
             // Local function invocation
             if (TryGetLocalFunctionFromEnclosingScopes(name, out var localFunc) && localFunc != null)
             {
@@ -13976,7 +14177,12 @@ namespace Cnidaria.Cs
                     diagnostics: diagnostics,
                     diagnosticNode: inv))
                 {
-                    return new BoundCallExpression(inv, receiverOpt: receiverValue, method: chosen!, arguments: convertedArgs);
+                    var callReceiver = PrepareReceiverForResolvedMemberCall(
+                        ma.Expression,
+                        receiverValue,
+                        chosen!,
+                        context);
+                    return new BoundCallExpression(inv, receiverOpt: callReceiver, method: chosen!, arguments: convertedArgs);
                 }
                 return new BoundBadExpression(inv);
             }
@@ -14027,6 +14233,32 @@ namespace Cnidaria.Cs
                 new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
 
             return new BoundBadExpression(inv);
+        }
+        private BoundExpression? PrepareReceiverForResolvedMemberCall(
+            SyntaxNode syntax, BoundExpression? receiver, MethodSymbol method, BindingContext context)
+        {
+            if (receiver is null)
+                return null;
+
+            if (receiver.Type is not TypeParameterSymbol tp ||
+                (tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
+            {
+                return receiver;
+            }
+
+            if (method.ContainingSymbol is not NamedTypeSymbol owner ||
+                owner.SpecialType != SpecialType.System_Object)
+            {
+                return receiver;
+            }
+
+            var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object);
+            return new BoundConversionExpression(
+                syntax,
+                objectType,
+                receiver,
+                new Conversion(ConversionKind.Boxing),
+                isChecked: false);
         }
         private BoundExpression BindGenericSimpleInvocation(
             InvocationExpressionSyntax inv,
@@ -14197,7 +14429,7 @@ namespace Cnidaria.Cs
                 }
 
                 var pointedAt = pt.PointedAtType;
-                receiverType = GetReceiverTypeForMemberLookup(pointedAt);
+                receiverType = GetReceiverTypeForMemberLookup(pointedAt, context);
                 if (receiverType is null)
                 {
                     diagnostics.Add(new Diagnostic("CN_CALL024", DiagnosticSeverity.Error,
@@ -14215,7 +14447,7 @@ namespace Cnidaria.Cs
                 if (TryBindSimpleValue(rid, out var simple))
                 {
                     receiverValue = simple;
-                    receiverType = GetReceiverTypeForMemberLookup(simple.Type);
+                    receiverType = GetReceiverTypeForMemberLookup(simple.Type, context);
                     return true;
                 }
                 var name = rid.Identifier.ValueText ?? "";
@@ -14223,14 +14455,14 @@ namespace Cnidaria.Cs
                     TryBindUnqualifiedMember(rid, name, BindValueKind.RValue, context, diagnostics, out var memberExpr))
                 {
                     receiverValue = memberExpr;
-                    receiverType = GetReceiverTypeForMemberLookup(memberExpr.Type);
+                    receiverType = GetReceiverTypeForMemberLookup(memberExpr.Type, context);
                     return true;
                 }
                 if (!string.IsNullOrEmpty(name) &&
                     TryBindImportedStaticMember(rid, name, BindValueKind.RValue, context, diagnostics, out var staticMemberExpr))
                 {
                     receiverValue = staticMemberExpr;
-                    receiverType = GetReceiverTypeForMemberLookup(staticMemberExpr.Type);
+                    receiverType = GetReceiverTypeForMemberLookup(staticMemberExpr.Type, context);
                     return true;
                 }
                 return false;
@@ -14245,7 +14477,7 @@ namespace Cnidaria.Cs
                 var tmpValue = BindExpression(receiverSyntax, tmpContext, tmpDiagnostics);
                 if (!tmpValue.HasErrors)
                 {
-                    var tmpReceiverType = GetReceiverTypeForMemberLookup(tmpValue.Type);
+                    var tmpReceiverType = GetReceiverTypeForMemberLookup(tmpValue.Type, context);
                     if (tmpReceiverType is not null)
                     {
                         receiverValue = tmpValue;
@@ -14271,12 +14503,12 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type);
+                receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type, context);
                 return true;
             }
 
             receiverValue = BindExpression(receiverSyntax, context, diagnostics);
-            receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type);
+            receiverType = GetReceiverTypeForMemberLookup(receiverValue.Type, context);
             return true;
         }
 
@@ -14568,6 +14800,20 @@ namespace Cnidaria.Cs
 
             if (type is ArrayTypeSymbol at)
                 return at.BaseType as NamedTypeSymbol;
+
+            return null;
+        }
+        private static NamedTypeSymbol? GetReceiverTypeForMemberLookup(TypeSymbol type, BindingContext context)
+        {
+            var receiverType = GetReceiverTypeForMemberLookup(type);
+            if (receiverType is not null)
+                return receiverType;
+
+            if (type is TypeParameterSymbol tp &&
+                (tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) == 0)
+            {
+                return context.Compilation.GetSpecialType(SpecialType.System_Object);
+            }
 
             return null;
         }
@@ -18165,6 +18411,9 @@ namespace Cnidaria.Cs
             if (TryBindPointerEquality(left, right, bin, ctx, diagnostics, out var lp, out var rp))
                 return new BoundBinaryExpression(bin, op, boolType, lp, rp, Optional<object>.None);
 
+            if (TryBindTypeParameterNullEquality(left, right, bin, ctx, diagnostics, out var tl, out var tr))
+                return new BoundBinaryExpression(bin, op, boolType, tl, tr, Optional<object>.None);
+
             // reference equality
             {
                 if (TryBindReferenceEquality(left, right, bin, ctx, diagnostics, out var l2, out var r2))
@@ -18213,6 +18462,61 @@ namespace Cnidaria.Cs
             }
 
             return false;
+        }
+        private bool TryBindTypeParameterNullEquality(
+            BoundExpression left,
+            BoundExpression right,
+            SyntaxNode diagnosticNode,
+            BindingContext ctx,
+            DiagnosticBag diagnostics,
+            out BoundExpression leftOut,
+            out BoundExpression rightOut)
+        {
+            leftOut = left;
+            rightOut = right;
+
+            bool leftNull = left.Type is NullTypeSymbol || (left.ConstantValueOpt.HasValue && left.ConstantValueOpt.Value is null);
+            bool rightNull = right.Type is NullTypeSymbol || (right.ConstantValueOpt.HasValue && right.ConstantValueOpt.Value is null);
+
+            if (leftNull == rightNull)
+                return false;
+
+            BoundExpression value = leftNull ? right : left;
+
+            if (value.Type is not TypeParameterSymbol tp)
+                return false;
+
+            if ((tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
+                return false;
+
+            var objectType = ctx.Compilation.GetSpecialType(SpecialType.System_Object);
+
+            BoundExpression boxedValue = new BoundConversionExpression(
+                syntax: value.Syntax,
+                type: objectType,
+                operand: value,
+                conversion: new Conversion(ConversionKind.Boxing),
+                isChecked: false);
+
+            BoundExpression nullObject = new BoundConversionExpression(
+                syntax: leftNull ? left.Syntax : right.Syntax,
+                type: objectType,
+                operand: leftNull ? left : right,
+                conversion: new Conversion(ConversionKind.NullLiteral),
+                isChecked: false);
+
+            if (leftNull)
+            {
+                leftOut = nullObject;
+                rightOut = boxedValue;
+            }
+            else
+            {
+                leftOut = boxedValue;
+                rightOut = nullObject;
+            }
+
+            return true;
         }
         private bool TryBindReferenceEquality(
             BoundExpression left,
@@ -24383,6 +24687,20 @@ namespace Cnidaria.Cs
             bool targetHasRefLike = RefLikeRestrictionFacts.ContainsRefLike(target);
 
             // type parameter conversions
+            if (target is TypeParameterSymbol targetTp)
+            {
+                if ((targetTp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
+                    return new Conversion(ConversionKind.None);
+
+                if (expr.Type.SpecialType is SpecialType.System_Object
+                    or SpecialType.System_ValueType
+                    or SpecialType.System_Enum
+                    || IsInterfaceType(expr.Type))
+                {
+                    return new Conversion(ConversionKind.Unboxing);
+                }
+            }
+
             if (expr.Type is TypeParameterSymbol tp)
             {
                 if ((tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)

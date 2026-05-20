@@ -115,7 +115,10 @@ namespace Cnidaria.Cs
         Endfinally, // end of finally
 
         // Pointers
+        StaticData,  // operand0: static data blob offset, operand1: byte length, stack: -> unmanaged ptr
         StackAlloc,  // operand0: elementSize
+        AllocHGlobal,  // stack: byteCount/native int -> unmanaged ptr
+        FreeHGlobal,   // stack: unmanaged ptr ->
         PtrElemAddr, // operand0: elementSize
         PtrToByRef,  // stack: ptr -> byref
         // Typed indirect
@@ -129,6 +132,7 @@ namespace Cnidaria.Cs
         LdArrayDataRef, // stack: arrayref -> byref
 
         Sizeof,  // operand0: Type token, stack: -> int32
+        TypeIsValueType, // operand0: Type token, stack: -> bool/int32
         PtrDiff, // operand0: elementSize, stack: ptrA, ptrB -> nint
         Isinst, // operand0: type token, stack: obj -> obj
 
@@ -316,9 +320,17 @@ namespace Cnidaria.Cs
         private readonly List<Instruction> _insns = new();
         private readonly List<int> _labelToPc = new();
         private readonly List<(int pc, BcLabel label)> _fixups = new();
+        private readonly List<byte> _staticDataBlob = new();
 
         public int Count => _insns.Count;
-
+        public ImmutableArray<byte> StaticDataBlob => _staticDataBlob.ToImmutableArray();
+        public int AddStaticData(ReadOnlySpan<byte> bytes)
+        {
+            int offset = _staticDataBlob.Count;
+            for (int i = 0; i < bytes.Length; i++)
+                _staticDataBlob.Add(bytes[i]);
+            return offset;
+        }
         public BcLabel DefineLabel()
         {
             var id = _labelToPc.Count;
@@ -388,19 +400,22 @@ namespace Cnidaria.Cs
         public ImmutableArray<int> LocalTypeTokens { get; }
         public ImmutableArray<Instruction> Instructions { get; }
         public ImmutableArray<ExceptionHandler> ExceptionHandlers { get; }
+        public ImmutableArray<byte> StaticDataBlob { get; }
         public int MaxStack { get; }
 
         public BytecodeFunction(int methodToken,
             ImmutableArray<int> localTypeTokens,
             ImmutableArray<Instruction> instructions,
             int maxStack,
-            ImmutableArray<ExceptionHandler> exceptionHandlers)
+            ImmutableArray<ExceptionHandler> exceptionHandlers,
+            ImmutableArray<byte> staticDataBlob = default)
         {
             MethodToken = methodToken;
             LocalTypeTokens = localTypeTokens;
             Instructions = instructions;
             MaxStack = maxStack;
             ExceptionHandlers = exceptionHandlers;
+            StaticDataBlob = staticDataBlob.IsDefault ? ImmutableArray<byte>.Empty : staticDataBlob;
         }
     }
     internal sealed class BytecodeEmitResult
@@ -575,7 +590,7 @@ namespace Cnidaria.Cs
                     localTypeTokens.Add(_tokens.GetTypeToken(_localTypes[i]));
 
                 int methodToken = _tokens.GetMethodToken(_method);
-                return new BytecodeFunction(methodToken, localTypeTokens.ToImmutable(), instructions, maxStack, exceptionHandlers);
+                return new BytecodeFunction(methodToken, localTypeTokens.ToImmutable(), instructions, maxStack, exceptionHandlers, _il.StaticDataBlob);
             }
             private ImmutableArray<ExceptionHandler> BakeExceptionHandlers(ImmutableArray<int> labelToPc)
             {
@@ -1109,6 +1124,10 @@ namespace Cnidaria.Cs
                         EmitStackAlloc(sa, mode);
                         return;
 
+                    case BoundStaticDataExpression sd:
+                        EmitStaticData(sd, mode);
+                        return;
+
                     case BoundArrayCreationExpression ac:
                         EmitArrayCreation(ac, mode);
                         return;
@@ -1313,6 +1332,56 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
 
+            }
+            private bool TryEmitTypeOfIsValueType(BoundCallExpression call, EmitMode mode)
+            {
+                if (call.ReceiverOpt is not BoundTypeOfExpression typeOf || call.Arguments.Length != 0)
+                    return false;
+
+                if (!IsSystemTypeIsValueTypeGetter(call.Method))
+                    return false;
+
+                if (mode == EmitMode.Discard)
+                    return true;
+
+                EmitTypeIsValueType(typeOf.OperandType);
+                return true;
+            }
+            private static bool IsSystemTypeIsValueTypeGetter(MethodSymbol method)
+            {
+                if (method.IsStatic ||
+                    method.Parameters.Length != 0 ||
+                    method.ReturnType.SpecialType != SpecialType.System_Boolean ||
+                    !string.Equals(method.Name, "get_IsValueType", StringComparison.Ordinal))
+                    return false;
+
+                return method.ContainingSymbol is NamedTypeSymbol containingType &&
+                    string.Equals(containingType.Name, "Type", StringComparison.Ordinal) &&
+                    IsInNamespace(containingType, "System");
+            }
+            private void EmitTypeIsValueType(TypeSymbol operandType)
+            {
+                if (TryGetCompileTimeTypeIsValueType(operandType, out bool isValueType))
+                {
+                    _il.Emit(BytecodeOp.Ldc_I4, operand0: isValueType ? 1 : 0, pop: 0, push: 1);
+                    return;
+                }
+                _il.Emit(BytecodeOp.TypeIsValueType, operand0: _tokens.GetTypeToken(operandType), pop: 0, push: 1);
+            }
+            private static bool TryGetCompileTimeTypeIsValueType(TypeSymbol type, out bool isValueType)
+            {
+                if (type is TypeParameterSymbol typeParameter)
+                {
+                    if ((typeParameter.GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0)
+                    {
+                        isValueType = true;
+                        return true;
+                    }
+                    isValueType = false;
+                    return false;
+                }
+                isValueType = type.IsValueType;
+                return true;
             }
             private void EmitLocal(BoundLocalExpression loc, EmitMode mode)
             {
@@ -1986,6 +2055,9 @@ namespace Cnidaria.Cs
                 if (TryEmitIntrinsic(call, mode))
                     return;
 
+                if (TryEmitTypeOfIsValueType(call, mode))
+                    return;
+
                 if (TryEmitDelegateCombineRemoveCall(call, mode))
                     return;
 
@@ -2293,6 +2365,20 @@ namespace Cnidaria.Cs
                             return true;
                         }
                     }
+                    // Unsafe.IsNullRef<T>(ref readonly T)
+                    if (def.Name == "IsNullRef" && ps.Length == 1 &&
+                        ps[0].Type is ByRefTypeSymbol)
+                    {
+                        EmitExpression(call.Arguments[0], EmitMode.Value); // byref
+                        _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
+                        EmitIntrinsicConv(NumericConvKind.NativeUInt);
+                        _il.Emit(BytecodeOp.Ceq, pop: 2, push: 1);
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
+                    }
                     // Unsafe.AreSame<T>(ref readonly T, ref readonly T)
                     if (def.Name == "AreSame" && ps.Length == 2 &&
                         ps[0].Type is ByRefTypeSymbol && ps[1].Type is ByRefTypeSymbol)
@@ -2305,6 +2391,34 @@ namespace Cnidaria.Cs
                         return true;
                     }
                     return false;
+                }
+                if (containingType.Name == "Marshal" && IsInNamespace(containingType, "System", "Runtime", "InteropServices"))
+                {
+                    var ps = call.Method.Parameters;
+
+                    // Marshal.AllocHGlobal(nint)
+                    if (def.Name == "AllocHGlobal" &&
+                        ps.Length == 1 &&
+                        ps[0].Type.SpecialType == SpecialType.System_IntPtr)
+                    {
+                        EmitExpression(call.Arguments[0], EmitMode.Value);
+                        _il.Emit(BytecodeOp.AllocHGlobal, pop: 1, push: 1);
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
+                    }
+
+                    // Marshal.FreeHGlobal(IntPtr)
+                    if (def.Name == "FreeHGlobal" &&
+                        ps.Length == 1 &&
+                        ps[0].Type.SpecialType == SpecialType.System_IntPtr)
+                    {
+                        EmitExpression(call.Arguments[0], EmitMode.Value);
+                        _il.Emit(BytecodeOp.FreeHGlobal, pop: 1, push: 0);
+                        return true;
+                    }
                 }
                 // MemoryMarshal
                 if (containingType.Name == "MemoryMarshal" && IsInNamespace(containingType, "System", "Runtime", "InteropServices"))
@@ -2733,6 +2847,74 @@ namespace Cnidaria.Cs
 
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
+            private void EmitStaticData(BoundStaticDataExpression node, EmitMode mode)
+            {
+                if (mode == EmitMode.Discard)
+                    return;
+
+                int elementSize = GetElementSizeOrThrow(node.ElementType);
+                int byteLength = checked(node.Elements.Length * elementSize);
+                byte[] bytes = new byte[byteLength];
+
+                for (int i = 0; i < node.Elements.Length; i++)
+                {
+                    var element = node.Elements[i];
+                    if (!element.ConstantValueOpt.HasValue)
+                        throw new InvalidOperationException("Static data element is not a constant.");
+
+                    WriteStaticDataElement(bytes.AsSpan(i * elementSize, elementSize), node.ElementType, element.ConstantValueOpt.Value);
+                }
+
+                int offset = _il.AddStaticData(bytes);
+                _il.Emit(BytecodeOp.StaticData, operand0: offset, operand1: byteLength, pop: 0, push: 1);
+            }
+            private static void WriteStaticDataElement(Span<byte> destination, TypeSymbol type, object? value)
+            {
+                if (type is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum)
+                    type = nt.EnumUnderlyingType ?? type;
+
+                switch (type.SpecialType)
+                {
+                    case SpecialType.System_Boolean:
+                        destination[0] = Convert.ToBoolean(value) ? (byte)1 : (byte)0;
+                        return;
+                    case SpecialType.System_Int8:
+                        destination[0] = unchecked((byte)Convert.ToSByte(value));
+                        return;
+                    case SpecialType.System_UInt8:
+                        destination[0] = Convert.ToByte(value);
+                        return;
+                    case SpecialType.System_Char:
+                        BinaryPrimitives.WriteUInt16LittleEndian(destination, Convert.ToChar(value));
+                        return;
+                    case SpecialType.System_Int16:
+                        BinaryPrimitives.WriteInt16LittleEndian(destination, Convert.ToInt16(value));
+                        return;
+                    case SpecialType.System_UInt16:
+                        BinaryPrimitives.WriteUInt16LittleEndian(destination, Convert.ToUInt16(value));
+                        return;
+                    case SpecialType.System_Int32:
+                        BinaryPrimitives.WriteInt32LittleEndian(destination, Convert.ToInt32(value));
+                        return;
+                    case SpecialType.System_UInt32:
+                        BinaryPrimitives.WriteUInt32LittleEndian(destination, Convert.ToUInt32(value));
+                        return;
+                    case SpecialType.System_Int64:
+                        BinaryPrimitives.WriteInt64LittleEndian(destination, Convert.ToInt64(value));
+                        return;
+                    case SpecialType.System_UInt64:
+                        BinaryPrimitives.WriteUInt64LittleEndian(destination, Convert.ToUInt64(value));
+                        return;
+                    case SpecialType.System_Single:
+                        BinaryPrimitives.WriteInt32LittleEndian(destination, BitConverter.SingleToInt32Bits(Convert.ToSingle(value)));
+                        return;
+                    case SpecialType.System_Double:
+                        BinaryPrimitives.WriteInt64LittleEndian(destination, BitConverter.DoubleToInt64Bits(Convert.ToDouble(value)));
+                        return;
+                    default:
+                        throw new NotSupportedException("Unsupported static data element type: " + type.Name);
+                }
             }
             private void EmitLoadAddressOfLValue(BoundExpression lvalue)
             {

@@ -187,8 +187,7 @@ namespace Cnidaria.Cs
                 var rts = new RuntimeTypeSystem(modules);
                 byte[] mem = new byte[stackSize + heapSize + staticRegionLimit];
                 int staticEnd = staticRegionLimit;
-                int stackBase = staticEnd;
-                int stackEnd = stackBase + stackSize;
+                int stackEnd = staticEnd + stackSize;
 
                 var sb = new StringBuilder();
                 using var stringWriter = new StringWriter(sb);
@@ -202,7 +201,6 @@ namespace Cnidaria.Cs
                 var stVm = new StackBasedVm(
                     memory: mem,
                     staticEnd: staticEnd,
-                    stackBase: stackBase,
                     stackEnd: stackEnd,
                     domain: domain,
                     rts: rts,
@@ -455,8 +453,7 @@ namespace Cnidaria.Cs
 
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + staticRegionLimit);
                 int staticEnd = staticRegionLimit;
-                int stackBase = staticEnd;
-                int stackEnd = stackBase + stackSize;
+                int stackEnd = staticEnd + stackSize;
 
                 var sb = new StringBuilder();
                 using var stringWriter = new StringWriter(sb);
@@ -470,7 +467,6 @@ namespace Cnidaria.Cs
                 var regVm = new RegisterBasedVm(
                     memory: mem,
                     staticEnd: staticEnd,
-                    stackBase: stackBase,
                     stackEnd: stackEnd,
                     rts: rts,
                     modules: modules,
@@ -817,8 +813,7 @@ namespace Cnidaria.Cs
                 swCompile.Stop();
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + metaSize);
                 int staticEnd = metaSize;
-                int stackBase = staticEnd;
-                int stackEnd = stackBase + stackSize;
+                int stackEnd = staticEnd + stackSize;
 
                 var sb = new StringBuilder();
                 using var stringWriter = new StringWriter(sb);
@@ -832,7 +827,6 @@ namespace Cnidaria.Cs
                 var regVm = new RegisterBasedVm(
                     memory: mem,
                     staticEnd: staticEnd,
-                    stackBase: stackBase,
                     stackEnd: stackEnd,
                     rts: rts,
                     modules: modules,
@@ -972,8 +966,7 @@ namespace Cnidaria.Cs
                 var rts = new RuntimeTypeSystem(modules);
                 byte[] mem = new byte[stackSize + heapSize + metaSize];
                 int staticEnd = metaSize;
-                int stackBase = staticEnd;
-                int stackEnd = stackBase + stackSize;
+                int stackEnd = staticEnd + stackSize;
 
                 var sb = new StringBuilder();
                 using var stringWriter = new StringWriter(sb);
@@ -987,7 +980,6 @@ namespace Cnidaria.Cs
                 var stVm = new StackBasedVm(
                     memory: mem,
                     staticEnd: staticEnd,
-                    stackBase: stackBase,
                     stackEnd: stackEnd,
                     domain: domain,
                     rts: rts,

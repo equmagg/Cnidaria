@@ -4902,6 +4902,12 @@ namespace Cnidaria.Cs
                 return new RelationalPatternSyntax(op, expr);
             }
 
+            if (_tokens.CurrentKind == SyntaxKind.NullKeyword)
+            {
+                var nullToken = _tokens.EatToken();
+                return new ConstantPatternSyntax(new LiteralExpressionSyntax(SyntaxKind.NullLiteralExpression, nullToken));
+            }
+
             var resetPoint = GetResetPoint();
             if (TryParse(
                 parse: ParseType,

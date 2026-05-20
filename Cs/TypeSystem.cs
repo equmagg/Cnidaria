@@ -747,9 +747,9 @@ namespace Cnidaria.Cs
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
 
             PrecreateAllTypeDefs();
+            IndexWellKnownCoreTypes();
             BindBaseTypes();
             BindInterfaces();
-            IndexWellKnownCoreTypes();
             BuildAllMembers();
             BindMethodImpls();
             foreach (var t in _typeCache.Values)
@@ -1405,6 +1405,87 @@ namespace Cnidaria.Cs
             var t = GetOrCreateArrayType(elementType);
             EnsureLayout(t);
             return t;
+        }
+
+        internal RuntimeType GetRequiredNamedType(string asm, string ns, string name)
+            => FindRequired(asm, ns, name);
+
+        internal RuntimeType GetPointerType(RuntimeType elementType)
+        {
+            if (elementType is null) throw new ArgumentNullException(nameof(elementType));
+            var t = GetOrCreatePointerType(elementType);
+            EnsureLayout(t);
+            return t;
+        }
+
+        internal RuntimeType RegisterSyntheticType(string asm, string ns, string name, RuntimeTypeKind kind)
+        {
+            asm ??= string.Empty;
+            ns ??= string.Empty;
+            name ??= string.Empty;
+
+            if (_namedTypes.TryGetValue((asm, ns, name), out var existing))
+                return existing;
+
+            var t = new RuntimeType(_nextTypeId++, kind, asm, ns, name);
+            if (kind == RuntimeTypeKind.Class && SystemObject is not null && !(ns == "System" && name == "Object"))
+                t.BaseType = SystemObject;
+            t.SizeOf = TargetArchitecture.PointerSize;
+            t.AlignOf = TargetArchitecture.PointerSize;
+            t.InstanceSize = kind == RuntimeTypeKind.Class ? TargetArchitecture.PointerSize : 0;
+            t.StaticSize = 0;
+            t.StaticAlign = 1;
+
+            _namedTypes[(asm, ns, name)] = t;
+            _typeById[t.TypeId] = t;
+            _layoutDone.Add(t.TypeId);
+            return t;
+        }
+
+        internal RuntimeMethod RegisterSyntheticStaticMethod(
+            RuntimeType owner,
+            string name,
+            RuntimeType returnType,
+            RuntimeType[] parameterTypes,
+            ushort implFlags = 0,
+            int methodId = 0)
+        {
+            if (owner is null) throw new ArgumentNullException(nameof(owner));
+            if (returnType is null) throw new ArgumentNullException(nameof(returnType));
+            parameterTypes ??= Array.Empty<RuntimeType>();
+            name ??= string.Empty;
+
+            if (methodId <= 0)
+                methodId = _nextMethodId++;
+            else if (methodId >= _nextMethodId)
+                _nextMethodId = methodId + 1;
+
+            if (_methodById.ContainsKey(methodId))
+                throw new InvalidOperationException("Duplicate synthetic RuntimeMethod id: " + methodId.ToString());
+
+            var flags = (ushort)(System.Reflection.MethodAttributes.Public |
+                                 System.Reflection.MethodAttributes.Static |
+                                 System.Reflection.MethodAttributes.HideBySig);
+            var method = new RuntimeMethod(
+                methodId,
+                owner,
+                name,
+                returnType,
+                parameterTypes,
+                hasThis: false,
+                isVirtual: false,
+                isStatic: true,
+                isNewSlot: false,
+                isFinal: true,
+                flags: flags,
+                implFlags: implFlags);
+
+            _methodById[method.MethodId] = method;
+            var methods = owner.Methods;
+            Array.Resize(ref methods, methods.Length + 1);
+            methods[^1] = method;
+            owner.Methods = methods;
+            return method;
         }
         private void PrecreateAllTypeDefs()
         {
@@ -2593,6 +2674,11 @@ namespace Cnidaria.Cs
             keySb.Append("ginst:").Append(genericDef.TypeId).Append('<');
             for (int i = 0; i < args.Length; i++)
             {
+                if (args[i] is null)
+                {
+                    throw new TypeLoadException(
+                        $"Generic instance '{genericDef.Namespace}.{genericDef.Name}' has an unresolved type argument at index {i}.");
+                }
                 if (i != 0) keySb.Append(',');
                 keySb.Append(args[i].TypeId);
             }

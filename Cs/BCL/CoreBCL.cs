@@ -1577,8 +1577,8 @@
             return System.Number.CharToString(m_value);
         }
 
-        private static ReadOnlySpan<byte> Latin1CharInfo => new byte[]
-        {
+        private static ReadOnlySpan<byte> Latin1CharInfo =>
+        [
         //  0     1     2     3     4     5     6     7     8     9     A     B     C     D     E     F
             0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x8E, 0x8E, 0x8E, 0x8E, 0x8E, 0x0E, 0x0E, // U+0000..U+000F
             0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, // U+0010..U+001F
@@ -1596,7 +1596,7 @@
             0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x19, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x21, // U+00D0..U+00DF
             0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, // U+00E0..U+00EF
             0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x19, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, // U+00F0..U+00FF
-        };
+        ];
 
         public static bool IsBetween(char c, char minInclusive, char maxInclusive) =>
             (uint)(c - minInclusive) <= (uint)(maxInclusive - minInclusive);
@@ -2228,6 +2228,7 @@
             return System.Number.FormatFloat(m_value, format, null);
         }
         public static float Abs(float value) => MathF.Abs(value);
+        public static float Sqrt(float x) => MathF.Sqrt(x);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IsFinite(float f)
@@ -2350,6 +2351,7 @@
         }
 
         public static double Abs(double value) => Math.Abs(value);
+        public static double Sqrt(double x) => Math.Sqrt(x);
         public static double Truncate(double x) => Math.Truncate(x);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -3835,12 +3837,30 @@
             hasValue ? value : defaultValue;
     }
 
-    public struct ValueTuple
+    public struct ValueTuple : ITuple
     {
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            return obj is ValueTuple;
+        }
+        public bool Equals(ValueTuple other)
+        {
+            return true;
+        }
+        public int CompareTo(ValueTuple other)
+        {
+            return 0;
+        }
+        public override int GetHashCode()
+        {
+            return 0;
+        }
         public override string ToString()
         {
             return "()";
         }
+        int ITuple.Length => 0;
+        object? ITuple.this[int index] => throw new IndexOutOfRangeException();
     }
     public struct ValueTuple<T1> : ITuple
     {
@@ -3851,12 +3871,26 @@
             Item1 = item1;
         }
         int ITuple.Length => 1;
-        object ITuple.this[int index] =>
-            index switch
+        object? ITuple.this[int index]
+        {
+            get
             {
-                0 => Item1,
-                _ => throw new IndexOutOfRangeException(),
-            };
+                if (index != 0)
+                {
+                    throw new IndexOutOfRangeException();
+                }
+                return Item1;
+            }
+        }
+
+        public override int GetHashCode()
+        {
+            return Item1?.GetHashCode() ?? 0;
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2> : ITuple
     {
@@ -3869,13 +3903,23 @@
             Item2 = item2;
         }
         int ITuple.Length => 2;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
                 1 => Item2,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3> : ITuple
     {
@@ -3890,7 +3934,7 @@
             Item3 = item3;
         }
         int ITuple.Length => 3;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -3898,6 +3942,17 @@
                 2 => Item3,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3, T4> : ITuple
     {
@@ -3914,7 +3969,7 @@
             Item4 = item4;
         }
         int ITuple.Length => 4;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -3923,6 +3978,18 @@
                 3 => Item4,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0,
+                                    Item4?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + ", " + Item4?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3, T4, T5> : ITuple
     {
@@ -3941,7 +4008,7 @@
             Item5 = item5;
         }
         int ITuple.Length => 5;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -3951,6 +4018,20 @@
                 4 => Item5,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0,
+                                    Item4?.GetHashCode() ?? 0,
+                                    Item5?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + 
+                ", " + Item4?.ToString() + ", " + Item5?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3, T4, T5, T6> : ITuple
     {
@@ -3971,7 +4052,7 @@
             Item6 = item6;
         }
         int ITuple.Length => 6;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -3982,6 +4063,21 @@
                 5 => Item6,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0,
+                                    Item4?.GetHashCode() ?? 0,
+                                    Item5?.GetHashCode() ?? 0,
+                                    Item6?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + 
+                ", " + Item4?.ToString() + ", " + Item5?.ToString() + ", " + Item6?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3, T4, T5, T6, T7> : ITuple
     {
@@ -4004,7 +4100,7 @@
             Item7 = item7;
         }
         int ITuple.Length => 7;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -4016,6 +4112,22 @@
                 6 => Item7,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0,
+                                    Item4?.GetHashCode() ?? 0,
+                                    Item5?.GetHashCode() ?? 0,
+                                    Item6?.GetHashCode() ?? 0,
+                                    Item7?.GetHashCode() ?? 0);
+        }
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + 
+                ", " + Item4?.ToString() + ", " + Item5?.ToString() + ", " + Item6?.ToString() + ", " + Item7?.ToString() + ")";
+        }
     }
     public struct ValueTuple<T1, T2, T3, T4, T5, T6, T7, TRest> : ITuple
         where TRest : struct
@@ -4041,7 +4153,7 @@
             Rest = rest;
         }
         int ITuple.Length => 8;
-        object ITuple.this[int index] =>
+        object? ITuple.this[int index] =>
             index switch
             {
                 0 => Item1,
@@ -4054,6 +4166,23 @@
                 7 => Rest,
                 _ => throw new IndexOutOfRangeException(),
             };
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Item1?.GetHashCode() ?? 0,
+                                    Item2?.GetHashCode() ?? 0,
+                                    Item3?.GetHashCode() ?? 0,
+                                    Item4?.GetHashCode() ?? 0,
+                                    Item5?.GetHashCode() ?? 0,
+                                    Item6?.GetHashCode() ?? 0,
+                                    Item7?.GetHashCode() ?? 0);
+        }
+
+        public override string ToString()
+        {
+            return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() + 
+                ", " + Item4?.ToString() + ", " + Item5?.ToString() + ", " + Item6?.ToString() + ", " + Item7?.ToString() + ", " + Rest.ToString() + ")";
+        }
     }
 
     public readonly struct IntPtr
@@ -4390,6 +4519,309 @@
             }
         }
     }
+
+    public struct HashCode
+    {
+        private static readonly uint s_seed = GenerateGlobalSeed();
+
+        private const uint Prime1 = 2654435761U;
+        private const uint Prime2 = 2246822519U;
+        private const uint Prime3 = 3266489917U;
+        private const uint Prime4 = 668265263U;
+        private const uint Prime5 = 374761393U;
+
+        private uint _v1, _v2, _v3, _v4;
+        private uint _queue1, _queue2, _queue3;
+        private uint _length;
+
+        private static unsafe uint GenerateGlobalSeed()
+        {
+            uint result = 0u;
+            //Interop.GetRandomBytes((byte*)&result, sizeof(uint));
+            return result;
+        }
+
+        public static int Combine<T1>(T1 value1)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+
+            uint hash = MixEmptyState();
+            hash += 4;
+
+            hash = QueueRound(hash, hc1);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2>(T1 value1, T2 value2)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+
+            uint hash = MixEmptyState();
+            hash += 8;
+
+            hash = QueueRound(hash, hc1);
+            hash = QueueRound(hash, hc2);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3>(T1 value1, T2 value2, T3 value3)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+
+            uint hash = MixEmptyState();
+            hash += 12;
+
+            hash = QueueRound(hash, hc1);
+            hash = QueueRound(hash, hc2);
+            hash = QueueRound(hash, hc3);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3, T4>(T1 value1, T2 value2, T3 value3, T4 value4)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+            uint hc4 = (uint)(value4?.GetHashCode() ?? 0);
+
+            Initialize(out uint v1, out uint v2, out uint v3, out uint v4);
+
+            v1 = Round(v1, hc1);
+            v2 = Round(v2, hc2);
+            v3 = Round(v3, hc3);
+            v4 = Round(v4, hc4);
+
+            uint hash = MixState(v1, v2, v3, v4);
+            hash += 16;
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3, T4, T5>(T1 value1, T2 value2, T3 value3, T4 value4, T5 value5)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+            uint hc4 = (uint)(value4?.GetHashCode() ?? 0);
+            uint hc5 = (uint)(value5?.GetHashCode() ?? 0);
+
+            Initialize(out uint v1, out uint v2, out uint v3, out uint v4);
+
+            v1 = Round(v1, hc1);
+            v2 = Round(v2, hc2);
+            v3 = Round(v3, hc3);
+            v4 = Round(v4, hc4);
+
+            uint hash = MixState(v1, v2, v3, v4);
+            hash += 20;
+
+            hash = QueueRound(hash, hc5);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3, T4, T5, T6>(T1 value1, T2 value2, T3 value3, T4 value4, T5 value5, T6 value6)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+            uint hc4 = (uint)(value4?.GetHashCode() ?? 0);
+            uint hc5 = (uint)(value5?.GetHashCode() ?? 0);
+            uint hc6 = (uint)(value6?.GetHashCode() ?? 0);
+
+            Initialize(out uint v1, out uint v2, out uint v3, out uint v4);
+
+            v1 = Round(v1, hc1);
+            v2 = Round(v2, hc2);
+            v3 = Round(v3, hc3);
+            v4 = Round(v4, hc4);
+
+            uint hash = MixState(v1, v2, v3, v4);
+            hash += 24;
+
+            hash = QueueRound(hash, hc5);
+            hash = QueueRound(hash, hc6);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3, T4, T5, T6, T7>(T1 value1, T2 value2, T3 value3, T4 value4, T5 value5, T6 value6, T7 value7)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+            uint hc4 = (uint)(value4?.GetHashCode() ?? 0);
+            uint hc5 = (uint)(value5?.GetHashCode() ?? 0);
+            uint hc6 = (uint)(value6?.GetHashCode() ?? 0);
+            uint hc7 = (uint)(value7?.GetHashCode() ?? 0);
+
+            Initialize(out uint v1, out uint v2, out uint v3, out uint v4);
+
+            v1 = Round(v1, hc1);
+            v2 = Round(v2, hc2);
+            v3 = Round(v3, hc3);
+            v4 = Round(v4, hc4);
+
+            uint hash = MixState(v1, v2, v3, v4);
+            hash += 28;
+
+            hash = QueueRound(hash, hc5);
+            hash = QueueRound(hash, hc6);
+            hash = QueueRound(hash, hc7);
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        public static int Combine<T1, T2, T3, T4, T5, T6, T7, T8>(T1 value1, T2 value2, T3 value3, T4 value4, T5 value5, T6 value6, T7 value7, T8 value8)
+        {
+            uint hc1 = (uint)(value1?.GetHashCode() ?? 0);
+            uint hc2 = (uint)(value2?.GetHashCode() ?? 0);
+            uint hc3 = (uint)(value3?.GetHashCode() ?? 0);
+            uint hc4 = (uint)(value4?.GetHashCode() ?? 0);
+            uint hc5 = (uint)(value5?.GetHashCode() ?? 0);
+            uint hc6 = (uint)(value6?.GetHashCode() ?? 0);
+            uint hc7 = (uint)(value7?.GetHashCode() ?? 0);
+            uint hc8 = (uint)(value8?.GetHashCode() ?? 0);
+
+            Initialize(out uint v1, out uint v2, out uint v3, out uint v4);
+
+            v1 = Round(v1, hc1);
+            v2 = Round(v2, hc2);
+            v3 = Round(v3, hc3);
+            v4 = Round(v4, hc4);
+
+            v1 = Round(v1, hc5);
+            v2 = Round(v2, hc6);
+            v3 = Round(v3, hc7);
+            v4 = Round(v4, hc8);
+
+            uint hash = MixState(v1, v2, v3, v4);
+            hash += 32;
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Initialize(out uint v1, out uint v2, out uint v3, out uint v4)
+        {
+            v1 = s_seed + Prime1 + Prime2;
+            v2 = s_seed + Prime2;
+            v3 = s_seed;
+            v4 = s_seed - Prime1;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint Round(uint hash, uint input)
+        {
+            return System.Numerics.BitOperations.RotateLeft(hash + input * Prime2, 13) * Prime1;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint QueueRound(uint hash, uint queuedValue)
+        {
+            return System.Numerics.BitOperations.RotateLeft(hash + queuedValue * Prime3, 17) * Prime4;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint MixState(uint v1, uint v2, uint v3, uint v4)
+        {
+            return System.Numerics.BitOperations.RotateLeft(v1, 1) 
+                 + System.Numerics.BitOperations.RotateLeft(v2, 7) 
+                 + System.Numerics.BitOperations.RotateLeft(v3, 12) 
+                 + System.Numerics.BitOperations.RotateLeft(v4, 18);
+        }
+
+        private static uint MixEmptyState()
+        {
+            return s_seed + Prime5;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint MixFinal(uint hash)
+        {
+            hash ^= hash >> 15;
+            hash *= Prime2;
+            hash ^= hash >> 13;
+            hash *= Prime3;
+            hash ^= hash >> 16;
+            return hash;
+        }
+
+        public void Add<T>(T value)
+        {
+            Add(value?.GetHashCode() ?? 0);
+        }
+
+        public void Add<T>(T value, IEqualityComparer<T>? comparer)
+        {
+            Add(value is null ? 0 : (comparer?.GetHashCode(value) ?? value.GetHashCode()));
+        }
+
+        private void Add(int value)
+        {
+            uint val = (uint)value;
+
+            uint previousLength = _length++;
+            uint position = previousLength % 4;
+
+            if (position == 0)
+                _queue1 = val;
+            else if (position == 1)
+                _queue2 = val;
+            else if (position == 2)
+                _queue3 = val;
+            else // position == 3
+            {
+                if (previousLength == 3)
+                    Initialize(out _v1, out _v2, out _v3, out _v4);
+
+                _v1 = Round(_v1, _queue1);
+                _v2 = Round(_v2, _queue2);
+                _v3 = Round(_v3, _queue3);
+                _v4 = Round(_v4, val);
+            }
+        }
+
+        public int ToHashCode()
+        {
+            uint length = _length;
+
+            uint position = length % 4;
+
+            uint hash = length < 4 ? MixEmptyState() : MixState(_v1, _v2, _v3, _v4);
+
+            hash += length * 4;
+
+            if (position > 0)
+            {
+                hash = QueueRound(hash, _queue1);
+                if (position > 1)
+                {
+                    hash = QueueRound(hash, _queue2);
+                    if (position > 2)
+                        hash = QueueRound(hash, _queue3);
+                }
+            }
+
+            hash = MixFinal(hash);
+            return (int)hash;
+        }
+    }
+
     public enum DateTimeKind
     {
         Unspecified = 0,
@@ -7138,6 +7570,13 @@
         public abstract string? FullName { get; }
 
         public abstract Type UnderlyingSystemType { get; }
+
+        public bool IsValueType
+        {
+            [Intrinsic]
+            get => IsValueTypeImpl();
+        }
+        protected virtual bool IsValueTypeImpl() => throw new NotImplementedException();
     }
 
     public enum AttributeTargets
@@ -7761,6 +8200,14 @@
 }
 namespace System.Runtime.InteropServices
 {
+    public static class Marshal
+    {
+        public static IntPtr AllocHGlobal(int cb) => AllocHGlobal((nint)cb);
+        [Intrinsic]
+        public static unsafe IntPtr AllocHGlobal(nint cb) => IntPtr.Zero;
+        [Intrinsic]
+        public static unsafe void FreeHGlobal(IntPtr hglobal) { }
+    }
     public static unsafe class MemoryMarshal
     {
         [Intrinsic]
@@ -8003,7 +8450,7 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void WriteUnaligned<T>(ref byte destination, T value)
             where T : allows ref struct
         {
@@ -8015,7 +8462,7 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static T As<T>(object o) where T : class?
         {
             throw new PlatformNotSupportedException();
@@ -8023,7 +8470,7 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ref TTo As<TFrom, TTo>(ref TFrom source)
             where TFrom : allows ref struct
             where TTo : allows ref struct
@@ -8033,14 +8480,14 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe ref T AsRef<T>(void* source)
             where T : allows ref struct
         {
             return ref *(T*)source;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ref T AsRef<T>(scoped ref readonly T source)
             where T : allows ref struct
         {
@@ -8049,7 +8496,7 @@ namespace System.Runtime.CompilerServices
             return ref source;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ref T Add<T>(ref T source, int elementOffset)
             where T : allows ref struct
         {
@@ -8063,7 +8510,7 @@ namespace System.Runtime.CompilerServices
             return ref source;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void* Add<T>(void* source, int elementOffset)
             where T : allows ref struct
         {
@@ -8077,7 +8524,7 @@ namespace System.Runtime.CompilerServices
             return (byte*)source + (elementOffset * (nint)sizeof(T));
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ref T Add<T>(ref T source, IntPtr elementOffset)
             where T : allows ref struct
         {
@@ -8090,7 +8537,7 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe ref T AddByteOffset<T>(ref T source, nuint byteOffset)
             where T : allows ref struct
         {
@@ -8101,7 +8548,7 @@ namespace System.Runtime.CompilerServices
             // ret
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static ref T AddByteOffset<T>(ref T source, IntPtr byteOffset)
             where T : allows ref struct
         {
@@ -8112,21 +8559,33 @@ namespace System.Runtime.CompilerServices
             return ref source;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static nint ByteOffset<T>(ref T origin, ref T target)
             where T : allows ref struct
         {
             return 0;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int SizeOf<T>()
             where T : allows ref struct
         {
             return 0;
         }
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNullRef<T>(ref readonly T source)
+            where T : allows ref struct
+        {
+            return true;
+            // ldarg.0
+            // ldc.i4.0
+            // conv.u
+            // ceq
+            // ret
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool AreSame<T>([AllowNull] ref readonly T left, [AllowNull] ref readonly T right)
             where T : allows ref struct
         {
@@ -9574,7 +10033,7 @@ namespace System.Drawing
                 return name.GetHashCode();
             }
 
-            return value.GetHashCode();
+            return HashCode.Combine(value.GetHashCode(), state.GetHashCode(), knownColor.GetHashCode());
         }
     }
     internal static class ColorTable
@@ -12249,6 +12708,8 @@ namespace System.Numerics
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator -(Vector2 value) => new Vector2(-(value.X), -(value.Y));
+
+        public override readonly int GetHashCode() => HashCode.Combine(X, Y);
     }
     public struct Vector3
     {
@@ -12375,6 +12836,8 @@ namespace System.Numerics
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator -(Vector3 value) => new Vector3(-(value.X), -(value.Y), -(value.Z));
+
+        public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z);
     }
     public struct Vector4
     {
@@ -12527,6 +12990,8 @@ namespace System.Numerics
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector4 operator -(Vector4 value) => new Vector4(-(value.X), -(value.Y), -(value.Z), -(value.W));
+
+        public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z, W);
     }
 }
 namespace System.Collections
@@ -13260,6 +13725,116 @@ namespace System.Collections.Generic
     public abstract class EqualityComparer<T> : IEqualityComparer, IEqualityComparer<T>
     {
         public static EqualityComparer<T> Default { get; } = null;
+
+        public static EqualityComparer<T> Create(Func<T?, T?, bool> equals, Func<T, int>? getHashCode = null)
+        {
+            if (equals == null) throw new ArgumentNullException();
+
+            getHashCode ??= _ => throw new NotSupportedException();
+
+            return new DelegateEqualityComparer<T>(equals, getHashCode);
+        }
+
+        public abstract bool Equals(T? x, T? y);
+        public abstract int GetHashCode(T obj);
+
+        int IEqualityComparer.GetHashCode(object? obj)
+        {
+            if (obj == null) return 0;
+            if (obj is T) return GetHashCode((T)obj);
+            throw new ArgumentException();
+            return 0;
+        }
+
+        bool IEqualityComparer.Equals(object? x, object? y)
+        {
+            if (x == y) return true;
+            if (x == null || y == null) return false;
+            if ((x is T) && (y is T)) return Equals((T)x, (T)y);
+            throw new ArgumentException();
+            return false;
+        }
+    }
+    internal sealed class DelegateEqualityComparer<T> : EqualityComparer<T>
+    {
+        private readonly Func<T?, T?, bool> _equals;
+        private readonly Func<T, int> _getHashCode;
+
+        public DelegateEqualityComparer(Func<T?, T?, bool> equals, Func<T, int> getHashCode)
+        {
+            _equals = equals;
+            _getHashCode = getHashCode;
+        }
+
+        public override bool Equals(T? x, T? y) =>
+            _equals(x, y);
+
+        public override int GetHashCode(T obj) =>
+            _getHashCode(obj);
+
+        public override bool Equals(object? obj) =>
+            obj is DelegateEqualityComparer<T> other &&
+            _equals == other._equals &&
+            _getHashCode == other._getHashCode;
+    }
+    public sealed class GenericEqualityComparer<T> : EqualityComparer<T> where T : IEquatable<T>?
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override bool Equals(T? x, T? y)
+        {
+            if (x != null)
+            {
+                if (y != null) return x.Equals(y);
+                return false;
+            }
+            if (y != null) return false;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode(T obj) =>
+            obj?.GetHashCode() ?? 0;
+    }
+    public sealed class NullableEqualityComparer<T> : EqualityComparer<T?> where T : struct
+    {
+        public NullableEqualityComparer() { }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode(T? obj) =>
+            obj.GetHashCode();
+    }
+    public sealed class ObjectEqualityComparer<T> : EqualityComparer<T>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override bool Equals(T? x, T? y)
+        {
+            if (x != null)
+            {
+                if (y != null) return x.Equals(y);
+                return false;
+            }
+            if (y != null) return false;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode(T obj) =>
+            obj?.GetHashCode() ?? 0;
+    }
+    public sealed class EnumEqualityComparer<T> : EqualityComparer<T> where T : struct, Enum
+    {
+        public EnumEqualityComparer() { }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode(T obj) =>
+            obj.GetHashCode();
+    }
+    internal sealed class StringEqualityComparer : EqualityComparer<string>
+    {
+        public override bool Equals(string? x, string? y) => string.Equals(x, y);
+
+        public override int GetHashCode(string obj) => obj?.GetHashCode() ?? 0;
+
+        public override bool Equals(object? obj) => obj is StringEqualityComparer;
     }
     public static class KeyValuePair
     {
@@ -13335,6 +13910,17 @@ namespace System.Collections.Generic
                 Initialize(capacity);
             }
 
+            if (!typeof(TKey).IsValueType)
+            {
+                _comparer = comparer ?? EqualityComparer<TKey>.Default;
+
+
+            }
+            else if (comparer is not null && // first check for null to avoid forcing default comparer instantiation unnecessarily
+                     comparer != EqualityComparer<TKey>.Default)
+            {
+                _comparer = comparer;
+            }
         }
 
         private int Initialize(int capacity)
@@ -13358,6 +13944,17 @@ namespace System.Collections.Generic
         /// Gets the total numbers of elements the internal data structure can hold without resizing.
         /// </summary>
         public int Capacity => _entries?.Length ?? 0;
+        public KeyCollection Keys => _keys ??= new KeyCollection(this);
+
+        //ICollection<TKey> IDictionary<TKey, TValue>.Keys => Keys;
+
+        //IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
+
+        public ValueCollection Values => _values ??= new ValueCollection(this);
+
+        //ICollection<TValue> IDictionary<TKey, TValue>.Values => Values;
+
+        //IEnumerable<TValue> IReadOnlyDictionary<TKey, TValue>.Values => Values;
 
         private struct Entry
         {

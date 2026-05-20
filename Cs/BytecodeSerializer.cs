@@ -176,6 +176,10 @@ namespace Cnidaria.Cs
                 bw.Write(eh.HandlerEndPc);
                 bw.Write(eh.CatchTypeToken);
             }
+            int staticDataLength = fn.StaticDataBlob.IsDefault ? 0 : fn.StaticDataBlob.Length;
+            bw.Write(staticDataLength);
+            for (int i = 0; i < staticDataLength; i++)
+                bw.Write(fn.StaticDataBlob[i]);
         }
 
         private static BytecodeFunction ReadFunction(BinaryReader br)
@@ -231,12 +235,18 @@ namespace Cnidaria.Cs
                     catchTypeToken));
             }
 
+            int staticDataLength = br.ReadInt32();
+            if (staticDataLength < 0)
+                throw new InvalidDataException("Negative static data blob size.");
+            ImmutableArray<byte> staticDataBlob = staticDataBlob = ImmutableArray.Create(ReadExactly(br, staticDataLength));
+
             return new BytecodeFunction(
                 methodToken,
                 localBuilder.ToImmutable(),
                 instructionBuilder.ToImmutable(),
                 maxStack,
-                ehBuilder.ToImmutable());
+                ehBuilder.ToImmutable(),
+                staticDataBlob);
         }
 
         private static byte[] ReadExactly(BinaryReader br, int count)
@@ -257,10 +267,11 @@ namespace Cnidaria.Cs
                 int locals = fn.LocalTypeTokens.IsDefault ? 0 : fn.LocalTypeTokens.Length;
                 int insns = fn.Instructions.IsDefault ? 0 : fn.Instructions.Length;
                 int ehs = fn.ExceptionHandlers.IsDefault ? 0 : fn.ExceptionHandlers.Length;
+                int staticData = fn.StaticDataBlob.IsDefault ? 0 : fn.StaticDataBlob.Length;
 
                 // Function header
-                // methodToken + maxStack + localCount + instructionCount + ehCount
-                size += 4 + 4 + 4 + 4 + 4;
+                // methodToken + maxStack + localCount + instructionCount + ehCount + staticDataLength
+                size += 4 + 4 + 4 + 4 + 4 + 4;
 
                 // Locals
                 size += locals * 4;
@@ -271,6 +282,9 @@ namespace Cnidaria.Cs
 
                 // ExceptionHandler
                 size += ehs * (5 * 4);
+
+                // Static data blob
+                size += staticData;
             }
 
             return size;

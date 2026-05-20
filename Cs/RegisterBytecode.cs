@@ -617,6 +617,9 @@ namespace Cnidaria.Cs
         ByRefAddI64 = 774,
         ByRefToPtr = 775,
         PtrToByRef = 776,
+        StaticData = 777,
+        AllocHGlobal = 778,
+        FreeHGlobal = 779,
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = RegisterVmIsa.InstructionSize)]
@@ -1418,6 +1421,10 @@ namespace Cnidaria.Cs
             {
                 ValidatePointerInstruction(pc, inst);
             }
+            else if (IsIndirectCall(inst.Op))
+            {
+                RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
+            }
         }
 
         private static void ValidateMoveInstruction(int pc, InstrDesc inst)
@@ -1549,7 +1556,14 @@ namespace Cnidaria.Cs
         {
             switch (inst.Op)
             {
+                case Op.StaticData:
+                    RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    return;
+                case Op.FreeHGlobal:
+                    RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
+                    return;
                 case Op.StackAlloc:
+                case Op.AllocHGlobal:
                 case Op.ByRefToPtr:
                 case Op.PtrToByRef:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
@@ -1666,6 +1680,9 @@ namespace Cnidaria.Cs
 
         private static bool IsPointerInstruction(Op op)
             => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
+
+        private static bool IsIndirectCall(Op op)
+            => IsOpInRange(op, Op.CallIndirectVoid, Op.CallIndirectValue);
 
         private static bool IsIntegerImmediate(Op op)
             => op is Op.I32AddImm or Op.I32SubImm or Op.I32MulImm or Op.I32AndImm or Op.I32OrImm or Op.I32XorImm
@@ -2842,11 +2859,26 @@ namespace Cnidaria.Cs
             if (IsDirectCall(inst.Op))
                 return "M" + inst.Imm.ToString() + FormatCallFlags(inst.Aux);
 
+            if (IsIndirectCall(inst.Op))
+                return "*" + FormatRegister(inst.Rs1) + FormatCallFlags(inst.Aux);
+
             if (IsCallSiteCall(inst.Op))
                 return FormatCallSite(image, inst.Imm, inst.Aux);
 
+            if (IsDelegateInvoke(inst.Op))
+                return "invoke=M" + inst.Imm.ToString() + FormatCallFlags(inst.Aux);
+
+            if (inst.Op == Op.StaticData)
+                return FormatRegister(inst.Rd) + ", blobOffset=" + ((int)(inst.Imm >> 32)).ToString() + ", length=" + unchecked((int)(uint)inst.Imm).ToString();
+
             if (inst.Op == Op.StackAlloc)
                 return FormatRegister(inst.Rd) + ", count=" + FormatRegister(inst.Rs1) + ", elemSize=" + inst.Imm.ToString();
+
+            if (inst.Op == Op.AllocHGlobal)
+                return FormatRegister(inst.Rd) + ", byteCount=" + FormatRegister(inst.Rs1);
+
+            if (inst.Op == Op.FreeHGlobal)
+                return FormatRegister(inst.Rs1);
 
             if (IsPointerOp(inst.Op))
                 return FormatPointerOperands(inst);
@@ -2861,7 +2893,7 @@ namespace Cnidaria.Cs
             if (IsAddressMemoryInstruction(inst.Op))
                 return FormatMemoryAux(inst.Aux);
 
-            if (IsDirectCall(inst.Op) || IsCallSiteCall(inst.Op))
+            if (IsDirectCall(inst.Op) || IsIndirectCall(inst.Op) || IsCallSiteCall(inst.Op) || IsDelegateInvoke(inst.Op))
                 return string.Empty;
 
             var flags = (InstructionFlags)inst.Aux;
@@ -3184,10 +3216,16 @@ namespace Cnidaria.Cs
             => IsOpInRange(op, Op.CallVoid, Op.CallValue) || IsOpInRange(op, Op.CallInternalVoid, Op.CallInternalValue);
 
         private static bool IsCallSiteCall(Op op)
-            => IsOpInRange(op, Op.CallVirtVoid, Op.CallIfaceValue) || IsOpInRange(op, Op.CallIndirectVoid, Op.DelegateInvokeValue);
+            => IsOpInRange(op, Op.CallVirtVoid, Op.CallIfaceValue);
+
+        private static bool IsIndirectCall(Op op)
+            => IsOpInRange(op, Op.CallIndirectVoid, Op.CallIndirectValue);
+
+        private static bool IsDelegateInvoke(Op op)
+            => IsOpInRange(op, Op.DelegateInvokeVoid, Op.DelegateInvokeValue);
 
         private static bool IsPointerOp(Op op)
-            => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
+            => IsOpInRange(op, Op.StackAlloc, Op.FreeHGlobal);
 
         private static bool IsTwoOperandBranch(Op op)
             => op is not (Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef);

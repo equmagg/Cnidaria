@@ -67,6 +67,7 @@ namespace Cnidaria.Cs
         }
         internal static void RunAll()
         {
+            Console.WriteLine("Running tests");
             // 1 arithmetic precedence
             RunTest(@"
 int A()

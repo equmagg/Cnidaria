@@ -177,6 +177,7 @@ namespace Cnidaria.Cs
                 BoundArrayCreationExpression e => RewriteArrayCreationExpression(e),
                 BoundArrayElementAccessExpression e => RewriteArrayElementAccessExpression(e),
                 BoundStackAllocArrayCreationExpression e => RewriteStackAllocArrayCreationExpression(e),
+                BoundStaticDataExpression e => RewriteStaticDataExpression(e),
 
                 BoundRefExpression e => RewriteRefExpression(e),
                 BoundAddressOfExpression e => RewriteAddressOfExpression(e),
@@ -671,6 +672,21 @@ namespace Cnidaria.Cs
                     node.ElementType,
                     count,
                     init);
+            }
+
+            return node;
+        }
+        protected virtual BoundExpression RewriteStaticDataExpression(BoundStaticDataExpression node)
+        {
+            var elements = RewriteExpressions(node.Elements, out var changed);
+
+            if (changed)
+            {
+                return new BoundStaticDataExpression(
+                    node.Syntax,
+                    (PointerTypeSymbol)node.Type,
+                    node.ElementType,
+                    elements);
             }
 
             return node;
@@ -3474,13 +3490,22 @@ namespace Cnidaria.Cs
             {
                 if (node.Initializer is BoundSpanCollectionExpression spanCollection)
                 {
-                    var useStackAlloc =
-                        _spanCollectionStackAllocLocals is not null &&
-                        _spanCollectionStackAllocLocals.Contains(node.Local);
+                    BoundExpression lowered;
 
-                    var lowered = useStackAlloc
-                        ? LowerSpanCollectionToStackAlloc(spanCollection)
-                        : LowerSpanCollectionToHeapArray(spanCollection);
+                    if (CanLowerReadOnlySpanCollectionToStaticData(spanCollection))
+                    {
+                        lowered = LowerReadOnlySpanCollectionToStaticData(spanCollection);
+                    }
+                    else
+                    {
+                        var useStackAlloc =
+                            _spanCollectionStackAllocLocals is not null &&
+                            _spanCollectionStackAllocLocals.Contains(node.Local);
+
+                        lowered = useStackAlloc
+                            ? LowerSpanCollectionToStackAlloc(spanCollection)
+                            : LowerSpanCollectionToHeapArray(spanCollection);
+                    }
 
                     return new BoundLocalDeclarationStatement(node.Syntax, node.Local, lowered, node.IsUsing);
                 }
@@ -3489,8 +3514,107 @@ namespace Cnidaria.Cs
             }
 
             protected override BoundExpression RewriteSpanCollectionExpression(BoundSpanCollectionExpression node)
-                => LowerSpanCollectionToHeapArray(node);
+            {
+                if (CanLowerReadOnlySpanCollectionToStaticData(node))
+                    return LowerReadOnlySpanCollectionToStaticData(node);
 
+                return LowerSpanCollectionToHeapArray(node);
+            }
+            private BoundExpression LowerReadOnlySpanCollectionToStaticData(BoundSpanCollectionExpression node)
+            {
+                var spanLikeType = (NamedTypeSymbol)node.Type;
+
+                if (!TryFindSpanPointerCtor(spanLikeType, _compilation, out var ctor))
+                    return LowerSpanCollectionToHeapArray(node);
+
+                var elements = RewriteExpressions(node.Elements, out _);
+                var int32 = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var pointerType = _compilation.CreatePointerType(node.ElementType);
+
+                BoundExpression pointerArgument = new BoundStaticDataExpression(
+                    node.Syntax,
+                    pointerType,
+                    node.ElementType,
+                    elements);
+
+                if (!ReferenceEquals(pointerArgument.Type, ctor.Parameters[0].Type))
+                {
+                    pointerArgument = new BoundConversionExpression(
+                        node.Syntax,
+                        ctor.Parameters[0].Type,
+                        pointerArgument,
+                        new Conversion(ConversionKind.ImplicitNumeric),
+                        isChecked: false);
+                }
+
+                BoundExpression lengthArgument = new BoundLiteralExpression(node.Syntax, int32, elements.Length);
+
+                if (!ReferenceEquals(lengthArgument.Type, ctor.Parameters[1].Type))
+                {
+                    lengthArgument = new BoundConversionExpression(
+                        node.Syntax,
+                        ctor.Parameters[1].Type,
+                        lengthArgument,
+                        LocalScopeBinder.ClassifyConversion(lengthArgument, ctor.Parameters[1].Type),
+                        isChecked: false);
+                }
+
+                return new BoundObjectCreationExpression(
+                    node.Syntax,
+                    spanLikeType,
+                    ctor,
+                    ImmutableArray.Create(pointerArgument, lengthArgument));
+            }
+            private static bool CanLowerReadOnlySpanCollectionToStaticData(BoundSpanCollectionExpression node)
+            {
+                if (!IsReadOnlySpanType(node.Type))
+                    return false;
+
+                if (!GenericConstraintFacts.IsUnmanagedType(node.ElementType))
+                    return false;
+
+                if (!IsSupportedStaticDataElementType(node.ElementType))
+                    return false;
+
+                for (int i = 0; i < node.Elements.Length; i++)
+                {
+                    if (!node.Elements[i].ConstantValueOpt.HasValue)
+                        return false;
+                }
+
+                return true;
+            }
+            private static bool IsReadOnlySpanType(TypeSymbol type)
+            {
+                if (type is not NamedTypeSymbol nt)
+                    return false;
+
+                var def = nt.OriginalDefinition;
+                if (def.Arity != 1 || !string.Equals(def.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                    return false;
+
+                return def.ContainingSymbol is NamespaceSymbol ns &&
+                       string.Equals(ns.Name, "System", StringComparison.Ordinal);
+            }
+            private static bool IsSupportedStaticDataElementType(TypeSymbol type)
+            {
+                if (type is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum)
+                    type = nt.EnumUnderlyingType ?? type;
+
+                return type.SpecialType is
+                    SpecialType.System_Boolean or
+                    SpecialType.System_Char or
+                    SpecialType.System_Int8 or
+                    SpecialType.System_UInt8 or
+                    SpecialType.System_Int16 or
+                    SpecialType.System_UInt16 or
+                    SpecialType.System_Int32 or
+                    SpecialType.System_UInt32 or
+                    SpecialType.System_Int64 or
+                    SpecialType.System_UInt64 or
+                    SpecialType.System_Single or
+                    SpecialType.System_Double;
+            }
             private BoundExpression LowerSpanCollectionToStackAlloc(BoundSpanCollectionExpression node)
             {
                 var spanLikeType = (NamedTypeSymbol)node.Type;

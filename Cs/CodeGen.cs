@@ -957,6 +957,9 @@ namespace Cnidaria.Cs
                     case GenTreeKind.ArrayDataRef:
                         EmitArray(instruction, source);
                         return;
+                    case GenTreeKind.StaticData:
+                        EmitStaticData(instruction, source);
+                        return;
                     case GenTreeKind.StackAlloc:
                         _asm.Emit(new InstrDesc(Op.StackAlloc, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
                             RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: Aux.Instruction(InstructionFlags.MayThrow), imm: source.Int32));
@@ -975,7 +978,26 @@ namespace Cnidaria.Cs
                         throw Unsupported(instruction, "unsupported tree kind " + instruction.TreeKind);
                 }
             }
+            private void EmitStaticData(GenTree instruction, GenTree source)
+            {
+                int sourceOffset = source.Int32;
+                int sourceLength = checked((int)source.Int64);
+                var staticData = _method.Function.StaticDataBlob;
 
+                if (sourceOffset < 0 || sourceLength < 0 || sourceOffset > staticData.Length || sourceLength > staticData.Length - sourceOffset)
+                    throw Unsupported(instruction, "invalid static data blob range");
+
+                int imageBlobOffset = _asm.AddBlob(staticData.AsSpan().Slice(sourceOffset, sourceLength));
+                long packedRange = PackBlobRange(imageBlobOffset, sourceLength);
+                _asm.Emit(new InstrDesc(Op.StaticData, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                    aux: Aux.Instruction(InstructionFlags.MayThrow), imm: packedRange));
+            }
+            private static long PackBlobRange(int offset, int length)
+            {
+                if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+                if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+                return ((long)offset << 32) | (uint)length;
+            }
             private void EmitFloatConstant(GenTree instruction, GenTree source)
             {
                 var rd = RequireResultRegister(instruction);

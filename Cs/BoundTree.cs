@@ -380,6 +380,25 @@ namespace Cnidaria.Cs
             InitializerOpt = initializerOpt;
         }
     }
+    internal sealed class BoundStaticDataExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.StaticData;
+
+        public TypeSymbol ElementType { get; }
+        public ImmutableArray<BoundExpression> Elements { get; }
+
+        public BoundStaticDataExpression(
+            SyntaxNode syntax,
+            PointerTypeSymbol type,
+            TypeSymbol elementType,
+            ImmutableArray<BoundExpression> elements)
+            : base(syntax)
+        {
+            Type = type;
+            ElementType = elementType;
+            Elements = elements.IsDefault ? ImmutableArray<BoundExpression>.Empty : elements;
+        }
+    }
     internal sealed class BoundSpanCollectionExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.SpanCollection;

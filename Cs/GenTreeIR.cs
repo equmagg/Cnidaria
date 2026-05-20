@@ -80,7 +80,10 @@ namespace Cnidaria.Cs
         StoreArrayElement,
         ArrayDataRef,
 
+        StaticData,
         StackAlloc,
+        AllocHGlobal,
+        FreeHGlobal,
         PointerElementAddr,
         PointerToByRef,
         PointerDiff,
@@ -2691,10 +2694,28 @@ namespace Cnidaria.Cs
                             break;
                         }
 
+                    case BytecodeOp.StaticData:
+                        PushImportedValue(stack, statements, Node(GenTreeKind.StaticData, pc, ins.Op, stackKind: GenStackKind.Ptr, int32: ins.Operand0, int64: ins.Operand1));
+                        break;
+
                     case BytecodeOp.StackAlloc:
                         {
                             var count = Pop(stack, pc, ins.Op);
                             PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(count.Node), int32: ins.Operand0));
+                            break;
+                        }
+
+                    case BytecodeOp.AllocHGlobal:
+                        {
+                            var byteCount = Pop(stack, pc, ins.Op);
+                            PushImportedValue(stack, statements, Node(GenTreeKind.AllocHGlobal, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(byteCount.Node)));
+                            break;
+                        }
+
+                    case BytecodeOp.FreeHGlobal:
+                        {
+                            var pointer = Pop(stack, pc, ins.Op);
+                            AppendImporterStatement(statements, stack, Node(GenTreeKind.FreeHGlobal, pc, ins.Op, stackKind: GenStackKind.Void, operands: One(pointer.Node)));
                             break;
                         }
 
@@ -3185,7 +3206,9 @@ namespace Cnidaria.Cs
                 GenTreeKind.StaticField or
                 GenTreeKind.StaticFieldAddr or
                 GenTreeKind.LoadIndirect or
+                GenTreeKind.StaticData or
                 GenTreeKind.StackAlloc or
+                GenTreeKind.AllocHGlobal or
                 GenTreeKind.Box or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.CastClass;
@@ -4406,8 +4429,17 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
+                case GenTreeKind.StaticData:
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
+                    break;
+
                 case GenTreeKind.StackAlloc:
+                case GenTreeKind.AllocHGlobal:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
+                    break;
+
+                case GenTreeKind.FreeHGlobal:
+                    flags |= GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.CastClass:
@@ -4890,8 +4922,21 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
+                case GenTreeKind.StaticData:
+                    sb.Append("staticData(offset=").Append(node.Int32).Append(", length=").Append(node.Int64).Append(')');
+                    return;
                 case GenTreeKind.StackAlloc:
                     sb.Append("stackalloc(size=").Append(node.Int32).Append(", count=");
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
+                case GenTreeKind.AllocHGlobal:
+                    sb.Append("alloc_hglobal(");
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
+                case GenTreeKind.FreeHGlobal:
+                    sb.Append("free_hglobal(");
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;

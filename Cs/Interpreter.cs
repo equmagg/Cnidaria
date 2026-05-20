@@ -101,6 +101,8 @@ namespace Cnidaria.Cs
         private int _frameCount;
         private readonly Dictionary<int, RuntimeField> _fieldById;
         private readonly Dictionary<int, int> _staticBaseByTypeId = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _staticDataByPc = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _staticDataHeapObjectByPc = new Dictionary<int, int>();
         private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly Dictionary<int, byte> _typeInitState = new Dictionary<int, byte>();
         private readonly List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
@@ -110,6 +112,7 @@ namespace Cnidaria.Cs
 
         private int _heapPtr;
         private int _heapFloor;
+        private int _staticAllocPtr;
         private int _allocDebtBytes;
         private bool _gcRunning;
         private int _pc;
@@ -120,6 +123,7 @@ namespace Cnidaria.Cs
         private long _instructionsElapsed;
         private int _stackLowWatermark;
         private int _heapPeakAbs;
+        private int _staticDataRegionBytes;
         private int _currentExceptionRef;
         private int _currentExceptionThrowMethodIndex = -1;
         private int _currentExceptionThrowPc = -1;
@@ -162,11 +166,10 @@ namespace Cnidaria.Cs
         public long InstructionsElapsed => _instructionsElapsed;
         public int StackPeakBytes => (_stackEnd - _stackLowWatermark) + (_frameStackPeakTop - _stackBase);
         public int HeapPeakBytes => _heapPeakAbs - _heapBase;
-
+        public int StaticDataRegionBytes => _staticDataRegionBytes;
         public RegisterBasedVm(
             byte[] memory,
             int staticEnd,
-            int stackBase,
             int stackEnd,
             RuntimeTypeSystem rts,
             Dictionary<string, RuntimeModule> modules,
@@ -175,7 +178,7 @@ namespace Cnidaria.Cs
         {
             _mem = memory ?? throw new ArgumentNullException(nameof(memory));
             _staticEnd = staticEnd;
-            _stackBase = stackBase;
+            _stackBase = staticEnd;
             _stackEnd = stackEnd;
             _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
@@ -183,7 +186,7 @@ namespace Cnidaria.Cs
             _textWriter = textWriter ?? TextWriter.Null;
             _hostCtx = new VmCallContext(this);
 
-            if (!(0 <= staticEnd && staticEnd <= stackBase && stackBase < stackEnd && stackEnd <= memory.Length))
+            if (!(0 <= staticEnd && staticEnd <= _stackBase && _stackBase < stackEnd && stackEnd <= memory.Length))
                 throw new ArgumentOutOfRangeException(nameof(stackEnd), "Bad VM memory layout.");
 
             _heapBase = AlignBlockStart(stackEnd);
@@ -193,10 +196,11 @@ namespace Cnidaria.Cs
 
             _heapPtr = _heapBase;
             _heapFloor = _heapBase;
+            _staticAllocPtr = Math.Min(AlignUp(TargetArchitecture.PointerSize, 8), staticEnd);
             _heapPeakAbs = _heapBase;
             _stackLowWatermark = stackEnd;
-            _frameStackTop = stackBase;
-            _frameStackPeakTop = stackBase;
+            _frameStackTop = _stackBase;
+            _frameStackPeakTop = _stackBase;
             X(MachineRegister.X0, 0);
             X(MachineRegisters.StackPointer, stackEnd);
             X(MachineRegisters.FramePointer, stackEnd);
@@ -1032,7 +1036,8 @@ namespace Cnidaria.Cs
                         case Op.CallIndirectF:
                         case Op.CallIndirectRef:
                         case Op.CallIndirectValue:
-                            throw new NotSupportedException($"Indirect calls are not supported by this register VM backend yet at PC {executingPc}");
+                            ExecIndirectCall(ins, executingPc, ct, limits);
+                            break;
                         case Op.DelegateInvokeVoid:
                         case Op.DelegateInvokeI:
                         case Op.DelegateInvokeF:
@@ -1040,7 +1045,9 @@ namespace Cnidaria.Cs
                         case Op.DelegateInvokeValue:
                             ExecDelegateInvoke(ins, executingPc, ct, limits);
                             break;
-
+                        case Op.StaticData:
+                            SetGpr(ins.Rd, StaticData(executingPc, ins));
+                            break;
                         case Op.StackAlloc:
                             SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
                             break;
@@ -1484,6 +1491,55 @@ namespace Cnidaria.Cs
                 if (target.BodyModule is null || target.Body is null)
                     throw new MissingMethodException("No body for register call target M" + target.MethodId.ToString());
                 throw new MissingMethodException("Target method exists in metadata but not in register image: M" + target.MethodId.ToString());
+            }
+
+            if (_frameCount >= MaxCallFramesHard)
+                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+            if (_frameCount >= limits.MaxCallDepth)
+                throw new InvalidOperationException("Configured call depth limit exceeded.");
+
+            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
+        }
+
+        private void ExecIndirectCall(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
+        {
+            int methodId = checked((int)GetGpr(ins.Rs1));
+            if (methodId == 0)
+                throw new NullReferenceException("function pointer is null.");
+
+            RuntimeMethod target = _rts.GetMethodById(methodId);
+            CallFlags callFlags = (CallFlags)ins.Aux;
+
+            NormalizeValueTypeThisArgument(target);
+
+            if (RequiresTypeInitializationBeforeCall(target))
+            {
+                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
+                    return;
+            }
+
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+            _activeCallFlags = callFlags;
+            _activeCallTargetMethod = target;
+            try
+            {
+                if (TryInvokeHostOverride(target, ct))
+                    return;
+                if (TryInvokeIntrinsic(target, ct))
+                    return;
+            }
+            finally
+            {
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
+            }
+
+            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
+            {
+                if (target.BodyModule is null || target.Body is null)
+                    throw new MissingMethodException($"No body for indirect register call target M{target.MethodId}");
+                throw new MissingMethodException($"Indirect target method exists in metadata but not in register image: M{target.MethodId}");
             }
 
             if (_frameCount >= MaxCallFramesHard)
@@ -3293,6 +3349,12 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        private void SetZeroReturnIfNonVoid(RuntimeMethod rm)
+        {
+            if (rm.ReturnType.PrimitiveKind != RuntimePrimitiveKind.Void)
+                SetReturnI4(0);
+        }
+
         private bool IntrinsicConsoleWrite(RuntimeMethod rm, CancellationToken ct)
         {
             if (rm.HasThis || rm.ParameterTypes.Length != 1)
@@ -3302,33 +3364,59 @@ namespace Cnidaria.Cs
             if (IsSystemStringType(p))
             {
                 long s = ReadAbiScalarArgument(rm, 0);
-                if (s == 0) return true;
-                ValidateStringRef(s, out int strAbs);
-                int len = ReadI32(strAbs + StringLengthOffset);
-                int chars = strAbs + StringCharsOffset;
-                CheckIndirectAccess(chars, checked(len * 2), false);
-                for (int i = 0; i < len; i++)
+                if (s != 0)
                 {
-                    if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
-                    _textWriter.Write((char)ReadU16(chars + i * 2));
+                    ValidateStringRef(s, out int strAbs);
+                    int len = ReadI32(strAbs + StringLengthOffset);
+                    int chars = strAbs + StringCharsOffset;
+                    CheckIndirectAccess(chars, checked(len * 2), false);
+                    for (int i = 0; i < len; i++)
+                    {
+                        if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                        _textWriter.Write((char)ReadU16(chars + i * 2));
+                    }
                 }
+                SetZeroReturnIfNonVoid(rm);
                 return true;
             }
 
             if (p.Kind == RuntimeTypeKind.Pointer && p.ElementType is { Namespace: "System", Name: "Char" })
             {
                 int abs = checked((int)ReadAbiScalarArgument(rm, 0));
-                if (abs == 0) return true;
-                const int MaxChars = 8 * 1024;
-                for (int i = 0; i < MaxChars; i++)
+                if (abs != 0)
                 {
-                    if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
-                    int pos = checked(abs + i * 2);
-                    CheckIndirectAccess(pos, 2, false);
-                    ushort ch = ReadU16(pos);
-                    if (ch == 0) break;
-                    _textWriter.Write((char)ch);
+                    const int MaxChars = 8 * 1024;
+                    for (int i = 0; i < MaxChars; i++)
+                    {
+                        if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                        int pos = checked(abs + i * 2);
+                        CheckIndirectAccess(pos, 2, false);
+                        ushort ch = ReadU16(pos);
+                        if (ch == 0) break;
+                        _textWriter.Write((char)ch);
+                    }
                 }
+                SetZeroReturnIfNonVoid(rm);
+                return true;
+            }
+
+            if (p.Kind == RuntimeTypeKind.Pointer && IsByteLikeElement(p.ElementType))
+            {
+                int abs = checked((int)ReadAbiScalarArgument(rm, 0));
+                if (abs != 0)
+                {
+                    const int MaxBytes = 8 * 1024;
+                    for (int i = 0; i < MaxBytes; i++)
+                    {
+                        if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
+                        int pos = checked(abs + i);
+                        CheckIndirectAccess(pos, 1, false);
+                        byte ch = ReadU8(pos);
+                        if (ch == 0) break;
+                        _textWriter.Write((char)ch);
+                    }
+                }
+                SetZeroReturnIfNonVoid(rm);
                 return true;
             }
 
@@ -3353,12 +3441,20 @@ namespace Cnidaria.Cs
                     if ((i & 255) == 0) ct.ThrowIfCancellationRequested();
                     _textWriter.Write((char)ReadU16(chars + i * 2));
                 }
+                SetZeroReturnIfNonVoid(rm);
                 return true;
             }
 
             throw new NotSupportedException("Console._Write intrinsic unsupported parameter: " + p.Namespace + "." + p.Name);
         }
+        private static bool IsByteLikeElement(RuntimeType? type)
+        {
+            if (type is null)
+                return false;
 
+            return type.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int8 ||
+                (type.Namespace == "System" && (type.Name == "Byte" || type.Name == "SByte"));
+        }
         private bool IntrinsicUnsafe(RuntimeMethod rm)
         {
             string n = rm.Name;
@@ -4433,7 +4529,75 @@ namespace Cnidaria.Cs
         {
             if ((uint)index >= (uint)length) throw new IndexOutOfRangeException();
         }
+        private int StaticData(int pc, InstrDesc instruction)
+        {
+            if (_staticDataByPc.TryGetValue(pc, out int existing))
+            {
+                if (_staticDataHeapObjectByPc.TryGetValue(pc, out int heapObject) && heapObject != 0)
+                    return checked(heapObject + ArrayDataOffset);
+                return existing;
+            }
 
+            int blobOffset = checked((int)(instruction.Imm >> 32));
+            int byteLength = unchecked((int)(uint)instruction.Imm);
+            if (blobOffset < 0 || byteLength < 0 || blobOffset > _image.Blob.Length || byteLength > _image.Blob.Length - blobOffset)
+                throw new InvalidOperationException("Invalid static data blob range.");
+
+            if (byteLength == 0)
+            {
+                _staticDataByPc[pc] = 0;
+                return 0;
+            }
+
+            int abs;
+            if (!TryAllocPersistentStaticDataBytes(byteLength, align: 8, out abs))
+            {
+                int heapObject = AllocStaticDataHeapArray(byteLength);
+                abs = checked(heapObject + ArrayDataOffset);
+                _staticDataHeapObjectByPc[pc] = heapObject;
+            }
+            else
+            {
+                _staticDataRegionBytes = checked(_staticDataRegionBytes + byteLength);
+            }
+            _image.Blob.AsSpan().Slice(blobOffset, byteLength).CopyTo(_mem.AsSpan(abs, byteLength));
+            _staticDataByPc[pc] = abs;
+            return abs;
+        }
+        private bool TryAllocPersistentStaticDataBytes(int byteCount, int align, out int abs)
+        {
+            if (byteCount < 0) throw new ArgumentOutOfRangeException(nameof(byteCount));
+            if (byteCount == 0)
+            {
+                abs = 0;
+                return true;
+            }
+            if (align <= 0) align = TargetArchitecture.PointerSize;
+
+            if (_staticEnd <= TargetArchitecture.PointerSize)
+            {
+                abs = 0;
+                return false;
+            }
+
+            abs = AlignUp(_staticAllocPtr, align);
+            if (abs <= 0)
+                abs = AlignUp(TargetArchitecture.PointerSize, align);
+            if (abs < _staticEnd && byteCount <= _staticEnd - abs)
+            {
+                _staticAllocPtr = checked(abs + byteCount);
+                return true;
+            }
+
+            abs = 0;
+            return false;
+        }
+        private int AllocStaticDataHeapArray(int byteLength)
+        {
+            RuntimeType byteType = ResolveRequiredType("std", "System", "Byte");
+            RuntimeType byteArrayType = _rts.GetArrayType(byteType);
+            return AllocArray(byteArrayType, byteLength);
+        }
         private int StackAlloc(int count, int elementSize)
         {
             if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
@@ -4793,6 +4957,12 @@ namespace Cnidaria.Cs
                 }
             }
 
+            foreach (var kv in _staticDataHeapObjectByPc)
+            {
+                if (kv.Value != 0)
+                    TryMarkObject(kv.Value);
+            }
+
             foreach (var kv in _internPool)
                 TryMarkObject(kv.Value);
 
@@ -4826,6 +4996,22 @@ namespace Cnidaria.Cs
                 {
                     if (kv.Value != 0)
                         _staticBaseByTypeId[kv.Key] = TranslateRawBase(kv.Value);
+                }
+            }
+
+            if (_staticDataHeapObjectByPc.Count != 0)
+            {
+                var keys = new List<int>(_staticDataHeapObjectByPc.Keys);
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    int key = keys[i];
+                    int heapObject = _staticDataHeapObjectByPc[key];
+                    if (heapObject != 0)
+                    {
+                        heapObject = TranslateObjectRef(heapObject);
+                        _staticDataHeapObjectByPc[key] = heapObject;
+                        _staticDataByPc[key] = checked(heapObject + ArrayDataOffset);
+                    }
                 }
             }
 
@@ -5874,6 +6060,12 @@ namespace Cnidaria.Cs
         private void CheckIndirectAccess(int abs, int size)
         {
             CheckRange(abs, size);
+            if (abs < _staticEnd)
+            {
+                if (abs + size > _staticEnd)
+                    throw new AccessViolationException("Static data access out of range.");
+                return;
+            }
             if (abs >= _heapBase)
             {
                 CheckHeapAccess(abs, size);

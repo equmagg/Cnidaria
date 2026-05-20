@@ -313,8 +313,10 @@ namespace Cnidaria.Cs
 
         private int _stackPeakAbs;
         private int _heapPeakAbs;
+        private int _staticDataRegionBytes;
         public int StackPeakBytes => _stackPeakAbs - _stackBase;
         public int HeapPeakBytes => _heapPeakAbs - _heapBase;
+        public int StaticDataRegionBytes => _staticDataRegionBytes;
 
         private int _sp;          // absolute offset into _mem
         private int _frameBase;   // absolute offset to current frame header, -1 if none
@@ -338,6 +340,8 @@ namespace Cnidaria.Cs
         private readonly List<CatchContext> _catchStack = new();
         private readonly List<FinallyContext> _finallyStack = new();
         private readonly Dictionary<int, MethodExecLayout> _methodLayouts = new();
+        private readonly Dictionary<(BytecodeFunction Function, int Pc), int> _staticDataByInstruction = new();
+        private readonly Dictionary<(BytecodeFunction Function, int Pc), int> _staticDataHeapObjectByInstruction = new();
         private readonly List<int> _heapObjects = new();
         private readonly Dictionary<string, int> _internPool = new(StringComparer.Ordinal);
         private readonly TextWriter _textWriter;
@@ -354,6 +358,7 @@ namespace Cnidaria.Cs
         private int _curEvalSp;
         private int _curEvalMax;
         private int _curPc;
+        private int _staticAllocPtr;
         private Slot[] _hotEvalSlots = Array.Empty<Slot>();
 
         private int _exceptionTranslationDepth;
@@ -372,7 +377,6 @@ namespace Cnidaria.Cs
         public StackBasedVm(
             byte[] memory,
             int staticEnd,
-            int stackBase,
             int stackEnd,
             Domain domain,
             RuntimeTypeSystem rts,
@@ -381,11 +385,12 @@ namespace Cnidaria.Cs
         {
             _mem = memory ?? throw new ArgumentNullException(nameof(memory));
             _staticEnd = staticEnd;
-            _stackBase = stackBase;
+            _stackBase = staticEnd;
             _stackEnd = stackEnd;
-            _sp = stackBase;
+            _sp = staticEnd;
             _frameBase = -1;
             _stackPeakAbs = _sp;
+            _staticAllocPtr = Math.Min(AlignUp(TargetArchitecture.PointerSize, 8), staticEnd);
 
             _heapBase = AlignUp(_stackEnd, 8);
             _heapEnd = _mem.Length;
@@ -510,6 +515,10 @@ namespace Cnidaria.Cs
 
                         case BytecodeOp.Sizeof:
                             ExecSizeof(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.TypeIsValueType:
+                            ExecTypeIsValueType(mod, ins.Operand0);
                             break;
 
                         case BytecodeOp.Pop:
@@ -870,6 +879,10 @@ namespace Cnidaria.Cs
                                 int sz = layout.ArgSizes[arg];
                                 PushSlot(new Slot(SlotKind.ByRef, abs, aux: sz));
                             }
+                            break;
+
+                        case BytecodeOp.StaticData:
+                            ExecStaticData(fn, pc, ins.Operand0, ins.Operand1);
                             break;
 
                         case BytecodeOp.StackAlloc:
@@ -1298,6 +1311,12 @@ namespace Cnidaria.Cs
                     int fieldAbs = checked(staticsAbs + f.Offset);
                     VisitManagedRefCellsInTypedStorage(fieldAbs, f.FieldType, VisitRefCell);
                 }
+            }
+            // Static data heap fallback roots
+            foreach (var kv in _staticDataHeapObjectByInstruction)
+            {
+                if (kv.Value != 0) 
+                    TryMarkObject(kv.Value);
             }
             // Intern pool roots
             foreach (var kv in _internPool)
@@ -2570,6 +2589,14 @@ namespace Cnidaria.Cs
             int size = _rts.GetStorageSizeAlign(t).size;
             PushSlot(new Slot(SlotKind.I4, size));
         }
+        private void ExecTypeIsValueType(RuntimeModule mod, int typeToken)
+        {
+            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
+            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
+            if (t.Kind == RuntimeTypeKind.TypeParam)
+                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsValueType: {t.Name}");
+            PushSlot(new Slot(SlotKind.I4, t.IsValueType ? 1 : 0));
+        }
         private void ExecDefaultValue(RuntimeModule mod, int typeToken)
         {
             var t = ResolveTypeTokenInCurrentMethod(mod, typeToken);
@@ -2998,6 +3025,75 @@ namespace Cnidaria.Cs
             int dataAbs = checked(arrAbs + ArrayDataOffset);
 
             PushSlot(new Slot(SlotKind.ByRef, dataAbs));
+        }
+        private void ExecStaticData(BytecodeFunction fn, int pc, int blobOffset, int byteLength)
+        {
+            if (blobOffset < 0 || byteLength < 0 || blobOffset > fn.StaticDataBlob.Length || byteLength > fn.StaticDataBlob.Length - blobOffset)
+                throw new InvalidOperationException("Invalid static data blob range.");
+
+            var key = (fn, pc);
+            if (_staticDataByInstruction.TryGetValue(key, out int existing))
+            {
+                if (_staticDataHeapObjectByInstruction.TryGetValue(key, out int heapObject) && heapObject != 0)
+                    existing = checked(heapObject + ArrayDataOffset);
+                PushSlot(new Slot(SlotKind.Ptr, existing, aux: 1));
+                return;
+            }
+
+            if (byteLength == 0)
+            {
+                _staticDataByInstruction[key] = 0;
+                PushSlot(new Slot(SlotKind.Ptr, 0, aux: 1));
+                return;
+            }
+
+            int abs;
+            if (!TryAllocPersistentStaticDataBytes(byteLength, align: 8, out abs))
+            {
+                int heapObject = AllocStaticDataHeapArray(byteLength);
+                abs = checked(heapObject + ArrayDataOffset);
+                _staticDataHeapObjectByInstruction[key] = heapObject;
+            }
+            else
+            {
+                _staticDataRegionBytes = checked(_staticDataRegionBytes + byteLength);
+            }
+            fn.StaticDataBlob.AsSpan().Slice(blobOffset, byteLength).CopyTo(_mem.AsSpan(abs, byteLength));
+            _staticDataByInstruction[key] = abs;
+            PushSlot(new Slot(SlotKind.Ptr, abs, aux: 1));
+        }
+        private bool TryAllocPersistentStaticDataBytes(int bytes, int align, out int abs)
+        {
+            if (bytes < 0) throw new InvalidOperationException("Negative persistent allocation size.");
+            if (bytes == 0)
+            {
+                abs = 0;
+                return true;
+            }
+            if (align <= 0) align = 1;
+
+            abs = AlignUp(_staticAllocPtr, align);
+            if (abs >= _staticEnd && abs <= _stackBase && bytes <= _stackBase - abs)
+            {
+                _staticAllocPtr = checked(abs + bytes);
+                return true;
+            }
+
+            abs = 0;
+            return false;
+        }
+        private int AllocStaticDataHeapArray(int byteLength)
+        {
+            RuntimeType byteType = ResolveCoreTypeOrThrow("System", "Byte");
+            RuntimeType byteArrayType = _rts.GetArrayType(byteType);
+            return AllocArrayObject(byteArrayType, byteLength);
+        }
+        private RuntimeType ResolveCoreTypeOrThrow(string ns, string name)
+        {
+            RuntimeModule core = FindCoreLibModuleOrThrow();
+            if (!core.TypeDefByFullName.TryGetValue((ns, name), out int typeDefToken))
+                throw new TypeLoadException(ns + "." + name);
+            return _rts.ResolveType(core, typeDefToken);
         }
         private void ExecStackAlloc(int elemSize)
         {
@@ -4533,7 +4629,13 @@ namespace Cnidaria.Cs
 
 
             if (abs < _staticEnd)
-                throw new InvalidOperationException("Access to metadata region is forbidden.");
+            {
+                if (abs + size > _staticEnd)
+                    throw new InvalidOperationException("Invalid static data access.");
+                if (writable)
+                    throw new InvalidOperationException("Write to static data region is forbidden.");
+                return;
+            }
 
             if (abs < _stackBase || abs + size > _sp)
                 throw new InvalidOperationException("Invalid stack access (inactive or out of range).");
@@ -4551,6 +4653,11 @@ namespace Cnidaria.Cs
             {
                 CheckHeapAccess(abs, size, writable);
                 return;
+            }
+
+            if (abs < _stackBase)
+            {
+                throw new InvalidOperationException("Invalid inactive memory access.");
             }
 
             CheckActiveStackAccess(abs, size, writable);
