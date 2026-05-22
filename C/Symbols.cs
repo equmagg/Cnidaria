@@ -18,10 +18,12 @@ namespace Cnidaria.C
     public enum RuntimeIntrinsicKind : byte
     {
         None,
-        Printf,
+        BuiltinVaStart,
+        CStringWrite,
         Malloc,
         Free,
     }
+
     public abstract class Symbol
     {
         public abstract SymbolKind Kind { get; }

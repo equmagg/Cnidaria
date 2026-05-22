@@ -579,7 +579,7 @@ namespace Cnidaria.C
         public int MaxIncludeBytes { get; }
         public int MaxMacroExpansionDepth { get; }
         public int MaxMacroExpansionTokens { get; }
-
+        public bool IncludeStandardHeaders { get; }
         public PreprocessorOptions(
             string? filePath = null,
             PreprocessorEnvironment? environment = null,
@@ -592,12 +592,14 @@ namespace Cnidaria.C
             int maxTokenLength = 246 * 1024,
             int maxIncludeBytes = 1 * 1024 * 1024,
             int maxMacroExpansionDepth = 200,
-            int maxMacroExpansionTokens = 1_000_000)
+            int maxMacroExpansionTokens = 1_000_000,
+            bool includeStandardHeaders = true)
         {
             FilePath = filePath;
             Environment = environment ?? PreprocessorEnvironment.Default;
             IncludeSearchPaths = includeSearchPaths?.ToImmutableArray() ?? ImmutableArray<string>.Empty;
-            IncludeResolver = CreateIncludeResolver(includeFiles, includeResolver);
+            IncludeStandardHeaders = includeStandardHeaders;
+            IncludeResolver = CreateIncludeResolver(includeFiles, includeResolver, includeStandardHeaders);
             MaxIncludeDepth = maxIncludeDepth <= 0 ? 200 : maxIncludeDepth;
             MaxInputLength = maxInputLength <= 0 ? 16 * 1024 * 1024 : maxInputLength;
             MaxTokenLength = maxTokenLength <= 0 ? 1024 * 1024 : maxTokenLength;
@@ -624,7 +626,8 @@ namespace Cnidaria.C
             IEnumerable<string>? includeSearchPaths = null,
             IIncludeResolver? includeResolver = null,
             IReadOnlyDictionary<string, string>? predefinedMacros = null,
-            PreprocessorEnvironment? environment = null)
+            PreprocessorEnvironment? environment = null,
+            bool includeStandardHeaders = true)
         {
             return new PreprocessorOptions(
                 filePath: filePath,
@@ -632,24 +635,30 @@ namespace Cnidaria.C
                 predefinedMacros: predefinedMacros,
                 includeSearchPaths: includeSearchPaths,
                 includeFiles: includeFiles,
-                includeResolver: includeResolver);
+                includeResolver: includeResolver,
+                includeStandardHeaders: includeStandardHeaders);
         }
 
         private static IIncludeResolver CreateIncludeResolver(
             IEnumerable<IncludeFile>? includeFiles,
-            IIncludeResolver? includeResolver)
+            IIncludeResolver? includeResolver,
+            bool includeStandardHeaders)
         {
-            var memoryResolver = includeFiles is null
-                ? null
-                : new InMemoryIncludeResolver(includeFiles);
+            var resolvers = ImmutableArray.CreateBuilder<IIncludeResolver>();
+            if (includeFiles is not null)
+                resolvers.Add(new InMemoryIncludeResolver(includeFiles));
+            if (includeResolver is not null && includeResolver is not NullIncludeResolver)
+                resolvers.Add(includeResolver);
+            if (includeStandardHeaders)
+                resolvers.Add(StandardHeaders.CreateResolver());
 
-            if (memoryResolver is null)
-                return includeResolver ?? NullIncludeResolver.Instance;
+            if (resolvers.Count == 0)
+                return NullIncludeResolver.Instance;
 
-            if (includeResolver is null || includeResolver is NullIncludeResolver)
-                return memoryResolver;
+            if (resolvers.Count == 1)
+                return resolvers[0];
 
-            return new CompositeIncludeResolver(memoryResolver, includeResolver);
+            return new CompositeIncludeResolver(resolvers);
         }
     }
 
@@ -1739,7 +1748,8 @@ namespace Cnidaria.C
                 maxTokenLength: _options.MaxTokenLength,
                 maxIncludeBytes: _options.MaxIncludeBytes,
                 maxMacroExpansionDepth: _options.MaxMacroExpansionDepth,
-                maxMacroExpansionTokens: _options.MaxMacroExpansionTokens);
+                maxMacroExpansionTokens: _options.MaxMacroExpansionTokens,
+                includeStandardHeaders: false);
 
         private SyntaxToken LexToken(ImmutableArray<SyntaxTrivia> leadingTrivia)
         {

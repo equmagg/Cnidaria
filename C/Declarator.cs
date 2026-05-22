@@ -68,9 +68,6 @@ namespace Cnidaria.C
             var collector = new DeclarationCollector(compilation);
             var globalScope = new Scope(parent: null, declaringSyntax: null);
 
-            if (compilation.Options.DeclareRuntimeIntrinsics)
-                collector.DeclareRuntimeIntrinsics(globalScope);
-
             foreach (var tree in compilation.SyntaxTrees)
                 collector.CollectTranslationUnit(tree.Root, globalScope);
 
@@ -81,61 +78,6 @@ namespace Cnidaria.C
                 collector._scopes,
                 collector._diagnostics.ToImmutableArray());
         }
-
-        private void DeclareRuntimeIntrinsics(Scope globalScope)
-        {
-            var intType = _types.Builtin(BuiltinTypeKind.Int);
-            var voidType = _types.Builtin(BuiltinTypeKind.Void);
-            var unsignedLongType = _types.Builtin(BuiltinTypeKind.UnsignedLong);
-            var constCharType = _types.Builtin(BuiltinTypeKind.Char, TypeQualifiers.Const);
-            var constCharPointerType = new QualifiedType(_types.PointerTo(constCharType));
-            var voidPointerType = new QualifiedType(_types.PointerTo(voidType));
-
-            DeclareOrdinary(globalScope, CreateIntrinsicFunction(
-                "printf",
-                RuntimeIntrinsicKind.Printf,
-                intType,
-                ImmutableArray.Create(CreateIntrinsicParameter("format", constCharPointerType)),
-                isVariadic: true));
-
-            DeclareOrdinary(globalScope, CreateIntrinsicFunction(
-                "malloc",
-                RuntimeIntrinsicKind.Malloc,
-                voidPointerType,
-                ImmutableArray.Create(CreateIntrinsicParameter("size", unsignedLongType)),
-                isVariadic: false));
-
-            DeclareOrdinary(globalScope, CreateIntrinsicFunction(
-                "free",
-                RuntimeIntrinsicKind.Free,
-                voidType,
-                ImmutableArray.Create(CreateIntrinsicParameter("ptr", voidPointerType)),
-                isVariadic: false));
-        }
-
-        private FunctionSymbol CreateIntrinsicFunction(
-            string name,
-            RuntimeIntrinsicKind intrinsicKind,
-            QualifiedType returnType,
-            ImmutableArray<ParameterSymbol> parameters,
-            bool isVariadic)
-        {
-            return new FunctionSymbol(
-                name,
-                new QualifiedType(_types.FunctionReturning(
-                    returnType,
-                    parameters,
-                    hasPrototype: true,
-                    isVariadic: isVariadic)),
-                StorageClass.Extern,
-                FunctionSpecifiers.None,
-                isDefinition: false,
-                declaringSyntax: null,
-                intrinsicKind: intrinsicKind);
-        }
-
-        private static ParameterSymbol CreateIntrinsicParameter(string name, QualifiedType type)
-            => new ParameterSymbol(name, type, declaringSyntax: null);
 
         private void CollectTranslationUnit(TranslationUnitSyntax root, Scope globalScope)
         {
@@ -177,13 +119,15 @@ namespace Cnidaria.C
             if (functionDefinition.Declarator.Identifier is null)
                 return;
 
+            var name = functionDefinition.Declarator.Identifier.Value.Text;
             var symbol = new FunctionSymbol(
-                functionDefinition.Declarator.Identifier.Value.Text,
+                name,
                 EnsureFunctionType(type),
                 specifiers.StorageClass,
                 specifiers.FunctionSpecifiers,
                 isDefinition: true,
-                functionDefinition);
+                functionDefinition,
+                GetRuntimeIntrinsicKind(name));
 
             DeclareOrdinary(scope, symbol);
             _declaredSymbols[functionDefinition] = symbol;
@@ -221,7 +165,22 @@ namespace Cnidaria.C
                     hasPrototype: false,
                     isVariadic: false));
         }
+        private static RuntimeIntrinsicKind GetRuntimeIntrinsicKind(string name)
+        {
+            if (string.Equals(name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal))
+                return RuntimeIntrinsicKind.CStringWrite;
 
+            if (string.Equals(name, StandardHeaders.MallocIntrinsicName, StringComparison.Ordinal))
+                return RuntimeIntrinsicKind.Malloc;
+
+            if (string.Equals(name, StandardHeaders.FreeIntrinsicName, StringComparison.Ordinal))
+                return RuntimeIntrinsicKind.Free;
+
+            if (string.Equals(name, StandardHeaders.BuiltinVaStartName, StringComparison.Ordinal))
+                return RuntimeIntrinsicKind.BuiltinVaStart;
+
+            return RuntimeIntrinsicKind.None;
+        }
         private void CollectDeclaration(DeclarationSyntax declaration, Scope scope)
         {
             _scopes[declaration] = scope;
@@ -270,7 +229,8 @@ namespace Cnidaria.C
                     specifiers.StorageClass,
                     specifiers.FunctionSpecifiers,
                     isDefinition: false,
-                    initDeclarator);
+                    initDeclarator,
+                    GetRuntimeIntrinsicKind(name));
             }
             else
             {

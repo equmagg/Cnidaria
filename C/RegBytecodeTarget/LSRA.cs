@@ -7,7 +7,7 @@ using Cnidaria.Cs;
 
 namespace Cnidaria.C
 {
-    internal sealed class LSRAOptions
+    public sealed class LSRAOptions
     {
         public static LSRAOptions Default { get; } = new LSRAOptions();
 
@@ -278,6 +278,14 @@ namespace Cnidaria.C
             var outgoingOffset = offset;
             offset = checked(offset + outgoingSize);
 
+            var varArgsPointerOffset = -1;
+            if (_function.Symbol?.FunctionType?.IsVariadic == true)
+            {
+                offset = AlignUp(offset, _target.PointerAlignment);
+                varArgsPointerOffset = offset;
+                offset = checked(offset + _target.PointerSize);
+            }
+
             var stackSlotOffsets = new Dictionary<LirStackSlot, int>();
             var stackSlotAreaOffset = offset;
             foreach (var slot in _function.StackSlots.OrderBy(static s => s.Ordinal))
@@ -338,6 +346,8 @@ namespace Cnidaria.C
                 parallelCopyTempSize,
                 savedRegisterAreaOffset,
                 savedRegisterAreaSize,
+                varArgsPointerOffset,
+                varArgsPointerOffset >= 0 ? _target.PointerSize : 0,
                 stackSlotOffsets,
                 spillOffsets,
                 savedRegisterOffsets);
@@ -370,6 +380,13 @@ namespace Cnidaria.C
                         if (integerIndex++ >= 8)
                             stackIndex++;
                     }
+                }
+
+                if (instruction.CallSignature?.IsVariadic == true)
+                {
+                    var fixedCount = instruction.CallSignature.Parameters.Length;
+                    var variadicCount = Math.Max(0, instruction.Operands.Length - 1 - fixedCount);
+                    stackIndex = checked(stackIndex + variadicCount);
                 }
 
                 maxStackSlots = Math.Max(maxStackSlots, stackIndex);
@@ -515,6 +532,9 @@ namespace Cnidaria.C
         public int ParallelCopyTempSize { get; }
         public int SavedRegisterAreaOffset { get; }
         public int SavedRegisterAreaSize { get; }
+        public int VarArgsPointerOffset { get; }
+        public int VarArgsPointerSize { get; }
+        public bool HasVarArgsPointer => VarArgsPointerOffset >= 0;
         public IReadOnlyDictionary<LirStackSlot, int> StackSlotOffsets { get; }
         public IReadOnlyDictionary<LirVirtualRegister, int> SpillOffsets { get; }
         public IReadOnlyDictionary<MachineRegister, int> SavedRegisterOffsets { get; }
@@ -526,6 +546,8 @@ namespace Cnidaria.C
             int outgoingArgumentAreaSize,
             int stackSlotAreaOffset,
             int stackSlotAreaSize,
+            int varArgsPointerOffset,
+            int varArgsPointerSize,
             int spillAreaOffset,
             int spillAreaSize,
             int parallelCopyTempOffset,
@@ -548,6 +570,8 @@ namespace Cnidaria.C
             ParallelCopyTempSize = parallelCopyTempSize;
             SavedRegisterAreaOffset = savedRegisterAreaOffset;
             SavedRegisterAreaSize = savedRegisterAreaSize;
+            VarArgsPointerOffset = varArgsPointerOffset;
+            VarArgsPointerSize = varArgsPointerSize;
             StackSlotOffsets = stackSlotOffsets ?? throw new ArgumentNullException(nameof(stackSlotOffsets));
             SpillOffsets = spillOffsets ?? throw new ArgumentNullException(nameof(spillOffsets));
             SavedRegisterOffsets = savedRegisterOffsets ?? throw new ArgumentNullException(nameof(savedRegisterOffsets));

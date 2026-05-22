@@ -1,4 +1,6 @@
-﻿namespace System
+﻿using System.Runtime.CompilerServices;
+
+namespace System
 {
     public static class Environment
     {
@@ -6234,6 +6236,215 @@
 
         public static byte[] GetBytes(bool value) => new byte[] { (value ? (byte)1 : (byte)0) };
 
+        public static byte[] GetBytes(char value)
+        {
+            byte[] bytes = new byte[sizeof(char)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, char value)
+        {
+            if (destination.Length < sizeof(char))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(short value)
+        {
+            byte[] bytes = new byte[sizeof(short)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, short value)
+        {
+            if (destination.Length < sizeof(short))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(int value)
+        {
+            byte[] bytes = new byte[sizeof(int)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, int value)
+        {
+            if (destination.Length < sizeof(int))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(long value)
+        {
+            byte[] bytes = new byte[sizeof(long)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, long value)
+        {
+            if (destination.Length < sizeof(long))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(ushort value)
+        {
+            byte[] bytes = new byte[sizeof(ushort)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, ushort value)
+        {
+            if (destination.Length < sizeof(ushort))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(uint value)
+        {
+            byte[] bytes = new byte[sizeof(uint)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, uint value)
+        {
+            if (destination.Length < sizeof(uint))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(ulong value)
+        {
+            byte[] bytes = new byte[sizeof(ulong)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, ulong value)
+        {
+            if (destination.Length < sizeof(ulong))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(float value)
+        {
+            byte[] bytes = new byte[sizeof(float)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, float value)
+        {
+            if (destination.Length < sizeof(float))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static byte[] GetBytes(double value)
+        {
+            byte[] bytes = new byte[sizeof(double)];
+            bool success = TryWriteBytes(bytes, value);
+            return bytes;
+        }
+
+        public static bool TryWriteBytes(Span<byte> destination, double value)
+        {
+            if (destination.Length < sizeof(double))
+                return false;
+
+            Unsafe.WriteUnaligned(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), value);
+            return true;
+        }
+
+        public static char ToChar(byte[] value, int startIndex) => unchecked((char)ToInt16(value, startIndex));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static char ToChar(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(char))
+                throw new ArgumentOutOfRangeException();
+            return Unsafe.ReadUnaligned<char>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
+        }
+
+        public static short ToInt16(byte[] value, int startIndex)
+        {
+            if (value == null)
+                throw new ArgumentNullException();
+            if (unchecked((uint)startIndex) >= unchecked((uint)value.Length))
+                throw new ArgumentOutOfRangeException();
+            if (startIndex > value.Length - sizeof(short))
+                throw new ArgumentException();
+
+            return Unsafe.ReadUnaligned<short>(ref value[startIndex]);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static short ToInt16(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(short))
+                throw new ArgumentOutOfRangeException();
+            return Unsafe.ReadUnaligned<short>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
+        }
+
+        public static int ToInt32(byte[] value, int startIndex)
+        {
+            if (value == null)
+                throw new ArgumentNullException();
+            if (unchecked((uint)startIndex) >= unchecked((uint)value.Length))
+                throw new ArgumentOutOfRangeException();
+            if (startIndex > value.Length - sizeof(int))
+                throw new ArgumentException();
+
+            return Unsafe.ReadUnaligned<int>(ref value[startIndex]);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int ToInt32(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(int))
+                throw new ArgumentOutOfRangeException();
+            return Unsafe.ReadUnaligned<int>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
+        }
+
+        public static long ToInt64(byte[] value, int startIndex)
+        {
+            if (value == null)
+                throw new ArgumentNullException();
+            if (unchecked((uint)startIndex) >= unchecked((uint)value.Length))
+                throw new ArgumentOutOfRangeException();
+            if (startIndex > value.Length - sizeof(long))
+                throw new ArgumentException();
+
+            return Unsafe.ReadUnaligned<long>(ref value[startIndex]);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long ToInt64(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(long))
+                throw new ArgumentOutOfRangeException();
+            return Unsafe.ReadUnaligned<long>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
+        }
 
         public static long DoubleToInt64Bits(double value) => Unsafe.BitCast<double, long>(value);
         public static double Int64BitsToDouble(long value) => Unsafe.BitCast<long, double>(value);
@@ -8595,15 +8806,6 @@ namespace System.Runtime.CompilerServices
             // ret
             return false;
         }
-    }
-}
-namespace System.Runtime.Intrinsics
-{
-    public static class Vector128
-    {
-        internal const int Size = 16;
-
-        internal const int Alignment = 16;
     }
 }
 namespace System.Reflection
@@ -12634,11 +12836,13 @@ namespace System.Numerics
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator +(Vector2 left, Vector2 right)
+            => new Vector2(left.X + right.X, left.Y + right.Y);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator +=(Vector2 value)
         {
-            var result = new Vector2(left.X, left.Y);
-            result.X += right.X;
-            result.Y += right.Y;
-            return result;
+            this.X += value.X;
+            this.Y += value.Y;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -12671,6 +12875,13 @@ namespace System.Numerics
             result.X *= right.X;
             result.Y *= right.Y;
             return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(Vector2 value)
+        {
+            this.X *= value.X;
+            this.Y *= value.Y;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -12707,9 +12918,91 @@ namespace System.Numerics
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator -=(Vector2 value)
+        {
+            this.X -= value.X;
+            this.Y -= value.Y;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector2 operator -(Vector2 value) => new Vector2(-(value.X), -(value.Y));
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator &(Vector2 left, Vector2 right) 
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) & Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) & Unsafe.BitCast<float, int>(right.Y)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator |(Vector2 left, Vector2 right)
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) | Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) | Unsafe.BitCast<float, int>(right.Y)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator ^(Vector2 left, Vector2 right)
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) ^ Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) ^ Unsafe.BitCast<float, int>(right.Y)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator <<(Vector2 value, int shiftAmount)
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) << shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator ~(Vector2 value) 
+            => new Vector2(
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.X)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.Y)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator >>(Vector2 value, int shiftAmount)
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >> shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator +(Vector2 value) => value;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector2 operator >>>(Vector2 value, int shiftAmount)
+            => new Vector2(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >>> shiftAmount));
+
+        public static float Distance(Vector2 value1, Vector2 value2) => float.Sqrt(DistanceSquared(value1, value2));
+        public static float DistanceSquared(Vector2 value1, Vector2 value2) => (value1 - value2).LengthSquared();
+
+        public static Vector2 Divide(Vector2 left, Vector2 right) => left / right;
+        public static Vector2 Divide(Vector2 left, float divisor) => left / divisor;
+
+        public static Vector2 Multiply(Vector2 left, Vector2 right) => left * right;
+        public static Vector2 Multiply(Vector2 left, float right) => left * right;
+        public static Vector2 Multiply(float left, Vector2 right) => left * right;
+
+        public static Vector2 Negate(Vector2 value) => -value;
+
+        public static Vector2 Subtract(Vector2 left, Vector2 right) => left - right;
+        public static Vector2 Add(Vector2 left, Vector2 right) => left + right;
+
+        public static Vector2 Xor(Vector2 left, Vector2 right) => left ^ right;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Dot(Vector2 vector1, Vector2 vector2)
+            => vector1.X * vector2.X + vector1.Y * vector2.Y;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Cross(Vector2 value1, Vector2 value2)
+            => value1.X * value2.Y - value1.Y * value2.X;
+
         public override readonly int GetHashCode() => HashCode.Combine(X, Y);
+
+        public readonly float Length() => float.Sqrt(LengthSquared());
+        public readonly float LengthSquared() => Dot(this, this);
+
+        public static Vector2 Normalize(Vector2 value) => value / value.Length();
     }
     public struct Vector3
     {
@@ -12754,13 +13047,16 @@ namespace System.Numerics
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator +(Vector3 left, Vector3 right)
+            => new Vector3(left.X + right.X, left.Y + right.Y, left.Z + right.Z);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator +=(Vector3 value)
         {
-            Vector3 result = new Vector3(left.X, left.Y, left.Z);
-            result.X += right.X;
-            result.Y += right.Y;
-            result.Z += right.Z;
-            return result;
+            this.X += value.X;
+            this.Y += value.Y;
+            this.Z += value.Z;
         }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator /(Vector3 left, Vector3 right)
         {
@@ -12794,6 +13090,13 @@ namespace System.Numerics
             result.Y *= right.Y;
             result.Z *= right.Z;
             return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(Vector3 value)
+        {
+            this.X *= value.X;
+            this.Y *= value.Y;
+            this.Z *= value.Z;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -12835,9 +13138,102 @@ namespace System.Numerics
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator -=(Vector3 value)
+        {
+            this.X -= value.X;
+            this.Y -= value.Y;
+            this.Z -= value.Z;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 operator -(Vector3 value) => new Vector3(-(value.X), -(value.Y), -(value.Z));
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator &(Vector3 left, Vector3 right)
+             => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) & Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) & Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) & Unsafe.BitCast<float, int>(right.Z)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator |(Vector3 left, Vector3 right)
+             => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) | Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) | Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) | Unsafe.BitCast<float, int>(right.Z)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator ^(Vector3 left, Vector3 right)
+             => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) ^ Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) ^ Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) ^ Unsafe.BitCast<float, int>(right.Z)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator <<(Vector3 value, int shiftAmount)
+            => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) << shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator ~(Vector3 value) 
+            => new Vector3(
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.X)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.Y)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.Z)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator >>(Vector3 value, int shiftAmount)
+            => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) >> shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator +(Vector3 value) => value;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 operator >>>(Vector3 value, int shiftAmount)
+            => new Vector3(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) >>> shiftAmount));
+
+        public static float Distance(Vector3 value1, Vector3 value2) => float.Sqrt(DistanceSquared(value1, value2));
+        public static float DistanceSquared(Vector3 value1, Vector3 value2) => (value1 - value2).LengthSquared();
+
+        public static Vector3 Divide(Vector3 left, Vector3 right) => left / right;
+        public static Vector3 Divide(Vector3 left, float divisor) => left / divisor;
+
+        public static Vector3 Multiply(Vector3 left, Vector3 right) => left * right;
+        public static Vector3 Multiply(Vector3 left, float right) => left * right;
+        public static Vector3 Multiply(float left, Vector3 right) => left * right;
+
+        public static Vector3 Negate(Vector3 value) => -value;
+
+        public static Vector3 Subtract(Vector3 left, Vector3 right) => left - right;
+        public static Vector3 Add(Vector3 left, Vector3 right) => left + right;
+
+        public static Vector3 Xor(Vector3 left, Vector3 right) => left ^ right;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Dot(Vector3 vector1, Vector3 vector2) 
+            => vector1.X * vector2.X + vector1.Y * vector2.Y + vector1.Z * vector2.Z;
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 Cross(Vector3 vector1, Vector3 vector2)
+            => new Vector3(vector1.Y * vector2.Z - vector1.Z * vector2.Y,
+                           vector1.Z * vector2.X - vector1.X * vector2.Z,
+                           vector1.X * vector2.Y - vector1.Y * vector2.X);
+
         public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z);
+
+        public readonly float Length() => float.Sqrt(LengthSquared());
+        public readonly float LengthSquared() => Dot(this, this);
+
+        public static Vector3 Normalize(Vector3 value) => value / value.Length();
     }
     public struct Vector4
     {
@@ -12900,14 +13296,17 @@ namespace System.Numerics
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector4 operator +(Vector4 left, Vector4 right)
+            => new Vector4(left.X + right.X, left.Y + right.Y, left.Z + right.Z, left.W + right.W);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator +=(Vector4 value)
         {
-            Vector4 result = new Vector4(left.X, left.Y, left.Z, left.W);
-            result.X += right.X;
-            result.Y += right.Y;
-            result.Z += right.Z;
-            result.W += right.W;
-            return result;
+            this.X += value.X;
+            this.Y += value.Y;
+            this.Z += value.Z;
+            this.W += value.W;
         }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector4 operator /(Vector4 left, Vector4 right)
         {
@@ -12944,6 +13343,15 @@ namespace System.Numerics
             result.Z *= right.Z;
             result.W *= right.W;
             return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator *=(Vector4 value)
+        {
+            this.X *= value.X;
+            this.Y *= value.Y;
+            this.Z *= value.Z;
+            this.W *= value.W;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -12989,9 +13397,110 @@ namespace System.Numerics
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void operator -=(Vector4 value)
+        {
+            this.X -= value.X;
+            this.Y -= value.Y;
+            this.Z -= value.Z;
+            this.W -= value.W;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector4 operator -(Vector4 value) => new Vector4(-(value.X), -(value.Y), -(value.Z), -(value.W));
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator &(Vector4 left, Vector4 right)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) & Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) & Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) & Unsafe.BitCast<float, int>(right.Z)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.W) & Unsafe.BitCast<float, int>(right.W)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator |(Vector4 left, Vector4 right)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) | Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) | Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) | Unsafe.BitCast<float, int>(right.Z)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.W) | Unsafe.BitCast<float, int>(right.W)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator ^(Vector4 left, Vector4 right)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.X) ^ Unsafe.BitCast<float, int>(right.X)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Y) ^ Unsafe.BitCast<float, int>(right.Y)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.Z) ^ Unsafe.BitCast<float, int>(right.Z)),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(left.W) ^ Unsafe.BitCast<float, int>(right.W)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator <<(Vector4 value, int shiftAmount)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) << shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.W) << shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator ~(Vector4 value) 
+            => new Vector4(
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.X)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.Y)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.Z)),
+                Unsafe.BitCast<int, float>(~Unsafe.BitCast<float, int>(value.W)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator >>(Vector4 value, int shiftAmount)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) >> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.W) >> shiftAmount));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator +(Vector4 value) => value;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 operator >>>(Vector4 value, int shiftAmount)
+            => new Vector4(
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.X) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Y) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.Z) >>> shiftAmount),
+                Unsafe.BitCast<int, float>(Unsafe.BitCast<float, int>(value.W) >>> shiftAmount));
+
+        public static float Distance(Vector4 value1, Vector4 value2) => float.Sqrt(DistanceSquared(value1, value2));
+        public static float DistanceSquared(Vector4 value1, Vector4 value2) => (value1 - value2).LengthSquared();
+
+        public static Vector4 Divide(Vector4 left, Vector4 right) => left / right;
+        public static Vector4 Divide(Vector4 left, float divisor) => left / divisor;
+
+        public static Vector4 Multiply(Vector4 left, Vector4 right) => left * right;
+        public static Vector4 Multiply(Vector4 left, float right) => left * right;
+        public static Vector4 Multiply(float left, Vector4 right) => left * right;
+
+        public static Vector4 Negate(Vector4 value) => -value;
+
+        public static Vector4 Subtract(Vector4 left, Vector4 right) => left - right;
+        public static Vector4 Add(Vector4 left, Vector4 right) => left + right;
+
+        public static Vector4 Xor(Vector4 left, Vector4 right) => left ^ right;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Dot(Vector4 vector1, Vector4 vector2)
+            => vector1.X * vector2.X + vector1.Y * vector2.Y + vector1.Z * vector2.Z + vector1.W * vector2.W;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector4 Cross(Vector4 vector1, Vector4 vector2)
+            => new Vector4(vector1.Y * vector2.Z - vector1.Z * vector2.Y, 
+                           vector1.Z * vector2.X - vector1.X * vector2.Z, 
+                           vector1.X * vector2.Y - vector1.Y * vector2.X,
+                           vector1.W * vector2.W);
+
         public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z, W);
+
+        public readonly float Length() => float.Sqrt(LengthSquared());
+        public readonly float LengthSquared() => Dot(this, this);
+
+        public static Vector4 Normalize(Vector4 value) => value / value.Length();
     }
 }
 namespace System.Collections

@@ -1096,21 +1096,21 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal sealed class CodeImage
+    public sealed class CodeImage
     {
-        public ImageFlags Flags { get; }
-        public ImmutableArray<InstrDesc> Code { get; }
-        public ImmutableArray<MethodRecord> Methods { get; }
-        public ImmutableArray<CallSiteRecord> CallSites { get; }
-        public ImmutableArray<EhRegionRecord> EhRegions { get; }
-        public ImmutableArray<GcSafePointRecord> GcSafePoints { get; }
-        public ImmutableArray<GcRootRecord> GcRoots { get; }
-        public ImmutableArray<UnwindRecord> Unwind { get; }
-        public ImmutableArray<SwitchTableRecord> SwitchTable { get; }
-        public ImmutableArray<byte> Blob { get; }
-        public IReadOnlyDictionary<int, int> MethodIndexByRuntimeMethodId { get; }
+        internal ImageFlags Flags { get; }
+        internal ImmutableArray<InstrDesc> Code { get; }
+        internal ImmutableArray<MethodRecord> Methods { get; }
+        internal ImmutableArray<CallSiteRecord> CallSites { get; }
+        internal ImmutableArray<EhRegionRecord> EhRegions { get; }
+        internal ImmutableArray<GcSafePointRecord> GcSafePoints { get; }
+        internal ImmutableArray<GcRootRecord> GcRoots { get; }
+        internal ImmutableArray<UnwindRecord> Unwind { get; }
+        internal ImmutableArray<SwitchTableRecord> SwitchTable { get; }
+        internal ImmutableArray<byte> Blob { get; }
+        internal IReadOnlyDictionary<int, int> MethodIndexByRuntimeMethodId { get; }
 
-        public CodeImage(
+        internal CodeImage(
             ImageFlags flags,
             ImmutableArray<InstrDesc> code,
             ImmutableArray<MethodRecord> methods,
@@ -1145,7 +1145,7 @@ namespace Cnidaria.Cs
                 Validate();
         }
 
-        public MethodRecord GetMethod(int runtimeMethodId)
+        internal MethodRecord GetMethod(int runtimeMethodId)
         {
             if (!MethodIndexByRuntimeMethodId.TryGetValue(runtimeMethodId, out int index))
                 throw new KeyNotFoundException("Runtime method id was not found in RVM image: " + runtimeMethodId.ToString());

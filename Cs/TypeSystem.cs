@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    sealed class RuntimeModule : Cnidaria.Cs.IRuntimeMetadataModule
+    public sealed class RuntimeModule : Cnidaria.Cs.IRuntimeMetadataModule
     {
         public string Name { get; }
         public IMetadataView Md { get; }
@@ -699,7 +699,7 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal static class TargetArchitecture
+    public static class TargetArchitecture
     {
         public const int PointerSize = 4;
         public const int NativeIntSize = PointerSize;
@@ -709,7 +709,7 @@ namespace Cnidaria.Cs
         public const int StackAlignment = 8;
         public const int CallFrameAlignment = 16;
     }
-    internal sealed class RuntimeTypeSystem
+    public sealed class RuntimeTypeSystem
     {
         private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
 
@@ -735,11 +735,11 @@ namespace Cnidaria.Cs
 
         private const int ObjectHeaderSize = TargetArchitecture.PointerSize * 2;
         private readonly HashSet<int> _layoutDone = new();
-        public RuntimeType SystemObject { get; private set; } = null!;
-        public RuntimeType SystemString { get; private set; } = null!;
-        public RuntimeType SystemArray { get; private set; } = null!;
-        public RuntimeType SystemValueType { get; private set; } = null!;
-        public RuntimeType SystemEnum { get; private set; } = null!;
+        internal RuntimeType SystemObject { get; private set; } = null!;
+        internal RuntimeType SystemString { get; private set; } = null!;
+        internal RuntimeType SystemArray { get; private set; } = null!;
+        internal RuntimeType SystemValueType { get; private set; } = null!;
+        internal RuntimeType SystemEnum { get; private set; } = null!;
         private readonly Dictionary<string, RuntimeType> _constructedTypes = new(StringComparer.Ordinal);
         private readonly Dictionary<string, RuntimeMethod> _constructedMethods = new(StringComparer.Ordinal);
         public RuntimeTypeSystem(IReadOnlyDictionary<string, RuntimeModule> modules)
@@ -1382,7 +1382,7 @@ namespace Cnidaria.Cs
             sb.Append('>');
             return sb.ToString();
         }
-        public RuntimeType GetTypeById(int typeId)
+        internal RuntimeType GetTypeById(int typeId)
         {
             if (!_typeById.TryGetValue(typeId, out var t))
                 throw new TypeLoadException($"RuntimeType id {typeId} not found.");
@@ -1396,9 +1396,9 @@ namespace Cnidaria.Cs
                 result[index++] = pair.Value;
             return result;
         }
-        public RuntimeType GetByRefType(RuntimeType elementType)
+        internal RuntimeType GetByRefType(RuntimeType elementType)
             => GetOrCreateByRefType(elementType);
-        public RuntimeType GetArrayType(RuntimeType elementType)
+        internal RuntimeType GetArrayType(RuntimeType elementType)
         {
             if (elementType is null) throw new ArgumentNullException(nameof(elementType));
 
@@ -1839,7 +1839,7 @@ namespace Cnidaria.Cs
             return (value + mask) & ~mask;
         }
 
-        public (int size, int align) GetStorageSizeAlign(RuntimeType fieldType)
+        internal (int size, int align) GetStorageSizeAlign(RuntimeType fieldType)
         {
             EnsureLayout(fieldType);
 
@@ -1884,7 +1884,7 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
-        public RuntimeField ResolveFieldInMethodContext(RuntimeModule contextModule, int fieldToken, RuntimeMethod? methodContext)
+        internal RuntimeField ResolveFieldInMethodContext(RuntimeModule contextModule, int fieldToken, RuntimeMethod? methodContext)
         {
             if (methodContext is null)
                 return ResolveField(contextModule, fieldToken);
@@ -2006,7 +2006,7 @@ namespace Cnidaria.Cs
 
             throw new MissingFieldException($"{owner.Namespace}.{owner.Name}.{fieldName} not found.");
         }
-        public RuntimeField ResolveField(RuntimeModule contextModule, int fieldToken)
+        internal RuntimeField ResolveField(RuntimeModule contextModule, int fieldToken)
         {
             int table = MetadataToken.Table(fieldToken);
             int rid = MetadataToken.Rid(fieldToken);
@@ -2402,7 +2402,7 @@ namespace Cnidaria.Cs
                 if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
             return true;
         }
-        public RuntimeType ResolveType(RuntimeModule contextModule, int typeToken)
+        internal RuntimeType ResolveType(RuntimeModule contextModule, int typeToken)
         {
             int table = MetadataToken.Table(typeToken);
             int rid = MetadataToken.Rid(typeToken);
@@ -2800,7 +2800,7 @@ namespace Cnidaria.Cs
             if (t.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Interface)
                 BuildVTableForType(t);
         }
-        public RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
+        internal RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
         {
             if (methodContext is null)
                 return ResolveType(contextModule, typeToken);
@@ -3057,13 +3057,13 @@ namespace Cnidaria.Cs
             IsStatic = isStatic;
         }
     }
-    internal sealed class RuntimeMethod
+    public sealed class RuntimeMethod
     {
         public int MethodId { get; }
-        public RuntimeType DeclaringType { get; }
+        internal RuntimeType DeclaringType { get; }
         public string Name { get; }
-        public RuntimeType ReturnType { get; }
-        public RuntimeType[] ParameterTypes { get; }
+        internal RuntimeType ReturnType { get; }
+        internal RuntimeType[] ParameterTypes { get; }
         public bool HasThis { get; }
         public bool IsVirtual { get; }
         public bool IsStatic { get; }
@@ -3078,7 +3078,7 @@ namespace Cnidaria.Cs
         public RuntimeModule? BodyModule { get; internal set; }
         public Cnidaria.Cs.BytecodeFunction? Body { get; internal set; }
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
-        public RuntimeType[] MethodGenericArguments { get; internal set; } = Array.Empty<RuntimeType>();
+        internal RuntimeType[] MethodGenericArguments { get; set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }
         public bool IsPrivate =>
             (((System.Reflection.MethodAttributes)Flags) &
@@ -3088,7 +3088,7 @@ namespace Cnidaria.Cs
             (((System.Reflection.MethodAttributes)Flags) &
             System.Reflection.MethodAttributes.MemberAccessMask) ==
             System.Reflection.MethodAttributes.Public;
-        public RuntimeMethod(
+        internal RuntimeMethod(
             int methodId,
             RuntimeType declType,
             string name,

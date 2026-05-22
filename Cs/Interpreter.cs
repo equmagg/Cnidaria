@@ -8,9 +8,9 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class RegisterBasedVm
+    public sealed class RegisterBasedVm
     {
-        internal sealed class VmUnhandledException : Exception
+        public sealed class VmUnhandledException : Exception
         {
             public string ManagedStackTrace { get; }
             public VmUnhandledException(string message) : base(message)

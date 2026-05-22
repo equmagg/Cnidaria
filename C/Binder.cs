@@ -1088,6 +1088,8 @@ namespace Cnidaria.C
                 resultType = functionType.ReturnType;
                 if (functionType.HasPrototype)
                     CheckCallArguments(syntax, functionType, arguments);
+                else
+                    ApplyDefaultArgumentPromotions(arguments, startIndex: 0);
             }
 
             return new BoundCallExpression(
@@ -1132,9 +1134,37 @@ namespace Cnidaria.C
                         $"Cannot convert argument {(i + 1).ToString(CultureInfo.InvariantCulture)} from '{argument.Type.ToDisplayString()}' to '{parameterType.ToDisplayString()}'.",
                         SpanOf(syntax.Arguments[i]));
                 }
+                else
+                {
+                    arguments[i] = ConvertCallArgument(argument, parameterType);
+                }
             }
+            if (functionType.IsVariadic)
+                ApplyDefaultArgumentPromotions(arguments, fixedCount);
         }
+        private void ApplyDefaultArgumentPromotions(ImmutableArray<BoundExpression>.Builder arguments, int startIndex)
+        {
+            for (var i = startIndex; i < arguments.Count; i++)
+                arguments[i] = ApplyDefaultArgumentPromotion(arguments[i]);
+        }
+        private BoundExpression ApplyDefaultArgumentPromotion(BoundExpression argument)
+        {
+            if (argument.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float })
+                return ConvertCallArgument(argument, _types.Builtin(BuiltinTypeKind.Double));
+            return ConvertCallArgument(argument, IntegerPromote(argument.Type));
+        }
+        private BoundExpression ConvertCallArgument(BoundExpression argument, QualifiedType targetType)
+        {
+            if (argument.Type.IsError || targetType.IsError || SameType(argument.Type, targetType))
+                return argument;
 
+            return new BoundConversionExpression(
+                argument.Syntax as ExpressionSyntax,
+                argument,
+                targetType,
+                BoundValueKind.RValue,
+                BoundConversionKind.Implicit);
+        }
         private BoundExpression BindElementAccessExpression(ElementAccessExpressionSyntax syntax)
         {
             var expression = ApplyDefaultConversions(BindExpression(syntax.Expression));
@@ -1639,7 +1669,8 @@ namespace Cnidaria.C
 
         private bool IsScalarType(QualifiedType type)
             => IsArithmeticType(type) || IsPointerType(type);
-
+        private static bool IsAggregateType(QualifiedType type)
+            => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
         private static bool IsPointerType(QualifiedType type)
             => type.Type is PointerType;
 

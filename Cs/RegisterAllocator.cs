@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    internal enum MachineRegister : byte
+    public enum MachineRegister : byte
     {
         X0 = 0,
         X1 = 1,

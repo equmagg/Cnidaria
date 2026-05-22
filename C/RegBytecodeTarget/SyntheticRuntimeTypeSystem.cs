@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Cnidaria.C
 {
-    internal sealed class RegisterBytecodeSyntheticRuntime
+    public sealed class RegisterBytecodeSyntheticRuntime
     {
         public RuntimeTypeSystem RuntimeTypes { get; }
         public Dictionary<string, RuntimeModule> Modules { get; }
@@ -138,6 +138,6 @@ namespace Cnidaria.C
         private static int EncodeTypeDefOrRefTypeDef(int rid) => rid << 2;
 
         private static Exception EmptyTable(string member, int rid)
-            => new ArgumentOutOfRangeException(nameof(rid), rid, member + " is empty in synthetic C runtime metadata.");
+            => new ArgumentOutOfRangeException(nameof(rid), rid, $"{member} is empty in synthetic C runtime metadata.");
     }
 }

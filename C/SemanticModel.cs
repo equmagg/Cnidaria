@@ -60,7 +60,8 @@ namespace Cnidaria.C
             IEnumerable<string>? includeSearchPaths = null,
             IIncludeResolver? includeResolver = null,
             IReadOnlyDictionary<string, string>? predefinedMacros = null,
-            PreprocessorEnvironment? environment = null)
+            PreprocessorEnvironment? environment = null,
+            bool includeStandardHeaders = true)
         {
             var effectiveOptions = PreprocessorOptions.CreateForInMemoryFiles(
                 filePath: filePath,
@@ -68,7 +69,8 @@ namespace Cnidaria.C
                 includeSearchPaths: includeSearchPaths,
                 includeResolver: includeResolver,
                 predefinedMacros: predefinedMacros,
-                environment: environment);
+                environment: environment,
+                includeStandardHeaders: includeStandardHeaders);
 
             return ParseText(text, effectiveOptions);
         }
@@ -77,14 +79,11 @@ namespace Cnidaria.C
     public sealed class CompilationOptions
     {
         public TargetInfo Target { get; }
-        public bool DeclareRuntimeIntrinsics { get; }
 
         public CompilationOptions(
-            TargetInfo? target = null,
-            bool declareRuntimeIntrinsics = true)
+            TargetInfo? target = null)
         {
             Target = target ?? TargetInfo.Default;
-            DeclareRuntimeIntrinsics = declareRuntimeIntrinsics;
         }
     }
 
@@ -137,6 +136,7 @@ namespace Cnidaria.C
             IIncludeResolver? includeResolver = null,
             IReadOnlyDictionary<string, string>? predefinedMacros = null,
             PreprocessorEnvironment? environment = null,
+            bool includeStandardHeaders = true,
             string? assemblyName = null,
             CompilationOptions? options = null)
         {
@@ -150,7 +150,8 @@ namespace Cnidaria.C
                         includeSearchPaths,
                         includeResolver,
                         predefinedMacros,
-                        environment)
+                        environment,
+                        includeStandardHeaders)
                 },
                 assemblyName,
                 options);

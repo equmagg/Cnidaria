@@ -1239,11 +1239,35 @@ namespace Cnidaria.C
                 arguments.Add(LowerExpression(argument));
 
             return new GimpleCallExpression(
-                LowerExpression(expression.Expression),
+                LowerCallCalleeExpression(expression.Expression),
                 arguments.ToImmutable(),
                 expression.FunctionType,
                 expression.Type,
                 expression.Syntax);
+        }
+        private GimpleValue LowerCallCalleeExpression(BoundExpression expression)
+        {
+            switch (expression)
+            {
+                case BoundParenthesizedExpression parenthesized:
+                    return LowerCallCalleeExpression(parenthesized.Expression);
+
+                case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
+                    return LowerCallCalleeExpression(conversion.Expression);
+
+                case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.FunctionToPointer:
+                    return new GimpleConversionExpression(
+                        LowerCallCalleeExpression(conversion.Expression),
+                        conversion.Type,
+                        ToGimpleConversionKind(conversion.ConversionKind),
+                        conversion.Syntax);
+
+                case BoundNameExpression name when name.Symbol is FunctionSymbol:
+                    return LowerNameExpression(name);
+
+                default:
+                    return LowerExpression(expression);
+            }
         }
 
         private GimplePlace LowerElementAccessExpression(BoundElementAccessExpression expression)

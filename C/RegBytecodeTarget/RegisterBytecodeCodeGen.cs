@@ -8,7 +8,7 @@ using Cnidaria.Cs;
 
 namespace Cnidaria.C
 {
-    internal sealed class RegisterBytecodeProgram
+    public sealed class RegisterBytecodeProgram
     {
         public CodeImage Image { get; }
         public int EntryMethodId { get; }
@@ -16,7 +16,7 @@ namespace Cnidaria.C
         public IReadOnlyDictionary<FunctionSymbol, int> MethodIds { get; }
         public IReadOnlyDictionary<int, FunctionType?> SignaturesByMethodId { get; }
 
-        internal RegisterBytecodeProgram(
+        public RegisterBytecodeProgram(
             CodeImage image,
             int entryMethodId,
             int printfMethodId,
@@ -43,7 +43,7 @@ namespace Cnidaria.C
             var entryMethod = RegisterSyntheticRuntimeMethods(runtimeTypes);
             return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryMethod);
         }
-        public RuntimeMethod RegisterSyntheticRuntimeMethods(RuntimeTypeSystem runtimeTypes)
+        internal RuntimeMethod RegisterSyntheticRuntimeMethods(RuntimeTypeSystem runtimeTypes)
         {
             if (runtimeTypes is null)
                 throw new ArgumentNullException(nameof(runtimeTypes));
@@ -69,7 +69,7 @@ namespace Cnidaria.C
                 runtimeTypes.RegisterSyntheticStaticMethod(cProgramType, name, returnType, parameters, implFlags: 0, methodId: pair.Key);
             }
 
-            RegisterPrintf(runtimeTypes, PrintfMethodId);
+            RegisterCStringWriteInternalCall(runtimeTypes, PrintfMethodId);
             return runtimeTypes.GetMethodById(EntryMethodId);
         }
 
@@ -87,17 +87,17 @@ namespace Cnidaria.C
             }
         }
 
-        private static void RegisterPrintf(RuntimeTypeSystem runtimeTypes, int methodId)
+        private static void RegisterCStringWriteInternalCall(RuntimeTypeSystem runtimeTypes, int methodId)
         {
             const ushort InternalCallImplFlag = 0x1000;
             if (TryGetMethod(runtimeTypes, methodId, out _))
                 return;
 
             var console = runtimeTypes.RegisterSyntheticType("std", "System", "Console", RuntimeTypeKind.Class);
-            var intType = GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.Int);
+            var voidType = GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.Void);
             var byteType = GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.UnsignedChar);
             var bytePointer = runtimeTypes.GetPointerType(byteType);
-            runtimeTypes.RegisterSyntheticStaticMethod(console, "_Write", intType, new[] { bytePointer }, InternalCallImplFlag, methodId);
+            runtimeTypes.RegisterSyntheticStaticMethod(console, "_Write", voidType, new[] { bytePointer }, InternalCallImplFlag, methodId);
         }
 
         private static RuntimeType MapRuntimeType(RuntimeTypeSystem runtimeTypes, QualifiedType type)
@@ -157,7 +157,7 @@ namespace Cnidaria.C
         }
     }
 
-    internal sealed class RegisterBytecodeCodeGenerator
+    public sealed class RegisterBytecodeCodeGenerator
     {
         public const int FirstCMethodId = 10_000_000;
         public const int PrintfMethodId = 10_999_999;
@@ -166,6 +166,7 @@ namespace Cnidaria.C
         private static readonly MachineRegister GpScratch0 = MachineRegister.X5;
         private static readonly MachineRegister GpScratch1 = MachineRegister.X6;
         private static readonly MachineRegister GpScratch2 = MachineRegister.X7;
+        private static readonly MachineRegister VarArgsRegister = MachineRegister.X9;
         private static readonly MachineRegister FpScratch0 = MachineRegister.F0;
         private static readonly MachineRegister FpScratch1 = MachineRegister.F1;
         private static readonly MachineRegister FpScratch2 = MachineRegister.F2;
@@ -311,6 +312,10 @@ namespace Cnidaria.C
                 if (frame.FrameSize != 0)
                     EmitI64Imm(Op.I64SubImm, Sp, Sp, frame.FrameSize);
 
+                if (frame.HasVarArgsPointer)
+                    EmitMem(Op.StPtr, VarArgsRegister, MachineRegister.Invalid, frame.VarArgsPointerOffset, 
+                        MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+
                 foreach (var pair in frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
                 {
                     var op = IsFloatRegister(pair.Key) ? Op.StF64 : Op.StI8;
@@ -390,6 +395,10 @@ namespace Cnidaria.C
 
                     case LirInstructionKind.Call:
                         EmitCall(instruction);
+                        break;
+
+                    case LirInstructionKind.VaStart:
+                        EmitVaStart(instruction);
                         break;
 
                     case LirInstructionKind.Jump:
@@ -643,7 +652,8 @@ namespace Cnidaria.C
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-                EmitMem(LoadOpForType(instruction.Result.Type), dst, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(instruction.Result.Type), parts.ScaleLog2);
+                EmitMem(LoadOpForType(instruction.Result.Type), dst, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, 
+                    AlignmentOf(instruction.Result.Type), parts.ScaleLog2);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
 
@@ -652,9 +662,10 @@ namespace Cnidaria.C
                 if (instruction.Address is null)
                     throw Unsupported(instruction, "Invalid store instruction.");
 
+                var storeType = instruction.Address.ElementType;
                 var src = LoadOperand(instruction.Operands[0], IsFloatType(instruction.Operands[0].Type) ? FpScratch0 : GpScratch0);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-                EmitMem(StoreOpForType(instruction.Operands[0].Type), src, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(instruction.Operands[0].Type), parts.ScaleLog2);
+                EmitMem(StoreOpForType(storeType), src, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(storeType), parts.ScaleLog2);
             }
 
             private void EmitZeroMemory(LirInstruction instruction)
@@ -674,15 +685,17 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Call has no callee operand.");
 
                 var callee = instruction.Operands[0];
+
                 if (TryResolveCallTarget(callee, out var methodId, out var isPrintf))
                 {
                     if (isPrintf)
                     {
-                        EmitPrintfCall(instruction, methodId);
+                        EmitCStringWriteCall(instruction, methodId);
                         return;
                     }
 
                     MarshalCallArguments(instruction, startOperand: 1);
+                    PrepareVariadicCall(instruction);
                     var directCallOp = CallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void), isInternal: false);
                     EmitRawCall(directCallOp, methodId, CallFlags.None);
                     EmitCallResult(instruction);
@@ -690,6 +703,7 @@ namespace Cnidaria.C
                 }
 
                 MarshalCallArguments(instruction, startOperand: 1);
+                PrepareVariadicCall(instruction);
                 var target = LoadOperand(callee, GpScratch0);
                 var indirectCallOp = IndirectCallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void));
                 EmitRawIndirectCall(indirectCallOp, target, CallFlags.None);
@@ -707,10 +721,10 @@ namespace Cnidaria.C
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
 
-            private void EmitPrintfCall(LirInstruction instruction, int methodId)
+            private void EmitCStringWriteCall(LirInstruction instruction, int methodId)
             {
                 if (instruction.Operands.Length != 2)
-                    throw Unsupported(instruction, "Only printf with a single C string argument is supported by this backend for now.");
+                    throw Unsupported(instruction, "Only __printf with a single C string argument is supported.");
 
                 var arg = instruction.Operands[1];
                 if (arg.Kind == LirOperandKind.Immediate && arg.Immediate is string text)
@@ -727,7 +741,77 @@ namespace Cnidaria.C
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                 }
             }
+            private void EmitVaStart(LirInstruction instruction)
+            {
+                if (instruction.Operands.Length != 0)
+                    throw Unsupported(instruction, "VaStart instruction must not have explicit operands.");
 
+                if (instruction.Result is null)
+                    return;
+
+                var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+                var frame = _allocation.Frame;
+
+                if (frame.HasVarArgsPointer)
+                    EmitMem(LoadOpForType(instruction.Result.Type), destination, MachineRegister.Invalid, 
+                        frame.VarArgsPointerOffset, MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                else
+                    _asm.LiI64(destination, 0);
+
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+            private void PrepareVariadicCall(LirInstruction instruction)
+            {
+                var signature = instruction.CallSignature;
+                if (signature is null || !signature.IsVariadic)
+                    return;
+
+                var fixedCount = signature.Parameters.Length;
+                var firstVariadicOperand = 1 + fixedCount;
+                var variadicCount = instruction.Operands.Length - firstVariadicOperand;
+                if (variadicCount <= 0)
+                {
+                    _asm.LiI64(VarArgsRegister, 0);
+                    return;
+                }
+
+                var normalStackSlots = CountStackArgumentSlots(instruction, startOperand: 1);
+                var baseOffset = checked(_allocation.Frame.OutgoingArgumentAreaOffset + normalStackSlots * _owner._allocationOptions.StackArgumentSlotSize);
+
+                for (var i = 0; i < variadicCount; i++)
+                {
+                    var operand = instruction.Operands[firstVariadicOperand + i];
+                    var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch0 : GpScratch0);
+                    EmitMem(StoreOpForType(operand.Type), source, MachineRegister.Invalid, 
+                        checked(baseOffset + i * _owner._allocationOptions.StackArgumentSlotSize), MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
+                }
+
+                EmitI64Imm(Op.I64AddImm, VarArgsRegister, Sp, baseOffset);
+            }
+            private int CountStackArgumentSlots(LirInstruction instruction, int startOperand)
+            {
+                var integer = 0;
+                var floating = 0;
+                var stack = 0;
+
+                for (var i = startOperand; i < instruction.Operands.Length; i++)
+                {
+                    var operand = instruction.Operands[i];
+                    var cls = ClassifyArgument(operand.Type);
+                    if (cls == AbiRegisterClass.Floating)
+                    {
+                        if (floating++ >= 8)
+                            stack++;
+                    }
+                    else
+                    {
+                        if (integer++ >= 8)
+                            stack++;
+                    }
+                }
+
+                return stack;
+            }
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
             {
                 var integer = 0;
@@ -869,12 +953,20 @@ namespace Cnidaria.C
                 if (instruction.ParallelCopies.Length == 0)
                     return;
 
-                if (_allocation.Frame.ParallelCopyTempSize < instruction.ParallelCopies.Length * 8)
+                var physicalCopies = ImmutableArray.CreateBuilder<LirParallelCopy>(instruction.ParallelCopies.Length);
+                foreach (var copy in instruction.ParallelCopies)
+                {
+                    if (RequiresPhysicalParallelCopy(copy))
+                        physicalCopies.Add(copy);
+                }
+                if (physicalCopies.Count == 0)
+                    return;
+                if (_allocation.Frame.ParallelCopyTempSize < physicalCopies.Count * 8)
                     throw Unsupported(instruction, "Parallel-copy temporary area was not reserved.");
 
-                for (var i = 0; i < instruction.ParallelCopies.Length; i++)
+                for (var i = 0; i < physicalCopies.Count; i++)
                 {
-                    var copy = instruction.ParallelCopies[i];
+                    var copy = physicalCopies[i];
                     var isFloat = IsFloatType(copy.Destination.Type);
                     var src = LoadOperand(copy.Source, isFloat ? FpScratch0 : GpScratch0);
                     EmitMem(isFloat ? Op.StF64 : Op.StI8, src, MachineRegister.Invalid,
@@ -882,9 +974,9 @@ namespace Cnidaria.C
                         MachineRegister.Invalid, MemoryBase.StackPointer, 8);
                 }
 
-                for (var i = 0; i < instruction.ParallelCopies.Length; i++)
+                for (var i = 0; i < physicalCopies.Count; i++)
                 {
-                    var copy = instruction.ParallelCopies[i];
+                    var copy = physicalCopies[i];
                     var isFloat = IsFloatType(copy.Destination.Type);
                     var dst = GetWritableRegister(copy.Destination, GpScratch0, FpScratch0);
                     EmitMem(isFloat ? Op.LdF64 : Op.LdI8, dst, MachineRegister.Invalid,
@@ -893,7 +985,28 @@ namespace Cnidaria.C
                     StoreWritableRegisterIfSpilled(copy.Destination, dst);
                 }
             }
+            private static bool RequiresPhysicalParallelCopy(LirParallelCopy copy)
+            {
+                if (copy.Destination.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory)
+                    return false;
 
+                if (IsVoid(copy.Destination.Type))
+                    return false;
+
+                if (copy.Source.Kind is LirOperandKind.Void or LirOperandKind.None)
+                    return false;
+
+                if (copy.Source.Kind == LirOperandKind.Register &&
+                    copy.Source.Register is { RegisterClass: LirRegisterClass.Void or LirRegisterClass.Memory })
+                {
+                    return false;
+                }
+
+                if (IsVoid(copy.Source.Type))
+                    return false;
+
+                return true;
+            }
             private bool TryResolveCallTarget(LirOperand callee, out int methodId, out bool isPrintf)
             {
                 methodId = 0;
@@ -909,7 +1022,11 @@ namespace Cnidaria.C
                 methodId = 0;
                 isPrintf = false;
 
-                if (function.IntrinsicKind == RuntimeIntrinsicKind.Printf || string.Equals(function.Name, "printf", StringComparison.Ordinal))
+                if (function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart)
+                    return false;
+
+                if (function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite 
+                    || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal))
                 {
                     methodId = PrintfMethodId;
                     isPrintf = true;

@@ -77,6 +77,7 @@ namespace Cnidaria.C
         Store,
         ZeroMemory,
         Call,
+        VaStart,
         Jump,
         Branch,
         Switch,
@@ -903,6 +904,8 @@ namespace Cnidaria.C
                 ? expression
                 : null;
             var value = valueExpression is null ? EmitValue(block, assignment.Value) : EmitValue(block, valueExpression);
+            if (IsVoid(assignment.Target.Type) || value.Kind == LirOperandKind.Void || IsVoid(value.Type))
+                return;
             var definition = GetPrimaryDefinition(instruction);
 
             if (definition is not null)
@@ -1058,7 +1061,9 @@ namespace Cnidaria.C
                 ? EmitValue(block, child)
                 : EmitValue(block, unary.Operand);
             var result = NewVirtualRegister(unary.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: TokenText(unary.OperatorToken), conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: unary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: TokenText(unary.OperatorToken), 
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+                sourceStatement: _currentInstruction?.Statement, sourceValue: unary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
@@ -1071,12 +1076,17 @@ namespace Cnidaria.C
                 ? EmitValue(block, rightExpression)
                 : EmitValue(block, binary.Right);
             var result = NewVirtualRegister(binary.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, op: TokenText(binary.OperatorToken), conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: binary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, op: TokenText(binary.OperatorToken), 
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: binary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
         private LirOperand EmitConversion(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression)
         {
+            if (conversion.ConversionKind == GimpleConversionKind.ArrayToPointer)
+                return EmitArrayToPointer(block, conversion, expression);
+
             var operand = GetChild(expression, 0) is { } child
                 ? EmitValue(block, child)
                 : EmitValue(block, conversion.Operand);
@@ -1084,37 +1094,83 @@ namespace Cnidaria.C
             if (conversion.ConversionKind == GimpleConversionKind.Identity && SameType(operand.Type, conversion.Type))
                 return operand;
 
+            if (IsVoid(conversion.Type))
+                return LirOperand.Void;
+
             if (conversion.ConversionKind == GimpleConversionKind.FunctionToPointer &&
                 operand.Kind == LirOperandKind.Symbol &&
-                operand.Symbol is FunctionSymbol)
+                operand.Symbol is FunctionSymbol function)
             {
+                if (function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart)
+                {
+                    _problems.Add(new LirProblem(
+                        LirProblemKind.UnsupportedNode,
+                        _currentInstruction?.Block,
+                        conversion,
+                        "Cannot take address of compiler intrinsic '__builtin_va_start'."));
+                    return LirOperand.Undefined(null, conversion.Type);
+                }
                 return LirOperand.ForSymbol(operand.Symbol, conversion.Type);
             }
 
-            if (conversion.ConversionKind == GimpleConversionKind.ArrayToPointer &&
-                operand.Kind == LirOperandKind.Immediate &&
-                operand.Immediate is string)
-            {
-                return LirOperand.ImmediateValue(operand.Immediate, conversion.Type);
-            }
-
             var result = NewVirtualRegister(conversion.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null, op: conversion.ConversionKind.ToString(), conversionKind: conversion.ConversionKind, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: conversion, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null, op: conversion.ConversionKind.ToString(), 
+                conversionKind: conversion.ConversionKind, callSignature: null, parallelCopies: default, switchCases: default, target: null, 
+                trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: conversion, 
+                sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
+        private LirOperand EmitArrayToPointer(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression)
+        {
+            var child = GetChild(expression, 0);
 
+            if (conversion.Operand is GimpleConstantValue { Value: string text })
+                return LirOperand.ImmediateValue(text, conversion.Type);
+
+            if (child?.Original is GimpleConstantValue { Value: string childText })
+                return LirOperand.ImmediateValue(childText, conversion.Type);
+
+            if (child is not null && child.IsAddress)
+                return EmitAddressValue(block, EmitAddress(block, child), conversion.Type, conversion, expression);
+
+            if (conversion.Operand is GimplePlace place)
+                return EmitAddressValue(block, EmitAddress(block, place, child), conversion.Type, conversion, expression);
+
+            if (child?.Original is GimplePlace childPlace)
+                return EmitAddressValue(block, EmitAddress(block, childPlace, child), conversion.Type, conversion, expression);
+
+            _problems.Add(new LirProblem(
+                LirProblemKind.InvalidAddress,
+                _currentInstruction?.Block,
+                conversion,
+                "Cannot decay a non-addressable array expression to pointer."));
+
+            return LirOperand.Undefined(null, conversion.Type);
+        }
         private LirOperand EmitCast(LirBlock block, GimpleCastExpression cast, SsaExpression? expression)
         {
             var operand = GetChild(expression, 0) is { } child
                 ? EmitValue(block, child)
                 : EmitValue(block, cast.Operand);
+            if (IsVoid(cast.Type))
+                return LirOperand.Void;
             var result = NewVirtualRegister(cast.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Cast, result, ImmutableArray.Create(operand), address: null, op: "cast", conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: cast, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Cast, result, ImmutableArray.Create(operand), address: null, op: "cast", conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: cast, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
         private LirOperand EmitCall(LirBlock block, GimpleCallExpression call, SsaExpression? expression)
         {
+            if (TryGetRuntimeIntrinsic(call.Callee, out var intrinsic))
+            {
+                switch (intrinsic)
+                {
+                    case RuntimeIntrinsicKind.BuiltinVaStart:
+                        return EmitVaStart(block, call, expression);
+                }
+            }
             var operands = ImmutableArray.CreateBuilder<LirOperand>();
             operands.Add(GetChild(expression, 0) is { } calleeExpression
                 ? EmitValue(block, calleeExpression)
@@ -1127,22 +1183,69 @@ namespace Cnidaria.C
             }
 
             LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null, callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null, 
+                callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
+        }
+
+        private LirOperand EmitVaStart(LirBlock block, GimpleCallExpression call, SsaExpression? expression)
+        {
+            if (call.Arguments.Length != 0)
+            {
+                _problems.Add(new LirProblem(
+                    LirProblemKind.UnsupportedNode,
+                    _currentInstruction?.Block,
+                    call,
+                    "__builtin_va_start expects no explicit arguments after macro expansion."));
+            }
+
+            LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
+            Emit(block, LirInstructionKind.VaStart, result, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
+        }
+        private static bool TryGetRuntimeIntrinsic(GimpleValue value, out RuntimeIntrinsicKind intrinsic)
+        {
+            while (true)
+            {
+                switch (value)
+                {
+                    case GimpleConversionExpression conversion 
+                    when conversion.ConversionKind is GimpleConversionKind.FunctionToPointer or GimpleConversionKind.Identity:
+                        value = conversion.Operand;
+                        continue;
+                    case GimpleCastExpression cast:
+                        value = cast.Operand;
+                        continue;
+                    case GimpleSymbolValue { Symbol: FunctionSymbol function } when function.IntrinsicKind != RuntimeIntrinsicKind.None:
+                        intrinsic = function.IntrinsicKind;
+                        return true;
+                    default:
+                        intrinsic = RuntimeIntrinsicKind.None;
+                        return false;
+                }
+            }
         }
 
         private LirOperand EmitLoad(LirBlock block, LirAddress address, QualifiedType type, GimpleValue sourceValue, SsaExpression? expression)
         {
             var result = NewVirtualRegister(type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            Emit(block, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
         private LirOperand EmitAddressValue(LirBlock block, LirAddress address, GimpleValue sourceValue, SsaExpression? expression)
+            => EmitAddressValue(block, address, new QualifiedType(TypeCatalog.Instance.PointerTo(address.ElementType)), sourceValue, expression);
+        private LirOperand EmitAddressValue(LirBlock block, LirAddress address, QualifiedType resultType, GimpleValue sourceValue, SsaExpression? expression)
         {
-            var type = new QualifiedType(TypeCatalog.Instance.PointerTo(address.ElementType));
-            var result = NewVirtualRegister(type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            var result = NewVirtualRegister(resultType, sourceName: null, GetValueNumber(expression));
+            Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
@@ -1194,7 +1297,7 @@ namespace Cnidaria.C
                     return EmitMemberAddress(block, memberAccess, expression);
 
                 default:
-                    _problems.Add(new LirProblem(LirProblemKind.InvalidAddress, _currentInstruction?.Block, value, "Cannot form an LIR address for GIMPLE value: " + value.Kind));
+                    _problems.Add(new LirProblem(LirProblemKind.InvalidAddress, _currentInstruction?.Block, value, $"Cannot form an LIR address for GIMPLE value: {value.Kind}"));
                     return LirAddress.Indirect(LirOperand.Undefined(null, value.Type), value.Type);
             }
         }
@@ -1205,7 +1308,7 @@ namespace Cnidaria.C
             LirAddress baseAddress;
             if (elementAccess.Expression.Type.Type is PointerType)
             {
-                var pointer = baseExpression is null ? EmitValue(block, elementAccess.Expression) : EmitValue(block, baseExpression);
+                var pointer = EmitPointerElementBaseValue(block, elementAccess.Expression, baseExpression);
                 baseAddress = LirAddress.Indirect(pointer, elementAccess.Type);
             }
             else if (baseExpression is not null && baseExpression.IsAddress)
@@ -1231,7 +1334,16 @@ namespace Cnidaria.C
             var scale = _target.SizeOf(elementAccess.Type);
             return LirAddress.Element(baseAddress, index, elementAccess.Type, scale);
         }
+        private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, SsaExpression? rewrittenBase)
+        {
+            if (rewrittenBase?.Name is not null)
+                return GetOperand(rewrittenBase.Name);
 
+            if (rewrittenBase is not null && !rewrittenBase.IsAddress)
+                return EmitValue(block, rewrittenBase);
+
+            return EmitValue(block, originalBase);
+        }
         private LirAddress EmitMemberAddress(LirBlock block, GimpleMemberAccessExpression memberAccess, SsaExpression? expression)
         {
             var baseExpression = GetChild(expression, 0);
@@ -1260,11 +1372,14 @@ namespace Cnidaria.C
         private LirAddress EmitPromotedAddress(LirBlock block, SsaExpression expression)
         {
             var name = expression.Name!;
-            _problems.Add(new LirProblem(
+            if (name.Variable.Kind != SsaVariableKind.Temporary)
+            {
+                _problems.Add(new LirProblem(
                 LirProblemKind.PromotedAddressTakenValue,
                 _currentInstruction?.Block,
                 expression.Original,
-                "Address was requested for promoted SSA value '" + name + "'. Keep SsaOptions.PromoteAddressTakenVariables disabled or introduce an explicit spill/reload repair pass."));
+                $"Address was requested for promoted SSA value '{name}'."));
+            }
 
             LirStackSlot slot;
             if (name.Variable.Symbol is not null)
@@ -1274,7 +1389,9 @@ namespace Cnidaria.C
             else
                 slot = GetOrCreateAnonymousStackSlot(name.Type, name.Variable.Name);
 
-            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(GetOperand(name)), LirAddress.ForStackSlot(slot), op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: expression.Original, sourceInstruction: _currentInstruction, valueNumber: null);
+            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(GetOperand(name)), LirAddress.ForStackSlot(slot), op: string.Empty, conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, 
+                sourceValue: expression.Original, sourceInstruction: _currentInstruction, valueNumber: null);
             return LirAddress.ForStackSlot(slot);
         }
 
@@ -1285,25 +1402,33 @@ namespace Cnidaria.C
 
             if (source.Successors.Length == 0)
             {
-                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
+                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
+                    sourceInstruction: null, valueNumber: null);
                 return;
             }
 
             var nonExitSuccessors = source.Successors.Where(static edge => !edge.Target.IsExit).ToArray();
             if (nonExitSuccessors.Length == 0)
             {
-                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
+                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
+                    sourceInstruction: null, valueNumber: null);
                 return;
             }
 
             var target = Redirect(source, nonExitSuccessors[0].Target);
-            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
+                parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
+                sourceInstruction: null, valueNumber: null);
         }
 
         private void EmitJump(LirBlock block, ControlFlowBlock source, GimpleLabel targetLabel, GimpleStatement statement)
         {
             var target = ResolveTarget(source, targetLabel, statement);
-            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null, sourceInstruction: _currentInstruction, valueNumber: null);
+            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
+                parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null, 
+                sourceInstruction: _currentInstruction, valueNumber: null);
         }
 
         private LirBlock ResolveTarget(ControlFlowBlock source, GimpleLabel label, GimpleStatement statement)
@@ -1311,7 +1436,7 @@ namespace Cnidaria.C
             if (_controlFlowFunction.TryGetBlock(label, out var target) && target is not null)
                 return Redirect(source, target);
 
-            _problems.Add(new LirProblem(LirProblemKind.MissingTarget, source, statement, "Missing LIR target for label '" + label.Name + "'."));
+            _problems.Add(new LirProblem(LirProblemKind.MissingTarget, source, statement, $"Missing LIR target for label '{label.Name}'."));
             return _blocksByControlFlowBlock.TryGetValue(source, out var self) ? self : _blocks[0];
         }
 
@@ -1328,7 +1453,7 @@ namespace Cnidaria.C
             if (_blocksByControlFlowBlock.TryGetValue(target, out var block))
                 return block;
 
-            _problems.Add(new LirProblem(LirProblemKind.MissingTarget, target, target.GimpleBlock, "Missing LIR block for CFG block '" + target + "'."));
+            _problems.Add(new LirProblem(LirProblemKind.MissingTarget, target, target.GimpleBlock, $"Missing LIR block for CFG block '{target}'."));
             return _blocks[0];
         }
 
@@ -1392,7 +1517,9 @@ namespace Cnidaria.C
         }
 
         private void EmitNop(LirBlock block, GimpleStatement statement)
-            => Emit(block, LirInstructionKind.Nop, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null, sourceInstruction: _currentInstruction, valueNumber: null);
+            => Emit(block, LirInstructionKind.Nop, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, 
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+                sourceStatement: statement, sourceValue: null, sourceInstruction: _currentInstruction, valueNumber: null);
 
         private bool HasTerminator(LirBlock block)
         {
@@ -1844,6 +1971,12 @@ namespace Cnidaria.C
                     if (instruction.Result is not null)
                         line += FormatResult(instruction) + " = ";
                     line += "call " + FormatOperand(instruction.Operands[0]) + "(" + string.Join(", ", instruction.Operands.Skip(1).Select(FormatOperand)) + ")";
+                    break;
+
+                case LirInstructionKind.VaStart:
+                    if (instruction.Result is not null)
+                        line += FormatResult(instruction) + " = ";
+                    line += "vastart";
                     break;
 
                 case LirInstructionKind.Jump:
