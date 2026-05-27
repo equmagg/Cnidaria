@@ -511,21 +511,48 @@ namespace Cnidaria.Cs
             if (block.Statements.Length == 0)
                 return CfgEdgeKind.FallThrough;
 
-            var last = block.Statements[block.Statements.Length - 1];
-            switch (last.Kind)
+            if (TryGetConditionalTransfer(block.Statements, out var conditional, out _))
             {
-                case GenTreeKind.Branch:
-                    return CfgEdgeKind.Branch;
+                if (conditional.TargetBlockId == successorBlockId)
+                    return conditional.Kind == GenTreeKind.BranchTrue ? CfgEdgeKind.BranchTrue : CfgEdgeKind.BranchFalse;
 
-                case GenTreeKind.BranchTrue:
-                    return last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchTrue : CfgEdgeKind.FallThrough;
-
-                case GenTreeKind.BranchFalse:
-                    return last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchFalse : CfgEdgeKind.FallThrough;
-
-                default:
-                    return CfgEdgeKind.FallThrough;
+                return CfgEdgeKind.FallThrough;
             }
+
+            var last = block.Statements[block.Statements.Length - 1];
+            return last.Kind == GenTreeKind.Branch ? CfgEdgeKind.Branch : CfgEdgeKind.FallThrough;
+        }
+
+        private static bool TryGetConditionalTransfer(
+            ImmutableArray<GenTree> statements,
+            out GenTree conditional,
+            out GenTree? appendedFallThrough)
+        {
+            conditional = null!;
+            appendedFallThrough = null;
+
+            if (statements.IsDefaultOrEmpty)
+                return false;
+
+            var last = statements[statements.Length - 1];
+            if (last.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+            {
+                conditional = last;
+                return true;
+            }
+
+            if (last.Kind == GenTreeKind.Branch && statements.Length >= 2)
+            {
+                var previous = statements[statements.Length - 2];
+                if (previous.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                {
+                    conditional = previous;
+                    appendedFallThrough = last;
+                    return true;
+                }
+            }
+
+            return false;
         }
         private static ImmutableArray<int> ComputeDominatorRoots(ImmutableArray<CfgBlock> blocks, ImmutableArray<CfgExceptionRegion> exceptionRegions)
         {
@@ -1214,14 +1241,49 @@ namespace Cnidaria.Cs
         {
             if (block.Statements.Length == 0)
                 return CfgEdgeKind.FallThrough;
-            var last = block.Statements[block.Statements.Length - 1];
-            return last.Kind switch
+
+            if (TryGetConditionalTransfer(block.Statements, out var conditional, out _))
             {
-                GenTreeKind.Branch => CfgEdgeKind.Branch,
-                GenTreeKind.BranchTrue => last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchTrue : CfgEdgeKind.FallThrough,
-                GenTreeKind.BranchFalse => last.TargetBlockId == successorBlockId ? CfgEdgeKind.BranchFalse : CfgEdgeKind.FallThrough,
-                _ => CfgEdgeKind.FallThrough
-            };
+                if (conditional.TargetBlockId == successorBlockId)
+                    return conditional.Kind == GenTreeKind.BranchTrue ? CfgEdgeKind.BranchTrue : CfgEdgeKind.BranchFalse;
+
+                return CfgEdgeKind.FallThrough;
+            }
+
+            var last = block.Statements[block.Statements.Length - 1];
+            return last.Kind == GenTreeKind.Branch ? CfgEdgeKind.Branch : CfgEdgeKind.FallThrough;
+        }
+
+        private static bool TryGetConditionalTransfer(
+            ImmutableArray<GenTree> statements,
+            out GenTree conditional,
+            out GenTree? appendedFallThrough)
+        {
+            conditional = null!;
+            appendedFallThrough = null;
+
+            if (statements.IsDefaultOrEmpty)
+                return false;
+
+            var last = statements[statements.Length - 1];
+            if (last.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+            {
+                conditional = last;
+                return true;
+            }
+
+            if (last.Kind == GenTreeKind.Branch && statements.Length >= 2)
+            {
+                var previous = statements[statements.Length - 2];
+                if (previous.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                {
+                    conditional = previous;
+                    appendedFallThrough = last;
+                    return true;
+                }
+            }
+
+            return false;
         }
         private static GenTreeBlock RewriteOriginalBlock(
             GenTreeBlock block,
@@ -5836,6 +5898,10 @@ namespace Cnidaria.Cs
         public bool SimplifyAlgebraicIdentities { get; set; } = true;
         public bool RemoveDeadDefinitions { get; set; } = true;
         public bool CopyPropagate { get; set; } = true;
+        public bool FoldRedundantBranches { get; set; } = true;
+        public bool JumpThreadBranches { get; set; } = true;
+        public bool RemoveUnreachableBlocks { get; set; } = true;
+        public int MaxBranchOptimizationPasses { get; set; } = 4;
         public int MaxIterations { get; set; } = 8;
     }
 
@@ -5985,6 +6051,21 @@ namespace Cnidaria.Cs
                     var next = WithBlocks(afterRewrite, dce.Blocks);
                     bool changed = copyProp.Changed || rewrite.Changed || dce.Changed;
 
+                    if ((_options.FoldRedundantBranches || _options.JumpThreadBranches || _options.RemoveUnreachableBlocks) &&
+                        _options.MaxBranchOptimizationPasses > 0)
+                    {
+                        next = EnsureValueNumbers(next);
+                        var flow = OptimizeRedundantBranches(next);
+                        _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, flow.NextSyntheticTreeId);
+                        if (flow.Changed)
+                        {
+                            current = flow.Method;
+                            continue;
+                        }
+
+                        next = flow.Method;
+                    }
+
                     if (!changed)
                     {
                         current = EnsureValueNumbers(next);
@@ -6014,6 +6095,1163 @@ namespace Cnidaria.Cs
             }
 
 
+
+
+            private readonly struct FlowOptimizationResult
+            {
+                public readonly SsaMethod Method;
+                public readonly bool Changed;
+                public readonly int NextSyntheticTreeId;
+
+                public FlowOptimizationResult(SsaMethod method, bool changed, int nextSyntheticTreeId)
+                {
+                    Method = method ?? throw new ArgumentNullException(nameof(method));
+                    Changed = changed;
+                    NextSyntheticTreeId = nextSyntheticTreeId;
+                }
+            }
+
+            private FlowOptimizationResult OptimizeRedundantBranches(SsaMethod method)
+            {
+                method = EnsureValueNumbers(method);
+
+                if (method.ValueNumbers is null || method.Blocks.Length == 0)
+                    return new FlowOptimizationResult(method, false, _nextSyntheticTreeId);
+
+                var current = method;
+                bool anyChange = false;
+                int nextTreeId = _nextSyntheticTreeId;
+                int maxPasses = Math.Max(1, _options.MaxBranchOptimizationPasses);
+
+                for (int pass = 0; pass < maxPasses; pass++)
+                {
+                    var passOptimizer = new RedundantBranchOptimizer(current, _options, nextTreeId);
+                    var passResult = passOptimizer.Run();
+                    nextTreeId = passResult.NextSyntheticTreeId;
+
+                    if (!passResult.Changed)
+                        break;
+
+                    anyChange = true;
+                    current = RebuildSsaAfterFlowRewrite(current, passResult.Method);
+                    current = EnsureValueNumbers(current);
+                }
+
+                return new FlowOptimizationResult(current, anyChange, nextTreeId);
+            }
+
+            private SsaMethod RebuildSsaAfterFlowRewrite(SsaMethod previous, GenTreeMethod rewritten)
+            {
+                bool includeExceptionEdges = HasExceptionEdges(previous.Cfg) || previous.Cfg.ExceptionRegions.Length != 0;
+                var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
+                rewritten.AttachFlowGraph(cfg);
+
+                var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
+                rewritten.AttachHirLiveness(liveness);
+
+                var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
+                return EnsureValueNumbers(rebuilt);
+            }
+
+            private static bool HasExceptionEdges(ControlFlowGraph cfg)
+            {
+                for (int b = 0; b < cfg.Blocks.Length; b++)
+                {
+                    var successors = cfg.Blocks[b].Successors;
+                    for (int s = 0; s < successors.Length; s++)
+                    {
+                        if (successors[s].Kind == CfgEdgeKind.Exception)
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private sealed class RedundantBranchOptimizer
+            {
+                private readonly SsaMethod _method;
+                private readonly SsaOptimizationOptions _options;
+                private readonly Dictionary<int, BranchInfo> _branches = new();
+                private readonly Dictionary<int, MutableBlock> _edits = new();
+                private int _nextTreeId;
+                private bool _changed;
+
+                public RedundantBranchOptimizer(SsaMethod method, SsaOptimizationOptions options, int nextTreeId)
+                {
+                    _method = method ?? throw new ArgumentNullException(nameof(method));
+                    _options = options ?? throw new ArgumentNullException(nameof(options));
+                    _nextTreeId = nextTreeId;
+                }
+
+                public FlowRewriteResult Run()
+                {
+                    BuildBranchIndex();
+
+                    if (_branches.Count == 0)
+                        return new FlowRewriteResult(_method.GenTreeMethod, false, _nextTreeId);
+
+                    if (_options.FoldRedundantBranches)
+                        FoldBranches();
+
+                    if (_options.JumpThreadBranches)
+                        ThreadBranches();
+
+                    if (!_changed && !_options.RemoveUnreachableBlocks)
+                        return new FlowRewriteResult(_method.GenTreeMethod, false, _nextTreeId);
+
+                    var blocks = FreezeBlocks();
+                    if (_options.RemoveUnreachableBlocks)
+                    {
+                        var compacted = RemoveUnreachableBlocks(blocks, out bool removed);
+                        if (removed)
+                        {
+                            _changed = true;
+                            blocks = compacted;
+                        }
+                    }
+
+                    if (!_changed)
+                        return new FlowRewriteResult(_method.GenTreeMethod, false, _nextTreeId);
+
+                    return new FlowRewriteResult(_method.GenTreeMethod.CloneWithBlocks(blocks), true, _nextTreeId);
+                }
+
+                private void BuildBranchIndex()
+                {
+                    for (int i = 0; i < _method.Blocks.Length; i++)
+                    {
+                        if (TryBuildBranchInfo(_method.Blocks[i], out var branch))
+                            _branches[branch.BlockId] = branch;
+                    }
+                }
+
+                private void FoldBranches()
+                {
+                    var order = _method.Cfg.ReversePostOrder;
+                    if (order.IsDefaultOrEmpty)
+                    {
+                        for (int blockId = 0; blockId < _method.Blocks.Length; blockId++)
+                            TryFoldBranch(blockId);
+                        return;
+                    }
+
+                    for (int i = 0; i < order.Length; i++)
+                        TryFoldBranch(order[i]);
+                }
+
+                private void TryFoldBranch(int blockId)
+                {
+                    if (!_branches.TryGetValue(blockId, out var branch))
+                        return;
+                    if (!BranchIsStillConditional(branch))
+                        return;
+
+                    if (TryGetConstantBranchValue(branch, out bool constantValue))
+                    {
+                        ReplaceWithUnconditionalBranch(branch, branch.TargetFor(constantValue));
+                        return;
+                    }
+
+                    if (branch.CompareNormalValueNumber.IsValid &&
+                        TryInferBranchValueFromDominators(branch, out bool inferredValue))
+                    {
+                        ReplaceWithUnconditionalBranch(branch, branch.TargetFor(inferredValue));
+                    }
+                }
+
+                private void ThreadBranches()
+                {
+                    var branches = new List<BranchInfo>(_branches.Values);
+                    branches.Sort(static (left, right) => left.BlockId.CompareTo(right.BlockId));
+
+                    for (int i = 0; i < branches.Count; i++)
+                    {
+                        var branch = branches[i];
+                        if (!BranchIsStillConditional(branch))
+                            continue;
+                        if (!branch.CompareNormalValueNumber.IsValid)
+                            continue;
+                        if (!CanThreadThrough(branch))
+                            continue;
+
+                        var predecessors = _method.Cfg.Blocks[branch.BlockId].Predecessors;
+                        for (int p = 0; p < predecessors.Length; p++)
+                        {
+                            var predEdge = predecessors[p];
+                            if (predEdge.Kind == CfgEdgeKind.Exception)
+                                continue;
+
+                            int predId = predEdge.FromBlockId;
+                            if (predId == branch.BlockId)
+                                continue;
+
+                            if (!TryInferBranchValueForIncomingEdge(branch, predId, out bool value))
+                                continue;
+
+                            int target = branch.TargetFor(value);
+                            if (target == branch.BlockId)
+                                continue;
+
+                            RedirectNormalEdge(predId, branch.BlockId, target);
+                        }
+                    }
+                }
+
+                private bool TryBuildBranchInfo(SsaBlock ssaBlock, out BranchInfo branch)
+                {
+                    branch = default;
+
+                    var block = ssaBlock.CfgBlock.SourceBlock;
+                    if (block.Statements.IsDefaultOrEmpty)
+                        return false;
+
+                    if (!TryGetConditionalTransfer(
+                            block.Statements,
+                            out var terminator,
+                            out _,
+                            out _,
+                            out _))
+                    {
+                        return false;
+                    }
+
+                    if (terminator.Operands.Length != 1)
+                        return false;
+
+                    var condition = terminator.Operands[0];
+                    if (!IsPureCondition(condition))
+                        return false;
+
+                    if (!TryGetNormalBranchTargets(block, terminator, out int trueTarget, out int falseTarget))
+                        return false;
+                    if ((uint)trueTarget >= (uint)_method.Blocks.Length || (uint)falseTarget >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    ValueNumber compareNormalVN = ValueNumberStore.NoVN;
+                    _ = TryGetLiberalNormalRelopValueNumber(condition, out compareNormalVN);
+
+                    branch = new BranchInfo(
+                        ssaBlock.Id,
+                        block,
+                        ssaBlock,
+                        terminator,
+                        condition,
+                        compareNormalVN,
+                        trueTarget,
+                        falseTarget);
+                    return true;
+                }
+
+                private bool TryGetConditionalTransfer(
+                    ImmutableArray<GenTree> statements,
+                    out GenTree conditional,
+                    out GenTree? appendedFallThrough,
+                    out int conditionalIndex,
+                    out int appendedIndex)
+                {
+                    conditional = null!;
+                    appendedFallThrough = null;
+                    conditionalIndex = -1;
+                    appendedIndex = -1;
+
+                    if (statements.IsDefaultOrEmpty)
+                        return false;
+
+                    var last = statements[statements.Length - 1];
+                    if (last.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                    {
+                        conditional = last;
+                        conditionalIndex = statements.Length - 1;
+                        return true;
+                    }
+
+                    if (last.Kind == GenTreeKind.Branch && statements.Length >= 2)
+                    {
+                        var previous = statements[statements.Length - 2];
+                        if (previous.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                        {
+                            conditional = previous;
+                            appendedFallThrough = last;
+                            conditionalIndex = statements.Length - 2;
+                            appendedIndex = statements.Length - 1;
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                private bool TryGetConservativeNormalValueNumber(GenTree tree, out ValueNumber vn)
+                {
+                    vn = ValueNumberStore.NoVN;
+
+                    if (_method.ValueNumbers is null)
+                        return false;
+
+                    if (!_method.ValueNumbers.TryGetTreeValue(tree, out var pair))
+                        return false;
+
+                    vn = NormalValueNumber(_method, pair.Conservative);
+                    return vn.IsValid;
+                }
+
+                private bool TryGetLiberalNormalRelopValueNumber(GenTree tree, out ValueNumber vn)
+                {
+                    vn = ValueNumberStore.NoVN;
+
+                    if (_method.ValueNumbers is null)
+                        return false;
+
+                    if (!_method.ValueNumbers.TryGetTreeValue(tree, out var pair))
+                        return false;
+
+                    vn = NormalValueNumber(_method, pair.Liberal);
+                    return IsRelopValueNumber(vn);
+                }
+
+                private bool IsRelopValueNumber(ValueNumber vn)
+                {
+                    if (_method.ValueNumbers is null || !vn.IsValid)
+                        return false;
+
+                    if (!_method.ValueNumbers.Store.TryGetEntry(vn, out var entry))
+                        return false;
+
+                    return entry.Kind == ValueNumberKind.Function && IsComparisonFunction(entry.Function);
+                }
+
+                private static bool IsComparisonFunction(ValueNumberFunction function)
+                    => function is ValueNumberFunction.Ceq
+                        or ValueNumberFunction.Clt
+                        or ValueNumberFunction.CltUn
+                        or ValueNumberFunction.Cgt
+                        or ValueNumberFunction.CgtUn;
+
+                private bool TryGetNormalBranchTargets(GenTreeBlock block, GenTree terminator, out int trueTarget, out int falseTarget)
+                {
+                    trueTarget = -1;
+                    falseTarget = -1;
+
+                    int branchTarget = terminator.TargetBlockId;
+                    if ((uint)branchTarget >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    int otherTarget = -1;
+                    var successors = GetSuccessors(block.Id);
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int succ = successors[i];
+                        if ((uint)succ >= (uint)_method.Blocks.Length)
+                            return false;
+
+                        if (succ == branchTarget)
+                            continue;
+
+                        if (otherTarget >= 0 && otherTarget != succ)
+                            return false;
+
+                        otherTarget = succ;
+                    }
+
+                    if (otherTarget < 0)
+                    {
+                        int fallThrough = block.Id + 1;
+                        if ((uint)fallThrough < (uint)_method.Blocks.Length && fallThrough != branchTarget)
+                            otherTarget = fallThrough;
+                    }
+
+                    if (otherTarget < 0)
+                        return false;
+
+                    if (terminator.Kind == GenTreeKind.BranchTrue)
+                    {
+                        trueTarget = branchTarget;
+                        falseTarget = otherTarget;
+                    }
+                    else
+                    {
+                        trueTarget = otherTarget;
+                        falseTarget = branchTarget;
+                    }
+
+                    return true;
+                }
+
+                private bool TryGetConstantBranchValue(BranchInfo branch, out bool value)
+                {
+                    value = false;
+
+                    if (_method.ValueNumbers is not null &&
+                        TryGetConservativeNormalValueNumber(branch.Condition, out var conditionVN) &&
+                        _method.ValueNumbers.Store.TryGetConstant(conditionVN, out var key))
+                    {
+                        switch (key.Kind)
+                        {
+                            case ValueNumberConstantKind.Int32:
+                                value = key.A != 0;
+                                return true;
+                            case ValueNumberConstantKind.Int64:
+                                value = key.A != 0;
+                                return true;
+                            case ValueNumberConstantKind.Null:
+                                value = false;
+                                return true;
+                        }
+                    }
+
+                    switch (branch.Condition.Kind)
+                    {
+                        case GenTreeKind.ConstI4:
+                            value = branch.Condition.Int32 != 0;
+                            return true;
+                        case GenTreeKind.ConstI8:
+                            value = branch.Condition.Int64 != 0;
+                            return true;
+                        case GenTreeKind.ConstNull:
+                            value = false;
+                            return true;
+                        default:
+                            return false;
+                    }
+                }
+
+                private bool TryInferBranchValueFromDominators(BranchInfo branch, out bool value)
+                {
+                    value = false;
+
+                    var idoms = _method.Cfg.ImmediateDominators;
+                    if ((uint)branch.BlockId >= (uint)idoms.Length)
+                        return false;
+
+                    int dom = idoms[branch.BlockId];
+                    int limit = _method.Blocks.Length;
+                    while ((uint)dom < (uint)_method.Blocks.Length && limit-- > 0)
+                    {
+                        if (_branches.TryGetValue(dom, out var dominating) &&
+                            SamePredicate(dominating, branch) &&
+                            TryInferValueOnPathFromDominator(dominating, branch.BlockId, out value))
+                        {
+                            return true;
+                        }
+
+                        dom = idoms[dom];
+                    }
+
+                    return false;
+                }
+
+                private bool TryInferValueOnPathFromDominator(BranchInfo dominating, int blockId, out bool value)
+                {
+                    value = false;
+
+                    bool onTruePath = Dominates(dominating.TrueTarget, blockId);
+                    bool onFalsePath = Dominates(dominating.FalseTarget, blockId);
+
+                    if (onTruePath == onFalsePath)
+                        return false;
+
+                    value = onTruePath;
+                    return true;
+                }
+
+                private bool TryInferBranchValueForIncomingEdge(BranchInfo branch, int predId, out bool value)
+                {
+                    value = false;
+
+                    if (TryInferDirectPredecessorValue(branch, predId, branch.BlockId, out value))
+                        return true;
+
+                    int child = branch.BlockId;
+                    int probe = predId;
+                    int limit = Math.Min(_method.Blocks.Length, 16);
+
+                    while (limit-- > 0)
+                    {
+                        if (TryInferDirectPredecessorValue(branch, probe, child, out value))
+                            return true;
+
+                        if (!IsTransparentUnconditionalBlock(probe))
+                            break;
+
+                        int solePred = SoleNormalPredecessor(probe);
+                        if (solePred < 0 || solePred == probe)
+                            break;
+
+                        child = probe;
+                        probe = solePred;
+                    }
+
+                    return false;
+                }
+
+                private bool TryInferDirectPredecessorValue(BranchInfo branch, int predId, int edgeTarget, out bool value)
+                {
+                    value = false;
+
+                    if (!_branches.TryGetValue(predId, out var predBranch))
+                        return false;
+                    if (!BranchIsStillConditional(predBranch))
+                        return false;
+                    if (!SamePredicate(predBranch, branch))
+                        return false;
+
+                    bool reachesViaTrue = predBranch.TrueTarget == edgeTarget;
+                    bool reachesViaFalse = predBranch.FalseTarget == edgeTarget;
+
+                    if (reachesViaTrue == reachesViaFalse)
+                        return false;
+
+                    value = reachesViaTrue;
+                    return true;
+                }
+
+                private bool SamePredicate(BranchInfo left, BranchInfo right)
+                    => left.CompareNormalValueNumber.IsValid &&
+                       right.CompareNormalValueNumber.IsValid &&
+                       left.CompareNormalValueNumber == right.CompareNormalValueNumber;
+
+                private bool Dominates(int dominator, int blockId)
+                {
+                    if (dominator == blockId)
+                        return true;
+                    if ((uint)dominator >= (uint)_method.Blocks.Length || (uint)blockId >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    var idoms = _method.Cfg.ImmediateDominators;
+                    int cur = blockId;
+                    int limit = _method.Blocks.Length;
+                    while ((uint)cur < (uint)idoms.Length && limit-- > 0)
+                    {
+                        cur = idoms[cur];
+                        if (cur == dominator)
+                            return true;
+                    }
+
+                    return false;
+                }
+
+                private bool CanThreadThrough(BranchInfo branch)
+                {
+                    if (branch.SsaBlock.Phis.Length != 0 || branch.SsaBlock.MemoryPhis.Length != 0)
+                        return false;
+
+                    var statements = GetStatements(branch.BlockId);
+                    if (!TryGetConditionalTransfer(statements, out var conditional, out var appendedFallThrough, out _, out _))
+                        return false;
+
+                    if (conditional.Id != branch.Terminator.Id)
+                        return false;
+
+                    return statements.Length == 1 || (statements.Length == 2 && appendedFallThrough is not null);
+                }
+
+                private bool IsTransparentUnconditionalBlock(int blockId)
+                {
+                    if ((uint)blockId >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    var ssaBlock = _method.Blocks[blockId];
+                    if (ssaBlock.Phis.Length != 0 || ssaBlock.MemoryPhis.Length != 0)
+                        return false;
+
+                    var statements = GetStatements(blockId);
+                    if (statements.Length == 0)
+                        return GetSuccessors(blockId).Length == 1;
+
+                    if (statements.Length != 1)
+                        return false;
+
+                    var last = statements[0];
+                    return last.Kind == GenTreeKind.Branch && GetSuccessors(blockId).Length == 1;
+                }
+
+                private int SoleNormalPredecessor(int blockId)
+                {
+                    if ((uint)blockId >= (uint)_method.Cfg.Blocks.Length)
+                        return -1;
+
+                    int result = -1;
+                    var predecessors = _method.Cfg.Blocks[blockId].Predecessors;
+                    for (int i = 0; i < predecessors.Length; i++)
+                    {
+                        var edge = predecessors[i];
+                        if (edge.Kind == CfgEdgeKind.Exception)
+                            continue;
+
+                        if (result >= 0 && result != edge.FromBlockId)
+                            return -1;
+
+                        result = edge.FromBlockId;
+                    }
+
+                    return result;
+                }
+
+                private bool BranchIsStillConditional(BranchInfo branch)
+                {
+                    var statements = GetStatements(branch.BlockId);
+                    return TryGetConditionalTransfer(statements, out var conditional, out _, out _, out _) &&
+                           conditional.Id == branch.Terminator.Id;
+                }
+
+                private void ReplaceWithUnconditionalBranch(BranchInfo branch, int targetBlockId)
+                {
+                    if ((uint)targetBlockId >= (uint)_method.Blocks.Length)
+                        return;
+
+                    var statements = GetStatements(branch.BlockId);
+                    if (!TryGetConditionalTransfer(statements, out var conditional, out _, out int conditionalIndex, out int appendedIndex))
+                        return;
+
+                    var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
+                    for (int i = 0; i < statements.Length; i++)
+                    {
+                        if (i == conditionalIndex || i == appendedIndex)
+                            continue;
+
+                        builder.Add(statements[i]);
+                    }
+                    builder.Add(NewUnconditionalBranch(conditional.Pc, targetBlockId));
+
+                    SetBlock(
+                        branch.BlockId,
+                        builder.ToImmutable(),
+                        ImmutableArray.Create(targetBlockId),
+                        ImmutableArray.Create(TargetPc(targetBlockId)),
+                        GenTreeBlockJumpKind.Always);
+                }
+
+                private void RedirectNormalEdge(int fromBlockId, int oldTargetId, int newTargetId)
+                {
+                    if ((uint)fromBlockId >= (uint)_method.Blocks.Length ||
+                        (uint)oldTargetId >= (uint)_method.Blocks.Length ||
+                        (uint)newTargetId >= (uint)_method.Blocks.Length ||
+                        oldTargetId == newTargetId)
+                    {
+                        return;
+                    }
+
+                    var successors = GetSuccessors(fromBlockId);
+                    bool hasOld = false;
+                    var succBuilder = ImmutableArray.CreateBuilder<int>(successors.Length);
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int succ = successors[i];
+                        if (succ == oldTargetId)
+                        {
+                            hasOld = true;
+                            succ = newTargetId;
+                        }
+
+                        if (!Contains(succBuilder, succ))
+                            succBuilder.Add(succ);
+                    }
+
+                    if (!hasOld)
+                        return;
+
+                    var statements = GetStatements(fromBlockId);
+                    if (statements.Length == 0)
+                    {
+                        if (successors.Length != 1)
+                            return;
+
+                        SetBlock(
+                            fromBlockId,
+                            ImmutableArray.Create(NewUnconditionalBranch(_method.GenTreeMethod.Blocks[fromBlockId].StartPc, newTargetId)),
+                            ImmutableArray.Create(newTargetId),
+                            ImmutableArray.Create(TargetPc(newTargetId)),
+                            GenTreeBlockJumpKind.Always);
+                        return;
+                    }
+
+                    if (TryGetConditionalTransfer(
+                            statements,
+                            out var conditional,
+                            out var appendedFallThrough,
+                            out int conditionalIndex,
+                            out int appendedIndex))
+                    {
+                        var rewrittenSuccs = succBuilder.ToImmutable();
+                        if (rewrittenSuccs.Length == 1)
+                        {
+                            var collapsed = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
+                            for (int i = 0; i < statements.Length; i++)
+                            {
+                                if (i == conditionalIndex || i == appendedIndex)
+                                    continue;
+
+                                collapsed.Add(statements[i]);
+                            }
+                            collapsed.Add(NewUnconditionalBranch(conditional.Pc, rewrittenSuccs[0]));
+
+                            SetBlock(
+                                fromBlockId,
+                                collapsed.ToImmutable(),
+                                rewrittenSuccs,
+                                SuccessorPcsFor(rewrittenSuccs),
+                                GenTreeBlockJumpKind.Always);
+                            return;
+                        }
+
+                        var builder = statements.ToBuilder();
+                        if (conditional.TargetBlockId == oldTargetId)
+                        {
+                            builder[conditionalIndex] = CloneTreeWithTarget(conditional, newTargetId);
+                        }
+                        else if (appendedFallThrough is not null && appendedFallThrough.TargetBlockId == oldTargetId)
+                        {
+                            builder[appendedIndex] = CloneTreeWithTarget(appendedFallThrough, newTargetId);
+                        }
+                        else
+                        {
+                            builder.Add(NewUnconditionalBranch(conditional.Pc, newTargetId));
+                        }
+
+                        SetBlock(
+                            fromBlockId,
+                            builder.ToImmutable(),
+                            rewrittenSuccs,
+                            SuccessorPcsFor(rewrittenSuccs),
+                            GenTreeBlockJumpKind.Conditional);
+                        return;
+                    }
+
+                    var last = statements[statements.Length - 1];
+                    if (last.Kind == GenTreeKind.Branch)
+                    {
+                        if (last.TargetBlockId != oldTargetId)
+                            return;
+
+                        var builder = statements.ToBuilder();
+                        builder[builder.Count - 1] = CloneTreeWithTarget(last, newTargetId);
+
+                        SetBlock(
+                            fromBlockId,
+                            builder.ToImmutable(),
+                            ImmutableArray.Create(newTargetId),
+                            ImmutableArray.Create(TargetPc(newTargetId)),
+                            GenTreeBlockJumpKind.Always);
+                    }
+                }
+
+                private void SetBlock(
+                    int blockId,
+                    ImmutableArray<GenTree> statements,
+                    ImmutableArray<int> successors,
+                    ImmutableArray<int> successorPcs,
+                    GenTreeBlockJumpKind jumpKind)
+                {
+                    var original = _method.GenTreeMethod.Blocks[blockId];
+                    _edits[blockId] = new MutableBlock(
+                        original,
+                        statements,
+                        successors,
+                        successorPcs,
+                        jumpKind);
+                    _changed = true;
+                }
+
+                private ImmutableArray<GenTreeBlock> FreezeBlocks()
+                {
+                    if (_edits.Count == 0)
+                        return _method.GenTreeMethod.Blocks;
+
+                    var builder = ImmutableArray.CreateBuilder<GenTreeBlock>(_method.GenTreeMethod.Blocks.Length);
+                    for (int i = 0; i < _method.GenTreeMethod.Blocks.Length; i++)
+                    {
+                        if (!_edits.TryGetValue(i, out var edit))
+                        {
+                            builder.Add(_method.GenTreeMethod.Blocks[i]);
+                            continue;
+                        }
+
+                        builder.Add(new GenTreeBlock(
+                            edit.Original.Id,
+                            edit.Original.StartPc,
+                            edit.Original.EndPcExclusive,
+                            edit.Original.EntryStackDepth,
+                            edit.Original.ExitStackDepth,
+                            edit.JumpKind,
+                            edit.Original.Flags,
+                            edit.Statements,
+                            edit.Successors,
+                            edit.SuccessorPcs));
+                    }
+
+                    return builder.ToImmutable();
+                }
+
+                private ImmutableArray<GenTreeBlock> RemoveUnreachableBlocks(ImmutableArray<GenTreeBlock> blocks, out bool removed)
+                {
+                    removed = false;
+
+                    if (blocks.Length == 0)
+                        return blocks;
+
+                    if (_method.GenTreeMethod.Function.ExceptionHandlers.Length != 0 || _method.Cfg.ExceptionRegions.Length != 0)
+                        return blocks;
+
+                    var reachable = new bool[blocks.Length];
+                    var stack = new Stack<int>();
+                    reachable[0] = true;
+                    stack.Push(0);
+
+                    while (stack.Count != 0)
+                    {
+                        int blockId = stack.Pop();
+                        var successors = blocks[blockId].SuccessorBlockIds;
+                        for (int i = 0; i < successors.Length; i++)
+                        {
+                            int succ = successors[i];
+                            if ((uint)succ >= (uint)blocks.Length || reachable[succ])
+                                continue;
+
+                            reachable[succ] = true;
+                            stack.Push(succ);
+                        }
+                    }
+
+                    int reachableCount = 0;
+                    for (int i = 0; i < reachable.Length; i++)
+                    {
+                        if (reachable[i])
+                            reachableCount++;
+                    }
+
+                    if (reachableCount == blocks.Length)
+                        return blocks;
+
+                    removed = true;
+
+                    var map = new int[blocks.Length];
+                    for (int i = 0; i < map.Length; i++)
+                        map[i] = -1;
+
+                    int next = 0;
+                    for (int i = 0; i < blocks.Length; i++)
+                    {
+                        if (reachable[i])
+                            map[i] = next++;
+                    }
+
+                    var builder = ImmutableArray.CreateBuilder<GenTreeBlock>(reachableCount);
+                    for (int oldId = 0; oldId < blocks.Length; oldId++)
+                    {
+                        if (!reachable[oldId])
+                            continue;
+
+                        var old = blocks[oldId];
+                        int newId = map[oldId];
+                        var successors = RemapSuccessors(old.SuccessorBlockIds, map);
+                        var statements = RemapStatementTargets(old.Statements, map, blocks);
+                        builder.Add(new GenTreeBlock(
+                            newId,
+                            old.StartPc,
+                            old.EndPcExclusive,
+                            old.EntryStackDepth,
+                            old.ExitStackDepth,
+                            old.JumpKind,
+                            RemapBlockFlags(old.Flags, oldId, newId),
+                            statements,
+                            successors,
+                            SuccessorPcsFor(successors, blocks, map)));
+                    }
+
+                    return builder.ToImmutable();
+                }
+
+                private ImmutableArray<int> RemapSuccessors(ImmutableArray<int> successors, int[] map)
+                {
+                    if (successors.IsDefaultOrEmpty)
+                        return ImmutableArray<int>.Empty;
+
+                    var builder = ImmutableArray.CreateBuilder<int>(successors.Length);
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int succ = successors[i];
+                        if ((uint)succ >= (uint)map.Length || map[succ] < 0)
+                            continue;
+
+                        int mapped = map[succ];
+                        if (!Contains(builder, mapped))
+                            builder.Add(mapped);
+                    }
+
+                    return builder.ToImmutable();
+                }
+
+                private ImmutableArray<GenTree> RemapStatementTargets(ImmutableArray<GenTree> statements, int[] map, ImmutableArray<GenTreeBlock> oldBlocks)
+                {
+                    if (statements.IsDefaultOrEmpty)
+                        return ImmutableArray<GenTree>.Empty;
+
+                    ImmutableArray<GenTree>.Builder? builder = null;
+                    for (int i = 0; i < statements.Length; i++)
+                    {
+                        var rewritten = RemapTreeTarget(statements[i], map, oldBlocks);
+                        if (!ReferenceEquals(rewritten, statements[i]) && builder is null)
+                        {
+                            builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
+                            for (int j = 0; j < i; j++)
+                                builder.Add(statements[j]);
+                        }
+
+                        builder?.Add(rewritten);
+                    }
+
+                    return builder is null ? statements : builder.ToImmutable();
+                }
+
+                private GenTree RemapTreeTarget(GenTree tree, int[] map, ImmutableArray<GenTreeBlock> oldBlocks)
+                {
+                    ImmutableArray<GenTree>.Builder? operands = null;
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                    {
+                        var operand = RemapTreeTarget(tree.Operands[i], map, oldBlocks);
+                        if (!ReferenceEquals(operand, tree.Operands[i]) && operands is null)
+                        {
+                            operands = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
+                            for (int j = 0; j < i; j++)
+                                operands.Add(tree.Operands[j]);
+                        }
+
+                        operands?.Add(operand);
+                    }
+
+                    int targetBlock = tree.TargetBlockId;
+                    int mappedTarget = targetBlock;
+                    int mappedTargetPc = tree.TargetPc;
+                    bool targetChanged = false;
+
+                    if ((uint)targetBlock < (uint)map.Length)
+                    {
+                        mappedTarget = map[targetBlock];
+                        if (mappedTarget < 0)
+                            mappedTarget = targetBlock;
+                        else if (mappedTarget != targetBlock)
+                            targetChanged = true;
+
+                        if (targetChanged && (uint)targetBlock < (uint)oldBlocks.Length)
+                            mappedTargetPc = oldBlocks[targetBlock].StartPc;
+                    }
+
+                    if (operands is null && !targetChanged)
+                        return tree;
+
+                    return new GenTree(
+                        tree.Id,
+                        tree.Kind,
+                        tree.Pc,
+                        tree.SourceOp,
+                        tree.Type,
+                        tree.StackKind,
+                        tree.Flags,
+                        operands?.ToImmutable() ?? tree.Operands,
+                        int32: tree.Int32,
+                        int64: tree.Int64,
+                        text: tree.Text,
+                        runtimeType: tree.RuntimeType,
+                        field: tree.Field,
+                        method: tree.Method,
+                        convKind: tree.ConvKind,
+                        convFlags: tree.ConvFlags,
+                        targetPc: mappedTargetPc,
+                        targetBlockId: mappedTarget);
+                }
+
+                private static GenTreeBlockFlags RemapBlockFlags(GenTreeBlockFlags flags, int oldId, int newId)
+                {
+                    if (oldId == newId)
+                        return flags;
+
+                    if ((flags & GenTreeBlockFlags.Entry) != 0 && newId != 0)
+                        return flags & ~GenTreeBlockFlags.Entry;
+
+                    if (newId == 0)
+                        return (flags | GenTreeBlockFlags.Entry);
+
+                    return flags;
+                }
+
+                private GenTree NewUnconditionalBranch(int pc, int targetBlockId)
+                    => new GenTree(
+                        _nextTreeId++,
+                        GenTreeKind.Branch,
+                        pc,
+                        BytecodeOp.Br,
+                        null,
+                        GenStackKind.Void,
+                        GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
+                        ImmutableArray<GenTree>.Empty,
+                        targetPc: TargetPc(targetBlockId),
+                        targetBlockId: targetBlockId);
+
+                private GenTree CloneTreeWithTarget(GenTree tree, int targetBlockId)
+                    => new GenTree(
+                        tree.Id,
+                        tree.Kind,
+                        tree.Pc,
+                        tree.SourceOp,
+                        tree.Type,
+                        tree.StackKind,
+                        tree.Flags,
+                        tree.Operands,
+                        int32: tree.Int32,
+                        int64: tree.Int64,
+                        text: tree.Text,
+                        runtimeType: tree.RuntimeType,
+                        field: tree.Field,
+                        method: tree.Method,
+                        convKind: tree.ConvKind,
+                        convFlags: tree.ConvFlags,
+                        targetPc: TargetPc(targetBlockId),
+                        targetBlockId: targetBlockId);
+
+                private ImmutableArray<GenTree> GetStatements(int blockId)
+                    => _edits.TryGetValue(blockId, out var edit)
+                        ? edit.Statements
+                        : _method.GenTreeMethod.Blocks[blockId].Statements;
+
+                private ImmutableArray<int> GetSuccessors(int blockId)
+                    => _edits.TryGetValue(blockId, out var edit)
+                        ? edit.Successors
+                        : _method.GenTreeMethod.Blocks[blockId].SuccessorBlockIds;
+
+                private int TargetPc(int blockId)
+                    => _method.GenTreeMethod.Blocks[blockId].StartPc;
+
+                private ImmutableArray<int> SuccessorPcsFor(ImmutableArray<int> successors)
+                    => SuccessorPcsFor(successors, _method.GenTreeMethod.Blocks, oldToNewMap: null);
+
+                private ImmutableArray<int> SuccessorPcsFor(ImmutableArray<int> successors, ImmutableArray<GenTreeBlock> blocks, int[]? oldToNewMap)
+                {
+                    if (successors.IsDefaultOrEmpty)
+                        return ImmutableArray<int>.Empty;
+
+                    var builder = ImmutableArray.CreateBuilder<int>(successors.Length);
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int succ = successors[i];
+                        int oldSucc = succ;
+
+                        if (oldToNewMap is not null)
+                        {
+                            oldSucc = -1;
+                            for (int old = 0; old < oldToNewMap.Length; old++)
+                            {
+                                if (oldToNewMap[old] == succ)
+                                {
+                                    oldSucc = old;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ((uint)oldSucc < (uint)blocks.Length)
+                            builder.Add(blocks[oldSucc].StartPc);
+                    }
+
+                    return builder.ToImmutable();
+                }
+
+                private static bool Contains(ImmutableArray<int>.Builder builder, int value)
+                {
+                    for (int i = 0; i < builder.Count; i++)
+                    {
+                        if (builder[i] == value)
+                            return true;
+                    }
+
+                    return false;
+                }
+
+                private static bool IsPureCondition(GenTree tree)
+                {
+                    if ((tree.Flags & (GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite | GenTreeFlags.CanThrow | GenTreeFlags.ExceptionFlow | GenTreeFlags.Ordered)) != 0)
+                        return false;
+
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                    {
+                        if (!IsPureCondition(tree.Operands[i]))
+                            return false;
+                    }
+
+                    return true;
+                }
+
+                private readonly struct BranchInfo
+                {
+                    public readonly int BlockId;
+                    public readonly GenTreeBlock Block;
+                    public readonly SsaBlock SsaBlock;
+                    public readonly GenTree Terminator;
+                    public readonly GenTree Condition;
+                    public readonly ValueNumber CompareNormalValueNumber;
+                    public readonly int TrueTarget;
+                    public readonly int FalseTarget;
+
+                    public BranchInfo(
+                        int blockId,
+                        GenTreeBlock block,
+                        SsaBlock ssaBlock,
+                        GenTree terminator,
+                        GenTree condition,
+                        ValueNumber compareNormalValueNumber,
+                        int trueTarget,
+                        int falseTarget)
+                    {
+                        BlockId = blockId;
+                        Block = block;
+                        SsaBlock = ssaBlock;
+                        Terminator = terminator;
+                        Condition = condition;
+                        CompareNormalValueNumber = compareNormalValueNumber;
+                        TrueTarget = trueTarget;
+                        FalseTarget = falseTarget;
+                    }
+
+                    public int TargetFor(bool conditionValue) => conditionValue ? TrueTarget : FalseTarget;
+                }
+
+                private readonly struct MutableBlock
+                {
+                    public readonly GenTreeBlock Original;
+                    public readonly ImmutableArray<GenTree> Statements;
+                    public readonly ImmutableArray<int> Successors;
+                    public readonly ImmutableArray<int> SuccessorPcs;
+                    public readonly GenTreeBlockJumpKind JumpKind;
+
+                    public MutableBlock(
+                        GenTreeBlock original,
+                        ImmutableArray<GenTree> statements,
+                        ImmutableArray<int> successors,
+                        ImmutableArray<int> successorPcs,
+                        GenTreeBlockJumpKind jumpKind)
+                    {
+                        Original = original ?? throw new ArgumentNullException(nameof(original));
+                        Statements = statements.IsDefault ? ImmutableArray<GenTree>.Empty : statements;
+                        Successors = successors.IsDefault ? ImmutableArray<int>.Empty : successors;
+                        SuccessorPcs = successorPcs.IsDefault ? ImmutableArray<int>.Empty : successorPcs;
+                        JumpKind = jumpKind;
+                    }
+                }
+            }
+
+            private readonly struct FlowRewriteResult
+            {
+                public readonly GenTreeMethod Method;
+                public readonly bool Changed;
+                public readonly int NextSyntheticTreeId;
+
+                public FlowRewriteResult(GenTreeMethod method, bool changed, int nextSyntheticTreeId)
+                {
+                    Method = method ?? throw new ArgumentNullException(nameof(method));
+                    Changed = changed;
+                    NextSyntheticTreeId = nextSyntheticTreeId;
+                }
+            }
 
             private readonly struct CopyPropSsaDef
             {
@@ -6393,13 +7631,13 @@ namespace Cnidaria.Cs
 
                 changed = true;
                 return new SsaTree(
-                    tree.Source, 
-                    operands.ToImmutable(), 
-                    tree.Value, 
-                    tree.StoreTarget, 
-                    tree.LocalFieldBaseValue, 
-                    tree.LocalField, 
-                    tree.MemoryUses, 
+                    tree.Source,
+                    operands.ToImmutable(),
+                    tree.Value,
+                    tree.StoreTarget,
+                    tree.LocalFieldBaseValue,
+                    tree.LocalField,
+                    tree.MemoryUses,
                     tree.MemoryDefinitions);
             }
 
@@ -6512,10 +7750,10 @@ namespace Cnidaria.Cs
                     _ => template.Kind,
                 };
 
-                var flags = (template.Flags & 
-                    ~(GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect 
-                    | GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow 
-                    | GenTreeFlags.ExceptionFlow | GenTreeFlags.AddressExposed | GenTreeFlags.VarDef 
+                var flags = (template.Flags &
+                    ~(GenTreeFlags.MemoryRead | GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect
+                    | GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.ControlFlow
+                    | GenTreeFlags.ExceptionFlow | GenTreeFlags.AddressExposed | GenTreeFlags.VarDef
                     | GenTreeFlags.VarUseAsg | GenTreeFlags.VarDeath)) | GenTreeFlags.LocalUse;
                 var source = new GenTree(
                     _nextSyntheticTreeId++,
@@ -6641,7 +7879,7 @@ namespace Cnidaria.Cs
                 {
                     var left = EvaluateTree(method, tree.Operands[0], facts);
                     var right = EvaluateTree(method, tree.Operands[1], facts);
-                    if (left.Kind == ValueFactKind.Constant 
+                    if (left.Kind == ValueFactKind.Constant
                         && right.Kind == ValueFactKind.Constant && TryFoldBinary(tree.Source, left.Constant, right.Constant, out var folded))
                         return ValueFact.ForConstant(folded);
                 }
@@ -6900,13 +8138,13 @@ namespace Cnidaria.Cs
 
                 var candidate = operandChanged
                     ? new SsaTree(
-                        tree.Source, 
-                        operands.ToImmutable(), 
-                        tree.Value, 
-                        tree.StoreTarget, 
-                        tree.LocalFieldBaseValue, 
-                        tree.LocalField, 
-                        tree.MemoryUses, 
+                        tree.Source,
+                        operands.ToImmutable(),
+                        tree.Value,
+                        tree.StoreTarget,
+                        tree.LocalFieldBaseValue,
+                        tree.LocalField,
+                        tree.MemoryUses,
                         tree.MemoryDefinitions)
                     : tree;
 
@@ -7419,19 +8657,19 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Mul:
                         if (IsOne(rightFact)) { simplified = left; return true; }
                         if (IsOne(leftFact)) { simplified = right; return true; }
-                        if (IsZero(rightFact) && !HasObservableEffect(left)) 
+                        if (IsZero(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right)) 
+                        if (IsZero(leftFact) && !HasObservableEffect(right))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift)) 
-                        { 
-                            simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift); 
-                            return true; 
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift))
+                        {
+                            simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift);
+                            return true;
                         }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift)) 
-                        { 
-                            simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift); 
-                            return true; 
+                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift))
+                        {
+                            simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift);
+                            return true;
                         }
                         break;
 
@@ -7442,14 +8680,14 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Rem:
                     case BytecodeOp.Rem_Un:
-                        if (IsOne(rightFact) && !HasObservableEffect(left)) 
+                        if (IsOne(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
                     case BytecodeOp.And:
-                        if (IsZero(rightFact) && !HasObservableEffect(left)) 
+                        if (IsZero(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right)) 
+                        if (IsZero(leftFact) && !HasObservableEffect(right))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         if (IsAllBitsSet(rightFact)) { simplified = left; return true; }
                         if (IsAllBitsSet(leftFact)) { simplified = right; return true; }
@@ -7459,9 +8697,9 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Or:
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left)) 
+                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
-                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right)) 
+                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right))
                         { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
                         if (SameValue(method, left, right, facts)) { simplified = left; return true; }
                         break;
@@ -7469,7 +8707,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Xor:
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (SameValue(method, left, right, facts)) 
+                        if (SameValue(method, left, right, facts))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
@@ -7480,7 +8718,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Ceq:
-                        if (SameValue(method, left, right, facts)) 
+                        if (SameValue(method, left, right, facts))
                         { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
                         break;
 
@@ -7488,7 +8726,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Clt_Un:
                     case BytecodeOp.Cgt:
                     case BytecodeOp.Cgt_Un:
-                        if (SameValue(method, left, right, facts)) 
+                        if (SameValue(method, left, right, facts))
                         { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
                         break;
                 }
@@ -7511,7 +8749,7 @@ namespace Cnidaria.Cs
                     BytecodeOp.Shl,
                     template.Type,
                     template.StackKind,
-                    template.Flags & ~(GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.MemoryRead | 
+                    template.Flags & ~(GenTreeFlags.CanThrow | GenTreeFlags.ContainsCall | GenTreeFlags.MemoryRead |
                     GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow),
                     genOperands);
 

@@ -55,13 +55,13 @@ namespace Cnidaria.Cs
                 if(diagnostics.All(x => x.GetSeverity() != DiagnosticSeverity.Error))
                 {
                     InstructionsExecuted.Add(context.InstructionsCount);
+                    BuildTime.Add(context.BuildTime);
+                    CompilationTime.Add(context.ComlilationTime);
                 }
                 else
                 {
                     InstructionsExecuted.Add(-1);
                 }
-                BuildTime.Add(context.BuildTime);
-                CompilationTime.Add(context.ComlilationTime);
                 Assert(output, target);
             }
         }
@@ -1583,6 +1583,10 @@ IEnumerable<int> ProduceEvenNumbers(int upto)
             
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
+            foreach (var msg in FailedMessages)
+            {
+                Console.WriteLine(msg);
+            }
             Console.WriteLine($"Average instructions executed count: " +
                 $"{(InstructionsExecuted.Count > 0 ? (long)InstructionsExecuted.Where(x => x > 0L).Average() : 0L)}" +
                 $"\nPeak instructions executed count: {InstructionsExecuted.Max()} at i {InstructionsExecuted.IndexOf(InstructionsExecuted.Max())}");
@@ -1590,10 +1594,6 @@ IEnumerable<int> ProduceEvenNumbers(int upto)
                 $"{new TimeSpan((BuildTime.Count > 0 ? Convert.ToInt64(BuildTime.Average(x => x.Ticks)) : 0L))}");
             Console.WriteLine($"Average compilation time: " +
                 $"{new TimeSpan((CompilationTime.Count > 0 ? Convert.ToInt64(CompilationTime.Average(x => x.Ticks)) : 0L))}");
-            foreach (var msg in FailedMessages)
-            {
-                Console.WriteLine(msg);
-            }
         }
     }
 }

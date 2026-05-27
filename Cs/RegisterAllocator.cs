@@ -3607,7 +3607,9 @@ namespace Cnidaria.Cs
             var method = registerMethod.GenTreeMethod;
             var allocationByValue = new Dictionary<GenTreeValueKey, RegisterAllocationInfo>();
             foreach (var allocation in registerMethod.Allocations)
+            {
                 allocationByValue[allocation.ValueKey] = allocation;
+            }
 
             method.AttachLsraFinalState(
                 registerMethod.Allocations,

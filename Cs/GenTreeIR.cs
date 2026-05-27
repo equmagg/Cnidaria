@@ -1098,7 +1098,6 @@ namespace Cnidaria.Cs
             LinearPhiCopyFromBlockId = phiCopyFromBlockId;
             LinearPhiCopyToBlockId = phiCopyToBlockId;
         }
-
         internal void AttachRegisterAllocation(RegisterAllocationInfo allocation)
         {
             if (allocation is null)
@@ -1361,6 +1360,30 @@ namespace Cnidaria.Cs
             Blocks = blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks;
             DirectDependencies = directDependencies.IsDefault ? ImmutableArray<RuntimeMethod>.Empty : directDependencies;
             VirtualDependencies = virtualDependencies.IsDefault ? ImmutableArray<RuntimeMethod>.Empty : virtualDependencies;
+        }
+
+
+        internal GenTreeMethod CloneWithBlocks(ImmutableArray<GenTreeBlock> blocks)
+        {
+            blocks = blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks;
+
+            var clone = new GenTreeMethod(
+                Module,
+                RuntimeMethod,
+                Function,
+                ArgTypes,
+                LocalTypes,
+                Temps,
+                blocks,
+                DirectDependencies,
+                VirtualDependencies);
+
+            clone.ArgDescriptors = ArgDescriptors;
+            clone.LocalDescriptors = LocalDescriptors;
+            clone.TempDescriptors = TempDescriptors;
+            clone.AllLocalDescriptors = AllLocalDescriptors;
+            clone.AttachLocalDescriptorsToTrees(blocks);
+            return clone;
         }
 
         private static ImmutableArray<GenLocalDescriptor> BuildArgDescriptors(ImmutableArray<RuntimeType> args)
@@ -1760,10 +1783,16 @@ namespace Cnidaria.Cs
 
         public RegisterOperand GetHome(GenTree value)
         {
-            if (value is null) throw new ArgumentNullException(nameof(value));
-            if (value.RegisterAllocation is null)
-                throw new InvalidOperationException("No LSRA home is attached to GenTree value " + value + ".");
-            return value.RegisterHome;
+            if (value is null)
+                throw new ArgumentNullException(nameof(value));
+
+            if (RegisterAllocationByValue.TryGetValue(value.LinearValueKey, out var allocation))
+                return allocation.Home;
+
+            if (value.RegisterAllocation is not null)
+                return value.RegisterHome;
+
+            throw new InvalidOperationException($"No LSRA home is attached to GenTree value {value}.");
         }
 
         public RegisterValueLocation GetValueLocation(GenTree value, int position, bool isReturn = false)
@@ -1824,10 +1853,12 @@ namespace Cnidaria.Cs
         private readonly RuntimeTypeSystem _rts;
         private readonly Dictionary<int, (RuntimeModule module, BytecodeFunction body, RuntimeMethod method)> _bodyByMethodId = new();
         private readonly Dictionary<int, GenTreeMethod> _built = new();
-        private readonly List<RuntimeMethod> _allBodyMethods = new();
         private readonly Dictionary<int, ImmutableArray<RuntimeMethod>> _virtualTargetCache = new();
-        private readonly HashSet<int> _scannedConstructedGenericVirtualTargetTypeIds = new();
-        private readonly HashSet<int> _scannedConstructedGenericCctorTypeIds = new();
+        private readonly Dictionary<int, RuntimeType> _liveInstantiatedTypes = new();
+        private readonly HashSet<int> _scannedLiveConstructedGenericTypeIds = new();
+        private readonly HashSet<int> _scannedLiveConstructedGenericCctorTypeIds = new();
+        private int _liveInstantiatedTypeVersion;
+        private int _virtualTargetScanVersion;
         public GenTreeBuilder(IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeTypeSystem rts)
         {
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
@@ -1924,11 +1955,7 @@ namespace Cnidaria.Cs
                 if (method is null)
                     return false;
 
-                if (!TryGetBuildableBody(
-                        method,
-                        out _,
-                        out _,
-                        out RuntimeMethod buildMethod))
+                if (!TryGetBuildableBody(method, out _, out _, out RuntimeMethod buildMethod))
                 {
                     return false;
                 }
@@ -1971,27 +1998,16 @@ namespace Cnidaria.Cs
             bool EnqueueConstructedGenericBodiesDiscoveredDuringImport()
             {
                 bool added = false;
-                bool discoveredConstructedGenericType = false;
-                RuntimeType[] types = _rts.SnapshotKnownTypes();
 
-                for (int i = 0; i < types.Length; i++)
+                foreach (RuntimeType type in _liveInstantiatedTypes.Values)
                 {
-                    RuntimeType type = types[i];
-
                     if (type.GenericTypeDefinition is null)
                         continue;
 
-                    bool scanVirtualTargets = _scannedConstructedGenericVirtualTargetTypeIds.Add(type.TypeId);
-                    bool scanCctor = _scannedConstructedGenericCctorTypeIds.Add(type.TypeId);
+                    if (_scannedLiveConstructedGenericTypeIds.Add(type.TypeId))
+                        _rts.EnsureConstructedMembers(type);
 
-                    if (!scanVirtualTargets && !scanCctor)
-                        continue;
-
-                    discoveredConstructedGenericType |= scanVirtualTargets;
-                    _rts.EnsureConstructedMembers(type);
-
-
-                    if (scanCctor)
+                    if (_scannedLiveConstructedGenericCctorTypeIds.Add(type.TypeId))
                     {
                         RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(type);
                         if (cctor is not null)
@@ -1999,9 +2015,10 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (discoveredConstructedGenericType && virtualDependencies.Count != 0)
+                if (_virtualTargetScanVersion != _liveInstantiatedTypeVersion && virtualDependencies.Count != 0)
                 {
                     _virtualTargetCache.Clear();
+                    _virtualTargetScanVersion = _liveInstantiatedTypeVersion;
 
                     for (int i = 0; i < virtualDependencies.Count; i++)
                     {
@@ -2012,8 +2029,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-
-                return added || discoveredConstructedGenericType;
+                return added;
             }
         }
 
@@ -2042,7 +2058,6 @@ namespace Cnidaria.Cs
                     }
 
                     _bodyByMethodId[method.MethodId] = (module, body, method);
-                    _allBodyMethods.Add(method);
                 }
             }
         }
@@ -2054,8 +2069,41 @@ namespace Cnidaria.Cs
 
             var builder = new GenTreeMethodBuilder(_rts, module, body, method);
             var result = builder.Build();
+
+            MarkLiveInstantiatedTypes(builder.InstantiatedTypes);
+
             _built.Add(method.MethodId, result);
             return result;
+        }
+
+        private void MarkLiveInstantiatedTypes(ImmutableArray<RuntimeType> types)
+        {
+            if (types.IsDefaultOrEmpty)
+                return;
+
+            for (int i = 0; i < types.Length; i++)
+                MarkLiveInstantiatedType(types[i]);
+        }
+
+        private bool MarkLiveInstantiatedType(RuntimeType? type)
+        {
+            if (!CanHaveRuntimeInstance(type))
+                return false;
+
+            if (!_liveInstantiatedTypes.TryAdd(type!.TypeId, type))
+                return false;
+
+            _liveInstantiatedTypeVersion++;
+            _virtualTargetCache.Clear();
+            return true;
+        }
+
+        private static bool CanHaveRuntimeInstance(RuntimeType? type)
+        {
+            if (type is null)
+                return false;
+
+            return type.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.Array;
         }
         private ImmutableArray<RuntimeMethod> GetVirtualTargets(RuntimeMethod declared)
         {
@@ -2083,38 +2131,33 @@ namespace Cnidaria.Cs
             if (declared.BodyModule is not null && declared.Body is not null)
                 yield return declared;
 
-            for (int i = 0; i < _allBodyMethods.Count; i++)
+            foreach (RuntimeType runtimeType in _liveInstantiatedTypes.Values)
             {
-                var candidate = _allBodyMethods[i];
+                if (runtimeType.GenericTypeDefinition is not null)
+                    _rts.EnsureConstructedMembers(runtimeType);
 
-                if (IsVirtualTargetCandidate(candidate, declared))
-                    yield return candidate;
-            }
-
-            RuntimeType[] knownTypes = _rts.SnapshotKnownTypes();
-
-            for (int t = 0; t < knownTypes.Length; t++)
-            {
-                RuntimeType candidateOwner = knownTypes[t];
-
-                _rts.EnsureConstructedMembers(candidateOwner);
-
-                if (!CanBeVirtualTarget(candidateOwner, declared.DeclaringType))
+                if (!CanBeVirtualTarget(runtimeType, declared.DeclaringType))
                     continue;
 
-                if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
+                for (RuntimeType? owner = runtimeType; owner is not null; owner = owner.BaseType)
                 {
-                    foreach (RuntimeMethod explicitTarget in EnumerateExplicitInterfaceTargets(candidateOwner, declared))
-                        yield return explicitTarget;
-                }
+                    if (owner.GenericTypeDefinition is not null)
+                        _rts.EnsureConstructedMembers(owner);
 
-                var methods = candidateOwner.Methods;
-                for (int m = 0; m < methods.Length; m++)
-                {
-                    var candidate = methods[m];
+                    if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
+                    {
+                        foreach (RuntimeMethod explicitTarget in EnumerateExplicitInterfaceTargets(owner, declared))
+                            yield return explicitTarget;
+                    }
 
-                    if (IsVirtualTargetCandidate(candidate, declared))
-                        yield return candidate;
+                    var methods = owner.Methods;
+                    for (int m = 0; m < methods.Length; m++)
+                    {
+                        var candidate = methods[m];
+
+                        if (IsVirtualTargetCandidate(candidate, declared))
+                            yield return candidate;
+                    }
                 }
             }
         }
@@ -2342,6 +2385,7 @@ namespace Cnidaria.Cs
         private readonly HashSet<int> _virtualDependencyIds = new();
         private readonly List<RuntimeMethod> _directDependencies = new();
         private readonly List<RuntimeMethod> _virtualDependencies = new();
+        private readonly Dictionary<int, RuntimeType> _instantiatedTypes = new();
 
         private RuntimeType[] _argTypes = Array.Empty<RuntimeType>();
         private RuntimeType[] _localTypes = Array.Empty<RuntimeType>();
@@ -2350,6 +2394,11 @@ namespace Cnidaria.Cs
         private Dictionary<int, int> _pcToBlockId = new();
         private int _nextNodeId;
         private int _nextTempIndex;
+
+        public ImmutableArray<RuntimeType> InstantiatedTypes
+            => _instantiatedTypes.Count == 0
+                ? ImmutableArray<RuntimeType>.Empty
+                : _instantiatedTypes.Values.ToImmutableArray();
 
         public GenTreeMethodBuilder(
             RuntimeTypeSystem rts,
@@ -2469,6 +2518,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Ldstr:
+                        MarkInstantiatedType(_rts.SystemString);
                         Push(stack, Node(GenTreeKind.ConstString, pc, ins.Op, type: _rts.SystemString, stackKind: GenStackKind.Ref,
                             int32: ins.Operand0, text: _module.Md.GetUserString(MetadataToken.Rid(ins.Operand0))));
                         break;
@@ -2476,6 +2526,8 @@ namespace Cnidaria.Cs
                     case BytecodeOp.DefaultValue:
                         {
                             var t = ResolveType(ins.Operand0);
+                            if (t.IsValueType)
+                                MarkInstantiatedType(t);
                             Push(stack, Node(GenTreeKind.DefaultValue, pc, ins.Op, type: t, stackKind: StackKindOf(t), runtimeType: t));
                             break;
                         }
@@ -2484,6 +2536,14 @@ namespace Cnidaria.Cs
                         {
                             var t = ResolveType(ins.Operand0);
                             Push(stack, Node(GenTreeKind.SizeOf, pc, ins.Op, stackKind: GenStackKind.I4, runtimeType: t));
+                            break;
+                        }
+
+                    case BytecodeOp.TypeIsValueType:
+                        {
+                            var t = ResolveType(ins.Operand0);
+                            Push(stack, Node(GenTreeKind.ConstI4, pc, ins.Op, stackKind: GenStackKind.I4,
+                                int32: RuntimeTypeIsValueType(t, pc, ins.Op) ? 1 : 0));
                             break;
                         }
 
@@ -2650,6 +2710,7 @@ namespace Cnidaria.Cs
                             var length = Pop(stack, pc, ins.Op);
                             var elemType = ResolveType(ins.Operand0);
                             var arrayType = _rts.GetArrayType(elemType);
+                            MarkInstantiatedType(arrayType);
                             PushImportedValue(stack, statements, Node(GenTreeKind.NewArray, pc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
                                 operands: One(length.Node), runtimeType: elemType));
                             break;
@@ -3277,6 +3338,7 @@ namespace Cnidaria.Cs
 
                 case BytecodeOp.Box:
                     operandType = ResolveType(ins.Operand0);
+                    MarkInstantiatedType(operandType);
                     type = _rts.SystemObject;
                     stackKind = GenStackKind.Ref;
                     break;
@@ -3331,6 +3393,15 @@ namespace Cnidaria.Cs
 
         private RuntimeType ObjectArrayType => _rts.GetArrayType(_rts.SystemObject);
 
+        private void MarkInstantiatedType(RuntimeType? type)
+        {
+            if (type is null)
+                return;
+
+            if (type.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.Array)
+                _instantiatedTypes.TryAdd(type.TypeId, type);
+        }
+
         private GenTemp MaterializeImporterValue(List<GenTree> statements, int pc, BytecodeOp sourceOp, GenTree value)
         {
             var temp = CreateImporterSpillTemp(value.Type, value.StackKind);
@@ -3346,6 +3417,7 @@ namespace Cnidaria.Cs
             if (!valueType.IsValueType)
                 return value;
 
+            MarkInstantiatedType(valueType);
             return Node(GenTreeKind.Box, pc, BytecodeOp.Box, type: _rts.SystemObject, stackKind: GenStackKind.Ref,
                 operands: One(value), int32: valueType.TypeId, runtimeType: valueType);
         }
@@ -3368,7 +3440,9 @@ namespace Cnidaria.Cs
         private GenTemp AllocateObjectArrayTemp(List<GenTree> statements, int pc, BytecodeOp sourceOp, int length)
         {
             var len = ConstI4(pc, sourceOp, length);
-            var array = Node(GenTreeKind.NewArray, pc, BytecodeOp.Newarr, type: ObjectArrayType, stackKind: GenStackKind.Ref,
+            var objectArrayType = ObjectArrayType;
+            MarkInstantiatedType(objectArrayType);
+            var array = Node(GenTreeKind.NewArray, pc, BytecodeOp.Newarr, type: objectArrayType, stackKind: GenStackKind.Ref,
                 operands: One(len), runtimeType: _rts.SystemObject);
             return MaterializeImporterValue(statements, pc, sourceOp, array);
         }
@@ -3447,6 +3521,7 @@ namespace Cnidaria.Cs
         private void EmitNewDelegate(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
         {
             var delegateType = ResolveType(ins.Operand0);
+            MarkInstantiatedType(delegateType);
             var targetMethod = _rts.ResolveMethodInMethodContext(_module, ins.Operand1, _method);
             AddDirectDependency(targetMethod);
             if (targetMethod.IsStatic && !StringComparer.Ordinal.Equals(targetMethod.Name, ".cctor"))
@@ -3555,6 +3630,7 @@ namespace Cnidaria.Cs
             AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
+            MarkInstantiatedType(t);
             PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: ins.Operand0, method: ctor, runtimeType: t));
         }
@@ -3671,6 +3747,14 @@ namespace Cnidaria.Cs
                         {
                             var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
                             Push(inlineStack, Node(GenTreeKind.SizeOf, callPc, ins.Op, stackKind: GenStackKind.I4, runtimeType: t));
+                            break;
+                        }
+
+                    case BytecodeOp.TypeIsValueType:
+                        {
+                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                            Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
+                                int32: RuntimeTypeIsValueType(t, callPc, ins.Op) ? 1 : 0));
                             break;
                         }
 
@@ -3933,6 +4017,7 @@ namespace Cnidaria.Cs
                 BytecodeOp.Ldstr or
                 BytecodeOp.DefaultValue or
                 BytecodeOp.Sizeof or
+                BytecodeOp.TypeIsValueType or
                 BytecodeOp.Ldloc or
                 BytecodeOp.Stloc or
                 BytecodeOp.Ldarg or
@@ -4308,6 +4393,14 @@ namespace Cnidaria.Cs
             if ((uint)index >= (uint)_localTypes.Length)
                 throw Fail(pc, BytecodeOp.Ldloc, $"Local index {index} is out of range. Local count: {_localTypes.Length}.");
             return _localTypes[index];
+        }
+
+        private bool RuntimeTypeIsValueType(RuntimeType type, int pc, BytecodeOp op)
+        {
+            if (type.Kind == RuntimeTypeKind.TypeParam)
+                throw Fail(pc, op, "TypeIsValueType requires a closed generic context.");
+
+            return type.IsValueType;
         }
 
         private RuntimeType CheckedArgType(int index, int pc)

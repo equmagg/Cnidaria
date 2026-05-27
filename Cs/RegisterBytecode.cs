@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -689,14 +690,14 @@ namespace Cnidaria.Cs
         public static InstrDesc Mem(Op op, MachineRegister rdOrValue, MachineRegister address, long offset, MachineRegister index = MachineRegister.Invalid, ushort aux = 0)
             => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), RegisterVmIsa.EncodeRegister(address), RegisterVmIsa.EncodeRegister(index), aux: aux, imm: offset);
 
-        public static InstrDesc Field(Op op, MachineRegister rdOrValue, MachineRegister instance, int runtimeFieldId, ushort aux = 0)
-            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), RegisterVmIsa.EncodeRegister(instance), aux: aux, imm: runtimeFieldId);
+        public static InstrDesc Field(Op op, MachineRegister rdOrValue, MachineRegister instance, int fieldLayoutIndex, ushort aux = 0)
+            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), RegisterVmIsa.EncodeRegister(instance), aux: aux, imm: fieldLayoutIndex);
 
-        public static InstrDesc StaticField(Op op, MachineRegister rdOrValue, int runtimeFieldId, ushort aux = 0)
-            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), aux: aux, imm: runtimeFieldId);
+        public static InstrDesc StaticField(Op op, MachineRegister rdOrValue, int fieldLayoutIndex, ushort aux = 0)
+            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), aux: aux, imm: fieldLayoutIndex);
 
-        public static InstrDesc Array(Op op, MachineRegister rdOrValue, MachineRegister array, MachineRegister index, int runtimeElementTypeId = 0, ushort aux = 0)
-            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), RegisterVmIsa.EncodeRegister(array), RegisterVmIsa.EncodeRegister(index), aux: aux, imm: runtimeElementTypeId);
+        public static InstrDesc Array(Op op, MachineRegister rdOrValue, MachineRegister array, MachineRegister index, int elementTypeLayoutIndex = -1, ushort aux = 0)
+            => new InstrDesc(op, RegisterVmIsa.EncodeRegister(rdOrValue), RegisterVmIsa.EncodeRegister(array), RegisterVmIsa.EncodeRegister(index), aux: aux, imm: elementTypeLayoutIndex);
 
         public static InstrDesc Call(Op op, int runtimeMethodId, CallFlags flags = CallFlags.None)
             => new InstrDesc(op, aux: Cs.Aux.Call(flags), imm: runtimeMethodId);
@@ -766,12 +767,14 @@ namespace Cnidaria.Cs
         public readonly int UnwindCount;
         public readonly int SwitchTableOffset;
         public readonly int SwitchTableCount;
+        public readonly int TypeLayoutOffset;
+        public readonly int TypeLayoutCount;
+        public readonly int FieldLayoutOffset;
+        public readonly int FieldLayoutCount;
         public readonly int BlobOffset;
         public readonly int BlobLength;
         public readonly long Reserved0;
         public readonly long Reserved1;
-        public readonly long Reserved2;
-        public readonly long Reserved3;
 
         public CodeImageHeader(
             ImageFlags flags,
@@ -791,6 +794,10 @@ namespace Cnidaria.Cs
             int unwindCount,
             int switchTableOffset,
             int switchTableCount,
+            int typeLayoutOffset,
+            int typeLayoutCount,
+            int fieldLayoutOffset,
+            int fieldLayoutCount,
             int blobOffset,
             int blobLength)
         {
@@ -813,12 +820,14 @@ namespace Cnidaria.Cs
             UnwindCount = unwindCount;
             SwitchTableOffset = switchTableOffset;
             SwitchTableCount = switchTableCount;
+            TypeLayoutOffset = typeLayoutOffset;
+            TypeLayoutCount = typeLayoutCount;
+            FieldLayoutOffset = fieldLayoutOffset;
+            FieldLayoutCount = fieldLayoutCount;
             BlobOffset = blobOffset;
             BlobLength = blobLength;
             Reserved0 = 0;
             Reserved1 = 0;
-            Reserved2 = 0;
-            Reserved3 = 0;
         }
     }
 
@@ -1096,6 +1105,121 @@ namespace Cnidaria.Cs
         }
     }
 
+    [Flags]
+    internal enum TypeLayoutFlags : ushort
+    {
+        None = 0,
+        ValueType = 1 << 0,
+        ReferenceType = 1 << 1,
+        Array = 1 << 2,
+        PointerLike = 1 << 3,
+        NativeInt = 1 << 4,
+        UnsignedSmall = 1 << 5,
+        Char = 1 << 6,
+        ContainsGcPointers = 1 << 7,
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal readonly struct TypeLayoutRecord
+    {
+        public readonly int RuntimeTypeId;
+        public readonly int ElementTypeLayoutIndex;
+        public readonly int Size;
+        public readonly int Align;
+        public readonly int InstanceSize;
+        public readonly int StaticSize;
+        public readonly int StaticAlign;
+        public readonly ushort Flags;
+        public readonly ushort Reserved;
+
+        public TypeLayoutRecord(
+            int runtimeTypeId,
+            int elementTypeLayoutIndex,
+            int size,
+            int align,
+            int instanceSize,
+            int staticSize,
+            int staticAlign,
+            TypeLayoutFlags flags)
+        {
+            if (runtimeTypeId < 0) throw new ArgumentOutOfRangeException(nameof(runtimeTypeId));
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            if (align <= 0) throw new ArgumentOutOfRangeException(nameof(align));
+            if (instanceSize < 0) throw new ArgumentOutOfRangeException(nameof(instanceSize));
+            if (staticSize < 0) throw new ArgumentOutOfRangeException(nameof(staticSize));
+            if (staticAlign <= 0) throw new ArgumentOutOfRangeException(nameof(staticAlign));
+            RuntimeTypeId = runtimeTypeId;
+            ElementTypeLayoutIndex = elementTypeLayoutIndex;
+            Size = size;
+            Align = align;
+            InstanceSize = instanceSize;
+            StaticSize = staticSize;
+            StaticAlign = staticAlign;
+            Flags = (ushort)flags;
+            Reserved = 0;
+        }
+
+        public TypeLayoutFlags LayoutFlags => (TypeLayoutFlags)Flags;
+        public bool IsValueType => (LayoutFlags & TypeLayoutFlags.ValueType) != 0;
+        public bool IsReferenceType => (LayoutFlags & TypeLayoutFlags.ReferenceType) != 0;
+        public bool IsArray => (LayoutFlags & TypeLayoutFlags.Array) != 0;
+        public bool IsPointerLike => (LayoutFlags & TypeLayoutFlags.PointerLike) != 0;
+        public bool IsNativeInt => (LayoutFlags & TypeLayoutFlags.NativeInt) != 0;
+        public bool IsUnsignedSmall => (LayoutFlags & TypeLayoutFlags.UnsignedSmall) != 0;
+        public bool IsChar => (LayoutFlags & TypeLayoutFlags.Char) != 0;
+        public bool ContainsGcPointers => (LayoutFlags & TypeLayoutFlags.ContainsGcPointers) != 0;
+    }
+
+    [Flags]
+    internal enum FieldLayoutFlags : ushort
+    {
+        None = 0,
+        Static = 1 << 0,
+        DeclaringTypeIsValueType = 1 << 1,
+        FieldTypeIsReferenceSized = 1 << 2,
+        FieldTypeContainsGcPointers = 1 << 3,
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal readonly struct FieldLayoutRecord
+    {
+        public readonly int RuntimeFieldId;
+        public readonly int DeclaringTypeLayoutIndex;
+        public readonly int FieldTypeLayoutIndex;
+        public readonly int Offset;
+        public readonly int Size;
+        public readonly ushort Flags;
+        public readonly ushort Reserved;
+
+        public FieldLayoutRecord(
+            int runtimeFieldId,
+            int declaringTypeLayoutIndex,
+            int fieldTypeLayoutIndex,
+            int offset,
+            int size,
+            FieldLayoutFlags flags)
+        {
+            if (runtimeFieldId < 0) throw new ArgumentOutOfRangeException(nameof(runtimeFieldId));
+            if (declaringTypeLayoutIndex < 0) throw new ArgumentOutOfRangeException(nameof(declaringTypeLayoutIndex));
+            if (fieldTypeLayoutIndex < 0) throw new ArgumentOutOfRangeException(nameof(fieldTypeLayoutIndex));
+            if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            RuntimeFieldId = runtimeFieldId;
+            DeclaringTypeLayoutIndex = declaringTypeLayoutIndex;
+            FieldTypeLayoutIndex = fieldTypeLayoutIndex;
+            Offset = offset;
+            Size = size;
+            Flags = (ushort)flags;
+            Reserved = 0;
+        }
+
+        public FieldLayoutFlags LayoutFlags => (FieldLayoutFlags)Flags;
+        public bool IsStatic => (LayoutFlags & FieldLayoutFlags.Static) != 0;
+        public bool DeclaringTypeIsValueType => (LayoutFlags & FieldLayoutFlags.DeclaringTypeIsValueType) != 0;
+        public bool FieldTypeIsReferenceSized => (LayoutFlags & FieldLayoutFlags.FieldTypeIsReferenceSized) != 0;
+        public bool FieldTypeContainsGcPointers => (LayoutFlags & FieldLayoutFlags.FieldTypeContainsGcPointers) != 0;
+    }
+
     public sealed class CodeImage
     {
         internal ImageFlags Flags { get; }
@@ -1107,8 +1231,11 @@ namespace Cnidaria.Cs
         internal ImmutableArray<GcRootRecord> GcRoots { get; }
         internal ImmutableArray<UnwindRecord> Unwind { get; }
         internal ImmutableArray<SwitchTableRecord> SwitchTable { get; }
+        internal ImmutableArray<TypeLayoutRecord> TypeLayouts { get; }
+        internal ImmutableArray<FieldLayoutRecord> FieldLayouts { get; }
         internal ImmutableArray<byte> Blob { get; }
         internal IReadOnlyDictionary<int, int> MethodIndexByRuntimeMethodId { get; }
+        internal IReadOnlyDictionary<int, int> TypeLayoutIndexByRuntimeTypeId { get; }
 
         internal CodeImage(
             ImageFlags flags,
@@ -1120,6 +1247,8 @@ namespace Cnidaria.Cs
             ImmutableArray<GcRootRecord> gcRoots = default,
             ImmutableArray<UnwindRecord> unwind = default,
             ImmutableArray<SwitchTableRecord> switchTable = default,
+            ImmutableArray<TypeLayoutRecord> typeLayouts = default,
+            ImmutableArray<FieldLayoutRecord> fieldLayouts = default,
             ImmutableArray<byte> blob = default,
             bool validate = true)
         {
@@ -1132,7 +1261,17 @@ namespace Cnidaria.Cs
             GcRoots = gcRoots.IsDefault ? ImmutableArray<GcRootRecord>.Empty : gcRoots;
             Unwind = unwind.IsDefault ? ImmutableArray<UnwindRecord>.Empty : unwind;
             SwitchTable = switchTable.IsDefault ? ImmutableArray<SwitchTableRecord>.Empty : switchTable;
+            TypeLayouts = typeLayouts.IsDefault ? ImmutableArray<TypeLayoutRecord>.Empty : typeLayouts;
+            FieldLayouts = fieldLayouts.IsDefault ? ImmutableArray<FieldLayoutRecord>.Empty : fieldLayouts;
             Blob = blob.IsDefault ? ImmutableArray<byte>.Empty : blob;
+
+            var typeMap = new Dictionary<int, int>(TypeLayouts.Length);
+            for (int i = 0; i < TypeLayouts.Length; i++)
+            {
+                if (!typeMap.TryAdd(TypeLayouts[i].RuntimeTypeId, i))
+                    throw new InvalidOperationException("Duplicate runtime type id in RVM layout table: " + TypeLayouts[i].RuntimeTypeId.ToString());
+            }
+            TypeLayoutIndexByRuntimeTypeId = typeMap;
 
             var map = new Dictionary<int, int>(Methods.Length);
             for (int i = 0; i < Methods.Length; i++)
@@ -1151,6 +1290,9 @@ namespace Cnidaria.Cs
                 throw new KeyNotFoundException("Runtime method id was not found in RVM image: " + runtimeMethodId.ToString());
             return Methods[index];
         }
+
+        internal bool TryGetTypeLayoutIndexByRuntimeTypeId(int runtimeTypeId, out int index)
+            => TypeLayoutIndexByRuntimeTypeId.TryGetValue(runtimeTypeId, out index);
 
         internal void Validate()
         {
@@ -1188,6 +1330,7 @@ namespace Cnidaria.Cs
 
                 var inst = Code[pc];
                 ValidateInstructionOperands(pc, inst);
+                ValidateInstructionLayoutOperand(pc, inst);
 
                 if (IsPcTargetInstruction(inst.Op))
                 {
@@ -1199,6 +1342,8 @@ namespace Cnidaria.Cs
                     ValidateSwitch(pc, inst, methodIndex, methodByPc);
                 }
             }
+
+            ValidateExecutionLayoutTables();
 
             for (int i = 0; i < CallSites.Length; i++)
             {
@@ -1212,6 +1357,67 @@ namespace Cnidaria.Cs
             ValidateMethodSideTables(methodByPc);
         }
 
+
+        private void ValidateExecutionLayoutTables()
+        {
+            for (int i = 0; i < TypeLayouts.Length; i++)
+            {
+                var t = TypeLayouts[i];
+                if (t.RuntimeTypeId < 0)
+                    throw new InvalidOperationException("Type layout has invalid runtime type id.");
+                if (t.Size < 0 || t.Align <= 0 || (t.Align & (t.Align - 1)) != 0)
+                    throw new InvalidOperationException("Type layout has invalid size or alignment.");
+                if (t.StaticSize < 0 || t.StaticAlign <= 0 || (t.StaticAlign & (t.StaticAlign - 1)) != 0)
+                    throw new InvalidOperationException("Type layout has invalid static size or alignment.");
+                if (t.ElementTypeLayoutIndex >= 0)
+                    CheckRange(t.ElementTypeLayoutIndex, 1, TypeLayouts.Length, "type layout element range");
+            }
+
+            for (int i = 0; i < FieldLayouts.Length; i++)
+            {
+                var f = FieldLayouts[i];
+                CheckRange(f.DeclaringTypeLayoutIndex, 1, TypeLayouts.Length, "field declaring type layout range");
+                CheckRange(f.FieldTypeLayoutIndex, 1, TypeLayouts.Length, "field type layout range");
+                if (f.Offset < 0 || f.Size < 0)
+                    throw new InvalidOperationException("Field layout has invalid offset or size.");
+            }
+        }
+
+        private void ValidateInstructionLayoutOperand(int pc, InstrDesc inst)
+        {
+            if (IsFieldLayoutInstruction(inst.Op))
+            {
+                ValidateTableIndex(inst.Imm, FieldLayouts.Length, pc, "field layout");
+                return;
+            }
+
+            if (IsTypeLayoutInstruction(inst.Op))
+            {
+                ValidateTableIndex(inst.Imm, TypeLayouts.Length, pc, "type layout");
+                return;
+            }
+
+            if (IsArrayElementLayoutInstruction(inst.Op))
+            {
+                ValidateTableIndex(inst.Imm, TypeLayouts.Length, pc, "array element type layout");
+                return;
+            }
+        }
+
+        private static void ValidateTableIndex(long value, int length, int pc, string name)
+        {
+            if (value < 0 || value > int.MaxValue || (int)value >= length)
+                throw new InvalidOperationException("Invalid " + name + " index at PC " + pc.ToString());
+        }
+
+        private static bool IsFieldLayoutInstruction(Op op)
+            => IsInstanceFieldInstruction(op) || IsStaticFieldInstruction(op);
+
+        private static bool IsTypeLayoutInstruction(Op op)
+            => op is Op.LiStaticBase or Op.CpObj or Op.NewArr or Op.NewSZArray or Op.Box or Op.UnboxAny or Op.UnboxAddr or Op.SizeOf or Op.InitObj or Op.DefaultValue;
+
+        private static bool IsArrayElementLayoutInstruction(Op op)
+            => IsArrayInstruction(op) && op is not (Op.LdLen or Op.LdArrayDataAddr);
         private void ValidateMethodSideTables(int[] methodByPc)
         {
             for (int methodIndex = 0; methodIndex < Methods.Length; methodIndex++)
@@ -1516,6 +1722,7 @@ namespace Cnidaria.Cs
                     RequireGpr(inst.Rs2, pc, nameof(inst.Rs2));
                     return;
 
+                case Op.NewArr:
                 case Op.NewSZArray:
                 case Op.FastAllocateString:
                 case Op.CastClass:
@@ -1771,6 +1978,10 @@ namespace Cnidaria.Cs
         private readonly List<GcRootRecord> _gcRoots = new List<GcRootRecord>();
         private readonly List<UnwindRecord> _unwind = new List<UnwindRecord>();
         private readonly List<SwitchTableRecord> _switchTable = new List<SwitchTableRecord>();
+        private readonly List<TypeLayoutRecord> _typeLayouts = new List<TypeLayoutRecord>();
+        private readonly List<FieldLayoutRecord> _fieldLayouts = new List<FieldLayoutRecord>();
+        private readonly Dictionary<int, int> _typeLayoutByRuntimeTypeId = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _fieldLayoutByRuntimeFieldId = new Dictionary<int, int>();
         private readonly List<byte> _blob = new List<byte>();
         private readonly List<int> _labelPc = new List<int>();
         private readonly List<Fixup> _fixups = new List<Fixup>();
@@ -1813,6 +2024,83 @@ namespace Cnidaria.Cs
             _currentMethod.UnwindEndIndex = _unwind.Count;
             _methods.Add(_currentMethod);
             _currentMethod = null;
+        }
+
+        public int InternTypeLayout(RuntimeType type)
+        {
+            if (type is null) throw new ArgumentNullException(nameof(type));
+            if (_typeLayoutByRuntimeTypeId.TryGetValue(type.TypeId, out int existing))
+                return existing;
+
+            int elementIndex = -1;
+            if (type.ElementType is not null)
+                elementIndex = InternTypeLayout(type.ElementType);
+
+            TypeLayoutFlags flags = TypeLayoutFlags.None;
+            if (type.IsValueType) flags |= TypeLayoutFlags.ValueType;
+            if (type.IsReferenceType) flags |= TypeLayoutFlags.ReferenceType;
+            if (type.Kind == RuntimeTypeKind.Array) flags |= TypeLayoutFlags.Array;
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam) flags |= TypeLayoutFlags.PointerLike;
+            if (type.PrimitiveKind is RuntimePrimitiveKind.NativeInt or RuntimePrimitiveKind.NativeUInt) flags |= TypeLayoutFlags.NativeInt;
+            if (type.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.UInt16 or RuntimePrimitiveKind.UInt32 or RuntimePrimitiveKind.UInt64 or RuntimePrimitiveKind.NativeUInt) flags |= TypeLayoutFlags.UnsignedSmall;
+            if (type.PrimitiveKind == RuntimePrimitiveKind.Char) flags |= TypeLayoutFlags.Char;
+            if (type.ContainsGcPointers) flags |= TypeLayoutFlags.ContainsGcPointers;
+
+            int size = StorageSizeOfForLayout(type);
+            int align = StorageAlignOfForLayout(type);
+            int index = _typeLayouts.Count;
+            _typeLayoutByRuntimeTypeId.Add(type.TypeId, index);
+            _typeLayouts.Add(new TypeLayoutRecord(
+                type.TypeId,
+                elementIndex,
+                size,
+                align,
+                Math.Max(0, type.InstanceSize),
+                Math.Max(0, type.StaticSize),
+                Math.Max(1, type.StaticAlign),
+                flags));
+            return index;
+        }
+
+        public int InternFieldLayout(RuntimeField field)
+        {
+            if (field is null) throw new ArgumentNullException(nameof(field));
+            if (_fieldLayoutByRuntimeFieldId.TryGetValue(field.FieldId, out int existing))
+                return existing;
+
+            int declaringTypeIndex = InternTypeLayout(field.DeclaringType);
+            int fieldTypeIndex = InternTypeLayout(field.FieldType);
+
+            FieldLayoutFlags flags = FieldLayoutFlags.None;
+            if (field.IsStatic) flags |= FieldLayoutFlags.Static;
+            if (field.DeclaringType.IsValueType) flags |= FieldLayoutFlags.DeclaringTypeIsValueType;
+            if (field.FieldType.IsReferenceType || field.FieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam) flags |= FieldLayoutFlags.FieldTypeIsReferenceSized;
+            if (field.FieldType.IsReferenceType || field.FieldType.ContainsGcPointers) flags |= FieldLayoutFlags.FieldTypeContainsGcPointers;
+
+            int index = _fieldLayouts.Count;
+            _fieldLayoutByRuntimeFieldId.Add(field.FieldId, index);
+            _fieldLayouts.Add(new FieldLayoutRecord(
+                field.FieldId,
+                declaringTypeIndex,
+                fieldTypeIndex,
+                field.Offset,
+                StorageSizeOfForLayout(field.FieldType),
+                flags));
+            return index;
+        }
+
+        private static int StorageSizeOfForLayout(RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                return TargetArchitecture.PointerSize;
+            return Math.Max(1, type.SizeOf);
+        }
+
+        private static int StorageAlignOfForLayout(RuntimeType type)
+        {
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                return TargetArchitecture.PointerSize;
+            return Math.Max(1, type.AlignOf);
         }
 
         public int AddBlob(ReadOnlySpan<byte> bytes)
@@ -2006,30 +2294,30 @@ namespace Cnidaria.Cs
         public void StRef(MachineRegister value, MachineRegister address, int offset = 0, MachineRegister index = MachineRegister.Invalid, ushort aux = 0)
             => Emit(InstrDesc.Mem(Op.StRef, value, address, offset, index, aux));
 
-        public void LdFldI4(MachineRegister rd, MachineRegister instance, int runtimeFieldId)
-            => Emit(InstrDesc.Field(Op.LdFldI4, rd, instance, runtimeFieldId));
-        public void StFldI4(MachineRegister value, MachineRegister instance, int runtimeFieldId)
-            => Emit(InstrDesc.Field(Op.StFldI4, value, instance, runtimeFieldId));
-        public void LdFldRef(MachineRegister rd, MachineRegister instance, int runtimeFieldId)
-            => Emit(InstrDesc.Field(Op.LdFldRef, rd, instance, runtimeFieldId));
-        public void StFldRef(MachineRegister value, MachineRegister instance, int runtimeFieldId)
-            => Emit(InstrDesc.Field(Op.StFldRef, value, instance, runtimeFieldId, Aux.Instruction(InstructionFlags.WriteBarrier)));
+        public void LdFldI4(MachineRegister rd, MachineRegister instance, int fieldLayoutIndex)
+            => Emit(InstrDesc.Field(Op.LdFldI4, rd, instance, fieldLayoutIndex));
+        public void StFldI4(MachineRegister value, MachineRegister instance, int fieldLayoutIndex)
+            => Emit(InstrDesc.Field(Op.StFldI4, value, instance, fieldLayoutIndex));
+        public void LdFldRef(MachineRegister rd, MachineRegister instance, int fieldLayoutIndex)
+            => Emit(InstrDesc.Field(Op.LdFldRef, rd, instance, fieldLayoutIndex));
+        public void StFldRef(MachineRegister value, MachineRegister instance, int fieldLayoutIndex)
+            => Emit(InstrDesc.Field(Op.StFldRef, value, instance, fieldLayoutIndex, Aux.Instruction(InstructionFlags.WriteBarrier)));
 
-        public void LdElemI4(MachineRegister rd, MachineRegister array, MachineRegister index, int runtimeElementTypeId = 0)
-            => Emit(InstrDesc.Array(Op.LdElemI4, rd, array, index, runtimeElementTypeId));
-        public void StElemI4(MachineRegister value, MachineRegister array, MachineRegister index, int runtimeElementTypeId = 0)
-            => Emit(InstrDesc.Array(Op.StElemI4, value, array, index, runtimeElementTypeId));
-        public void LdElemRef(MachineRegister rd, MachineRegister array, MachineRegister index, int runtimeElementTypeId = 0)
-            => Emit(InstrDesc.Array(Op.LdElemRef, rd, array, index, runtimeElementTypeId));
-        public void StElemRef(MachineRegister value, MachineRegister array, MachineRegister index, int runtimeElementTypeId = 0)
-            => Emit(InstrDesc.Array(Op.StElemRef, value, array, index, runtimeElementTypeId, Aux.Instruction(InstructionFlags.WriteBarrier)));
+        public void LdElemI4(MachineRegister rd, MachineRegister array, MachineRegister index, int elementTypeLayoutIndex = -1)
+            => Emit(InstrDesc.Array(Op.LdElemI4, rd, array, index, elementTypeLayoutIndex));
+        public void StElemI4(MachineRegister value, MachineRegister array, MachineRegister index, int elementTypeLayoutIndex = -1)
+            => Emit(InstrDesc.Array(Op.StElemI4, value, array, index, elementTypeLayoutIndex));
+        public void LdElemRef(MachineRegister rd, MachineRegister array, MachineRegister index, int elementTypeLayoutIndex = -1)
+            => Emit(InstrDesc.Array(Op.LdElemRef, rd, array, index, elementTypeLayoutIndex));
+        public void StElemRef(MachineRegister value, MachineRegister array, MachineRegister index, int elementTypeLayoutIndex = -1)
+            => Emit(InstrDesc.Array(Op.StElemRef, value, array, index, elementTypeLayoutIndex, Aux.Instruction(InstructionFlags.WriteBarrier)));
         public void LdLen(MachineRegister rd, MachineRegister array) => Emit(new InstrDesc(Op.LdLen, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(array)));
 
         public void NewObj(MachineRegister rd, int runtimeConstructorMethodId)
             => Emit(InstrDesc.Li(Op.NewObj, rd, runtimeConstructorMethodId, Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
-        public void NewSZArray(MachineRegister rd, MachineRegister length, int runtimeElementTypeId)
+        public void NewSZArray(MachineRegister rd, MachineRegister length, int arrayTypeLayoutIndex)
             => Emit(new InstrDesc(Op.NewSZArray, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(length),
-                aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: runtimeElementTypeId));
+                aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: arrayTypeLayoutIndex));
 
         public void NewDelegate(MachineRegister rd, int runtimeDelegateTypeId, int runtimeTargetMethodId)
             => Emit(new InstrDesc(Op.NewDelegate, RegisterVmIsa.EncodeRegister(rd),
@@ -2138,6 +2426,8 @@ namespace Cnidaria.Cs
                 _gcRoots.ToImmutableArray(),
                 _unwind.ToImmutableArray(),
                 _switchTable.ToImmutableArray(),
+                _typeLayouts.ToImmutableArray(),
+                _fieldLayouts.ToImmutableArray(),
                 _blob.ToImmutableArray(),
                 validate: validate);
         }
@@ -2248,6 +2538,10 @@ namespace Cnidaria.Cs
             offset = unwindOffset + image.Unwind.Length * Marshal.SizeOf<UnwindRecord>();
             int switchOffset = Align(offset, 8);
             offset = switchOffset + image.SwitchTable.Length * Marshal.SizeOf<SwitchTableRecord>();
+            int typeLayoutOffset = Align(offset, 8);
+            offset = typeLayoutOffset + image.TypeLayouts.Length * Marshal.SizeOf<TypeLayoutRecord>();
+            int fieldLayoutOffset = Align(offset, 8);
+            offset = fieldLayoutOffset + image.FieldLayouts.Length * Marshal.SizeOf<FieldLayoutRecord>();
             int blobOffset = Align(offset, 8);
             offset = blobOffset + image.Blob.Length;
 
@@ -2270,6 +2564,10 @@ namespace Cnidaria.Cs
                 image.Unwind.Length,
                 switchOffset,
                 image.SwitchTable.Length,
+                typeLayoutOffset,
+                image.TypeLayouts.Length,
+                fieldLayoutOffset,
+                image.FieldLayouts.Length,
                 blobOffset,
                 image.Blob.Length);
 
@@ -2282,6 +2580,8 @@ namespace Cnidaria.Cs
             WriteMany(bytes, gcRootOffset, image.GcRoots.AsSpan());
             WriteMany(bytes, unwindOffset, image.Unwind.AsSpan());
             WriteMany(bytes, switchOffset, image.SwitchTable.AsSpan());
+            WriteMany(bytes, typeLayoutOffset, image.TypeLayouts.AsSpan());
+            WriteMany(bytes, fieldLayoutOffset, image.FieldLayouts.AsSpan());
             image.Blob.AsSpan().CopyTo(bytes.AsSpan(blobOffset));
             return bytes;
         }
@@ -2309,6 +2609,8 @@ namespace Cnidaria.Cs
             ValidateSection(data.Length, header.GcRootOffset, header.GcRootCount, Marshal.SizeOf<GcRootRecord>(), "GC root", ref end);
             ValidateSection(data.Length, header.UnwindOffset, header.UnwindCount, Marshal.SizeOf<UnwindRecord>(), "unwind", ref end);
             ValidateSection(data.Length, header.SwitchTableOffset, header.SwitchTableCount, Marshal.SizeOf<SwitchTableRecord>(), "switch", ref end);
+            ValidateSection(data.Length, header.TypeLayoutOffset, header.TypeLayoutCount, Marshal.SizeOf<TypeLayoutRecord>(), "type-layout", ref end);
+            ValidateSection(data.Length, header.FieldLayoutOffset, header.FieldLayoutCount, Marshal.SizeOf<FieldLayoutRecord>(), "field-layout", ref end);
             ValidateSection(data.Length, header.BlobOffset, header.BlobLength, 1, "blob", ref end);
             if (end != data.Length)
                 throw new InvalidDataException("Trailing bytes found in register image.");
@@ -2323,6 +2625,8 @@ namespace Cnidaria.Cs
                 ReadMany<GcRootRecord>(data, header.GcRootOffset, header.GcRootCount),
                 ReadMany<UnwindRecord>(data, header.UnwindOffset, header.UnwindCount),
                 ReadMany<SwitchTableRecord>(data, header.SwitchTableOffset, header.SwitchTableCount),
+                ReadMany<TypeLayoutRecord>(data, header.TypeLayoutOffset, header.TypeLayoutCount),
+                ReadMany<FieldLayoutRecord>(data, header.FieldLayoutOffset, header.FieldLayoutCount),
                 data.Slice(header.BlobOffset, header.BlobLength).ToArray().ToImmutableArray());
         }
 
@@ -2358,7 +2662,8 @@ namespace Cnidaria.Cs
         private static void WriteOne<T>(byte[] destination, int offset, T value)
             where T : struct
         {
-            MemoryMarshal.Write(destination.AsSpan(offset, Marshal.SizeOf<T>()), in value);
+            ref byte destRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(destination), offset);
+            Unsafe.WriteUnaligned(ref destRef, value);
         }
 
         private static void WriteMany<T>(byte[] destination, int offset, ReadOnlySpan<T> values)
@@ -2650,6 +2955,67 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (image.TypeLayouts.Length != 0)
+            {
+                writer.WriteLine("  type-layouts:");
+                for (int i = 0; i < image.TypeLayouts.Length; i++)
+                {
+                    var t = image.TypeLayouts[i];
+                    writer.Write("    TL");
+                    writer.Write(i);
+                    writer.Write(" T");
+                    writer.Write(t.RuntimeTypeId);
+                    writer.Write(" size=");
+                    writer.Write(t.Size);
+                    writer.Write(" align=");
+                    writer.Write(t.Align);
+                    writer.Write(" instance=");
+                    writer.Write(t.InstanceSize);
+                    writer.Write(" static=");
+                    writer.Write(t.StaticSize);
+                    writer.Write("/");
+                    writer.Write(t.StaticAlign);
+                    if (t.ElementTypeLayoutIndex >= 0)
+                    {
+                        writer.Write(" elem=TL");
+                        writer.Write(t.ElementTypeLayoutIndex);
+                    }
+                    if (t.Flags != 0)
+                    {
+                        writer.Write(" flags=");
+                        writer.Write((TypeLayoutFlags)t.Flags);
+                    }
+                    writer.WriteLine();
+                }
+            }
+
+            if (image.FieldLayouts.Length != 0)
+            {
+                writer.WriteLine("  field-layouts:");
+                for (int i = 0; i < image.FieldLayouts.Length; i++)
+                {
+                    var f = image.FieldLayouts[i];
+                    writer.Write("    FL");
+                    writer.Write(i);
+                    writer.Write(" F");
+                    writer.Write(f.RuntimeFieldId);
+                    writer.Write(" decl=TL");
+                    writer.Write(f.DeclaringTypeLayoutIndex);
+                    writer.Write(" type=TL");
+                    writer.Write(f.FieldTypeLayoutIndex);
+                    writer.Write(" offset=");
+                    writer.Write(f.Offset);
+                    writer.Write(" size=");
+                    writer.Write(f.Size);
+                    if (f.Flags != 0)
+                    {
+                        writer.Write(" flags=");
+                        writer.Write((FieldLayoutFlags)f.Flags);
+                    }
+                    writer.WriteLine();
+                }
+            }
+
             if (image.Blob.Length != 0)
             {
                 writer.Write("  blob: ");
@@ -2830,10 +3196,10 @@ namespace Cnidaria.Cs
                 return FormatAddressMemoryOperands(inst);
 
             if (IsInstanceFieldInstruction(inst.Op))
-                return FormatRegister(inst.Rd) + ", [" + FormatRegister(inst.Rs1) + "].F" + inst.Imm.ToString();
+                return FormatRegister(inst.Rd) + ", [" + FormatRegister(inst.Rs1) + "].FL" + inst.Imm.ToString();
 
             if (IsStaticFieldInstruction(inst.Op))
-                return FormatRegister(inst.Rd) + ", SF" + inst.Imm.ToString();
+                return FormatRegister(inst.Rd) + ", SFL" + inst.Imm.ToString();
 
             if (IsArrayInstruction(inst.Op))
             {
@@ -2841,17 +3207,20 @@ namespace Cnidaria.Cs
                     return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1);
                 if (inst.Op == Op.LdArrayDataAddr)
                     return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1);
-                return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + "[" + FormatRegister(inst.Rs2) + "]" + FormatRuntimeTypeSuffix(inst.Imm);
+                return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + "[" + FormatRegister(inst.Rs2) + "]" + FormatTypeLayoutSuffix(inst.Imm);
             }
 
             if (inst.Op == Op.NewObj)
                 return FormatRegister(inst.Rd) + ", ctor=M" + inst.Imm.ToString();
 
-            if (inst.Op == Op.NewSZArray)
-                return FormatRegister(inst.Rd) + ", len=" + FormatRegister(inst.Rs1) + ", elem=T" + inst.Imm.ToString();
+            if (inst.Op is Op.NewArr or Op.NewSZArray)
+                return FormatRegister(inst.Rd) + ", len=" + FormatRegister(inst.Rs1) + ", layout=TL" + inst.Imm.ToString();
 
-            if (inst.Op is Op.CastClass or Op.IsInst or Op.Box or Op.UnboxAny or Op.UnboxAddr or Op.InitObj or Op.DefaultValue or Op.SizeOf)
+            if (inst.Op is Op.CastClass or Op.IsInst)
                 return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", T" + inst.Imm.ToString();
+
+            if (inst.Op is Op.Box or Op.UnboxAny or Op.UnboxAddr or Op.InitObj or Op.DefaultValue or Op.SizeOf)
+                return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", TL" + inst.Imm.ToString();
 
             if (inst.Op is Op.RefEq or Op.RefNe or Op.RuntimeTypeEquals)
                 return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", " + FormatRegister(inst.Rs2);
@@ -2904,7 +3273,7 @@ namespace Cnidaria.Cs
         {
             return inst.Op switch
             {
-                Op.CpObj => FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", T" + inst.Imm.ToString(),
+                Op.CpObj => FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", TL" + inst.Imm.ToString(),
                 Op.CpBlk => FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", size=" + inst.Imm.ToString(),
                 Op.InitBlk => FormatRegister(inst.Rd) + ", size=" + inst.Imm.ToString(),
                 Op.NullCheck => FormatRegister(inst.Rs1),
@@ -3128,8 +3497,8 @@ namespace Cnidaria.Cs
             return value.ToString() + " / 0x" + unchecked((ulong)value).ToString("X");
         }
 
-        private static string FormatRuntimeTypeSuffix(long runtimeTypeId)
-            => runtimeTypeId == 0 ? string.Empty : " type=T" + runtimeTypeId.ToString();
+        private static string FormatTypeLayoutSuffix(long typeLayoutIndex)
+            => typeLayoutIndex < 0 ? string.Empty : " type=TL" + typeLayoutIndex.ToString();
 
         private static void AppendFlags(TextWriter writer, string name, CallFlags flags)
         {

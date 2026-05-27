@@ -1,9 +1,13 @@
-﻿using System;
+﻿using Microsoft.VisualBasic;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Drawing;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -28,10 +32,22 @@ namespace Cnidaria.Cs
         {
             None,
             Leave,
-            Return,
             Throw,
-            ReturnFloat,
             MulticastDelegate,
+            ReturnVoid,
+            ReturnInteger,
+            ReturnFloat,
+            ReturnReference,
+            ReturnValueAddress,
+        }
+
+        private enum ReturnPayloadKind : byte
+        {
+            None,
+            Integer,
+            Float,
+            Reference,
+            ValueAddress,
         }
 
         private const int GprCount = 32;
@@ -205,7 +221,7 @@ namespace Cnidaria.Cs
             X(MachineRegisters.StackPointer, stackEnd);
             X(MachineRegisters.FramePointer, stackEnd);
             X(MachineRegisters.ThreadPointer, 0);
-            _fieldById = BuildFieldIdMap(rts);
+            _fieldById = new Dictionary<int, RuntimeField>();
         }
 
         public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits)
@@ -420,7 +436,6 @@ namespace Cnidaria.Cs
         {
             int tokenCheckPeriod = Math.Max(1, limits.TokenCheckPeriod);
             var code = _image.Code;
-            int codeLength = code.Length;
 
             while (_currentMethodIndex >= 0)
             {
@@ -434,659 +449,837 @@ namespace Cnidaria.Cs
                     ct.ThrowIfCancellationRequested();
                 }
 
-                if ((uint)_pc >= (uint)codeLength)
-                    throw new InvalidOperationException($"PC out of code range: {_pc}");
-
                 int executingPc = _pc;
                 InstrDesc ins = code[executingPc];
                 _pc = executingPc + 1;
                 _currentSafePointPc = executingPc;
 
-                if ((IsRegisterVmStaticFieldInstruction(ins.Op) || ins.Op == Op.NewObj) &&
+                if ((IsStaticFieldInstruction(ins.Op) || ins.Op == Op.NewObj) &&
                     TryDeferRequiredTypeInitializationBeforeInstruction(ins, executingPc, ct, limits))
                     continue;
 
-                try
+                switch (ins.Op)
                 {
-                    switch (ins.Op)
-                    {
-                        case Op.Nop:
-                            break;
-                        case Op.Break:
-                            break;
-                        case Op.Trap:
-                            throw new InvalidOperationException($"Register VM trap at PC {executingPc}");
-                        case Op.GcPoll:
-                            ct.ThrowIfCancellationRequested();
-                            MaybeCollectGarbage();
-                            break;
+                    case Op.Nop:
+                        break;
+                    case Op.Break:
+                        break;
+                    case Op.Trap:
+                        throw new InvalidOperationException($"Register VM trap at PC {executingPc}");
+                    case Op.GcPoll:
+                        ct.ThrowIfCancellationRequested();
+                        MaybeCollectGarbage();
+                        break;
 
-                        case Op.J:
-                            _pc = CheckedTarget(ins.Imm);
-                            break;
-                        case Op.Leave:
-                            Leave(executingPc, CheckedTarget(ins.Imm));
-                            break;
-                        case Op.EndFinally:
-                            EndFinally();
-                            break;
-                        case Op.Throw:
-                            ThrowManaged(GetGpr(ins.Rs1), executingPc, preserveExistingThrowSite: false);
-                            break;
-                        case Op.Rethrow:
-                            ThrowManaged(_currentExceptionRef, executingPc, preserveExistingThrowSite: true);
-                            break;
-                        case Op.LdExceptionRef:
-                            SetGpr(ins.Rd, _currentExceptionRef);
-                            break;
+                    case Op.J:
+                        _pc = unchecked((int)ins.Imm);
+                        break;
+                    case Op.Leave:
+                        Leave(executingPc, unchecked((int)ins.Imm));
+                        break;
+                    case Op.EndFinally:
+                        EndFinally();
+                        break;
+                    case Op.Throw:
+                        ThrowManaged(GetGpr(ins.Rs1), executingPc, preserveExistingThrowSite: false);
+                        break;
+                    case Op.Rethrow:
+                        ThrowManaged(_currentExceptionRef, executingPc, preserveExistingThrowSite: true);
+                        break;
+                    case Op.LdExceptionRef:
+                        SetGpr(ins.Rd, _currentExceptionRef);
+                        break;
 
-                        case Op.RetVoid:
-                            ReturnFromCurrentFrame(hasInteger: false, hasFloat: false, hasRef: false, hasValue: false, valueSize: 0);
-                            break;
-                        case Op.RetI:
-                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
-                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: false, hasValue: false, valueSize: 0);
-                            break;
-                        case Op.RetF:
-                            SetFpr(MachineRegisters.FloatReturnValue0, GetFprBits(ins.Rs1));
-                            ReturnFromCurrentFrame(hasInteger: false, hasFloat: true, hasRef: false, hasValue: false, valueSize: 0);
-                            break;
-                        case Op.RetRef:
-                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
-                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: true, hasValue: false, valueSize: 0);
-                            break;
-                        case Op.RetValue:
-                            SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
-                            ReturnFromCurrentFrame(hasInteger: true, hasFloat: false, hasRef: false, hasValue: true, valueSize: checked((int)ins.Imm));
-                            break;
+                    case Op.RetVoid:
+                        ReturnFromCurrentFrame(ReturnPayloadKind.None);
+                        break;
+                    case Op.RetI:
+                        SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                        ReturnFromCurrentFrame(ReturnPayloadKind.Integer);
+                        break;
+                    case Op.RetF:
+                        SetFpr(MachineRegisters.FloatReturnValue0, GetFpr(ins.Rs1));
+                        ReturnFromCurrentFrame(ReturnPayloadKind.Float);
+                        break;
+                    case Op.RetRef:
+                        SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                        ReturnFromCurrentFrame(ReturnPayloadKind.Reference);
+                        break;
+                    case Op.RetValue:
+                        SetGpr(MachineRegisters.ReturnValue0, GetGpr(ins.Rs1));
+                        ReturnFromCurrentFrame(ReturnPayloadKind.ValueAddress, checked((int)ins.Imm));
+                        break;
 
-                        case Op.SwitchI32:
-                            Switch((int)GetGpr(ins.Rs1), ins);
-                            break;
-                        case Op.SwitchI64:
-                            Switch(GetGpr(ins.Rs1), ins);
-                            break;
+                    case Op.SwitchI32:
+                        Switch((int)GetGpr(ins.Rs1), ins);
+                        break;
+                    case Op.SwitchI64:
+                        Switch(GetGpr(ins.Rs1), ins);
+                        break;
 
-                        case Op.BrTrueI32:
-                            if ((int)GetGpr(ins.Rs1) != 0) _pc = CheckedTarget(ins.Imm);
-                            break;
-                        case Op.BrFalseI32:
-                            if ((int)GetGpr(ins.Rs1) == 0) _pc = CheckedTarget(ins.Imm);
-                            break;
-                        case Op.BrTrueI64:
-                        case Op.BrTrueRef:
-                            if (GetGpr(ins.Rs1) != 0) _pc = CheckedTarget(ins.Imm);
-                            break;
-                        case Op.BrFalseI64:
-                        case Op.BrFalseRef:
-                            if (GetGpr(ins.Rs1) == 0) _pc = CheckedTarget(ins.Imm);
-                            break;
+                    case Op.BrTrueI32:
+                        if ((int)GetGpr(ins.Rs1) != 0) _pc = unchecked((int)ins.Imm);
+                        break;
+                    case Op.BrFalseI32:
+                        if ((int)GetGpr(ins.Rs1) == 0) _pc = unchecked((int)ins.Imm);
+                        break;
+                    case Op.BrTrueI64:
+                    case Op.BrTrueRef:
+                        if (GetGpr(ins.Rs1) != 0) _pc = unchecked((int)ins.Imm);
+                        break;
+                    case Op.BrFalseI64:
+                    case Op.BrFalseRef:
+                        if (GetGpr(ins.Rs1) == 0) _pc = unchecked((int)ins.Imm);
+                        break;
 
-                        case Op.BrI32Eq: if ((int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI32Ne: if ((int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI32Lt: if ((int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI32Le: if ((int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI32Gt: if ((int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI32Ge: if ((int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU32Lt: if ((uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU32Le: if ((uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU32Gt: if ((uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU32Ge: if ((uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Eq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Ne: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Lt: if (GetGpr(ins.Rs1) < GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Le: if (GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Gt: if (GetGpr(ins.Rs1) > GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrI64Ge: if (GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU64Lt: if ((ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU64Le: if ((ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU64Gt: if ((ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrU64Ge: if ((ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrRefEq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrRefNe: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Eq: if (F32(ins.Rs1) == F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Ne: if (F32(ins.Rs1) != F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Lt: if (F32(ins.Rs1) < F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Le: if (F32(ins.Rs1) <= F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Gt: if (F32(ins.Rs1) > F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF32Ge: if (F32(ins.Rs1) >= F32(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Eq: if (F64(ins.Rs1) == F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Ne: if (F64(ins.Rs1) != F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Lt: if (F64(ins.Rs1) < F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Le: if (F64(ins.Rs1) <= F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Gt: if (F64(ins.Rs1) > F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
-                        case Op.BrF64Ge: if (F64(ins.Rs1) >= F64(ins.Rs2)) _pc = CheckedTarget(ins.Imm); break;
+                    case Op.BrI32Eq: if ((int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI32Ne: if ((int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI32Lt: if ((int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI32Le: if ((int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI32Gt: if ((int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI32Ge: if ((int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU32Lt: if ((uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU32Le: if ((uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU32Gt: if ((uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU32Ge: if ((uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Eq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Ne: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Lt: if (GetGpr(ins.Rs1) < GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Le: if (GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Gt: if (GetGpr(ins.Rs1) > GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrI64Ge: if (GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU64Lt: if ((ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU64Le: if ((ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU64Gt: if ((ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrU64Ge: if ((ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrRefEq: if (GetGpr(ins.Rs1) == GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrRefNe: if (GetGpr(ins.Rs1) != GetGpr(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Eq: if (F32(ins.Rs1) == F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Ne: if (F32(ins.Rs1) != F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Lt: if (F32(ins.Rs1) < F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Le: if (F32(ins.Rs1) <= F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Gt: if (F32(ins.Rs1) > F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32Ge: if (F32(ins.Rs1) >= F32(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Eq: if (F64(ins.Rs1) == F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Ne: if (F64(ins.Rs1) != F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Lt: if (F64(ins.Rs1) < F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Le: if (F64(ins.Rs1) <= F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Gt: if (F64(ins.Rs1) > F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64Ge: if (F64(ins.Rs1) >= F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
 
-                        case Op.MovI:
-                        case Op.MovRef:
-                        case Op.MovPtr:
-                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                    case Op.MovI:
+                    case Op.MovRef:
+                    case Op.MovPtr:
+                        SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                        break;
+                    case Op.MovF:
+                        SetFpr(ins.Rd, GetFpr(ins.Rs1));
+                        break;
+                    case Op.LiI32:
+                        SetGpr(ins.Rd, (int)ins.Imm);
+                        break;
+                    case Op.LiI64:
+                        SetGpr(ins.Rd, ins.Imm);
+                        break;
+                    case Op.LiF32Bits:
+                        SetFpr(ins.Rd, (uint)(int)ins.Imm);
+                        break;
+                    case Op.LiF64Bits:
+                        SetFpr(ins.Rd, ins.Imm);
+                        break;
+                    case Op.LiNull:
+                        SetGpr(ins.Rd, 0);
+                        break;
+                    case Op.LiString:
+                        SetGpr(ins.Rd, InternString(CurrentModule().Md.GetUserString(checked((int)ins.Imm))));
+                        break;
+                    case Op.LiTypeHandle:
+                    case Op.LiMethodHandle:
+                    case Op.LiFieldHandle:
+                        SetGpr(ins.Rd, ins.Imm);
+                        break;
+                    case Op.LiStaticBase:
+                        SetGpr(ins.Rd, EnsureStaticStorage(TypeLayout(ins.Imm)));
+                        break;
+
+                    case Op.I32Add: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
+                    case Op.I32Sub: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
+                    case Op.I32Mul: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
+                    case Op.I32Div: DivI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32Rem: RemI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U32Div: DivU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U32Rem: RemU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32Neg: SetI32(ins.Rd, unchecked(-(int)GetGpr(ins.Rs1))); break;
+                    case Op.I32AddOvf: AddOvfI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32SubOvf: SubOvfI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32MulOvf: MulOvfI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U32AddOvf: AddOvfU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U32SubOvf: SubOvfU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U32MulOvf: MulOvfU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32And: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Or: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Xor: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Not: SetI32(ins.Rd, ~(int)GetGpr(ins.Rs1)); break;
+                    case Op.I32Shl: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 31)); break;
+                    case Op.I32Shr: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)); break;
+                    case Op.U32Shr: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)))); break;
+                    case Op.I32Rol: SetI32(ins.Rd, BitOperationsRotateLeft((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
+                    case Op.I32Ror: SetI32(ins.Rd, BitOperationsRotateRight((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
+                    case Op.I32Eq: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Ne: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Lt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Le: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Gt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)); break;
+                    case Op.I32Ge: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)); break;
+                    case Op.U32Lt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)); break;
+                    case Op.U32Le: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)); break;
+                    case Op.U32Gt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)); break;
+                    case Op.U32Ge: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)); break;
+                    case Op.I32Min: SetI32(ins.Rd, Math.Min((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
+                    case Op.I32Max: SetI32(ins.Rd, Math.Max((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
+                    case Op.U32Min: SetI32(ins.Rd, unchecked((int)Math.Min((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
+                    case Op.U32Max: SetI32(ins.Rd, unchecked((int)Math.Max((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
+
+                    case Op.I32AddImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)ins.Imm)); break;
+                    case Op.I32SubImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)ins.Imm)); break;
+                    case Op.I32MulImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)ins.Imm)); break;
+                    case Op.I32AndImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)ins.Imm); break;
+                    case Op.I32OrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)ins.Imm); break;
+                    case Op.I32XorImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)ins.Imm); break;
+                    case Op.I32ShlImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)ins.Imm & 31)); break;
+                    case Op.I32ShrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)); break;
+                    case Op.U32ShrImm: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)))); break;
+                    case Op.I32EqImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)ins.Imm); break;
+                    case Op.I32NeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)ins.Imm); break;
+                    case Op.I32LtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)ins.Imm); break;
+                    case Op.I32LeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)ins.Imm); break;
+                    case Op.I32GtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)ins.Imm); break;
+                    case Op.I32GeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)ins.Imm); break;
+                    case Op.U32LtImm: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)(int)ins.Imm); break;
+
+                    case Op.I64Add: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
+                    case Op.I64Sub: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
+                    case Op.I64Mul: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
+                    case Op.I64Div: DivI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64Rem: RemI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U64Div: DivU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U64Rem: RemU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64Neg: SetGpr(ins.Rd, unchecked(-GetGpr(ins.Rs1))); break;
+                    case Op.I64AddOvf: AddOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64SubOvf: SubOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64MulOvf: MulOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U64AddOvf: AddOvfU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U64SubOvf: SubOvfU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.U64MulOvf: MulOvfU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64And: SetGpr(ins.Rd, GetGpr(ins.Rs1) & GetGpr(ins.Rs2)); break;
+                    case Op.I64Or: SetGpr(ins.Rd, GetGpr(ins.Rs1) | GetGpr(ins.Rs2)); break;
+                    case Op.I64Xor: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ GetGpr(ins.Rs2)); break;
+                    case Op.I64Not: SetGpr(ins.Rd, ~GetGpr(ins.Rs1)); break;
+                    case Op.I64Shl: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 63)); break;
+                    case Op.I64Shr: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)); break;
+                    case Op.U64Shr: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)))); break;
+                    case Op.I64Rol: SetGpr(ins.Rd, RotateLeft(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
+                    case Op.I64Ror: SetGpr(ins.Rd, RotateRight(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
+                    case Op.I64Eq: SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2)); break;
+                    case Op.I64Ne: SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2)); break;
+                    case Op.I64Lt: SetBool(ins.Rd, GetGpr(ins.Rs1) < GetGpr(ins.Rs2)); break;
+                    case Op.I64Le: SetBool(ins.Rd, GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)); break;
+                    case Op.I64Gt: SetBool(ins.Rd, GetGpr(ins.Rs1) > GetGpr(ins.Rs2)); break;
+                    case Op.I64Ge: SetBool(ins.Rd, GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)); break;
+                    case Op.U64Lt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)); break;
+                    case Op.U64Le: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)); break;
+                    case Op.U64Gt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)); break;
+                    case Op.U64Ge: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)); break;
+                    case Op.I64Min: SetGpr(ins.Rd, Math.Min(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
+                    case Op.I64Max: SetGpr(ins.Rd, Math.Max(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
+                    case Op.U64Min: SetGpr(ins.Rd, unchecked((long)Math.Min((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
+                    case Op.U64Max: SetGpr(ins.Rd, unchecked((long)Math.Max((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
+
+                    case Op.I64AddImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + ins.Imm)); break;
+                    case Op.I64SubImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - ins.Imm)); break;
+                    case Op.I64MulImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * ins.Imm)); break;
+                    case Op.I64AndImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) & ins.Imm); break;
+                    case Op.I64OrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) | ins.Imm); break;
+                    case Op.I64XorImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ ins.Imm); break;
+                    case Op.I64ShlImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)ins.Imm & 63)); break;
+                    case Op.I64ShrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)); break;
+                    case Op.U64ShrImm: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)))); break;
+                    case Op.I64EqImm: SetBool(ins.Rd, GetGpr(ins.Rs1) == ins.Imm); break;
+                    case Op.I64NeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) != ins.Imm); break;
+                    case Op.I64LtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) < ins.Imm); break;
+                    case Op.I64LeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) <= ins.Imm); break;
+                    case Op.I64GtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) > ins.Imm); break;
+                    case Op.I64GeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) >= ins.Imm); break;
+                    case Op.U64LtImm: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)ins.Imm); break;
+
+                    case Op.F32Add: SetF32(ins.Rd, F32(ins.Rs1) + F32(ins.Rs2)); break;
+                    case Op.F32Sub: SetF32(ins.Rd, F32(ins.Rs1) - F32(ins.Rs2)); break;
+                    case Op.F32Mul: SetF32(ins.Rd, F32(ins.Rs1) * F32(ins.Rs2)); break;
+                    case Op.F32Div: SetF32(ins.Rd, F32(ins.Rs1) / F32(ins.Rs2)); break;
+                    case Op.F32Rem: SetF32(ins.Rd, F32(ins.Rs1) % F32(ins.Rs2)); break;
+                    case Op.F32Neg: SetF32(ins.Rd, -F32(ins.Rs1)); break;
+                    case Op.F32Abs: SetF32(ins.Rd, MathF.Abs(F32(ins.Rs1))); break;
+                    case Op.F32Eq: SetBool(ins.Rd, F32(ins.Rs1) == F32(ins.Rs2)); break;
+                    case Op.F32Ne: SetBool(ins.Rd, F32(ins.Rs1) != F32(ins.Rs2)); break;
+                    case Op.F32Lt: SetBool(ins.Rd, F32(ins.Rs1) < F32(ins.Rs2)); break;
+                    case Op.F32Le: SetBool(ins.Rd, F32(ins.Rs1) <= F32(ins.Rs2)); break;
+                    case Op.F32Gt: SetBool(ins.Rd, F32(ins.Rs1) > F32(ins.Rs2)); break;
+                    case Op.F32Ge: SetBool(ins.Rd, F32(ins.Rs1) >= F32(ins.Rs2)); break;
+                    case Op.F32Min: SetF32(ins.Rd, MathF.Min(F32(ins.Rs1), F32(ins.Rs2))); break;
+                    case Op.F32Max: SetF32(ins.Rd, MathF.Max(F32(ins.Rs1), F32(ins.Rs2))); break;
+                    case Op.F32IsNaN: SetBool(ins.Rd, float.IsNaN(F32(ins.Rs1))); break;
+                    case Op.F32IsFinite: SetBool(ins.Rd, !float.IsNaN(F32(ins.Rs1)) && !float.IsInfinity(F32(ins.Rs1))); break;
+                    case Op.F64Add: SetF64(ins.Rd, F64(ins.Rs1) + F64(ins.Rs2)); break;
+                    case Op.F64Sub: SetF64(ins.Rd, F64(ins.Rs1) - F64(ins.Rs2)); break;
+                    case Op.F64Mul: SetF64(ins.Rd, F64(ins.Rs1) * F64(ins.Rs2)); break;
+                    case Op.F64Div: SetF64(ins.Rd, F64(ins.Rs1) / F64(ins.Rs2)); break;
+                    case Op.F64Rem: SetF64(ins.Rd, F64(ins.Rs1) % F64(ins.Rs2)); break;
+                    case Op.F64Neg: SetF64(ins.Rd, -F64(ins.Rs1)); break;
+                    case Op.F64Abs: SetF64(ins.Rd, Math.Abs(F64(ins.Rs1))); break;
+                    case Op.F64Eq: SetBool(ins.Rd, F64(ins.Rs1) == F64(ins.Rs2)); break;
+                    case Op.F64Ne: SetBool(ins.Rd, F64(ins.Rs1) != F64(ins.Rs2)); break;
+                    case Op.F64Lt: SetBool(ins.Rd, F64(ins.Rs1) < F64(ins.Rs2)); break;
+                    case Op.F64Le: SetBool(ins.Rd, F64(ins.Rs1) <= F64(ins.Rs2)); break;
+                    case Op.F64Gt: SetBool(ins.Rd, F64(ins.Rs1) > F64(ins.Rs2)); break;
+                    case Op.F64Ge: SetBool(ins.Rd, F64(ins.Rs1) >= F64(ins.Rs2)); break;
+                    case Op.F64Min: SetF64(ins.Rd, Math.Min(F64(ins.Rs1), F64(ins.Rs2))); break;
+                    case Op.F64Max: SetF64(ins.Rd, Math.Max(F64(ins.Rs1), F64(ins.Rs2))); break;
+                    case Op.F64IsNaN: SetBool(ins.Rd, double.IsNaN(F64(ins.Rs1))); break;
+                    case Op.F64IsFinite: SetBool(ins.Rd, !double.IsNaN(F64(ins.Rs1)) && !double.IsInfinity(F64(ins.Rs1))); break;
+
+                    case Op.I32ToI64: SetGpr(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                    case Op.U32ToI64: SetGpr(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                    case Op.I64ToI32: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1))); break;
+                    case Op.I64ToI32Ovf: ConvertI64ToI32Ovf(ins.Rd, GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U64ToI32Ovf: ConvertU64ToI32Ovf(ins.Rd, (ulong)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.I64ToU32Ovf: ConvertI64ToU32Ovf(ins.Rd, GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U64ToU32Ovf: ConvertU64ToU32Ovf(ins.Rd, (ulong)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.I32ToF32: SetF32(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                    case Op.I32ToF64: SetF64(ins.Rd, (int)GetGpr(ins.Rs1)); break;
+                    case Op.U32ToF32: SetF32(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                    case Op.U32ToF64: SetF64(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
+                    case Op.I64ToF32: SetF32(ins.Rd, GetGpr(ins.Rs1)); break;
+                    case Op.I64ToF64: SetF64(ins.Rd, GetGpr(ins.Rs1)); break;
+                    case Op.U64ToF32: SetF32(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
+                    case Op.U64ToF64: SetF64(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
+                    case Op.F32ToF64: SetF64(ins.Rd, F32(ins.Rs1)); break;
+                    case Op.F64ToF32: SetF32(ins.Rd, (float)F64(ins.Rs1)); break;
+                    case Op.F32ToI32: SetI32(ins.Rd, unchecked((int)F32(ins.Rs1))); break;
+                    case Op.F32ToI64: SetGpr(ins.Rd, unchecked((long)F32(ins.Rs1))); break;
+                    case Op.F64ToI32: SetI32(ins.Rd, unchecked((int)F64(ins.Rs1))); break;
+                    case Op.F64ToI64: SetGpr(ins.Rd, unchecked((long)F64(ins.Rs1))); break;
+                    case Op.F32ToI32Ovf: ConvertF32ToI32Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
+                    case Op.F32ToI64Ovf: ConvertF32ToI64Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
+                    case Op.F64ToI32Ovf: ConvertF64ToI32Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
+                    case Op.F64ToI64Ovf: ConvertF64ToI64Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
+                    case Op.BitcastI32F32: SetFpr(ins.Rd, (uint)(int)GetGpr(ins.Rs1)); break;
+                    case Op.BitcastF32I32: SetI32(ins.Rd, unchecked((int)(uint)GetFpr(ins.Rs1))); break;
+                    case Op.BitcastI64F64: SetFpr(ins.Rd, GetGpr(ins.Rs1)); break;
+                    case Op.BitcastF64I64: SetGpr(ins.Rd, GetFpr(ins.Rs1)); break;
+                    case Op.SignExtendI8ToI32: SetI32(ins.Rd, (sbyte)(int)GetGpr(ins.Rs1)); break;
+                    case Op.SignExtendI16ToI32: SetI32(ins.Rd, (short)(int)GetGpr(ins.Rs1)); break;
+                    case Op.ZeroExtendI8ToI32: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
+                    case Op.ZeroExtendI16ToI32: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
+                    case Op.TruncI32ToI8: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
+                    case Op.TruncI32ToI16: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
+                    case Op.I32ToI8Ovf: ConvertI32ToI8Ovf(ins.Rd, (int)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U32ToI8Ovf: ConvertU32ToI8Ovf(ins.Rd, (uint)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.I32ToU8Ovf: ConvertI32ToU8Ovf(ins.Rd, (int)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U32ToU8Ovf: ConvertU32ToU8Ovf(ins.Rd, (uint)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.I32ToI16Ovf: ConvertI32ToI16Ovf(ins.Rd, (int)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U32ToI16Ovf: ConvertU32ToI16Ovf(ins.Rd, (uint)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.I32ToU16Ovf: ConvertI32ToU16Ovf(ins.Rd, (int)GetGpr(ins.Rs1), executingPc); break;
+                    case Op.U32ToU16Ovf: ConvertU32ToU16Ovf(ins.Rd, (uint)GetGpr(ins.Rs1), executingPc); break;
+
+                    case Op.LdI1: SetI32(ins.Rd, (sbyte)ReadU8(EA(ins))); break;
+                    case Op.LdU1: SetI32(ins.Rd, ReadU8(EA(ins))); break;
+                    case Op.LdI2: SetI32(ins.Rd, (short)ReadU16(EA(ins))); break;
+                    case Op.LdU2: SetI32(ins.Rd, ReadU16(EA(ins))); break;
+                    case Op.LdI4: SetI32(ins.Rd, ReadI32(EA(ins))); break;
+                    case Op.LdU4: SetGpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
+                    case Op.LdI8: SetGpr(ins.Rd, ReadI64(EA(ins))); break;
+                    case Op.LdN: SetGpr(ins.Rd, ReadNative(EA(ins))); break;
+                    case Op.LdF32: SetFpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
+                    case Op.LdF64: SetFpr(ins.Rd, ReadI64(EA(ins))); break;
+                    case Op.LdRef:
+                    case Op.LdPtr:
+                        SetGpr(ins.Rd, ReadNative(EA(ins)));
+                        break;
+                    case Op.LdAddr:
+                        SetGpr(ins.Rd, EA(ins));
+                        break;
+                    case Op.LdObj:
+                        throw new InvalidOperationException("LdObj requires a type/size-carrying opcode");
+                    case Op.StI1: WriteU8(EA(ins), unchecked((byte)GetGpr(ins.Rd))); break;
+                    case Op.StI2: WriteU16(EA(ins), unchecked((ushort)GetGpr(ins.Rd))); break;
+                    case Op.StI4: WriteI32(EA(ins), (int)GetGpr(ins.Rd)); break;
+                    case Op.StI8: WriteI64(EA(ins), GetGpr(ins.Rd)); break;
+                    case Op.StN:
+                    case Op.StRef:
+                    case Op.StPtr:
+                        WriteNative(EA(ins), GetGpr(ins.Rd));
+                        break;
+                    case Op.StF32: WriteI32(EA(ins), unchecked((int)(uint)GetFpr(ins.Rd))); break;
+                    case Op.StF64: WriteI64(EA(ins), GetFpr(ins.Rd)); break;
+                    case Op.StObj:
+                        throw new InvalidOperationException("StObj requires a type/size-carrying opcode");
+                    case Op.CpBlk:
+                        CopyBlock(GetAddress(ins.Rd), GetAddress(ins.Rs1), checked((int)ins.Imm));
+                        break;
+                    case Op.InitBlk:
+                        {
+                            int dst = GetAddress(ins.Rd);
+                            int size = checked((int)ins.Imm);
+                            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+                            CheckIndirectAccess(dst, size, true);
+                            _mem.AsSpan(dst, size).Fill(checked((byte)GetGpr(ins.Rs1)));
+                        }
+                        break;
+                    case Op.CpObj:
+                        CopyTypedObject(GetAddress(ins.Rd), GetAddress(ins.Rs1), TypeLayout(ins.Imm));
+                        break;
+                    case Op.NullCheck:
+                        {
+                            long objRef = GetGpr(ins.Rs1);
+                            if (objRef == 0)
+                            {
+                                ThrowNullReference(executingPc);
+                                break;
+                            }
+                            SetGpr(ins.Rd, objRef);
                             break;
-                        case Op.MovF:
-                            SetFpr(ins.Rd, GetFprBits(ins.Rs1));
+                        }
+                    case Op.BoundsCheck:
+                        if (!BoundsCheck((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc))
                             break;
-                        case Op.LiI32:
-                            SetGpr(ins.Rd, (int)ins.Imm);
-                            break;
-                        case Op.LiI64:
-                            SetGpr(ins.Rd, ins.Imm);
-                            break;
-                        case Op.LiF32Bits:
-                            SetFpr(ins.Rd, (uint)(int)ins.Imm);
-                            break;
-                        case Op.LiF64Bits:
-                            SetFpr(ins.Rd, ins.Imm);
-                            break;
-                        case Op.LiNull:
+                        break;
+                    case Op.WriteBarrier:
+                        break;
+                    case Op.LdFldAddr:
+                        SetGpr(ins.Rd, GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), writable: false));
+                        break;
+                    case Op.LdFldI1: LoadFieldInt(ins, 1, signed: true); break;
+                    case Op.LdFldU1: LoadFieldInt(ins, 1, signed: false); break;
+                    case Op.LdFldI2: LoadFieldInt(ins, 2, signed: true); break;
+                    case Op.LdFldU2: LoadFieldInt(ins, 2, signed: false); break;
+                    case Op.LdFldI4: SetI32(ins.Rd, ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldI8:
+                    case Op.LdFldN:
+                    case Op.LdFldRef:
+                    case Op.LdFldPtr:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false);
+                            SetGpr(ins.Rd, ins.Op == Op.LdFldI8 ? ReadI64Unchecked(abs) : ReadNativeUnchecked(abs));
+                        }
+                        break;
+                    case Op.LdFldF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldF64: SetFpr(ins.Rd, ReadI64Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldObj:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            CopyBlock(GetAddress(ins.Rd), GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false), field.Size);
+                        }
+                        break;
+                    case Op.StFldI1:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StFldI2:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StFldI4:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StFldI8:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteI64Unchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StFldN:
+                    case Op.StFldRef:
+                    case Op.StFldPtr:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteNativeUnchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StFldF32:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StFldF64:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            WriteI64Unchecked(abs, GetFpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StFldObj:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            CopyBlock(abs, GetAddress(ins.Rd), field.Size);
+                        }
+                        break;
+
+                    case Op.LdSFldAddr:
+                        SetGpr(ins.Rd, GetStaticFieldAddress(FieldLayout(ins.Imm)));
+                        break;
+                    case Op.LdSFldI1: LoadStaticFieldInt(ins, 1, signed: true); break;
+                    case Op.LdSFldU1: LoadStaticFieldInt(ins, 1, signed: false); break;
+                    case Op.LdSFldI2: LoadStaticFieldInt(ins, 2, signed: true); break;
+                    case Op.LdSFldU2: LoadStaticFieldInt(ins, 2, signed: false); break;
+                    case Op.LdSFldI4: SetI32(ins.Rd, ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
+                    case Op.LdSFldU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
+                    case Op.LdSFldI8:
+                    case Op.LdSFldN:
+                    case Op.LdSFldRef:
+                    case Op.LdSFldPtr:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            SetGpr(ins.Rd, ins.Op == Op.LdSFldI8 ? ReadI64Unchecked(abs) : ReadNativeUnchecked(abs));
+                        }
+                        break;
+                    case Op.LdSFldF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
+                    case Op.LdSFldF64: SetFpr(ins.Rd, ReadI64Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
+                    case Op.LdSFldObj:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            CopyBlock(GetAddress(ins.Rd), GetStaticFieldAddress(field), field.Size);
+                        }
+                        break;
+                    case Op.StSFldI1:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StSFldI2:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StSFldI4:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StSFldI8:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteI64Unchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StSFldN:
+                    case Op.StSFldRef:
+                    case Op.StSFldPtr:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteNativeUnchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StSFldF32:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StSFldF64:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            WriteI64Unchecked(abs, GetFpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StSFldObj:
+                        {
+                            FieldLayoutRecord field = FieldLayout(ins.Imm);
+                            int abs = GetStaticFieldAddress(field);
+                            CheckWritableRange(abs, field.Size);
+                            CopyBlock(abs, GetAddress(ins.Rd), field.Size);
+                        }
+                        break;
+
+                    case Op.LdLen:
+                        ValidateArrayRefForExecution(GetGpr(ins.Rs1), out int arrAbs);
+                        SetI32(ins.Rd, ReadI32Unchecked(arrAbs + ArrayLengthOffset));
+                        break;
+                    case Op.LdArrayDataAddr:
+                        ValidateArrayRefForExecution(GetGpr(ins.Rs1), out int dataArrAbs);
+                        SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
+                        break;
+                    case Op.LdElemAddr:
+                        SetGpr(ins.Rd, GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), TypeLayout(ins.Imm)));
+                        break;
+                    case Op.LdElemI1: LoadElemInt(ins, 1, true); break;
+                    case Op.LdElemU1: LoadElemInt(ins, 1, false); break;
+                    case Op.LdElemI2: LoadElemInt(ins, 2, true); break;
+                    case Op.LdElemU2: LoadElemInt(ins, 2, false); break;
+                    case Op.LdElemI4: SetI32(ins.Rd, ReadI32Unchecked(ArrayEA(ins))); break;
+                    case Op.LdElemU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(ArrayEA(ins))); break;
+                    case Op.LdElemI8:
+                    case Op.LdElemN:
+                    case Op.LdElemRef:
+                    case Op.LdElemPtr:
+                        {
+                            var type = TypeLayout(ins.Imm);
+                            SetGpr(ins.Rd, 
+                                type.IsReferenceType || type.IsPointerLike || type.IsNativeInt 
+                                    ? ReadNativeUnchecked(ArrayEA(ins)) 
+                                    : ReadI64Unchecked(ArrayEA(ins)));
+                        }
+                        break;
+                    case Op.LdElemF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(ArrayEA(ins))); break;
+                    case Op.LdElemF64: SetFpr(ins.Rd, ReadI64Unchecked(ArrayEA(ins))); break;
+                    case Op.LdElemObj:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            CopyTypedObject(GetAddress(ins.Rd), ArrayEA(ins), elem);
+                        }
+                        break;
+                    case Op.StElemI1:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StElemI2:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StElemI4:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StElemI8:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteI64Unchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StElemN:
+                    case Op.StElemRef:
+                    case Op.StElemPtr:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteNativeUnchecked(abs, GetGpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StElemF32:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
+                        }
+                        break;
+                    case Op.StElemF64:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            WriteI64Unchecked(abs, GetFpr(ins.Rd));
+                        }
+                        break;
+                    case Op.StElemObj:
+                        {
+                            TypeLayoutRecord elem = TypeLayout(ins.Imm);
+                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            CheckWritableRange(abs, elem.Size);
+                            CopyBlock(abs, GetAddress(ins.Rd), elem.Size);
+                        }
+                        break;
+
+                    case Op.NewObj:
+                        ExecNewObj(ins, ct, limits);
+                        break;
+                    case Op.NewDelegate:
+                        SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, 0));
+                        break;
+                    case Op.NewDelegateClosed:
+                        SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, GetGpr(ins.Rs1)));
+                        break;
+                    case Op.DelegateCombine:
+                        SetGpr(ins.Rd, ExecDelegateCombine(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                        break;
+                    case Op.DelegateRemove:
+                        SetGpr(ins.Rd, ExecDelegateRemove(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                        break;
+                    case Op.NewArr:
+                    case Op.NewSZArray:
+                        SetGpr(ins.Rd, AllocArray(TypeLayout(ins.Imm), (int)GetGpr(ins.Rs1)));
+                        break;
+                    case Op.FastAllocateString:
+                        SetGpr(ins.Rd, AllocStringUninitialized((int)GetGpr(ins.Rs1)));
+                        break;
+                    case Op.Box:
+                        SetGpr(ins.Rd, BoxValue(TypeLayout(ins.Imm), ins.Rs1));
+                        break;
+                    case Op.UnboxAddr:
+                        SetGpr(ins.Rd, UnboxAddress(GetGpr(ins.Rs1), TypeLayout(ins.Imm)));
+                        break;
+                    case Op.UnboxAny:
+                        {
+                            TypeLayoutRecord type = TypeLayout(ins.Imm);
+                            int addr = UnboxAddress(GetGpr(ins.Rs1), type);
+                            LoadTypedAddressToRegister(ins.Rd, addr, type);
+                        }
+                        break;
+                    case Op.CastClass:
+                        CastClass(ins.Rd, GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm)), executingPc);
+                        break;
+                    case Op.IsInst:
+                        SetGpr(ins.Rd, IsInst(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
+                        break;
+                    case Op.SizeOf:
+                        SetI32(ins.Rd, TypeLayout(ins.Imm).Size);
+                        break;
+                    case Op.InitObj:
+                        {
+                            int abs = GetAddress(ins.Rd);
+                            int size = TypeLayout(ins.Imm).Size;
+                            CheckIndirectAccess(abs, size, true);
+                            _mem.AsSpan(abs, size).Clear();
+                        }
+                        break;
+                    case Op.DefaultValue:
+                        {
+                            if (MachineRegisters.GetClass((MachineRegister)ins.Rd) == RegisterClass.Float)
+                            {
+                                SetFpr(ins.Rd, 0);
+                                return;
+                            }
                             SetGpr(ins.Rd, 0);
+                        }
+                        break;
+                    case Op.RefEq:
+                        SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2));
+                        break;
+                    case Op.RefNe:
+                        SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2));
+                        break;
+                    case Op.RuntimeTypeEquals:
+                        {
+                            long left = GetGpr(ins.Rs1);
+                            long right = GetGpr(ins.Rs2);
+                            SetBool(ins.Rd, left != 0 && right != 0 && GetObjectRuntimeTypeId(left) == GetObjectRuntimeTypeId(right));
                             break;
-                        case Op.LiString:
-                            SetGpr(ins.Rd, InternString(CurrentModule().Md.GetUserString(checked((int)ins.Imm))));
-                            break;
-                        case Op.LiTypeHandle:
-                        case Op.LiMethodHandle:
-                        case Op.LiFieldHandle:
-                            SetGpr(ins.Rd, ins.Imm);
-                            break;
-                        case Op.LiStaticBase:
-                            SetGpr(ins.Rd, EnsureStaticStorage(_rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
+                        }
 
-                        case Op.I32Add: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32Sub: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32Mul: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32Div: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) / (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Rem: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) % (int)GetGpr(ins.Rs2)); break;
-                        case Op.U32Div: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) / (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.U32Rem: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) % (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.I32Neg: SetI32(ins.Rd, unchecked(-(int)GetGpr(ins.Rs1))); break;
-                        case Op.I32AddOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32SubOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32MulOvf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
-                        case Op.U32AddOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) + (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.U32SubOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) - (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.U32MulOvf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1) * (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.I32And: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Or: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Xor: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Not: SetI32(ins.Rd, ~(int)GetGpr(ins.Rs1)); break;
-                        case Op.I32Shl: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 31)); break;
-                        case Op.I32Shr: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)); break;
-                        case Op.U32Shr: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 31)))); break;
-                        case Op.I32Rol: SetI32(ins.Rd, BitOperationsRotateLeft((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
-                        case Op.I32Ror: SetI32(ins.Rd, BitOperationsRotateRight((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 31)); break;
-                        case Op.I32Eq: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Ne: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Lt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Le: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Gt: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)GetGpr(ins.Rs2)); break;
-                        case Op.I32Ge: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)GetGpr(ins.Rs2)); break;
-                        case Op.U32Lt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)GetGpr(ins.Rs2)); break;
-                        case Op.U32Le: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) <= (uint)GetGpr(ins.Rs2)); break;
-                        case Op.U32Gt: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) > (uint)GetGpr(ins.Rs2)); break;
-                        case Op.U32Ge: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) >= (uint)GetGpr(ins.Rs2)); break;
-                        case Op.I32Min: SetI32(ins.Rd, Math.Min((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
-                        case Op.I32Max: SetI32(ins.Rd, Math.Max((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2))); break;
-                        case Op.U32Min: SetI32(ins.Rd, unchecked((int)Math.Min((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
-                        case Op.U32Max: SetI32(ins.Rd, unchecked((int)Math.Max((uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2)))); break;
-
-                        case Op.I32AddImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)ins.Imm)); break;
-                        case Op.I32SubImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)ins.Imm)); break;
-                        case Op.I32MulImm: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)ins.Imm)); break;
-                        case Op.I32AndImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) & (int)ins.Imm); break;
-                        case Op.I32OrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) | (int)ins.Imm); break;
-                        case Op.I32XorImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) ^ (int)ins.Imm); break;
-                        case Op.I32ShlImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) << ((int)ins.Imm & 31)); break;
-                        case Op.I32ShrImm: SetI32(ins.Rd, (int)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)); break;
-                        case Op.U32ShrImm: SetI32(ins.Rd, unchecked((int)((uint)GetGpr(ins.Rs1) >> ((int)ins.Imm & 31)))); break;
-                        case Op.I32EqImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) == (int)ins.Imm); break;
-                        case Op.I32NeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) != (int)ins.Imm); break;
-                        case Op.I32LtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) < (int)ins.Imm); break;
-                        case Op.I32LeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) <= (int)ins.Imm); break;
-                        case Op.I32GtImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) > (int)ins.Imm); break;
-                        case Op.I32GeImm: SetBool(ins.Rd, (int)GetGpr(ins.Rs1) >= (int)ins.Imm); break;
-                        case Op.U32LtImm: SetBool(ins.Rd, (uint)GetGpr(ins.Rs1) < (uint)(int)ins.Imm); break;
-
-                        case Op.I64Add: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
-                        case Op.I64Sub: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
-                        case Op.I64Mul: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
-                        case Op.I64Div: SetGpr(ins.Rd, GetGpr(ins.Rs1) / GetGpr(ins.Rs2)); break;
-                        case Op.I64Rem: SetGpr(ins.Rd, GetGpr(ins.Rs1) % GetGpr(ins.Rs2)); break;
-                        case Op.U64Div: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) / (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.U64Rem: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) % (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.I64Neg: SetGpr(ins.Rd, unchecked(-GetGpr(ins.Rs1))); break;
-                        case Op.I64AddOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
-                        case Op.I64SubOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
-                        case Op.I64MulOvf: SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
-                        case Op.U64AddOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) + (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.U64SubOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) - (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.U64MulOvf: SetGpr(ins.Rd, unchecked((long)checked((ulong)GetGpr(ins.Rs1) * (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.I64And: SetGpr(ins.Rd, GetGpr(ins.Rs1) & GetGpr(ins.Rs2)); break;
-                        case Op.I64Or: SetGpr(ins.Rd, GetGpr(ins.Rs1) | GetGpr(ins.Rs2)); break;
-                        case Op.I64Xor: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ GetGpr(ins.Rs2)); break;
-                        case Op.I64Not: SetGpr(ins.Rd, ~GetGpr(ins.Rs1)); break;
-                        case Op.I64Shl: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)GetGpr(ins.Rs2) & 63)); break;
-                        case Op.I64Shr: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)); break;
-                        case Op.U64Shr: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)GetGpr(ins.Rs2) & 63)))); break;
-                        case Op.I64Rol: SetGpr(ins.Rd, RotateLeft(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
-                        case Op.I64Ror: SetGpr(ins.Rd, RotateRight(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2) & 63)); break;
-                        case Op.I64Eq: SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2)); break;
-                        case Op.I64Ne: SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2)); break;
-                        case Op.I64Lt: SetBool(ins.Rd, GetGpr(ins.Rs1) < GetGpr(ins.Rs2)); break;
-                        case Op.I64Le: SetBool(ins.Rd, GetGpr(ins.Rs1) <= GetGpr(ins.Rs2)); break;
-                        case Op.I64Gt: SetBool(ins.Rd, GetGpr(ins.Rs1) > GetGpr(ins.Rs2)); break;
-                        case Op.I64Ge: SetBool(ins.Rd, GetGpr(ins.Rs1) >= GetGpr(ins.Rs2)); break;
-                        case Op.U64Lt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)GetGpr(ins.Rs2)); break;
-                        case Op.U64Le: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) <= (ulong)GetGpr(ins.Rs2)); break;
-                        case Op.U64Gt: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) > (ulong)GetGpr(ins.Rs2)); break;
-                        case Op.U64Ge: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) >= (ulong)GetGpr(ins.Rs2)); break;
-                        case Op.I64Min: SetGpr(ins.Rd, Math.Min(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
-                        case Op.I64Max: SetGpr(ins.Rd, Math.Max(GetGpr(ins.Rs1), GetGpr(ins.Rs2))); break;
-                        case Op.U64Min: SetGpr(ins.Rd, unchecked((long)Math.Min((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
-                        case Op.U64Max: SetGpr(ins.Rd, unchecked((long)Math.Max((ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2)))); break;
-
-                        case Op.I64AddImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + ins.Imm)); break;
-                        case Op.I64SubImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - ins.Imm)); break;
-                        case Op.I64MulImm: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * ins.Imm)); break;
-                        case Op.I64AndImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) & ins.Imm); break;
-                        case Op.I64OrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) | ins.Imm); break;
-                        case Op.I64XorImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) ^ ins.Imm); break;
-                        case Op.I64ShlImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) << ((int)ins.Imm & 63)); break;
-                        case Op.I64ShrImm: SetGpr(ins.Rd, GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)); break;
-                        case Op.U64ShrImm: SetGpr(ins.Rd, unchecked((long)((ulong)GetGpr(ins.Rs1) >> ((int)ins.Imm & 63)))); break;
-                        case Op.I64EqImm: SetBool(ins.Rd, GetGpr(ins.Rs1) == ins.Imm); break;
-                        case Op.I64NeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) != ins.Imm); break;
-                        case Op.I64LtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) < ins.Imm); break;
-                        case Op.I64LeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) <= ins.Imm); break;
-                        case Op.I64GtImm: SetBool(ins.Rd, GetGpr(ins.Rs1) > ins.Imm); break;
-                        case Op.I64GeImm: SetBool(ins.Rd, GetGpr(ins.Rs1) >= ins.Imm); break;
-                        case Op.U64LtImm: SetBool(ins.Rd, (ulong)GetGpr(ins.Rs1) < (ulong)ins.Imm); break;
-
-                        case Op.F32Add: SetF32(ins.Rd, F32(ins.Rs1) + F32(ins.Rs2)); break;
-                        case Op.F32Sub: SetF32(ins.Rd, F32(ins.Rs1) - F32(ins.Rs2)); break;
-                        case Op.F32Mul: SetF32(ins.Rd, F32(ins.Rs1) * F32(ins.Rs2)); break;
-                        case Op.F32Div: SetF32(ins.Rd, F32(ins.Rs1) / F32(ins.Rs2)); break;
-                        case Op.F32Rem: SetF32(ins.Rd, F32(ins.Rs1) % F32(ins.Rs2)); break;
-                        case Op.F32Neg: SetF32(ins.Rd, -F32(ins.Rs1)); break;
-                        case Op.F32Abs: SetF32(ins.Rd, MathF.Abs(F32(ins.Rs1))); break;
-                        case Op.F32Eq: SetBool(ins.Rd, F32(ins.Rs1) == F32(ins.Rs2)); break;
-                        case Op.F32Ne: SetBool(ins.Rd, F32(ins.Rs1) != F32(ins.Rs2)); break;
-                        case Op.F32Lt: SetBool(ins.Rd, F32(ins.Rs1) < F32(ins.Rs2)); break;
-                        case Op.F32Le: SetBool(ins.Rd, F32(ins.Rs1) <= F32(ins.Rs2)); break;
-                        case Op.F32Gt: SetBool(ins.Rd, F32(ins.Rs1) > F32(ins.Rs2)); break;
-                        case Op.F32Ge: SetBool(ins.Rd, F32(ins.Rs1) >= F32(ins.Rs2)); break;
-                        case Op.F32Min: SetF32(ins.Rd, MathF.Min(F32(ins.Rs1), F32(ins.Rs2))); break;
-                        case Op.F32Max: SetF32(ins.Rd, MathF.Max(F32(ins.Rs1), F32(ins.Rs2))); break;
-                        case Op.F32IsNaN: SetBool(ins.Rd, float.IsNaN(F32(ins.Rs1))); break;
-                        case Op.F32IsFinite: SetBool(ins.Rd, !float.IsNaN(F32(ins.Rs1)) && !float.IsInfinity(F32(ins.Rs1))); break;
-                        case Op.F64Add: SetF64(ins.Rd, F64(ins.Rs1) + F64(ins.Rs2)); break;
-                        case Op.F64Sub: SetF64(ins.Rd, F64(ins.Rs1) - F64(ins.Rs2)); break;
-                        case Op.F64Mul: SetF64(ins.Rd, F64(ins.Rs1) * F64(ins.Rs2)); break;
-                        case Op.F64Div: SetF64(ins.Rd, F64(ins.Rs1) / F64(ins.Rs2)); break;
-                        case Op.F64Rem: SetF64(ins.Rd, F64(ins.Rs1) % F64(ins.Rs2)); break;
-                        case Op.F64Neg: SetF64(ins.Rd, -F64(ins.Rs1)); break;
-                        case Op.F64Abs: SetF64(ins.Rd, Math.Abs(F64(ins.Rs1))); break;
-                        case Op.F64Eq: SetBool(ins.Rd, F64(ins.Rs1) == F64(ins.Rs2)); break;
-                        case Op.F64Ne: SetBool(ins.Rd, F64(ins.Rs1) != F64(ins.Rs2)); break;
-                        case Op.F64Lt: SetBool(ins.Rd, F64(ins.Rs1) < F64(ins.Rs2)); break;
-                        case Op.F64Le: SetBool(ins.Rd, F64(ins.Rs1) <= F64(ins.Rs2)); break;
-                        case Op.F64Gt: SetBool(ins.Rd, F64(ins.Rs1) > F64(ins.Rs2)); break;
-                        case Op.F64Ge: SetBool(ins.Rd, F64(ins.Rs1) >= F64(ins.Rs2)); break;
-                        case Op.F64Min: SetF64(ins.Rd, Math.Min(F64(ins.Rs1), F64(ins.Rs2))); break;
-                        case Op.F64Max: SetF64(ins.Rd, Math.Max(F64(ins.Rs1), F64(ins.Rs2))); break;
-                        case Op.F64IsNaN: SetBool(ins.Rd, double.IsNaN(F64(ins.Rs1))); break;
-                        case Op.F64IsFinite: SetBool(ins.Rd, !double.IsNaN(F64(ins.Rs1)) && !double.IsInfinity(F64(ins.Rs1))); break;
-
-                        case Op.I32ToI64: SetGpr(ins.Rd, (int)GetGpr(ins.Rs1)); break;
-                        case Op.U32ToI64: SetGpr(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
-                        case Op.I64ToI32: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1))); break;
-                        case Op.I64ToI32Ovf: SetI32(ins.Rd, checked((int)GetGpr(ins.Rs1))); break;
-                        case Op.U64ToI32Ovf: SetI32(ins.Rd, checked((int)(ulong)GetGpr(ins.Rs1))); break;
-                        case Op.I64ToU32Ovf: SetI32(ins.Rd, unchecked((int)checked((uint)GetGpr(ins.Rs1)))); break;
-                        case Op.U64ToU32Ovf: SetI32(ins.Rd, unchecked((int)checked((uint)(ulong)GetGpr(ins.Rs1)))); break;
-                        case Op.I32ToF32: SetF32(ins.Rd, (int)GetGpr(ins.Rs1)); break;
-                        case Op.I32ToF64: SetF64(ins.Rd, (int)GetGpr(ins.Rs1)); break;
-                        case Op.U32ToF32: SetF32(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
-                        case Op.U32ToF64: SetF64(ins.Rd, (uint)GetGpr(ins.Rs1)); break;
-                        case Op.I64ToF32: SetF32(ins.Rd, GetGpr(ins.Rs1)); break;
-                        case Op.I64ToF64: SetF64(ins.Rd, GetGpr(ins.Rs1)); break;
-                        case Op.U64ToF32: SetF32(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
-                        case Op.U64ToF64: SetF64(ins.Rd, (ulong)GetGpr(ins.Rs1)); break;
-                        case Op.F32ToF64: SetF64(ins.Rd, F32(ins.Rs1)); break;
-                        case Op.F64ToF32: SetF32(ins.Rd, (float)F64(ins.Rs1)); break;
-                        case Op.F32ToI32: SetI32(ins.Rd, unchecked((int)F32(ins.Rs1))); break;
-                        case Op.F32ToI64: SetGpr(ins.Rd, unchecked((long)F32(ins.Rs1))); break;
-                        case Op.F64ToI32: SetI32(ins.Rd, unchecked((int)F64(ins.Rs1))); break;
-                        case Op.F64ToI64: SetGpr(ins.Rd, unchecked((long)F64(ins.Rs1))); break;
-                        case Op.F32ToI32Ovf: SetI32(ins.Rd, checked((int)F32(ins.Rs1))); break;
-                        case Op.F32ToI64Ovf: SetGpr(ins.Rd, checked((long)F32(ins.Rs1))); break;
-                        case Op.F64ToI32Ovf: SetI32(ins.Rd, checked((int)F64(ins.Rs1))); break;
-                        case Op.F64ToI64Ovf: SetGpr(ins.Rd, checked((long)F64(ins.Rs1))); break;
-                        case Op.BitcastI32F32: SetFpr(ins.Rd, (uint)(int)GetGpr(ins.Rs1)); break;
-                        case Op.BitcastF32I32: SetI32(ins.Rd, unchecked((int)(uint)GetFprBits(ins.Rs1))); break;
-                        case Op.BitcastI64F64: SetFpr(ins.Rd, GetGpr(ins.Rs1)); break;
-                        case Op.BitcastF64I64: SetGpr(ins.Rd, GetFprBits(ins.Rs1)); break;
-                        case Op.SignExtendI8ToI32: SetI32(ins.Rd, (sbyte)(int)GetGpr(ins.Rs1)); break;
-                        case Op.SignExtendI16ToI32: SetI32(ins.Rd, (short)(int)GetGpr(ins.Rs1)); break;
-                        case Op.ZeroExtendI8ToI32: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
-                        case Op.ZeroExtendI16ToI32: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
-                        case Op.TruncI32ToI8: SetI32(ins.Rd, (byte)(int)GetGpr(ins.Rs1)); break;
-                        case Op.TruncI32ToI16: SetI32(ins.Rd, (ushort)(int)GetGpr(ins.Rs1)); break;
-                        case Op.I32ToI8Ovf: SetI32(ins.Rd, checked((sbyte)(int)GetGpr(ins.Rs1))); break;
-                        case Op.U32ToI8Ovf: SetI32(ins.Rd, checked((sbyte)(uint)GetGpr(ins.Rs1))); break;
-                        case Op.I32ToU8Ovf: SetI32(ins.Rd, checked((byte)(int)GetGpr(ins.Rs1))); break;
-                        case Op.U32ToU8Ovf: SetI32(ins.Rd, checked((byte)(uint)GetGpr(ins.Rs1))); break;
-                        case Op.I32ToI16Ovf: SetI32(ins.Rd, checked((short)(int)GetGpr(ins.Rs1))); break;
-                        case Op.U32ToI16Ovf: SetI32(ins.Rd, checked((short)(uint)GetGpr(ins.Rs1))); break;
-                        case Op.I32ToU16Ovf: SetI32(ins.Rd, checked((ushort)(int)GetGpr(ins.Rs1))); break;
-                        case Op.U32ToU16Ovf: SetI32(ins.Rd, checked((ushort)(uint)GetGpr(ins.Rs1))); break;
-
-                        case Op.LdI1: SetI32(ins.Rd, (sbyte)ReadU8(EA(ins))); break;
-                        case Op.LdU1: SetI32(ins.Rd, ReadU8(EA(ins))); break;
-                        case Op.LdI2: SetI32(ins.Rd, (short)ReadU16(EA(ins))); break;
-                        case Op.LdU2: SetI32(ins.Rd, ReadU16(EA(ins))); break;
-                        case Op.LdI4: SetI32(ins.Rd, ReadI32(EA(ins))); break;
-                        case Op.LdU4: SetGpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
-                        case Op.LdI8: SetGpr(ins.Rd, ReadI64(EA(ins))); break;
-                        case Op.LdN: SetGpr(ins.Rd, ReadNative(EA(ins))); break;
-                        case Op.LdF32: SetFpr(ins.Rd, (uint)ReadI32(EA(ins))); break;
-                        case Op.LdF64: SetFpr(ins.Rd, ReadI64(EA(ins))); break;
-                        case Op.LdRef:
-                        case Op.LdPtr:
-                            SetGpr(ins.Rd, ReadNative(EA(ins)));
-                            break;
-                        case Op.LdAddr:
-                            SetGpr(ins.Rd, EA(ins));
-                            break;
-                        case Op.LdObj:
-                            throw new InvalidOperationException("LdObj requires a type/size-carrying opcode; use CpObj/CpBlk or typed field/array object load.");
-                        case Op.StI1: WriteU8(EA(ins), unchecked((byte)GetGpr(ins.Rd))); break;
-                        case Op.StI2: WriteU16(EA(ins), unchecked((ushort)GetGpr(ins.Rd))); break;
-                        case Op.StI4: WriteI32(EA(ins), (int)GetGpr(ins.Rd)); break;
-                        case Op.StI8: WriteI64(EA(ins), GetGpr(ins.Rd)); break;
-                        case Op.StN:
-                        case Op.StRef:
-                        case Op.StPtr:
-                            WriteNative(EA(ins), GetGpr(ins.Rd));
-                            break;
-                        case Op.StF32: WriteI32(EA(ins), unchecked((int)(uint)GetFprBits(ins.Rd))); break;
-                        case Op.StF64: WriteI64(EA(ins), GetFprBits(ins.Rd)); break;
-                        case Op.StObj:
-                            throw new InvalidOperationException("StObj requires a type/size-carrying opcode; use CpObj/CpBlk or typed field/array object store.");
-                        case Op.CpBlk:
-                            CopyBlock(GetAddress(ins.Rd), GetAddress(ins.Rs1), checked((int)ins.Imm));
-                            break;
-                        case Op.InitBlk:
-                            InitBlock(GetAddress(ins.Rd), checked((byte)GetGpr(ins.Rs1)), checked((int)ins.Imm));
-                            break;
-                        case Op.CpObj:
-                            CopyTypedObject(GetAddress(ins.Rd), GetAddress(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm)));
-                            break;
-                        case Op.NullCheck:
-                            if (GetGpr(ins.Rs1) == 0) throw new NullReferenceException();
-                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
-                            break;
-                        case Op.BoundsCheck:
-                            BoundsCheck((int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2));
-                            break;
-                        case Op.WriteBarrier:
-                            break;
-                        case Op.LdFldAddr:
-                            SetGpr(ins.Rd, GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), writable: false));
-                            break;
-                        case Op.LdFldI1: LoadFieldInt(ins, 1, signed: true); break;
-                        case Op.LdFldU1: LoadFieldInt(ins, 1, signed: false); break;
-                        case Op.LdFldI2: LoadFieldInt(ins, 2, signed: true); break;
-                        case Op.LdFldU2: LoadFieldInt(ins, 2, signed: false); break;
-                        case Op.LdFldI4: SetI32(ins.Rd, ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                        case Op.LdFldU4: SetGpr(ins.Rd, (uint)ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                        case Op.LdFldI8:
-                        case Op.LdFldN:
-                        case Op.LdFldRef:
-                        case Op.LdFldPtr:
-                            SetGpr(ins.Rd, ReadSizedInteger(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false), FieldById(ins.Imm).FieldType));
-                            break;
-                        case Op.LdFldF32: SetFpr(ins.Rd, (uint)ReadI32(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                        case Op.LdFldF64: SetFpr(ins.Rd, ReadI64(GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                        case Op.LdFldObj:
-                            {
-                                RuntimeField field = FieldById(ins.Imm);
-                                CopyTypedObject(GetAddress(ins.Rd), GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false), field.FieldType);
-                                break;
-                            }
-                        case Op.StFldI1:
-                        case Op.StFldI2:
-                        case Op.StFldI4:
-                        case Op.StFldI8:
-                        case Op.StFldN:
-                        case Op.StFldRef:
-                        case Op.StFldPtr:
-                        case Op.StFldF32:
-                        case Op.StFldF64:
-                        case Op.StFldObj:
-                            StoreField(ins);
-                            break;
-
-                        case Op.LdSFldAddr:
-                            SetGpr(ins.Rd, GetStaticFieldAddress(FieldById(ins.Imm), false));
-                            break;
-                        case Op.LdSFldI1: LoadStaticFieldInt(ins, 1, signed: true); break;
-                        case Op.LdSFldU1: LoadStaticFieldInt(ins, 1, signed: false); break;
-                        case Op.LdSFldI2: LoadStaticFieldInt(ins, 2, signed: true); break;
-                        case Op.LdSFldU2: LoadStaticFieldInt(ins, 2, signed: false); break;
-                        case Op.LdSFldI4: SetI32(ins.Rd, ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
-                        case Op.LdSFldU4: SetGpr(ins.Rd, (uint)ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
-                        case Op.LdSFldI8:
-                        case Op.LdSFldN:
-                        case Op.LdSFldRef:
-                        case Op.LdSFldPtr:
-                            SetGpr(ins.Rd, ReadSizedInteger(GetStaticFieldAddress(FieldById(ins.Imm), false), FieldById(ins.Imm).FieldType));
-                            break;
-                        case Op.LdSFldF32: SetFpr(ins.Rd, (uint)ReadI32(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
-                        case Op.LdSFldF64: SetFpr(ins.Rd, ReadI64(GetStaticFieldAddress(FieldById(ins.Imm), false))); break;
-                        case Op.LdSFldObj:
-                            {
-                                RuntimeField field = FieldById(ins.Imm);
-                                CopyTypedObject(GetAddress(ins.Rd), GetStaticFieldAddress(field, false), field.FieldType);
-                                break;
-                            }
-                        case Op.StSFldI1:
-                        case Op.StSFldI2:
-                        case Op.StSFldI4:
-                        case Op.StSFldI8:
-                        case Op.StSFldN:
-                        case Op.StSFldRef:
-                        case Op.StSFldPtr:
-                        case Op.StSFldF32:
-                        case Op.StSFldF64:
-                        case Op.StSFldObj:
-                            StoreStaticField(ins);
-                            break;
-
-                        case Op.LdLen:
-                            ValidateArrayRef(GetGpr(ins.Rs1), out int arrAbs, out _);
-                            SetI32(ins.Rd, ReadI32(arrAbs + ArrayLengthOffset));
-                            break;
-                        case Op.LdArrayDataAddr:
-                            ValidateArrayRef(GetGpr(ins.Rs1), out int dataArrAbs, out _);
-                            SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
-                            break;
-                        case Op.LdElemAddr:
-                            SetGpr(ins.Rd, GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), _rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
-                        case Op.LdElemI1: LoadElemInt(ins, 1, true); break;
-                        case Op.LdElemU1: LoadElemInt(ins, 1, false); break;
-                        case Op.LdElemI2: LoadElemInt(ins, 2, true); break;
-                        case Op.LdElemU2: LoadElemInt(ins, 2, false); break;
-                        case Op.LdElemI4: SetI32(ins.Rd, ReadI32(ArrayEA(ins))); break;
-                        case Op.LdElemU4: SetGpr(ins.Rd, (uint)ReadI32(ArrayEA(ins))); break;
-                        case Op.LdElemI8:
-                        case Op.LdElemN:
-                        case Op.LdElemRef:
-                        case Op.LdElemPtr:
-                            SetGpr(ins.Rd, ReadNativeOrI64(ArrayEA(ins), ElementTypeOf(ins)));
-                            break;
-                        case Op.LdElemF32: SetFpr(ins.Rd, (uint)ReadI32(ArrayEA(ins))); break;
-                        case Op.LdElemF64: SetFpr(ins.Rd, ReadI64(ArrayEA(ins))); break;
-                        case Op.LdElemObj:
-                            {
-                                RuntimeType elem = ElementTypeOf(ins);
-                                CopyTypedObject(GetAddress(ins.Rd), ArrayEA(ins), elem);
-                                break;
-                            }
-                        case Op.StElemI1:
-                        case Op.StElemI2:
-                        case Op.StElemI4:
-                        case Op.StElemI8:
-                        case Op.StElemN:
-                        case Op.StElemRef:
-                        case Op.StElemPtr:
-                        case Op.StElemF32:
-                        case Op.StElemF64:
-                        case Op.StElemObj:
-                            StoreElement(ins);
-                            break;
-
-                        case Op.NewObj:
-                            ExecNewObj(ins, ct, limits);
-                            break;
-                        case Op.NewDelegate:
-                            SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, 0));
-                            break;
-                        case Op.NewDelegateClosed:
-                            SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, GetGpr(ins.Rs1)));
-                            break;
-                        case Op.DelegateCombine:
-                            SetGpr(ins.Rd, ExecDelegateCombine(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
-                            break;
-                        case Op.DelegateRemove:
-                            SetGpr(ins.Rd, ExecDelegateRemove(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
-                            break;
-                        case Op.NewArr:
-                        case Op.NewSZArray:
-                            SetGpr(ins.Rd, AllocArray(_rts.GetTypeById(checked((int)ins.Imm)), (int)GetGpr(ins.Rs1)));
-                            break;
-                        case Op.FastAllocateString:
-                            SetGpr(ins.Rd, AllocStringUninitialized((int)GetGpr(ins.Rs1)));
-                            break;
-                        case Op.Box:
-                            SetGpr(ins.Rd, BoxValue(_rts.GetTypeById(checked((int)ins.Imm)), ins.Rs1));
-                            break;
-                        case Op.UnboxAddr:
-                            SetGpr(ins.Rd, UnboxAddress(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
-                        case Op.UnboxAny:
-                            UnboxAny(ins);
-                            break;
-                        case Op.CastClass:
-                            SetGpr(ins.Rd, CastClass(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
-                        case Op.IsInst:
-                            SetGpr(ins.Rd, IsInst(GetGpr(ins.Rs1), _rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
-                        case Op.SizeOf:
-                            SetI32(ins.Rd, StorageSizeOf(_rts.GetTypeById(checked((int)ins.Imm))));
-                            break;
-                        case Op.InitObj:
-                            InitTypedObject(GetAddress(ins.Rd), _rts.GetTypeById(checked((int)ins.Imm)));
-                            break;
-                        case Op.DefaultValue:
-                            InitDefaultValue(ins);
-                            break;
-                        case Op.RefEq:
-                            SetBool(ins.Rd, GetGpr(ins.Rs1) == GetGpr(ins.Rs2));
-                            break;
-                        case Op.RefNe:
-                            SetBool(ins.Rd, GetGpr(ins.Rs1) != GetGpr(ins.Rs2));
-                            break;
-                        case Op.RuntimeTypeEquals:
-                            {
-                                long left = GetGpr(ins.Rs1);
-                                long right = GetGpr(ins.Rs2);
-                                SetBool(ins.Rd, left != 0 && right != 0 && GetObjectTypeFromRef(left).TypeId == GetObjectTypeFromRef(right).TypeId);
-                                break;
-                            }
-
-                        case Op.CallVoid:
-                        case Op.CallI:
-                        case Op.CallF:
-                        case Op.CallRef:
-                        case Op.CallValue:
-                        case Op.CallInternalVoid:
-                        case Op.CallInternalI:
-                        case Op.CallInternalF:
-                        case Op.CallInternalRef:
-                        case Op.CallInternalValue:
-                            ExecCall(ins, isVirtual: false, executingPc, ct, limits);
-                            break;
-                        case Op.CallVirtVoid:
-                        case Op.CallVirtI:
-                        case Op.CallVirtF:
-                        case Op.CallVirtRef:
-                        case Op.CallVirtValue:
-                        case Op.CallIfaceVoid:
-                        case Op.CallIfaceI:
-                        case Op.CallIfaceF:
-                        case Op.CallIfaceRef:
-                        case Op.CallIfaceValue:
-                            ExecCall(ins, isVirtual: true, executingPc, ct, limits);
-                            break;
-                        case Op.CallIndirectVoid:
-                        case Op.CallIndirectI:
-                        case Op.CallIndirectF:
-                        case Op.CallIndirectRef:
-                        case Op.CallIndirectValue:
-                            ExecIndirectCall(ins, executingPc, ct, limits);
-                            break;
-                        case Op.DelegateInvokeVoid:
-                        case Op.DelegateInvokeI:
-                        case Op.DelegateInvokeF:
-                        case Op.DelegateInvokeRef:
-                        case Op.DelegateInvokeValue:
-                            ExecDelegateInvoke(ins, executingPc, ct, limits);
-                            break;
-                        case Op.StaticData:
-                            SetGpr(ins.Rd, StaticData(executingPc, ins));
-                            break;
-                        case Op.StackAlloc:
-                            SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
-                            break;
-                        case Op.PtrAddI32:
-                        case Op.ByRefAddI32:
-                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + ((long)(int)GetGpr(ins.Rs2) * ins.Imm)));
-                            break;
-                        case Op.PtrAddI64:
-                        case Op.ByRefAddI64:
-                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) + (GetGpr(ins.Rs2) * ins.Imm)));
-                            break;
-                        case Op.PtrSub:
-                            SetGpr(ins.Rd, checked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2)));
-                            break;
-                        case Op.PtrDiff:
-                            SetGpr(ins.Rd, (GetGpr(ins.Rs1) - GetGpr(ins.Rs2)) / Math.Max(1, ins.Imm));
-                            break;
-                        case Op.ByRefToPtr:
-                        case Op.PtrToByRef:
-                            SetGpr(ins.Rd, GetGpr(ins.Rs1));
-                            break;
-                        default: throw new NotSupportedException($"Unsupported register VM opcode {ins.Op} at PC {executingPc}");
-                    }
-
-
-                }
-                catch (VmUnhandledException)
-                {
-                    throw;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    if (!TryTranslateHostExceptionToManaged(ex, out int managedExceptionRef))
-                        throw;
-                    ThrowManaged(managedExceptionRef, executingPc, preserveExistingThrowSite: false);
+                    case Op.CallVoid:
+                    case Op.CallI:
+                    case Op.CallF:
+                    case Op.CallRef:
+                    case Op.CallValue:
+                        ExecCall(ins, isVirtual: false, executingPc, ct, limits);
+                        break;
+                    case Op.CallVirtVoid:
+                    case Op.CallVirtI:
+                    case Op.CallVirtF:
+                    case Op.CallVirtRef:
+                    case Op.CallVirtValue:
+                    case Op.CallIfaceVoid:
+                    case Op.CallIfaceI:
+                    case Op.CallIfaceF:
+                    case Op.CallIfaceRef:
+                    case Op.CallIfaceValue:
+                        ExecCall(ins, isVirtual: true, executingPc, ct, limits);
+                        break;
+                    case Op.CallInternalVoid:
+                    case Op.CallInternalI:
+                    case Op.CallInternalF:
+                    case Op.CallInternalRef:
+                    case Op.CallInternalValue:
+                        ExecInternalCall(ins, executingPc, ct, limits);
+                        break;
+                    case Op.CallIndirectVoid:
+                    case Op.CallIndirectI:
+                    case Op.CallIndirectF:
+                    case Op.CallIndirectRef:
+                    case Op.CallIndirectValue:
+                        ExecIndirectCall(ins, executingPc, ct, limits);
+                        break;
+                    case Op.DelegateInvokeVoid:
+                    case Op.DelegateInvokeI:
+                    case Op.DelegateInvokeF:
+                    case Op.DelegateInvokeRef:
+                    case Op.DelegateInvokeValue:
+                        ExecDelegateInvoke(ins, executingPc, ct, limits);
+                        break;
+                    case Op.StaticData:
+                        SetGpr(ins.Rd, StaticData(executingPc, ins));
+                        break;
+                    case Op.StackAlloc:
+                        SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
+                        break;
+                    case Op.PtrAddI32:
+                    case Op.ByRefAddI32:
+                        PtrAddI32(ins.Rd, GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), ins.Imm, executingPc);
+                        break;
+                    case Op.PtrAddI64:
+                    case Op.ByRefAddI64:
+                        PtrAddI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), ins.Imm, executingPc);
+                        break;
+                    case Op.PtrSub:
+                        SubOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc);
+                        break;
+                    case Op.PtrDiff:
+                        SetGpr(ins.Rd, (GetGpr(ins.Rs1) - GetGpr(ins.Rs2)) / Math.Max(1, ins.Imm));
+                        break;
+                    case Op.ByRefToPtr:
+                    case Op.PtrToByRef:
+                        SetGpr(ins.Rd, GetGpr(ins.Rs1));
+                        break;
+                    default: throw new NotSupportedException($"Unsupported register VM opcode {ins.Op} at PC {executingPc}");
                 }
             }
         }
@@ -1101,16 +1294,12 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int TopMethodIndex()
-            => ReadI32(TopFrameOffset() + ShadowFrameMethodIndex);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private RuntimeMethod MethodForIndex(int methodIndex)
             => _rts.GetMethodById(_image.Methods[methodIndex].RuntimeMethodId);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private RuntimeMethod CurrentFrameMethod()
-            => MethodForIndex(TopMethodIndex());
+            => MethodForIndex(ReadI32(TopFrameOffset() + ShadowFrameMethodIndex));
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int TopReturnPc()
@@ -1199,15 +1388,32 @@ namespace Cnidaria.Cs
             => ReadI64(TopFrameOffset() + ShadowFrameContinuationF0);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool TopContinuationIsFloat()
-            => TopContinuationKind() == PendingContinuationKind.ReturnFloat;
+        private static ReturnPayloadKind ReturnPayloadFromContinuation(PendingContinuationKind kind)
+            => kind switch
+            {
+                PendingContinuationKind.ReturnVoid => ReturnPayloadKind.None,
+                PendingContinuationKind.ReturnInteger => ReturnPayloadKind.Integer,
+                PendingContinuationKind.ReturnFloat => ReturnPayloadKind.Float,
+                PendingContinuationKind.ReturnReference => ReturnPayloadKind.Reference,
+                PendingContinuationKind.ReturnValueAddress => ReturnPayloadKind.ValueAddress,
+                _ => throw new InvalidOperationException("Continuation does not carry a return payload: " + kind.ToString()),
+            };
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetTopContinuation(PendingContinuationKind kind, int targetPc, long i0, long f0, bool isFloat)
-        {
-            if (kind == PendingContinuationKind.Return && isFloat)
-                kind = PendingContinuationKind.ReturnFloat;
+        private static PendingContinuationKind ContinuationFromReturnPayload(ReturnPayloadKind payload)
+            => payload switch
+            {
+                ReturnPayloadKind.None => PendingContinuationKind.ReturnVoid,
+                ReturnPayloadKind.Integer => PendingContinuationKind.ReturnInteger,
+                ReturnPayloadKind.Float => PendingContinuationKind.ReturnFloat,
+                ReturnPayloadKind.Reference => PendingContinuationKind.ReturnReference,
+                ReturnPayloadKind.ValueAddress => PendingContinuationKind.ReturnValueAddress,
+                _ => throw new InvalidOperationException("Invalid return payload kind: " + payload.ToString()),
+            };
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetTopContinuation(PendingContinuationKind kind, int targetPc, long i0, long f0)
+        {
             int frame = TopFrameOffset();
             int packed = ReadI32(frame + ShadowFramePackedFlags);
             packed = (packed & ~(0xFF << ShadowFrameContinuationKindShift)) | ((byte)kind << ShadowFrameContinuationKindShift);
@@ -1477,8 +1683,6 @@ namespace Cnidaria.Cs
             {
                 if (TryInvokeHostOverride(target, ct))
                     return;
-                if (TryInvokeIntrinsic(target, ct))
-                    return;
             }
             finally
             {
@@ -1489,8 +1693,8 @@ namespace Cnidaria.Cs
             if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
             {
                 if (target.BodyModule is null || target.Body is null)
-                    throw new MissingMethodException("No body for register call target M" + target.MethodId.ToString());
-                throw new MissingMethodException("Target method exists in metadata but not in register image: M" + target.MethodId.ToString());
+                    throw new MissingMethodException($"No body for register call target M{target.MethodId}");
+                throw new MissingMethodException($"Target method exists in metadata but not in register image: M{target.MethodId}");
             }
 
             if (_frameCount >= MaxCallFramesHard)
@@ -1500,7 +1704,34 @@ namespace Cnidaria.Cs
 
             EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
         }
+        private void ExecInternalCall(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
+        {
+            RuntimeMethod target = _rts.GetMethodById(checked((int)ins.Imm));
 
+            NormalizeValueTypeThisArgument(target);
+            if (RequiresTypeInitializationBeforeCall(target))
+            {
+                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
+                    return;
+            }
+
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+            _activeCallFlags = (CallFlags)ins.Aux | CallFlags.InternalCall;
+            _activeCallTargetMethod = target;
+            try
+            {
+                if (TryInvokeHostOverride(target, ct))
+                    return;
+                if (!TryInvokeIntrinsic(target, ct))
+                    throw new MissingMethodException("InternalCall implementation is missing: " + FormatMethodName(target));
+            }
+            finally
+            {
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
+            }
+        }
         private void ExecIndirectCall(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
         {
             int methodId = checked((int)GetGpr(ins.Rs1));
@@ -1646,7 +1877,7 @@ namespace Cnidaria.Cs
 
 
         private void SetTopMulticastContinuation(long continuation)
-           => SetTopContinuation(PendingContinuationKind.MulticastDelegate, -1, continuation, 0, false);
+           => SetTopContinuation(PendingContinuationKind.MulticastDelegate, -1, continuation, 0);
 
         private void StartDelegateInvocationTarget(long continuation)
         {
@@ -1661,7 +1892,7 @@ namespace Cnidaria.Cs
                 long multicastRef = ReadNative(blob + McDelegateRefOffset);
                 long delegateObj = GetDelegateInvocationTargetAt(multicastRef, nextIndex);
                 RuntimeMethod target = ReadDelegateTargetMethod(delegateObj);
-                long targetRef = ReadDelegateTarget(delegateObj);
+                long targetRef = ReadDelegateField(delegateObj, "_target");
 
                 if (RequiresTypeInitializationBeforeCall(target))
                 {
@@ -2019,9 +2250,6 @@ namespace Cnidaria.Cs
             return _rts.GetMethodById(checked((int)methodId));
         }
 
-        private long ReadDelegateTarget(long delegateRef)
-            => ReadDelegateField(delegateRef, "_target");
-
         private long ReadDelegateField(long delegateRef, string name)
         {
             int obj = checked((int)delegateRef);
@@ -2064,38 +2292,6 @@ namespace Cnidaria.Cs
                     return true;
             }
             return false;
-        }
-
-        private void RebindDelegateInvokeArguments(
-            RuntimeMethod invokeMethod,
-            RuntimeMethod target,
-            long targetRef,
-            CallFlags callFlags,
-            CapturedAbiArgument[] captured,
-            long hiddenReturnBuffer)
-        {
-            int targetArgCount = LogicalArgumentCount(target);
-            bool hasClosedTarget = targetRef != 0 || target.HasThis;
-            int targetExplicitArgBase = hasClosedTarget ? 1 : 0;
-            if (targetArgCount != targetExplicitArgBase + captured.Length)
-            {
-                throw new InvalidOperationException(
-                    "Delegate target signature does not match Invoke signature. InvokeArgs=" + captured.Length.ToString() +
-                    ", TargetArgs=" + targetArgCount.ToString() + ", Closed=" + hasClosedTarget.ToString());
-            }
-
-            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
-                WriteHiddenReturnBufferAddress(target, hiddenReturnBuffer);
-
-            if (hasClosedTarget)
-            {
-                if (targetRef == 0)
-                    throw new NullReferenceException();
-                WriteAbiScalarArgument(target, 0, targetRef);
-            }
-
-            for (int i = 0; i < captured.Length; i++)
-                WriteAbiArgument(target, targetExplicitArgBase + i, captured[i]);
         }
 
         private readonly struct CapturedAbiArgument
@@ -2218,7 +2414,7 @@ namespace Cnidaria.Cs
 
             // System.String is a variable sized object
             int obj = IsSystemStringType(ctor.DeclaringType)
-                ? AllocStringForNewObjConstructor(ctor)
+                ? AllocStringUninitialized(TryGetStringConstructorResultLength(ctor, out int computedLength) ? computedLength : 0)
                 : AllocObject(ctor.DeclaringType);
             SetThisArgumentReference(ctor, obj);
 
@@ -2230,12 +2426,6 @@ namespace Cnidaria.Cs
 
 
             EnterManagedFrame(methodIndex, _pc, CallFlags.None, ctor, ins.Rd, obj);
-        }
-
-        private int AllocStringForNewObjConstructor(RuntimeMethod ctor)
-        {
-            int length = TryGetStringConstructorResultLength(ctor, out int computedLength) ? computedLength : 0;
-            return AllocStringUninitialized(length);
         }
 
         private bool TryGetStringConstructorResultLength(RuntimeMethod ctor, out int length)
@@ -2262,7 +2452,7 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                if (IsCharPointerType(p0))
+                if (p0.Kind == RuntimeTypeKind.Pointer && p0.ElementType is not null && IsCharType(p0.ElementType))
                 {
                     long ptr = ReadAbiScalarArgument(ctor, 1);
                     length = ptr == 0 ? 0 : NullTerminatedCharPointerLength(checked((int)ptr));
@@ -2317,9 +2507,6 @@ namespace Cnidaria.Cs
         private bool IsCharArrayType(RuntimeType type)
             => type.Kind == RuntimeTypeKind.Array && type.ElementType is not null && IsCharType(type.ElementType);
 
-        private bool IsCharPointerType(RuntimeType type)
-            => type.Kind == RuntimeTypeKind.Pointer && type.ElementType is not null && IsCharType(type.ElementType);
-
         private bool IsInt32Type(RuntimeType type)
             => type.Namespace == "System" && type.Name == "Int32";
 
@@ -2368,16 +2555,21 @@ namespace Cnidaria.Cs
             return null;
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool IsRegisterVmStaticFieldInstruction(Op op)
+        private static bool IsStaticFieldInstruction(Op op)
             => (ushort)op >= (ushort)Op.LdSFldI1 && (ushort)op <= (ushort)Op.StSFldObj;
 
         private bool TryDeferRequiredTypeInitializationBeforeInstruction(InstrDesc ins, int executingPc, CancellationToken ct, ExecutionLimits limits)
         {
-            if (IsRegisterVmStaticFieldInstruction(ins.Op))
+            if (IsStaticFieldInstruction(ins.Op))
             {
-                RuntimeField field = FieldById(ins.Imm);
-                if (field.IsStatic && TryRunTypeInitializer(field.DeclaringType, executingPc, ct, limits))
-                    return true;
+                FieldLayoutRecord field = FieldLayout(ins.Imm);
+                if (field.IsStatic)
+                {
+                    TypeLayoutRecord declaringTypeLayout = TypeLayout(field.DeclaringTypeLayoutIndex);
+                    RuntimeType declaringType = _rts.GetTypeById(declaringTypeLayout.RuntimeTypeId);
+                    if (TryRunTypeInitializer(declaringType, executingPc, ct, limits))
+                        return true;
+                }
             }
 
             if (ins.Op == Op.NewObj)
@@ -2390,15 +2582,15 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private void ReturnFromCurrentFrame(bool hasInteger, bool hasFloat, bool hasRef, bool hasValue, int valueSize)
+        private void ReturnFromCurrentFrame(ReturnPayloadKind payloadKind, int valueSize = 0)
         {
             int retPc = TopReturnPc();
             int callerMethod = TopCallerMethodIndex();
             RuntimeMethod returningMethod = CurrentFrameMethod();
             long retI0 = X(MachineRegisters.ReturnValue0);
-            long retF0 = GetFprBits((byte)MachineRegisters.FloatReturnValue0);
+            long retF0 = GetFpr((byte)MachineRegisters.FloatReturnValue0);
 
-            if (hasValue && valueSize > 0 && (CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) != 0)
+            if (payloadKind == ReturnPayloadKind.ValueAddress && valueSize > 0 && (CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) != 0)
             {
                 int source = checked((int)retI0);
                 int target = checked((int)ReadHiddenReturnBufferAddress(returningMethod));
@@ -2406,7 +2598,7 @@ namespace Cnidaria.Cs
                 retI0 = target;
             }
 
-            if (TryBeginFinallyForReturn(_pc - 1, hasInteger, hasFloat, retI0, retF0))
+            if (TryBeginFinallyForReturn(_pc - 1, payloadKind, retI0, retF0))
                 return;
 
             bool returnedFromCctor = StringComparer.Ordinal.Equals(returningMethod.Name, ".cctor");
@@ -2442,13 +2634,33 @@ namespace Cnidaria.Cs
             X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
             if (registerSnapshotIndex >= 0)
             {
-                RestoreRegisterSnapshot(registerSnapshotIndex);
+                if ((uint)registerSnapshotIndex >= (uint)_registerSnapshots.Count || _registerSnapshots[registerSnapshotIndex] is not RegisterSnapshot snapshot)
+                    throw new InvalidOperationException("Invalid register snapshot index.");
+
+                Array.Copy(snapshot.General, _x, GprCount);
+                Array.Copy(snapshot.Float, _f, FprCount);
+                _registerSnapshots[registerSnapshotIndex] = null;
                 X(MachineRegisters.StackPointer, callerSp);
                 X(MachineRegisters.FramePointer, callerFp);
                 X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
             }
-            if (hasFloat) SetFpr(MachineRegisters.FloatReturnValue0, retF0);
-            if (hasInteger || hasRef || hasValue) SetGpr(MachineRegisters.ReturnValue0, retI0);
+
+            switch (payloadKind)
+            {
+                case ReturnPayloadKind.None:
+                    break;
+                case ReturnPayloadKind.Float:
+                    SetFpr(MachineRegisters.FloatReturnValue0, retF0);
+                    break;
+                case ReturnPayloadKind.Integer:
+                case ReturnPayloadKind.Reference:
+                case ReturnPayloadKind.ValueAddress:
+                    SetGpr(MachineRegisters.ReturnValue0, retI0);
+                    break;
+                default:
+                    throw new InvalidOperationException("Invalid return payload kind: " + payloadKind.ToString());
+            }
+
             if (postReturnRegister != RegisterVmIsa.InvalidRegister) SetGpr(postReturnRegister, postReturnObjectRef);
             if (returnedFromCctor) _typeInitState[cctorTypeId] = 2;
 
@@ -2472,15 +2684,6 @@ namespace Cnidaria.Cs
             return _registerSnapshots.Count - 1;
         }
 
-        private void RestoreRegisterSnapshot(int index)
-        {
-            if ((uint)index >= (uint)_registerSnapshots.Count || _registerSnapshots[index] is not RegisterSnapshot snapshot)
-                throw new InvalidOperationException("Invalid register snapshot index.");
-
-            Array.Copy(snapshot.General, _x, GprCount);
-            Array.Copy(snapshot.Float, _f, FprCount);
-            _registerSnapshots[index] = null;
-        }
         private void ReleaseRegisterSnapshot(int index)
         {
             if ((uint)index >= (uint)_registerSnapshots.Count)
@@ -2488,11 +2691,12 @@ namespace Cnidaria.Cs
 
             _registerSnapshots[index] = null;
         }
-        private bool TryBeginFinallyForReturn(int fromPc, bool hasInteger, bool hasFloat, long retI0, long retF0)
+        private bool TryBeginFinallyForReturn(int fromPc, ReturnPayloadKind payloadKind, long retI0, long retF0)
         {
             if (!TryFindEnclosingFinally(fromPc, targetPc: -1, out var finallyRegion))
                 return false;
-            SetTopContinuation(PendingContinuationKind.Return, -1, retI0, retF0, hasFloat);
+
+            SetTopContinuation(ContinuationFromReturnPayload(payloadKind), -1, retI0, retF0);
             _pc = finallyRegion.HandlerStartPc;
             return true;
         }
@@ -2501,7 +2705,7 @@ namespace Cnidaria.Cs
         {
             if (TryFindEnclosingFinally(fromPc, targetPc, out var finallyRegion))
             {
-                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0, 0, false);
+                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0, 0);
                 _pc = finallyRegion.HandlerStartPc;
                 return;
             }
@@ -2514,8 +2718,7 @@ namespace Cnidaria.Cs
             int targetPc = TopContinuationTargetPc();
             long i0 = TopContinuationI0();
             long f0 = TopContinuationF0();
-            bool isFloat = TopContinuationIsFloat();
-            SetTopContinuation(PendingContinuationKind.None, -1, 0, 0, false);
+            SetTopContinuation(PendingContinuationKind.None, -1, 0, 0);
 
             switch (kind)
             {
@@ -2527,13 +2730,20 @@ namespace Cnidaria.Cs
                 case PendingContinuationKind.Throw:
                     ThrowManaged(_currentExceptionRef, _pc - 1, preserveExistingThrowSite: true);
                     return;
-                case PendingContinuationKind.Return:
+                case PendingContinuationKind.ReturnVoid:
+                case PendingContinuationKind.ReturnInteger:
                 case PendingContinuationKind.ReturnFloat:
-                    isFloat = kind == PendingContinuationKind.ReturnFloat;
-                    if (isFloat) SetFpr(MachineRegisters.FloatReturnValue0, f0);
-                    else SetGpr(MachineRegisters.ReturnValue0, i0);
-                    ReturnFromCurrentFrame(hasInteger: !isFloat, hasFloat: isFloat, hasRef: false, hasValue: false, valueSize: 0);
-                    return;
+                case PendingContinuationKind.ReturnReference:
+                case PendingContinuationKind.ReturnValueAddress:
+                    {
+                        ReturnPayloadKind payloadKind = ReturnPayloadFromContinuation(kind);
+                        if (payloadKind == ReturnPayloadKind.Float)
+                            SetFpr(MachineRegisters.FloatReturnValue0, f0);
+                        else if (payloadKind != ReturnPayloadKind.None)
+                            SetGpr(MachineRegisters.ReturnValue0, i0);
+                        ReturnFromCurrentFrame(payloadKind);
+                        return;
+                    }
                 default:
                     throw new InvalidOperationException("Invalid finally continuation.");
             }
@@ -2567,7 +2777,7 @@ namespace Cnidaria.Cs
                 {
                     if ((EhRegionKind)h.Kind == EhRegionKind.Finally || (EhRegionKind)h.Kind == EhRegionKind.Fault)
                     {
-                        SetTopContinuation(PendingContinuationKind.Throw, -1, 0, 0, false);
+                        SetTopContinuation(PendingContinuationKind.Throw, -1, 0, 0);
                         _pc = h.HandlerStartPc;
                         return;
                     }
@@ -2818,7 +3028,8 @@ namespace Cnidaria.Cs
             if (v.Kind != VmValueKind.Ref)
                 throw new InvalidOperationException($"Expected string ref, got {v.Kind}.");
 
-            ValidateStringRef(v.Payload, out int strAbs);
+            RuntimeType type = ValidateStringRef(v.Payload);
+            int strAbs = checked((int)v.Payload);
             int len = ReadI32(strAbs + StringLengthOffset);
             if (len < 0) throw new InvalidOperationException("Corrupted string length.");
 
@@ -2865,7 +3076,7 @@ namespace Cnidaria.Cs
                 ?? throw new InvalidOperationException("Array type has no element type.");
             int elemSize = StorageSizeOf(elemType);
             int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-            CheckHeapAccess(elemAbs, elemSize, false);
+            CheckHeapAccess(elemAbs, elemSize);
             return LoadHostValue(elemAbs, elemType);
         }
 
@@ -2880,7 +3091,8 @@ namespace Cnidaria.Cs
                 ?? throw new InvalidOperationException("Array type has no element type.");
             int elemSize = StorageSizeOf(elemType);
             int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-            CheckHeapAccess(elemAbs, elemSize, true);
+            CheckHeapAccess(elemAbs, elemSize);
+            CheckWritableRange(elemAbs, elemSize);
             StoreHostValue(elemAbs, elemType, value);
         }
 
@@ -3254,14 +3466,16 @@ namespace Cnidaria.Cs
                 if (rm.HasThis && rm.Name == "get_Length" && rm.ParameterTypes.Length == 0)
                 {
                     long s = ReadThisArgumentReference(rm);
-                    ValidateStringRef(s, out int strAbs);
+                    RuntimeType type = ValidateStringRef(s);
+                    int strAbs = checked((int)s);
                     SetReturnI4(ReadI32(strAbs + StringLengthOffset));
                     return true;
                 }
                 if (rm.HasThis && (rm.Name == "GetPinnableReference" || rm.Name == "GetRawStringData") && rm.ParameterTypes.Length == 0)
                 {
                     long s = ReadThisArgumentReference(rm);
-                    ValidateStringRef(s, out int strAbs);
+                    RuntimeType type = ValidateStringRef(s);
+                    int strAbs = checked((int)s);
                     SetReturnRef(strAbs + StringCharsOffset);
                     return true;
                 }
@@ -3330,7 +3544,7 @@ namespace Cnidaria.Cs
             if (rm.DeclaringType.Namespace == "System.Runtime.InteropServices" && rm.DeclaringType.Name == "MemoryMarshal")
                 return IntrinsicMemoryMarshal(rm);
 
-            if (IsCoreLibRandomLike(rm.DeclaringType) && rm.Name == "Next")
+            if (rm.DeclaringType.Namespace == "System" && (rm.DeclaringType.Name == "Random" || rm.DeclaringType.Name == "ThreadSafeRandom") && rm.Name == "Next")
             {
                 if (rm.ParameterTypes.Length == 0)
                     SetReturnI4(Random.Shared.Next());
@@ -3344,7 +3558,7 @@ namespace Cnidaria.Cs
             }
 
             if (rm.HasInternalCall)
-                throw new NotSupportedException("InternalCall is not implemented: " + rm.DeclaringType.Namespace + "." + rm.DeclaringType.Name + "." + rm.Name);
+                throw new NotSupportedException($"InternalCall is not implemented: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
 
             return false;
         }
@@ -3366,7 +3580,8 @@ namespace Cnidaria.Cs
                 long s = ReadAbiScalarArgument(rm, 0);
                 if (s != 0)
                 {
-                    ValidateStringRef(s, out int strAbs);
+                    RuntimeType type = ValidateStringRef(s);
+                    int strAbs = checked((int)s);
                     int len = ReadI32(strAbs + StringLengthOffset);
                     int chars = strAbs + StringCharsOffset;
                     CheckIndirectAccess(chars, checked(len * 2), false);
@@ -3400,7 +3615,9 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            if (p.Kind == RuntimeTypeKind.Pointer && IsByteLikeElement(p.ElementType))
+            if (p.Kind == RuntimeTypeKind.Pointer && 
+                p.ElementType is not null && (p.ElementType.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int8 ||
+                (p.ElementType.Namespace == "System" && (p.ElementType.Name == "Byte" || p.ElementType.Name == "SByte"))))
             {
                 int abs = checked((int)ReadAbiScalarArgument(rm, 0));
                 if (abs != 0)
@@ -3446,14 +3663,6 @@ namespace Cnidaria.Cs
             }
 
             throw new NotSupportedException("Console._Write intrinsic unsupported parameter: " + p.Namespace + "." + p.Name);
-        }
-        private static bool IsByteLikeElement(RuntimeType? type)
-        {
-            if (type is null)
-                return false;
-
-            return type.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int8 ||
-                (type.Namespace == "System" && (type.Name == "Byte" || type.Name == "SByte"));
         }
         private bool IntrinsicUnsafe(RuntimeMethod rm)
         {
@@ -3544,7 +3753,8 @@ namespace Cnidaria.Cs
                     if (span.Length < size)
                     {
                         int dst = checked((int)ReadAbiScalarArgument(rm, 1));
-                        InitTypedObject(dst, valueType);
+                        CheckIndirectAccess(dst, size, true);
+                        _mem.AsSpan(dst, size).Clear();
                         SetReturnI4(0);
                         return true;
                     }
@@ -3753,7 +3963,7 @@ namespace Cnidaria.Cs
             {
                 AbiArgumentSlice slice = slices[0];
                 if (slice.Location.IsRegister)
-                    return slice.RegisterClass == RegisterClass.Float ? GetFprBits((byte)slice.Location.Register) : X(slice.Location.Register);
+                    return slice.RegisterClass == RegisterClass.Float ? GetFpr((byte)slice.Location.Register) : X(slice.Location.Register);
 
                 int addr = GetAbiStackArgumentAddress(method, slice.Location);
                 return ReadRawBits(addr, Math.Min(size, slice.Size));
@@ -3766,7 +3976,9 @@ namespace Cnidaria.Cs
         private int MaterializeAbiArgumentToStack(RuntimeMethod method, int logicalIndex, RuntimeType type)
         {
             int size = StorageSizeOf(type);
-            int align = StorageAlignOf(type);
+            int align = type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
+                    ? TargetArchitecture.PointerSize
+                    : Math.Max(1, type.AlignOf);
             int dst = StackAllocBytes(size, align);
             var slices = GetAbiArgumentSlices(method, logicalIndex);
             for (int i = 0; i < slices.Length; i++)
@@ -3780,7 +3992,7 @@ namespace Cnidaria.Cs
                 if (slice.Location.IsRegister)
                 {
                     long bits = slice.RegisterClass == RegisterClass.Float
-                        ? GetFprBits((byte)slice.Location.Register)
+                        ? GetFpr((byte)slice.Location.Register)
                         : X(slice.Location.Register);
                     WriteRawBits(target, bits, count);
                 }
@@ -3891,7 +4103,7 @@ namespace Cnidaria.Cs
             {
                 AbiArgumentSlice slice = slices[0];
                 if (slice.Location.IsRegister)
-                    return slice.RegisterClass == RegisterClass.Float ? GetFprBits((byte)slice.Location.Register) : X(slice.Location.Register);
+                    return slice.RegisterClass == RegisterClass.Float ? GetFpr((byte)slice.Location.Register) : X(slice.Location.Register);
                 return ReadSizedInteger(GetAbiStackArgumentAddress(method, slice.Location), type);
             }
 
@@ -4154,9 +4366,25 @@ namespace Cnidaria.Cs
             return (int)v;
         }
 
+        private TypeLayoutRecord TypeLayout(long index)
+        {
+            int i = checked((int)index);
+            if ((uint)i >= (uint)_image.TypeLayouts.Length)
+                throw new InvalidOperationException("Invalid type layout index: " + i.ToString());
+            return _image.TypeLayouts[i];
+        }
+
+        private FieldLayoutRecord FieldLayout(long index)
+        {
+            int i = checked((int)index);
+            if ((uint)i >= (uint)_image.FieldLayouts.Length)
+                throw new InvalidOperationException("Invalid field layout index: " + i.ToString());
+            return _image.FieldLayouts[i];
+        }
+
         private void LoadFieldInt(InstrDesc ins, int size, bool signed)
         {
-            int abs = GetInstanceFieldAddress(FieldById(ins.Imm), GetGpr(ins.Rs1), false);
+            int abs = GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false);
             long v = size switch
             {
                 1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
@@ -4168,7 +4396,7 @@ namespace Cnidaria.Cs
 
         private void LoadStaticFieldInt(InstrDesc ins, int size, bool signed)
         {
-            int abs = GetStaticFieldAddress(FieldById(ins.Imm), false);
+            int abs = GetStaticFieldAddress(FieldLayout(ins.Imm));
             long v = size switch
             {
                 1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
@@ -4178,26 +4406,11 @@ namespace Cnidaria.Cs
             SetGpr(ins.Rd, v);
         }
 
-        private void StoreField(InstrDesc ins)
-        {
-            var field = FieldById(ins.Imm);
-            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
-            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, field.FieldType);
-        }
-
-        private void StoreStaticField(InstrDesc ins)
-        {
-            var field = FieldById(ins.Imm);
-            int abs = GetStaticFieldAddress(field, true);
-            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, field.FieldType);
-        }
-
-        private RuntimeType ElementTypeOf(InstrDesc ins)
-            => ins.Imm > 0 ? _rts.GetTypeById(checked((int)ins.Imm)) : GetObjectTypeFromRef(GetGpr(ins.Rs1)).ElementType ?? throw new InvalidOperationException("Array has no element type.");
 
         private int ArrayEA(InstrDesc ins)
         {
-            return GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), ElementTypeOf(ins));
+            return GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), TypeLayout(ins.Imm));
+
         }
 
         private void LoadElemInt(InstrDesc ins, int size, bool signed)
@@ -4205,68 +4418,13 @@ namespace Cnidaria.Cs
             int abs = ArrayEA(ins);
             long v = size switch
             {
-                1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
-                2 => signed ? (short)ReadU16(abs) : ReadU16(abs),
+                1 => signed ? (sbyte)ReadU8Unchecked(abs) : ReadU8Unchecked(abs),
+                2 => signed ? (short)ReadU16Unchecked(abs) : ReadU16Unchecked(abs),
                 _ => throw new ArgumentOutOfRangeException(nameof(size)),
             };
             SetGpr(ins.Rd, v);
         }
-
-        private void StoreElement(InstrDesc ins)
-        {
-            RuntimeType elem = ElementTypeOf(ins);
-            int abs = ArrayEA(ins);
-            StoreRegisterToTypedAddress(ins.Op, ins.Rd, abs, elem);
-        }
-
-        private void StoreRegisterToTypedAddress(Op op, byte reg, int abs, RuntimeType type)
-        {
-            int size = StorageSizeOf(type);
-            if (op is Op.StFldF32 or Op.StSFldF32 or Op.StElemF32 or Op.StF32)
-            {
-                WriteI32(abs, unchecked((int)(uint)GetFprBits(reg)));
-                return;
-            }
-            if (op is Op.StFldF64 or Op.StSFldF64 or Op.StElemF64 or Op.StF64)
-            {
-                WriteI64(abs, GetFprBits(reg));
-                return;
-            }
-            if (op is Op.StFldObj or Op.StSFldObj or Op.StElemObj or Op.StObj)
-            {
-                CopyTypedObject(abs, GetAddress(reg), type);
-                return;
-            }
-            long v = GetGpr(reg);
-            switch (size)
-            {
-                case 1: WriteU8(abs, unchecked((byte)v)); return;
-                case 2: WriteU16(abs, unchecked((ushort)v)); return;
-                case 4: WriteI32(abs, unchecked((int)v)); return;
-                case 8: WriteI64(abs, v); return;
-                default:
-                    CopyBlock(abs, checked((int)v), size);
-                    return;
-            }
-        }
-
-        private void InitDefaultValue(InstrDesc ins)
-        {
-            var t = _rts.GetTypeById(checked((int)ins.Imm));
-            if (t.IsReferenceType || t.Kind == RuntimeTypeKind.Pointer || t.Kind == RuntimeTypeKind.ByRef)
-            {
-                SetGpr(ins.Rd, 0);
-                return;
-            }
-            if (MachineRegisters.GetClass((MachineRegister)ins.Rd) == RegisterClass.Float)
-            {
-                SetFpr(ins.Rd, 0);
-                return;
-            }
-            SetGpr(ins.Rd, 0);
-        }
-
-        private int GetInstanceFieldAddress(RuntimeField field, long receiver, bool writable)
+        private int GetInstanceFieldAddress(FieldLayoutRecord field, long receiver, bool writable)
         {
             if (field.IsStatic)
                 throw new InvalidOperationException("Instance field access used for static field.");
@@ -4278,41 +4436,58 @@ namespace Cnidaria.Cs
 
             int receiverAbs = (int)receiver;
 
-            if (TryGetObjectTypeFromExactRef(receiverAbs, out RuntimeType actual))
+            if (!field.DeclaringTypeIsValueType)
             {
-                field = _rts.BindFieldToReceiver(field, actual);
-                if (field.DeclaringType.IsValueType)
-                {
-                    if (actual.TypeId != field.DeclaringType.TypeId)
-                        throw new InvalidOperationException("Boxed value field receiver type mismatch.");
-                    int boxed = checked(receiverAbs + ObjectHeaderSize + field.Offset);
-                    CheckHeapAccess(boxed, StorageSizeOf(field.FieldType), writable);
-                    return boxed;
-                }
-
-                if (!IsAssignableTo(actual, field.DeclaringType))
-                    throw new InvalidOperationException("Field receiver is not assignable to declaring type.");
-
                 int abs = checked(receiverAbs + field.Offset);
-                CheckHeapAccess(abs, StorageSizeOf(field.FieldType), writable);
+                CheckHeapAccess(abs, field.Size);
+                if (writable) CheckWritableRange(abs, field.Size);
                 return abs;
             }
 
-            if (!field.DeclaringType.IsValueType)
-                throw new InvalidOperationException("Address receiver is only valid for value-type field access.");
+            TypeLayoutRecord declaringType = TypeLayout(field.DeclaringTypeLayoutIndex);
+            if (TryGetObjectTypeIdFromExactRef(receiverAbs, out int actualTypeId))
+            {
+                if (actualTypeId != declaringType.RuntimeTypeId)
+                    throw new InvalidOperationException("Boxed value field receiver type mismatch.");
+
+                int boxed = checked(receiverAbs + ObjectHeaderSize + field.Offset);
+                CheckHeapAccess(boxed, field.Size);
+                if (writable) CheckWritableRange(boxed, field.Size);
+                return boxed;
+            }
 
             int byrefAbs = checked(receiverAbs + field.Offset);
-            CheckIndirectAccess(byrefAbs, StorageSizeOf(field.FieldType), writable);
+            CheckIndirectAccess(byrefAbs, field.Size, writable);
             return byrefAbs;
         }
 
-        private int GetStaticFieldAddress(RuntimeField field, bool writable)
+        private int GetStaticFieldAddress(FieldLayoutRecord field)
         {
             if (!field.IsStatic)
                 throw new InvalidOperationException("Static field access used for instance field.");
-            int baseAbs = EnsureStaticStorage(field.DeclaringType);
+            TypeLayoutRecord declaringType = TypeLayout(field.DeclaringTypeLayoutIndex);
+            int baseAbs = EnsureStaticStorage(declaringType);
             int abs = checked(baseAbs + field.Offset);
-            CheckHeapAccess(abs, StorageSizeOf(field.FieldType), writable);
+            CheckHeapAccess(abs, field.Size);
+            return abs;
+        }
+
+        private int EnsureStaticStorage(TypeLayoutRecord type)
+        {
+            if (_staticBaseByTypeId.TryGetValue(type.RuntimeTypeId, out int abs))
+                return abs;
+
+            if (type.StaticSize <= 0)
+            {
+                _staticBaseByTypeId[type.RuntimeTypeId] = 0;
+                return 0;
+            }
+
+            abs = AllocRawHeapBytes(type.StaticSize, Math.Max(8, type.StaticAlign));
+            Array.Clear(_mem, abs, type.StaticSize);
+            _staticBaseByTypeId[type.RuntimeTypeId] = abs;
+            if (abs + type.StaticSize > _heapFloor)
+                _heapFloor = abs + type.StaticSize;
             return abs;
         }
 
@@ -4353,6 +4528,17 @@ namespace Cnidaria.Cs
             return obj;
         }
 
+        private int AllocBoxedValueObject(TypeLayoutRecord type)
+        {
+            int payload = type.Size;
+            int size = checked(ObjectHeaderSize + payload);
+            int obj = AllocHeapBytes(size, Math.Max(8, type.Align));
+            WriteI32(obj, type.RuntimeTypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            _mem.AsSpan(obj + ObjectHeaderSize, payload).Clear();
+            return obj;
+        }
+
         private int AllocBoxedValueObject(RuntimeType type)
         {
             int payload = StorageSizeOf(type);
@@ -4364,20 +4550,19 @@ namespace Cnidaria.Cs
             return obj;
         }
 
-        private int BoxValue(RuntimeType type, byte sourceReg)
+        private int BoxValue(TypeLayoutRecord type, byte sourceReg)
         {
             if (type.IsReferenceType)
-            {
                 return checked((int)GetGpr(sourceReg));
-            }
+
             int obj = AllocBoxedValueObject(type);
             int payload = obj + ObjectHeaderSize;
-            int size = StorageSizeOf(type);
+            int size = type.Size;
 
             if (RegisterVmIsa.IsFloatRegister(sourceReg))
             {
-                if (size == 4) WriteI32(payload, unchecked((int)(uint)GetFprBits(sourceReg)));
-                else WriteI64(payload, GetFprBits(sourceReg));
+                if (size == 4) WriteI32(payload, unchecked((int)(uint)GetFpr(sourceReg)));
+                else WriteI64(payload, GetFpr(sourceReg));
                 return obj;
             }
 
@@ -4393,37 +4578,60 @@ namespace Cnidaria.Cs
             return obj;
         }
 
-        private int UnboxAddress(long objRef, RuntimeType type)
+        private int BoxValue(RuntimeType type, byte sourceReg)
+        {
+            if (type.IsReferenceType)
+            {
+                return checked((int)GetGpr(sourceReg));
+            }
+            int obj = AllocBoxedValueObject(type);
+            int payload = obj + ObjectHeaderSize;
+            int size = StorageSizeOf(type);
+
+            if (RegisterVmIsa.IsFloatRegister(sourceReg))
+            {
+                if (size == 4) WriteI32(payload, unchecked((int)(uint)GetFpr(sourceReg)));
+                else WriteI64(payload, GetFpr(sourceReg));
+                return obj;
+            }
+
+            long raw = GetGpr(sourceReg);
+            if (size <= 8 && !type.ContainsGcPointers)
+            {
+                WriteSizedInteger(payload, type, raw);
+            }
+            else
+            {
+                CopyTypedObject(payload, checked((int)raw), type);
+            }
+            return obj;
+        }
+
+        private int UnboxAddress(long objRef, TypeLayoutRecord type)
         {
             if (objRef == 0) throw new NullReferenceException();
-            var actual = GetObjectTypeFromRef(objRef);
-            if (actual.TypeId != type.TypeId)
+            int actualTypeId = GetObjectRuntimeTypeId(objRef);
+            if (actualTypeId != type.RuntimeTypeId)
                 throw new InvalidCastException();
             return checked((int)objRef + ObjectHeaderSize);
         }
 
-        private void UnboxAny(InstrDesc ins)
-        {
-            var type = _rts.GetTypeById(checked((int)ins.Imm));
-            int addr = UnboxAddress(GetGpr(ins.Rs1), type);
-            LoadTypedAddressToRegister(ins.Rd, addr, type);
-        }
-
-        private void LoadTypedAddressToRegister(byte rd, int abs, RuntimeType type)
+        private void LoadTypedAddressToRegister(byte rd, int abs, TypeLayoutRecord type)
         {
             if (MachineRegisters.GetClass((MachineRegister)rd) == RegisterClass.Float)
             {
-                SetFpr(rd, StorageSizeOf(type) == 4 ? (uint)ReadI32(abs) : ReadI64(abs));
+                SetFpr(rd, type.Size == 4 ? (uint)ReadI32(abs) : ReadI64(abs));
                 return;
             }
             SetGpr(rd, ReadSizedInteger(abs, type));
         }
 
-        private void InitTypedObject(int abs, RuntimeType type)
+        private void CopyTypedObject(int dst, int src, TypeLayoutRecord type)
         {
-            int size = StorageSizeOf(type);
-            CheckIndirectAccess(abs, size, true);
-            _mem.AsSpan(abs, size).Clear();
+            int size = type.Size;
+            CheckIndirectAccess(src, size, false);
+            CheckIndirectAccess(dst, size, true);
+            _mem.AsSpan(src, size).CopyTo(_mem.AsSpan(dst, size));
         }
 
         private void CopyTypedObject(int dst, int src, RuntimeType type)
@@ -4442,11 +4650,24 @@ namespace Cnidaria.Cs
             _mem.AsSpan(src, size).CopyTo(_mem.AsSpan(dst, size));
         }
 
-        private void InitBlock(int dst, byte value, int size)
+
+        private int AllocArray(TypeLayoutRecord arrayType, int length)
         {
-            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
-            CheckIndirectAccess(dst, size, true);
-            _mem.AsSpan(dst, size).Fill(value);
+            if (length < 0) throw new OverflowException();
+            if (!arrayType.IsArray || arrayType.ElementTypeLayoutIndex < 0)
+                throw new InvalidOperationException("NewArr requires an array type execution layout.");
+
+            TypeLayoutRecord elemType = TypeLayout(arrayType.ElementTypeLayoutIndex);
+            int elemSize = elemType.Size;
+            int dataBytes = checked(length * elemSize);
+            int size = AlignUp(ArrayDataOffset + dataBytes, 8);
+            int obj = AllocHeapBytes(size, 8);
+            WriteI32(obj, arrayType.RuntimeTypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            WriteI32(obj + ArrayLengthOffset, length);
+            WriteI32(obj + ArrayLengthOffset + 4, 0);
+            if (dataBytes != 0) _mem.AsSpan(obj + ArrayDataOffset, dataBytes).Clear();
+            return obj;
         }
 
         private int AllocArray(RuntimeType typeOrElementType, int length)
@@ -4466,6 +4687,16 @@ namespace Cnidaria.Cs
             return obj;
         }
 
+        private int GetArrayElementAddress(long arrRef, int index, TypeLayoutRecord elemType)
+        {
+            ValidateArrayRefForExecution(arrRef, out int arrAbs);
+            int len = ReadI32(arrAbs + ArrayLengthOffset);
+            if ((uint)index >= (uint)len) throw new IndexOutOfRangeException();
+            int elemSize = elemType.Size;
+            int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            return abs;
+        }
+
         private int GetArrayElementAddress(long arrRef, int index, RuntimeType elemType)
         {
             ValidateArrayRef(arrRef, out int arrAbs, out RuntimeType arrType);
@@ -4474,7 +4705,8 @@ namespace Cnidaria.Cs
             RuntimeType actualElem = arrType.ElementType ?? elemType;
             int elemSize = StorageSizeOf(actualElem);
             int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-            CheckHeapAccess(abs, elemSize, true);
+            CheckHeapAccess(abs, elemSize);
+            CheckWritableRange(abs, elemSize);
             return abs;
         }
 
@@ -4510,12 +4742,22 @@ namespace Cnidaria.Cs
             return obj;
         }
 
-        private int CastClass(long objRef, RuntimeType target)
+        private void CastClass(byte rd, long objRef, RuntimeType target, int pc)
         {
-            if (objRef == 0) return 0;
+            if (objRef == 0)
+            {
+                SetGpr(rd, 0);
+                return;
+            }
+
             RuntimeType actual = GetObjectTypeFromRef(objRef);
-            if (!IsAssignableTo(actual, target)) throw new InvalidCastException();
-            return checked((int)objRef);
+            if (!IsAssignableTo(actual, target))
+            {
+                ThrowInvalidCast(pc);
+                return;
+            }
+
+            SetGpr(rd, (int)objRef);
         }
 
         private int IsInst(long objRef, RuntimeType target)
@@ -4525,9 +4767,13 @@ namespace Cnidaria.Cs
             return IsAssignableTo(actual, target) ? checked((int)objRef) : 0;
         }
 
-        private void BoundsCheck(int index, int length)
+        private bool BoundsCheck(int index, int length, int pc)
         {
-            if ((uint)index >= (uint)length) throw new IndexOutOfRangeException();
+            if ((uint)index < (uint)length)
+                return true;
+
+            ThrowIndexOutOfRange(pc);
+            return false;
         }
         private int StaticData(int pc, InstrDesc instruction)
         {
@@ -5840,7 +6086,7 @@ namespace Cnidaria.Cs
                 var e = _image.SwitchTable[start + i];
                 if (e.Key == key)
                 {
-                    _pc = CheckedTarget(e.TargetPc);
+                    _pc = unchecked((int)e.TargetPc);
                     return;
                 }
             }
@@ -5860,15 +6106,13 @@ namespace Cnidaria.Cs
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long GetGpr(byte register)
-            => register == (byte)MachineRegister.X0 ? 0 : _x[register];
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_x), register);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetGpr(byte register, long value)
         {
-            if (register == (byte)MachineRegister.X0)
-                return;
-
-            _x[register] = value;
+            //if (register == (byte)MachineRegister.X0) return; trust compiler to not do that
+            Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_x), register) = value;
             if (register == (byte)MachineRegister.X2)
                 TrackStackPeak(value);
         }
@@ -5877,21 +6121,22 @@ namespace Cnidaria.Cs
             => SetGpr(RegisterVmIsa.EncodeRegister(register), value);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private long GetFprBits(byte register)
-            => _f[register - (byte)MachineRegister.F0];
+        private long GetFpr(byte register)
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - (byte)MachineRegister.F0);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetFpr(byte register, long bits)
-            => _f[register - (byte)MachineRegister.F0] = bits;
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - (byte)MachineRegister.F0) = bits;
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetFpr(MachineRegister register, long bits)
-            => SetFpr(RegisterVmIsa.EncodeRegister(register), bits);
+        private void SetFpr(MachineRegister register, long bits) 
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - MachineRegister.F0) = bits;
+        //  => SetFpr(RegisterVmIsa.EncodeRegister(register), bits); trust the compiler to avoid mistakes here
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private float F32(byte register)
-            => BitConverter.Int32BitsToSingle(unchecked((int)(uint)GetFprBits(register)));
+            => BitConverter.Int32BitsToSingle(unchecked((int)(uint)GetFpr(register)));
 
         private double F64(byte register)
-            => BitConverter.Int64BitsToDouble(GetFprBits(register));
+            => BitConverter.Int64BitsToDouble(GetFpr(register));
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetF32(byte register, float value)
             => SetFpr(register, unchecked((uint)BitConverter.SingleToInt32Bits(value)));
@@ -5904,6 +6149,534 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetBool(byte register, bool value)
             => SetGpr(register, value ? 1 : 0);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowDivideByZero(int pc)
+            => ThrowManaged(AllocExceptionRef("System", "DivideByZeroException", string.Empty), pc, preserveExistingThrowSite: false);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowOverflow(int pc)
+            => ThrowManaged(AllocExceptionRef("System", "OverflowException", string.Empty), pc, preserveExistingThrowSite: false);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowNullReference(int pc)
+            => ThrowManaged(AllocExceptionRef("System", "NullReferenceException", string.Empty), pc, preserveExistingThrowSite: false);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowIndexOutOfRange(int pc)
+            => ThrowManaged(AllocExceptionRef("System", "IndexOutOfRangeException", string.Empty), pc, preserveExistingThrowSite: false);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowInvalidCast(int pc)
+            => ThrowManaged(AllocExceptionRef("System", "InvalidCastException", string.Empty), pc, preserveExistingThrowSite: false);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DivI32(byte rd, int lhs, int rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            if (lhs == int.MinValue && rhs == -1)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, lhs / rhs);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void RemI32(byte rd, int lhs, int rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            if (lhs == int.MinValue && rhs == -1)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, lhs % rhs);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DivU32(byte rd, uint lhs, uint rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(lhs / rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void RemU32(byte rd, uint lhs, uint rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(lhs % rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DivI64(byte rd, long lhs, long rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            if (lhs == long.MinValue && rhs == -1)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, lhs / rhs);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void RemI64(byte rd, long lhs, long rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            if (lhs == long.MinValue && rhs == -1)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, lhs % rhs);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DivU64(byte rd, ulong lhs, ulong rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)(lhs / rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void RemU64(byte rd, ulong lhs, ulong rhs, int pc)
+        {
+            if (rhs == 0)
+            {
+                ThrowDivideByZero(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)(lhs % rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void AddOvfI32(byte rd, int lhs, int rhs, int pc)
+        {
+            long value = (long)lhs + rhs;
+            if (value < int.MinValue || value > int.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SubOvfI32(byte rd, int lhs, int rhs, int pc)
+        {
+            long value = (long)lhs - rhs;
+            if (value < int.MinValue || value > int.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MulOvfI32(byte rd, int lhs, int rhs, int pc)
+        {
+            long value = (long)lhs * rhs;
+            if (value < int.MinValue || value > int.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void AddOvfU32(byte rd, uint lhs, uint rhs, int pc)
+        {
+            uint value = lhs + rhs;
+            if (value < lhs)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SubOvfU32(byte rd, uint lhs, uint rhs, int pc)
+        {
+            if (lhs < rhs)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(lhs - rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MulOvfU32(byte rd, uint lhs, uint rhs, int pc)
+        {
+            ulong value = (ulong)lhs * rhs;
+            if (value > uint.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(uint)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void AddOvfI64(byte rd, long lhs, long rhs, int pc)
+        {
+            long value = lhs + rhs;
+            if (((lhs ^ value) & (rhs ^ value)) < 0)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SubOvfI64(byte rd, long lhs, long rhs, int pc)
+        {
+            long value = lhs - rhs;
+            if (((lhs ^ rhs) & (lhs ^ value)) < 0)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MulOvfI64(byte rd, long lhs, long rhs, int pc)
+        {
+            if (MulI64Overflows(lhs, rhs))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, lhs * rhs);
+        }
+
+        private static bool MulI64Overflows(long lhs, long rhs)
+        {
+            if (lhs > 0)
+            {
+                if (rhs > 0) return lhs > long.MaxValue / rhs;
+                if (rhs < 0) return rhs < long.MinValue / lhs;
+                return false;
+            }
+
+            if (lhs < 0)
+            {
+                if (rhs > 0) return lhs < long.MinValue / rhs;
+                if (rhs < 0) return lhs < long.MaxValue / rhs;
+                return false;
+            }
+
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void AddOvfU64(byte rd, ulong lhs, ulong rhs, int pc)
+        {
+            ulong value = lhs + rhs;
+            if (value < lhs)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SubOvfU64(byte rd, ulong lhs, ulong rhs, int pc)
+        {
+            if (lhs < rhs)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)(lhs - rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MulOvfU64(byte rd, ulong lhs, ulong rhs, int pc)
+        {
+            if (rhs != 0 && lhs > ulong.MaxValue / rhs)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)(lhs * rhs)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PtrAddI32(byte rd, long @base, int index, long scale, int pc)
+        {
+            if (MulI64Overflows(index, scale))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            AddOvfI64(rd, @base, index * scale, pc);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PtrAddI64(byte rd, long @base, long index, long scale, int pc)
+        {
+            if (MulI64Overflows(index, scale))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            AddOvfI64(rd, @base, index * scale, pc);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI64ToI32Ovf(byte rd, long value, int pc)
+        {
+            if (value < int.MinValue || value > int.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU64ToI32Ovf(byte rd, ulong value, int pc)
+        {
+            if (value > int.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI64ToU32Ovf(byte rd, long value, int pc)
+        {
+            if (value < 0 || value > uint.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(uint)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU64ToU32Ovf(byte rd, ulong value, int pc)
+        {
+            if (value > uint.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(uint)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF32ToI32Ovf(byte rd, float value, int pc)
+        {
+            if (!(value >= int.MinValue && value < 2147483648.0f))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF32ToI64Ovf(byte rd, float value, int pc)
+        {
+            if (!(value >= long.MinValue && value < 9223372036854775808.0f))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, (long)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF64ToI32Ovf(byte rd, double value, int pc)
+        {
+            if (!(value >= int.MinValue && value < 2147483648.0))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (int)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF64ToI64Ovf(byte rd, double value, int pc)
+        {
+            if (!(value >= long.MinValue && value < 9223372036854775808.0))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, (long)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI32ToI8Ovf(byte rd, int value, int pc)
+        {
+            if (value < sbyte.MinValue || value > sbyte.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (sbyte)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU32ToI8Ovf(byte rd, uint value, int pc)
+        {
+            if (value > (uint)sbyte.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (sbyte)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI32ToU8Ovf(byte rd, int value, int pc)
+        {
+            if (value < byte.MinValue || value > byte.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (byte)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU32ToU8Ovf(byte rd, uint value, int pc)
+        {
+            if (value > byte.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (byte)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI32ToI16Ovf(byte rd, int value, int pc)
+        {
+            if (value < short.MinValue || value > short.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (short)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU32ToI16Ovf(byte rd, uint value, int pc)
+        {
+            if (value > (uint)short.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (short)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertI32ToU16Ovf(byte rd, int value, int pc)
+        {
+            if (value < ushort.MinValue || value > ushort.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (ushort)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertU32ToU16Ovf(byte rd, uint value, int pc)
+        {
+            if (value > ushort.MaxValue)
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, (ushort)value);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetReturnI4(int value)
             => SetGpr(MachineRegisters.ReturnValue0, value);
@@ -5911,52 +6684,93 @@ namespace Cnidaria.Cs
         private void SetReturnRef(long value)
             => SetGpr(MachineRegisters.ReturnValue0, value);
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private byte ReadU8Unchecked(int abs)
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteU8Unchecked(int abs, byte value)
+            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs) = value;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ushort ReadU16Unchecked(int abs)
+            => Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteU16Unchecked(int abs, ushort value)
+            => Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int ReadI32Unchecked(int abs)
+            => Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteI32Unchecked(int abs, int value)
+            => Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long ReadI64Unchecked(int abs)
+            => Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteI64Unchecked(int abs, long value)
+            => Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long ReadNativeUnchecked(int abs)
+        {
+#pragma warning disable CS0162
+            return TargetArchitecture.PointerSize == 8 ? ReadI64Unchecked(abs) : ReadI32Unchecked(abs);
+#pragma warning restore CS0162
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteNativeUnchecked(int abs, long value)
+        {
+#pragma warning disable CS0162
+            if (TargetArchitecture.PointerSize == 8) WriteI64Unchecked(abs, value);
+            else WriteI32Unchecked(abs, checked((int)value));
+#pragma warning restore CS0162
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private byte ReadU8(int abs)
         {
             CheckRange(abs, 1);
-            return _mem[abs];
+            return Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs);
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteU8(int abs, byte value)
         {
             CheckWritableRange(abs, 1);
-            _mem[abs] = value;
+            Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs) = value;
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private ushort ReadU16(int abs)
         {
             CheckRange(abs, 2);
-            return Unsafe.ReadUnaligned<ushort>(ref _mem[abs]);
+            return Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
         }
 
         private void WriteU16(int abs, ushort value)
         {
             CheckWritableRange(abs, 2);
-            Unsafe.WriteUnaligned(ref _mem[abs], value);
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
         }
 
         private int ReadI32(int abs)
         {
             CheckRange(abs, 4);
-            return Unsafe.ReadUnaligned<int>(ref _mem[abs]);
+            return Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
         }
 
         private void WriteI32(int abs, int value)
         {
             CheckWritableRange(abs, 4);
-            Unsafe.WriteUnaligned(ref _mem[abs], value);
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
         }
 
         private long ReadI64(int abs)
         {
             CheckRange(abs, 8);
-            return Unsafe.ReadUnaligned<long>(ref _mem[abs]);
+            return Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs));
         }
 
         private void WriteI64(int abs, long value)
         {
             CheckWritableRange(abs, 8);
-            Unsafe.WriteUnaligned(ref _mem[abs], value);
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_mem), abs), value);
         }
 
         private long ReadNative(int abs)
@@ -5974,12 +6788,37 @@ namespace Cnidaria.Cs
             else WriteI32(abs, checked((int)value));
 #pragma warning restore CS0162
         }
-
-        private long ReadNativeOrI64(int abs, RuntimeType type)
+        private long ReadSizedInteger(int abs, TypeLayoutRecord type)
         {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+            int size = type.Size;
+            if (type.IsReferenceType || type.IsPointerLike || type.IsNativeInt)
                 return ReadNative(abs);
-            return ReadI64(abs);
+            switch (size)
+            {
+                case 1: return type.IsUnsignedSmall ? ReadU8(abs) : unchecked((sbyte)ReadU8(abs));
+                case 2: return type.IsUnsignedSmall || type.IsChar ? ReadU16(abs) : unchecked((short)ReadU16(abs));
+                case 4: return type.IsUnsignedSmall ? unchecked((uint)ReadI32(abs)) : ReadI32(abs);
+                case 8: return ReadI64(abs);
+                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+            }
+        }
+
+        private void WriteSizedInteger(int abs, TypeLayoutRecord type, long value)
+        {
+            int size = type.Size;
+            if (type.IsReferenceType || type.IsPointerLike || type.IsNativeInt)
+            {
+                WriteNative(abs, value);
+                return;
+            }
+            switch (size)
+            {
+                case 1: WriteU8(abs, unchecked((byte)value)); return;
+                case 2: WriteU16(abs, unchecked((ushort)value)); return;
+                case 4: WriteI32(abs, unchecked((int)value)); return;
+                case 8: WriteI64(abs, value); return;
+                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+            }
         }
 
         private long ReadSizedInteger(int abs, RuntimeType type)
@@ -6014,11 +6853,10 @@ namespace Cnidaria.Cs
                 default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
             }
         }
-
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void CheckRange(int abs, int size)
         {
-            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
-            if ((uint)abs > (uint)_mem.Length || abs + size < abs || abs + size > _mem.Length)
+            if ((uint)abs > (uint)_mem.Length || (uint)size > (uint)(_mem.Length - abs))
                 throw new AccessViolationException();
         }
 
@@ -6029,17 +6867,35 @@ namespace Cnidaria.Cs
                 throw new AccessViolationException("Attempt to write read-only/static metadata memory.");
         }
 
-
-        private void CheckHeapAccess(int abs, int size, bool writable)
-        {
-            CheckHeapAccess(abs, size);
-            if (writable) CheckWritableRange(abs, size);
-        }
-
         private void CheckIndirectAccess(int abs, int size, bool writable)
         {
-            CheckIndirectAccess(abs, size);
-            if (writable) CheckWritableRange(abs, size);
+            CheckRange(abs, size);
+            if (abs < _staticEnd)
+            {
+                if (abs + size > _staticEnd)
+                    throw new AccessViolationException("Static data access out of range.");
+                if (writable) CheckWritableRange(abs, size);
+                return;
+            }
+            if (abs >= _heapBase)
+            {
+                CheckHeapAccess(abs, size);
+                if (writable) CheckWritableRange(abs, size);
+                return;
+            }
+            if (abs >= _stackBase && abs < _stackEnd)
+            {
+                CheckStackRange(abs, size);
+                if (writable) CheckWritableRange(abs, size);
+                return;
+            }
+            if (abs >= _staticEnd && abs < _heapBase)
+            {
+                if (writable) CheckWritableRange(abs, size);
+                return;
+            }
+                
+            throw new AccessViolationException();
         }
 
         private void CheckStackRange(int abs, int size)
@@ -6055,30 +6911,6 @@ namespace Cnidaria.Cs
             CheckRange(abs, size);
             if (abs < _heapBase || abs + size > _heapPtr)
                 throw new AccessViolationException("Heap access out of range.");
-        }
-
-        private void CheckIndirectAccess(int abs, int size)
-        {
-            CheckRange(abs, size);
-            if (abs < _staticEnd)
-            {
-                if (abs + size > _staticEnd)
-                    throw new AccessViolationException("Static data access out of range.");
-                return;
-            }
-            if (abs >= _heapBase)
-            {
-                CheckHeapAccess(abs, size);
-                return;
-            }
-            if (abs >= _stackBase && abs < _stackEnd)
-            {
-                CheckStackRange(abs, size);
-                return;
-            }
-            if (abs >= _staticEnd && abs < _heapBase)
-                return;
-            throw new AccessViolationException();
         }
 
         private void TrackStackPeak(long stackLow)
@@ -6111,6 +6943,19 @@ namespace Cnidaria.Cs
             return value & ~((long)mask);
         }
 
+        private void ValidateArrayRefForExecution(long objRef, out int abs)
+        {
+            if (objRef == 0) throw new NullReferenceException();
+            if (objRef < int.MinValue || objRef > int.MaxValue)
+                throw new AccessViolationException("Array reference is outside VM address space.");
+            abs = (int)objRef;
+            if (!TryGetBlockFromObjectRef(abs, out _))
+                throw new AccessViolationException();
+            int flags = ReadI32(abs + 4);
+            if ((flags & GcFlagAllocated) == 0)
+                throw new AccessViolationException();
+        }
+
         private RuntimeType ValidateArrayRef(long objRef)
         {
             if (objRef == 0) throw new NullReferenceException();
@@ -6135,6 +6980,27 @@ namespace Cnidaria.Cs
             return t;
         }
 
+        private bool TryGetObjectTypeIdFromExactRef(long objRef, out int typeId)
+        {
+            typeId = 0;
+            if (objRef < int.MinValue || objRef > int.MaxValue) return false;
+            int obj = (int)objRef;
+            if (!TryGetBlockFromObjectRef(obj, out _)) return false;
+            int flags = ReadI32(obj + 4);
+            if ((flags & GcFlagAllocated) == 0) return false;
+            typeId = ReadI32(obj);
+            return true;
+        }
+
+        private int GetObjectRuntimeTypeId(long objRef)
+        {
+            int obj = checked((int)objRef);
+            if (!TryGetBlockFromObjectRef(obj, out _)) throw new AccessViolationException();
+            int flags = ReadI32(obj + 4);
+            if ((flags & GcFlagAllocated) == 0) throw new AccessViolationException();
+            return ReadI32(obj);
+        }
+
         private bool TryGetObjectTypeFromExactRef(long objRef, out RuntimeType type)
         {
             type = null!;
@@ -6157,14 +7023,6 @@ namespace Cnidaria.Cs
         }
 
 
-        private RuntimeType ValidateStringRef(long objRef, out int abs)
-        {
-            RuntimeType type = ValidateStringRef(objRef);
-            abs = checked((int)objRef);
-            return type;
-        }
-
-
         private RuntimeType ResolveRequiredType(string assemblyName, string ns, string name)
         {
             RuntimeType? fallback = null;
@@ -6176,16 +7034,6 @@ namespace Cnidaria.Cs
             }
             if (fallback != null) return fallback;
             throw new TypeLoadException(ns + "." + name);
-        }
-
-        private RuntimeField FieldById(long id)
-        {
-            int fieldId = checked((int)id);
-            if (_fieldById.TryGetValue(fieldId, out RuntimeField? f)) return f;
-            var fresh = BuildFieldIdMap(_rts);
-            foreach (var kv in fresh) _fieldById[kv.Key] = kv.Value;
-            if (_fieldById.TryGetValue(fieldId, out f)) return f;
-            throw new MissingFieldException("Runtime field not found: F" + fieldId.ToString());
         }
 
         private static Dictionary<int, RuntimeField> BuildFieldIdMap(RuntimeTypeSystem rts)
@@ -6440,18 +7288,9 @@ namespace Cnidaria.Cs
         }
 
         private int StorageSizeOf(RuntimeType type)
-        {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
-                return TargetArchitecture.PointerSize;
-            return Math.Max(1, type.SizeOf);
-        }
-
-        private int StorageAlignOf(RuntimeType type)
-        {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
-                return TargetArchitecture.PointerSize;
-            return Math.Max(1, type.AlignOf);
-        }
+            => type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
+                    ? TargetArchitecture.PointerSize
+                    : Math.Max(1, type.SizeOf);
 
         private bool IsNativeIntType(RuntimeType type)
             => type.Namespace == "System" && (type.Name == "IntPtr" || type.Name == "UIntPtr" || type.Name == "nint" || type.Name == "nuint");
@@ -6461,9 +7300,6 @@ namespace Cnidaria.Cs
 
         private bool IsUnsignedSmall(RuntimeType type)
             => type.Namespace == "System" && (type.Name == "Byte" || type.Name == "UInt16" || type.Name == "UInt32" || type.Name == "UInt64" || type.Name == "UIntPtr");
-
-        private bool IsCoreLibRandomLike(RuntimeType type)
-            => type.Namespace == "System" && (type.Name == "Random" || type.Name == "ThreadSafeRandom");
 
         private bool IsSystemStringType(RuntimeType type)
             => type.Namespace == "System" && type.Name == "String";
@@ -6488,37 +7324,6 @@ namespace Cnidaria.Cs
             for (int i = 0; i < len; i++)
                 chars[i] = (char)ReadU16(p + i * 2);
             return new string(chars);
-        }
-
-        private bool TryTranslateHostExceptionToManaged(Exception ex, out int exceptionRef)
-        {
-            string name = ex switch
-            {
-                OverflowException => "OverflowException",
-                DivideByZeroException => "DivideByZeroException",
-                NullReferenceException => "NullReferenceException",
-                IndexOutOfRangeException => "IndexOutOfRangeException",
-                InvalidCastException => "InvalidCastException",
-                OutOfMemoryException => "OutOfMemoryException",
-                ArgumentNullException => "ArgumentNullException",
-                ArgumentOutOfRangeException => "ArgumentOutOfRangeException",
-                ArgumentException => "ArgumentException",
-                InvalidOperationException => "InvalidOperationException",
-                NotSupportedException => "NotSupportedException",
-                AccessViolationException => "AccessViolationException",
-                _ => "Exception"
-            };
-
-            try
-            {
-                exceptionRef = AllocExceptionRef("System", name, ex.Message ?? string.Empty);
-                return true;
-            }
-            catch
-            {
-                exceptionRef = 0;
-                return false;
-            }
         }
 
         private int AllocExceptionRef(string ns, string name, string message)

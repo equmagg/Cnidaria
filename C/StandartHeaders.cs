@@ -11,7 +11,8 @@ namespace Cnidaria.C
         public const string MallocIntrinsicName = "malloc";
         public const string FreeIntrinsicName = "free";
 
-        private const string StddefH = @"#ifndef __STDDEF_H
+        private const string StddefH = @"
+#ifndef __STDDEF_H
 #define __STDDEF_H
 
 typedef unsigned long size_t;
@@ -24,7 +25,8 @@ typedef long ptrdiff_t;
 #endif
 ";
 
-        private const string StdioH = @"#ifndef __STDIO_H
+        private const string StdioH = @"
+#ifndef __STDIO_H
 #define __STDIO_H
 
 #include <stddef.h>
@@ -43,37 +45,41 @@ static int __print_char(int ch)
 
 static int __print_int(int value)
 {
-    char digits[12];
+    char buffer[12];
+    char* p = buffer + 11;
     unsigned int current;
-    int length = 0;
     int count = 0;
+
+    *p = 0;
 
     if (value < 0)
     {
-        count = count + __print_char('-');
-        current = (unsigned int)(0 - value);
+        current = 0u - (unsigned int)value;
     }
     else
     {
         current = (unsigned int)value;
     }
 
-    if (current == 0)
-        return count + __print_char('0');
-
-    while (current != 0)
+    do
     {
-        digits[length] = (char)('0' + (current % 10));
-        length = length + 1;
+        unsigned int digit = current % 10;
         current = current / 10;
-    }
 
-    while (length != 0)
+        p = p - 1;
+        *p = (char)('0' + digit);
+        count = count + 1;
+    }
+    while (current != 0);
+
+    if (value < 0)
     {
-        length = length - 1;
-        count = count + __print_char(digits[length]);
+        p = p - 1;
+        *p = '-';
+        count = count + 1;
     }
 
+    __printf(p);
     return count;
 }
 
@@ -127,7 +133,8 @@ int printf(const char* format, ...)
 #endif
 ";
 
-        private const string StdargH = @"#ifndef __STDARG_H
+        private const string StdargH = @"
+#ifndef __STDARG_H
 #define __STDARG_H
 
 typedef char* va_list;

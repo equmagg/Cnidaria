@@ -1,6 +1,128 @@
 ﻿namespace System.Numerics
 {
-    
+    public struct Quaternion : IEquatable<Quaternion>
+    {
+        /// <summary>The X value of the vector component of the quaternion.</summary>
+        public float X;
+
+        /// <summary>The Y value of the vector component of the quaternion.</summary>
+        public float Y;
+
+        /// <summary>The Z value of the vector component of the quaternion.</summary>
+        public float Z;
+
+        /// <summary>The rotation component of the quaternion.</summary>
+        public float W;
+
+        internal const int Count = 4;
+
+        public Quaternion(float x, float y, float z, float w)
+        {
+            X = x; Y= y; Z = z; W = w;
+        }
+        public Quaternion(Vector3 vectorPart, float scalarPart)
+        {
+            this = Create(vectorPart, scalarPart);
+        }
+
+        public static Quaternion Zero
+        {
+            get => default;
+        }
+        public static Quaternion Identity
+        {
+            get => Create(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        public static Quaternion Create(float x, float y, float z, float w) => new Quaternion(x, y, z, w);
+        public static Quaternion Create(Vector3 vectorPart, float scalarPart) => new Quaternion(vectorPart.X, vectorPart.Y, vectorPart.Z, scalarPart);
+
+        public static Quaternion CreateFromRotationMatrix(Matrix4x4 matrix)
+        {
+            float trace = matrix.M11 + matrix.M22 + matrix.M33;
+
+            Quaternion q = default;
+
+            if (trace > 0.0f)
+            {
+                float s = float.Sqrt(trace + 1.0f);
+                q.W = s * 0.5f;
+                s = 0.5f / s;
+                q.X = (matrix.M23 - matrix.M32) * s;
+                q.Y = (matrix.M31 - matrix.M13) * s;
+                q.Z = (matrix.M12 - matrix.M21) * s;
+            }
+            else
+            {
+                if (matrix.M11 >= matrix.M22 && matrix.M11 >= matrix.M33)
+                {
+                    float s = float.Sqrt(1.0f + matrix.M11 - matrix.M22 - matrix.M33);
+                    float invS = 0.5f / s;
+                    q.X = 0.5f * s;
+                    q.Y = (matrix.M12 + matrix.M21) * invS;
+                    q.Z = (matrix.M13 + matrix.M31) * invS;
+                    q.W = (matrix.M23 - matrix.M32) * invS;
+                }
+                else if (matrix.M22 > matrix.M33)
+                {
+                    float s = float.Sqrt(1.0f + matrix.M22 - matrix.M11 - matrix.M33);
+                    float invS = 0.5f / s;
+                    q.X = (matrix.M21 + matrix.M12) * invS;
+                    q.Y = 0.5f * s;
+                    q.Z = (matrix.M32 + matrix.M23) * invS;
+                    q.W = (matrix.M31 - matrix.M13) * invS;
+                }
+                else
+                {
+                    float s = float.Sqrt(1.0f + matrix.M33 - matrix.M11 - matrix.M22);
+                    float invS = 0.5f / s;
+                    q.X = (matrix.M31 + matrix.M13) * invS;
+                    q.Y = (matrix.M32 + matrix.M23) * invS;
+                    q.Z = 0.5f * s;
+                    q.W = (matrix.M12 - matrix.M21) * invS;
+                }
+            }
+
+            return q;
+        }
+        public static Quaternion CreateFromYawPitchRoll(float yaw, float pitch, float roll)
+        {
+            (Vector3 sin, Vector3 cos) = Vector3.SinCos((new Vector3(roll, pitch, yaw)) * 0.5f);
+
+            (float sr, float cr) = (sin.X, cos.X);
+            (float sp, float cp) = (sin.Y, cos.Y);
+            (float sy, float cy) = (sin.Z, cos.Z);
+
+            Quaternion result;
+
+            result.X = cy * sp * cr + sy * cp * sr;
+            result.Y = sy * cp * cr - cy * sp * sr;
+            result.Z = cy * cp * sr - sy * sp * cr;
+            result.W = cy * cp * cr + sy * sp * sr;
+
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Dot(Quaternion quaternion1, Quaternion quaternion2)
+            => quaternion1.X * quaternion2.X +
+               quaternion1.Y * quaternion2.Y +
+               quaternion1.Z * quaternion2.Z +
+               quaternion1.W * quaternion2.W;
+
+        public static bool operator ==(Quaternion value1, Quaternion value2) 
+            => value1.X == value2.X && value1.Y == value2.Y && value1.Z == value2.Z && value1.W == value2.W;
+        public static bool operator !=(Quaternion value1, Quaternion value2) => !(value1 == value2);
+
+        public readonly float Length() => float.Sqrt(LengthSquared());
+        public readonly float LengthSquared() => Dot(this, this);
+
+        public override readonly bool Equals([NotNullWhen(true)] object? obj) => (obj is Quaternion other) && Equals(other);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly bool Equals(Quaternion other) => this == other;
+        public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z, W);
+        public override readonly string ToString() => $"{{X:{X} Y:{Y} Z:{Z} W:{W}}}";
+    }
     public struct Matrix3x2
     {
         private const int RowCount = 3;

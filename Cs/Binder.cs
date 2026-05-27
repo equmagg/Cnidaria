@@ -9887,10 +9887,10 @@ namespace Cnidaria.Cs
             }
 
             var elements = ImmutableArray.CreateBuilder<BoundExpression>(args.Count);
-            var names = ImmutableArray.CreateBuilder<string?>(args.Count);
+            var names = new string?[args.Count];
+            var nameIsExplicit = new bool[args.Count];
             var types = ImmutableArray.CreateBuilder<TypeSymbol>(args.Count);
-
-            var seenNames = new HashSet<string>(StringComparer.Ordinal);
+            var explicitNames = new HashSet<string>(StringComparer.Ordinal);
             bool hasErrors = false;
 
             for (int i = 0; i < args.Count; i++)
@@ -9911,39 +9911,57 @@ namespace Cnidaria.Cs
                     hasErrors = true;
                 }
 
-                string? name = null;
-                if (a.NameColon != null)
-                    name = a.NameColon.Name.Identifier.ValueText;
-                else
-                    name = TryInferTupleElementName(a.Expression);
+                bool isExplicitName = a.NameColon != null;
+                string? name = isExplicitName
+                    ? a.NameColon!.Name.Identifier.ValueText
+                    : TryInferTupleElementName(a.Expression);
 
-                if (!string.IsNullOrEmpty(name))
+                if (!string.IsNullOrEmpty(name) && isExplicitName)
                 {
-                    if (!seenNames.Add(name!))
+                    if (!explicitNames.Add(name!))
                     {
                         diagnostics.Add(new Diagnostic(
                             "CN_TUPNAME000",
                             DiagnosticSeverity.Error,
                             $"Tuple element name '{name}' is a duplicate.",
-                            new Location(context.SemanticModel.SyntaxTree, (a.NameColon?.Span ?? a.Expression.Span))));
+                            new Location(context.SemanticModel.SyntaxTree, a.NameColon!.Span)));
                         name = null;
+                        isExplicitName = false;
                         hasErrors = true;
                     }
                 }
 
-                names.Add(name);
+                names[i] = name;
+                nameIsExplicit[i] = isExplicitName && !string.IsNullOrEmpty(name);
             }
-            var tupleType = context.Compilation.CreateTupleType(types.ToImmutable(), names.ToImmutable());
-            return new BoundTupleExpression(te, tupleType, elements.ToImmutable(), names.ToImmutable(), hasErrors);
-            static string? TryInferTupleElementName(ExpressionSyntax expr)
+            var inferredNameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < names.Length; i++)
             {
-                return expr switch
-                {
-                    IdentifierNameSyntax id => id.Identifier.ValueText,
-                    MemberAccessExpressionSyntax ma => GetSimpleName(ma.Name),
-                    _ => null
-                };
+                var name = names[i];
+                if (nameIsExplicit[i] || string.IsNullOrEmpty(name) || explicitNames.Contains(name!))
+                    continue;
+
+                inferredNameCounts.TryGetValue(name!, out int count);
+                inferredNameCounts[name!] = count + 1;
             }
+            for (int i = 0; i < names.Length; i++)
+            {
+                var name = names[i];
+                if (nameIsExplicit[i] || string.IsNullOrEmpty(name))
+                    continue;
+
+                if (explicitNames.Contains(name!) || inferredNameCounts[name!] != 1)
+                    names[i] = null;
+            }
+            var elementNames = ImmutableArray.CreateRange(names);
+            var tupleType = context.Compilation.CreateTupleType(types.ToImmutable(), elementNames);
+            return new BoundTupleExpression(te, tupleType, elements.ToImmutable(), elementNames, hasErrors);
+            static string? TryInferTupleElementName(ExpressionSyntax expr) => expr switch
+            {
+                 IdentifierNameSyntax id => id.Identifier.ValueText,
+                 MemberAccessExpressionSyntax ma => GetSimpleName(ma.Name),
+                 _ => null
+            };
 
         }
         private static bool TupleHasUninferableElements(TupleTypeSymbol tupleType)

@@ -369,7 +369,7 @@ namespace Cnidaria.C
                 for (var i = 1; i < instruction.Operands.Length; i++)
                 {
                     var operand = instruction.Operands[i];
-                    var cls = ClassifyArgument(operand.Type);
+                    var cls = RegisterClassOf(ClassifyValue(operand.Type));
                     if (cls == AbiRegisterClass.Floating)
                     {
                         if (floatIndex++ >= 8)
@@ -407,13 +407,28 @@ namespace Cnidaria.C
             return checked(maxCopies * _options.SpillSlotSize);
         }
 
-        private static AbiRegisterClass ClassifyArgument(QualifiedType type)
+        private static CValueKind ClassifyValue(QualifiedType type)
         {
-            if (type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float or BuiltinTypeKind.Double })
-                return AbiRegisterClass.Floating;
-
-            return AbiRegisterClass.General;
+            if (type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void })
+                return CValueKind.Void;
+            if (type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float })
+                return CValueKind.Float32;
+            if (type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble })
+                return CValueKind.Float64;
+            if (type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function)
+                return CValueKind.Pointer;
+            if (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum)
+                return CValueKind.General;
+            return CValueKind.UnsupportedAggregate;
         }
+
+        private static AbiRegisterClass RegisterClassOf(CValueKind kind)
+            => kind switch
+            {
+                CValueKind.Float32 or CValueKind.Float64 => AbiRegisterClass.Floating,
+                CValueKind.General or CValueKind.Pointer => AbiRegisterClass.General,
+                _ => AbiRegisterClass.General,
+            };
 
         private static int AlignUp(int value, int alignment)
         {
@@ -437,6 +452,16 @@ namespace Cnidaria.C
                 End = end;
                 PhysicalRegister = MachineRegister.Invalid;
             }
+        }
+
+        private enum CValueKind
+        {
+            Void,
+            General,
+            Pointer,
+            Float32,
+            Float64,
+            UnsupportedAggregate,
         }
 
         private enum AbiRegisterClass

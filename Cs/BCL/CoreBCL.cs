@@ -6193,6 +6193,655 @@ namespace System
 
         public static bool operator >=(TimeSpan t1, TimeSpan t2) => t1._ticks >= t2._ticks;
     }
+    public static class Convert
+    {
+        public static bool ToBoolean(bool value)
+        {
+            return value;
+        }
+
+        public static bool ToBoolean(sbyte value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(byte value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(short value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(ushort value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(int value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(uint value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(long value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(ulong value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(float value)
+        {
+            return value != 0;
+        }
+
+        public static bool ToBoolean(double value)
+        {
+            return value != 0;
+        }
+
+        public static char ToChar(char value)
+        {
+            return value;
+        }
+
+        public static char ToChar(sbyte value)
+        {
+            if (value < 0) ThrowCharOverflowException();
+            return (char)value;
+        }
+
+        public static char ToChar(byte value)
+        {
+            return (char)value;
+        }
+
+        public static char ToChar(short value)
+        {
+            if (value < 0) ThrowCharOverflowException();
+            return (char)value;
+        }
+
+        public static char ToChar(ushort value)
+        {
+            return (char)value;
+        }
+
+        public static char ToChar(int value) => ToChar((uint)value);
+
+        public static char ToChar(uint value)
+        {
+            if (value > char.MaxValue) ThrowCharOverflowException();
+            return (char)value;
+        }
+
+        public static char ToChar(long value) => ToChar((ulong)value);
+
+        public static char ToChar(ulong value)
+        {
+            if (value > char.MaxValue) ThrowCharOverflowException();
+            return (char)value;
+        }
+
+        public static sbyte ToSByte(bool value)
+        {
+            return value ? (sbyte)bool.True : (sbyte)bool.False;
+        }
+
+        public static sbyte ToSByte(sbyte value)
+        {
+            return value;
+        }
+
+        public static sbyte ToSByte(char value)
+        {
+            if (value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(byte value)
+        {
+            if (value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(short value)
+        {
+            if (value < sbyte.MinValue || value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(ushort value)
+        {
+            if (value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(int value)
+        {
+            if (value < sbyte.MinValue || value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(uint value)
+        {
+            if (value > (uint)sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(long value)
+        {
+            if (value < sbyte.MinValue || value > sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(ulong value)
+        {
+            if (value > (ulong)sbyte.MaxValue) ThrowSByteOverflowException();
+            return (sbyte)value;
+        }
+
+        public static sbyte ToSByte(float value)
+        {
+            return ToSByte((double)value);
+        }
+
+        public static sbyte ToSByte(double value)
+        {
+            return ToSByte(ToInt32(value));
+        }
+
+        public static byte ToByte(bool value)
+        {
+            return value ? (byte)bool.True : (byte)bool.False;
+        }
+
+        public static byte ToByte(byte value)
+        {
+            return value;
+        }
+
+        public static byte ToByte(char value)
+        {
+            if (value > byte.MaxValue) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(sbyte value)
+        {
+            if (value < 0) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(short value)
+        {
+            if ((uint)value > byte.MaxValue) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(ushort value)
+        {
+            if (value > byte.MaxValue) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(int value) => ToByte((uint)value);
+
+        public static byte ToByte(uint value)
+        {
+            if (value > byte.MaxValue) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(long value) => ToByte((ulong)value);
+
+        public static byte ToByte(ulong value)
+        {
+            if (value > byte.MaxValue) ThrowByteOverflowException();
+            return (byte)value;
+        }
+
+        public static byte ToByte(float value)
+        {
+            return ToByte((double)value);
+        }
+
+        public static byte ToByte(double value)
+        {
+            return ToByte(ToInt32(value));
+        }
+
+        public static short ToInt16(bool value)
+        {
+            return value ? (short)bool.True : (short)bool.False;
+        }
+
+        public static short ToInt16(char value)
+        {
+            if (value > short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(sbyte value)
+        {
+            return value;
+        }
+
+        public static short ToInt16(byte value)
+        {
+            return value;
+        }
+
+        public static short ToInt16(ushort value)
+        {
+            if (value > short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(int value)
+        {
+            if (value < short.MinValue || value > short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(uint value)
+        {
+            if (value > (uint)short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(short value)
+        {
+            return value;
+        }
+
+        public static short ToInt16(long value)
+        {
+            if (value < short.MinValue || value > short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(ulong value)
+        {
+            if (value > (ulong)short.MaxValue) ThrowInt16OverflowException();
+            return (short)value;
+        }
+
+        public static short ToInt16(float value)
+        {
+            return ToInt16((double)value);
+        }
+
+        public static short ToInt16(double value)
+        {
+            return ToInt16(ToInt32(value));
+        }
+
+        public static ushort ToUInt16(bool value)
+        {
+            return value ? (ushort)bool.True : (ushort)bool.False;
+        }
+
+        public static ushort ToUInt16(char value)
+        {
+            return value;
+        }
+
+        public static ushort ToUInt16(sbyte value)
+        {
+            if (value < 0) ThrowUInt16OverflowException();
+            return (ushort)value;
+        }
+
+        public static ushort ToUInt16(byte value)
+        {
+            return value;
+        }
+
+        public static ushort ToUInt16(short value)
+        {
+            if (value < 0) ThrowUInt16OverflowException();
+            return (ushort)value;
+        }
+
+        public static ushort ToUInt16(int value) => ToUInt16((uint)value);
+
+        public static ushort ToUInt16(ushort value)
+        {
+            return value;
+        }
+
+        public static ushort ToUInt16(uint value)
+        {
+            if (value > ushort.MaxValue) ThrowUInt16OverflowException();
+            return (ushort)value;
+        }
+
+        public static ushort ToUInt16(long value) => ToUInt16((ulong)value);
+
+        public static ushort ToUInt16(ulong value)
+        {
+            if (value > ushort.MaxValue) ThrowUInt16OverflowException();
+            return (ushort)value;
+        }
+
+        public static ushort ToUInt16(float value)
+        {
+            return ToUInt16((double)value);
+        }
+
+        public static ushort ToUInt16(double value)
+        {
+            return ToUInt16(ToInt32(value));
+        }
+
+        public static int ToInt32(bool value)
+        {
+            return value ? bool.True : bool.False;
+        }
+
+        public static int ToInt32(char value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(sbyte value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(byte value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(short value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(ushort value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(uint value)
+        {
+            if ((int)value < 0) ThrowInt32OverflowException();
+            return (int)value;
+        }
+
+        public static int ToInt32(int value)
+        {
+            return value;
+        }
+
+        public static int ToInt32(long value)
+        {
+            if (value < int.MinValue || value > int.MaxValue) ThrowInt32OverflowException();
+            return (int)value;
+        }
+
+        public static int ToInt32(ulong value)
+        {
+            if (value > int.MaxValue) ThrowInt32OverflowException();
+            return (int)value;
+        }
+
+        public static int ToInt32(float value)
+        {
+            return ToInt32((double)value);
+        }
+
+        public static int ToInt32(double value)
+        {
+            if (value >= 0)
+            {
+                if (value < 2147483647.5)
+                {
+                    int result = (int)value;
+                    double dif = value - result;
+                    if (dif > 0.5 || dif == 0.5 && (result & 1) != 0) result++;
+                    return result;
+                }
+            }
+            else
+            {
+                if (value >= -2147483648.5)
+                {
+                    int result = (int)value;
+                    double dif = value - result;
+                    if (dif < -0.5 || dif == -0.5 && (result & 1) != 0) result--;
+                    return result;
+                }
+            }
+            throw new OverflowException();
+        }
+
+
+        public static uint ToUInt32(bool value)
+        {
+            return value ? (uint)bool.True : (uint)bool.False;
+        }
+
+        public static uint ToUInt32(char value)
+        {
+            return value;
+        }
+
+        public static uint ToUInt32(sbyte value)
+        {
+            if (value < 0) ThrowUInt32OverflowException();
+            return (uint)value;
+        }
+
+        public static uint ToUInt32(byte value)
+        {
+            return value;
+        }
+
+        public static uint ToUInt32(short value)
+        {
+            if (value < 0) ThrowUInt32OverflowException();
+            return (uint)value;
+        }
+
+        public static uint ToUInt32(ushort value)
+        {
+            return value;
+        }
+
+        public static uint ToUInt32(int value)
+        {
+            if (value < 0) ThrowUInt32OverflowException();
+            return (uint)value;
+        }
+
+        public static uint ToUInt32(uint value)
+        {
+            return value;
+        }
+
+        public static uint ToUInt32(long value) => ToUInt32((ulong)value);
+
+        public static uint ToUInt32(ulong value)
+        {
+            if (value > uint.MaxValue) ThrowUInt32OverflowException();
+            return (uint)value;
+        }
+
+        public static uint ToUInt32(float value)
+        {
+            return ToUInt32((double)value);
+        }
+
+        public static uint ToUInt32(double value)
+        {
+            if (value >= -0.5 && value < 4294967295.5)
+            {
+                uint result = (uint)value;
+                double dif = value - result;
+                if (dif > 0.5 || dif == 0.5 && (result & 1) != 0) result++;
+                return result;
+            }
+            throw new OverflowException();
+        }
+
+
+        public static long ToInt64(bool value)
+        {
+            return value ? bool.True : bool.False;
+        }
+
+        public static long ToInt64(char value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(sbyte value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(byte value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(short value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(ushort value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(int value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(uint value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(ulong value)
+        {
+            if ((long)value < 0) ThrowInt64OverflowException();
+            return (long)value;
+        }
+
+        public static long ToInt64(long value)
+        {
+            return value;
+        }
+
+        public static long ToInt64(float value)
+        {
+            return ToInt64((double)value);
+        }
+
+        public static long ToInt64(double value)
+        {
+            return checked((long)Math.Round(value));
+        }
+
+
+        public static ulong ToUInt64(bool value)
+        {
+            return value ? (ulong)bool.True : (ulong)bool.False;
+        }
+
+        public static ulong ToUInt64(char value)
+        {
+            return value;
+        }
+
+        public static ulong ToUInt64(sbyte value)
+        {
+            if (value < 0) ThrowUInt64OverflowException();
+            return (ulong)value;
+        }
+
+        public static ulong ToUInt64(byte value)
+        {
+            return value;
+        }
+
+        public static ulong ToUInt64(short value)
+        {
+            if (value < 0) ThrowUInt64OverflowException();
+            return (ulong)value;
+        }
+
+        public static ulong ToUInt64(ushort value)
+        {
+            return value;
+        }
+
+        public static ulong ToUInt64(int value)
+        {
+            if (value < 0) ThrowUInt64OverflowException();
+            return (ulong)value;
+        }
+
+        public static ulong ToUInt64(uint value)
+        {
+            return value;
+        }
+
+        public static ulong ToUInt64(long value)
+        {
+            if (value < 0) ThrowUInt64OverflowException();
+            return (ulong)value;
+        }
+
+        public static ulong ToUInt64(ulong value)
+        {
+            return value;
+        }
+
+        public static ulong ToUInt64(float value)
+        {
+            return ToUInt64((double)value);
+        }
+
+        public static ulong ToUInt64(double value)
+        {
+            return checked((ulong)Math.Round(value));
+        }
+
+        private static void ThrowCharOverflowException() { throw new OverflowException(); }
+
+        private static void ThrowByteOverflowException() { throw new OverflowException(); }
+
+        private static void ThrowSByteOverflowException() { throw new OverflowException(); }
+
+        private static void ThrowInt16OverflowException() { throw new OverflowException(); }
+
+        private static void ThrowUInt16OverflowException() { throw new OverflowException(); }
+
+        private static void ThrowInt32OverflowException() { throw new OverflowException(); }
+
+        private static void ThrowUInt32OverflowException() { throw new OverflowException(); }
+
+        private static void ThrowInt64OverflowException() { throw new OverflowException(); }
+
+        private static void ThrowUInt64OverflowException() { throw new OverflowException(); }
+    }
     // interfaces
     public interface ITuple
     {
@@ -6211,6 +6860,23 @@ namespace System
     public interface IConvertible
     {
         TypeCode GetTypeCode();
+
+        bool ToBoolean(IFormatProvider? provider);
+        char ToChar(IFormatProvider? provider);
+        sbyte ToSByte(IFormatProvider? provider);
+        byte ToByte(IFormatProvider? provider);
+        short ToInt16(IFormatProvider? provider);
+        ushort ToUInt16(IFormatProvider? provider);
+        int ToInt32(IFormatProvider? provider);
+        uint ToUInt32(IFormatProvider? provider);
+        long ToInt64(IFormatProvider? provider);
+        ulong ToUInt64(IFormatProvider? provider);
+        float ToSingle(IFormatProvider? provider);
+        double ToDouble(IFormatProvider? provider);
+        decimal ToDecimal(IFormatProvider? provider);
+        DateTime ToDateTime(IFormatProvider? provider);
+        string ToString(IFormatProvider? provider);
+        object ToType(Type conversionType, IFormatProvider? provider);
     }
     public interface IFormatProvider
     {
@@ -6571,6 +7237,107 @@ namespace System
             ix += unchecked((uint)(m << 23));
 
             return BitConverter.UInt32BitsToSingle(ix);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe (float Sin, float Cos) SinCos(float x)
+        {
+            float sin, cos;
+            SinCos(x, &sin, &cos);
+            return (sin, cos);
+        }
+        public static unsafe float Sin(float x)
+        {
+            float sin, cos;
+            SinCos(x, &sin, &cos);
+            return sin;
+        }
+
+        public static unsafe float Cos(float x)
+        {
+            float sin, cos;
+            SinCos(x, &sin, &cos);
+            return cos;
+        }
+
+        private static unsafe void SinCos(float x, float* sin, float* cos)
+        {
+            const uint ExponentMask = 0x7F80_0000u;
+
+            uint ux = BitConverter.SingleToUInt32Bits(x);
+            // NaN and infinities
+            if ((ux & ExponentMask) == ExponentMask)
+            {
+                *sin = float.NaN;
+                *cos = float.NaN;
+                return;
+            }
+            // zero
+            if ((ux & 0x7FFF_FFFFu) == 0)
+            {
+                *sin = x;
+                *cos = 1.0f;
+                return;
+            }
+
+            const double PiOver2 = 1.57079632679489661923132169163975144;
+            const double TwoPi = 6.28318530717958647692528676655900576;
+            const double TwoOverPi = 0.636619772367581343075535053490057448;
+
+            double y = (double)x % TwoPi;
+            int q = (int)(y * TwoOverPi + (y >= 0.0 ? 0.5 : -0.5));
+            double r = y - q * PiOver2;
+            double z = r * r;
+            double sr = r + r * z *
+            (
+                -1.66666666666666657415e-1 + z *
+                (
+                    8.33333333333333321769e-3 + z *
+                    (
+                        -1.98412698412698412535e-4 + z *
+                        (
+                            2.75573192239858906526e-6 + z * -2.50521083854417187750e-8
+                        )
+                    )
+                )
+            );
+
+            double cr = 1.0 + z *
+            (
+                -5.00000000000000000000e-1 + z *
+                (
+                    4.16666666666666643537e-2 + z *
+                    (
+                        -1.38888888888888894189e-3 + z *
+                        (
+                            2.48015873015873015688e-5 + z * -2.75573192239858925110e-7
+                        )
+                    )
+                )
+            );
+
+            switch (q & 3)
+            {
+                case 0:
+                    *sin = (float)sr;
+                    *cos = (float)cr;
+                    break;
+
+                case 1:
+                    *sin = (float)cr;
+                    *cos = (float)-sr;
+                    break;
+
+                case 2:
+                    *sin = (float)-sr;
+                    *cos = (float)-cr;
+                    break;
+
+                default:
+                    *sin = (float)-cr;
+                    *cos = (float)sr;
+                    break;
+            }
         }
     }
     public static class Math
@@ -8351,14 +9118,6 @@ namespace System
             }
             Write('\n');
         }
-        // convenience aliases
-        public static void print(bool value) { Write(value); }
-        public static void print(char value) { Write(value); }
-        public static void print(int value) { Write(value); }
-        public static void print(ulong value) { Write(value); }
-        public static void print(double value) { Write(value); }
-        public static void print(string value) { WriteLine(value); }
-        public static void print(object value) { WriteLine(value); }
         // intrinsics
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static unsafe void _Write(char* value) { }
@@ -12997,6 +13756,17 @@ namespace System.Numerics
         public static float Cross(Vector2 value1, Vector2 value2)
             => value1.X * value2.Y - value1.Y * value2.X;
 
+        public static (Vector2 Sin, Vector2 Cos) SinCos(Vector2 vector)
+        {
+            var (sinX, cosX) = MathF.SinCos(vector.X);
+            var (sinY, cosY) = MathF.SinCos(vector.Y);
+
+            return (
+                new Vector2(sinX, sinY),
+                new Vector2(cosX, cosY)
+            );
+        }
+
         public override readonly int GetHashCode() => HashCode.Combine(X, Y);
 
         public readonly float Length() => float.Sqrt(LengthSquared());
@@ -13221,12 +13991,23 @@ namespace System.Numerics
         public static float Dot(Vector3 vector1, Vector3 vector2) 
             => vector1.X * vector2.X + vector1.Y * vector2.Y + vector1.Z * vector2.Z;
 
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 Cross(Vector3 vector1, Vector3 vector2)
             => new Vector3(vector1.Y * vector2.Z - vector1.Z * vector2.Y,
                            vector1.Z * vector2.X - vector1.X * vector2.Z,
                            vector1.X * vector2.Y - vector1.Y * vector2.X);
+
+        public static (Vector3 Sin, Vector3 Cos) SinCos(Vector3 vector)
+        {
+            var (sinX, cosX) = MathF.SinCos(vector.X);
+            var (sinY, cosY) = MathF.SinCos(vector.Y);
+            var (sinZ, cosZ) = MathF.SinCos(vector.Z);
+
+            return (
+                new Vector3(sinX, sinY, sinZ),
+                new Vector3(cosX, cosY, cosZ)
+            );
+        }
 
         public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z);
 
@@ -13494,6 +14275,19 @@ namespace System.Numerics
                            vector1.Z * vector2.X - vector1.X * vector2.Z, 
                            vector1.X * vector2.Y - vector1.Y * vector2.X,
                            vector1.W * vector2.W);
+
+        public static (Vector4 Sin, Vector4 Cos) SinCos(Vector4 vector)
+        {
+            var (sinX, cosX) = MathF.SinCos(vector.X);
+            var (sinY, cosY) = MathF.SinCos(vector.Y);
+            var (sinZ, cosZ) = MathF.SinCos(vector.Z);
+            var (sinW, cosW) = MathF.SinCos(vector.W);
+
+            return (
+                new Vector4(sinX, sinY, sinZ, sinW),
+                new Vector4(cosX, cosY, cosZ, cosW)
+            );
+        }
 
         public override readonly int GetHashCode() => HashCode.Combine(X, Y, Z, W);
 

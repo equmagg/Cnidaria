@@ -1617,6 +1617,7 @@ namespace Cnidaria.Cs
         private int _defaultExternalAssemblyRefToken; // AssemblyRef
         private int _localFunctionsHostTypeToken;     // TypeDef
         private readonly NamespaceSymbol _moduleGlobalNamespace;
+        private readonly NamespaceSymbol _metadataLookupGlobalNamespace;
         private readonly NamedTypeSymbol _systemObject;
         private NamespaceSymbol? _sysNsCache;
         public MetadataTokenProvider(
@@ -1624,10 +1625,12 @@ namespace Cnidaria.Cs
             NamespaceSymbol moduleGlobalNamespace,
             NamedTypeSymbol systemObject,
             string defaultExternalAssemblyName = "std",
-            Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null)
+            Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
+            NamespaceSymbol? metadataLookupGlobalNamespace = null)
         {
             if (moduleGlobalNamespace is null) throw new ArgumentNullException(nameof(moduleGlobalNamespace));
             _moduleGlobalNamespace = moduleGlobalNamespace;
+            _metadataLookupGlobalNamespace = metadataLookupGlobalNamespace ?? moduleGlobalNamespace;
             _systemObject = systemObject ?? throw new ArgumentNullException(nameof(systemObject));
             _externalAssemblyResolver = externalAssemblyResolver;
 
@@ -1709,11 +1712,12 @@ namespace Cnidaria.Cs
             if (_sysNsCache != null)
                 return _sysNsCache;
 
-            var nss = _moduleGlobalNamespace.GetNamespaceMembers();
-            for (int i = 0; i < nss.Length; i++)
+            if (TryGetSystemNamespace(_metadataLookupGlobalNamespace, out var lookupSystem))
+                return _sysNsCache = lookupSystem;
+            if (!ReferenceEquals(_metadataLookupGlobalNamespace, _moduleGlobalNamespace) &&
+                TryGetSystemNamespace(_moduleGlobalNamespace, out var moduleSystem))
             {
-                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
-                    return _sysNsCache = nss[i];
+                return _sysNsCache = moduleSystem;
             }
 
             if (_systemObject.ContainingSymbol is NamespaceSymbol ns &&
@@ -1724,19 +1728,67 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException("Namespace 'System' not found.");
         }
+        private static bool TryGetSystemNamespace(NamespaceSymbol root, out NamespaceSymbol systemNamespace)
+        {
+            var nss = root.GetNamespaceMembers();
+            for (int i = 0; i < nss.Length; i++)
+            {
+                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                {
+                    systemNamespace = nss[i];
+                    return true;
+                }
+            }
+            systemNamespace = null!;
+            return false;
+        }
         private NamedTypeSymbol GetValueTupleDef(int arity)
         {
             if (_valueTupleDefCache.TryGetValue(arity, out var t))
                 return t;
 
-            var sys = GetSystemNamespaceOrThrow();
-            var cands = sys.GetTypeMembers("ValueTuple", arity);
-            if (cands.IsDefaultOrEmpty)
-                throw new InvalidOperationException($"Missing System.ValueTuple with arity {arity}.");
+            if (TryGetValueTupleDef(_metadataLookupGlobalNamespace, arity, out t) ||
+                (!ReferenceEquals(_metadataLookupGlobalNamespace, _moduleGlobalNamespace) &&
+                TryGetValueTupleDef(_moduleGlobalNamespace, arity, out t)) ||
+                (_systemObject.ContainingSymbol is NamespaceSymbol systemNamespace &&
+                TryGetValueTupleDef(systemNamespace, arity, out t)))
+            {
+                _valueTupleDefCache[arity] = t;
+                return t;
+            }
+            throw new InvalidOperationException($"Missing System.ValueTuple with arity {arity}.");
+        }
+        private static bool TryGetValueTupleDef(NamespaceSymbol rootOrSystem, int arity, out NamedTypeSymbol type)
+        {
+            NamespaceSymbol systemNamespace;
 
-            t = cands[0];
-            _valueTupleDefCache[arity] = t;
-            return t;
+            if (rootOrSystem.IsGlobalNamespace)
+            {
+                if (!TryGetSystemNamespace(rootOrSystem, out systemNamespace))
+                {
+                    type = null!;
+                    return false;
+                }
+            }
+            else if (string.Equals(rootOrSystem.Name, "System", StringComparison.Ordinal))
+            {
+                systemNamespace = rootOrSystem;
+            }
+            else
+            {
+                type = null!;
+                return false;
+            }
+
+            var cands = systemNamespace.GetTypeMembers("ValueTuple", arity);
+            if (cands.IsDefaultOrEmpty)
+            {
+                type = null!;
+                return false;
+            }
+
+            type = cands[0];
+            return true;
         }
         private void WriteValueTupleSigForElements(SigWriter w, ImmutableArray<TypeSymbol> elems, int start)
         {

@@ -313,7 +313,7 @@ namespace Cnidaria.C
                     EmitI64Imm(Op.I64SubImm, Sp, Sp, frame.FrameSize);
 
                 if (frame.HasVarArgsPointer)
-                    EmitMem(Op.StPtr, VarArgsRegister, MachineRegister.Invalid, frame.VarArgsPointerOffset, 
+                    EmitMem(Op.StPtr, VarArgsRegister, MachineRegister.Invalid, frame.VarArgsPointerOffset,
                         MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
 
                 foreach (var pair in frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
@@ -433,7 +433,7 @@ namespace Cnidaria.C
 
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var type = instruction.Result.Type;
-                var cls = ClassifyArgument(type);
+                var cls = RegisterClassOf(ClassifyValue(type));
                 if (cls == AbiRegisterClass.Floating)
                 {
                     if (_parameters.Float < 8)
@@ -652,7 +652,7 @@ namespace Cnidaria.C
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-                EmitMem(LoadOpForType(instruction.Result.Type), dst, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, 
+                EmitMem(LoadOpForType(instruction.Result.Type), dst, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind,
                     AlignmentOf(instruction.Result.Type), parts.ScaleLog2);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
@@ -716,7 +716,7 @@ namespace Cnidaria.C
                     return;
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
-                var ret = ClassifyArgument(instruction.Result.Type) == AbiRegisterClass.Floating ? MachineRegister.F10 : MachineRegister.X10;
+                var ret = RegisterClassOf(ClassifyValue(instruction.Result.Type)) == AbiRegisterClass.Floating ? MachineRegister.F10 : MachineRegister.X10;
                 MoveRegister(dst, ret);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
@@ -753,7 +753,7 @@ namespace Cnidaria.C
                 var frame = _allocation.Frame;
 
                 if (frame.HasVarArgsPointer)
-                    EmitMem(LoadOpForType(instruction.Result.Type), destination, MachineRegister.Invalid, 
+                    EmitMem(LoadOpForType(instruction.Result.Type), destination, MachineRegister.Invalid,
                         frame.VarArgsPointerOffset, MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
                 else
                     _asm.LiI64(destination, 0);
@@ -782,7 +782,7 @@ namespace Cnidaria.C
                 {
                     var operand = instruction.Operands[firstVariadicOperand + i];
                     var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch0 : GpScratch0);
-                    EmitMem(StoreOpForType(operand.Type), source, MachineRegister.Invalid, 
+                    EmitMem(StoreOpForType(operand.Type), source, MachineRegister.Invalid,
                         checked(baseOffset + i * _owner._allocationOptions.StackArgumentSlotSize), MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
                 }
 
@@ -797,7 +797,7 @@ namespace Cnidaria.C
                 for (var i = startOperand; i < instruction.Operands.Length; i++)
                 {
                     var operand = instruction.Operands[i];
-                    var cls = ClassifyArgument(operand.Type);
+                    var cls = RegisterClassOf(ClassifyValue(operand.Type));
                     if (cls == AbiRegisterClass.Floating)
                     {
                         if (floating++ >= 8)
@@ -821,7 +821,7 @@ namespace Cnidaria.C
                 for (var i = startOperand; i < instruction.Operands.Length; i++)
                 {
                     var operand = instruction.Operands[i];
-                    var cls = ClassifyArgument(operand.Type);
+                    var cls = RegisterClassOf(ClassifyValue(operand.Type));
                     if (cls == AbiRegisterClass.Floating)
                     {
                         if (floating < 8)
@@ -913,7 +913,7 @@ namespace Cnidaria.C
                 if (instruction.Operands.Length != 0)
                 {
                     var operand = instruction.Operands[0];
-                    if (ClassifyArgument(operand.Type) == AbiRegisterClass.Floating)
+                    if (RegisterClassOf(ClassifyValue(operand.Type)) == AbiRegisterClass.Floating)
                         LoadOperandInto(operand, MachineRegister.F10);
                     else
                         LoadOperandInto(operand, MachineRegister.X10);
@@ -925,7 +925,7 @@ namespace Cnidaria.C
                 {
                     _asm.RetVoid();
                 }
-                else if (ClassifyArgument(instruction.Operands[0].Type) == AbiRegisterClass.Floating)
+                else if (RegisterClassOf(ClassifyValue(instruction.Operands[0].Type)) == AbiRegisterClass.Floating)
                 {
                     _asm.RetF(MachineRegister.F10);
                 }
@@ -1025,7 +1025,7 @@ namespace Cnidaria.C
                 if (function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart)
                     return false;
 
-                if (function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite 
+                if (function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite
                     || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal))
                 {
                     methodId = PrintfMethodId;
@@ -1505,9 +1505,19 @@ namespace Cnidaria.C
 
             private Op LoadOpForType(QualifiedType type)
             {
-                if (IsFloat32(type)) return Op.LdF32;
-                if (IsFloat64(type)) return Op.LdF64;
-                if (IsPointerLike(type)) return Op.LdPtr;
+                var kind = ClassifyValue(type);
+                return kind switch
+                {
+                    ValueKind.Float32 => Op.LdF32,
+                    ValueKind.Float64 => Op.LdF64,
+                    ValueKind.Pointer => Op.LdPtr,
+                    ValueKind.General32 or ValueKind.General64 => LoadIntegerOp(type),
+                    _ => throw new NotSupportedException("Cannot load non-scalar type " + type.ToDisplayString() + "."),
+                };
+            }
+
+            private Op LoadIntegerOp(QualifiedType type)
+            {
                 var signed = !IsUnsignedInteger(type);
                 return SizeOf(type) switch
                 {
@@ -1515,39 +1525,55 @@ namespace Cnidaria.C
                     2 => signed ? Op.LdI2 : Op.LdU2,
                     4 => signed ? Op.LdI4 : Op.LdU4,
                     8 => Op.LdI8,
-                    _ => throw new NotSupportedException("Cannot load non-scalar type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException("Cannot load integer type " + type.ToDisplayString() + "."),
                 };
             }
 
             private Op StoreOpForType(QualifiedType type)
             {
-                if (IsFloat32(type)) return Op.StF32;
-                if (IsFloat64(type)) return Op.StF64;
-                if (IsPointerLike(type)) return Op.StPtr;
+                var kind = ClassifyValue(type);
+                return kind switch
+                {
+                    ValueKind.Float32 => Op.StF32,
+                    ValueKind.Float64 => Op.StF64,
+                    ValueKind.Pointer => Op.StPtr,
+                    ValueKind.General32 or ValueKind.General64 => StoreIntegerOp(type),
+                    _ => throw new NotSupportedException("Cannot store non-scalar type " + type.ToDisplayString() + "."),
+                };
+            }
+
+            private Op StoreIntegerOp(QualifiedType type)
+            {
                 return SizeOf(type) switch
                 {
                     1 => Op.StI1,
                     2 => Op.StI2,
                     4 => Op.StI4,
                     8 => Op.StI8,
-                    _ => throw new NotSupportedException("Cannot store non-scalar type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException("Cannot store integer type " + type.ToDisplayString() + "."),
                 };
             }
 
             private Op CallOpForReturn(QualifiedType returnType, bool isInternal)
             {
-                if (IsVoid(returnType)) return isInternal ? Op.CallInternalVoid : Op.CallVoid;
-                if (IsFloatType(returnType)) return isInternal ? Op.CallInternalF : Op.CallF;
-                if (IsIntegerLike(returnType) || IsPointerLike(returnType)) return isInternal ? Op.CallInternalI : Op.CallI;
-                throw new NotSupportedException("Aggregate return values are not supported by this backend yet.");
+                return ClassifyValue(returnType) switch
+                {
+                    ValueKind.Void => isInternal ? Op.CallInternalVoid : Op.CallVoid,
+                    ValueKind.Float32 or ValueKind.Float64 => isInternal ? Op.CallInternalF : Op.CallF,
+                    ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => isInternal ? Op.CallInternalI : Op.CallI,
+                    _ => throw new NotSupportedException("Aggregate return values are not supported by this backend yet."),
+                };
             }
 
             private Op IndirectCallOpForReturn(QualifiedType returnType)
             {
-                if (IsVoid(returnType)) return Op.CallIndirectVoid;
-                if (IsFloatType(returnType)) return Op.CallIndirectF;
-                if (IsIntegerLike(returnType) || IsPointerLike(returnType)) return Op.CallIndirectI;
-                throw new NotSupportedException("Aggregate return values are not supported by this backend yet.");
+                return ClassifyValue(returnType) switch
+                {
+                    ValueKind.Void => Op.CallIndirectVoid,
+                    ValueKind.Float32 or ValueKind.Float64 => Op.CallIndirectF,
+                    ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => Op.CallIndirectI,
+                    _ => throw new NotSupportedException("Aggregate return values are not supported by this backend yet."),
+                };
             }
 
             private void EmitMem(Op op, MachineRegister valueOrDestination, MachineRegister baseRegister, int offset, MachineRegister indexRegister, MemoryBase memoryBase, int alignment, int scaleLog2 = 0)
@@ -1681,8 +1707,33 @@ namespace Cnidaria.C
                     or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
             }
 
-            private static AbiRegisterClass ClassifyArgument(QualifiedType type)
-                => IsFloatType(type) ? AbiRegisterClass.Floating : AbiRegisterClass.General;
+            private ValueKind ClassifyValue(QualifiedType type)
+            {
+                if (IsVoid(type))
+                    return ValueKind.Void;
+                if (IsFloat32(type))
+                    return ValueKind.Float32;
+                if (IsFloat64(type) || IsLongDouble(type))
+                    return ValueKind.Float64;
+                if (IsPointerLike(type))
+                    return ValueKind.Pointer;
+                if (IsIntegerLike(type))
+                    return SizeOf(type) <= 4 ? ValueKind.General32 : ValueKind.General64;
+                return ValueKind.UnsupportedAggregate;
+            }
+
+            private static AbiRegisterClass RegisterClassOf(ValueKind kind)
+            {
+                return kind switch
+                {
+                    ValueKind.Float32 or ValueKind.Float64 => AbiRegisterClass.Floating,
+                    ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => AbiRegisterClass.General,
+                    _ => throw new NotSupportedException("Value kind has no ABI register class: " + kind.ToString() + "."),
+                };
+            }
+
+            private static bool IsFloatingValue(ValueKind kind)
+                => kind is ValueKind.Float32 or ValueKind.Float64;
 
             private static bool IsFloatRegister(MachineRegister register)
                 => RegisterVmIsa.IsFloatRegister((byte)register);
@@ -1770,6 +1821,17 @@ namespace Cnidaria.C
                 public int Integer;
                 public int Float;
                 public int Stack;
+            }
+
+            private enum ValueKind
+            {
+                Void,
+                General32,
+                General64,
+                Pointer,
+                Float32,
+                Float64,
+                UnsupportedAggregate,
             }
 
             private enum AbiRegisterClass
