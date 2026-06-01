@@ -21,7 +21,7 @@ namespace Cnidaria.Cs
             if (string.IsNullOrWhiteSpace(result))
             {
                 TestsFailed++;
-                FailedMessages.Add($"Test {TestsRan} is empty");
+                FailedMessages.Add($"Test {TestsRan} is empty, expected '{target}'");
                 return false;
             }
 

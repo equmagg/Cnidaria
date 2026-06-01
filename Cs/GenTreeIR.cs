@@ -2386,6 +2386,16 @@ namespace Cnidaria.Cs
         private readonly List<RuntimeMethod> _directDependencies = new();
         private readonly List<RuntimeMethod> _virtualDependencies = new();
         private readonly Dictionary<int, RuntimeType> _instantiatedTypes = new();
+        private readonly HashSet<int> _activeInlineMethods = new();
+
+        private const int InlineAlwaysBudget = 24;
+        private const int InlineDiscretionaryBudget = 48;
+        private const int InlineForceBudget = 128;
+        private const int InlineSmallOverBudgetSize = 12;
+        private const int InlineMaxDepth = 4;
+        private const int InlineMaxForceDepth = 1;
+        private const int InlineTotalBudget = 512;
+        private int _inlineBudgetRemaining = InlineTotalBudget;
 
         private RuntimeType[] _argTypes = Array.Empty<RuntimeType>();
         private RuntimeType[] _localTypes = Array.Empty<RuntimeType>();
@@ -2989,6 +2999,18 @@ namespace Cnidaria.Cs
         }
         private static bool RangesIntersect(int aStart, int aEnd, int bStart, int bEnd)
             => aStart < bEnd && bStart < aEnd;
+        private bool PcInExceptionHandlerRegion(int pc)
+        {
+            if (_body.ExceptionHandlers.Length == 0)
+                return false;
+            for (int i = 0; i < _body.ExceptionHandlers.Length; i++)
+            {
+                var h = _body.ExceptionHandlers[i];
+                if ((uint)(pc - h.HandlerStartPc) < (uint)(h.HandlerEndPc - h.HandlerStartPc))
+                    return true;
+            }
+            return false;
+        }
         private bool TryGetStackDepthAtPc(int pc, out int depth)
         {
             if ((uint)pc < (uint)_stackDepthAtPc.Length)
@@ -3641,7 +3663,8 @@ namespace Cnidaria.Cs
             List<GenTree> statements,
             int callPc,
             BytecodeOp callOp,
-            out GenTree? result)
+            out GenTree? result,
+            int inlineDepth = 1)
         {
             result = null;
 
@@ -3649,330 +3672,438 @@ namespace Cnidaria.Cs
             var bodyModule = callee.BodyModule;
             if (body is null || bodyModule is null)
                 return false;
-            if (!CanInline(callee, body, args.Length))
+
+            if (PcInExceptionHandlerRegion(callPc))
+                return false;
+
+            if (!CanInline(callee, bodyModule, body, args, inlineDepth, out var inlineInfo))
                 return false;
 
             var calleeArgTypes = BuildArgTypes(callee);
             if (calleeArgTypes.Length != args.Length)
                 return false;
 
-            var argTemps = new GenTemp[calleeArgTypes.Length];
-            for (int i = 0; i < argTemps.Length; i++)
-            {
-                var t = calleeArgTypes[i];
-                var temp = CreateInlineTemp(GenTempKind.InlineArg, t, StackKindOf(t));
-                argTemps[i] = temp;
-                statements.Add(Node(GenTreeKind.StoreTemp, callPc, callOp, operands: One(args[i]), int32: temp.Index));
-            }
+            bool registeredActiveInline = _activeInlineMethods.Add(callee.MethodId);
+            if (!registeredActiveInline)
+                return false;
 
-            var localTypes = BuildInlineLocalTypes(bodyModule, body, callee);
-            var localTemps = new GenTemp[localTypes.Length];
-            for (int i = 0; i < localTypes.Length; i++)
-            {
-                var t = localTypes[i];
-                var temp = CreateInlineTemp(GenTempKind.InlineLocal, t, StackKindOf(t));
-                localTemps[i] = temp;
-                var init = Node(GenTreeKind.DefaultValue, callPc, BytecodeOp.DefaultValue, type: t, stackKind: StackKindOf(t), runtimeType: t);
-                statements.Add(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
-            }
+            _inlineBudgetRemaining = Math.Max(0, _inlineBudgetRemaining - inlineInfo.Cost);
 
-            var inlineStack = new List<StackValue>(Math.Max(body.MaxStack, 4));
-            bool sawReturn = false;
-
-            for (int pc = 0; pc < body.Instructions.Length; pc++)
+            try
             {
-                var ins = body.Instructions[pc];
-                if (ins.Op == BytecodeOp.Ret)
+                var argTemps = new GenTemp[calleeArgTypes.Length];
+                var argSubstitutions = new StackValue?[calleeArgTypes.Length];
+                for (int i = 0; i < argTemps.Length; i++)
                 {
-                    if (ins.Pop == 1)
+                    var t = calleeArgTypes[i];
+                    if (inlineInfo.CanSubstituteArgument(i, args[i]))
                     {
-                        var returnValue = Pop(inlineStack, callPc, ins.Op);
-
-                        var returnTemp = CreateInlineTemp(GenTempKind.InlineReturn, returnValue.Type, returnValue.StackKind);
-                        AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(returnValue.Node), int32: returnTemp.Index));
-                        result = TempLoad(callPc, ins.Op, returnTemp).Node;
-                    }
-                    else
-                    {
-                        result = null;
+                        argSubstitutions[i] = new StackValue(args[i], args[i].Type, args[i].StackKind);
+                        continue;
                     }
 
-                    sawReturn = true;
-                    for (int tail = pc + 1; tail < body.Instructions.Length; tail++)
-                    {
-                        if (body.Instructions[tail].Op != BytecodeOp.Nop)
-                            throw Fail(callPc, body.Instructions[tail].Op, "Unexpected non-nop after inlined return.");
-                    }
-                    break;
+                    var temp = CreateInlineTemp(GenTempKind.InlineArg, t, StackKindOf(t));
+                    argTemps[i] = temp;
+                    statements.Add(Node(GenTreeKind.StoreTemp, callPc, callOp, operands: One(args[i]), int32: temp.Index));
                 }
 
-                switch (ins.Op)
+                var localTypes = BuildInlineLocalTypes(bodyModule, body, callee);
+                var localTemps = new GenTemp[localTypes.Length];
+                for (int i = 0; i < localTypes.Length; i++)
                 {
-                    case BytecodeOp.Nop:
-                        break;
+                    var t = localTypes[i];
+                    var temp = CreateInlineTemp(GenTempKind.InlineLocal, t, StackKindOf(t));
+                    localTemps[i] = temp;
 
-                    case BytecodeOp.Ldc_I4:
-                        Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4, int32: ins.Operand0));
-                        break;
-
-                    case BytecodeOp.Ldc_I8:
-                        Push(inlineStack, Node(GenTreeKind.ConstI8, callPc, ins.Op, stackKind: GenStackKind.I8, int64: ins.Operand2));
-                        break;
-
-                    case BytecodeOp.Ldc_R4:
-                        Push(inlineStack, Node(GenTreeKind.ConstR4Bits, callPc, ins.Op, stackKind: GenStackKind.R4, int32: ins.Operand0));
-                        break;
-
-                    case BytecodeOp.Ldc_R8:
-                        Push(inlineStack, Node(GenTreeKind.ConstR8Bits, callPc, ins.Op, stackKind: GenStackKind.R8, int64: ins.Operand2));
-                        break;
-
-                    case BytecodeOp.Ldnull:
-                        Push(inlineStack, Node(GenTreeKind.ConstNull, callPc, ins.Op, stackKind: GenStackKind.Null));
-                        break;
-
-                    case BytecodeOp.Ldstr:
-                        Push(inlineStack, Node(GenTreeKind.ConstString, callPc, ins.Op, type: _rts.SystemString, stackKind: GenStackKind.Ref,
-                            int32: ins.Operand0, text: bodyModule.Md.GetUserString(MetadataToken.Rid(ins.Operand0))));
-                        break;
-
-                    case BytecodeOp.DefaultValue:
-                        {
-                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.DefaultValue, callPc, ins.Op, type: t, stackKind: StackKindOf(t), runtimeType: t));
-                            break;
-                        }
-
-                    case BytecodeOp.Sizeof:
-                        {
-                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.SizeOf, callPc, ins.Op, stackKind: GenStackKind.I4, runtimeType: t));
-                            break;
-                        }
-
-                    case BytecodeOp.TypeIsValueType:
-                        {
-                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
-                                int32: RuntimeTypeIsValueType(t, callPc, ins.Op) ? 1 : 0));
-                            break;
-                        }
-
-                    case BytecodeOp.Ldarg:
-                        Push(inlineStack, TempLoad(callPc, ins.Op, CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op)));
-                        break;
-
-                    case BytecodeOp.Ldthis:
-                        Push(inlineStack, TempLoad(callPc, ins.Op, CheckedInlineArgTemp(argTemps, 0, callPc, ins.Op)));
-                        break;
-
-                    case BytecodeOp.Starg:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var temp = CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
-                            break;
-                        }
-
-                    case BytecodeOp.Ldloc:
-                        Push(inlineStack, TempLoad(callPc, ins.Op, CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op)));
-                        break;
-
-                    case BytecodeOp.Stloc:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var temp = CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
-                            break;
-                        }
-
-                    case BytecodeOp.Pop:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
-                            break;
-                        }
-
-                    case BytecodeOp.Dup:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var temp = CreateDupTemp(value.Type, value.StackKind);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
-                            Push(inlineStack, TempLoad(callPc, ins.Op, temp));
-                            Push(inlineStack, TempLoad(callPc, ins.Op, temp));
-                            break;
-                        }
-
-                    case BytecodeOp.Neg:
-                    case BytecodeOp.Not:
-                    case BytecodeOp.PtrToByRef:
-                    case BytecodeOp.CastClass:
-                    case BytecodeOp.Isinst:
-                    case BytecodeOp.Box:
-                    case BytecodeOp.UnboxAny:
-                        EmitInlineUnary(inlineStack, statements, bodyModule, callee, callPc, ins);
-                        break;
-
-                    case BytecodeOp.Add:
-                    case BytecodeOp.Add_Ovf:
-                    case BytecodeOp.Add_Ovf_Un:
-                    case BytecodeOp.Sub:
-                    case BytecodeOp.Sub_Ovf:
-                    case BytecodeOp.Sub_Ovf_Un:
-                    case BytecodeOp.Mul:
-                    case BytecodeOp.Mul_Ovf:
-                    case BytecodeOp.Mul_Ovf_Un:
-                    case BytecodeOp.Div:
-                    case BytecodeOp.Div_Un:
-                    case BytecodeOp.Rem:
-                    case BytecodeOp.Rem_Un:
-                    case BytecodeOp.And:
-                    case BytecodeOp.Or:
-                    case BytecodeOp.Xor:
-                    case BytecodeOp.Shl:
-                    case BytecodeOp.Shr:
-                    case BytecodeOp.Shr_Un:
-                    case BytecodeOp.Ceq:
-                    case BytecodeOp.Clt:
-                    case BytecodeOp.Clt_Un:
-                    case BytecodeOp.Cgt:
-                    case BytecodeOp.Cgt_Un:
-                    case BytecodeOp.PtrElemAddr:
-                    case BytecodeOp.PtrDiff:
-                        EmitInlineBinary(inlineStack, statements, callPc, ins);
-                        break;
-
-                    case BytecodeOp.Conv:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var stackKind = StackKindOf((NumericConvKind)ins.Operand0);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.Conv, callPc, ins.Op, stackKind: stackKind, operands: One(value.Node),
-                                convKind: (NumericConvKind)ins.Operand0, convFlags: (NumericConvFlags)ins.Operand1));
-                            break;
-                        }
-
-                    case BytecodeOp.Newobj:
-                        EmitInlineNewObject(inlineStack, statements, bodyModule, callee, callPc, ins);
-                        break;
-
-                    case BytecodeOp.Ldfld:
-                    case BytecodeOp.Ldflda:
-                    case BytecodeOp.Stfld:
-                    case BytecodeOp.Ldsfld:
-                    case BytecodeOp.Ldsflda:
-                    case BytecodeOp.Stsfld:
-                        EmitInlineField(inlineStack, statements, bodyModule, callee, callPc, ins);
-                        break;
-
-                    case BytecodeOp.Ldobj:
-                        {
-                            var address = Pop(inlineStack, callPc, ins.Op);
-                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.LoadIndirect, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
-                            break;
-                        }
-
-                    case BytecodeOp.Stobj:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var address = Pop(inlineStack, callPc, ins.Op);
-                            var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
-                            break;
-                        }
-
-                    case BytecodeOp.Newarr:
-                        {
-                            var length = Pop(inlineStack, callPc, ins.Op);
-                            var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            var arrayType = _rts.GetArrayType(elemType);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.NewArray, callPc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
-                                operands: One(length.Node), runtimeType: elemType));
-                            break;
-                        }
-
-                    case BytecodeOp.Ldelem:
-                        {
-                            var index = Pop(inlineStack, callPc, ins.Op);
-                            var array = Pop(inlineStack, callPc, ins.Op);
-                            var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElement, callPc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
-                                operands: Two(array.Node, index.Node), runtimeType: elemType));
-                            break;
-                        }
-
-                    case BytecodeOp.Ldelema:
-                        {
-                            var index = Pop(inlineStack, callPc, ins.Op);
-                            var array = Pop(inlineStack, callPc, ins.Op);
-                            var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            var byRef = _rts.GetByRefType(elemType);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElementAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
-                                operands: Two(array.Node, index.Node), runtimeType: elemType));
-                            break;
-                        }
-
-                    case BytecodeOp.Stelem:
-                        {
-                            var value = Pop(inlineStack, callPc, ins.Op);
-                            var index = Pop(inlineStack, callPc, ins.Op);
-                            var array = Pop(inlineStack, callPc, ins.Op);
-                            var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreArrayElement, callPc, ins.Op,
-                                operands: ImmutableArray.Create(array.Node, index.Node, value.Node), runtimeType: elemType));
-                            break;
-                        }
-
-                    case BytecodeOp.LdArrayDataRef:
-                        {
-                            var array = Pop(inlineStack, callPc, ins.Op);
-                            PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayDataRef, callPc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
-                            break;
-                        }
-
-                    case BytecodeOp.Ldloca:
-                    case BytecodeOp.Ldarga:
-                    case BytecodeOp.Call:
-                    case BytecodeOp.CallVirt:
-                    case BytecodeOp.Br:
-                    case BytecodeOp.Leave:
-                    case BytecodeOp.Brtrue:
-                    case BytecodeOp.Brfalse:
-                    case BytecodeOp.Throw:
-                    case BytecodeOp.Rethrow:
-                    case BytecodeOp.Ldexception:
-                    case BytecodeOp.Endfinally:
-                    case BytecodeOp.StackAlloc:
-                        throw Fail(callPc, ins.Op, "Opcode passed inline screening but has no inline translator.");
-
-                    default:
-                        throw Fail(callPc, ins.Op, "Opcode passed inline screening but has no inline translator.");
+                    if (inlineInfo.LocalNeedsInit(i))
+                    {
+                        var init = Node(GenTreeKind.DefaultValue, callPc, BytecodeOp.DefaultValue, type: t, stackKind: StackKindOf(t), runtimeType: t);
+                        statements.Add(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
+                    }
                 }
-            }
 
-            if (!sawReturn)
-                throw Fail(callPc, BytecodeOp.Ret, "Inline candidate has no return.");
-            if (!IsVoid(callee.ReturnType) && result is null)
-                throw Fail(callPc, BytecodeOp.Ret, "Inline candidate returned no value for a non-void method.");
-            return true;
+                var inlineStack = new List<StackValue>(Math.Max(body.MaxStack, 4));
+                bool sawReturn = false;
+
+                for (int pc = 0; pc < body.Instructions.Length; pc++)
+                {
+                    var ins = body.Instructions[pc];
+                    if (ins.Op == BytecodeOp.Ret)
+                    {
+                        if (ins.Pop == 1)
+                        {
+                            var returnValue = Pop(inlineStack, callPc, ins.Op);
+
+                            var returnTemp = CreateInlineTemp(GenTempKind.InlineReturn, returnValue.Type, returnValue.StackKind);
+                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(returnValue.Node), int32: returnTemp.Index));
+                            result = TempLoad(callPc, ins.Op, returnTemp).Node;
+                        }
+                        else
+                        {
+                            result = null;
+                        }
+
+                        sawReturn = true;
+                        for (int tail = pc + 1; tail < body.Instructions.Length; tail++)
+                        {
+                            if (body.Instructions[tail].Op != BytecodeOp.Nop)
+                                throw Fail(callPc, body.Instructions[tail].Op, "Unexpected non-nop after inlined return.");
+                        }
+                        break;
+                    }
+
+                    switch (ins.Op)
+                    {
+                        case BytecodeOp.Nop:
+                            break;
+
+                        case BytecodeOp.Ldc_I4:
+                            Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4, int32: ins.Operand0));
+                            break;
+
+                        case BytecodeOp.Ldc_I8:
+                            Push(inlineStack, Node(GenTreeKind.ConstI8, callPc, ins.Op, stackKind: GenStackKind.I8, int64: ins.Operand2));
+                            break;
+
+                        case BytecodeOp.Ldc_R4:
+                            Push(inlineStack, Node(GenTreeKind.ConstR4Bits, callPc, ins.Op, stackKind: GenStackKind.R4, int32: ins.Operand0));
+                            break;
+
+                        case BytecodeOp.Ldc_R8:
+                            Push(inlineStack, Node(GenTreeKind.ConstR8Bits, callPc, ins.Op, stackKind: GenStackKind.R8, int64: ins.Operand2));
+                            break;
+
+                        case BytecodeOp.Ldnull:
+                            Push(inlineStack, Node(GenTreeKind.ConstNull, callPc, ins.Op, stackKind: GenStackKind.Null));
+                            break;
+
+                        case BytecodeOp.Ldstr:
+                            Push(inlineStack, Node(GenTreeKind.ConstString, callPc, ins.Op, type: _rts.SystemString, stackKind: GenStackKind.Ref,
+                                int32: ins.Operand0, text: bodyModule.Md.GetUserString(MetadataToken.Rid(ins.Operand0))));
+                            break;
+
+                        case BytecodeOp.DefaultValue:
+                            {
+                                var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                Push(inlineStack, Node(GenTreeKind.DefaultValue, callPc, ins.Op, type: t, stackKind: StackKindOf(t), runtimeType: t));
+                                break;
+                            }
+
+                        case BytecodeOp.Sizeof:
+                            {
+                                var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                Push(inlineStack, Node(GenTreeKind.SizeOf, callPc, ins.Op, stackKind: GenStackKind.I4, runtimeType: t));
+                                break;
+                            }
+
+                        case BytecodeOp.TypeIsValueType:
+                            {
+                                var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
+                                    int32: RuntimeTypeIsValueType(t, callPc, ins.Op) ? 1 : 0));
+                                break;
+                            }
+
+                        case BytecodeOp.Ldarg:
+                            Push(inlineStack, LoadInlineArg(argTemps, argSubstitutions, ins.Operand0, callPc, ins.Op));
+                            break;
+
+                        case BytecodeOp.Ldthis:
+                            Push(inlineStack, LoadInlineArg(argTemps, argSubstitutions, 0, callPc, ins.Op));
+                            break;
+
+                        case BytecodeOp.Starg:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var temp = CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                                break;
+                            }
+
+                        case BytecodeOp.Ldloc:
+                            Push(inlineStack, TempLoad(callPc, ins.Op, CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op)));
+                            break;
+
+                        case BytecodeOp.Stloc:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var temp = CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                                break;
+                            }
+
+                        case BytecodeOp.Pop:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
+                                break;
+                            }
+
+                        case BytecodeOp.Dup:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var temp = CreateDupTemp(value.Type, value.StackKind);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                                Push(inlineStack, TempLoad(callPc, ins.Op, temp));
+                                Push(inlineStack, TempLoad(callPc, ins.Op, temp));
+                                break;
+                            }
+
+                        case BytecodeOp.Neg:
+                        case BytecodeOp.Not:
+                        case BytecodeOp.PtrToByRef:
+                        case BytecodeOp.CastClass:
+                        case BytecodeOp.Isinst:
+                        case BytecodeOp.Box:
+                        case BytecodeOp.UnboxAny:
+                            EmitInlineUnary(inlineStack, statements, bodyModule, callee, callPc, ins);
+                            break;
+
+                        case BytecodeOp.Add:
+                        case BytecodeOp.Add_Ovf:
+                        case BytecodeOp.Add_Ovf_Un:
+                        case BytecodeOp.Sub:
+                        case BytecodeOp.Sub_Ovf:
+                        case BytecodeOp.Sub_Ovf_Un:
+                        case BytecodeOp.Mul:
+                        case BytecodeOp.Mul_Ovf:
+                        case BytecodeOp.Mul_Ovf_Un:
+                        case BytecodeOp.Div:
+                        case BytecodeOp.Div_Un:
+                        case BytecodeOp.Rem:
+                        case BytecodeOp.Rem_Un:
+                        case BytecodeOp.And:
+                        case BytecodeOp.Or:
+                        case BytecodeOp.Xor:
+                        case BytecodeOp.Shl:
+                        case BytecodeOp.Shr:
+                        case BytecodeOp.Shr_Un:
+                        case BytecodeOp.Ceq:
+                        case BytecodeOp.Clt:
+                        case BytecodeOp.Clt_Un:
+                        case BytecodeOp.Cgt:
+                        case BytecodeOp.Cgt_Un:
+                        case BytecodeOp.PtrElemAddr:
+                        case BytecodeOp.PtrDiff:
+                            EmitInlineBinary(inlineStack, statements, callPc, ins);
+                            break;
+
+                        case BytecodeOp.Conv:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var stackKind = StackKindOf((NumericConvKind)ins.Operand0);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.Conv, callPc, ins.Op, stackKind: stackKind, operands: One(value.Node),
+                                    convKind: (NumericConvKind)ins.Operand0, convFlags: (NumericConvFlags)ins.Operand1));
+                                break;
+                            }
+
+                        case BytecodeOp.Call:
+                        case BytecodeOp.CallVirt:
+                            EmitInlineCall(inlineStack, statements, bodyModule, callee, callPc, ins, inlineDepth);
+                            break;
+
+                        case BytecodeOp.Newobj:
+                            EmitInlineNewObject(inlineStack, statements, bodyModule, callee, callPc, ins);
+                            break;
+
+                        case BytecodeOp.Ldfld:
+                        case BytecodeOp.Ldflda:
+                        case BytecodeOp.Stfld:
+                        case BytecodeOp.Ldsfld:
+                        case BytecodeOp.Ldsflda:
+                        case BytecodeOp.Stsfld:
+                            EmitInlineField(inlineStack, statements, bodyModule, callee, callPc, ins);
+                            break;
+
+                        case BytecodeOp.Ldobj:
+                            {
+                                var address = Pop(inlineStack, callPc, ins.Op);
+                                var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.LoadIndirect, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
+                                break;
+                            }
+
+                        case BytecodeOp.Stobj:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var address = Pop(inlineStack, callPc, ins.Op);
+                                var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
+                                break;
+                            }
+
+                        case BytecodeOp.Newarr:
+                            {
+                                var length = Pop(inlineStack, callPc, ins.Op);
+                                var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                var arrayType = _rts.GetArrayType(elemType);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.NewArray, callPc, ins.Op, type: arrayType, stackKind: GenStackKind.Ref,
+                                    operands: One(length.Node), runtimeType: elemType));
+                                break;
+                            }
+
+                        case BytecodeOp.Ldelem:
+                            {
+                                var index = Pop(inlineStack, callPc, ins.Op);
+                                var array = Pop(inlineStack, callPc, ins.Op);
+                                var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElement, callPc, ins.Op, type: elemType, stackKind: StackKindOf(elemType),
+                                    operands: Two(array.Node, index.Node), runtimeType: elemType));
+                                break;
+                            }
+
+                        case BytecodeOp.Ldelema:
+                            {
+                                var index = Pop(inlineStack, callPc, ins.Op);
+                                var array = Pop(inlineStack, callPc, ins.Op);
+                                var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                var byRef = _rts.GetByRefType(elemType);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayElementAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
+                                    operands: Two(array.Node, index.Node), runtimeType: elemType));
+                                break;
+                            }
+
+                        case BytecodeOp.Stelem:
+                            {
+                                var value = Pop(inlineStack, callPc, ins.Op);
+                                var index = Pop(inlineStack, callPc, ins.Op);
+                                var array = Pop(inlineStack, callPc, ins.Op);
+                                var elemType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreArrayElement, callPc, ins.Op,
+                                    operands: ImmutableArray.Create(array.Node, index.Node, value.Node), runtimeType: elemType));
+                                break;
+                            }
+
+                        case BytecodeOp.LdArrayDataRef:
+                            {
+                                var array = Pop(inlineStack, callPc, ins.Op);
+                                PushImportedValue(inlineStack, statements, Node(GenTreeKind.ArrayDataRef, callPc, ins.Op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
+                                break;
+                            }
+
+                        case BytecodeOp.Ldloca:
+                        case BytecodeOp.Ldarga:
+                        case BytecodeOp.Br:
+                        case BytecodeOp.Leave:
+                        case BytecodeOp.Brtrue:
+                        case BytecodeOp.Brfalse:
+                        case BytecodeOp.Throw:
+                        case BytecodeOp.Rethrow:
+                        case BytecodeOp.Ldexception:
+                        case BytecodeOp.Endfinally:
+                        case BytecodeOp.StackAlloc:
+                            throw Fail(callPc, ins.Op, "Opcode passed inline screening but has no inline translator.");
+
+                        default:
+                            throw Fail(callPc, ins.Op, "Opcode passed inline screening but has no inline translator.");
+                    }
+                }
+
+                if (!sawReturn)
+                    throw Fail(callPc, BytecodeOp.Ret, "Inline candidate has no return.");
+                if (!IsVoid(callee.ReturnType) && result is null)
+                    throw Fail(callPc, BytecodeOp.Ret, "Inline candidate returned no value for a non-void method.");
+                return true;
+            }
+            finally
+            {
+                _activeInlineMethods.Remove(callee.MethodId);
+            }
         }
 
-        private bool CanInline(RuntimeMethod callee, BytecodeFunction body, int actualArgCount)
+        private bool CanInline(
+            RuntimeMethod callee,
+            RuntimeModule bodyModule,
+            BytecodeFunction body,
+            ImmutableArray<GenTree> args,
+            int inlineDepth,
+            out InlineCandidateInfo info)
         {
+            info = null!;
+
             if (callee.MethodId == _method.MethodId)
+                return false;
+            if (_activeInlineMethods.Contains(callee.MethodId))
                 return false;
             if (callee.HasInternalCall || callee.HasNoInlining)
                 return false;
             if (body.ExceptionHandlers.Length != 0)
                 return false;
-            if (actualArgCount != (callee.HasThis ? callee.ParameterTypes.Length + 1 : callee.ParameterTypes.Length))
+            if (args.Length != (callee.HasThis ? callee.ParameterTypes.Length + 1 : callee.ParameterTypes.Length))
                 return false;
-            if (body.LocalTypeTokens.Length > 16)
+            if (body.LocalTypeTokens.Length > (callee.HasAggressiveInlining ? 64 : 24))
+                return false;
+            if (!callee.HasAggressiveInlining && body.MaxStack > 32)
+                return false;
+            if (inlineDepth > InlineMaxDepth)
                 return false;
 
-            int budget = callee.HasAggressiveInlining ? 96 : 24;
+            if (!AnalyzeInlineCandidate(callee, bodyModule, body, args.Length, out var candidate))
+                return false;
+
+            int budget = DetermineInlineBudget(callee, candidate, args, inlineDepth);
+            bool forceInline = callee.HasAggressiveInlining;
+            bool allowOverBudget = forceInline && inlineDepth <= InlineMaxForceDepth;
+            if (!allowOverBudget && candidate.CodeSize <= InlineSmallOverBudgetSize)
+                allowOverBudget = true;
+
+            if (candidate.Cost > budget && !allowOverBudget)
+                return false;
+
+            if (candidate.Cost > _inlineBudgetRemaining && !allowOverBudget)
+                return false;
+
+            info = candidate;
+            return true;
+        }
+
+        private int DetermineInlineBudget(RuntimeMethod callee, InlineCandidateInfo candidate, ImmutableArray<GenTree> args, int inlineDepth)
+        {
+            int budget = callee.HasAggressiveInlining
+                ? InlineForceBudget
+                : candidate.CodeSize <= InlineSmallOverBudgetSize ? InlineAlwaysBudget : InlineDiscretionaryBudget;
+
+            if (candidate.LooksLikeWrapper)
+                budget += 32;
+            if (candidate.MostlyLoadStore)
+                budget += 32;
+            if (candidate.HasCall)
+                budget += candidate.LooksLikeWrapper ? 16 : 8;
+
+            int substitutableArgs = 0;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (candidate.CanSubstituteArgument(i, args[i]))
+                    substitutableArgs++;
+            }
+            budget += Math.Min(24, substitutableArgs * 4);
+
+            if (inlineDepth > 1)
+                budget = Math.Max(InlineAlwaysBudget, budget - ((inlineDepth - 1) * 12));
+
+            return budget;
+        }
+
+        private bool AnalyzeInlineCandidate(
+            RuntimeMethod callee,
+            RuntimeModule bodyModule,
+            BytecodeFunction body,
+            int argCount,
+            out InlineCandidateInfo info)
+        {
+            info = null!;
+
+            var argLoadCounts = new int[argCount];
+            var argStoreCounts = new int[argCount];
+            var localNeedsInit = new bool[body.LocalTypeTokens.Length];
+            var localDefinitelyAssigned = new bool[body.LocalTypeTokens.Length];
+
             int cost = 0;
+            int instructionCount = 0;
+            int loadStoreCount = 0;
+            int callCount = 0;
             bool sawReturn = false;
+            bool returnsValue = false;
 
             for (int i = 0; i < body.Instructions.Length; i++)
             {
@@ -3987,19 +4118,186 @@ namespace Cnidaria.Cs
                 if (ins.Op == BytecodeOp.Ret)
                 {
                     sawReturn = true;
+                    returnsValue = ins.Pop == 1;
                     cost++;
+                    instructionCount++;
                     continue;
                 }
 
                 if (!CanTranslateInlineOpcode(ins.Op))
                     return false;
 
-                cost += InlineOpcodeCost(ins.Op);
-                if (cost > budget)
+                if (!NoteInlineOperandUse(ins, argLoadCounts, argStoreCounts, localNeedsInit, localDefinitelyAssigned))
                     return false;
+
+                instructionCount++;
+                if (IsInlineLoadStoreOpcode(ins.Op))
+                    loadStoreCount++;
+                if (ins.Op is BytecodeOp.Call or BytecodeOp.CallVirt)
+                    callCount++;
+
+                cost += InlineOpcodeCost(ins.Op);
+                if (ins.Op == BytecodeOp.CallVirt)
+                    cost += 4;
             }
 
-            return sawReturn;
+            if (!sawReturn)
+                return false;
+
+            bool mostlyLoadStore = instructionCount != 0 &&
+                ((instructionCount - loadStoreCount) < 4 || (loadStoreCount * 10) >= instructionCount * 9);
+            bool looksLikeWrapper = callCount == 1 && instructionCount <= 8;
+
+            info = new InlineCandidateInfo(
+                cost,
+                body.Instructions.Length,
+                argLoadCounts,
+                argStoreCounts,
+                localNeedsInit,
+                mostlyLoadStore,
+                looksLikeWrapper,
+                hasCall: callCount != 0,
+                returnsValue: returnsValue);
+            return true;
+        }
+
+        private static bool NoteInlineOperandUse(
+            Instruction ins,
+            int[] argLoadCounts,
+            int[] argStoreCounts,
+            bool[] localNeedsInit,
+            bool[] localDefinitelyAssigned)
+        {
+            switch (ins.Op)
+            {
+                case BytecodeOp.Ldthis:
+                    if (argLoadCounts.Length == 0)
+                        return false;
+                    argLoadCounts[0]++;
+                    return true;
+
+                case BytecodeOp.Ldarg:
+                    if ((uint)ins.Operand0 >= (uint)argLoadCounts.Length)
+                        return false;
+                    argLoadCounts[ins.Operand0]++;
+                    return true;
+
+                case BytecodeOp.Starg:
+                    if ((uint)ins.Operand0 >= (uint)argStoreCounts.Length)
+                        return false;
+                    argStoreCounts[ins.Operand0]++;
+                    return true;
+
+                case BytecodeOp.Ldloc:
+                    if ((uint)ins.Operand0 >= (uint)localNeedsInit.Length)
+                        return false;
+                    if (!localDefinitelyAssigned[ins.Operand0])
+                        localNeedsInit[ins.Operand0] = true;
+                    return true;
+
+                case BytecodeOp.Stloc:
+                    if ((uint)ins.Operand0 >= (uint)localDefinitelyAssigned.Length)
+                        return false;
+                    localDefinitelyAssigned[ins.Operand0] = true;
+                    return true;
+
+                default:
+                    return true;
+            }
+        }
+
+        private StackValue LoadInlineArg(GenTemp[] argTemps, StackValue?[] argSubstitutions, int index, int pc, BytecodeOp op)
+        {
+            if ((uint)index >= (uint)argTemps.Length)
+                throw Fail(pc, op, $"Inline argument index {index} is out of range. Argument count: {argTemps.Length}.");
+
+            if (argSubstitutions[index].HasValue)
+                return argSubstitutions[index]!.Value;
+
+            return TempLoad(pc, op, CheckedInlineArgTemp(argTemps, index, pc, op));
+        }
+
+        private static bool IsInlineLoadStoreOpcode(BytecodeOp op)
+        {
+            return op is BytecodeOp.Ldarg or BytecodeOp.Ldthis or BytecodeOp.Ldloc or BytecodeOp.Ldc_I4 or
+                BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R4 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull or
+                BytecodeOp.Ldstr or BytecodeOp.DefaultValue or BytecodeOp.Sizeof or BytecodeOp.TypeIsValueType or
+                BytecodeOp.Starg or BytecodeOp.Stloc or BytecodeOp.Ldfld or BytecodeOp.Ldflda or
+                BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Stobj or
+                BytecodeOp.Ldelem or BytecodeOp.Ldelema or BytecodeOp.Stelem or BytecodeOp.Pop;
+        }
+
+        private static bool IsPureInlineArgument(GenTree arg)
+        {
+            const GenTreeFlags badFlags =
+                GenTreeFlags.ContainsCall |
+                GenTreeFlags.CanThrow |
+                GenTreeFlags.SideEffect |
+                GenTreeFlags.MemoryRead |
+                GenTreeFlags.MemoryWrite |
+                GenTreeFlags.GlobalRef |
+                GenTreeFlags.Indirect |
+                GenTreeFlags.Allocation |
+                GenTreeFlags.ControlFlow |
+                GenTreeFlags.ExceptionFlow |
+                GenTreeFlags.Ordered |
+                GenTreeFlags.AddressExposed;
+
+            if ((arg.Flags & badFlags) != 0)
+                return false;
+
+            return arg.Kind is GenTreeKind.ConstI4 or GenTreeKind.ConstI8 or GenTreeKind.ConstR4Bits or GenTreeKind.ConstR8Bits or
+                GenTreeKind.ConstNull or GenTreeKind.ConstString or GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp or
+                GenTreeKind.DefaultValue or GenTreeKind.SizeOf or GenTreeKind.Unary or GenTreeKind.Binary or GenTreeKind.Conv;
+        }
+
+        private sealed class InlineCandidateInfo
+        {
+            private readonly int[] _argLoadCounts;
+            private readonly int[] _argStoreCounts;
+            private readonly bool[] _localNeedsInit;
+
+            public int Cost { get; }
+            public int CodeSize { get; }
+            public bool MostlyLoadStore { get; }
+            public bool LooksLikeWrapper { get; }
+            public bool HasCall { get; }
+            public bool ReturnsValue { get; }
+
+            public InlineCandidateInfo(
+                int cost,
+                int codeSize,
+                int[] argLoadCounts,
+                int[] argStoreCounts,
+                bool[] localNeedsInit,
+                bool mostlyLoadStore,
+                bool looksLikeWrapper,
+                bool hasCall,
+                bool returnsValue)
+            {
+                Cost = cost;
+                CodeSize = codeSize;
+                _argLoadCounts = argLoadCounts ?? Array.Empty<int>();
+                _argStoreCounts = argStoreCounts ?? Array.Empty<int>();
+                _localNeedsInit = localNeedsInit ?? Array.Empty<bool>();
+                MostlyLoadStore = mostlyLoadStore;
+                LooksLikeWrapper = looksLikeWrapper;
+                HasCall = hasCall;
+                ReturnsValue = returnsValue;
+            }
+
+            public bool CanSubstituteArgument(int index, GenTree arg)
+            {
+                if ((uint)index >= (uint)_argLoadCounts.Length || (uint)index >= (uint)_argStoreCounts.Length)
+                    return false;
+
+                return _argStoreCounts[index] == 0 &&
+                    _argLoadCounts[index] == 1 &&
+                    IsPureInlineArgument(arg);
+            }
+
+            public bool LocalNeedsInit(int index)
+                => (uint)index < (uint)_localNeedsInit.Length && _localNeedsInit[index];
         }
 
         private static bool CanTranslateInlineOpcode(BytecodeOp op)
@@ -4049,6 +4347,8 @@ namespace Cnidaria.Cs
                 BytecodeOp.Clt_Un or
                 BytecodeOp.Cgt or
                 BytecodeOp.Cgt_Un or
+                BytecodeOp.Call or
+                BytecodeOp.CallVirt or
                 BytecodeOp.Newobj or
                 BytecodeOp.Ldfld or
                 BytecodeOp.Stfld or
@@ -4085,6 +4385,7 @@ namespace Cnidaria.Cs
                 BytecodeOp.Ldfld or BytecodeOp.Ldflda or BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Ldelem or BytecodeOp.Ldelema => 3,
                 BytecodeOp.Stfld or BytecodeOp.Stsfld or BytecodeOp.Stobj or BytecodeOp.Stelem => 4,
                 BytecodeOp.Newobj or BytecodeOp.Newarr or BytecodeOp.Box => 8,
+                BytecodeOp.Call or BytecodeOp.CallVirt => 10,
                 BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un => 4,
                 _ => 1,
             };
@@ -4207,6 +4508,61 @@ namespace Cnidaria.Cs
 
             PushImportedValue(stack, statements, Node(kind, callPc, ins.Op, type: type, stackKind: stackKind, operands: Two(left.Node, right.Node),
                 int32: ins.Operand0, runtimeType: runtimeType));
+        }
+
+        private void EmitInlineCall(
+            List<StackValue> stack,
+            List<GenTree> statements,
+            RuntimeModule bodyModule,
+            RuntimeMethod callerContext,
+            int callPc,
+            Instruction ins,
+            int inlineDepth)
+        {
+            bool isVirtual = ins.Op == BytecodeOp.CallVirt;
+            int packed = ins.Operand1;
+            int argCount = packed & 0x7FFF;
+            int hasThis = (packed >> 15) & 1;
+            int total = argCount + hasThis;
+
+            var args = PopMany(stack, total, callPc, ins.Op);
+            var method = _rts.ResolveMethodInMethodContext(bodyModule, ins.Operand0, callerContext);
+
+            if (isVirtual)
+            {
+                AddVirtualDependency(method);
+            }
+            else
+            {
+                AddDirectDependency(method);
+                if (method.IsStatic && !StringComparer.Ordinal.Equals(method.Name, ".cctor"))
+                    AddTypeInitializerDependency(method.DeclaringType);
+            }
+
+            SpillEvaluationStackForImportBarrier(statements, stack, callPc, ins.Op);
+
+            if (!isVirtual && TryInlineCall(method, args, statements, callPc, ins.Op, out var inlineResult, inlineDepth + 1))
+            {
+                if (inlineResult is not null)
+                    Push(stack, inlineResult);
+                return;
+            }
+
+            bool returnsVoid = IsVoid(method.ReturnType);
+            var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
+                callPc,
+                ins.Op,
+                type: returnsVoid ? null : method.ReturnType,
+                stackKind: returnsVoid ? GenStackKind.Void : StackKindOf(method.ReturnType),
+                operands: args,
+                int32: total,
+                int64: ins.Operand0,
+                method: method);
+
+            if (returnsVoid)
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(call)));
+            else
+                PushImportedValue(stack, statements, call);
         }
 
         private void EmitInlineNewObject(List<StackValue> stack, List<GenTree> statements, RuntimeModule bodyModule, RuntimeMethod callee, int callPc, Instruction ins)

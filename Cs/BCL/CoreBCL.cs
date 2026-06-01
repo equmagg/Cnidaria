@@ -3112,6 +3112,14 @@ namespace System
             return FormatDouble((double)value, format, info);
         }
 
+        private const int DoubleFormatBigUIntMaxWords = 48;
+
+        private unsafe struct BigUIntScratch
+        {
+            public uint* Words;
+            public int Length;
+            public int Capacity;
+        }
         internal static unsafe string FormatDouble(double value, string? format, NumberFormatInfo? info)
         {
             const ulong SignMask = 0x8000_0000_0000_0000UL;
@@ -3241,32 +3249,47 @@ namespace System
             }
             return length;
         }
-        private static ulong ComputeRoundedScaledDigits(ulong mantissa, int binaryExponent, int decimalScale)
+        private static unsafe ulong ComputeRoundedScaledDigits(ulong mantissa, int binaryExponent, int decimalScale)
         {
-            uint[] numerator = UIntArrayFromUInt64(mantissa);
-            uint[] denominator = UIntArrayFromUInt64(1UL);
+            uint* numeratorStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* denominatorStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* remainderStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* tempStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
 
+            BigUIntScratch numerator = CreateBigUIntScratch(numeratorStorage);
+            BigUIntScratch denominator = CreateBigUIntScratch(denominatorStorage);
+            BigUIntScratch remainder = CreateBigUIntScratch(remainderStorage);
+            BigUIntScratch temp = CreateBigUIntScratch(tempStorage);
+
+            BigUIntSetUInt64(ref numerator, mantissa);
             if (binaryExponent >= 0)
-                numerator = ShiftLeft(numerator, binaryExponent);
-            else
-                denominator = ShiftLeft(denominator, -binaryExponent);
+            {
+                BigUIntShiftLeft(ref numerator, binaryExponent);
+            }
+            else if (decimalScale < 0)
+            {
+                BigUIntMultiplyPow10(ref numerator, -decimalScale);
+                int denominatorShift = -binaryExponent;
+                ulong pow2Result = BigUIntDivRemPow2ToUInt64(ref numerator, denominatorShift, ref remainder);
+                int pow2Cmp = BigUIntCompareTwiceToPowerOfTwo(ref remainder, denominatorShift);
+                if (pow2Cmp > 0 || (pow2Cmp == 0 && (pow2Result & 1UL) != 0))
+                    pow2Result++;
+                return pow2Result;
+            }
+            BigUIntSetUInt64(ref denominator, 1UL);
+
+            if (binaryExponent < 0)
+                BigUIntShiftLeft(ref denominator, -binaryExponent);
 
             if (decimalScale >= 0)
-                denominator = MultiplyPow10(denominator, decimalScale);
+                BigUIntMultiplyPow10(ref denominator, decimalScale);
             else
-                numerator = MultiplyPow10(numerator, -decimalScale);
+                BigUIntMultiplyPow10(ref numerator, -decimalScale);
 
-            return RoundQuotientToUInt64(numerator, denominator);
-        }
-        private static ulong RoundQuotientToUInt64(uint[] numerator, uint[] denominator)
-        {
-            uint[] remainder;
-            uint[] quotient = System.Numerics.BigIntegerCalculator.Divide(numerator, denominator, out remainder);
+            ulong result = BigUIntDivRemToUInt64(ref numerator, ref denominator, ref remainder, ref temp);
+            BigUIntShiftLeft(ref remainder, 1);
 
-            uint[] twiceRemainder = ShiftLeft(remainder, 1);
-            int cmp = System.Numerics.BigIntegerCalculator.Compare(twiceRemainder, denominator);
-            ulong result = UIntArrayToUInt64(quotient);
-
+            int cmp = BigUIntCompare(ref remainder, ref denominator);
             if (cmp > 0 || (cmp == 0 && (result & 1UL) != 0))
                 result++;
 
@@ -3298,157 +3321,549 @@ namespace System
 
             return upperCmp < 0;
         }
-        private static int ComparePositiveBinaryFloatToPowerOf10(ulong mantissa, int binaryExponent, int decimalExponent)
+        private static unsafe int ComparePositiveBinaryFloatToPowerOf10(ulong mantissa, int binaryExponent, int decimalExponent)
         {
-            uint[] left = UIntArrayFromUInt64(mantissa);
-            uint[] right = UIntArrayFromUInt64(1UL);
+            uint* leftStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* rightStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+
+            BigUIntScratch left = CreateBigUIntScratch(leftStorage);
+            BigUIntScratch right = CreateBigUIntScratch(rightStorage);
+
+            BigUIntSetUInt64(ref left, mantissa);
+            BigUIntSetUInt64(ref right, 1UL);
 
             if (decimalExponent >= 0)
             {
                 if (binaryExponent >= 0)
                 {
-                    left = ShiftLeft(left, binaryExponent);
-                    right = Pow10UInt(decimalExponent);
+                    BigUIntShiftLeft(ref left, binaryExponent);
+                    BigUIntMultiplyPow10(ref right, decimalExponent);
                 }
                 else
                 {
-                    right = MultiplyPow10(right, decimalExponent);
-                    right = ShiftLeft(right, -binaryExponent);
+                    BigUIntMultiplyPow10(ref right, decimalExponent);
+                    BigUIntShiftLeft(ref right, -binaryExponent);
                 }
             }
             else
             {
-                left = MultiplyPow10(left, -decimalExponent);
+                BigUIntMultiplyPow10(ref left, -decimalExponent);
                 if (binaryExponent >= 0)
-                    left = ShiftLeft(left, binaryExponent);
+                    BigUIntShiftLeft(ref left, binaryExponent);
                 else
-                    right = ShiftLeft(right, -binaryExponent);
+                    BigUIntShiftLeft(ref right, -binaryExponent);
             }
 
-            return System.Numerics.BigIntegerCalculator.Compare(left, right);
+            return BigUIntCompare(ref left, ref right);
         }
-        private static int CompareDecimalToBinary(ulong decimalDigits, int decimalScale, ulong binaryMantissa, int binaryExponent)
+        private static unsafe int CompareDecimalToBinary(ulong decimalDigits, int decimalScale, ulong binaryMantissa, int binaryExponent)
         {
-            uint[] left = UIntArrayFromUInt64(decimalDigits);
-            uint[] right = UIntArrayFromUInt64(binaryMantissa);
+            uint* leftStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* rightStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+
+            BigUIntScratch left = CreateBigUIntScratch(leftStorage);
+            BigUIntScratch right = CreateBigUIntScratch(rightStorage);
+
+            BigUIntSetUInt64(ref left, decimalDigits);
+            BigUIntSetUInt64(ref right, binaryMantissa);
 
             if (decimalScale >= 0)
-                left = MultiplyPow10(left, decimalScale);
+                BigUIntMultiplyPow10(ref left, decimalScale);
             else
-                right = MultiplyPow10(right, -decimalScale);
+                BigUIntMultiplyPow10(ref right, -decimalScale);
 
             if (binaryExponent >= 0)
-                right = ShiftLeft(right, binaryExponent);
+                BigUIntShiftLeft(ref right, binaryExponent);
             else
-                left = ShiftLeft(left, -binaryExponent);
+                BigUIntShiftLeft(ref left, -binaryExponent);
 
-            return System.Numerics.BigIntegerCalculator.Compare(left, right);
+            return BigUIntCompare(ref left, ref right);
         }
-        private static uint[] UIntArrayFromUInt64(ulong value)
-        {
-            if (value == 0UL)
-                return Array.Empty<uint>();
-
-            uint lo = (uint)value;
-            uint hi = (uint)(value >> 32);
-
-            if (hi == 0U)
-                return new uint[] { lo };
-
-            return new uint[] { lo, hi };
-        }
-        private static ulong UIntArrayToUInt64(uint[] value)
-        {
-            int length = UIntArrayLength(value);
-            if (length == 0)
-                return 0UL;
-            if (length == 1)
-                return value[0];
-            if (length == 2)
-                return ((ulong)value[1] << 32) | value[0];
-
-            throw new OverflowException();
-        }
-        private static int UIntArrayLength(uint[] value)
-        {
-            int length = value.Length;
-            while (length > 0 && value[length - 1] == 0U)
-                length--;
-            return length;
-        }
-        private static uint[] Pow10UInt(int exponent)
-        {
-            uint[] result = UIntArrayFromUInt64(1UL);
-            return MultiplyPow10(result, exponent);
-        }
-        private static uint[] MultiplyPow10(uint[] value, int exponent)
-        {
-            uint[] result = value;
-            for (int i = 0; i < exponent; i++)
-                result = MultiplyByUInt32(result, 10U);
-            return result;
-        }
-        private static uint[] MultiplyByUInt32(uint[] value, uint multiplier)
-        {
-            int length = UIntArrayLength(value);
-            if (length == 0 || multiplier == 0U)
-                return Array.Empty<uint>();
-
-            uint[] result = new uint[length + 1];
-            ulong carry = 0UL;
-
-            for (int i = 0; i < length; i++)
+        private static unsafe BigUIntScratch CreateBigUIntScratch(uint* storage) 
+            => new BigUIntScratch
             {
-                ulong product = (ulong)value[i] * multiplier + carry;
-                result[i] = (uint)product;
+                Words = storage,
+                Length = 0,
+                Capacity = DoubleFormatBigUIntMaxWords,
+            };
+        private static unsafe void BigUIntSetUInt64(ref BigUIntScratch value, ulong source)
+        {
+            BigUIntClear(ref value);
+
+            if (source == 0UL)
+                return;
+
+            value.Words[0] = (uint)source;
+            uint hi = (uint)(source >> 32);
+            if (hi != 0U)
+            {
+                BigUIntEnsureCapacity(ref value, 2);
+                value.Words[1] = hi;
+                value.Length = 2;
+            }
+            else
+            {
+                value.Length = 1;
+            }
+        }
+        private static unsafe void BigUIntClear(ref BigUIntScratch value)
+        {
+            for (int i = 0; i < value.Length; i++)
+                value.Words[i] = 0U;
+
+            value.Length = 0;
+        }
+        private static unsafe void BigUIntCopy(ref BigUIntScratch destination, ref BigUIntScratch source)
+        {
+            BigUIntClear(ref destination);
+            BigUIntEnsureCapacity(ref destination, source.Length);
+
+            for (int i = 0; i < source.Length; i++)
+                destination.Words[i] = source.Words[i];
+
+            destination.Length = source.Length;
+        }
+        private static unsafe void BigUIntEnsureCapacity(ref BigUIntScratch value, int required)
+        {
+            if (required > value.Capacity)
+                throw new OverflowException();
+        }
+        private static unsafe void BigUIntNormalize(ref BigUIntScratch value)
+        {
+            while (value.Length > 0 && value.Words[value.Length - 1] == 0U)
+                value.Length--;
+        }
+        private static unsafe int BigUIntBitLength(ref BigUIntScratch value)
+        {
+            BigUIntNormalize(ref value);
+            if (value.Length == 0)
+                return 0;
+
+            uint top = value.Words[value.Length - 1];
+            int bits = 32;
+            while ((top & 0x8000_0000U) == 0U)
+            {
+                bits--;
+                top <<= 1;
+            }
+
+            return (value.Length - 1) * 32 + bits;
+        }
+        private static unsafe int BigUIntCompare(ref BigUIntScratch left, ref BigUIntScratch right)
+        {
+            BigUIntNormalize(ref left);
+            BigUIntNormalize(ref right);
+
+            if (left.Length != right.Length)
+                return left.Length < right.Length ? -1 : 1;
+
+            for (int i = left.Length - 1; i >= 0; i--)
+            {
+                uint l = left.Words[i];
+                uint r = right.Words[i];
+                if (l != r)
+                    return l < r ? -1 : 1;
+            }
+
+            return 0;
+        }
+        private static unsafe void BigUIntShiftLeft(ref BigUIntScratch value, int shift)
+        {
+            if (shift == 0 || value.Length == 0)
+                return;
+
+            if (shift < 0)
+                throw new ArgumentOutOfRangeException("shift");
+
+            int wordShift = shift >> 5;
+            int bitShift = shift & 31;
+
+            if (bitShift != 0)
+            {
+                BigUIntEnsureCapacity(ref value, value.Length + 1);
+
+                int carryShift = 32 - bitShift;
+                uint carry = 0U;
+                for (int i = 0; i < value.Length; i++)
+                {
+                    uint current = value.Words[i];
+                    value.Words[i] = (current << bitShift) | carry;
+                    carry = current >> carryShift;
+                }
+
+                if (carry != 0U)
+                    value.Words[value.Length++] = carry;
+            }
+
+            if (wordShift != 0)
+            {
+                BigUIntEnsureCapacity(ref value, value.Length + wordShift);
+
+                for (int i = value.Length - 1; i >= 0; i--)
+                    value.Words[i + wordShift] = value.Words[i];
+
+                for (int i = 0; i < wordShift; i++)
+                    value.Words[i] = 0U;
+
+                value.Length += wordShift;
+            }
+        }
+        private static unsafe void BigUIntTruncateToLowBits(ref BigUIntScratch value, int bitCount)
+        {
+            if (bitCount <= 0)
+            {
+                BigUIntClear(ref value);
+                return;
+            }
+
+            int keepLength = (bitCount + 31) >> 5;
+            if (keepLength < value.Length)
+            {
+                for (int i = keepLength; i < value.Length; i++)
+                    value.Words[i] = 0U;
+
+                value.Length = keepLength;
+            }
+
+            int usedBitsInTopWord = bitCount & 31;
+            if (usedBitsInTopWord != 0 && value.Length != 0)
+            {
+                uint mask = (1U << usedBitsInTopWord) - 1U;
+                value.Words[value.Length - 1] &= mask;
+            }
+
+            BigUIntNormalize(ref value);
+        }
+        private static unsafe void BigUIntMultiplyByUInt32(ref BigUIntScratch value, uint multiplier)
+        {
+            BigUIntNormalize(ref value);
+
+            if (value.Length == 0 || multiplier == 1U)
+                return;
+
+            if (multiplier == 0U)
+            {
+                BigUIntClear(ref value);
+                return;
+            }
+
+            BigUIntEnsureCapacity(ref value, value.Length + 1);
+
+            ulong carry = 0UL;
+            for (int i = 0; i < value.Length; i++)
+            {
+                ulong product = (ulong)value.Words[i] * multiplier + carry;
+                value.Words[i] = (uint)product;
                 carry = product >> 32;
             }
 
-            result[length] = (uint)carry;
-            return result;
+            if (carry != 0UL)
+                value.Words[value.Length++] = (uint)carry;
         }
-        private static uint[] ShiftLeft(uint[] value, int shift)
+        private static void BigUIntMultiplyPow10(ref BigUIntScratch value, int exponent)
         {
-            if (shift == 0 || UIntArrayLength(value) == 0)
-                return value;
+            if (exponent < 0)
+                throw new ArgumentOutOfRangeException("exponent");
 
-            return System.Numerics.BigIntegerCalculator.ShiftLeft(value, shift);
+            while (exponent >= 9)
+            {
+                BigUIntMultiplyByUInt32(ref value, 1000000000U);
+                exponent -= 9;
+            }
+
+            if (exponent != 0)
+                BigUIntMultiplyByUInt32(ref value, Pow10UInt32(exponent));
         }
-        private static string FormatShortestDouble(bool negative, ulong digits, int decimalScale)
+        private static uint Pow10UInt32(int exponent)
         {
-            string digitText = UInt64ToString(digits);
-            int digitCount = digitText.Length;
+            switch (exponent)
+            {
+                case 0: return 1U;
+                case 1: return 10U;
+                case 2: return 100U;
+                case 3: return 1000U;
+                case 4: return 10000U;
+                case 5: return 100000U;
+                case 6: return 1000000U;
+                case 7: return 10000000U;
+                case 8: return 100000000U;
+                case 9: return 1000000000U;
+                default: throw new ArgumentOutOfRangeException("exponent");
+            }
+        }
+        private static unsafe void BigUIntSubtract(ref BigUIntScratch left, ref BigUIntScratch right)
+        {
+            ulong borrow = 0UL;
+            int rightLength = right.Length;
+
+            for (int i = 0; i < left.Length; i++)
+            {
+                ulong subtrahend = (i < rightLength ? right.Words[i] : 0UL) + borrow;
+                ulong minuend = left.Words[i];
+                left.Words[i] = (uint)(minuend - subtrahend);
+                borrow = minuend < subtrahend ? 1UL : 0UL;
+            }
+
+            if (borrow != 0UL)
+                throw new InvalidOperationException();
+
+            BigUIntNormalize(ref left);
+        }
+        private static unsafe ulong BigUIntDivRemPow2ToUInt64(ref BigUIntScratch numerator, int denominatorShift, ref BigUIntScratch remainder)
+        {
+            if (denominatorShift < 0)
+                throw new ArgumentOutOfRangeException("denominatorShift");
+
+            BigUIntCopy(ref remainder, ref numerator);
+            BigUIntTruncateToLowBits(ref remainder, denominatorShift);
+
+            int wordShift = denominatorShift >> 5;
+            int bitShift = denominatorShift & 31;
+            if (wordShift >= numerator.Length)
+                return 0UL;
+
+            ulong quotient = 0UL;
+            int quotientWords = numerator.Length - wordShift;
+            for (int i = 0; i < quotientWords; i++)
+            {
+                int sourceIndex = wordShift + i;
+                uint word = bitShift == 0
+                    ? numerator.Words[sourceIndex]
+                    : numerator.Words[sourceIndex] >> bitShift;
+
+                if (bitShift != 0 && sourceIndex + 1 < numerator.Length)
+                    word |= numerator.Words[sourceIndex + 1] << (32 - bitShift);
+
+                if (i < 2)
+                {
+                    quotient |= (ulong)word << (i * 32);
+                }
+                else if (word != 0U)
+                {
+                    throw new OverflowException();
+                }
+            }
+
+            return quotient;
+        }
+        private static unsafe int BigUIntCompareTwiceToPowerOfTwo(ref BigUIntScratch value, int powerOfTwoExponent)
+        {
+            if (powerOfTwoExponent < 0)
+                throw new ArgumentOutOfRangeException("powerOfTwoExponent");
+
+            BigUIntNormalize(ref value);
+            if (value.Length == 0)
+                return -1;
+
+            if (powerOfTwoExponent == 0)
+                return 1;
+            int bitLength = BigUIntBitLength(ref value);
+            if (bitLength < powerOfTwoExponent)
+                return -1;
+            if (bitLength > powerOfTwoExponent)
+                return 1;
+
+            return BigUIntIsSingleBitSet(ref value, powerOfTwoExponent - 1) ? 0 : 1;
+        }
+        private static unsafe bool BigUIntIsSingleBitSet(ref BigUIntScratch value, int bitIndex)
+        {
+            if (bitIndex < 0)
+                return false;
+
+            int wordIndex = bitIndex >> 5;
+            int bitInWord = bitIndex & 31;
+            if (value.Length != wordIndex + 1)
+                return false;
+
+            if (value.Words[wordIndex] != (1U << bitInWord))
+                return false;
+
+            for (int i = 0; i < wordIndex; i++)
+            {
+                if (value.Words[i] != 0U)
+                    return false;
+            }
+
+            return true;
+        }
+        private static unsafe ulong BigUIntDivRemToUInt64(
+            ref BigUIntScratch numerator,
+            ref BigUIntScratch denominator,
+            ref BigUIntScratch remainder,
+            ref BigUIntScratch shiftedDenominator)
+        {
+            if (denominator.Length == 0)
+                throw new DivideByZeroException();
+
+            BigUIntCopy(ref remainder, ref numerator);
+
+            if (BigUIntCompare(ref remainder, ref denominator) < 0)
+                return 0UL;
+
+            int maxShift = BigUIntBitLength(ref remainder) - BigUIntBitLength(ref denominator);
+            if (maxShift >= 64)
+                throw new OverflowException();
+
+            BigUIntCopy(ref shiftedDenominator, ref denominator);
+            BigUIntShiftLeft(ref shiftedDenominator, maxShift);
+
+            ulong quotient = 0UL;
+            for (int shift = maxShift; shift >= 0; shift--)
+            {
+                if (BigUIntCompare(ref remainder, ref shiftedDenominator) >= 0)
+                {
+                    BigUIntSubtract(ref remainder, ref shiftedDenominator);
+                    quotient |= 1UL << shift;
+                }
+                if (shift != 0 && shiftedDenominator.Length != 0)
+                {
+                    uint carry = 0U;
+                    for (int i = shiftedDenominator.Length - 1; i >= 0; i--)
+                    {
+                        uint current = shiftedDenominator.Words[i];
+                        shiftedDenominator.Words[i] = (current >> 1) | (carry << 31);
+                        carry = current & 1U;
+                    }
+                    BigUIntNormalize(ref shiftedDenominator);
+                }
+            }
+
+            return quotient;
+        }
+        private static unsafe string FormatShortestDouble(bool negative, ulong digits, int decimalScale)
+        {
+            char* digitBuffer = stackalloc char[24];
+            int digitCount = UInt64ToDecimalDigits(digits, digitBuffer + 24);
+            char* digitStart = digitBuffer + 24 - digitCount;
+
             int scientificExponent = digitCount + decimalScale - 1;
-
-            string body;
             if (scientificExponent >= -4 && scientificExponent < digitCount)
-                body = FormatFixedDecimal(digitText, decimalScale);
-            else
-                body = FormatScientificDecimal(digitText, scientificExponent);
+                return FormatFixedDecimal(negative, digitStart, digitCount, decimalScale);
 
-            return negative ? ("-" + body) : body;
+            return FormatScientificDecimal(negative, digitStart, digitCount, scientificExponent);
         }
-        private static string FormatFixedDecimal(string digits, int decimalScale)
+        private static unsafe int UInt64ToDecimalDigits(ulong value, char* end)
         {
-            int decimalPoint = digits.Length + decimalScale;
+            char* p = end;
+            ulong v = value;
+            do
+            {
+                ulong digit = v % 10UL;
+                v /= 10UL;
+                *--p = (char)('0' + digit);
+            } while (v != 0UL);
+
+            return (int)(end - p);
+        }
+        private static unsafe string FormatFixedDecimal(bool negative, char* digits, int digitCount, int decimalScale)
+        {
+            int decimalPoint = digitCount + decimalScale;
+            int signLength = negative ? 1 : 0;
+            int length;
 
             if (decimalPoint <= 0)
-                return "0." + RepeatChar('0', -decimalPoint) + digits;
-
-            if (decimalPoint >= digits.Length)
-                return digits + RepeatChar('0', decimalPoint - digits.Length);
-
-            return digits.Substring(0, decimalPoint) + "." + digits.Substring(decimalPoint);
-        }
-        private static string FormatScientificDecimal(string digits, int scientificExponent)
-        {
-            string significand;
-            if (digits.Length == 1)
-                significand = digits;
+                length = signLength + 2 + (-decimalPoint) + digitCount;
+            else if (decimalPoint >= digitCount)
+                length = signLength + decimalPoint;
             else
-                significand = CharToString(digits[0]) + "." + digits.Substring(1);
+                length = signLength + digitCount + 1;
 
-            return significand + FormatExponent(scientificExponent);
+            string result = String.FastAllocateString(length);
+            ref char dst = ref result.GetRawStringData();
+            int pos = 0;
+
+            if (negative)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '-';
+
+            if (decimalPoint <= 0)
+            {
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+
+                int zeroCount = -decimalPoint;
+                for (int i = 0; i < zeroCount; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+
+                for (int i = 0; i < digitCount; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+
+                return result;
+            }
+
+            if (decimalPoint >= digitCount)
+            {
+                for (int i = 0; i < digitCount; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+
+                for (int i = digitCount; i < decimalPoint; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+
+                return result;
+            }
+
+            for (int i = 0; i < decimalPoint; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+
+            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+
+            for (int i = decimalPoint; i < digitCount; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+
+            return result;
+        }
+        private static unsafe string FormatScientificDecimal(bool negative, char* digits, int digitCount, int scientificExponent)
+        {
+            char* exponentBuffer = stackalloc char[8];
+            int exponentDigitCount = UInt32ToDecimalDigits(
+                scientificExponent < 0 ? (uint)(-scientificExponent) : (uint)scientificExponent, exponentBuffer + 8);
+            if (exponentDigitCount < 2)
+                exponentDigitCount = 2;
+
+            int signLength = negative ? 1 : 0;
+            int significandLength = digitCount == 1 ? 1 : digitCount + 1;
+            int length = signLength + significandLength + 2 + exponentDigitCount;
+
+            string result = String.FastAllocateString(length);
+            ref char dst = ref result.GetRawStringData();
+            int pos = 0;
+
+            if (negative)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '-';
+
+            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[0];
+            if (digitCount != 1)
+            {
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+                for (int i = 1; i < digitCount; i++)
+                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+            }
+
+            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = 'E';
+            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = scientificExponent < 0 ? '-' : '+';
+
+            int leadingZeroCount = exponentDigitCount - UInt32ToDecimalDigits(
+                scientificExponent < 0 ? (uint)(-scientificExponent) : (uint)scientificExponent, exponentBuffer + 8);
+            for (int i = 0; i < leadingZeroCount; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+
+            char* exponentStart = exponentBuffer + 8 - (exponentDigitCount - leadingZeroCount);
+            for (int i = 0; i < exponentDigitCount - leadingZeroCount; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = exponentStart[i];
+
+            return result;
+        }
+        private static unsafe int UInt32ToDecimalDigits(uint value, char* end)
+        {
+            char* p = end;
+            uint v = value;
+            do
+            {
+                uint digit = v % 10U;
+                v /= 10U;
+                *--p = (char)('0' + digit);
+            } while (v != 0U);
+
+            return (int)(end - p);
         }
         private static string FormatExponent(int exponent)
         {
@@ -3460,19 +3875,6 @@ namespace System
                 digits = "0" + digits;
 
             return negative ? ("E-" + digits) : ("E+" + digits);
-        }
-        private static string RepeatChar(char c, int count)
-        {
-            if (count <= 0)
-                return string.Empty;
-
-            string result = String.FastAllocateString(count);
-            ref char dst = ref result.GetRawStringData();
-
-            for (int i = 0; i < count; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = c;
-
-            return result;
         }
 
 
@@ -7470,6 +7872,327 @@ namespace System
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static byte Clamp(byte value, byte min, byte max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Clamp(double value, double min, double max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static short Clamp(short value, short min, short max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Clamp(int value, int min, int max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long Clamp(long value, long min, long max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static nint Clamp(nint value, nint min, nint max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static sbyte Clamp(sbyte value, sbyte min, sbyte max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Clamp(float value, float min, float max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ushort Clamp(ushort value, ushort min, ushort max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint Clamp(uint value, uint min, uint max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong Clamp(ulong value, ulong min, ulong max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static nuint Clamp(nuint value, nuint min, nuint max)
+        {
+            if (min > max)
+            {
+                ThrowMinMaxException(min, max);
+            }
+
+            if (value < min)
+            {
+                return min;
+            }
+            else if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        internal static void ThrowMinMaxException<T>(T min, T max)
+        {
+            throw new ArgumentException("minimum malue must be lower then maximum value.");
+        }
+
+        public static double BitDecrement(double x)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(x);
+
+            if (!double.IsFinite(x))
+            {
+                // NaN returns NaN
+                // -Infinity returns -Infinity
+                // +Infinity returns MaxValue
+                return (bits == double.PositiveInfinityBits) ? double.MaxValue : x;
+            }
+
+            if (bits == double.PositiveZeroBits)
+            {
+                // +0.0 returns -double.Epsilon
+                return -double.Epsilon;
+            }
+
+            // Negative values need to be incremented
+            // Positive values need to be decremented
+
+            if (double.IsNegative(x))
+            {
+                bits += 1;
+            }
+            else
+            {
+                bits -= 1;
+            }
+            return BitConverter.UInt64BitsToDouble(bits);
+        }
+
+        public static double BitIncrement(double x)
+        {
+            ulong bits = BitConverter.DoubleToUInt64Bits(x);
+
+            if (!double.IsFinite(x))
+            {
+                // NaN returns NaN
+                // -Infinity returns MinValue
+                // +Infinity returns +Infinity
+                return (bits == double.NegativeInfinityBits) ? double.MinValue : x;
+            }
+
+            if (bits == double.NegativeZeroBits)
+            {
+                // -0.0 returns Epsilon
+                return double.Epsilon;
+            }
+
+            // Negative values need to be decremented
+            // Positive values need to be incremented
+
+            if (double.IsNegative(x))
+            {
+                bits -= 1;
+            }
+            else
+            {
+                bits += 1;
+            }
+            return BitConverter.UInt64BitsToDouble(bits);
+        }
+
+        public static double CopySign(double x, double y)
+        {
+            // This method is required to work for all inputs,
+            // including NaN, so we operate on the raw bits.
+            ulong xbits = BitConverter.DoubleToUInt64Bits(x);
+            ulong ybits = BitConverter.DoubleToUInt64Bits(y);
+
+            // Remove the sign from x, and remove everything but the sign from y
+            // Then, simply OR them to get the correct sign
+            return BitConverter.UInt64BitsToDouble((xbits & ~double.SignMask) | (ybits & double.SignMask));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static (sbyte Quotient, sbyte Remainder) DivRem(sbyte left, sbyte right)
         {
             sbyte quotient = (sbyte)(left / right);
@@ -7534,6 +8257,63 @@ namespace System
         public static long BigMul(int a, int b)
         {
             return ((long)a) * b;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ulong BigMul(ulong a, uint b, out ulong low)
+        {
+            if(IntPtr.Size == 8)
+            {
+                return Math.BigMul((ulong)a, (ulong)b, out low);
+            }
+            else
+            {
+                ulong prodL = ((ulong)(uint)a) * b;
+                ulong prodH = (prodL >> 32) + (((ulong)(uint)(a >> 32)) * b);
+
+                low = ((prodH << 32) | (uint)prodL);
+                return (prodH >> 32);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ulong BigMul(uint a, ulong b, out ulong low)
+            => BigMul(b, a, out low);
+
+        public static unsafe ulong BigMul(ulong a, ulong b, out ulong low)
+        {
+            uint al = (uint)a;
+            uint ah = (uint)(a >> 32);
+            uint bl = (uint)b;
+            uint bh = (uint)(b >> 32);
+
+            ulong mull = ((ulong)al) * bl;
+            ulong t = ((ulong)ah) * bl + (mull >> 32);
+            ulong tl = ((ulong)al) * bh + (uint)t;
+
+            low = tl << 32 | (uint)mull;
+
+            return ((ulong)ah) * bh + (t >> 32) + (tl >> 32);
+        }
+
+        public static long BigMul(long a, long b, out long low)
+        {
+            ulong high = BigMul((ulong)a, (ulong)b, out ulong ulow);
+            low = (long)ulow;
+            return (long)high - ((a >> 63) & b) - ((b >> 63) & a);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static UInt128 BigMul(ulong a, ulong b)
+        {
+            ulong high = BigMul(a, b, out ulong low);
+            return new UInt128(high, low);
+        }
+
+        public static Int128 BigMul(long a, long b)
+        {
+            long high = BigMul(a, b, out long low);
+            return new Int128((ulong)high, (ulong)low);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -7696,6 +8476,127 @@ namespace System
             // Remove the sign from x, and remove everything but the sign from y
             // Then, simply OR them to get the correct sign
             return BitConverter.UInt64BitsToDouble((xbits & ~double.SignMask) | (ybits & double.SignMask));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe (double Sin, double Cos) SinCos(double x)
+        {
+            double sin, cos;
+            SinCos(x, &sin, &cos);
+            return (sin, cos);
+        }
+        public static unsafe double Sin(double x)
+        {
+            double sin, cos;
+            SinCos(x, &sin, &cos);
+            return sin;
+        }
+
+        public static unsafe double Cos(double x)
+        {
+            double sin, cos;
+            SinCos(x, &sin, &cos);
+            return cos;
+        }
+
+        private static unsafe void SinCos(double x, double* sin, double* cos)
+        {
+            const ulong ExponentMask = 0x7FF0_0000_0000_0000UL;
+            const ulong AbsMask = 0x7FFF_FFFF_FFFF_FFFFUL;
+
+            ulong ux = BitConverter.DoubleToUInt64Bits(x);
+            // NaN and infinities
+            if ((ux & ExponentMask) == ExponentMask)
+            {
+                *sin = double.NaN;
+                *cos = double.NaN;
+                return;
+            }
+            // zero
+            if ((ux & AbsMask) == 0)
+            {
+                *sin = x;
+                *cos = 1.0;
+                return;
+            }
+
+            const double PiOver2 = 1.57079632679489661923132169163975144;
+            const double TwoPi = 6.28318530717958647692528676655900576;
+            const double TwoOverPi = 0.636619772367581343075535053490057448;
+
+            double y = x % TwoPi;
+            int q = (int)(y * TwoOverPi + (y >= 0.0 ? 0.5 : -0.5));
+            double r = y - (double)q * PiOver2;
+            double z = r * r;
+
+            double sr = r + r * z *
+            (
+                -1.66666666666666666666e-1 + z *
+                (
+                    8.33333333333333333322e-3 + z *
+                    (
+                        -1.98412698412698412550e-4 + z *
+                        (
+                            2.75573192239858906526e-6 + z *
+                            (
+                                -2.50521083854417187750e-8 + z *
+                                (
+                                    1.60590438368216145994e-10 + z *
+                                    (
+                                        -7.64716373181981647590e-13 + z * 2.81145725434552076320e-15
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            );
+
+            double cr = 1.0 + z *
+            (
+                -5.00000000000000000000e-1 + z *
+                (
+                    4.16666666666666666667e-2 + z *
+                    (
+                        -1.38888888888888888889e-3 + z *
+                        (
+                            2.48015873015873015873e-5 + z *
+                            (
+                                -2.75573192239858906526e-7 + z *
+                                (
+                                    2.08767569878680989792e-9 + z *
+                                    (
+                                        -1.14707455977297247139e-11 + z * 4.77947733238738525335e-14
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            );
+
+            switch (q & 3)
+            {
+                case 0:
+                    *sin = sr;
+                    *cos = cr;
+                    break;
+
+                case 1:
+                    *sin = cr;
+                    *cos = -sr;
+                    break;
+
+                case 2:
+                    *sin = -sr;
+                    *cos = -cr;
+                    break;
+
+                default:
+                    *sin = -cr;
+                    *cos = sr;
+                    break;
+            }
         }
 
         public static double Sqrt(double d)

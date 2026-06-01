@@ -4207,6 +4207,7 @@ namespace Cnidaria.Cs
                 : Accessibility.Internal;
             var isReadOnlyStruct = HasModifier(syntax.Modifiers, SyntaxKind.ReadOnlyKeyword);
             var isRefStruct = HasModifier(syntax.Modifiers, SyntaxKind.RefKeyword);
+            var isUnsafe = HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container);
             var isSealed = HasModifier(syntax.Modifiers, SyntaxKind.SealedKeyword);
             var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var declaredAcc = DecodeDeclaredAccessibility(
@@ -4258,7 +4259,8 @@ namespace Cnidaria.Cs
                         isFromMetadata: false,
                         isReadOnlyStruct: kind == TypeKind.Struct && isReadOnlyStruct,
                         isRefLikeType: kind == TypeKind.Struct && isRefStruct,
-                        isSealed: kind == TypeKind.Class && isSealed);
+                        isSealed: kind == TypeKind.Class && isSealed,
+                        isUnsafe: isUnsafe);
                     s.SetDefaultBaseType(GetDefaultBaseType(kind));
                     s.SetTypeParameters(DeclareTypeParameters(tree, s, typeParameterList));
                     type = s;
@@ -4291,6 +4293,8 @@ namespace Cnidaria.Cs
                 }
 
             }
+            if (isUnsafe && type is SourceNamedTypeSymbol unsafeSourceType)
+                unsafeSourceType.MarkUnsafe();
             if (kind == TypeKind.Class && isSealed)
             {
                 switch (type)
@@ -4439,7 +4443,7 @@ namespace Cnidaria.Cs
                 allowProtected: container is NamedTypeSymbol,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
-
+            var isUnsafe = HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container);
             NamedTypeSymbol type;
             if (!_typeCache.TryGetValue(key, out var existing))
             {
@@ -4449,7 +4453,8 @@ namespace Cnidaria.Cs
                     TypeKind.Delegate,
                     arity,
                     declaredAcc,
-                    isFromMetadata: false);
+                    isFromMetadata: false,
+                    isUnsafe: isUnsafe);
 
                 sourceType.SetDefaultBaseType(GetDefaultBaseType(TypeKind.Delegate));
                 sourceType.SetTypeParameters(DeclareTypeParameters(tree, sourceType, syntax.TypeParameterList));
@@ -4757,7 +4762,8 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
                 declaredAccessibility: declaredAcc,
                 isExtensionMethod: syntax.ParameterList.Parameters.Count != 0
-                    && HasModifier(syntax.ParameterList.Parameters[0].Modifiers, SyntaxKind.ThisKeyword));
+                    && HasModifier(syntax.ParameterList.Parameters[0].Modifiers, SyntaxKind.ThisKeyword),
+                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container));
 
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);
@@ -5166,7 +5172,8 @@ namespace Cnidaria.Cs
                 isConstructor: true,
                 isAsync: isAsync,
                 locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
-                declaredAccessibility: declaredAcc);
+                declaredAccessibility: declaredAcc,
+                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container));
             ctor.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
             var ps = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
             for (int i = 0; i < syntax.ParameterList.Parameters.Count; i++)
@@ -5512,7 +5519,7 @@ namespace Cnidaria.Cs
             bool isConst = HasModifier(syntax.Modifiers, SyntaxKind.ConstKeyword);
             bool isStatic = isConst || HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
             bool isReadOnly = !isConst && HasModifier(syntax.Modifiers, SyntaxKind.ReadOnlyKeyword);
-            bool isUnsafe = HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword);
+            bool isUnsafe = HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container);
             var typeDefaultAcc = container is NamedTypeSymbol
                 ? Accessibility.Private
                 : Accessibility.Internal;
@@ -5785,6 +5792,26 @@ namespace Cnidaria.Cs
         public abstract BoundStatement BindStatement(StatementSyntax node, BindingContext context, DiagnosticBag diagnostics);
 
         public abstract Symbol? GetDeclaredSymbol(SyntaxNode declaration);
+        internal static bool IsUnsafeContext(Symbol? symbol, BinderFlags flags = BinderFlags.None)
+        {
+            if ((flags & BinderFlags.UnsafeRegion) != 0)
+                return true;
+            for (Symbol? cur = symbol; cur is not null; cur = cur.ContainingSymbol)
+            {
+                switch (cur)
+                {
+                    case SourceNamedTypeSymbol type when type.IsUnsafe:
+                        return true;
+
+                    case SourceMethodSymbol method when method.IsUnsafe:
+                        return true;
+
+                    case SourceFieldSymbol field when field.IsUnsafe:
+                        return true;
+                }
+            }
+            return false;
+        }
         public virtual Symbol? BindNamespaceOrType(ExpressionSyntax expr, BindingContext context, DiagnosticBag diagnostics)
             => Parent?.BindNamespaceOrType(expr, context, diagnostics);
         internal virtual Imports GetImports(BindingContext context)
@@ -6101,7 +6128,7 @@ namespace Cnidaria.Cs
         }
         private TypeSymbol BindPointerType(PointerTypeSyntax p, BindingContext context, DiagnosticBag diagnostics)
         {
-            if ((Flags & BinderFlags.UnsafeRegion) == 0)
+            if (!IsUnsafeContext(context.ContainingSymbol, Flags))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_UNSAFE_TYPE001",
@@ -7361,7 +7388,7 @@ namespace Cnidaria.Cs
         }
         private bool EnsureUnsafe(SyntaxNode diagnosticNode, BindingContext context, DiagnosticBag diagnostics)
         {
-            if ((Flags & BinderFlags.UnsafeRegion) != 0)
+            if (IsUnsafeContext(context.ContainingSymbol, Flags))
                 return true;
 
             diagnostics.Add(new Diagnostic(
@@ -22369,7 +22396,7 @@ namespace Cnidaria.Cs
         {
             if (syntax is PointerTypeSyntax p)
             {
-                if ((Flags & BinderFlags.UnsafeRegion) == 0)
+                if (!IsUnsafeContext(context.ContainingSymbol, Flags))
                 {
                     diagnostics.Add(new Diagnostic(
                         "CN_UNSAFE_TYPE001",

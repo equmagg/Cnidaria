@@ -516,11 +516,6 @@ namespace Cnidaria.Cs
                         | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck,
                         addressOperandIndex: 0, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
 
-                case GenTreeKind.StackAlloc:
-                    return new LinearMemoryAccess(LinearMemoryAccessKind.StackAlloc, LinearMemoryAccessFlags.Write
-                        | LinearMemoryAccessFlags.Address, valueOperandIndex: 0,
-                        size: source.Int32 <= 0 ? TargetArchitecture.PointerSize : source.Int32, alignment: TargetArchitecture.PointerSize);
-
                 case GenTreeKind.PointerElementAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.PointerElement, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress, addressOperandIndex: 0, indexOperandIndex: 1,
@@ -618,7 +613,6 @@ namespace Cnidaria.Cs
                 GenTreeKind.StoreArrayElement => StoreArrayElementGeneralScratchCount(source),
                 GenTreeKind.PointerElementAddr => 1,
                 GenTreeKind.PointerDiff => 1,
-                GenTreeKind.StackAlloc => 1,
                 GenTreeKind.UnboxAny => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
                 GenTreeKind.Field => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
                 GenTreeKind.StaticField => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),

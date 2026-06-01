@@ -1004,6 +1004,7 @@ namespace Cnidaria.Cs
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
         private bool _isSealed;
+        private bool _isUnsafe;
         private readonly bool _isReadOnlyStruct;
         private readonly bool _isRefLikeType;
         private readonly int _arity;
@@ -1027,6 +1028,7 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         private readonly List<AttributeData> _attributes = new();
         public override bool IsSealed => _isSealed;
+        internal bool IsUnsafe => _isUnsafe;
         public override bool IsRefLikeType => _isRefLikeType;
         public override bool IsReadOnlyStruct => _isReadOnlyStruct;
         public override int Arity => _arity;
@@ -1057,6 +1059,7 @@ namespace Cnidaria.Cs
 
         public override TypeSymbol? EnumUnderlyingType => _enumUnderlyingTypeSet ? _enumUnderlyingType : null;
         internal void MarkSealed() => _isSealed = true;
+        internal void MarkUnsafe() => _isUnsafe = true;
         internal void SetEnumUnderlyingType(TypeSymbol underlyingType)
         {
             if (TypeKind != TypeKind.Enum)
@@ -1111,7 +1114,8 @@ namespace Cnidaria.Cs
             bool isFromMetadata = false,
             bool isReadOnlyStruct = false,
             bool isRefLikeType = false,
-            bool isSealed = false)
+            bool isSealed = false,
+            bool isUnsafe = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1124,6 +1128,7 @@ namespace Cnidaria.Cs
             _isReadOnlyStruct = isReadOnlyStruct;
             _isRefLikeType = isRefLikeType;
             _isSealed = isSealed;
+            _isUnsafe = isUnsafe;
         }
 
         public void AddDeclaration(SyntaxTree tree, SyntaxNode node)
@@ -1257,6 +1262,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => _declRefs.ToImmutableArray();
         private readonly bool _isExtensionMethod;
         public override bool IsExtensionMethod => _isExtensionMethod;
+        internal bool IsUnsafe { get; }
         public SourceMethodSymbol(
             string name,
             Symbol containing,
@@ -1267,7 +1273,8 @@ namespace Cnidaria.Cs
             bool isAsync,
             ImmutableArray<Location> locations,
             Accessibility declaredAccessibility = Accessibility.Public,
-            bool isExtensionMethod = false)
+            bool isExtensionMethod = false,
+            bool isUnsafe = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1277,6 +1284,7 @@ namespace Cnidaria.Cs
             IsConstructor = isConstructor;
             IsAsync = isAsync;
             _isExtensionMethod = isExtensionMethod;
+            IsUnsafe = isUnsafe;
             Locations = locations;
             DeclaredAccessibility = declaredAccessibility;
             _parameters = default;

@@ -729,16 +729,22 @@ namespace Cnidaria.Cs
             if (reduced.IsValid)
                 return reduced;
 
+            var normalizedArgs = NormalizePhiArgs(inputVNs);
             var key = (target, category, ValueNumberFunction.PhiDef);
             if (!_stableSsaPhis.TryGetValue(key, out var vn))
             {
                 int stableId = HashCode.Combine(StableIdFor(target), (int)category);
-                vn = Allocate(new ValueNumberEntry(ValueNumberKind.Phi, stackKind, type, default, ValueNumberFunction.PhiDef, NormalizePhiArgs(inputVNs), stableId));
+                vn = Allocate(new ValueNumberEntry(ValueNumberKind.Phi, stackKind, type, default, ValueNumberFunction.PhiDef, normalizedArgs, stableId));
                 _stableSsaPhis.Add(key, vn);
             }
             else
             {
-                _entries[vn.Id].SetArgs(NormalizePhiArgs(inputVNs));
+                var entry = _entries[vn.Id];
+                if (!SameArgs(entry.Args, normalizedArgs))
+                {
+                    entry.SetArgs(normalizedArgs);
+                    InvalidateMapSelectCache();
+                }
             }
             return vn;
         }
@@ -752,16 +758,22 @@ namespace Cnidaria.Cs
             if (reduced.IsValid)
                 return reduced;
 
+            var normalizedArgs = NormalizePhiArgs(inputVNs);
             var key = (blockId, memoryKind, ValueNumberFunction.PhiMemoryDef);
             if (!_stableMemoryPhis.TryGetValue(key, out var vn))
             {
                 int stableId = HashCode.Combine(blockId, memoryKind);
-                vn = Allocate(new ValueNumberEntry(ValueNumberKind.MemoryPhi, GenStackKind.Unknown, null, default, ValueNumberFunction.PhiMemoryDef, NormalizePhiArgs(inputVNs), stableId));
+                vn = Allocate(new ValueNumberEntry(ValueNumberKind.MemoryPhi, GenStackKind.Unknown, null, default, ValueNumberFunction.PhiMemoryDef, normalizedArgs, stableId));
                 _stableMemoryPhis.Add(key, vn);
             }
             else
             {
-                _entries[vn.Id].SetArgs(NormalizePhiArgs(inputVNs));
+                var entry = _entries[vn.Id];
+                if (!SameArgs(entry.Args, normalizedArgs))
+                {
+                    entry.SetArgs(normalizedArgs);
+                    InvalidateMapSelectCache();
+                }
             }
             return vn;
         }
@@ -1276,29 +1288,77 @@ namespace Cnidaria.Cs
             return inputVNs;
         }
 
+        private static bool SameArgs(ImmutableArray<ValueNumber> left, ImmutableArray<ValueNumber> right)
+        {
+            if (left.IsDefault)
+                left = ImmutableArray<ValueNumber>.Empty;
+            if (right.IsDefault)
+                right = ImmutableArray<ValueNumber>.Empty;
+            if (left.Length != right.Length)
+                return false;
+
+            for (int i = 0; i < left.Length; i++)
+            {
+                if (left[i] != right[i])
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void InvalidateMapSelectCache()
+        {
+            if (_mapSelectCache.Count != 0)
+                _mapSelectCache.Clear();
+        }
+
         private bool TryFold(ValueNumberFunction function, GenStackKind stackKind, RuntimeType? type, ImmutableArray<ValueNumber> args, out ValueNumber folded)
         {
             folded = NoVN;
 
-            if (args.Length == 1 && TryGetConstant(args[0], out var c0))
+            bool integerLike = IsIntegerLikeStackKind(stackKind);
+
+            if (args.Length == 1)
             {
-                switch (function)
+                if (TryGetConstant(args[0], out var const0))
                 {
-                    case ValueNumberFunction.Neg:
-                        if (c0.Kind == ValueNumberConstantKind.Int32) { folded = VNForInt32(unchecked(-(int)c0.A)); return true; }
-                        if (c0.Kind == ValueNumberConstantKind.Int64) { folded = VNForInt64(unchecked(-c0.A)); return true; }
-                        break;
-                    case ValueNumberFunction.Not:
-                        if (c0.Kind == ValueNumberConstantKind.Int32) { folded = VNForInt32(~(int)c0.A); return true; }
-                        if (c0.Kind == ValueNumberConstantKind.Int64) { folded = VNForInt64(~c0.A); return true; }
-                        break;
-                    case ValueNumberFunction.Conv:
-                        folded = FoldUncheckedIntegerConversion(stackKind, type, c0);
-                        return folded.IsValid;
+                    switch (function)
+                    {
+                        case ValueNumberFunction.Neg:
+                            if (!integerLike)
+                                break;
+                            if (const0.Kind == ValueNumberConstantKind.Int32) { folded = VNForInt32(unchecked(-(int)const0.A)); return true; }
+                            if (const0.Kind == ValueNumberConstantKind.Int64) { folded = VNForInt64(unchecked(-const0.A)); return true; }
+                            break;
+                        case ValueNumberFunction.Not:
+                            if (!integerLike)
+                                break;
+                            if (const0.Kind == ValueNumberConstantKind.Int32) { folded = VNForInt32(~(int)const0.A); return true; }
+                            if (const0.Kind == ValueNumberConstantKind.Int64) { folded = VNForInt64(~const0.A); return true; }
+                            break;
+                        case ValueNumberFunction.Conv:
+                            folded = FoldUncheckedIntegerConversion(stackKind, type, const0);
+                            return folded.IsValid;
+                    }
+                }
+
+                if (integerLike && TryGetEntry(args[0], out var unaryEntry) && unaryEntry.Args.Length == 1)
+                {
+                    if (function == ValueNumberFunction.Neg && unaryEntry.Function == ValueNumberFunction.Neg)
+                    {
+                        folded = unaryEntry.Args[0];
+                        return true;
+                    }
+
+                    if (function == ValueNumberFunction.Not && unaryEntry.Function == ValueNumberFunction.Not)
+                    {
+                        folded = unaryEntry.Args[0];
+                        return true;
+                    }
                 }
             }
 
-            if (args.Length == 2 && TryGetConstant(args[0], out c0) && TryGetConstant(args[1], out var c1))
+            if (args.Length == 2 && TryGetConstant(args[0], out var c0) && TryGetConstant(args[1], out var c1))
             {
                 if (TryFoldBinary(function, stackKind, c0, c1, out folded))
                     return true;
@@ -1310,34 +1370,68 @@ namespace Cnidaria.Cs
                 {
                     case ValueNumberFunction.Add:
                     case ValueNumberFunction.Or:
-                    case ValueNumberFunction.Xor:
+                        if (!integerLike)
+                            break;
                         if (IsZero(args[0])) { folded = args[1]; return true; }
                         if (IsZero(args[1])) { folded = args[0]; return true; }
+                        if (args[0] == args[1] && function == ValueNumberFunction.Or) { folded = args[0]; return true; }
+                        break;
+                    case ValueNumberFunction.Xor:
+                        if (!integerLike)
+                            break;
+                        if (IsZero(args[0])) { folded = args[1]; return true; }
+                        if (IsZero(args[1])) { folded = args[0]; return true; }
+                        if (args[0] == args[1]) { folded = ZeroForStackKind(stackKind); return true; }
                         break;
                     case ValueNumberFunction.Sub:
+                        if (!integerLike)
+                            break;
+                        if (IsZero(args[1])) { folded = args[0]; return true; }
+                        if (args[0] == args[1]) { folded = ZeroForStackKind(stackKind); return true; }
+                        break;
                     case ValueNumberFunction.Shl:
                     case ValueNumberFunction.Shr:
                     case ValueNumberFunction.ShrUn:
-                        if (IsZero(args[1])) { folded = args[0]; return true; }
+                        if (!integerLike)
+                            break;
+                        if (IsEffectiveZeroShift(args[1], stackKind)) { folded = args[0]; return true; }
                         break;
                     case ValueNumberFunction.Mul:
+                        if (!integerLike)
+                            break;
                         if (IsOne(args[0])) { folded = args[1]; return true; }
                         if (IsOne(args[1])) { folded = args[0]; return true; }
-                        if (IsZero(args[0]) || IsZero(args[1])) { folded = stackKind == GenStackKind.I8 ? VNForInt64(0) : VNForInt32(0); return true; }
+                        if (IsZero(args[0]) || IsZero(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
+                        break;
+                    case ValueNumberFunction.Div:
+                    case ValueNumberFunction.DivUn:
+                        if (!integerLike)
+                            break;
+                        if (IsOne(args[1])) { folded = args[0]; return true; }
+                        break;
+                    case ValueNumberFunction.Rem:
+                    case ValueNumberFunction.RemUn:
+                        if (!integerLike)
+                            break;
+                        if (IsOne(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
                         break;
                     case ValueNumberFunction.And:
+                        if (!integerLike)
+                            break;
                         if (IsAllBitsSet(args[0])) { folded = args[1]; return true; }
                         if (IsAllBitsSet(args[1])) { folded = args[0]; return true; }
-                        if (IsZero(args[0]) || IsZero(args[1])) { folded = stackKind == GenStackKind.I8 ? VNForInt64(0) : VNForInt32(0); return true; }
+                        if (IsZero(args[0]) || IsZero(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
+                        if (args[0] == args[1]) { folded = args[0]; return true; }
                         break;
                     case ValueNumberFunction.Ceq:
-                        if (args[0] == args[1]) { folded = VNForInt32(1); return true; }
+                        if (args[0] == args[1] && CanFoldSelfEquality(args[0])) { folded = VNForInt32(1); return true; }
+                        if (ConstantsKnownDistinct(args[0], args[1])) { folded = VNForInt32(0); return true; }
                         break;
                     case ValueNumberFunction.Clt:
                     case ValueNumberFunction.CltUn:
                     case ValueNumberFunction.Cgt:
                     case ValueNumberFunction.CgtUn:
-                        if (args[0] == args[1]) { folded = VNForInt32(0); return true; }
+                        if (args[0] == args[1] && CanFoldSelfOrdering(args[0])) { folded = VNForInt32(0); return true; }
                         break;
                 }
             }
@@ -1443,11 +1537,45 @@ namespace Cnidaria.Cs
             };
         }
 
+        private ValueNumber ZeroForStackKind(GenStackKind stackKind)
+            => Is64BitStackKind(stackKind) ? VNForInt64(0) : VNForInt32(0);
+
+        private static bool Is64BitStackKind(GenStackKind stackKind)
+            => stackKind == GenStackKind.I8 ||
+               ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) && TargetArchitecture.PointerSize == 8);
+
+        private static bool IsIntegerLikeStackKind(GenStackKind stackKind)
+            => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
+
+        private static bool IsReferenceLikeStackKind(GenStackKind stackKind)
+            => stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
+
+        private bool CanFoldSelfEquality(ValueNumber vn)
+        {
+            if (TryGetEntry(vn, out var entry))
+                return IsIntegerLikeStackKind(entry.StackKind) || IsReferenceLikeStackKind(entry.StackKind);
+
+            if (TryGetConstant(vn, out var c))
+                return IsIntegerConstant(c) || c.Kind == ValueNumberConstantKind.Null;
+
+            return false;
+        }
+
+        private bool CanFoldSelfOrdering(ValueNumber vn)
+        {
+            if (TryGetEntry(vn, out var entry))
+                return IsIntegerLikeStackKind(entry.StackKind);
+
+            if (TryGetConstant(vn, out var c))
+                return IsIntegerConstant(c);
+
+            return false;
+        }
+
         private bool IsZero(ValueNumber vn)
         {
             return TryGetConstant(vn, out var c) &&
-                   (c.Kind == ValueNumberConstantKind.Null ||
-                    c.Kind == ValueNumberConstantKind.Int32 && c.A == 0 ||
+                   (c.Kind == ValueNumberConstantKind.Int32 && c.A == 0 ||
                     c.Kind == ValueNumberConstantKind.Int64 && c.A == 0);
         }
 
@@ -1463,6 +1591,46 @@ namespace Cnidaria.Cs
             return TryGetConstant(vn, out var c) &&
                    (c.Kind == ValueNumberConstantKind.Int32 && (int)c.A == -1 ||
                     c.Kind == ValueNumberConstantKind.Int64 && c.A == -1);
+        }
+
+        private bool IsEffectiveZeroShift(ValueNumber vn, GenStackKind stackKind)
+        {
+            if (!TryGetConstant(vn, out var c) || !IsIntegerConstant(c))
+                return false;
+
+            int mask = stackKind == GenStackKind.I8 ? 0x3f : 0x1f;
+            return (((int)c.A) & mask) == 0;
+        }
+
+        private bool ConstantsKnownDistinct(ValueNumber left, ValueNumber right)
+        {
+            if (!TryGetConstant(left, out var l) || !TryGetConstant(right, out var r))
+                return false;
+
+            if (l.Kind != r.Kind)
+            {
+                if (IsIntegerConstant(l) && IsIntegerConstant(r))
+                    return l.A != r.A;
+                return false;
+            }
+
+            return l.Kind switch
+            {
+                ValueNumberConstantKind.Int32 => l.A != r.A,
+                ValueNumberConstantKind.Int64 => l.A != r.A,
+                ValueNumberConstantKind.Null => false,
+                ValueNumberConstantKind.String => !l.Equals(r),
+                ValueNumberConstantKind.TypeHandle => l.A != r.A,
+                ValueNumberConstantKind.CanonicalTypeHandle => l.A != r.A || l.B != r.B,
+                ValueNumberConstantKind.FieldHandle => l.A != r.A,
+                ValueNumberConstantKind.FieldSequence => !object.Equals(l.Object, r.Object),
+                ValueNumberConstantKind.MethodHandle => l.A != r.A,
+                ValueNumberConstantKind.SsaSlot => l.A != r.A || l.B != r.B,
+                ValueNumberConstantKind.PhysicalSelector => l.A != r.A || l.B != r.B,
+                ValueNumberConstantKind.ArrayElementClass => l.A != r.A || l.B != r.B,
+                ValueNumberConstantKind.Block => l.A != r.A,
+                _ => false,
+            };
         }
 
         private static bool IsIntegerConstant(ValueNumberConstantKey c)
@@ -2252,7 +2420,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.StaticFieldAddr:
                         return StaticFieldAddress(node, blockId);
                     case GenTreeKind.StackAlloc:
-                        return FuncWithException(node, ValueNumberFunction.StackAlloc, operands, _store.VNForInt32(node.Int32));
+                        return StackAlloc(node, operands);
                     case GenTreeKind.PointerElementAddr:
                         return Func(node, ValueNumberFunction.PointerElementAddr, operands, _store.VNForInt32(node.Int32));
                     case GenTreeKind.PointerToByRef:
@@ -2870,6 +3038,17 @@ namespace Cnidaria.Cs
                     _store.VNForFieldSequence(sequence),
                     _store.VNForInt32(0));
                 return ValueNumberPair.Same(vn);
+            }
+
+            private ValueNumberPair StackAlloc(GenTree node, ImmutableArray<ValueNumberPair> operands)
+            {
+                ValueNumber liberal = _store.VNForStableUnique(
+                    node.Id,
+                    node.StackKind,
+                    node.Type,
+                    ValueNumberFunction.StackAlloc,
+                    ArgsFromPairs(operands).Add(_store.VNForInt32(node.Int32)));
+                return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
             private ValueNumberPair Func(GenTree node, ValueNumberFunction function, ImmutableArray<ValueNumberPair> operands)

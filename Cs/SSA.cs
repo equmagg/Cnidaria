@@ -8586,15 +8586,25 @@ namespace Cnidaria.Cs
                 var operand = tree.Operands[0];
                 var fact = EvaluateTree(method, operand, facts);
 
-                if (tree.Source.SourceOp == BytecodeOp.Neg && IsZero(fact))
+                bool integerLike = IsIntegerLike(tree.Source.StackKind);
+
+                if (integerLike && tree.Source.SourceOp == BytecodeOp.Neg && IsZero(fact))
                 {
                     simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
                     return true;
                 }
 
-                if (tree.Source.SourceOp == BytecodeOp.Not && IsAllBitsSet(fact))
+                if (integerLike && tree.Source.SourceOp == BytecodeOp.Not && IsAllBitsSet(fact))
                 {
                     simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
+                    return true;
+                }
+
+                if (integerLike && operand.Kind == GenTreeKind.Unary && operand.Operands.Length == 1 &&
+                    operand.Source.SourceOp == tree.Source.SourceOp &&
+                    (tree.Source.SourceOp == BytecodeOp.Neg || tree.Source.SourceOp == BytecodeOp.Not))
+                {
+                    simplified = operand.Operands[0];
                     return true;
                 }
 
@@ -8633,40 +8643,44 @@ namespace Cnidaria.Cs
             {
                 simplified = null!;
 
-                if (!IsIntegerLike(tree.Source.StackKind) && tree.Source.StackKind is not (GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null))
-                    return false;
-
                 var left = tree.Operands[0];
                 var right = tree.Operands[1];
                 var leftFact = EvaluateTree(method, left, facts);
                 var rightFact = EvaluateTree(method, right, facts);
                 var op = tree.Source.SourceOp;
 
+                bool integerResult = IsIntegerLike(tree.Source.StackKind);
+                bool comparableOperands = CanFoldComparisonOperands(left.Source.StackKind, right.Source.StackKind);
+                bool orderedOperands = IsIntegerLike(left.Source.StackKind) && IsIntegerLike(right.Source.StackKind);
+
                 switch (op)
                 {
                     case BytecodeOp.Add:
+                        if (!integerResult) break;
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
                         break;
 
                     case BytecodeOp.Sub:
+                        if (!integerResult) break;
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
                     case BytecodeOp.Mul:
+                        if (!integerResult) break;
                         if (IsOne(rightFact)) { simplified = left; return true; }
                         if (IsOne(leftFact)) { simplified = right; return true; }
                         if (IsZero(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         if (IsZero(leftFact) && !HasObservableEffect(right))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(rightFact, out int rightShift))
+                        if (TryGetPositivePowerOfTwoShift(rightFact, out int rightShift))
                         {
                             simplified = CreateShiftLeftSsaTree(tree.Source, left, rightShift);
                             return true;
                         }
-                        if (IsIntegerLike(tree.Source.StackKind) && TryGetPositivePowerOfTwoShift(leftFact, out int leftShift))
+                        if (TryGetPositivePowerOfTwoShift(leftFact, out int leftShift))
                         {
                             simplified = CreateShiftLeftSsaTree(tree.Source, right, leftShift);
                             return true;
@@ -8675,16 +8689,19 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Div:
                     case BytecodeOp.Div_Un:
+                        if (!integerResult) break;
                         if (IsOne(rightFact)) { simplified = left; return true; }
                         break;
 
                     case BytecodeOp.Rem:
                     case BytecodeOp.Rem_Un:
+                        if (!integerResult) break;
                         if (IsOne(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         break;
 
                     case BytecodeOp.And:
+                        if (!integerResult) break;
                         if (IsZero(rightFact) && !HasObservableEffect(left))
                         { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
                         if (IsZero(leftFact) && !HasObservableEffect(right))
@@ -8695,6 +8712,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Or:
+                        if (!integerResult) break;
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
                         if (IsAllBitsSet(rightFact) && !HasObservableEffect(left))
@@ -8705,6 +8723,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BytecodeOp.Xor:
+                        if (!integerResult) break;
                         if (IsZero(rightFact)) { simplified = left; return true; }
                         if (IsZero(leftFact)) { simplified = right; return true; }
                         if (SameValue(method, left, right, facts))
@@ -8714,11 +8733,12 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Shl:
                     case BytecodeOp.Shr:
                     case BytecodeOp.Shr_Un:
-                        if (IsZero(rightFact)) { simplified = left; return true; }
+                        if (!integerResult) break;
+                        if (IsEffectiveZeroShift(rightFact, tree.Source.StackKind)) { simplified = left; return true; }
                         break;
 
                     case BytecodeOp.Ceq:
-                        if (SameValue(method, left, right, facts))
+                        if (comparableOperands && SameValue(method, left, right, facts))
                         { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
                         break;
 
@@ -8726,7 +8746,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Clt_Un:
                     case BytecodeOp.Cgt:
                     case BytecodeOp.Cgt_Un:
-                        if (SameValue(method, left, right, facts))
+                        if (orderedOperands && SameValue(method, left, right, facts))
                         { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
                         break;
                 }
@@ -8776,8 +8796,7 @@ namespace Cnidaria.Cs
             private static bool IsZero(ValueFact fact)
                 => fact.Kind == ValueFactKind.Constant &&
                    (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == 0 ||
-                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 0 ||
-                    fact.Constant.Kind == ConstKind.Null);
+                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 0);
 
             private static bool IsOne(ValueFact fact)
                 => fact.Kind == ValueFactKind.Constant &&
@@ -8805,6 +8824,19 @@ namespace Cnidaria.Cs
                 while ((value >>= 1) != 0)
                     shift++;
                 return true;
+            }
+
+            private static bool IsEffectiveZeroShift(ValueFact fact, GenStackKind stackKind)
+            {
+                if (fact.Kind != ValueFactKind.Constant || fact.Constant.Kind == ConstKind.Null)
+                    return false;
+
+                int mask = stackKind == GenStackKind.I8 ? 0x3f : 0x1f;
+                int amount = fact.Constant.Kind == ConstKind.I8
+                    ? unchecked((int)fact.Constant.I8)
+                    : fact.Constant.I4;
+
+                return (amount & mask) == 0;
             }
 
             private static ConstValue ZeroFor(GenTree template)
@@ -8889,6 +8921,20 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
+
+            private static bool CanFoldComparisonOperands(GenStackKind left, GenStackKind right)
+            {
+                if (left is GenStackKind.R4 or GenStackKind.R8 || right is GenStackKind.R4 or GenStackKind.R8)
+                    return false;
+
+                if (IsIntegerLike(left) && IsIntegerLike(right))
+                    return true;
+
+                return IsReferenceLike(left) && IsReferenceLike(right);
+            }
+
+            private static bool IsReferenceLike(GenStackKind stackKind)
+                => stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
 
             private static bool IsIntegerLike(GenStackKind stackKind)
                 => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
