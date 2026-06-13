@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
+using System.Xml.Linq;
 
 namespace Cnidaria.Cs
 {
@@ -3552,7 +3553,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < program.Methods.Length; i++)
                 methods.Add(AllocateMethod(program.Methods[i], options));
 
-            return new GenTreeProgram(methods.ToImmutable());
+            return new GenTreeProgram(program.TypeSystem, methods.ToImmutable());
         }
 
         public static GenTreeMethod AllocateMethod(GenTreeMethod method, RegisterAllocatorOptions? options = null)
@@ -6976,6 +6977,7 @@ namespace Cnidaria.Cs
                 var registerMoves = new List<RegisterResolvedMove>();
                 var stackMoves = new List<RegisterResolvedMove>();
                 bool valueTypeNewObject = node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == true;
+                bool referenceTypeNewObject = node.Kind == GenTreeKind.NewObject && !valueTypeNewObject;
                 var descriptor = MachineAbi.BuildCallDescriptor(node.RegisterUses, _method.GetValueInfo, node.RegisterResult, node.Method, node.Kind == GenTreeKind.NewObject);
 
                 RegisterOperand finalResult = RegisterOperand.None;
@@ -6991,13 +6993,16 @@ namespace Cnidaria.Cs
                     resultValueOpt = resultValue;
                     finalResult = HomeForDefinition(resultValue, definitionPosition);
                     if (finalResult.IsNone &&
-                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || valueTypeNewObject))
+                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || valueTypeNewObject || referenceTypeNewObject))
                     {
+                        int homeSize = referenceTypeNewObject
+                            ? TargetArchitecture.PointerSize
+                            : Math.Max(MachineAbi.StackArgumentSlotSize, Math.Max(1, resultAbi.Size));
                         finalResult = RegisterOperand.ForSpillSlot(
                             RegisterClass.General,
                             _nextSpillSlot++,
                             0,
-                            Math.Max(MachineAbi.StackArgumentSlotSize, Math.Max(1, resultAbi.Size)));
+                            homeSize);
                     }
 
                     if (valueTypeNewObject)
@@ -7014,6 +7019,13 @@ namespace Cnidaria.Cs
                         {
                             callResult = RegisterOperand.None;
                             nodeResultValue = null;
+                        }
+                        else if (referenceTypeNewObject)
+                        {
+                            callResult = finalResult.IsFrameSlot
+                                ? finalResult
+                                : RegisterOperand.ForSpillSlot(RegisterClass.General, _nextSpillSlot++, 0, TargetArchitecture.PointerSize);
+                            nodeResultValue = resultValue;
                         }
                         else if (resultAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
                         {
@@ -7035,11 +7047,6 @@ namespace Cnidaria.Cs
                             callResult = finalResult;
                             nodeResultValue = resultValue;
                         }
-                    }
-                    else if (RequiresCallLikeCodegenResultOperand(node, resultAbi))
-                    {
-                        callResult = RegisterOperand.ForRegister(GetCallLikeScratchResultRegister(resultAbi));
-                        nodeResultValue = resultValue;
                     }
                 }
 
@@ -7673,24 +7680,6 @@ namespace Cnidaria.Cs
                 };
             }
 
-
-            private static bool RequiresCallLikeCodegenResultOperand(GenTree node, AbiValueInfo abi)
-            {
-                if (node.RegisterResult is null)
-                    return false;
-
-                return node.Kind == GenTreeKind.NewObject &&
-                       node.Method?.DeclaringType.IsValueType != true &&
-                       abi.PassingKind == AbiValuePassingKind.ScalarRegister;
-            }
-
-            private static MachineRegister GetCallLikeScratchResultRegister(AbiValueInfo abi)
-            {
-                if (abi.RegisterClass == RegisterClass.Float)
-                    return MachineRegisters.FloatBackendScratch;
-
-                return MachineRegisters.BackendScratch;
-            }
 
             private static bool RequiresCodegenRegisterDefinition(GenTree node, AbiValueInfo abi)
             {
@@ -9745,7 +9734,13 @@ namespace Cnidaria.Cs
             public MethodBuilder(RegisterAllocatedMethod method)
             {
                 _method = method;
-                _nextNodeId = ComputeNextNodeId(method);
+                int max = -1;
+                for (int i = 0; i < method.LinearNodes.Length; i++)
+                {
+                    if (method.LinearNodes[i].Id > max)
+                        max = method.LinearNodes[i].Id;
+                }
+                _nextNodeId = checked(max + 1);
             }
 
             public RegisterAllocatedMethod Run()
@@ -9767,12 +9762,13 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < sourceBlock.LinearNodes.Length; i++)
                     {
                         var node = sourceBlock.LinearNodes[i];
-                        if (IsReturn(node))
+                        if (node.Kind == GenTreeKind.Return)
                         {
                             node = NormalizeReturnOperand(sourceBlock.Id, node, blockLinearNodes);
-                            AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
+                            if (!ReturnMustRunFinallyBeforeMethodExit(sourceBlock.Id))
+                                AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
                         }
-                        else if (IsFuncletExit(node))
+                        else if (node.Kind == GenTreeKind.EndFinally)
                         {
                             AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
                         }
@@ -10957,11 +10953,21 @@ namespace Cnidaria.Cs
                 return 0;
             }
 
-            private static bool IsFuncletExit(GenTree node)
-                => node.Kind == GenTreeKind.EndFinally;
-
-            private static bool IsReturn(GenTree node)
-                => node.Kind == GenTreeKind.Return;
+            private bool ReturnMustRunFinallyBeforeMethodExit(int blockId)
+            {
+                var regions = _method.GenTreeMethod.Cfg.ExceptionRegions;
+                for (int i = 0; i < regions.Length; i++)
+                {
+                    var region = regions[i];
+                    if (region.Kind == CfgExceptionRegionKind.Finally &&
+                        blockId >= region.TryStartBlockId &&
+                        blockId < region.TryEndBlockIdExclusive)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
 
             private static ImmutableArray<GenTree> NormalizeOrdinals(ImmutableArray<GenTree> nodes)
             {
@@ -11009,7 +11015,7 @@ namespace Cnidaria.Cs
                 int result = 0;
                 for (int i = 0; i < block.LinearNodes.Length; i++)
                 {
-                    if (IsReturn(block.LinearNodes[i]))
+                    if (block.LinearNodes[i].Kind == GenTreeKind.Return)
                     {
                         result += perReturn;
                         if (block.LinearNodes[i].Uses.Length != 0)
@@ -11017,18 +11023,6 @@ namespace Cnidaria.Cs
                     }
                 }
                 return result;
-            }
-
-            private static int ComputeNextNodeId(RegisterAllocatedMethod method)
-            {
-                int max = -1;
-                for (int i = 0; i < method.LinearNodes.Length; i++)
-                {
-                    if (method.LinearNodes[i].Id > max)
-                        max = method.LinearNodes[i].Id;
-                }
-
-                return checked(max + 1);
             }
         }
     }
@@ -13340,7 +13334,8 @@ namespace Cnidaria.Cs
                     if (node.Kind == GenTreeKind.Return)
                     {
                         sawReturn = true;
-                        if (!HasContiguousEpilogBefore(block.LinearNodes, i))
+                        if (!HasContiguousEpilogBefore(block.LinearNodes, i) &&
+                            !ReturnMustRunFinallyBeforeMethodExit(method, block.Id))
                             throw new InvalidOperationException("Return node is missing an immediately preceding epilog sequence.");
                     }
                 }
@@ -13360,6 +13355,21 @@ namespace Cnidaria.Cs
                 i--;
 
             return true;
+        }
+        private static bool ReturnMustRunFinallyBeforeMethodExit(RegisterAllocatedMethod method, int blockId)
+        {
+            var regions = method.GenTreeMethod.Cfg.ExceptionRegions;
+            for (int i = 0; i < regions.Length; i++)
+            {
+                var region = regions[i];
+                if (region.Kind == CfgExceptionRegionKind.Finally &&
+                    blockId >= region.TryStartBlockId &&
+                    blockId < region.TryEndBlockIdExclusive)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
         private static bool IsPrologFrameNode(GenTree node)
             => node.Kind == GenTreeKind.StackFrameOp && IsPrologFrameOperation(node.FrameOperation);
@@ -13977,12 +13987,12 @@ namespace Cnidaria.Cs
                         if (node.RegisterResults.Length != 1 || !node.RegisterResults[0].Equals(node.RegisterResult))
                             throw new InvalidOperationException("Scalar call-like result must preserve its linear IR result metadata.");
                         if (node.Results.Length != 1)
-                            throw new InvalidOperationException("Scalar call-like result must have exactly one register result operand.");
+                            throw new InvalidOperationException("Scalar call-like result must have exactly one result operand.");
 
                         if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType != true)
                         {
-                            if (!node.Results[0].IsRegister)
-                                throw new InvalidOperationException("Reference newobj result must be a register result operand.");
+                            if (!node.Results[0].IsFrameSlot)
+                                throw new InvalidOperationException("Reference newobj result must be a frame home that preserves the object across the constructor call.");
                         }
                         else
                         {

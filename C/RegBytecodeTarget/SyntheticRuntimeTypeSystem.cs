@@ -10,16 +10,18 @@ namespace Cnidaria.C
     {
         public RuntimeTypeSystem RuntimeTypes { get; }
         public Dictionary<string, RuntimeModule> Modules { get; }
-        public RuntimeMethod EntryMethod { get; }
+        public int EntryPc { get; }
 
         public RegisterBytecodeSyntheticRuntime(
             RuntimeTypeSystem runtimeTypes,
             Dictionary<string, RuntimeModule> modules,
-            RuntimeMethod entryMethod)
+            int entryPc)
         {
             RuntimeTypes = runtimeTypes ?? throw new ArgumentNullException(nameof(runtimeTypes));
             Modules = modules ?? throw new ArgumentNullException(nameof(modules));
-            EntryMethod = entryMethod ?? throw new ArgumentNullException(nameof(entryMethod));
+            if (entryPc < 0)
+                throw new ArgumentOutOfRangeException(nameof(entryPc));
+            EntryPc = entryPc;
         }
     }
     internal sealed class MinimalCRuntimeMetadataView : IMetadataView

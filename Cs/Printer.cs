@@ -869,6 +869,7 @@ namespace Cnidaria.Cs
                     BoundArrayInitializerExpression => "BoundArrayInitializerExpression",
                     BoundArrayCreationExpression => "BoundArrayCreationExpression",
                     BoundArrayElementAccessExpression => "BoundArrayElementAccessExpression",
+                    BoundInlineArrayElementAccessExpression => "BoundInlineArrayElementAccessExpression",
                     BoundStackAllocArrayCreationExpression => "BoundStackAllocArrayCreationExpression",
                     BoundRefExpression => "BoundRefExpression",
                     BoundAddressOfExpression => "BoundAddressOfExpression",
@@ -1066,6 +1067,12 @@ namespace Cnidaria.Cs
                                 list.Add(new Child($"Indices[{i}]", aea.Indices[i]));
                             return list.ToArray();
                         }
+                    case BoundInlineArrayElementAccessExpression iae:
+                        return new[]
+                        {
+                            new Child("Receiver", iae.Receiver),
+                            new Child("Index", iae.Index)
+                        };
                     case BoundStackAllocArrayCreationExpression sa:
                         {
                             var list = new List<Child>(2);
@@ -1361,6 +1368,9 @@ namespace Cnidaria.Cs
 
                     case BoundArrayElementAccessExpression aea:
                         return $"Rank={aea.Indices.Length}, IsLValue={(aea.IsLValue ? "true" : "false")}";
+
+                    case BoundInlineArrayElementAccessExpression iae:
+                        return $"Field={FormatSymbol(iae.ElementField)}, Length={iae.Length}, IsLValue={(iae.IsLValue ? "true" : "false")}";
 
                     case BoundNullCoalescingAssignmentExpression:
                         return "Operator=??=";

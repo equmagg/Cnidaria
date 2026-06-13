@@ -33,7 +33,6 @@ namespace Cnidaria.Cs
             None,
             Leave,
             Throw,
-            MulticastDelegate,
             ReturnVoid,
             ReturnInteger,
             ReturnFloat,
@@ -67,38 +66,20 @@ namespace Cnidaria.Cs
         private const int StringCharsOffset = ObjectHeaderSize + 4;
         private const int MaxCallFramesHard = 4096;
 
-        private const int ShadowFrameSize = 88;
+        private const int ShadowFrameSize = 64;
         private const int ShadowFrameCallerSp = 0;
         private const int ShadowFrameCallerFp = 8;
-        private const int ShadowFrameContinuationI0 = 16;
-        private const int ShadowFrameContinuationF0 = 24;
-        private const int ShadowFrameAllocaSp = 32;
-        private const int ShadowFrameIncomingStackArgBase = 40;
-        private const int ShadowFramePostReturnObjectRef = 48;
-        private const int ShadowFrameMethodIndex = 56;
-        private const int ShadowFrameReturnPc = 60;
-        private const int ShadowFrameCallerMethodIndex = 64;
-        private const int ShadowFrameContinuationTargetPc = 68;
-        private const int ShadowFramePackedFlags = 72;
-        private const int ShadowFrameIncomingTargetMethodId = 76;
-        private const int ShadowFrameRegisterSnapshotIndex = 80;
-        private const int ShadowFrameSafePointPc = 84;
+        private const int ShadowFrameAllocaSp = 16;
+        private const int ShadowFrameIncomingStackArgBase = 24;
+        private const int ShadowFrameMethodIndex = 32;
+        private const int ShadowFrameReturnPc = 36;
+        private const int ShadowFrameContinuationI0 = 40;
+        private const int ShadowFrameContinuationTargetPc = 48;
+        private const int ShadowFramePackedFlags = 52;
+        private const int ShadowFrameRegisterSnapshotIndex = 56;
+        private const int ShadowFrameSafePointPc = 60;
         private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
         private const int ShadowFrameContinuationKindShift = 16;
-        private const int ShadowFramePostReturnRegisterShift = 24;
-
-        private const int McInvokeMethodIdOffset = 0;
-        private const int McNextIndexOffset = 4;
-        private const int McCountOffset = 8;
-        private const int McCallFlagsOffset = 12;
-        private const int McDelegateRefOffset = 16;
-        private const int McHiddenReturnBufferOffset = 24;
-        private const int McArgCountOffset = 32;
-        private const int McArgRecordsOffset = 40;
-        private const int McArgRecordSize = 12;
-        private const int McArgTypeIdOffset = 0;
-        private const int McArgSizeOffset = 4;
-        private const int McArgDataRelOffset = 8;
 
         private readonly byte[] _mem;
         private readonly int _staticEnd;
@@ -224,18 +205,20 @@ namespace Cnidaria.Cs
             _fieldById = new Dictionary<int, RuntimeField>();
         }
 
-        public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits)
+        public void Execute(int entryPc, CancellationToken ct, ExecutionLimits limits, ReadOnlySpan<VmValue> initialArgs = default)
         {
-            Execute(entryMethod, ct, limits, default);
-        }
-
-        public void Execute(RuntimeMethod entryMethod, CancellationToken ct, ExecutionLimits limits, ReadOnlySpan<VmValue> initialArgs)
-        {
-            if (entryMethod is null) throw new ArgumentNullException(nameof(entryMethod));
             if (limits is null) throw new ArgumentNullException(nameof(limits));
+            if (!_image.MethodIndexByEntryPc.TryGetValue(entryPc, out int entryIndex))
+                throw new MissingMethodException($"Entry PC is not present in register code image: {entryPc}");
 
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(entryMethod.MethodId, out int entryIndex))
-                throw new MissingMethodException("Entry method is not present in register code image: M" + entryMethod.MethodId);
+            MethodRecord entryRecord = _image.Methods[entryIndex];
+            RuntimeMethod? entryRuntimeMethod = null;
+            if (initialArgs.Length != 0)
+            {
+                if (entryRecord.RuntimeMethodId < 0)
+                    throw new MissingMethodException($"Entry method has no runtime method id for entry argument marshalling at PC {entryPc}");
+                entryRuntimeMethod = _rts.GetMethodById(entryRecord.RuntimeMethodId);
+            }
 
             _fuel = limits.MaxInstructions;
             _tick = 0;
@@ -263,31 +246,31 @@ namespace Cnidaria.Cs
             X(MachineRegisters.ThreadPointer, 0);
             X(MachineRegisters.ReturnAddress, -1);
 
-            int incomingStackArgBase = PrepareEntryArguments(entryMethod, initialArgs);
+            int incomingStackArgBase = PrepareEntryArguments(entryRuntimeMethod, initialArgs);
 
-            _pc = _image.Methods[entryIndex].EntryPc;
+            _pc = entryRecord.EntryPc;
             _currentMethodIndex = entryIndex;
             PushFrame(
                 entryIndex,
                 -1,
-                -1,
                 X(MachineRegisters.StackPointer),
                 X(MachineRegisters.FramePointer),
                 CallFlags.None,
-                entryMethod.MethodId,
                 incomingStackArgBase);
             X(MachineRegisters.ThreadPointer, incomingStackArgBase);
 
             Run(ct, limits);
         }
 
-        private int PrepareEntryArguments(RuntimeMethod method, ReadOnlySpan<VmValue> initialArgs)
+        private int PrepareEntryArguments(RuntimeMethod? method, ReadOnlySpan<VmValue> initialArgs)
         {
             if (initialArgs.Length == 0)
                 return 0;
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
             if (method.HasThis)
                 throw new InvalidOperationException("Instance entrypoints are not supported by the register VM entry adapter.");
-            if (initialArgs.Length != method.ParameterTypes.Length)
+            if (initialArgs.Length != LogicalArgumentCount(method))
                 throw new InvalidOperationException("Initial argument count does not match entrypoint signature.");
 
             int stackAreaSize = ComputeEntryArgumentStackAreaSize(method);
@@ -311,8 +294,9 @@ namespace Cnidaria.Cs
 
         private int ComputeEntryArgumentStackAreaSize(RuntimeMethod method)
         {
+            int argumentCount = LogicalArgumentCount(method);
             int max = 0;
-            for (int i = 0; i < method.ParameterTypes.Length; i++)
+            for (int i = 0; i < argumentCount; i++)
             {
                 var slices = GetAbiArgumentSlices(method, i);
                 for (int s = 0; s < slices.Length; s++)
@@ -327,19 +311,22 @@ namespace Cnidaria.Cs
 
         private void WriteEntryArgument(RuntimeMethod method, int logicalIndex, VmValue value, int incomingStackArgBase)
         {
-            RuntimeType type = method.ParameterTypes[logicalIndex];
-            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
-            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            int argumentCount = LogicalArgumentCount(method);
+            if ((uint)logicalIndex >= (uint)argumentCount)
+                throw new ArgumentOutOfRangeException(nameof(logicalIndex));
 
-            if (abi.PassingKind == AbiValuePassingKind.Void || slices.Length == 0)
+            RuntimeType argType = GetLogicalArgumentType(method, logicalIndex);
+            TypeLayoutRecord type = TypeLayout(TypeLayoutIndexForRuntimeType(argType));
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            if (slices.Length == 0)
                 return;
 
-            if (abi.PassingKind != AbiValuePassingKind.ScalarRegister)
+            if (slices.Length != 1 || !IsSingleScalarAbiArgument(type, slices[0]))
             {
                 if (value.Kind == VmValueKind.Value)
                 {
                     int source = checked((int)value.Payload);
-                    int size = value.Aux != 0 ? value.Aux : StorageSizeOf(type);
+                    int size = value.Aux != 0 ? value.Aux : type.Size;
                     for (int i = 0; i < slices.Length; i++)
                     {
                         AbiArgumentSlice slice = slices[i];
@@ -349,11 +336,11 @@ namespace Cnidaria.Cs
 
                         if (slice.Location.IsRegister)
                         {
-                            long bits = ReadRawBits(checked(source + slice.Offset), count);
+                            long rawBits = ReadRawBits(checked(source + slice.Offset), count);
                             if (slice.RegisterClass == RegisterClass.Float)
-                                SetFpr((byte)slice.Location.Register, bits);
+                                SetFpr((byte)slice.Location.Register, rawBits);
                             else
-                                SetGpr(slice.Location.Register, bits);
+                                SetGpr(slice.Location.Register, rawBits);
                         }
                         else
                         {
@@ -369,59 +356,38 @@ namespace Cnidaria.Cs
                 throw new NotSupportedException("Only scalar and address-like entry arguments are supported by the register VM entry adapter.");
             }
 
-            if (slices.Length != 1)
-                throw new InvalidOperationException("Scalar ABI argument unexpectedly has multiple slices.");
-
             AbiArgumentSlice scalar = slices[0];
+            long bits = ConvertEntryArgumentToAbiBits(type, value, scalar.Size, scalar.RegisterClass);
+            if (scalar.Location.IsRegister)
             {
-                long bits = ConvertEntryArgumentToAbiBits(type, value, scalar.Size);
-                if (scalar.Location.IsRegister)
-                {
-                    if (scalar.RegisterClass == RegisterClass.Float)
-                        SetFpr((byte)scalar.Location.Register, bits);
-                    else
-                        SetGpr(scalar.Location.Register, bits);
-                }
+                if (scalar.RegisterClass == RegisterClass.Float)
+                    SetFpr((byte)scalar.Location.Register, bits);
                 else
-                {
-                    if (incomingStackArgBase == 0)
-                        throw new InvalidOperationException("Entry stack argument area was not allocated.");
-                    int target = checked(incomingStackArgBase + scalar.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + scalar.Location.StackOffset);
-                    WriteRawBits(target, bits, scalar.Size);
-                }
+                    SetGpr(scalar.Location.Register, bits);
+            }
+            else
+            {
+                if (incomingStackArgBase == 0)
+                    throw new InvalidOperationException("Entry stack argument area was not allocated.");
+                int target = checked(incomingStackArgBase + scalar.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + scalar.Location.StackOffset);
+                WriteRawBits(target, bits, scalar.Size);
             }
         }
 
-        private long ConvertEntryArgumentToAbiBits(RuntimeType type, VmValue value, int size)
+        private static bool IsSingleScalarAbiArgument(TypeLayoutRecord type, AbiArgumentSlice slice)
+            => slice.Offset == 0 && slice.Size <= Math.Max(type.Size, TargetArchitecture.PointerSize);
+
+        private static long ConvertEntryArgumentToAbiBits(TypeLayoutRecord type, VmValue value, int size, RegisterClass registerClass)
         {
-            if (type.IsReferenceType || type.Kind == RuntimeTypeKind.Pointer || type.Kind == RuntimeTypeKind.ByRef)
+            if (type.IsReferenceType || type.IsPointerLike)
                 return value.Kind == VmValueKind.Null ? 0 : value.Payload;
 
-
-            if (type.Namespace == "System")
+            if (registerClass == RegisterClass.Float)
             {
-                switch (type.Name)
-                {
-                    case "Single":
-                        return unchecked((uint)BitConverter.SingleToInt32Bits((float)value.AsDouble()));
-                    case "Double":
-                        return BitConverter.DoubleToInt64Bits(value.AsDouble());
-                    case "Boolean":
-                        return value.AsBool() ? 1 : 0;
-                    case "Char":
-                    case "SByte":
-                    case "Byte":
-                    case "Int16":
-                    case "UInt16":
-                    case "Int32":
-                    case "UInt32":
-                        return unchecked((uint)value.AsInt32());
-                    case "Int64":
-                    case "UInt64":
-                    case "IntPtr":
-                    case "UIntPtr":
-                        return value.AsInt64();
-                }
+                double number = value.AsDouble();
+                return size <= 4
+                    ? unchecked((uint)BitConverter.SingleToInt32Bits((float)number))
+                    : BitConverter.DoubleToInt64Bits(number);
             }
 
             if (value.Kind == VmValueKind.I4 || size <= 4)
@@ -429,7 +395,7 @@ namespace Cnidaria.Cs
             if (value.Kind == VmValueKind.I8)
                 return value.AsInt64();
 
-            throw new NotSupportedException("Unsupported register VM entry argument type: " + type.Namespace + "." + type.Name);
+            throw new NotSupportedException($"Unsupported register VM entry argument layout: typeId={type.RuntimeTypeId}, size={size}");
         }
 
         private void Run(CancellationToken ct, ExecutionLimits limits)
@@ -454,7 +420,7 @@ namespace Cnidaria.Cs
                 _pc = executingPc + 1;
                 _currentSafePointPc = executingPc;
 
-                if ((IsStaticFieldInstruction(ins.Op) || ins.Op == Op.NewObj) &&
+                if ((ins.Op == Op.LiStaticBase || ins.Op == Op.AllocObj) &&
                     TryDeferRequiredTypeInitializationBeforeInstruction(ins, executingPc, ct, limits))
                     continue;
 
@@ -856,57 +822,49 @@ namespace Cnidaria.Cs
                     case Op.WriteBarrier:
                         break;
                     case Op.LdFldAddr:
-                        SetGpr(ins.Rd, GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), writable: false));
+                        SetGpr(ins.Rd, GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), writable: false));
                         break;
                     case Op.LdFldI1: LoadFieldInt(ins, 1, signed: true); break;
                     case Op.LdFldU1: LoadFieldInt(ins, 1, signed: false); break;
                     case Op.LdFldI2: LoadFieldInt(ins, 2, signed: true); break;
                     case Op.LdFldU2: LoadFieldInt(ins, 2, signed: false); break;
-                    case Op.LdFldI4: SetI32(ins.Rd, ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                    case Op.LdFldU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldI4: SetI32(ins.Rd, ReadI32Unchecked(GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false))); break;
                     case Op.LdFldI8:
                     case Op.LdFldN:
                     case Op.LdFldRef:
                     case Op.LdFldPtr:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false);
                             SetGpr(ins.Rd, ins.Op == Op.LdFldI8 ? ReadI64Unchecked(abs) : ReadNativeUnchecked(abs));
                         }
                         break;
-                    case Op.LdFldF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
-                    case Op.LdFldF64: SetFpr(ins.Rd, ReadI64Unchecked(GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false))); break;
+                    case Op.LdFldF64: SetFpr(ins.Rd, ReadI64Unchecked(GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false))); break;
                     case Op.LdFldObj:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            CopyBlock(GetAddress(ins.Rd), GetInstanceFieldAddress(field, GetGpr(ins.Rs1), false), field.Size);
-                        }
+                        CopyBlock(GetAddress(ins.Rd), GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false), InstrDesc.FieldSize(ins.Imm));
                         break;
                     case Op.StFldI1:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
                         }
                         break;
                     case Op.StFldI2:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
                         }
                         break;
                     case Op.StFldI4:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
                         }
                         break;
                     case Op.StFldI8:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteI64Unchecked(abs, GetGpr(ins.Rd));
                         }
                         break;
@@ -914,125 +872,24 @@ namespace Cnidaria.Cs
                     case Op.StFldRef:
                     case Op.StFldPtr:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteNativeUnchecked(abs, GetGpr(ins.Rd));
                         }
                         break;
                     case Op.StFldF32:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
                         }
                         break;
                     case Op.StFldF64:
                         {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
+                            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true);
                             WriteI64Unchecked(abs, GetFpr(ins.Rd));
                         }
                         break;
                     case Op.StFldObj:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetInstanceFieldAddress(field, GetGpr(ins.Rs1), true);
-                            CopyBlock(abs, GetAddress(ins.Rd), field.Size);
-                        }
-                        break;
-
-                    case Op.LdSFldAddr:
-                        SetGpr(ins.Rd, GetStaticFieldAddress(FieldLayout(ins.Imm)));
-                        break;
-                    case Op.LdSFldI1: LoadStaticFieldInt(ins, 1, signed: true); break;
-                    case Op.LdSFldU1: LoadStaticFieldInt(ins, 1, signed: false); break;
-                    case Op.LdSFldI2: LoadStaticFieldInt(ins, 2, signed: true); break;
-                    case Op.LdSFldU2: LoadStaticFieldInt(ins, 2, signed: false); break;
-                    case Op.LdSFldI4: SetI32(ins.Rd, ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
-                    case Op.LdSFldU4: SetGpr(ins.Rd, (uint)ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
-                    case Op.LdSFldI8:
-                    case Op.LdSFldN:
-                    case Op.LdSFldRef:
-                    case Op.LdSFldPtr:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            SetGpr(ins.Rd, ins.Op == Op.LdSFldI8 ? ReadI64Unchecked(abs) : ReadNativeUnchecked(abs));
-                        }
-                        break;
-                    case Op.LdSFldF32: SetFpr(ins.Rd, (uint)ReadI32Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
-                    case Op.LdSFldF64: SetFpr(ins.Rd, ReadI64Unchecked(GetStaticFieldAddress(FieldLayout(ins.Imm)))); break;
-                    case Op.LdSFldObj:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            CopyBlock(GetAddress(ins.Rd), GetStaticFieldAddress(field), field.Size);
-                        }
-                        break;
-                    case Op.StSFldI1:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
-                        }
-                        break;
-                    case Op.StSFldI2:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
-                        }
-                        break;
-                    case Op.StSFldI4:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
-                        }
-                        break;
-                    case Op.StSFldI8:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteI64Unchecked(abs, GetGpr(ins.Rd));
-                        }
-                        break;
-                    case Op.StSFldN:
-                    case Op.StSFldRef:
-                    case Op.StSFldPtr:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteNativeUnchecked(abs, GetGpr(ins.Rd));
-                        }
-                        break;
-                    case Op.StSFldF32:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
-                        }
-                        break;
-                    case Op.StSFldF64:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            WriteI64Unchecked(abs, GetFpr(ins.Rd));
-                        }
-                        break;
-                    case Op.StSFldObj:
-                        {
-                            FieldLayoutRecord field = FieldLayout(ins.Imm);
-                            int abs = GetStaticFieldAddress(field);
-                            CheckWritableRange(abs, field.Size);
-                            CopyBlock(abs, GetAddress(ins.Rd), field.Size);
-                        }
+                        CopyBlock(GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), true), GetAddress(ins.Rd), InstrDesc.FieldSize(ins.Imm));
                         break;
 
                     case Op.LdLen:
@@ -1139,8 +996,8 @@ namespace Cnidaria.Cs
                         }
                         break;
 
-                    case Op.NewObj:
-                        ExecNewObj(ins, ct, limits);
+                    case Op.AllocObj:
+                        SetGpr(ins.Rd, AllocObject(TypeLayout(ins.Imm)));
                         break;
                     case Op.NewDelegate:
                         SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, 0));
@@ -1214,46 +1071,53 @@ namespace Cnidaria.Cs
                             SetBool(ins.Rd, left != 0 && right != 0 && GetObjectRuntimeTypeId(left) == GetObjectRuntimeTypeId(right));
                             break;
                         }
-
+                    case Op.LdVTableEntry:
+                        SetGpr(ins.Rd, LoadVTableEntry(GetGpr(ins.Rs1), checked((int)ins.Imm)));
+                        break;
                     case Op.CallVoid:
                     case Op.CallI:
                     case Op.CallF:
                     case Op.CallRef:
                     case Op.CallValue:
-                        ExecCall(ins, isVirtual: false, executingPc, ct, limits);
-                        break;
-                    case Op.CallVirtVoid:
-                    case Op.CallVirtI:
-                    case Op.CallVirtF:
-                    case Op.CallVirtRef:
-                    case Op.CallVirtValue:
-                    case Op.CallIfaceVoid:
-                    case Op.CallIfaceI:
-                    case Op.CallIfaceF:
-                    case Op.CallIfaceRef:
-                    case Op.CallIfaceValue:
-                        ExecCall(ins, isVirtual: true, executingPc, ct, limits);
+                        {
+                            int targetEntryPc = checked((int)ins.Imm);
+
+                            if (!_image.MethodIndexByEntryPc.TryGetValue(targetEntryPc, out int targetMethodIndex))
+                                throw new InvalidOperationException($"Invalid direct call target PC {targetEntryPc}");
+                            if (_frameCount >= MaxCallFramesHard)
+                                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+                            if (_frameCount >= limits.MaxCallDepth)
+                                throw new InvalidOperationException("Configured call depth limit exceeded.");
+
+                            EnterManagedFrame(targetMethodIndex, _pc, (CallFlags)ins.Aux);
+                        }
                         break;
                     case Op.CallInternalVoid:
                     case Op.CallInternalI:
                     case Op.CallInternalF:
                     case Op.CallInternalRef:
                     case Op.CallInternalValue:
-                        ExecInternalCall(ins, executingPc, ct, limits);
+                        ExecInternalCall(ins, ct);
                         break;
                     case Op.CallIndirectVoid:
                     case Op.CallIndirectI:
                     case Op.CallIndirectF:
                     case Op.CallIndirectRef:
                     case Op.CallIndirectValue:
-                        ExecIndirectCall(ins, executingPc, ct, limits);
-                        break;
-                    case Op.DelegateInvokeVoid:
-                    case Op.DelegateInvokeI:
-                    case Op.DelegateInvokeF:
-                    case Op.DelegateInvokeRef:
-                    case Op.DelegateInvokeValue:
-                        ExecDelegateInvoke(ins, executingPc, ct, limits);
+                        {
+                            int targetEntryPc = checked((int)GetGpr(ins.Rs1));
+
+                            if (targetEntryPc < 0)
+                                throw new NullReferenceException("function pointer is null.");
+                            if (!_image.MethodIndexByEntryPc.TryGetValue(targetEntryPc, out int targetMethodIndex))
+                                throw new MissingMethodException($"Indirect register call target PC is absent from register image: {targetEntryPc}");
+                            if (_frameCount >= MaxCallFramesHard)
+                                throw new InvalidOperationException("Register VM call stack limit exceeded.");
+                            if (_frameCount >= limits.MaxCallDepth)
+                                throw new InvalidOperationException("Configured call depth limit exceeded.");
+
+                            EnterManagedFrame(targetMethodIndex, _pc, (CallFlags)ins.Aux);
+                        }
                         break;
                     case Op.StaticData:
                         SetGpr(ins.Rd, StaticData(executingPc, ins));
@@ -1295,7 +1159,12 @@ namespace Cnidaria.Cs
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private RuntimeMethod MethodForIndex(int methodIndex)
-            => _rts.GetMethodById(_image.Methods[methodIndex].RuntimeMethodId);
+        {
+            MethodRecord method = _image.Methods[methodIndex];
+            if (method.RuntimeMethodId < 0)
+                throw new MissingMethodException($"Image method #{methodIndex} has no runtime method id.");
+            return _rts.GetMethodById(method.RuntimeMethodId);
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private RuntimeMethod CurrentFrameMethod()
@@ -1304,10 +1173,6 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int TopReturnPc()
             => ReadI32(TopFrameOffset() + ShadowFrameReturnPc);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int TopCallerMethodIndex()
-            => ReadI32(TopFrameOffset() + ShadowFrameCallerMethodIndex);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long TopCallerSp()
@@ -1328,10 +1193,14 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private CallFlags TopIncomingCallFlags()
             => (CallFlags)(TopPackedFlags() & ShadowFrameCallFlagsMask);
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int TopIncomingTargetMethodId()
-            => ReadI32(TopFrameOffset() + ShadowFrameIncomingTargetMethodId);
+        private int MethodIndexForFrame(int frameOffset)
+        {
+            int methodIndex = ReadI32(frameOffset + ShadowFrameMethodIndex);
+            if ((uint)methodIndex >= (uint)_image.Methods.Length)
+                throw new InvalidOperationException($"Invalid shadow frame method index: {methodIndex}");
+            return methodIndex;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long TopIncomingStackArgBase()
@@ -1350,7 +1219,7 @@ namespace Cnidaria.Cs
         {
             if (_activeCallTargetMethod is not null || _frameCount == 0)
                 return false;
-            return TopIncomingTargetMethodId() == method.MethodId;
+            return CurrentFrameMethod().MethodId == method.MethodId;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1384,10 +1253,6 @@ namespace Cnidaria.Cs
             => ReadI64(TopFrameOffset() + ShadowFrameContinuationI0);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private long TopContinuationF0()
-            => ReadI64(TopFrameOffset() + ShadowFrameContinuationF0);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static ReturnPayloadKind ReturnPayloadFromContinuation(PendingContinuationKind kind)
             => kind switch
             {
@@ -1396,7 +1261,7 @@ namespace Cnidaria.Cs
                 PendingContinuationKind.ReturnFloat => ReturnPayloadKind.Float,
                 PendingContinuationKind.ReturnReference => ReturnPayloadKind.Reference,
                 PendingContinuationKind.ReturnValueAddress => ReturnPayloadKind.ValueAddress,
-                _ => throw new InvalidOperationException("Continuation does not carry a return payload: " + kind.ToString()),
+                _ => throw new InvalidOperationException($"Continuation does not carry a return payload: {kind}"),
             };
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1408,11 +1273,11 @@ namespace Cnidaria.Cs
                 ReturnPayloadKind.Float => PendingContinuationKind.ReturnFloat,
                 ReturnPayloadKind.Reference => PendingContinuationKind.ReturnReference,
                 ReturnPayloadKind.ValueAddress => PendingContinuationKind.ReturnValueAddress,
-                _ => throw new InvalidOperationException("Invalid return payload kind: " + payload.ToString()),
+                _ => throw new InvalidOperationException($"Invalid return payload kind: {payload}"),
             };
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetTopContinuation(PendingContinuationKind kind, int targetPc, long i0, long f0)
+        private void SetTopContinuation(PendingContinuationKind kind, int targetPc, long i0)
         {
             int frame = TopFrameOffset();
             int packed = ReadI32(frame + ShadowFramePackedFlags);
@@ -1420,25 +1285,21 @@ namespace Cnidaria.Cs
             WriteI32(frame + ShadowFramePackedFlags, packed);
             WriteI32(frame + ShadowFrameContinuationTargetPc, targetPc);
             WriteI64(frame + ShadowFrameContinuationI0, i0);
-            WriteI64(frame + ShadowFrameContinuationF0, f0);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void PushFrame(
             int methodIndex,
             int returnPc,
-            int callerMethodIndex,
             long callerSp,
             long callerFp,
             CallFlags incomingCallFlags,
-            int incomingTargetMethodId,
-            long incomingStackArgBase,
-            byte postReturnRegister = RegisterVmIsa.InvalidRegister,
-            long postReturnObjectRef = 0)
+            long incomingStackArgBase)
         {
             if ((uint)_frameCount >= (uint)MaxCallFramesHard)
                 throw new InvalidOperationException("Register VM call stack limit exceeded.");
-
+            if ((uint)methodIndex >= (uint)_image.Methods.Length)
+                throw new InvalidOperationException($"Invalid method index for shadow frame: {methodIndex}");
             int frame = _frameStackTop;
             int newTop = checked(frame + ShadowFrameSize);
             if (newTop > (int)X(MachineRegisters.StackPointer))
@@ -1447,16 +1308,13 @@ namespace Cnidaria.Cs
             Array.Clear(_mem, frame, ShadowFrameSize);
             WriteI32(frame + ShadowFrameMethodIndex, methodIndex);
             WriteI32(frame + ShadowFrameReturnPc, returnPc);
-            WriteI32(frame + ShadowFrameCallerMethodIndex, callerMethodIndex);
             WriteI32(frame + ShadowFrameContinuationTargetPc, -1);
             WriteI64(frame + ShadowFrameCallerSp, callerSp);
             WriteI64(frame + ShadowFrameCallerFp, callerFp);
-            WriteI32(frame + ShadowFramePackedFlags, ((int)incomingCallFlags & ShadowFrameCallFlagsMask) | ((int)postReturnRegister << ShadowFramePostReturnRegisterShift));
-            WriteI32(frame + ShadowFrameIncomingTargetMethodId, incomingTargetMethodId);
+            WriteI32(frame + ShadowFramePackedFlags, (int)incomingCallFlags & ShadowFrameCallFlagsMask);
             WriteI64(frame + ShadowFrameIncomingStackArgBase, incomingStackArgBase);
             WriteI32(frame + ShadowFrameRegisterSnapshotIndex, -1);
             WriteI32(frame + ShadowFrameSafePointPc, -1);
-            WriteI64(frame + ShadowFramePostReturnObjectRef, postReturnObjectRef);
             _frameStackTop = newTop;
             if (newTop > _frameStackPeakTop) _frameStackPeakTop = newTop;
             _frameCount++;
@@ -1478,13 +1336,6 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetTopRegisterSnapshotIndex(int value)
             => WriteI32(TopFrameOffset() + ShadowFrameRegisterSnapshotIndex, value);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private byte TopPostReturnRegister()
-            => unchecked((byte)(TopPackedFlags() >> ShadowFramePostReturnRegisterShift));
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private long TopPostReturnObjectRef()
-            => ReadI64(TopFrameOffset() + ShadowFramePostReturnObjectRef);
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int FrameSafePointPc(int frameOffset)
             => ReadI32(frameOffset + ShadowFrameSafePointPc);
@@ -1533,16 +1384,13 @@ namespace Cnidaria.Cs
             RuntimeMethod method = CurrentFrameMethod();
             if (method.BodyModule != null) return method.BodyModule;
             if (_modules.TryGetValue(method.DeclaringType.AssemblyName, out RuntimeModule? module)) return module;
-            throw new InvalidOperationException("Unable to resolve current runtime module for method M" + method.MethodId.ToString());
+            throw new InvalidOperationException($"Unable to resolve current runtime module for method M{method.MethodId}");
         }
 
         private void EnterManagedFrame(
             int targetMethodIndex,
             int returnPc,
-            CallFlags incomingCallFlags,
-            RuntimeMethod? targetMethod,
-            byte postReturnRegister = RegisterVmIsa.InvalidRegister,
-            long postReturnObjectRef = 0)
+            CallFlags incomingCallFlags)
         {
             long callerVisibleSp = X(MachineRegisters.StackPointer);
             long incomingStackArgBase = _currentMethodIndex >= 0 ? GetCurrentOutgoingArgumentBase() : 0;
@@ -1553,98 +1401,44 @@ namespace Cnidaria.Cs
             PushFrame(
                 targetMethodIndex,
                 returnPc,
-                _currentMethodIndex,
                 callerVisibleSp,
                 X(MachineRegisters.FramePointer),
                 incomingCallFlags,
-                targetMethod?.MethodId ?? -1,
-                incomingStackArgBase,
-                postReturnRegister,
-                postReturnObjectRef);
+                incomingStackArgBase);
 
             _currentMethodIndex = targetMethodIndex;
             _pc = _image.Methods[targetMethodIndex].EntryPc;
             X(MachineRegisters.ReturnAddress, returnPc);
             X(MachineRegisters.ThreadPointer, incomingStackArgBase);
         }
-
-        private RuntimeMethod ResolveCallTarget(InstrDesc ins, bool isVirtual)
+        private void ExecInternalCall(InstrDesc ins, CancellationToken ct)
         {
-            if (!isVirtual)
-                return _rts.GetMethodById(checked((int)ins.Imm));
+            int runtimeMethodId = checked((int)ins.Imm);
+            RuntimeMethod target = _rts.GetMethodById(runtimeMethodId);
+            if (!target.HasInternalCall)
+                throw new InvalidOperationException($"CallInternal target method M{runtimeMethodId} is not marked InternalCall.");
 
-            int callSiteIndex = checked((int)ins.Imm);
-            if ((uint)callSiteIndex >= (uint)_image.CallSites.Length)
-                throw new InvalidOperationException("Invalid register VM call-site index " + callSiteIndex.ToString());
-
-            CallSiteRecord site = _image.CallSites[callSiteIndex];
-            RuntimeMethod declared = _rts.GetMethodById(site.DeclaredRuntimeMethodId);
-            long receiverRef = ReadThisArgumentReference(declared);
-
-            if (receiverRef == 0)
-                throw new NullReferenceException();
-
-            RuntimeType receiverType;
-            bool receiverIsManagedObject = TryGetObjectTypeFromExactRef(receiverRef, out receiverType);
-
-            if (!receiverIsManagedObject)
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+            _activeCallFlags = (CallFlags)ins.Aux | CallFlags.InternalCall;
+            _activeCallTargetMethod = target;
+            try
             {
-                if (declared.DeclaringType.IsValueType)
-                    return declared;
+                PrepareValueTypeThisForInternalCall(target);
 
-                throw new AccessViolationException("Virtual dispatch receiver is not a managed object reference.");
+                if (TryInvokeHostOverride(target, ct))
+                    return;
+                if (!TryInvokeIntrinsic(target, ct))
+                    throw new MissingMethodException($"InternalCall implementation is missing: {FormatMethodName(target)}");
             }
-
-            CallFlags siteFlags = (CallFlags)site.Flags;
-            bool interfaceDispatch =
-                (siteFlags & CallFlags.InterfaceDispatch) != 0 ||
-                declared.DeclaringType.Kind == RuntimeTypeKind.Interface;
-            if (!interfaceDispatch && site.DispatchSlot >= 0)
+            finally
             {
-                if ((uint)site.DispatchSlot >= (uint)receiverType.VTable.Length)
-                    throw new MissingMethodException("Invalid virtual dispatch slot " + site.DispatchSlot.ToString());
-
-                return receiverType.VTable[site.DispatchSlot];
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
             }
-
-            return ResolveVirtualDispatch(receiverType, declared);
         }
 
-        private RuntimeMethod ReadDeclaredCallMethod(InstrDesc ins, bool isVirtual)
-        {
-            if (!isVirtual)
-                return _rts.GetMethodById(checked((int)ins.Imm));
-
-            int callSiteIndex = checked((int)ins.Imm);
-            if ((uint)callSiteIndex >= (uint)_image.CallSites.Length)
-                throw new InvalidOperationException("Invalid register VM call-site index " + callSiteIndex.ToString());
-            return _rts.GetMethodById(_image.CallSites[callSiteIndex].DeclaredRuntimeMethodId);
-        }
-
-        private CallFlags ReadCallFlags(InstrDesc ins, bool isVirtual)
-        {
-            CallFlags flags = (CallFlags)ins.Aux;
-            if (isVirtual)
-            {
-                int callSiteIndex = checked((int)ins.Imm);
-                if ((uint)callSiteIndex < (uint)_image.CallSites.Length)
-                    flags |= (CallFlags)_image.CallSites[callSiteIndex].Flags;
-            }
-            return flags;
-        }
-
-        private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
-        {
-            if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
-                return false;
-
-            if (target.IsStatic)
-                return true;
-
-            return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
-        }
-
-        private void NormalizeValueTypeThisArgument(RuntimeMethod method)
+        private void PrepareValueTypeThisForInternalCall(RuntimeMethod method)
         {
             if (!method.HasThis || !method.DeclaringType.IsValueType)
                 return;
@@ -1653,424 +1447,28 @@ namespace Cnidaria.Cs
             if (thisRef == 0)
                 throw new NullReferenceException();
 
-            if (!TryGetObjectTypeFromExactRef(thisRef, out RuntimeType actual))
+            if (!TryGetObjectTypeIdFromExactRef(thisRef, out int actualTypeId))
                 return;
-            if (actual.TypeId != method.DeclaringType.TypeId)
+            if (actualTypeId != method.DeclaringType.TypeId)
                 return;
 
             SetThisArgumentReference(method, checked(thisRef + ObjectHeaderSize));
         }
 
-        private void ExecCall(InstrDesc ins, bool isVirtual, int callPc, CancellationToken ct, ExecutionLimits limits)
-        {
-            RuntimeMethod declared = ReadDeclaredCallMethod(ins, isVirtual);
-            RuntimeMethod target = ResolveCallTarget(ins, isVirtual);
-            CallFlags callFlags = ReadCallFlags(ins, isVirtual);
-
-            NormalizeValueTypeThisArgument(target);
-
-            if (RequiresTypeInitializationBeforeCall(target))
-            {
-                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
-                    return;
-            }
-
-            CallFlags previousActiveCallFlags = _activeCallFlags;
-            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
-            _activeCallFlags = callFlags;
-            _activeCallTargetMethod = target;
-            try
-            {
-                if (TryInvokeHostOverride(target, ct))
-                    return;
-            }
-            finally
-            {
-                _activeCallFlags = previousActiveCallFlags;
-                _activeCallTargetMethod = previousActiveCallTargetMethod;
-            }
-
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
-            {
-                if (target.BodyModule is null || target.Body is null)
-                    throw new MissingMethodException($"No body for register call target M{target.MethodId}");
-                throw new MissingMethodException($"Target method exists in metadata but not in register image: M{target.MethodId}");
-            }
-
-            if (_frameCount >= MaxCallFramesHard)
-                throw new InvalidOperationException("Register VM call stack limit exceeded.");
-            if (_frameCount >= limits.MaxCallDepth)
-                throw new InvalidOperationException("Configured call depth limit exceeded.");
-
-            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
-        }
-        private void ExecInternalCall(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
-        {
-            RuntimeMethod target = _rts.GetMethodById(checked((int)ins.Imm));
-
-            NormalizeValueTypeThisArgument(target);
-            if (RequiresTypeInitializationBeforeCall(target))
-            {
-                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
-                    return;
-            }
-
-            CallFlags previousActiveCallFlags = _activeCallFlags;
-            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
-            _activeCallFlags = (CallFlags)ins.Aux | CallFlags.InternalCall;
-            _activeCallTargetMethod = target;
-            try
-            {
-                if (TryInvokeHostOverride(target, ct))
-                    return;
-                if (!TryInvokeIntrinsic(target, ct))
-                    throw new MissingMethodException("InternalCall implementation is missing: " + FormatMethodName(target));
-            }
-            finally
-            {
-                _activeCallFlags = previousActiveCallFlags;
-                _activeCallTargetMethod = previousActiveCallTargetMethod;
-            }
-        }
-        private void ExecIndirectCall(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
-        {
-            int methodId = checked((int)GetGpr(ins.Rs1));
-            if (methodId == 0)
-                throw new NullReferenceException("function pointer is null.");
-
-            RuntimeMethod target = _rts.GetMethodById(methodId);
-            CallFlags callFlags = (CallFlags)ins.Aux;
-
-            NormalizeValueTypeThisArgument(target);
-
-            if (RequiresTypeInitializationBeforeCall(target))
-            {
-                if (TryRunTypeInitializer(target.DeclaringType, callPc, ct, limits))
-                    return;
-            }
-
-            CallFlags previousActiveCallFlags = _activeCallFlags;
-            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
-            _activeCallFlags = callFlags;
-            _activeCallTargetMethod = target;
-            try
-            {
-                if (TryInvokeHostOverride(target, ct))
-                    return;
-                if (TryInvokeIntrinsic(target, ct))
-                    return;
-            }
-            finally
-            {
-                _activeCallFlags = previousActiveCallFlags;
-                _activeCallTargetMethod = previousActiveCallTargetMethod;
-            }
-
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
-            {
-                if (target.BodyModule is null || target.Body is null)
-                    throw new MissingMethodException($"No body for indirect register call target M{target.MethodId}");
-                throw new MissingMethodException($"Indirect target method exists in metadata but not in register image: M{target.MethodId}");
-            }
-
-            if (_frameCount >= MaxCallFramesHard)
-                throw new InvalidOperationException("Register VM call stack limit exceeded.");
-            if (_frameCount >= limits.MaxCallDepth)
-                throw new InvalidOperationException("Configured call depth limit exceeded.");
-
-            EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
-        }
-
-        private void ExecDelegateInvoke(InstrDesc ins, int callPc, CancellationToken ct, ExecutionLimits limits)
-        {
-            RuntimeMethod invokeMethod = _rts.GetMethodById(checked((int)ins.Imm));
-            CallFlags callFlags = (CallFlags)ins.Aux;
-
-            CallFlags previousActiveCallFlags = _activeCallFlags;
-            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
-
-            long delegateRef;
-            CapturedAbiArgument[] captured;
-            long hiddenReturnBuffer = 0;
-
-            _activeCallFlags = callFlags;
-            _activeCallTargetMethod = invokeMethod;
-            try
-            {
-                delegateRef = ReadThisArgumentReference(invokeMethod);
-                if (delegateRef == 0)
-                    throw new NullReferenceException();
-
-                int invokeArgCount = LogicalArgumentCount(invokeMethod);
-                int explicitInvokeArgCount = Math.Max(0, invokeArgCount - 1);
-                captured = new CapturedAbiArgument[explicitInvokeArgCount];
-                for (int i = 0; i < captured.Length; i++)
-                    captured[i] = CaptureAbiArgument(invokeMethod, i + 1);
-
-                if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
-                    hiddenReturnBuffer = ReadHiddenReturnBufferAddress(invokeMethod);
-            }
-            finally
-            {
-                _activeCallFlags = previousActiveCallFlags;
-                _activeCallTargetMethod = previousActiveCallTargetMethod;
-            }
-
-            int targetCount = DelegateInvocationCount(delegateRef);
-            if (targetCount <= 0)
-                throw new InvalidOperationException("Delegate invocation list is empty.");
-
-            int continuation = AllocMulticastContinuation(
-                invokeMethod,
-                delegateRef,
-                targetCount,
-                captured,
-                hiddenReturnBuffer,
-                callFlags);
-
-            StartDelegateInvocationTarget(continuation);
-        }
-
-        private int AllocMulticastContinuation(
-            RuntimeMethod invokeMethod,
-            long delegateRef,
-            int targetCount,
-            CapturedAbiArgument[] arguments,
-            long hiddenReturnBuffer,
-            CallFlags callFlags)
-        {
-            if (targetCount <= 0)
-                throw new ArgumentOutOfRangeException(nameof(targetCount));
-            if (arguments is null)
-                throw new ArgumentNullException(nameof(arguments));
-
-            int recordsSize = checked(arguments.Length * McArgRecordSize);
-            int dataCursor = AlignUp(checked(McArgRecordsOffset + recordsSize), TargetArchitecture.PointerSize);
-            for (int i = 0; i < arguments.Length; i++)
-                dataCursor = AlignUp(checked(dataCursor + Math.Max(1, arguments[i].Data.Length)), TargetArchitecture.PointerSize);
-
-            int continuation = StackAllocBytes(dataCursor, TargetArchitecture.PointerSize);
-
-            WriteI32(continuation + McInvokeMethodIdOffset, invokeMethod.MethodId);
-            WriteI32(continuation + McNextIndexOffset, 0);
-            WriteI32(continuation + McCountOffset, targetCount);
-            WriteI32(continuation + McCallFlagsOffset, (int)callFlags);
-            WriteNative(continuation + McDelegateRefOffset, delegateRef);
-            WriteNative(continuation + McHiddenReturnBufferOffset, hiddenReturnBuffer);
-            WriteI32(continuation + McArgCountOffset, arguments.Length);
-
-            int dataRel = AlignUp(checked(McArgRecordsOffset + recordsSize), TargetArchitecture.PointerSize);
-            for (int i = 0; i < arguments.Length; i++)
-            {
-                CapturedAbiArgument arg = arguments[i];
-                int size = Math.Max(1, arg.Data.Length);
-                int rec = continuation + McArgRecordsOffset + i * McArgRecordSize;
-                WriteI32(rec + McArgTypeIdOffset, arg.Type.TypeId);
-                WriteI32(rec + McArgSizeOffset, size);
-                WriteI32(rec + McArgDataRelOffset, dataRel);
-                arg.Data.AsSpan(0, Math.Min(arg.Data.Length, size)).CopyTo(_mem.AsSpan(continuation + dataRel, Math.Min(arg.Data.Length, size)));
-                dataRel = AlignUp(checked(dataRel + size), TargetArchitecture.PointerSize);
-            }
-
-            return continuation;
-        }
-
-
-        private void SetTopMulticastContinuation(long continuation)
-           => SetTopContinuation(PendingContinuationKind.MulticastDelegate, -1, continuation, 0);
-
-        private void StartDelegateInvocationTarget(long continuation)
-        {
-            while (true)
-            {
-                int blob = checked((int)continuation);
-                int nextIndex = ReadI32(blob + McNextIndexOffset);
-                int count = ReadI32(blob + McCountOffset);
-                if ((uint)nextIndex >= (uint)count)
-                    throw new InvalidOperationException("Delegate invocation target index is out of range.");
-
-                long multicastRef = ReadNative(blob + McDelegateRefOffset);
-                long delegateObj = GetDelegateInvocationTargetAt(multicastRef, nextIndex);
-                RuntimeMethod target = ReadDelegateTargetMethod(delegateObj);
-                long targetRef = ReadDelegateField(delegateObj, "_target");
-
-                if (RequiresTypeInitializationBeforeCall(target))
-                {
-                    ExecutionLimits limits = _executionLimits ?? throw new InvalidOperationException("Execution limits are not initialized.");
-                    if (TryRunTypeInitializer(target.DeclaringType, _pc, _executionCancellationToken, limits))
-                    {
-                        SetTopMulticastContinuation(continuation);
-                        return;
-                    }
-                }
-
-                WriteI32(blob + McNextIndexOffset, nextIndex + 1);
-
-                CallFlags callFlags = (CallFlags)ReadI32(blob + McCallFlagsOffset);
-                RuntimeMethod invokeMethod = _rts.GetMethodById(ReadI32(blob + McInvokeMethodIdOffset));
-                CallFlags previousActiveCallFlags = _activeCallFlags;
-                RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
-                _activeCallFlags = callFlags;
-                _activeCallTargetMethod = target;
-                try
-                {
-                    RebindDelegateInvokeArgumentsFromBlob(continuation, invokeMethod, target, targetRef);
-                    NormalizeValueTypeThisArgument(target);
-
-                    int pcBeforeHostOrIntrinsic = _pc;
-                    if (TryInvokeHostOverride(target, _executionCancellationToken) || TryInvokeIntrinsic(target, _executionCancellationToken))
-                    {
-                        if (_pc != pcBeforeHostOrIntrinsic)
-                            return;
-
-                        if (nextIndex + 1 >= count)
-                            return;
-
-                        continue;
-                    }
-                }
-                finally
-                {
-                    _activeCallFlags = previousActiveCallFlags;
-                    _activeCallTargetMethod = previousActiveCallTargetMethod;
-                }
-
-                if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(target.MethodId, out int targetMethodIndex))
-                {
-                    if (target.BodyModule is null || target.Body is null)
-                        throw new MissingMethodException("No body for delegate target M" + target.MethodId.ToString());
-                    throw new MissingMethodException("Delegate target method exists in metadata but not in register image: M" + target.MethodId.ToString());
-                }
-
-                ExecutionLimits limitsForDepth = _executionLimits ?? throw new InvalidOperationException("Execution limits are not initialized.");
-                if (_frameCount >= MaxCallFramesHard)
-                    throw new InvalidOperationException("Register VM call stack limit exceeded.");
-                if (_frameCount >= limitsForDepth.MaxCallDepth)
-                    throw new InvalidOperationException("Configured call depth limit exceeded.");
-
-                EnterManagedFrame(targetMethodIndex, _pc, callFlags, target);
-
-                if (nextIndex + 1 < count)
-                    SetTopMulticastContinuation(continuation);
-
-                return;
-            }
-        }
-        private long GetDelegateInvocationTargetAt(long delegateRef, int index)
-        {
-            if (delegateRef == 0)
-                throw new NullReferenceException();
-
-            long listRef = ReadDelegateField(delegateRef, "_invocationList");
-            int count = DelegateInvocationCount(delegateRef);
-            if ((uint)index >= (uint)count)
-                throw new IndexOutOfRangeException();
-
-            if (listRef == 0 || count <= 1)
-                return delegateRef;
-
-            return ReadDelegateArrayEntry(listRef, index);
-        }
-
-        private int DelegateInvocationCount(long delegateRef)
-        {
-            if (delegateRef == 0)
-                return 0;
-
-            RuntimeType type = GetObjectTypeFromRef(delegateRef);
-            if (!IsDelegateLikeRuntimeType(type))
-                throw new InvalidOperationException("Expected delegate object.");
-
-            long listRef = ReadDelegateField(delegateRef, "_invocationList");
-            long count64 = ReadDelegateField(delegateRef, "_invocationCount");
-            if (listRef == 0 || count64 <= 1)
-                return 1;
-            if (count64 > int.MaxValue)
-                throw new InvalidOperationException("Delegate invocation count is too large.");
-            return (int)count64;
-        }
-
-        private void RebindDelegateInvokeArgumentsFromBlob(long continuation, RuntimeMethod invokeMethod, RuntimeMethod target, long targetRef)
-        {
-            int blob = checked((int)continuation);
-            CallFlags callFlags = (CallFlags)ReadI32(blob + McCallFlagsOffset);
-            int capturedCount = ReadI32(blob + McArgCountOffset);
-            int targetArgCount = LogicalArgumentCount(target);
-            bool hasClosedTarget = targetRef != 0 || target.HasThis;
-            int targetExplicitArgBase = hasClosedTarget ? 1 : 0;
-            if (targetArgCount != targetExplicitArgBase + capturedCount)
-            {
-                throw new InvalidOperationException(
-                    "Delegate target signature does not match Invoke signature. InvokeArgs=" + capturedCount.ToString() +
-                    ", TargetArgs=" + targetArgCount.ToString() + ", Closed=" + hasClosedTarget.ToString());
-            }
-
-            if ((callFlags & CallFlags.HiddenReturnBuffer) != 0)
-                WriteHiddenReturnBufferAddress(target, ReadNative(blob + McHiddenReturnBufferOffset));
-
-            if (hasClosedTarget)
-            {
-                if (targetRef == 0)
-                    throw new NullReferenceException();
-                WriteAbiScalarArgument(target, 0, targetRef);
-            }
-
-            for (int i = 0; i < capturedCount; i++)
-            {
-                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
-                int typeId = ReadI32(rec + McArgTypeIdOffset);
-                int size = ReadI32(rec + McArgSizeOffset);
-                int dataRel = ReadI32(rec + McArgDataRelOffset);
-                RuntimeType argType = _rts.GetTypeById(typeId);
-                WriteAbiArgumentFromMemory(target, targetExplicitArgBase + i, argType, blob + dataRel, size);
-            }
-        }
-
-        private void WriteAbiArgumentFromMemory(RuntimeMethod method, int logicalIndex, RuntimeType valueType, int source, int sourceSize)
-        {
-            RuntimeType targetType = GetLogicalArgumentType(method, logicalIndex);
-            int targetSize = Math.Max(1, StorageSizeOf(targetType));
-            int valueSize = Math.Min(Math.Max(1, sourceSize), Math.Max(1, StorageSizeOf(valueType)));
-            var slices = GetAbiArgumentSlices(method, logicalIndex);
-            for (int i = 0; i < slices.Length; i++)
-            {
-                AbiArgumentSlice slice = slices[i];
-                int count = Math.Min(slice.Size, Math.Min(valueSize, targetSize) - slice.Offset);
-                if (count <= 0)
-                    continue;
-
-                if (slice.Location.IsRegister)
-                {
-                    long bits = ReadRawBits(source + slice.Offset, count);
-                    if (slice.RegisterClass == RegisterClass.Float)
-                        SetFpr((byte)slice.Location.Register, bits);
-                    else
-                        X(slice.Location.Register, bits);
-                }
-                else
-                {
-                    int target = GetAbiStackArgumentAddress(method, slice.Location);
-                    _mem.AsSpan(source + slice.Offset, count).CopyTo(_mem.AsSpan(target, count));
-                }
-            }
-        }
-
         private int AllocDelegateFromDescriptor(long descriptor, long targetRef)
         {
-            int delegateTypeId = unchecked((int)((ulong)descriptor >> 32));
-            int targetMethodId = unchecked((int)(uint)descriptor);
-            RuntimeType delegateType = _rts.GetTypeById(delegateTypeId);
-            RuntimeMethod targetMethod = _rts.GetMethodById(targetMethodId);
+            int delegateTypeLayoutIndex = unchecked((int)((ulong)descriptor >> 32));
+            int targetCodePointer = unchecked((int)(uint)descriptor);
+            TypeLayoutRecord delegateLayout = TypeLayout(delegateTypeLayoutIndex);
+            if (!delegateLayout.IsDelegateLike)
+                throw new InvalidOperationException("NewDelegate expects a delegate layout.");
 
-            if (!IsDelegateLikeRuntimeType(delegateType))
-                throw new InvalidOperationException("NewDelegate expects a delegate type.");
-
-            int obj = AllocObject(delegateType);
-            WriteDelegateField(obj, "_target", targetRef);
-            WriteDelegateField(obj, "_methodPtr", targetMethod.MethodId);
-            WriteDelegateField(obj, "_methodModule", 0);
-            WriteDelegateField(obj, "_invocationList", 0);
-            WriteDelegateField(obj, "_invocationCount", 1);
+            EnsureDelegateLayout(delegateLayout);
+            int obj = AllocObject(delegateLayout);
+            WriteDelegateSlot(obj, delegateLayout.DelegateTargetOffset, targetRef);
+            WriteDelegateSlot(obj, delegateLayout.DelegateMethodPtrOffset, targetCodePointer);
+            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationListOffset, 0);
+            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationCountOffset, 1);
             return obj;
         }
 
@@ -2081,11 +1479,9 @@ namespace Cnidaria.Cs
             if (b == 0)
                 return a;
 
-            RuntimeType aType = GetObjectTypeFromRef(a);
-            RuntimeType bType = GetObjectTypeFromRef(b);
-            if (!IsDelegateLikeRuntimeType(aType) || !IsDelegateLikeRuntimeType(bType))
-                throw new InvalidOperationException("DelegateCombine expects delegate operands.");
-            if (aType.TypeId != bType.TypeId)
+            TypeLayoutRecord aLayout = RequireDelegateLayout(a);
+            TypeLayoutRecord bLayout = RequireDelegateLayout(b);
+            if (aLayout.RuntimeTypeId != bLayout.RuntimeTypeId)
                 throw new InvalidOperationException("Cannot combine delegates of different runtime types.");
 
             int[] left = FlattenDelegate(a);
@@ -2093,7 +1489,7 @@ namespace Cnidaria.Cs
             int[] merged = new int[checked(left.Length + right.Length)];
             Array.Copy(left, 0, merged, 0, left.Length);
             Array.Copy(right, 0, merged, left.Length, right.Length);
-            return AllocMulticastDelegate(aType, merged);
+            return AllocMulticastDelegate(aLayout, merged);
         }
 
         private long ExecDelegateRemove(long source, long value)
@@ -2101,11 +1497,9 @@ namespace Cnidaria.Cs
             if (source == 0 || value == 0)
                 return source;
 
-            RuntimeType sourceType = GetObjectTypeFromRef(source);
-            RuntimeType valueType = GetObjectTypeFromRef(value);
-            if (!IsDelegateLikeRuntimeType(sourceType) || !IsDelegateLikeRuntimeType(valueType))
-                throw new InvalidOperationException("DelegateRemove expects delegate operands.");
-            if (sourceType.TypeId != valueType.TypeId)
+            TypeLayoutRecord sourceLayout = RequireDelegateLayout(source);
+            TypeLayoutRecord valueLayout = RequireDelegateLayout(value);
+            if (sourceLayout.RuntimeTypeId != valueLayout.RuntimeTypeId)
                 return source;
 
             int[] sourceTargets = FlattenDelegate(source);
@@ -2149,28 +1543,30 @@ namespace Cnidaria.Cs
             if (tailCount != 0)
                 Array.Copy(sourceTargets, tailStart, result, removeAt, tailCount);
 
-            return AllocMulticastDelegate(sourceType, result);
+            return AllocMulticastDelegate(sourceLayout, result);
         }
 
-        private int AllocMulticastDelegate(RuntimeType delegateType, ReadOnlySpan<int> targets)
+        private int AllocMulticastDelegate(TypeLayoutRecord delegateLayout, ReadOnlySpan<int> targets)
         {
             if (targets.Length <= 0)
                 throw new ArgumentOutOfRangeException(nameof(targets));
             if (targets.Length == 1)
                 return targets[0];
 
-            int obj = AllocObject(delegateType);
-            RuntimeType arrayType = _rts.GetArrayType(delegateType);
-            int list = AllocArray(arrayType, targets.Length);
+            EnsureDelegateLayout(delegateLayout);
+            if (delegateLayout.DelegateArrayTypeLayoutIndex < 0)
+                throw new TypeLoadException($"Delegate layout T{delegateLayout.RuntimeTypeId} has no invocation-list array layout.");
+
+            int obj = AllocObject(delegateLayout);
+            int list = AllocArray(TypeLayout(delegateLayout.DelegateArrayTypeLayoutIndex), targets.Length);
 
             for (int i = 0; i < targets.Length; i++)
                 WriteDelegateArrayEntry(list, i, targets[i]);
 
-            WriteDelegateField(obj, "_target", 0);
-            WriteDelegateField(obj, "_methodPtr", 0);
-            WriteDelegateField(obj, "_methodModule", 0);
-            WriteDelegateField(obj, "_invocationList", list);
-            WriteDelegateField(obj, "_invocationCount", targets.Length);
+            WriteDelegateSlot(obj, delegateLayout.DelegateTargetOffset, 0);
+            WriteDelegateSlot(obj, delegateLayout.DelegateMethodPtrOffset, 0);
+            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationListOffset, list);
+            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationCountOffset, targets.Length);
             return obj;
         }
 
@@ -2179,24 +1575,17 @@ namespace Cnidaria.Cs
             if (delegateRef == 0)
                 return Array.Empty<int>();
 
-            RuntimeType type = GetObjectTypeFromRef(delegateRef);
-            if (!IsDelegateLikeRuntimeType(type))
-                throw new InvalidOperationException("Expected delegate object.");
-
-            long listRef = ReadDelegateField(delegateRef, "_invocationList");
-            long count64 = ReadDelegateField(delegateRef, "_invocationCount");
+            TypeLayoutRecord layout = RequireDelegateLayout(delegateRef);
+            long listRef = ReadDelegateSlot(delegateRef, layout.DelegateInvocationListOffset);
+            long count64 = ReadDelegateSlot(delegateRef, layout.DelegateInvocationCountOffset);
             if (listRef == 0 || count64 <= 1)
                 return new[] { checked((int)delegateRef) };
             if (count64 > int.MaxValue)
                 throw new InvalidOperationException("Delegate invocation count is too large.");
 
             int count = (int)count64;
-            ValidateArrayRef(listRef, out int listAbs, out RuntimeType listType);
-            RuntimeType elemType = listType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
-            if (!elemType.IsReferenceType)
-                throw new InvalidOperationException("Delegate invocation list must contain references.");
-
-            int len = ReadI32(listAbs + ArrayLengthOffset);
+            TypeLayoutRecord listLayout = RequireDelegateArrayLayout(listRef);
+            int len = ReadI32(checked((int)listRef) + ArrayLengthOffset);
             if ((uint)count > (uint)len)
                 throw new InvalidOperationException("Delegate invocation count exceeds invocation list length.");
 
@@ -2208,8 +1597,8 @@ namespace Cnidaria.Cs
 
         private int ReadDelegateArrayEntry(long arrayRef, int index)
         {
-            RuntimeType arrayType = ValidateArrayRef(arrayRef);
-            RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
+            TypeLayoutRecord arrayLayout = RequireDelegateArrayLayout(arrayRef);
+            TypeLayoutRecord elemType = TypeLayout(arrayLayout.ElementTypeLayoutIndex);
             int elemAddr = GetArrayElementAddress(arrayRef, index, elemType);
             long value = ReadSizedInteger(elemAddr, elemType);
             if (value == 0)
@@ -2219,8 +1608,8 @@ namespace Cnidaria.Cs
 
         private void WriteDelegateArrayEntry(long arrayRef, int index, long delegateRef)
         {
-            RuntimeType arrayType = ValidateArrayRef(arrayRef);
-            RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Delegate invocation list array has no element type.");
+            TypeLayoutRecord arrayLayout = RequireDelegateArrayLayout(arrayRef);
+            TypeLayoutRecord elemType = TypeLayout(arrayLayout.ElementTypeLayoutIndex);
             int elemAddr = GetArrayElementAddress(arrayRef, index, elemType);
             WriteSizedInteger(elemAddr, elemType, delegateRef);
         }
@@ -2232,289 +1621,80 @@ namespace Cnidaria.Cs
             if (a == 0 || b == 0)
                 return false;
 
-            RuntimeType at = GetObjectTypeFromRef(a);
-            RuntimeType bt = GetObjectTypeFromRef(b);
-            if (at.TypeId != bt.TypeId)
+            TypeLayoutRecord aLayout = RequireDelegateLayout(a);
+            TypeLayoutRecord bLayout = RequireDelegateLayout(b);
+            if (aLayout.RuntimeTypeId != bLayout.RuntimeTypeId)
                 return false;
 
-            return ReadDelegateField(a, "_target") == ReadDelegateField(b, "_target") &&
-                   ReadDelegateField(a, "_methodPtr") == ReadDelegateField(b, "_methodPtr") &&
-                   ReadDelegateField(a, "_methodModule") == ReadDelegateField(b, "_methodModule");
+            return ReadDelegateSlot(a, aLayout.DelegateTargetOffset) == ReadDelegateSlot(b, bLayout.DelegateTargetOffset) &&
+                   ReadDelegateSlot(a, aLayout.DelegateMethodPtrOffset) == ReadDelegateSlot(b, bLayout.DelegateMethodPtrOffset);
         }
 
-        private RuntimeMethod ReadDelegateTargetMethod(long delegateRef)
+        private int ReadDelegateTargetCodePointer(long delegateRef)
         {
-            long methodId = ReadDelegateField(delegateRef, "_methodPtr");
-            if (methodId == 0)
-                throw new MissingMethodException("Delegate has null target method pointer.");
-            return _rts.GetMethodById(checked((int)methodId));
+            TypeLayoutRecord layout = RequireDelegateLayout(delegateRef);
+            return checked((int)ReadDelegateSlot(delegateRef, layout.DelegateMethodPtrOffset));
         }
 
-        private long ReadDelegateField(long delegateRef, string name)
+        private TypeLayoutRecord RequireDelegateLayout(long delegateRef)
         {
+            TypeLayoutRecord layout = GetObjectTypeLayoutFromRef(delegateRef);
+            if (!layout.IsDelegateLike)
+                throw new InvalidOperationException("Expected delegate object.");
+            EnsureDelegateLayout(layout);
+            return layout;
+        }
+
+        private TypeLayoutRecord RequireDelegateArrayLayout(long arrayRef)
+        {
+            TypeLayoutRecord arrayLayout = GetObjectTypeLayoutFromRef(arrayRef);
+            if (!arrayLayout.IsArray || arrayLayout.ElementTypeLayoutIndex < 0)
+                throw new ArrayTypeMismatchException();
+
+            TypeLayoutRecord elem = TypeLayout(arrayLayout.ElementTypeLayoutIndex);
+            if (!elem.IsReferenceType || !elem.IsDelegateLike)
+                throw new InvalidOperationException("Delegate invocation list must contain delegate references.");
+            return arrayLayout;
+        }
+
+        private static void EnsureDelegateLayout(TypeLayoutRecord layout)
+        {
+            if (layout.DelegateTargetOffset < 0 ||
+                layout.DelegateMethodPtrOffset < 0 ||
+                layout.DelegateInvocationListOffset < 0 ||
+                layout.DelegateInvocationCountOffset < 0)
+            {
+                throw new TypeLoadException($"Delegate layout T{layout.RuntimeTypeId} is missing required delegate field offsets.");
+            }
+        }
+
+        private TypeLayoutRecord GetObjectTypeLayoutFromRef(long objRef)
+        {
+            int typeId = GetObjectRuntimeTypeId(objRef);
+            if (!_image.TypeLayoutIndexByRuntimeTypeId.TryGetValue(typeId, out int layoutIndex))
+                throw new TypeLoadException($"Object runtime type {typeId} has no execution layout.");
+            return TypeLayout(layoutIndex);
+        }
+
+        private long ReadDelegateSlot(long delegateRef, int offset)
+        {
+            if (offset < 0)
+                throw new ArgumentOutOfRangeException(nameof(offset));
             int obj = checked((int)delegateRef);
-            RuntimeType type = GetObjectTypeFromRef(obj);
-            RuntimeField field = FindInstanceFieldInHierarchy(type, name);
-            return ReadSizedInteger(obj + field.Offset, field.FieldType);
+            return ReadNative(checked(obj + offset));
         }
 
-        private void WriteDelegateField(int delegateRef, string name, long value)
+        private void WriteDelegateSlot(int delegateRef, int offset, long value)
         {
-            RuntimeType type = GetObjectTypeFromRef(delegateRef);
-            RuntimeField field = FindInstanceFieldInHierarchy(type, name);
-            WriteSizedInteger(delegateRef + field.Offset, field.FieldType, value);
+            if (offset < 0)
+                throw new ArgumentOutOfRangeException(nameof(offset));
+            WriteNative(checked(delegateRef + offset), value);
         }
 
-        private static RuntimeField FindInstanceFieldInHierarchy(RuntimeType type, string name)
+        private bool TryRunTypeInitializer(int typeLayoutIndex, int returnPc, CancellationToken ct, ExecutionLimits limits)
         {
-            for (RuntimeType? cur = type; cur is not null; cur = cur.BaseType)
-            {
-                for (int i = 0; i < cur.InstanceFields.Length; i++)
-                {
-                    RuntimeField field = cur.InstanceFields[i];
-                    if (!field.IsStatic && StringComparer.Ordinal.Equals(field.Name, name))
-                        return field;
-                }
-            }
-            throw new MissingFieldException(type.Name, name);
-        }
-
-        private static bool IsSystemDelegateBase(RuntimeType type)
-            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-               (StringComparer.Ordinal.Equals(type.Name, "Delegate") ||
-                StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate"));
-
-        private static bool IsDelegateLikeRuntimeType(RuntimeType type)
-        {
-            for (RuntimeType? t = type; t is not null; t = t.BaseType)
-            {
-                if (IsSystemDelegateBase(t))
-                    return true;
-            }
-            return false;
-        }
-
-        private readonly struct CapturedAbiArgument
-        {
-            public readonly RuntimeType Type;
-            public readonly byte[] Data;
-
-            public CapturedAbiArgument(RuntimeType type, byte[] data)
-            {
-                Type = type;
-                Data = data;
-            }
-        }
-
-        private CapturedAbiArgument CaptureAbiArgument(RuntimeMethod method, int logicalIndex)
-        {
-            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
-            int size = Math.Max(1, StorageSizeOf(type));
-            int temp = MaterializeAbiArgumentToStack(method, logicalIndex, type);
-            var data = new byte[size];
-            _mem.AsSpan(temp, size).CopyTo(data);
-            return new CapturedAbiArgument(type, data);
-        }
-
-        private void WriteAbiScalarArgument(RuntimeMethod method, int logicalIndex, long value)
-        {
-            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
-            int size = Math.Max(1, StorageSizeOf(type));
-            var data = new byte[size];
-            WriteRawBitsToSpan(data, value, Math.Min(size, TargetArchitecture.PointerSize));
-            WriteAbiArgument(method, logicalIndex, new CapturedAbiArgument(type, data));
-        }
-
-        private void WriteAbiArgument(RuntimeMethod method, int logicalIndex, CapturedAbiArgument value)
-        {
-            RuntimeType targetType = GetLogicalArgumentType(method, logicalIndex);
-            int targetSize = Math.Max(1, StorageSizeOf(targetType));
-            var slices = GetAbiArgumentSlices(method, logicalIndex);
-            for (int i = 0; i < slices.Length; i++)
-            {
-                AbiArgumentSlice slice = slices[i];
-                int count = Math.Min(slice.Size, Math.Min(value.Data.Length, targetSize) - slice.Offset);
-                if (count <= 0)
-                    continue;
-
-                if (slice.Location.IsRegister)
-                {
-                    long bits = ReadRawBitsFromSpan(value.Data, slice.Offset, count);
-                    if (slice.RegisterClass == RegisterClass.Float)
-                        SetFpr((byte)slice.Location.Register, bits);
-                    else
-                        X(slice.Location.Register, bits);
-                }
-                else
-                {
-                    int target = GetAbiStackArgumentAddress(method, slice.Location);
-                    value.Data.AsSpan(slice.Offset, count).CopyTo(_mem.AsSpan(target, count));
-                }
-            }
-        }
-
-        private void WriteHiddenReturnBufferAddress(RuntimeMethod method, long address)
-        {
-            int insertion = HiddenReturnBufferInsertionIndex(method);
-            if (insertion < 0)
-                return;
-
-            int general = 0, floating = 0, stack = 0;
-            for (int i = 0; i <= insertion; i++)
-            {
-                if (i == insertion)
-                {
-                    AbiArgumentLocation loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
-                    if (loc.IsRegister)
-                        X(loc.Register, address);
-                    else
-                        WriteNative(GetAbiStackArgumentAddress(method, loc), address);
-                    return;
-                }
-
-                RuntimeType argType = GetLogicalArgumentType(method, i);
-                ConsumeAbiValue(argType, ref general, ref floating, ref stack);
-            }
-        }
-
-        private static long ReadRawBitsFromSpan(byte[] data, int offset, int size)
-        {
-            return size switch
-            {
-                1 => data[offset],
-                2 => BitConverter.ToUInt16(data, offset),
-                4 => BitConverter.ToUInt32(data, offset),
-                8 => BitConverter.ToInt64(data, offset),
-                _ => throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString()),
-            };
-        }
-
-        private static void WriteRawBitsToSpan(byte[] data, long value, int size)
-        {
-            switch (size)
-            {
-                case 1: data[0] = unchecked((byte)value); return;
-                case 2: BitConverter.GetBytes(unchecked((ushort)value)).CopyTo(data, 0); return;
-                case 4: BitConverter.GetBytes(unchecked((uint)value)).CopyTo(data, 0); return;
-                case 8: BitConverter.GetBytes(value).CopyTo(data, 0); return;
-                default: throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString());
-            }
-        }
-
-        private void ExecNewObj(InstrDesc ins, CancellationToken ct, ExecutionLimits limits)
-        {
-            var ctor = _rts.GetMethodById(checked((int)ins.Imm));
-            if (ctor.DeclaringType.IsValueType)
-            {
-                if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(ctor.MethodId, out int ctorIndex))
-                    throw new MissingMethodException("Value-type constructor not in register image: M" + ctor.MethodId.ToString());
-                EnterManagedFrame(ctorIndex, _pc, CallFlags.None, ctor);
-                return;
-            }
-
-            // System.String is a variable sized object
-            int obj = IsSystemStringType(ctor.DeclaringType)
-                ? AllocStringUninitialized(TryGetStringConstructorResultLength(ctor, out int computedLength) ? computedLength : 0)
-                : AllocObject(ctor.DeclaringType);
-            SetThisArgumentReference(ctor, obj);
-
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(ctor.MethodId, out int methodIndex))
-            {
-                SetGpr(ins.Rd, obj);
-                return;
-            }
-
-
-            EnterManagedFrame(methodIndex, _pc, CallFlags.None, ctor, ins.Rd, obj);
-        }
-
-        private bool TryGetStringConstructorResultLength(RuntimeMethod ctor, out int length)
-        {
-            length = 0;
-            RuntimeType[] parameters = ctor.ParameterTypes;
-
-            if (parameters.Length == 0)
-                return true;
-
-            if (parameters.Length == 1)
-            {
-                RuntimeType p0 = parameters[0];
-                if (IsCharArrayType(p0))
-                {
-                    long arrayRef = ReadAbiScalarArgument(ctor, 1);
-                    if (arrayRef == 0)
-                        return true;
-
-                    ValidateArrayRef(arrayRef, out int arrAbs, out _);
-                    length = ReadI32(arrAbs + ArrayLengthOffset);
-                    if (length < 0)
-                        throw new InvalidOperationException("Corrupted char[] length.");
-                    return true;
-                }
-
-                if (p0.Kind == RuntimeTypeKind.Pointer && p0.ElementType is not null && IsCharType(p0.ElementType))
-                {
-                    long ptr = ReadAbiScalarArgument(ctor, 1);
-                    length = ptr == 0 ? 0 : NullTerminatedCharPointerLength(checked((int)ptr));
-                    return true;
-                }
-            }
-
-            if (parameters.Length == 2 && IsCharType(parameters[0]) && IsInt32Type(parameters[1]))
-            {
-                int requestedLength = unchecked((int)ReadAbiScalarArgument(ctor, 2));
-                length = requestedLength < 0 ? 0 : requestedLength;
-                return true;
-            }
-
-            if (parameters.Length == 3 && IsCharArrayType(parameters[0]) && IsInt32Type(parameters[1]) && IsInt32Type(parameters[2]))
-            {
-                long arrayRef = ReadAbiScalarArgument(ctor, 1);
-                int startIndex = unchecked((int)ReadAbiScalarArgument(ctor, 2));
-                int requestedLength = unchecked((int)ReadAbiScalarArgument(ctor, 3));
-
-                if (arrayRef == 0 || startIndex < 0 || requestedLength < 0)
-                    return true;
-
-                ValidateArrayRef(arrayRef, out int arrAbs, out _);
-                int arrayLength = ReadI32(arrAbs + ArrayLengthOffset);
-                if (arrayLength < 0)
-                    throw new InvalidOperationException("Corrupted char[] length.");
-
-                length = (uint)startIndex <= (uint)arrayLength && requestedLength <= arrayLength - startIndex
-                    ? requestedLength
-                    : 0;
-                return true;
-            }
-
-            return false;
-        }
-
-        private int NullTerminatedCharPointerLength(int charsAbs)
-        {
-            const int MaxStringConstructorChars = 8 * 1024 * 1024;
-            for (int i = 0; i < MaxStringConstructorChars; i++)
-            {
-                int pos = checked(charsAbs + checked(i * 2));
-                CheckIndirectAccess(pos, 2, false);
-                if (ReadU16(pos) == 0)
-                    return i;
-            }
-
-            throw new AccessViolationException("Unterminated char* string constructor input.");
-        }
-
-        private bool IsCharArrayType(RuntimeType type)
-            => type.Kind == RuntimeTypeKind.Array && type.ElementType is not null && IsCharType(type.ElementType);
-
-        private bool IsInt32Type(RuntimeType type)
-            => type.Namespace == "System" && type.Name == "Int32";
-
-        private bool TryRunTypeInitializer(RuntimeType type, int returnPc, CancellationToken ct, ExecutionLimits limits)
-        {
-            _rts.EnsureConstructedMembers(type);
-
-            if (_typeInitState.TryGetValue(type.TypeId, out byte state))
+            TypeLayoutRecord type = TypeLayout(typeLayoutIndex);
+            if (_typeInitState.TryGetValue(type.RuntimeTypeId, out byte state))
             {
                 // 1 == running
                 // 2 == completed or known noop
@@ -2523,59 +1703,40 @@ namespace Cnidaria.Cs
 
             _ = EnsureStaticStorage(type);
 
-            RuntimeMethod? cctor = FindTypeInitializer(type);
-            if (cctor is null || cctor.BodyModule is null || cctor.Body is null)
+            int cctorMethodIndex = FindTypeInitializerMethodIndex(typeLayoutIndex);
+            if (cctorMethodIndex < 0)
             {
-                _typeInitState[type.TypeId] = 2;
+                _typeInitState[type.RuntimeTypeId] = 2;
                 return false;
             }
-            if (!_image.MethodIndexByRuntimeMethodId.TryGetValue(cctor.MethodId, out int index))
-            {
-                _typeInitState.Remove(type.TypeId);
-                throw new MissingMethodException(
-                    $"Type initializer is reachable at runtime but is absent from register image: " +
-                    $"{type.Namespace}.{type.Name}; cctor=M{cctor.MethodId}");
-            }
 
-            _typeInitState[type.TypeId] = 1;
+            MethodRecord cctorRecord = _image.Methods[cctorMethodIndex];
+            if (cctorRecord.StaticConstructorTypeLayoutIndex != typeLayoutIndex)
+                throw new MissingMethodException($"Type initializer marker is invalid for type layout {typeLayoutIndex}.");
+
+            _typeInitState[type.RuntimeTypeId] = 1;
             int snapshotIndex = SaveRegisterSnapshot();
-            EnterManagedFrame(index, returnPc, CallFlags.None, cctor);
+            EnterManagedFrame(cctorMethodIndex, returnPc, CallFlags.None);
             SetTopRegisterSnapshotIndex(snapshotIndex);
             return true;
         }
 
-        private static RuntimeMethod? FindTypeInitializer(RuntimeType type)
+        private int FindTypeInitializerMethodIndex(int typeLayoutIndex)
         {
-            for (int i = 0; i < type.Methods.Length; i++)
+            for (int i = 0; i < _image.Methods.Length; i++)
             {
-                RuntimeMethod m = type.Methods[i];
-                if (m.IsStatic && m.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(m.Name, ".cctor"))
-                    return m;
+                if (_image.Methods[i].StaticConstructorTypeLayoutIndex == typeLayoutIndex)
+                    return i;
             }
-            return null;
+
+            return -1;
         }
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool IsStaticFieldInstruction(Op op)
-            => (ushort)op >= (ushort)Op.LdSFldI1 && (ushort)op <= (ushort)Op.StSFldObj;
 
         private bool TryDeferRequiredTypeInitializationBeforeInstruction(InstrDesc ins, int executingPc, CancellationToken ct, ExecutionLimits limits)
         {
-            if (IsStaticFieldInstruction(ins.Op))
+            if (ins.Op == Op.LiStaticBase || ins.Op == Op.AllocObj)
             {
-                FieldLayoutRecord field = FieldLayout(ins.Imm);
-                if (field.IsStatic)
-                {
-                    TypeLayoutRecord declaringTypeLayout = TypeLayout(field.DeclaringTypeLayoutIndex);
-                    RuntimeType declaringType = _rts.GetTypeById(declaringTypeLayout.RuntimeTypeId);
-                    if (TryRunTypeInitializer(declaringType, executingPc, ct, limits))
-                        return true;
-                }
-            }
-
-            if (ins.Op == Op.NewObj)
-            {
-                RuntimeMethod ctor = _rts.GetMethodById(checked((int)ins.Imm));
-                if (TryRunTypeInitializer(ctor.DeclaringType, executingPc, ct, limits))
+                if (TryRunTypeInitializer(checked((int)ins.Imm), executingPc, ct, limits))
                     return true;
             }
 
@@ -2585,34 +1746,21 @@ namespace Cnidaria.Cs
         private void ReturnFromCurrentFrame(ReturnPayloadKind payloadKind, int valueSize = 0)
         {
             int retPc = TopReturnPc();
-            int callerMethod = TopCallerMethodIndex();
-            RuntimeMethod returningMethod = CurrentFrameMethod();
-            long retI0 = X(MachineRegisters.ReturnValue0);
-            long retF0 = GetFpr((byte)MachineRegisters.FloatReturnValue0);
+            int returningStaticConstructorTypeLayoutIndex = _image.Methods[_currentMethodIndex].StaticConstructorTypeLayoutIndex;
+            long retI0 = payloadKind == ReturnPayloadKind.Float
+                ? GetFpr((byte)MachineRegisters.FloatReturnValue0)
+                : X(MachineRegisters.ReturnValue0);
 
-            if (payloadKind == ReturnPayloadKind.ValueAddress && valueSize > 0 && (CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) != 0)
-            {
-                int source = checked((int)retI0);
-                int target = checked((int)ReadHiddenReturnBufferAddress(returningMethod));
-                CopyBlock(target, source, valueSize);
-                retI0 = target;
-            }
-
-            if (TryBeginFinallyForReturn(_pc - 1, payloadKind, retI0, retF0))
+            if (TryBeginFinallyForReturn(_pc - 1, payloadKind, retI0))
                 return;
 
-            bool returnedFromCctor = StringComparer.Ordinal.Equals(returningMethod.Name, ".cctor");
-            int cctorTypeId = returnedFromCctor ? returningMethod.DeclaringType.TypeId : -1;
+            bool returnedFromCctor = returningStaticConstructorTypeLayoutIndex >= 0;
+            int cctorTypeId = returnedFromCctor ? TypeLayout(returningStaticConstructorTypeLayoutIndex).RuntimeTypeId : -1;
             int registerSnapshotIndex = TopRegisterSnapshotIndex();
-            byte postReturnRegister = TopPostReturnRegister();
-            long postReturnObjectRef = TopPostReturnObjectRef();
             long callerSp = TopCallerSp();
             long callerFp = TopCallerFp();
-            PendingContinuationKind continuationKind = TopContinuationKind();
-            long multicastContinuationRef = continuationKind == PendingContinuationKind.MulticastDelegate ? TopContinuationI0() : 0;
-
             PopFrame();
-            if (_frameCount == 0 || retPc < 0 || callerMethod < 0)
+            if (_frameCount == 0 || retPc < 0)
             {
                 if (returnedFromCctor)
                     _typeInitState[cctorTypeId] = 2;
@@ -2627,6 +1775,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
+            int callerMethod = MethodIndexForFrame(TopFrameOffset());
             _currentMethodIndex = callerMethod;
             _pc = retPc;
             X(MachineRegisters.StackPointer, callerSp);
@@ -2650,7 +1799,7 @@ namespace Cnidaria.Cs
                 case ReturnPayloadKind.None:
                     break;
                 case ReturnPayloadKind.Float:
-                    SetFpr(MachineRegisters.FloatReturnValue0, retF0);
+                    SetFpr(MachineRegisters.FloatReturnValue0, retI0);
                     break;
                 case ReturnPayloadKind.Integer:
                 case ReturnPayloadKind.Reference:
@@ -2658,16 +1807,47 @@ namespace Cnidaria.Cs
                     SetGpr(MachineRegisters.ReturnValue0, retI0);
                     break;
                 default:
-                    throw new InvalidOperationException("Invalid return payload kind: " + payloadKind.ToString());
+                    throw new InvalidOperationException($"Invalid return payload kind: {payloadKind}");
             }
 
-            if (postReturnRegister != RegisterVmIsa.InvalidRegister) SetGpr(postReturnRegister, postReturnObjectRef);
             if (returnedFromCctor) _typeInitState[cctorTypeId] = 2;
-
-            if (multicastContinuationRef != 0)
-                StartDelegateInvocationTarget(multicastContinuationRef);
         }
+        private void RestoreSavedRegistersForCurrentFrame()
+        {
+            if (_currentMethodIndex < 0)
+                return;
 
+            MethodRecord method = _image.Methods[_currentMethodIndex];
+            if (method.UnwindCount == 0 || method.FrameSize <= 0)
+                return;
+
+            long frameBase64 = checked(TopCallerSp() - method.FrameSize);
+            int frameBase = checked((int)frameBase64);
+            CheckRange(frameBase, method.FrameSize);
+
+            int start = method.UnwindStartIndex;
+            int end = checked(start + method.UnwindCount);
+            for (int i = start; i < end; i++)
+            {
+                UnwindRecord unwind = _image.Unwind[i];
+                var kind = (UnwindCodeKind)unwind.Kind;
+                if (kind is not (UnwindCodeKind.SaveReturnAddress or UnwindCodeKind.SaveCalleeSavedRegister))
+                    continue;
+
+                int address = checked(frameBase + unwind.StackOffset);
+                CheckRange(address, Math.Max(1, unwind.Size));
+
+                var register = (MachineRegister)unwind.Register;
+                long value = unwind.Size >= 8
+                    ? ReadI64Unchecked(address)
+                    : ReadNativeUnchecked(address);
+
+                if (MachineRegisters.GetClass(register) == RegisterClass.Float)
+                    SetFpr(register, value);
+                else
+                    SetGpr(register, value);
+            }
+        }
         private int SaveRegisterSnapshot()
         {
             var snapshot = new RegisterSnapshot((long[])_x.Clone(), (long[])_f.Clone());
@@ -2691,12 +1871,12 @@ namespace Cnidaria.Cs
 
             _registerSnapshots[index] = null;
         }
-        private bool TryBeginFinallyForReturn(int fromPc, ReturnPayloadKind payloadKind, long retI0, long retF0)
+        private bool TryBeginFinallyForReturn(int fromPc, ReturnPayloadKind payloadKind, long retI0)
         {
             if (!TryFindEnclosingFinally(fromPc, targetPc: -1, out var finallyRegion))
                 return false;
 
-            SetTopContinuation(ContinuationFromReturnPayload(payloadKind), -1, retI0, retF0);
+            SetTopContinuation(ContinuationFromReturnPayload(payloadKind), -1, retI0);
             _pc = finallyRegion.HandlerStartPc;
             return true;
         }
@@ -2705,7 +1885,7 @@ namespace Cnidaria.Cs
         {
             if (TryFindEnclosingFinally(fromPc, targetPc, out var finallyRegion))
             {
-                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0, 0);
+                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0);
                 _pc = finallyRegion.HandlerStartPc;
                 return;
             }
@@ -2717,8 +1897,7 @@ namespace Cnidaria.Cs
             PendingContinuationKind kind = TopContinuationKind();
             int targetPc = TopContinuationTargetPc();
             long i0 = TopContinuationI0();
-            long f0 = TopContinuationF0();
-            SetTopContinuation(PendingContinuationKind.None, -1, 0, 0);
+            SetTopContinuation(PendingContinuationKind.None, -1, 0);
 
             switch (kind)
             {
@@ -2738,9 +1917,10 @@ namespace Cnidaria.Cs
                     {
                         ReturnPayloadKind payloadKind = ReturnPayloadFromContinuation(kind);
                         if (payloadKind == ReturnPayloadKind.Float)
-                            SetFpr(MachineRegisters.FloatReturnValue0, f0);
+                            SetFpr(MachineRegisters.FloatReturnValue0, i0);
                         else if (payloadKind != ReturnPayloadKind.None)
                             SetGpr(MachineRegisters.ReturnValue0, i0);
+                        RestoreSavedRegistersForCurrentFrame();
                         ReturnFromCurrentFrame(payloadKind);
                         return;
                     }
@@ -2777,7 +1957,7 @@ namespace Cnidaria.Cs
                 {
                     if ((EhRegionKind)h.Kind == EhRegionKind.Finally || (EhRegionKind)h.Kind == EhRegionKind.Fault)
                     {
-                        SetTopContinuation(PendingContinuationKind.Throw, -1, 0, 0);
+                        SetTopContinuation(PendingContinuationKind.Throw, -1, 0);
                         _pc = h.HandlerStartPc;
                         return;
                     }
@@ -2786,20 +1966,20 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                RuntimeMethod unwindingMethod = CurrentFrameMethod();
-                if (StringComparer.Ordinal.Equals(unwindingMethod.Name, ".cctor"))
-                    _typeInitState.Remove(unwindingMethod.DeclaringType.TypeId);
+                int unwindingStaticConstructorTypeLayoutIndex = _image.Methods[_currentMethodIndex].StaticConstructorTypeLayoutIndex;
+                if (unwindingStaticConstructorTypeLayoutIndex >= 0)
+                    _typeInitState.Remove(TypeLayout(unwindingStaticConstructorTypeLayoutIndex).RuntimeTypeId);
 
                 int registerSnapshotIndex = TopRegisterSnapshotIndex();
                 int retPc = TopReturnPc();
-                int callerMethod = TopCallerMethodIndex();
                 long callerSp = TopCallerSp();
                 long callerFp = TopCallerFp();
                 PopFrame();
                 if (registerSnapshotIndex >= 0)
                     ReleaseRegisterSnapshot(registerSnapshotIndex);
-                if (_frameCount == 0 || retPc < 0 || callerMethod < 0)
+                if (_frameCount == 0 || retPc < 0)
                     break;
+                int callerMethod = MethodIndexForFrame(TopFrameOffset());
                 _currentMethodIndex = callerMethod;
                 _pc = retPc;
                 X(MachineRegisters.StackPointer, callerSp);
@@ -2843,7 +2023,8 @@ namespace Cnidaria.Cs
                 if ((uint)methodIndex < (uint)_image.Methods.Length)
                 {
                     runtimeMethodId = _image.Methods[methodIndex].RuntimeMethodId;
-                    method = _rts.GetMethodById(runtimeMethodId);
+                    if (runtimeMethodId >= 0)
+                        method = _rts.GetMethodById(runtimeMethodId);
                 }
             }
             catch
@@ -3445,6 +2626,9 @@ namespace Cnidaria.Cs
             if (!rm.IsStatic || rm.HasThis)
                 throw new InvalidOperationException("Only static host overrides are supported by the register VM.");
 
+            if (LogicalArgumentCount(rm) != rm.ParameterTypes.Length)
+                throw new InvalidOperationException($"Host override ABI argument count mismatch for {FormatMethodName(rm)}.");
+
             int argCount = rm.ParameterTypes.Length;
             Span<VmValue> args = argCount <= 32 ? stackalloc VmValue[argCount] : new VmValue[argCount];
             for (int i = 0; i < argCount; i++)
@@ -3798,13 +2982,15 @@ namespace Cnidaria.Cs
             public readonly RegisterClass RegisterClass;
             public readonly int Offset;
             public readonly int Size;
+            public readonly bool ContainsGcPointers;
 
-            public AbiArgumentSlice(AbiArgumentLocation location, RegisterClass registerClass, int offset, int size)
+            public AbiArgumentSlice(AbiArgumentLocation location, RegisterClass registerClass, int offset, int size, bool containsGcPointers = false)
             {
                 Location = location;
                 RegisterClass = registerClass;
                 Offset = offset;
                 Size = size;
+                ContainsGcPointers = containsGcPointers;
             }
         }
 
@@ -3815,10 +3001,8 @@ namespace Cnidaria.Cs
         {
             if ((CurrentInvocationCallFlags() & CallFlags.HiddenReturnBuffer) == 0)
                 return -1;
-
-            if (method.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(method.Name, ".ctor"))
+            if (!MachineAbi.RequiresHiddenReturnBuffer(method))
                 return -1;
-
             return MachineAbi.HiddenReturnBufferInsertionIndex(method, LogicalArgumentCount(method));
         }
 
@@ -3828,95 +3012,99 @@ namespace Cnidaria.Cs
             if (insertion < 0)
                 throw new InvalidOperationException("Current call has no hidden return buffer.");
 
-            int general = 0, floating = 0, stack = 0;
-            for (int i = 0; i <= insertion; i++)
-            {
-                if (i == insertion)
-                {
-                    AbiArgumentLocation loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
-                    return loc.IsRegister ? X(loc.Register) : ReadNative(GetAbiStackArgumentAddress(method, loc));
-                }
+            AbiArgumentLocation loc = GetHiddenReturnBufferLocation(method);
+            return loc.IsRegister ? X(loc.Register) : ReadNative(GetAbiStackArgumentAddress(method, loc));
+        }
 
-                RuntimeType argType = GetLogicalArgumentType(method, i);
-                ConsumeAbiValue(argType, ref general, ref floating, ref stack);
-            }
+        private AbiArgumentLocation GetHiddenReturnBufferLocation(RuntimeMethod method)
+        {
+            int insertionIndex = HiddenReturnBufferInsertionIndex(method);
+            if (insertionIndex < 0)
+                throw new InvalidOperationException("Current call has no hidden return buffer argument.");
 
-            throw new InvalidOperationException("Invalid hidden return buffer position.");
+            int general = 0;
+            int floating = 0;
+            int stack = 0;
+            for (int i = 0; i < insertionIndex; i++)
+                ConsumeAbiValue(GetLogicalArgumentType(method, i), ref general, ref floating, ref stack);
+
+            return AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
         }
 
         private ImmutableArray<AbiArgumentSlice> GetAbiArgumentSlices(RuntimeMethod method, int logicalIndex)
         {
-            int argCount = LogicalArgumentCount(method);
-            if ((uint)logicalIndex >= (uint)argCount)
+            int argumentCount = LogicalArgumentCount(method);
+            if ((uint)logicalIndex >= (uint)argumentCount)
                 throw new ArgumentOutOfRangeException(nameof(logicalIndex));
 
-            int hiddenIndex = HiddenReturnBufferInsertionIndex(method);
-            int general = 0, floating = 0, stack = 0;
+            int general = 0;
+            int floating = 0;
+            int stack = 0;
+            int hiddenInsertion = HiddenReturnBufferInsertionIndex(method);
 
-            for (int i = 0; i <= logicalIndex; i++)
+            for (int i = 0; i < argumentCount; i++)
             {
-                if (hiddenIndex == i)
-                    ConsumeHiddenReturnBuffer(ref general, ref stack);
+                if (hiddenInsertion == i)
+                    _ = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
 
                 RuntimeType argType = GetLogicalArgumentType(method, i);
-                var abi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false);
-
-                if (abi.PassingKind == AbiValuePassingKind.Void)
-                    continue;
-
-                if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
-                {
-                    AbiArgumentLocation loc = AssignScalarAbiLocation(abi.RegisterClass, abi.Size, ref general, ref floating, ref stack);
-                    if (i == logicalIndex)
-                    {
-                        return ImmutableArray.Create(new AbiArgumentSlice(
-                            loc,
-                            abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass,
-                            0,
-                            abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size));
-                    }
-                    continue;
-                }
-
-                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
-                {
-                    var segments = MachineAbi.GetRegisterSegments(abi);
-                    var result = i == logicalIndex ? ImmutableArray.CreateBuilder<AbiArgumentSlice>(segments.Length) : null;
-                    int aggregateStackSlot = -1;
-                    int aggregateStackBaseOffset = 0;
-
-                    for (int s = 0; s < segments.Length; s++)
-                    {
-                        AbiRegisterSegment segment = segments[s];
-                        AbiArgumentLocation loc = AssignAggregateSegmentAbiLocation(
-                            segment,
-                            ref general,
-                            ref floating,
-                            ref stack,
-                            ref aggregateStackSlot,
-                            ref aggregateStackBaseOffset);
-
-                        result?.Add(new AbiArgumentSlice(loc, segment.RegisterClass, segment.Offset, segment.Size));
-                    }
-
-                    if (i == logicalIndex)
-                        return result!.ToImmutable();
-                    continue;
-                }
-
-                int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
-                AbiArgumentLocation stackLoc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, stackSize);
                 if (i == logicalIndex)
-                {
-                    return ImmutableArray.Create(new AbiArgumentSlice(
-                        stackLoc,
-                        RegisterClass.General,
-                        0,
-                        stackSize));
-                }
+                    return BuildAbiArgumentSlices(argType, ref general, ref floating, ref stack);
+
+                ConsumeAbiValue(argType, ref general, ref floating, ref stack);
             }
 
-            throw new InvalidOperationException("Invalid ABI argument index.");
+            return ImmutableArray<AbiArgumentSlice>.Empty;
+        }
+
+        private ImmutableArray<AbiArgumentSlice> BuildAbiArgumentSlices(RuntimeType type, ref int general, ref int floating, ref int stack)
+        {
+            var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+            switch (abi.PassingKind)
+            {
+                case AbiValuePassingKind.Void:
+                    return ImmutableArray<AbiArgumentSlice>.Empty;
+
+                case AbiValuePassingKind.ScalarRegister:
+                    {
+                        RegisterClass registerClass = abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass;
+                        int size = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                        AbiArgumentLocation loc = AssignScalarAbiLocation(registerClass, size, ref general, ref floating, ref stack);
+                        return ImmutableArray.Create(new AbiArgumentSlice(loc, registerClass, 0, size, abi.ContainsGcPointers));
+                    }
+
+                case AbiValuePassingKind.MultiRegister:
+                    {
+                        var segments = MachineAbi.GetRegisterSegments(abi);
+                        var builder = ImmutableArray.CreateBuilder<AbiArgumentSlice>(segments.Length);
+                        int aggregateStackSlot = -1;
+                        int aggregateStackBaseOffset = 0;
+                        for (int i = 0; i < segments.Length; i++)
+                        {
+                            AbiRegisterSegment segment = segments[i];
+                            AbiArgumentLocation loc = AssignAggregateSegmentAbiLocation(
+                                segment,
+                                ref general,
+                                ref floating,
+                                ref stack,
+                                ref aggregateStackSlot,
+                                ref aggregateStackBaseOffset);
+                            builder.Add(new AbiArgumentSlice(loc, segment.RegisterClass, segment.Offset, segment.Size, segment.ContainsGcPointers));
+                        }
+                        return builder.ToImmutable();
+                    }
+
+                case AbiValuePassingKind.Stack:
+                case AbiValuePassingKind.Indirect:
+                    {
+                        int size = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                        AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, size);
+                        return ImmutableArray.Create(new AbiArgumentSlice(loc, RegisterClass.General, 0, size, abi.ContainsGcPointers));
+                    }
+
+                default:
+                    throw new InvalidOperationException("Unsupported ABI argument passing kind: " + abi.PassingKind);
+            }
         }
 
         private void ConsumeAbiValue(RuntimeType type, ref int general, ref int floating, ref int stack)
@@ -3947,13 +3135,6 @@ namespace Cnidaria.Cs
                 return;
             }
             stack++;
-        }
-
-        private static void ConsumeHiddenReturnBuffer(ref int general, ref int stack)
-        {
-            MachineRegister r = MachineRegisters.GetIntegerArgumentRegister(general++);
-            if (r == MachineRegister.Invalid)
-                stack++;
         }
 
         private long ReadAbiValueBits(RuntimeMethod method, int logicalIndex, RuntimeType type, int size)
@@ -4013,7 +3194,7 @@ namespace Cnidaria.Cs
                 2 => ReadU16(abs),
                 4 => unchecked((uint)ReadI32(abs)),
                 8 => ReadI64(abs),
-                _ => throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString()),
+                _ => throw new InvalidOperationException($"Unsupported ABI scalar bit size: {size}"),
             };
         }
 
@@ -4025,7 +3206,7 @@ namespace Cnidaria.Cs
                 case 2: WriteU16(abs, unchecked((ushort)value)); return;
                 case 4: WriteI32(abs, unchecked((int)value)); return;
                 case 8: WriteI64(abs, value); return;
-                default: throw new InvalidOperationException("Unsupported ABI scalar bit size: " + size.ToString());
+                default: throw new InvalidOperationException($"Unsupported ABI scalar bit size: {size}");
             }
         }
 
@@ -4083,12 +3264,9 @@ namespace Cnidaria.Cs
 
         private void SetThisArgumentReference(RuntimeMethod method, long value)
         {
-            int general = 0, floating = 0, stack = 0;
-            var loc = AssignScalarAbiLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref general, ref floating, ref stack);
-            if (loc.IsRegister)
-                SetGpr(loc.Register, value);
-            else
-                WriteNative(GetOutgoingArgAddress(loc.StackSlotIndex) + loc.StackOffset, value);
+            if (!method.HasThis)
+                throw new InvalidOperationException("Method has no this argument.");
+            WriteAbiScalarArgument(method, 0, value);
         }
 
         private long ReadAbiScalarArgument(RuntimeMethod method, int logicalIndex)
@@ -4114,6 +3292,29 @@ namespace Cnidaria.Cs
             }
 
             return ReadAbiAggregateAddress(method, logicalIndex);
+        }
+
+        private void WriteAbiScalarArgument(RuntimeMethod method, int logicalIndex, long value)
+        {
+            RuntimeType type = GetLogicalArgumentType(method, logicalIndex);
+            var slices = GetAbiArgumentSlices(method, logicalIndex);
+            if (slices.Length == 0)
+                return;
+            if (slices.Length != 1)
+                throw new InvalidOperationException("Scalar ABI write expected a single storage location.");
+
+            AbiArgumentSlice slice = slices[0];
+            if (slice.Location.IsRegister)
+            {
+                if (slice.RegisterClass == RegisterClass.Float)
+                    SetFpr((byte)slice.Location.Register, value);
+                else
+                    SetGpr(slice.Location.Register, value);
+                return;
+            }
+
+            int size = Math.Min(slice.Size, Math.Max(1, Math.Min(StorageSizeOf(type), TargetArchitecture.PointerSize)));
+            WriteRawBits(GetAbiStackArgumentAddress(method, slice.Location), value, size);
         }
 
         private long ReadAbiAggregateAddress(RuntimeMethod method, int logicalIndex)
@@ -4206,20 +3407,16 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("No current method for outgoing argument address.");
 
             MethodRecord method = _image.Methods[_currentMethodIndex];
-            int outgoingBaseOffset = 0;
-            if (method.OutgoingArgumentAreaSize != 0)
-            {
-                outgoingBaseOffset = method.OutgoingArgumentAreaOffset;
-                if (outgoingBaseOffset < 0)
-                    throw new InvalidOperationException("Corrupted method outgoing argument area metadata.");
-            }
+            int outgoingBaseOffset = method.OutgoingArgumentAreaOffset;
+            if (outgoingBaseOffset < 0)
+                throw new InvalidOperationException("Corrupted method outgoing argument area metadata.");
 
             long frameBase = (((MethodFlags)method.Flags & MethodFlags.UsesFramePointer) != 0)
                 ? X(MachineRegisters.FramePointer)
                 : X(MachineRegisters.StackPointer);
 
             int addr = checked((int)frameBase + outgoingBaseOffset);
-            CheckStackRange(addr, method.OutgoingArgumentAreaSize);
+            CheckStackRange(addr, 0);
             return addr;
         }
 
@@ -4227,12 +3424,8 @@ namespace Cnidaria.Cs
         {
             if (stackIndex < 0) throw new ArgumentOutOfRangeException(nameof(stackIndex));
 
-            MethodRecord method = _image.Methods[_currentMethodIndex];
             int slotSize = MachineAbi.StackArgumentSlotSize;
             int slotOffset = checked(stackIndex * slotSize);
-            if (method.OutgoingArgumentAreaSize != 0 && slotOffset + slotSize > method.OutgoingArgumentAreaSize)
-                throw new InvalidOperationException("ABI stack argument slot is outside caller outgoing argument area.");
-
             int addr = checked(GetCurrentOutgoingArgumentBase() + slotOffset);
             CheckStackRange(addr, slotSize);
             return addr;
@@ -4313,7 +3506,9 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            int retBuffer = checked((int)ReadHiddenReturnBufferAddress(_activeCallTargetMethod ?? CurrentFrameMethod()));
+            if (_activeCallTargetMethod is null)
+                throw new InvalidOperationException("Hidden return buffer requires an active internal call target.");
+            int retBuffer = checked((int)ReadHiddenReturnBufferAddress(_activeCallTargetMethod));
             CopyTypedObject(retBuffer, abs, type);
             SetReturnRef(retBuffer);
         }
@@ -4366,25 +3561,51 @@ namespace Cnidaria.Cs
             return (int)v;
         }
 
+        private int LoadVTableEntry(long receiverRef, int slot)
+        {
+            if (receiverRef == 0)
+                throw new NullReferenceException();
+            if (slot < 0)
+                throw new MissingMethodException($"Invalid virtual dispatch slot {slot}.");
+
+            int typeId = GetObjectRuntimeTypeId(receiverRef);
+            if (!_image.TypeLayoutIndexByRuntimeTypeId.TryGetValue(typeId, out int typeLayoutIndex))
+                throw new TypeLoadException($"Runtime type {typeId} has no execution layout.");
+
+            TypeLayoutRecord layout = TypeLayout(typeLayoutIndex);
+            if ((uint)slot >= (uint)layout.VTableCount || layout.VTableStartIndex < 0)
+                throw new MissingMethodException($"Virtual dispatch slot {slot} is absent for runtime type {typeId}.");
+
+            int vtableIndex = checked(layout.VTableStartIndex + slot);
+            if ((uint)vtableIndex >= (uint)_image.VTables.Length)
+                throw new MissingMethodException($"Virtual dispatch slot {slot} is outside the linked vtable for runtime type {typeId}.");
+
+            int targetPc = _image.VTables[vtableIndex].TargetPc;
+            if (targetPc < 0)
+                throw new MissingMethodException($"Virtual dispatch slot {slot} has no linked target for runtime type {typeId}.");
+
+            return targetPc;
+        }
+
         private TypeLayoutRecord TypeLayout(long index)
         {
             int i = checked((int)index);
             if ((uint)i >= (uint)_image.TypeLayouts.Length)
-                throw new InvalidOperationException("Invalid type layout index: " + i.ToString());
+                throw new InvalidOperationException($"Invalid type layout index: {i}");
             return _image.TypeLayouts[i];
         }
 
-        private FieldLayoutRecord FieldLayout(long index)
+        private int TypeLayoutIndexForRuntimeType(RuntimeType type)
         {
-            int i = checked((int)index);
-            if ((uint)i >= (uint)_image.FieldLayouts.Length)
-                throw new InvalidOperationException("Invalid field layout index: " + i.ToString());
-            return _image.FieldLayouts[i];
+            if (!_image.TypeLayoutIndexByRuntimeTypeId.TryGetValue(type.TypeId, out int index))
+                throw new TypeLoadException($"Runtime type {type.TypeId} has no execution layout.");
+            return index;
         }
+
 
         private void LoadFieldInt(InstrDesc ins, int size, bool signed)
         {
-            int abs = GetInstanceFieldAddress(FieldLayout(ins.Imm), GetGpr(ins.Rs1), false);
+            int abs = GetInstanceFieldAddress(ins, GetGpr(ins.Rs1), false);
             long v = size switch
             {
                 1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
@@ -4393,19 +3614,6 @@ namespace Cnidaria.Cs
             };
             SetGpr(ins.Rd, v);
         }
-
-        private void LoadStaticFieldInt(InstrDesc ins, int size, bool signed)
-        {
-            int abs = GetStaticFieldAddress(FieldLayout(ins.Imm));
-            long v = size switch
-            {
-                1 => signed ? (sbyte)ReadU8(abs) : ReadU8(abs),
-                2 => signed ? (short)ReadU16(abs) : ReadU16(abs),
-                _ => throw new ArgumentOutOfRangeException(nameof(size)),
-            };
-            SetGpr(ins.Rd, v);
-        }
-
 
         private int ArrayEA(InstrDesc ins)
         {
@@ -4424,53 +3632,37 @@ namespace Cnidaria.Cs
             };
             SetGpr(ins.Rd, v);
         }
-        private int GetInstanceFieldAddress(FieldLayoutRecord field, long receiver, bool writable)
+        private int GetInstanceFieldAddress(InstrDesc instruction, long receiver, bool writable)
         {
-            if (field.IsStatic)
-                throw new InvalidOperationException("Instance field access used for static field.");
+            int offset = InstrDesc.FieldOffset(instruction.Imm);
+            int size = InstrDesc.FieldSize(instruction.Imm);
+            FieldAccessFlags flags = Aux.FieldFlags(instruction.Aux);
+            bool declaringTypeIsValueType = (flags & FieldAccessFlags.DeclaringTypeIsValueType) != 0;
+            return GetInstanceFieldAddress(offset, size, declaringTypeIsValueType, receiver, writable);
+        }
 
+        private int GetInstanceFieldAddress(int offset, int size, bool declaringTypeIsValueType, long receiver, bool writable)
+        {
             if (receiver == 0)
                 throw new NullReferenceException();
             if (receiver < int.MinValue || receiver > int.MaxValue)
                 throw new AccessViolationException("Field receiver is outside VM address space.");
 
             int receiverAbs = (int)receiver;
+            bool boxedValueReceiver = declaringTypeIsValueType && TryGetObjectTypeIdFromExactRef(receiverAbs, out _);
+            int abs = checked(receiverAbs + (boxedValueReceiver ? ObjectHeaderSize : 0) + offset);
 
-            if (!field.DeclaringTypeIsValueType)
+            if (declaringTypeIsValueType && !boxedValueReceiver)
             {
-                int abs = checked(receiverAbs + field.Offset);
-                CheckHeapAccess(abs, field.Size);
-                if (writable) CheckWritableRange(abs, field.Size);
+                CheckIndirectAccess(abs, size, writable);
                 return abs;
             }
 
-            TypeLayoutRecord declaringType = TypeLayout(field.DeclaringTypeLayoutIndex);
-            if (TryGetObjectTypeIdFromExactRef(receiverAbs, out int actualTypeId))
-            {
-                if (actualTypeId != declaringType.RuntimeTypeId)
-                    throw new InvalidOperationException("Boxed value field receiver type mismatch.");
-
-                int boxed = checked(receiverAbs + ObjectHeaderSize + field.Offset);
-                CheckHeapAccess(boxed, field.Size);
-                if (writable) CheckWritableRange(boxed, field.Size);
-                return boxed;
-            }
-
-            int byrefAbs = checked(receiverAbs + field.Offset);
-            CheckIndirectAccess(byrefAbs, field.Size, writable);
-            return byrefAbs;
-        }
-
-        private int GetStaticFieldAddress(FieldLayoutRecord field)
-        {
-            if (!field.IsStatic)
-                throw new InvalidOperationException("Static field access used for instance field.");
-            TypeLayoutRecord declaringType = TypeLayout(field.DeclaringTypeLayoutIndex);
-            int baseAbs = EnsureStaticStorage(declaringType);
-            int abs = checked(baseAbs + field.Offset);
-            CheckHeapAccess(abs, field.Size);
+            CheckHeapAccess(abs, size);
+            if (writable) CheckWritableRange(abs, size);
             return abs;
         }
+
 
         private int EnsureStaticStorage(TypeLayoutRecord type)
         {
@@ -4515,6 +3707,18 @@ namespace Cnidaria.Cs
             if (abs + type.StaticSize > _heapFloor)
                 _heapFloor = abs + type.StaticSize;
             return abs;
+        }
+
+        private int AllocObject(TypeLayoutRecord type)
+        {
+            int payloadSize = type.IsValueType ? type.Size : Math.Max(0, type.InstanceSize - ObjectHeaderSize);
+            int size = checked(ObjectHeaderSize + payloadSize);
+            int obj = AllocHeapBytes(Math.Max(ObjectHeaderSize, size), Math.Max(8, type.Align));
+            WriteI32(obj, type.RuntimeTypeId);
+            WriteI32(obj + 4, GcFlagAllocated);
+            if (size > ObjectHeaderSize)
+                _mem.AsSpan(obj + ObjectHeaderSize, size - ObjectHeaderSize).Clear();
+            return obj;
         }
 
         private int AllocObject(RuntimeType type)
@@ -5215,7 +4419,7 @@ namespace Cnidaria.Cs
             if (_currentExceptionRef != 0)
                 TryMarkObject(_currentExceptionRef);
 
-            MarkPendingPostReturnObjects();
+            MarkPendingContinuationRoots();
         }
 
         private void UpdateRootsAfterCompaction()
@@ -5267,7 +4471,7 @@ namespace Cnidaria.Cs
                     _internPool[kv.Key] = TranslateObjectRef(kv.Value);
             }
 
-            UpdatePendingPostReturnObjectsAfterCompaction();
+            UpdatePendingContinuationRootsAfterCompaction();
         }
 
         private void MarkFrameRoots(bool update)
@@ -5477,87 +4681,38 @@ namespace Cnidaria.Cs
 
             return false;
         }
-        private void MarkPendingPostReturnObjects()
+        private void MarkPendingContinuationRoots()
         {
             for (int frame = _stackBase; frame < _frameStackTop; frame += ShadowFrameSize)
             {
-                long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
-                if (obj != 0) TryMarkObject(checked((int)obj));
-
                 PendingContinuationKind kind = (PendingContinuationKind)((ReadI32(frame + ShadowFramePackedFlags) >> ShadowFrameContinuationKindShift) & 0xFF);
-                if (kind == PendingContinuationKind.MulticastDelegate)
-                {
-                    long continuation = ReadI64(frame + ShadowFrameContinuationI0);
-                    if (continuation != 0)
-                    {
-                        MarkMulticastContinuationRoots(checked((int)continuation));
-                    }
-                }
+                long value = ReadI64(frame + ShadowFrameContinuationI0);
+                if (value == 0)
+                    continue;
+
+                if (kind == PendingContinuationKind.ReturnReference)
+                    TryMarkObject(checked((int)value));
+                else if (kind == PendingContinuationKind.ReturnValueAddress)
+                    TryMarkObjectFromInteriorPointer(checked((int)value));
             }
         }
 
-        private void UpdatePendingPostReturnObjectsAfterCompaction()
+        private void UpdatePendingContinuationRootsAfterCompaction()
         {
             for (int frame = _stackBase; frame < _frameStackTop; frame += ShadowFrameSize)
             {
-                long obj = ReadI64(frame + ShadowFramePostReturnObjectRef);
-                if (obj != 0) WriteI64(frame + ShadowFramePostReturnObjectRef, TranslateObjectRef(checked((int)obj)));
-
                 PendingContinuationKind kind = (PendingContinuationKind)((ReadI32(frame + ShadowFramePackedFlags) >> ShadowFrameContinuationKindShift) & 0xFF);
-                if (kind == PendingContinuationKind.MulticastDelegate)
-                {
-                    long continuation = ReadI64(frame + ShadowFrameContinuationI0);
-                    if (continuation != 0)
-                    {
-                        UpdateMulticastContinuationRootsBeforeMove(checked((int)continuation));
-                    }
-                }
+                long value = ReadI64(frame + ShadowFrameContinuationI0);
+                if (value == 0)
+                    continue;
+
+                if (kind == PendingContinuationKind.ReturnReference)
+                    WriteI64(frame + ShadowFrameContinuationI0, TranslateObjectRef(checked((int)value)));
+                else if (kind == PendingContinuationKind.ReturnValueAddress)
+                    WriteI64(frame + ShadowFrameContinuationI0, TranslateInteriorPointer(checked((int)value)));
             }
         }
 
-        private void MarkMulticastContinuationRoots(int continuation)
-        {
-            int blob = continuation;
-
-            long delegateRef = ReadNative(blob + McDelegateRefOffset);
-            if (delegateRef != 0)
-                TryMarkObject(checked((int)delegateRef));
-
-            long hiddenReturnBuffer = ReadNative(blob + McHiddenReturnBufferOffset);
-            if (hiddenReturnBuffer != 0)
-                TryMarkObjectFromInteriorPointer(checked((int)hiddenReturnBuffer));
-
-            int argCount = ReadI32(blob + McArgCountOffset);
-            for (int i = 0; i < argCount; i++)
-            {
-                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
-                RuntimeType type = _rts.GetTypeById(ReadI32(rec + McArgTypeIdOffset));
-                int dataRel = ReadI32(rec + McArgDataRelOffset);
-                MarkManagedRefCellsInTypedStorage(blob + dataRel, type);
-            }
-        }
-
-        private void UpdateMulticastContinuationRootsBeforeMove(int continuation)
-        {
-            int blob = continuation;
-
-            long delegateRef = ReadNative(blob + McDelegateRefOffset);
-            if (delegateRef != 0)
-                WriteNative(blob + McDelegateRefOffset, TranslateObjectRef(checked((int)delegateRef)));
-
-            long hiddenReturnBuffer = ReadNative(blob + McHiddenReturnBufferOffset);
-            if (hiddenReturnBuffer != 0)
-                WriteNative(blob + McHiddenReturnBufferOffset, TranslateInteriorPointer(checked((int)hiddenReturnBuffer)));
-
-            int argCount = ReadI32(blob + McArgCountOffset);
-            for (int i = 0; i < argCount; i++)
-            {
-                int rec = blob + McArgRecordsOffset + i * McArgRecordSize;
-                RuntimeType type = _rts.GetTypeById(ReadI32(rec + McArgTypeIdOffset));
-                int dataRel = ReadI32(rec + McArgDataRelOffset);
-                UpdateManagedRefCellsInTypedStorage(blob + dataRel, type);
-            }
-        }
         private int CurrentFrameRootAddress(GcRootRecord root)
             => checked((int)CurrentFrameBase((RegisterFrameBase)root.FrameBase) + root.FrameOffset);
         private long CurrentFrameBase(RegisterFrameBase frameBase)
@@ -6070,7 +5225,7 @@ namespace Cnidaria.Cs
         private int CheckedTarget(long target)
         {
             if (target < 0 || target >= _image.Code.Length)
-                throw new InvalidOperationException("Invalid branch target PC: " + target.ToString());
+                throw new InvalidOperationException($"Invalid branch target PC: {target}");
             return (int)target;
         }
 
@@ -6799,7 +5954,7 @@ namespace Cnidaria.Cs
                 case 2: return type.IsUnsignedSmall || type.IsChar ? ReadU16(abs) : unchecked((short)ReadU16(abs));
                 case 4: return type.IsUnsignedSmall ? unchecked((uint)ReadI32(abs)) : ReadI32(abs);
                 case 8: return ReadI64(abs);
-                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+                default: throw new InvalidOperationException($"Unsupported scalar size: {size}");
             }
         }
 
@@ -6817,7 +5972,7 @@ namespace Cnidaria.Cs
                 case 2: WriteU16(abs, unchecked((ushort)value)); return;
                 case 4: WriteI32(abs, unchecked((int)value)); return;
                 case 8: WriteI64(abs, value); return;
-                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+                default: throw new InvalidOperationException($"Unsupported scalar size: {size}");
             }
         }
 
@@ -6832,7 +5987,7 @@ namespace Cnidaria.Cs
                 case 2: return IsUnsignedSmall(type) || IsCharType(type) ? ReadU16(abs) : unchecked((short)ReadU16(abs));
                 case 4: return IsUnsignedSmall(type) ? unchecked((uint)ReadI32(abs)) : ReadI32(abs);
                 case 8: return ReadI64(abs);
-                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+                default: throw new InvalidOperationException($"Unsupported scalar size: {size}");
             }
         }
 
@@ -6850,7 +6005,7 @@ namespace Cnidaria.Cs
                 case 2: WriteU16(abs, unchecked((ushort)value)); return;
                 case 4: WriteI32(abs, unchecked((int)value)); return;
                 case 8: WriteI64(abs, value); return;
-                default: throw new InvalidOperationException("Unsupported scalar size: " + size.ToString());
+                default: throw new InvalidOperationException($"Unsupported scalar size: {size}");
             }
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -7091,193 +6246,6 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private RuntimeMethod ResolveVirtualDispatch(RuntimeType actual, RuntimeMethod declared)
-        {
-            if (actual is null) throw new ArgumentNullException(nameof(actual));
-            if (declared is null) throw new ArgumentNullException(nameof(declared));
-
-            if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
-            {
-                for (RuntimeType? t = actual; t is not null; t = t.BaseType)
-                {
-                    RuntimeMethod? explicitImpl = TryResolveExplicitInterfaceImpl(t, declared);
-                    if (explicitImpl is not null)
-                        return explicitImpl;
-                }
-
-                RuntimeMethod? implicitImpl = FindMostDerivedMethodByNameAndSig(actual, declared);
-                if (implicitImpl is not null)
-                    return implicitImpl;
-
-                throw new MissingMethodException(
-                    "Interface method not implemented: " +
-                    declared.DeclaringType.Namespace + "." +
-                    declared.DeclaringType.Name + "." +
-                    declared.Name);
-            }
-
-            int slot = declared.VTableSlot;
-            if (slot >= 0 && (uint)slot < (uint)actual.VTable.Length)
-                return actual.VTable[slot];
-
-            return FindMostDerivedMethodByNameAndSig(actual, declared) ?? declared;
-        }
-        private RuntimeMethod? TryResolveExplicitInterfaceImpl(RuntimeType implementationType, RuntimeMethod declared)
-        {
-            var map = implementationType.ExplicitInterfaceMethodImpls;
-            if (map is null || map.Count == 0)
-                return null;
-
-            if (map.TryGetValue(declared.MethodId, out RuntimeMethod? exact))
-                return ProjectRuntimeMethodToOwner(implementationType, exact);
-
-            foreach (var kv in map)
-            {
-                RuntimeMethod ifaceMethod;
-
-                try
-                {
-                    ifaceMethod = _rts.GetMethodById(kv.Key);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (!SameInterfaceMethodIdentity(ifaceMethod, declared))
-                    continue;
-
-                return ProjectRuntimeMethodToOwner(implementationType, kv.Value);
-            }
-
-            return null;
-        }
-        private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
-        {
-            if (method.DeclaringType.TypeId == owner.TypeId)
-                return method;
-
-            _rts.EnsureConstructedMembers(owner);
-
-            RuntimeMethod[] methods = owner.Methods;
-            for (int i = 0; i < methods.Length; i++)
-            {
-                RuntimeMethod candidate = methods[i];
-
-                if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name))
-                    continue;
-
-                if (candidate.GenericArity != method.GenericArity)
-                    continue;
-
-                if (candidate.IsStatic != method.IsStatic)
-                    continue;
-
-                if (candidate.Body is not null &&
-                    method.Body is not null &&
-                    ReferenceEquals(candidate.Body, method.Body))
-                {
-                    return candidate;
-                }
-
-                if (SameSigRuntime(candidate, method))
-                    return candidate;
-            }
-
-            return method;
-        }
-        private static bool SameInterfaceMethodIdentity(RuntimeMethod ifaceMethod, RuntimeMethod declared)
-        {
-            if (!StringComparer.Ordinal.Equals(ifaceMethod.Name, declared.Name))
-                return false;
-
-            if (ifaceMethod.GenericArity != declared.GenericArity)
-                return false;
-
-            if (!SameRuntimeTypeDefinitionOrExact(ifaceMethod.DeclaringType, declared.DeclaringType))
-                return false;
-
-            if (ifaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length)
-                return false;
-
-            if (!CompatibleInterfaceSignatureType(ifaceMethod.ReturnType, declared.ReturnType))
-                return false;
-
-            for (int i = 0; i < ifaceMethod.ParameterTypes.Length; i++)
-            {
-                if (!CompatibleInterfaceSignatureType(ifaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
-                    return false;
-            }
-
-            return true;
-        }
-        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-
-            RuntimeType ad = a.GenericTypeDefinition ?? a;
-            RuntimeType bd = b.GenericTypeDefinition ?? b;
-
-            return ad.TypeId == bd.TypeId;
-        }
-        private static bool CompatibleInterfaceSignatureType(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-
-            if (a.Kind == RuntimeTypeKind.TypeParam || b.Kind == RuntimeTypeKind.TypeParam)
-                return true;
-
-            return SameRuntimeTypeDefinitionOrExact(a, b);
-        }
-        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
-        {
-            for (RuntimeType? cur = actual; cur is not null; cur = cur.BaseType)
-            {
-                RuntimeMethod[] methods = cur.Methods;
-
-                for (int i = 0; i < methods.Length; i++)
-                {
-                    RuntimeMethod m = methods[i];
-
-                    if (m.IsStatic)
-                        continue;
-
-                    if (m.IsPrivate)
-                        continue;
-
-                    if (!StringComparer.Ordinal.Equals(m.Name, declared.Name))
-                        continue;
-
-                    if (!SameSigRuntime(m, declared))
-                        continue;
-
-                    return m;
-                }
-            }
-
-            return null;
-        }
-        private static bool SameSigRuntime(RuntimeMethod a, RuntimeMethod b)
-        {
-            if (a.GenericArity != b.GenericArity)
-                return false;
-
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length)
-                return false;
-
-            if (a.ReturnType.TypeId != b.ReturnType.TypeId)
-                return false;
-
-            for (int i = 0; i < a.ParameterTypes.Length; i++)
-            {
-                if (a.ParameterTypes[i].TypeId != b.ParameterTypes[i].TypeId)
-                    return false;
-            }
-
-            return true;
-        }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool TypeIsReferenceOrContainsReferences(RuntimeType type)
         {

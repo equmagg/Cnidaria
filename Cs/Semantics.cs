@@ -2440,6 +2440,7 @@ namespace Cnidaria.Cs
         ArrayInitializer,
         ArrayCreation,
         ArrayElementAccess,
+        InlineArrayElementAccess,
         StackAllocArrayCreation,
         StaticData,
         SpanCollection,

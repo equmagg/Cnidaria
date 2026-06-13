@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Numerics;
 using System.Text;
 
@@ -15,6 +16,7 @@ namespace Cnidaria.Cs
         SingleLineDocCommentTrivia,
         MultiLineDocCommentTrivia,
         PreprocessorDirectiveTrivia,
+        DisabledTextTrivia,
 
         SkippedTokensTrivia
     }
@@ -39,7 +41,7 @@ namespace Cnidaria.Cs
         }
         public override bool Equals(object? obj)
         {
-            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length ;
+            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length;
         }
         public override int GetHashCode()
         {
@@ -186,6 +188,16 @@ namespace Cnidaria.Cs
     public sealed class LexerOptions
     {
         public bool IncludeTrivia { get; set; } = true;
+
+        /// <summary>
+        /// Target pointer size used to synthesize TARGET_32BIT/TARGET_64BIT symbols.
+        /// </summary>
+        public int TargetPointerSize { get; set; } = IntPtr.Size;
+
+        /// <summary>
+        /// Initial conditional compilation symbols.
+        /// </summary>
+        public HashSet<string> PreprocessorSymbols { get; } = new HashSet<string>(StringComparer.Ordinal);
     }
     internal static partial class SyntaxFacts
     {
@@ -384,6 +396,33 @@ namespace Cnidaria.Cs
             ["with"] = SyntaxKind.WithKeyword,
             ["yield"] = SyntaxKind.YieldKeyword,
         };
+        public static readonly Dictionary<string, SyntaxKind> PreprocessorKeywords = new(StringComparer.Ordinal)
+        {
+            ["if"] = SyntaxKind.IfKeyword,
+            ["elif"] = SyntaxKind.ElifKeyword,
+            ["else"] = SyntaxKind.ElseKeyword,
+            ["endif"] = SyntaxKind.EndIfKeyword,
+            ["define"] = SyntaxKind.DefineKeyword,
+            ["undef"] = SyntaxKind.UndefKeyword,
+            ["warning"] = SyntaxKind.WarningKeyword,
+            ["error"] = SyntaxKind.ErrorKeyword,
+            ["region"] = SyntaxKind.RegionKeyword,
+            ["endregion"] = SyntaxKind.EndRegionKeyword,
+            ["line"] = SyntaxKind.LineKeyword,
+            ["pragma"] = SyntaxKind.PragmaKeyword,
+            ["nullable"] = SyntaxKind.NullableKeyword,
+            ["load"] = SyntaxKind.LoadKeyword,
+            ["r"] = SyntaxKind.ReferenceKeyword,
+            ["reference"] = SyntaxKind.ReferenceKeyword,
+            ["hidden"] = SyntaxKind.HiddenKeyword,
+            ["checksum"] = SyntaxKind.ChecksumKeyword,
+            ["disable"] = SyntaxKind.DisableKeyword,
+            ["restore"] = SyntaxKind.RestoreKeyword,
+            ["enable"] = SyntaxKind.EnableKeyword,
+            ["warnings"] = SyntaxKind.WarningsKeyword,
+            ["annotations"] = SyntaxKind.AnnotationsKeyword,
+        };
+
         // Longest match operator table
         public static readonly (string Text, SyntaxKind Kind)[] Operators =
         {
@@ -471,7 +510,32 @@ namespace Cnidaria.Cs
         public static bool IsKeyword(SyntaxKind kind)
             => IsReservedKeyword(kind) || IsContextualKeyword(kind);
 
-        public static bool IsPreprocessorKeyword(SyntaxKind kind) => false;
+        public static bool TryGetPreprocessorKeyword(string identifierValueText, out SyntaxKind kind)
+            => PreprocessorKeywords.TryGetValue(identifierValueText, out kind);
+
+        public static bool IsPreprocessorKeyword(SyntaxKind kind)
+            => kind == SyntaxKind.IfKeyword ||
+               kind == SyntaxKind.ElseKeyword ||
+               kind == SyntaxKind.ElifKeyword ||
+               kind == SyntaxKind.EndIfKeyword ||
+               kind == SyntaxKind.RegionKeyword ||
+               kind == SyntaxKind.EndRegionKeyword ||
+               kind == SyntaxKind.DefineKeyword ||
+               kind == SyntaxKind.UndefKeyword ||
+               kind == SyntaxKind.WarningKeyword ||
+               kind == SyntaxKind.ErrorKeyword ||
+               kind == SyntaxKind.LineKeyword ||
+               kind == SyntaxKind.PragmaKeyword ||
+               kind == SyntaxKind.HiddenKeyword ||
+               kind == SyntaxKind.ChecksumKeyword ||
+               kind == SyntaxKind.DisableKeyword ||
+               kind == SyntaxKind.RestoreKeyword ||
+               kind == SyntaxKind.ReferenceKeyword ||
+               kind == SyntaxKind.LoadKeyword ||
+               kind == SyntaxKind.NullableKeyword ||
+               kind == SyntaxKind.EnableKeyword ||
+               kind == SyntaxKind.WarningsKeyword ||
+               kind == SyntaxKind.AnnotationsKeyword;
     }
     public static class CSharpExtensions
     {
@@ -527,17 +591,38 @@ namespace Cnidaria.Cs
         private readonly string _text;
         private readonly LexerOptions _options;
 
+        private struct ConditionalFrame
+        {
+            public bool ParentActive;
+            public bool BranchActive;
+            public bool AnyBranchTaken;
+            public bool ElseSeen;
+            public int DirectiveStart;
+        }
+
         private int _pos;
         private bool _atStartOfLine = true;
         private LexMode _mode = LexMode.Normal;
         private InterpolatedState _is;
         private int _interpBraceDepth;
+        private bool _seenNonDirectiveToken;
+        private bool _reportedUnterminatedPreprocessor;
+        private readonly HashSet<string> _preprocessorSymbols;
+        private readonly List<ConditionalFrame> _conditionalStack = new();
         public List<SyntaxDiagnostic> Diagnostics { get; } = new List<SyntaxDiagnostic>();
 
         public Lexer(string text, LexerOptions? options = null)
         {
             _text = text ?? string.Empty;
             _options = options ?? new LexerOptions();
+            _preprocessorSymbols = new HashSet<string>(_options.PreprocessorSymbols, StringComparer.Ordinal);
+
+            if (_options.TargetPointerSize == 8)
+                _preprocessorSymbols.Add("TARGET_64BIT");
+            else if (_options.TargetPointerSize == 4)
+                _preprocessorSymbols.Add("TARGET_32BIT");
+            else
+                Diagnostics.Add(new SyntaxDiagnostic(0, "LexerOptions.TargetPointerSize must be 4 or 8."));
         }
         private void PushFrame()
         {
@@ -580,23 +665,28 @@ namespace Cnidaria.Cs
             if (_mode == LexMode.InterpolationFormat)
                 return LexInterpolationFormatToken();
 
-            // Normal mode
-            SyntaxTrivia[] leading = Array.Empty<SyntaxTrivia>();
+            // Normal mode. Preprocessor state is advanced here, so the parser only sees
+            // tokens from active conditional-compilation regions.
+            SyntaxTrivia[] leading = ReadLeadingTriviaAndSkippedText();
             SyntaxTrivia[] trailing = Array.Empty<SyntaxTrivia>();
-
-            if (_options.IncludeTrivia)
-                leading = ReadTrivia(isLeading: true);
 
             // Try start interpolated string
             if (TryStartInterpolatedString(leading, out var startTok))
             {
+                _seenNonDirectiveToken = true;
                 return startTok;
             }
 
             var token = ReadTokenCore(leading);
 
+            if (token.Kind != SyntaxKind.EndOfFileToken)
+                _seenNonDirectiveToken = true;
+            else
+                ReportUnterminatedPreprocessorDirectivesIfNeeded();
+
+            var rawTrailing = ReadTrivia(isLeading: false);
             if (_options.IncludeTrivia)
-                trailing = ReadTrivia(isLeading: false);
+                trailing = rawTrailing;
 
             return new SyntaxToken(
                 token.Kind,
@@ -863,9 +953,9 @@ namespace Cnidaria.Cs
         }
         private SyntaxToken LexInterpolationExpressionToken()
         {
-            SyntaxTrivia[] leading = Array.Empty<SyntaxTrivia>();
-            if (_options.IncludeTrivia)
-                leading = ReadTrivia(isLeading: true);
+            SyntaxTrivia[] leading = ReadTrivia(isLeading: true);
+            if (!_options.IncludeTrivia)
+                leading = Array.Empty<SyntaxTrivia>();
             if (_interpBraceDepth == 0 && IsAtInterpolationEndDelimiter())
             {
                 int start = _pos;
@@ -880,9 +970,9 @@ namespace Cnidaria.Cs
 
             var core = ReadTokenCore(leading);
 
-            SyntaxTrivia[] trailing = Array.Empty<SyntaxTrivia>();
-            if (_options.IncludeTrivia)
-                trailing = ReadTrivia(isLeading: false);
+            SyntaxTrivia[] trailing = ReadTrivia(isLeading: false);
+            if (!_options.IncludeTrivia)
+                trailing = Array.Empty<SyntaxTrivia>();
 
             var tok = new SyntaxToken(
                 core.Kind,
@@ -1588,7 +1678,7 @@ namespace Cnidaria.Cs
             else
                 ReadIntegerSuffixIfAny();
 
-            ComputeTokenValue:
+        ComputeTokenValue:
 
             var span = new TextSpan(start, _pos - start);
             var text = _text.AsSpan(span.Start, span.Length);
@@ -1925,10 +2015,10 @@ namespace Cnidaria.Cs
                         bool isU8 = TryConsumeU8Suffix();
                         SyntaxKind kind;
                         if (isU8)
-                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken 
+                            kind = isMultiLine ? SyntaxKind.Utf8MultiLineRawStringLiteralToken
                                 : SyntaxKind.Utf8SingleLineRawStringLiteralToken;
                         else
-                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken 
+                            kind = isMultiLine ? SyntaxKind.MultiLineRawStringLiteralToken
                                 : SyntaxKind.SingleLineRawStringLiteralToken;
 
                         var span = new TextSpan(start, _pos - start);
@@ -2028,6 +2118,631 @@ namespace Cnidaria.Cs
                 _pos++;
             return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, _pos - start), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
         }
+        private SyntaxTrivia[] ReadLeadingTriviaAndSkippedText()
+        {
+            List<SyntaxTrivia>? merged = null;
+
+            while (true)
+            {
+                var trivia = ReadTrivia(isLeading: true);
+                AppendTrivia(ref merged, trivia);
+
+                if (IsPreprocessorActive())
+                    return FinishTrivia(merged, trivia);
+
+                SkipDisabledText(ref merged);
+
+                if (IsAtEnd())
+                    return FinishTrivia(merged, Array.Empty<SyntaxTrivia>());
+            }
+        }
+
+        private SyntaxTrivia[] FinishTrivia(List<SyntaxTrivia>? merged, SyntaxTrivia[] last)
+        {
+            if (!_options.IncludeTrivia)
+                return Array.Empty<SyntaxTrivia>();
+
+            return merged == null ? last : merged.ToArray();
+        }
+
+        private static void AppendTrivia(ref List<SyntaxTrivia>? target, SyntaxTrivia[] trivia)
+        {
+            if (trivia == null || trivia.Length == 0)
+                return;
+
+            target ??= new List<SyntaxTrivia>(trivia.Length + 4);
+            target.AddRange(trivia);
+        }
+
+        private static void AppendTrivia(ref List<SyntaxTrivia>? target, SyntaxTrivia trivia)
+        {
+            target ??= new List<SyntaxTrivia>(8);
+            target.Add(trivia);
+        }
+
+        private bool IsPreprocessorActive()
+        {
+            return _conditionalStack.Count == 0 || _conditionalStack[_conditionalStack.Count - 1].BranchActive;
+        }
+
+        private void SkipDisabledText(ref List<SyntaxTrivia>? trivia)
+        {
+            while (!IsAtEnd() && !IsPreprocessorActive())
+            {
+                if (TryPeekDirectiveStartOnCurrentLine(out int hashPos))
+                {
+                    if (hashPos > _pos)
+                    {
+                        AppendTrivia(ref trivia, new SyntaxTrivia(
+                            TriviaKind.DisabledTextTrivia,
+                            new TextSpan(_pos, hashPos - _pos)));
+                        _pos = hashPos;
+                    }
+
+                    AppendTrivia(ref trivia, ReadPreprocessorDirectiveTrivia());
+                    continue;
+                }
+
+                int start = _pos;
+                while (!IsAtEnd())
+                {
+                    if (TryPeekDirectiveStartOnCurrentLine(out _))
+                        break;
+
+                    char c = Current();
+                    if (IsNewLineChar(c))
+                    {
+                        ConsumeNewLine();
+                        _atStartOfLine = true;
+                        continue;
+                    }
+
+                    if (!IsWhitespaceButNotNewLine(c))
+                        _atStartOfLine = false;
+
+                    _pos++;
+                }
+
+                if (_pos > start)
+                {
+                    AppendTrivia(ref trivia, new SyntaxTrivia(
+                        TriviaKind.DisabledTextTrivia,
+                        new TextSpan(start, _pos - start)));
+                }
+            }
+        }
+
+        private bool TryPeekDirectiveStartOnCurrentLine(out int hashPos)
+        {
+            hashPos = -1;
+            if (!_atStartOfLine)
+                return false;
+
+            int p = _pos;
+            while (p < _text.Length && IsWhitespaceButNotNewLine(_text[p]))
+                p++;
+
+            if (p < _text.Length && _text[p] == '#')
+            {
+                hashPos = p;
+                return true;
+            }
+
+            return false;
+        }
+
+        private SyntaxTrivia ReadPreprocessorDirectiveTrivia()
+        {
+            int directiveStart = _pos;
+            _pos++; // #
+
+            while (!IsAtEnd() && IsWhitespaceButNotNewLine(Current()))
+                _pos++;
+
+            int keywordStart = _pos;
+            while (!IsAtEnd() && (Current() == '_' || IsIdentifierPartChar(Current())))
+                _pos++;
+
+            string keyword = keywordStart == _pos
+                ? string.Empty
+                : _text.Substring(keywordStart, _pos - keywordStart);
+
+            int argsStart = _pos;
+            while (!IsAtEnd() && !IsNewLineChar(Current()))
+                _pos++;
+
+            int directiveEnd = _pos;
+            ProcessPreprocessorDirective(keyword, argsStart, directiveEnd, directiveStart);
+
+            _atStartOfLine = false;
+            return new SyntaxTrivia(
+                TriviaKind.PreprocessorDirectiveTrivia,
+                new TextSpan(directiveStart, directiveEnd - directiveStart));
+        }
+
+        private void ProcessPreprocessorDirective(string keyword, int argsStart, int argsEnd, int directiveStart)
+        {
+            bool activeBeforeDirective = IsPreprocessorActive();
+
+            switch (keyword)
+            {
+                case "if":
+                    ProcessIfDirective(argsStart, argsEnd, directiveStart);
+                    return;
+
+                case "elif":
+                    ProcessElifDirective(argsStart, argsEnd, directiveStart);
+                    return;
+
+                case "else":
+                    ProcessElseDirective(argsStart, argsEnd, directiveStart);
+                    return;
+
+                case "endif":
+                    ProcessEndIfDirective(argsStart, argsEnd, directiveStart);
+                    return;
+
+                case "define":
+                    if (activeBeforeDirective)
+                        ProcessDefineOrUndefDirective(argsStart, argsEnd, directiveStart, define: true);
+                    return;
+
+                case "undef":
+                    if (activeBeforeDirective)
+                        ProcessDefineOrUndefDirective(argsStart, argsEnd, directiveStart, define: false);
+                    return;
+
+                case "error":
+                    if (activeBeforeDirective)
+                    {
+                        string message = GetDirectiveMessage(argsStart, argsEnd);
+                        Diagnostics.Add(new SyntaxDiagnostic(directiveStart, message.Length == 0
+                            ? "#error directive."
+                            : "#error: " + message));
+                    }
+                    return;
+
+                case "warning":
+                    // SyntaxDiagnostic has error severity only. Do not turn #warning into a build-stopping lexer error.
+                    return;
+
+                case "region":
+                case "endregion":
+                case "line":
+                case "pragma":
+                case "nullable":
+                case "r":
+                case "reference":
+                case "load":
+                    // Accepted and intentionally ignored by this lexer-level preprocessor.
+                    return;
+
+                case "":
+                    if (activeBeforeDirective)
+                        Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "Expected preprocessor directive keyword."));
+                    return;
+
+                default:
+                    if (activeBeforeDirective)
+                        Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "Unknown preprocessor directive '#" + keyword + "'."));
+                    return;
+            }
+        }
+
+        private void ProcessIfDirective(int argsStart, int argsEnd, int directiveStart)
+        {
+            bool parentActive = IsPreprocessorActive();
+            bool condition = EvaluatePreprocessorExpression(argsStart, argsEnd, directiveStart);
+            bool branchActive = parentActive && condition;
+
+            _conditionalStack.Add(new ConditionalFrame
+            {
+                ParentActive = parentActive,
+                BranchActive = branchActive,
+                AnyBranchTaken = branchActive,
+                ElseSeen = false,
+                DirectiveStart = directiveStart
+            });
+        }
+
+        private void ProcessElifDirective(int argsStart, int argsEnd, int directiveStart)
+        {
+            if (_conditionalStack.Count == 0)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "#elif without matching #if."));
+                return;
+            }
+
+            int index = _conditionalStack.Count - 1;
+            var frame = _conditionalStack[index];
+
+            if (frame.ElseSeen)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "#elif after #else."));
+                frame.BranchActive = false;
+                _conditionalStack[index] = frame;
+                return;
+            }
+
+            bool condition = EvaluatePreprocessorExpression(argsStart, argsEnd, directiveStart);
+            bool branchActive = frame.ParentActive && !frame.AnyBranchTaken && condition;
+
+            frame.BranchActive = branchActive;
+            frame.AnyBranchTaken |= branchActive;
+            _conditionalStack[index] = frame;
+        }
+
+        private void ProcessElseDirective(int argsStart, int argsEnd, int directiveStart)
+        {
+            if (_conditionalStack.Count == 0)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "#else without matching #if."));
+                return;
+            }
+
+            if (HasNonCommentText(argsStart, argsEnd))
+                Diagnostics.Add(new SyntaxDiagnostic(argsStart, "Unexpected text after #else."));
+
+            int index = _conditionalStack.Count - 1;
+            var frame = _conditionalStack[index];
+
+            if (frame.ElseSeen)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "Duplicate #else directive."));
+                frame.BranchActive = false;
+                _conditionalStack[index] = frame;
+                return;
+            }
+
+            bool branchActive = frame.ParentActive && !frame.AnyBranchTaken;
+            frame.BranchActive = branchActive;
+            frame.AnyBranchTaken |= branchActive;
+            frame.ElseSeen = true;
+            _conditionalStack[index] = frame;
+        }
+
+        private void ProcessEndIfDirective(int argsStart, int argsEnd, int directiveStart)
+        {
+            if (_conditionalStack.Count == 0)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "#endif without matching #if."));
+                return;
+            }
+
+            if (HasNonCommentText(argsStart, argsEnd))
+                Diagnostics.Add(new SyntaxDiagnostic(argsStart, "Unexpected text after #endif."));
+
+            _conditionalStack.RemoveAt(_conditionalStack.Count - 1);
+        }
+
+        private void ProcessDefineOrUndefDirective(int argsStart, int argsEnd, int directiveStart, bool define)
+        {
+            if (_seenNonDirectiveToken)
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(directiveStart,
+                    define ? "#define must appear before the first token in the file." : "#undef must appear before the first token in the file."));
+                return;
+            }
+
+            int p = argsStart;
+            SkipDirectiveWhitespace(ref p, argsEnd);
+            int symbolStart = p;
+
+            if (!TryReadPreprocessorSymbolName(ref p, argsEnd, out string symbol))
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(symbolStart,
+                    define ? "Expected conditional compilation symbol after #define." : "Expected conditional compilation symbol after #undef."));
+                return;
+            }
+
+            if (symbol == "true" || symbol == "false")
+            {
+                Diagnostics.Add(new SyntaxDiagnostic(symbolStart, "Preprocessor symbol cannot be 'true' or 'false'."));
+                return;
+            }
+
+            if (HasNonCommentText(p, argsEnd))
+                Diagnostics.Add(new SyntaxDiagnostic(p, "Unexpected text after preprocessor symbol."));
+
+            if (define)
+                _preprocessorSymbols.Add(symbol);
+            else
+                _preprocessorSymbols.Remove(symbol);
+        }
+
+        private bool EvaluatePreprocessorExpression(int argsStart, int argsEnd, int directiveStart)
+        {
+            string expression = _text.Substring(argsStart, argsEnd - argsStart);
+            var parser = new PreprocessorExpressionParser(this, expression, argsStart);
+            return parser.ParseExpressionForDirective(directiveStart);
+        }
+
+        private string GetDirectiveMessage(int argsStart, int argsEnd)
+        {
+            int start = argsStart;
+            while (start < argsEnd && IsWhitespaceButNotNewLine(_text[start]))
+                start++;
+
+            int end = argsEnd;
+            while (end > start && IsWhitespaceButNotNewLine(_text[end - 1]))
+                end--;
+
+            return start >= end ? string.Empty : _text.Substring(start, end - start);
+        }
+
+        private bool HasNonCommentText(int start, int end)
+        {
+            int p = start;
+            while (p < end)
+            {
+                char c = _text[p];
+                if (IsWhitespaceButNotNewLine(c))
+                {
+                    p++;
+                    continue;
+                }
+
+                if (c == '/' && p + 1 < end && _text[p + 1] == '/')
+                    return false;
+
+                if (c == '/' && p + 1 < end && _text[p + 1] == '*')
+                {
+                    p += 2;
+                    while (p + 1 < end && !(_text[p] == '*' && _text[p + 1] == '/'))
+                        p++;
+                    p = Math.Min(end, p + 2);
+                    continue;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private void SkipDirectiveWhitespace(ref int p, int end)
+        {
+            while (p < end && IsWhitespaceButNotNewLine(_text[p]))
+                p++;
+        }
+
+        private bool TryReadPreprocessorSymbolName(ref int p, int end, out string symbol)
+        {
+            symbol = string.Empty;
+            if (p >= end)
+                return false;
+
+            char first = _text[p];
+            if (!(first == '_' || IsIdentifierStartChar(first)))
+                return false;
+
+            int start = p++;
+            while (p < end)
+            {
+                char c = _text[p];
+                if (!(c == '_' || IsIdentifierPartChar(c)))
+                    break;
+                p++;
+            }
+
+            symbol = _text.Substring(start, p - start);
+            return true;
+        }
+
+        private void ReportUnterminatedPreprocessorDirectivesIfNeeded()
+        {
+            if (_reportedUnterminatedPreprocessor || _conditionalStack.Count == 0)
+                return;
+
+            _reportedUnterminatedPreprocessor = true;
+            var frame = _conditionalStack[_conditionalStack.Count - 1];
+            Diagnostics.Add(new SyntaxDiagnostic(frame.DirectiveStart, "Missing #endif for preprocessor #if directive."));
+        }
+
+        private sealed class PreprocessorExpressionParser
+        {
+            private readonly Lexer _lexer;
+            private readonly string _text;
+            private readonly int _absoluteStart;
+            private int _pos;
+            private bool _reportedError;
+
+            public PreprocessorExpressionParser(Lexer lexer, string text, int absoluteStart)
+            {
+                _lexer = lexer;
+                _text = text ?? string.Empty;
+                _absoluteStart = absoluteStart;
+            }
+
+            public bool ParseExpressionForDirective(int directiveStart)
+            {
+                SkipTrivia();
+                if (_pos >= _text.Length)
+                {
+                    Error(directiveStart, "Expected preprocessor expression.");
+                    return false;
+                }
+
+                bool value = ParseOrExpression();
+                SkipTrivia();
+
+                if (_pos < _text.Length)
+                    Error(CurrentAbsolutePosition(), "Unexpected token in preprocessor expression.");
+
+                return !_reportedError && value;
+            }
+
+            private bool ParseOrExpression()
+            {
+                bool left = ParseAndExpression();
+                while (true)
+                {
+                    SkipTrivia();
+                    if (!TryConsume("||"))
+                        return left;
+                    bool right = ParseAndExpression();
+                    left = left || right;
+                }
+            }
+
+            private bool ParseAndExpression()
+            {
+                bool left = ParseEqualityExpression();
+                while (true)
+                {
+                    SkipTrivia();
+                    if (!TryConsume("&&"))
+                        return left;
+                    bool right = ParseEqualityExpression();
+                    left = left && right;
+                }
+            }
+
+            private bool ParseEqualityExpression()
+            {
+                bool left = ParseUnaryExpression();
+                while (true)
+                {
+                    SkipTrivia();
+                    if (TryConsume("=="))
+                    {
+                        bool right = ParseUnaryExpression();
+                        left = left == right;
+                        continue;
+                    }
+                    if (TryConsume("!="))
+                    {
+                        bool right = ParseUnaryExpression();
+                        left = left != right;
+                        continue;
+                    }
+                    return left;
+                }
+            }
+
+            private bool ParseUnaryExpression()
+            {
+                SkipTrivia();
+                if (TryConsume("!"))
+                    return !ParseUnaryExpression();
+                return ParsePrimaryExpression();
+            }
+
+            private bool ParsePrimaryExpression()
+            {
+                SkipTrivia();
+                if (_pos >= _text.Length)
+                {
+                    Error(CurrentAbsolutePosition(), "Expected preprocessor expression operand.");
+                    return false;
+                }
+
+                if (TryConsume("("))
+                {
+                    bool value = ParseOrExpression();
+                    SkipTrivia();
+                    if (!TryConsume(")"))
+                        Error(CurrentAbsolutePosition(), "Expected ')' in preprocessor expression.");
+                    return value;
+                }
+
+                if (TryReadIdentifier(out string id))
+                {
+                    if (id == "true")
+                        return true;
+                    if (id == "false")
+                        return false;
+                    return _lexer._preprocessorSymbols.Contains(id);
+                }
+
+                Error(CurrentAbsolutePosition(), "Expected preprocessor expression operand.");
+                _pos++;
+                return false;
+            }
+
+            private bool TryReadIdentifier(out string id)
+            {
+                id = string.Empty;
+                if (_pos >= _text.Length)
+                    return false;
+
+                char first = _text[_pos];
+                if (!(first == '_' || IsIdentifierStartChar(first)))
+                    return false;
+
+                int start = _pos++;
+                while (_pos < _text.Length)
+                {
+                    char c = _text[_pos];
+                    if (!(c == '_' || IsIdentifierPartChar(c)))
+                        break;
+                    _pos++;
+                }
+
+                id = _text.Substring(start, _pos - start);
+                return true;
+            }
+
+            private bool TryConsume(string text)
+            {
+                if (_pos + text.Length > _text.Length)
+                    return false;
+
+                for (int i = 0; i < text.Length; i++)
+                {
+                    if (_text[_pos + i] != text[i])
+                        return false;
+                }
+
+                _pos += text.Length;
+                return true;
+            }
+
+            private void SkipTrivia()
+            {
+                while (_pos < _text.Length)
+                {
+                    char c = _text[_pos];
+                    if (IsWhitespaceButNotNewLine(c))
+                    {
+                        _pos++;
+                        continue;
+                    }
+
+                    if (c == '/' && _pos + 1 < _text.Length && _text[_pos + 1] == '/')
+                    {
+                        _pos = _text.Length;
+                        return;
+                    }
+
+                    if (c == '/' && _pos + 1 < _text.Length && _text[_pos + 1] == '*')
+                    {
+                        _pos += 2;
+                        while (_pos + 1 < _text.Length && !(_text[_pos] == '*' && _text[_pos + 1] == '/'))
+                            _pos++;
+                        if (_pos + 1 < _text.Length)
+                            _pos += 2;
+                        else
+                            _pos = _text.Length;
+                        continue;
+                    }
+
+                    return;
+                }
+            }
+
+            private int CurrentAbsolutePosition() => _absoluteStart + Math.Min(_pos, _text.Length);
+
+            private void Error(int absolutePosition, string message)
+            {
+                if (_reportedError)
+                    return;
+
+                _reportedError = true;
+                _lexer.Diagnostics.Add(new SyntaxDiagnostic(absolutePosition, message));
+            }
+        }
+
         private SyntaxTrivia[] ReadTrivia(bool isLeading)
         {
             var list = new List<SyntaxTrivia>(capacity: 8);
@@ -2062,11 +2777,7 @@ namespace Cnidaria.Cs
 
                 if (_atStartOfLine && Current() == '#')
                 {
-                    int dirStart = _pos;
-                    while (!IsAtEnd() && !IsNewLineChar(Current()))
-                        _pos++;
-                    list.Add(new SyntaxTrivia(TriviaKind.PreprocessorDirectiveTrivia, new TextSpan(dirStart, _pos - dirStart)));
-                    _atStartOfLine = false;
+                    list.Add(ReadPreprocessorDirectiveTrivia());
                     continue;
                 }
                 // Whitespace
@@ -2851,6 +3562,10 @@ namespace Cnidaria.Cs
 
             // Stack frames flattened
             public readonly FrameSnapshot[] Frames;
+            public readonly ConditionalFrameSnapshot[] ConditionalFrames;
+            public readonly string[] PreprocessorSymbols;
+            public readonly bool SeenNonDirectiveToken;
+            public readonly bool ReportedUnterminatedPreprocessor;
 
             public readonly int DiagnosticCount;
 
@@ -2865,6 +3580,10 @@ namespace Cnidaria.Cs
                 int quoteCount,
                 int interpBraceDepth,
                 FrameSnapshot[] frames,
+                ConditionalFrameSnapshot[] conditionalFrames,
+                string[] preprocessorSymbols,
+                bool seenNonDirectiveToken,
+                bool reportedUnterminatedPreprocessor,
                 int diagnosticCount)
             {
                 Pos = pos;
@@ -2877,6 +3596,10 @@ namespace Cnidaria.Cs
                 QuoteCount = quoteCount;
                 InterpBraceDepth = interpBraceDepth;
                 Frames = frames ?? Array.Empty<FrameSnapshot>();
+                ConditionalFrames = conditionalFrames ?? Array.Empty<ConditionalFrameSnapshot>();
+                PreprocessorSymbols = preprocessorSymbols ?? Array.Empty<string>();
+                SeenNonDirectiveToken = seenNonDirectiveToken;
+                ReportedUnterminatedPreprocessor = reportedUnterminatedPreprocessor;
                 DiagnosticCount = diagnosticCount;
             }
         }
@@ -2901,6 +3624,23 @@ namespace Cnidaria.Cs
                 BraceDepth = braceDepth;
             }
         }
+        internal readonly struct ConditionalFrameSnapshot
+        {
+            public readonly bool ParentActive;
+            public readonly bool BranchActive;
+            public readonly bool AnyBranchTaken;
+            public readonly bool ElseSeen;
+            public readonly int DirectiveStart;
+
+            public ConditionalFrameSnapshot(bool parentActive, bool branchActive, bool anyBranchTaken, bool elseSeen, int directiveStart)
+            {
+                ParentActive = parentActive;
+                BranchActive = branchActive;
+                AnyBranchTaken = anyBranchTaken;
+                ElseSeen = elseSeen;
+                DirectiveStart = directiveStart;
+            }
+        }
         internal Snapshot CaptureSnapshot()
         {
             var frames = _modeStack.ToArray();
@@ -2919,6 +3659,18 @@ namespace Cnidaria.Cs
                     f.BraceDepth);
             }
 
+            var conditionalSnap = new ConditionalFrameSnapshot[_conditionalStack.Count];
+            for (int i = 0; i < _conditionalStack.Count; i++)
+            {
+                var f = _conditionalStack[i];
+                conditionalSnap[i] = new ConditionalFrameSnapshot(
+                    f.ParentActive,
+                    f.BranchActive,
+                    f.AnyBranchTaken,
+                    f.ElseSeen,
+                    f.DirectiveStart);
+            }
+
             return new Snapshot(
                 _pos,
                 _atStartOfLine,
@@ -2930,6 +3682,10 @@ namespace Cnidaria.Cs
                 _is.QuoteCount,
                 _interpBraceDepth,
                 snap,
+                conditionalSnap,
+                _preprocessorSymbols.ToArray(),
+                _seenNonDirectiveToken,
+                _reportedUnterminatedPreprocessor,
                 Diagnostics.Count);
         }
         internal void RestoreSnapshot(Snapshot s)
@@ -2948,6 +3704,8 @@ namespace Cnidaria.Cs
             };
 
             _interpBraceDepth = s.InterpBraceDepth;
+            _seenNonDirectiveToken = s.SeenNonDirectiveToken;
+            _reportedUnterminatedPreprocessor = s.ReportedUnterminatedPreprocessor;
 
             _modeStack.Clear();
 
@@ -2964,6 +3722,24 @@ namespace Cnidaria.Cs
                 };
                 _modeStack.Push(new ModeFrame((LexMode)f.Mode, st, f.BraceDepth));
             }
+
+            _conditionalStack.Clear();
+            for (int i = 0; i < s.ConditionalFrames.Length; i++)
+            {
+                var f = s.ConditionalFrames[i];
+                _conditionalStack.Add(new ConditionalFrame
+                {
+                    ParentActive = f.ParentActive,
+                    BranchActive = f.BranchActive,
+                    AnyBranchTaken = f.AnyBranchTaken,
+                    ElseSeen = f.ElseSeen,
+                    DirectiveStart = f.DirectiveStart
+                });
+            }
+
+            _preprocessorSymbols.Clear();
+            for (int i = 0; i < s.PreprocessorSymbols.Length; i++)
+                _preprocessorSymbols.Add(s.PreprocessorSymbols[i]);
 
             // Roll back diagnostics
             if (Diagnostics.Count > s.DiagnosticCount)

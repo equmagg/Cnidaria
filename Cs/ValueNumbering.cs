@@ -2409,7 +2409,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.IsInst:
                         return FuncWithException(node, ValueNumberFunction.IsInstanceOf, operands);
                     case GenTreeKind.Box:
-                        return FuncWithException(node, ValueNumberFunction.Box, operands);
+                        return Box(node, operands, ref heap, blockId);
                     case GenTreeKind.UnboxAny:
                         return FuncWithException(node, ValueNumberFunction.UnboxAny, operands);
                     case GenTreeKind.LocalAddr:
@@ -2998,6 +2998,28 @@ namespace Cnidaria.Cs
                 if (node.Method is not null)
                     newObjArgs = newObjArgs.Add(_store.VNForMethod(node.Method));
                 ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.NewObject, newObjArgs);
+                heap = OpaqueMemory(blockId);
+                return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
+            }
+
+            private ValueNumberPair Box(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber heap, int blockId)
+            {
+                RuntimeType? boxedType = node.RuntimeType;
+
+                if (boxedType is { IsReferenceType: true })
+                    return FuncWithException(node, ValueNumberFunction.Box, operands);
+
+                var args = ArgsFromPairs(operands);
+                if (boxedType is not null)
+                    args = args.Add(_store.VNForType(boxedType));
+
+                ValueNumber liberal = _store.VNForStableUnique(
+                    node.Id,
+                    node.StackKind,
+                    node.Type,
+                    ValueNumberFunction.Box,
+                    args);
+
                 heap = OpaqueMemory(blockId);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }

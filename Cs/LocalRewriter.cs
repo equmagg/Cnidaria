@@ -176,6 +176,7 @@ namespace Cnidaria.Cs
                 BoundArrayInitializerExpression e => RewriteArrayInitializerExpression(e),
                 BoundArrayCreationExpression e => RewriteArrayCreationExpression(e),
                 BoundArrayElementAccessExpression e => RewriteArrayElementAccessExpression(e),
+                BoundInlineArrayElementAccessExpression e => RewriteInlineArrayElementAccessExpression(e),
                 BoundStackAllocArrayCreationExpression e => RewriteStackAllocArrayCreationExpression(e),
                 BoundStaticDataExpression e => RewriteStaticDataExpression(e),
 
@@ -645,6 +646,21 @@ namespace Cnidaria.Cs
                 return new BoundArrayElementAccessExpression(node.Syntax, node.Type, expr, indices);
             return node;
         }
+        protected virtual BoundExpression RewriteInlineArrayElementAccessExpression(BoundInlineArrayElementAccessExpression node)
+        {
+            var receiver = RewriteExpression(node.Receiver);
+            var index = RewriteExpression(node.Index);
+            if (!ReferenceEquals(receiver, node.Receiver) || !ReferenceEquals(index, node.Index))
+                return new BoundInlineArrayElementAccessExpression(
+                    node.Syntax,
+                    receiver,
+                    node.ElementField,
+                    index,
+                    node.Length,
+                    node.IsLValue);
+            return node;
+        }
+
         protected virtual BoundExpression RewriteSpanCollectionExpression(BoundSpanCollectionExpression node)
         {
             var elements = RewriteExpressions(node.Elements, out var changed);
@@ -1172,7 +1188,26 @@ namespace Cnidaria.Cs
 
             return node;
         }
+        protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+        {
+            var body = RewriteMethodLike(
+                node.Syntax,
+                node.LocalFunction,
+                node.Body,
+                closureParameterOpt: null,
+                externalCaptures: ImmutableArray<Symbol>.Empty,
+                out var bodyChanged);
 
+            if (bodyChanged || !ReferenceEquals(body, node.Body))
+            {
+                return new BoundLocalFunctionStatement(
+                    (LocalFunctionStatementSyntax)node.Syntax,
+                    node.LocalFunction,
+                    body);
+            }
+
+            return node;
+        }
         protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
         {
             if (_cellByCapturedSymbol.TryGetValue(node.Local, out var cell) && cell is BoundLocalExpression cellLocal)
@@ -1379,6 +1414,13 @@ namespace Cnidaria.Cs
             protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
                 => node;
 
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+            {
+                if (node.TargetOpt is not null)
+                    RewriteExpression(node.TargetOpt);
+                return node;
+            }
+
             protected override BoundExpression RewriteExpression(BoundExpression node)
             {
                 switch (node)
@@ -1487,9 +1529,30 @@ namespace Cnidaria.Cs
                 case BoundCallExpression call:
                     return RewriteCallExpressionWithCaptures(call);
 
+                case BoundLambdaExpression lambda:
+                    return RewriteClosedLambdaExpression(lambda);
+
                 default:
                     return base.RewriteExpression(node);
             }
+        }
+
+        private BoundExpression RewriteClosedLambdaExpression(BoundLambdaExpression node)
+        {
+            var target = node.TargetOpt is null ? null : RewriteExpression(node.TargetOpt);
+            if (!ReferenceEquals(target, node.TargetOpt))
+            {
+                return new BoundLambdaExpression(
+                    (ExpressionSyntax)node.Syntax,
+                    (NamedTypeSymbol)node.Type,
+                    node.Method,
+                    node.InvokeMethod,
+                    node.Body,
+                    node.IsStatic,
+                    node.IsAsync,
+                    target);
+            }
+            return node;
         }
 
         private BoundExpression RewriteCallExpressionWithCaptures(BoundCallExpression node)
@@ -1906,7 +1969,56 @@ namespace Cnidaria.Cs
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
         }
+        private sealed class IteratorExternalCaptureCollector : BoundTreeRewriter
+        {
+            private readonly MethodSymbol _owner;
+            private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
+            private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
 
+            private IteratorExternalCaptureCollector(MethodSymbol owner)
+            {
+                _owner = owner;
+            }
+
+            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            {
+                var collector = new IteratorExternalCaptureCollector(owner);
+                collector.RewriteStatement(body);
+                return collector._captures.ToImmutable();
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => node;
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+
+            protected override BoundExpression RewriteExpression(BoundExpression node)
+            {
+                switch (node)
+                {
+                    case BoundLocalExpression local when !ReferenceEquals(local.Local.ContainingSymbol, _owner):
+                        Add(local.Local);
+                        return node;
+
+                    case BoundParameterExpression parameter when !ReferenceEquals(parameter.Parameter.ContainingSymbol, _owner):
+                        Add(parameter.Parameter);
+                        return node;
+
+                    default:
+                        return base.RewriteExpression(node);
+                }
+            }
+
+            private void Add(Symbol symbol)
+            {
+                if (symbol is LocalSymbol { IsConst: true })
+                    return;
+
+                if (_seen.Add(symbol))
+                    _captures.Add(symbol);
+            }
+        }
         private sealed class IteratorLocalFunctionYieldFinder : BoundTreeRewriter
         {
             public bool Found { get; private set; }
@@ -2018,13 +2130,13 @@ namespace Cnidaria.Cs
                     return node;
                 }
 
-                ThrowIfIteratorLocalFunctionHasByRefParameters(localFunction);
-
-                if (!_compilation.TryGetIteratorStateMachine(localFunction, out var info))
+                if (!TryGetIteratorStateMachine(localFunction, out var info))
                 {
                     throw new InvalidOperationException(
                         $"Iterator local function '{localFunction.Name}' was not prepared before metadata snapshot.");
                 }
+
+                ValidateIteratorLocalFunctionParameters(localFunction, info);
 
                 var body = new BoundMethodBody(
                     node.Syntax,
@@ -2043,21 +2155,42 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
+            private bool TryGetIteratorStateMachine(LocalFunctionSymbol localFunction, out IteratorStateMachineInfo info)
+            {
+                if (_compilation.TryGetIteratorStateMachine(localFunction, out info))
+                    return true;
 
-            private static void ThrowIfIteratorLocalFunctionHasByRefParameters(LocalFunctionSymbol method)
+                if (localFunction.DeclaringSyntaxReferences.Length == 0)
+                    return false;
+
+                var tree = localFunction.DeclaringSyntaxReferences[0].SyntaxTree;
+                foreach (var candidate in _compilation.GetIteratorStateMachinesForTree(tree))
+                {
+                    if (candidate.OriginalMethod is LocalFunctionSymbol original &&
+                        ReferenceEquals(original.Declaration, localFunction.Declaration))
+                    {
+                        info = candidate;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            private static void ValidateIteratorLocalFunctionParameters(LocalFunctionSymbol method, IteratorStateMachineInfo info)
             {
                 var parameters = method.Parameters;
 
                 for (int i = 0; i < parameters.Length; i++)
                 {
                     var p = parameters[i];
+                    if (p.RefKind == ParameterRefKind.None && p.Type is not ByRefTypeSymbol)
+                        continue;
 
-                    if (p.RefKind != ParameterRefKind.None || p.Type is ByRefTypeSymbol)
-                    {
-                        throw new NotSupportedException(
-                            $"Iterator local function '{method.Name}' still has by-ref parameter '{p.Name}' after local-function closure lowering. " +
-                            "Captured locals in iterator local functions require direct state-machine capture lifting, not by-ref hidden parameters.");
-                    }
+                    if (IteratorLowering.TryGetIteratorCaptureFieldForHiddenParameter(info, p, out _))
+                        continue;
+
+                    throw new NotSupportedException(
+                        $"Iterator local function '{method.Name}' has unsupported by-ref parameter '{p.Name}' after local-function closure lowering.");
                 }
             }
         }
@@ -2094,6 +2227,7 @@ namespace Cnidaria.Cs
             public FieldSymbol? ThisField { get; }
 
             public ImmutableDictionary<ParameterSymbol, FieldSymbol> ParameterFields { get; }
+            public ImmutableDictionary<Symbol, FieldSymbol> CaptureFields { get; }
             public ImmutableDictionary<LocalSymbol, FieldSymbol> LocalFields { get; }
 
             public IteratorStateMachineInfo(
@@ -2115,6 +2249,7 @@ namespace Cnidaria.Cs
                 FieldSymbol currentField,
                 FieldSymbol? thisField,
                 ImmutableDictionary<ParameterSymbol, FieldSymbol> parameterFields,
+                ImmutableDictionary<Symbol, FieldSymbol> captureFields,
                 ImmutableDictionary<LocalSymbol, FieldSymbol> localFields)
             {
                 SyntaxTree = syntaxTree;
@@ -2134,8 +2269,9 @@ namespace Cnidaria.Cs
                 StateField = stateField;
                 CurrentField = currentField;
                 ThisField = thisField;
-                ParameterFields = parameterFields;
-                LocalFields = localFields;
+                ParameterFields = parameterFields ?? ImmutableDictionary<ParameterSymbol, FieldSymbol>.Empty;
+                CaptureFields = captureFields ?? ImmutableDictionary<Symbol, FieldSymbol>.Empty;
+                LocalFields = localFields ?? ImmutableDictionary<LocalSymbol, FieldSymbol>.Empty;
             }
         }
 
@@ -2224,6 +2360,20 @@ namespace Cnidaria.Cs
 
                 foreach (var p in method.Parameters)
                     parameterFields[p] = AddField(tree, smType, "<>3__" + p.Name, p.Type, originalBody.Syntax);
+
+                var captureFields = ImmutableDictionary.CreateBuilder<Symbol, FieldSymbol>(ReferenceEqualityComparer<Symbol>.Instance);
+
+                var externalCaptures = IteratorExternalCaptureCollector.Collect(method, preLoweredBody.Body);
+                for (int i = 0; i < externalCaptures.Length; i++)
+                {
+                    var captured = externalCaptures[i];
+                    captureFields[captured] = AddField(
+                        tree,
+                        smType,
+                        "<>c__" + captured.Name,
+                        GetIteratorCaptureFieldType(compilation, captured),
+                        originalBody.Syntax);
+                }
 
                 var collector = new IteratorLocalCollector();
                 collector.Visit(preLoweredBody.Body);
@@ -2353,7 +2503,18 @@ namespace Cnidaria.Cs
                     currentField,
                     thisField,
                     parameterFields.ToImmutable(),
+                    captureFields.ToImmutable(),
                     localFields.ToImmutable());
+            }
+            private static TypeSymbol GetIteratorCaptureFieldType(Compilation compilation, Symbol symbol)
+            {
+                return symbol switch
+                {
+                    LocalSymbol local => compilation.CreateByRefType(local.Type),
+                    ParameterSymbol parameter when parameter.Type is ByRefTypeSymbol => parameter.Type,
+                    ParameterSymbol parameter => compilation.CreateByRefType(parameter.Type),
+                    _ => throw new NotSupportedException($"Unsupported iterator capture symbol '{symbol.Kind}'.")
+                };
             }
             private static SourceNamedTypeSymbol GetContainingSourceType(MethodSymbol method)
             {
@@ -2413,13 +2574,22 @@ namespace Cnidaria.Cs
 
                 foreach (var p in body.Method.Parameters)
                 {
-                    if (!info.ParameterFields.TryGetValue(p, out var f))
+                    if (info.ParameterFields.TryGetValue(p, out var f))
+                    {
+                        statements.Add(AssignStmt(
+                            syntax,
+                            Field(syntax, smLocalExpr, f),
+                            new BoundParameterExpression(syntax, p)));
                         continue;
+                    }
 
-                    statements.Add(AssignStmt(
-                        syntax,
-                        Field(syntax, smLocalExpr, f),
-                        new BoundParameterExpression(syntax, p)));
+                    if (TryGetIteratorCaptureFieldForHiddenParameter(info, p, out var captureField))
+                    {
+                        statements.Add(AssignStmt(
+                            syntax,
+                            Field(syntax, smLocalExpr, captureField),
+                            MakeIteratorCaptureArgument(syntax, p, captureField)));
+                    }
                 }
 
                 statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
@@ -2428,6 +2598,40 @@ namespace Cnidaria.Cs
                     syntax,
                     body.Method,
                     new BoundBlockStatement(syntax, statements.ToImmutable()));
+            }
+            public static bool TryGetIteratorCaptureFieldForHiddenParameter(
+                IteratorStateMachineInfo info,
+                ParameterSymbol parameter,
+                out FieldSymbol field)
+            {
+                const string prefix = "<>capture";
+                field = null!;
+
+                if (!parameter.Name.StartsWith(prefix, StringComparison.Ordinal))
+                    return false;
+
+                int separator = parameter.Name.IndexOf('_', prefix.Length);
+                if (separator < 0 || separator + 1 >= parameter.Name.Length)
+                    return false;
+
+                string capturedName = parameter.Name.Substring(separator + 1);
+                foreach (var kv in info.CaptureFields)
+                {
+                    if (StringComparer.Ordinal.Equals(kv.Key.Name, capturedName))
+                    {
+                        field = kv.Value;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            private static BoundExpression MakeIteratorCaptureArgument(SyntaxNode syntax, ParameterSymbol parameter, FieldSymbol captureField)
+            {
+                var parameterExpression = new BoundParameterExpression(syntax, parameter);
+                if (captureField.Type is ByRefTypeSymbol byRefField)
+                    return new BoundRefExpression(syntax, byRefField, parameterExpression);
+                return parameterExpression;
             }
             private static int GetInitialIteratorState(IteratorStateMachineInfo info)
             {
@@ -2630,6 +2834,17 @@ namespace Cnidaria.Cs
                         Field(syntax, This(syntax, info), kv.Value)));
                 }
 
+                foreach (var kv in info.CaptureFields)
+                {
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, kv.Value),
+                        new BoundRefExpression(
+                            syntax,
+                            (ByRefTypeSymbol)kv.Value.Type,
+                            Field(syntax, This(syntax, info), kv.Value))));
+                }
+
                 statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
 
                 return new BoundMethodBody(
@@ -2709,16 +2924,20 @@ namespace Cnidaria.Cs
 
                 protected override BoundExpression RewriteExpression(BoundExpression node)
                 {
-                    if (node is BoundLocalExpression local &&
-                        _info.LocalFields.TryGetValue(local.Local, out var localField))
+                    if (node is BoundLocalExpression local)
                     {
-                        return Field(node.Syntax, This(node.Syntax, _info), localField);
+                        if (_info.LocalFields.TryGetValue(local.Local, out var localField))
+                            return Field(node.Syntax, This(node.Syntax, _info), localField);
+                        if (_info.CaptureFields.TryGetValue(local.Local, out var capturedLocalField))
+                            return Field(node.Syntax, This(node.Syntax, _info), capturedLocalField);
                     }
 
-                    if (node is BoundParameterExpression parameter &&
-                        _info.ParameterFields.TryGetValue(parameter.Parameter, out var parameterField))
+                    if (node is BoundParameterExpression parameter)
                     {
-                        return Field(node.Syntax, This(node.Syntax, _info), parameterField);
+                        if (_info.ParameterFields.TryGetValue(parameter.Parameter, out var parameterField))
+                            return Field(node.Syntax, This(node.Syntax, _info), parameterField);
+                        if (_info.CaptureFields.TryGetValue(parameter.Parameter, out var capturedParameterField))
+                            return Field(node.Syntax, This(node.Syntax, _info), capturedParameterField);
                     }
 
                     if (node is BoundThisExpression && _info.ThisField is not null)
@@ -2766,11 +2985,14 @@ namespace Cnidaria.Cs
 
             private static BoundExpression Field(SyntaxNode syntax, BoundExpression receiver, FieldSymbol field)
             {
+                var expressionType = field.Type is ByRefTypeSymbol byRef
+                    ? byRef.ElementType
+                    : field.Type;
                 return new BoundMemberAccessExpression(
                     syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default),
                     receiver,
                     field,
-                    field.Type,
+                    expressionType,
                     isLValue: true);
             }
 
@@ -2996,6 +3218,7 @@ namespace Cnidaria.Cs
             private HashSet<LocalSymbol>? _spanCollectionStackAllocLocals;
             private NamespaceSymbol? _systemNsCache;
             private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
+            private readonly Dictionary<TypeSymbol, MethodSymbol> _unsafeAddRefIntCache = new(ReferenceEqualityComparer<TypeSymbol>.Instance);
             private IDisposable PushCheckedContext(bool value)
             {
                 var previous = _checkedContextOverride;
@@ -5312,6 +5535,10 @@ namespace Cnidaria.Cs
                             return ExpressionEscapes(arrayElementAccess.Expression, local) ||
                                    AnyExpressionEscapes(arrayElementAccess.Indices, local);
 
+                        case BoundInlineArrayElementAccessExpression inlineArrayElementAccess:
+                            return ExpressionEscapes(inlineArrayElementAccess.Receiver, local) ||
+                                   ExpressionEscapes(inlineArrayElementAccess.Index, local);
+
                         case BoundStackAllocArrayCreationExpression stackAlloc:
                             return ExpressionEscapes(stackAlloc.Count, local) ||
                                    (stackAlloc.InitializerOpt is not null && ExpressionEscapes(stackAlloc.InitializerOpt, local));
@@ -5589,6 +5816,9 @@ namespace Cnidaria.Cs
                                 if (ContainsLocal(arrayElementAccess.Indices[i], local))
                                     return true;
                             return false;
+                        case BoundInlineArrayElementAccessExpression inlineArrayElementAccess:
+                            return ContainsLocal(inlineArrayElementAccess.Receiver, local) ||
+                                   ContainsLocal(inlineArrayElementAccess.Index, local);
                         case BoundStackAllocArrayCreationExpression stackAlloc:
                             return ContainsLocal(stackAlloc.Count, local) ||
                                    (stackAlloc.InitializerOpt is not null && ContainsLocal(stackAlloc.InitializerOpt, local));
@@ -6040,6 +6270,145 @@ namespace Cnidaria.Cs
                     return node;
                 return new BoundCallExpression(node.Syntax, receiver, node.Method, args);
             }
+            protected override BoundExpression RewriteInlineArrayElementAccessExpression(BoundInlineArrayElementAccessExpression node)
+            {
+                var receiver = RewriteExpression(node.Receiver);
+                var index = RewriteExpression(node.Index);
+
+                if (!receiver.IsLValue)
+                {
+                    if (node.IsLValue)
+                        throw new InvalidOperationException("Cannot lower inline array element write through a non-lvalue receiver.");
+
+                    var receiverTemp = CreateTempLocal(receiver.Type);
+                    var locals = ImmutableArray.Create(receiverTemp);
+                    var receiverTempExpr = new BoundLocalExpression(node.Syntax, receiverTemp);
+                    var sideEffects = ImmutableArray.Create<BoundStatement>(
+                        new BoundExpressionStatement(
+                            node.Syntax,
+                            new BoundAssignmentExpression(node.Syntax, receiverTempExpr, receiver)));
+
+                    var value = MakeInlineArrayElementRef(
+                        node.Syntax,
+                        new BoundLocalExpression(node.Syntax, receiverTemp),
+                        node.ElementField,
+                        index);
+
+                    return new BoundSequenceExpression(node.Syntax, locals, sideEffects, value);
+                }
+
+                return MakeInlineArrayElementRef(node.Syntax, receiver, node.ElementField, index);
+            }
+
+            private BoundExpression MakeInlineArrayElementRef(
+                SyntaxNode syntax,
+                BoundExpression receiver,
+                FieldSymbol elementField,
+                BoundExpression index)
+            {
+                var exprSyntax = syntax as ExpressionSyntax
+                    ?? receiver.Syntax as ExpressionSyntax
+                    ?? throw new InvalidOperationException("Expected expression syntax for inline array element access.");
+
+                var fieldAccess = new BoundMemberAccessExpression(
+                    exprSyntax,
+                    receiver,
+                    elementField,
+                    elementField.Type,
+                    isLValue: true,
+                    constantValueOpt: Optional<object>.None);
+
+                var refFirst = new BoundRefExpression(
+                    syntax,
+                    _compilation.CreateByRefType(elementField.Type),
+                    fieldAccess);
+
+                var addMethod = RequireUnsafeAddRefInt(elementField.Type);
+                return new BoundCallExpression(
+                    syntax,
+                    receiverOpt: null,
+                    addMethod,
+                    ImmutableArray.Create<BoundExpression>(refFirst, index));
+            }
+
+            private MethodSymbol RequireUnsafeAddRefInt(TypeSymbol elementType)
+            {
+                if (_unsafeAddRefIntCache.TryGetValue(elementType, out var cached))
+                    return cached;
+
+                var unsafeType = LookupTypeByMetadataName(_compilation, "System.Runtime.CompilerServices", "Unsafe", 0)
+                    ?? throw new InvalidOperationException("System.Runtime.CompilerServices.Unsafe was not found.");
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+
+                foreach (var member in unsafeType.GetMembers())
+                {
+                    if (member is not MethodSymbol method || !method.IsStatic || method.IsConstructor)
+                        continue;
+                    if (!string.Equals(method.Name, "Add", StringComparison.Ordinal))
+                        continue;
+                    if (method.TypeParameters.Length != 1)
+                        continue;
+
+                    var constructed = new ConstructedMethodSymbol(
+                        method,
+                        ImmutableArray.Create(elementType),
+                        _compilation.TypeManager);
+
+                    if (constructed.Parameters.Length != 2)
+                        continue;
+
+                    if (constructed.Parameters[0].Type is not ByRefTypeSymbol firstParam ||
+                        !ReferenceEquals(firstParam.ElementType, elementType))
+                        continue;
+
+                    if (!ReferenceEquals(constructed.Parameters[1].Type, intType))
+                        continue;
+
+                    if (constructed.ReturnType is not ByRefTypeSymbol ret ||
+                        !ReferenceEquals(ret.ElementType, elementType))
+                        continue;
+
+                    _unsafeAddRefIntCache[elementType] = constructed;
+                    return constructed;
+                }
+
+                throw new MissingMethodException("System.Runtime.CompilerServices.Unsafe.Add<T>(ref T, int) was not found.");
+            }
+
+            private static NamedTypeSymbol? LookupTypeByMetadataName(
+                Compilation compilation,
+                string namespaceName,
+                string typeName,
+                int arity)
+            {
+                NamespaceSymbol current = compilation.GlobalNamespace;
+                if (!string.IsNullOrEmpty(namespaceName))
+                {
+                    var parts = namespaceName.Split('.');
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        NamespaceSymbol? next = null;
+                        var children = current.GetNamespaceMembers();
+                        for (int j = 0; j < children.Length; j++)
+                        {
+                            if (string.Equals(children[j].Name, parts[i], StringComparison.Ordinal))
+                            {
+                                next = children[j];
+                                break;
+                            }
+                        }
+
+                        if (next is null)
+                            return null;
+
+                        current = next;
+                    }
+                }
+
+                var types = current.GetTypeMembers(typeName, arity);
+                return types.IsDefaultOrEmpty ? null : types[0];
+            }
+
             protected override BoundExpression RewriteIndexerAccessExpression(BoundIndexerAccessExpression node)
             {
                 if (node.Indexer.GetMethod is MethodSymbol getMethod)
@@ -6220,6 +6589,15 @@ namespace Cnidaria.Cs
                                 localsBuilder,
                                 sideEffectsBuilder);
 
+                            break;
+                        }
+                    case BoundCallExpression call when call.IsLValue:
+                        {
+                            lvalue = SpillByRefReturnCallLValue(
+                                node.Syntax,
+                                call,
+                                localsBuilder,
+                                sideEffectsBuilder);
                             break;
                         }
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
@@ -6484,6 +6862,16 @@ namespace Cnidaria.Cs
                             break;
                         }
 
+                    case BoundCallExpression call when call.IsLValue:
+                        {
+                            lvalue = SpillByRefReturnCallLValue(
+                                node.Syntax,
+                                call,
+                                localsBuilder,
+                                sideEffectsBuilder);
+                            break;
+                        }
+
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
                             BoundExpression? receiver = SpillReceiverForLValueAccess(
@@ -6629,6 +7017,16 @@ namespace Cnidaria.Cs
                                 pea.Type,
                                 new BoundLocalExpression(node.Syntax, ptrTemp),
                                 new BoundLocalExpression(node.Syntax, idxTemp));
+                            break;
+                        }
+
+                    case BoundCallExpression call when call.IsLValue:
+                        {
+                            lvalue = SpillByRefReturnCallLValue(
+                                node.Syntax,
+                                call,
+                                localsBuilder,
+                                sideEffectsBuilder);
                             break;
                         }
 
@@ -6795,6 +7193,16 @@ namespace Cnidaria.Cs
 
                 switch (rewrittenLeft)
                 {
+                    case BoundCallExpression call when call.IsLValue:
+                        {
+                            lvalue = SpillByRefReturnCallLValue(
+                                node.Syntax,
+                                call,
+                                locals,
+                                sideEffects);
+                            break;
+                        }
+
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
                             BoundExpression? receiver = SpillReceiverForLValueAccess(
@@ -7044,6 +7452,15 @@ namespace Cnidaria.Cs
 
                             break;
                         }
+                    case BoundCallExpression call when call.IsLValue:
+                        {
+                            lvalue = SpillByRefReturnCallLValue(
+                                node.Syntax,
+                                call,
+                                localsBuilder,
+                                sideEffectsBuilder);
+                            break;
+                        }
                     case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
                         {
                             BoundExpression? receiver = SpillReceiverForLValueAccess(
@@ -7080,6 +7497,102 @@ namespace Cnidaria.Cs
                     sideEffectsBuilder.ToImmutable(),
                     assignment);
             }
+            private BoundCallExpression SpillByRefReturnCallLValue(
+                SyntaxNode syntax,
+                BoundCallExpression call,
+                ImmutableArray<LocalSymbol>.Builder locals,
+                ImmutableArray<BoundStatement>.Builder sideEffects)
+            {
+                BoundExpression? receiver = call.ReceiverOpt;
+                if (receiver is not null && !IsSimpleSpillExpression(receiver))
+                {
+                    var receiverTemp = CreateTempLocal(receiver.Type);
+                    locals.Add(receiverTemp);
+                    sideEffects.Add(
+                        new BoundExpressionStatement(
+                            syntax,
+                            new BoundAssignmentExpression(
+                                syntax,
+                                new BoundLocalExpression(syntax, receiverTemp),
+                                receiver)));
+                    receiver = new BoundLocalExpression(syntax, receiverTemp);
+                }
+
+                var args = ImmutableArray.CreateBuilder<BoundExpression>(call.Arguments.Length);
+                for (int i = 0; i < call.Arguments.Length; i++)
+                {
+                    var arg = call.Arguments[i];
+                    if (arg is BoundRefExpression refArg)
+                    {
+                        args.Add(new BoundRefExpression(
+                            syntax,
+                            refArg.Type,
+                            SpillLValueOperand(syntax, refArg.Operand, locals, sideEffects)));
+                        continue;
+                    }
+
+                    if (IsSimpleSpillExpression(arg))
+                    {
+                        args.Add(arg);
+                        continue;
+                    }
+
+                    var temp = CreateTempLocal(arg.Type);
+                    locals.Add(temp);
+                    sideEffects.Add(
+                        new BoundExpressionStatement(
+                            syntax,
+                            new BoundAssignmentExpression(
+                                syntax,
+                                new BoundLocalExpression(syntax, temp),
+                                arg)));
+                    args.Add(new BoundLocalExpression(syntax, temp));
+                }
+
+                return new BoundCallExpression(syntax, receiver, call.Method, args.ToImmutable());
+            }
+
+            private BoundExpression SpillLValueOperand(
+                SyntaxNode syntax,
+                BoundExpression operand,
+                ImmutableArray<LocalSymbol>.Builder locals,
+                ImmutableArray<BoundStatement>.Builder sideEffects)
+            {
+                switch (operand)
+                {
+                    case BoundLocalExpression:
+                    case BoundParameterExpression:
+                    case BoundThisExpression:
+                    case BoundBaseExpression:
+                        return operand;
+
+                    case BoundMemberAccessExpression ma when ma.Member is FieldSymbol fs:
+                        {
+                            var receiver = SpillReceiverForLValueAccess(
+                                syntax,
+                                ma.ReceiverOpt,
+                                locals,
+                                sideEffects);
+                            return new BoundMemberAccessExpression(
+                                (ExpressionSyntax)syntax,
+                                receiver,
+                                fs,
+                                fs.Type,
+                                isLValue: true,
+                                constantValueOpt: Optional<object>.None);
+                        }
+
+                    case BoundArrayElementAccessExpression aea:
+                        return SpillArrayElementAccess(syntax, aea, locals, sideEffects);
+
+                    case BoundCallExpression call when call.IsLValue:
+                        return SpillByRefReturnCallLValue(syntax, call, locals, sideEffects);
+
+                    default:
+                        return operand;
+                }
+            }
+
             private BoundArrayElementAccessExpression SpillArrayElementAccess(
                 SyntaxNode syntax,
                 BoundArrayElementAccessExpression arrayElement,

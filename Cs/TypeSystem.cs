@@ -702,7 +702,6 @@ namespace Cnidaria.Cs
     public static class TargetArchitecture
     {
         public const int PointerSize = 4;
-        public const int NativeIntSize = PointerSize;
         public const int GeneralRegisterSize = 8;
         public const int FloatingRegisterSize = 8;
         public const int StackSlotSize = 8;
@@ -1610,10 +1609,17 @@ namespace Cnidaria.Cs
                         {
                             var f = t.InstanceFields[i];
                             var (fs, fa) = GetStorageSizeAlign(f.FieldType);
+                            int repeat = (t.InlineArrayLength > 0 && ReferenceEquals(f, t.InlineArrayElementField))
+                                ? t.InlineArrayLength
+                                : 1;
+
                             offset = AlignUp(offset, fa);
                             f.Offset = offset;
-                            AppendGcPointerOffsets(gcOffsets, offset, f.FieldType);
-                            offset += fs;
+
+                            for (int elementIndex = 0; elementIndex < repeat; elementIndex++)
+                                AppendGcPointerOffsets(gcOffsets, offset + elementIndex * fs, f.FieldType);
+
+                            offset += checked(fs * repeat);
                             if (fa > maxAlign) maxAlign = fa;
                         }
 
@@ -2266,7 +2272,95 @@ namespace Cnidaria.Cs
 
             declaringType.InstanceFields = inst.ToArray();
             declaringType.StaticFields = stat.ToArray();
+
+            int typeTok = MetadataToken.Make(MetadataToken.TypeDef, tdIndex + 1);
+            if (TryGetInlineArrayLengthFromMetadata(m, typeTok, out int inlineArrayLength))
+            {
+                declaringType.InlineArrayLength = inlineArrayLength;
+                if (declaringType.Kind != RuntimeTypeKind.Struct)
+                    throw new TypeLoadException($"Inline array type '{declaringType.Namespace}.{declaringType.Name}' must be a struct.");
+                if (inlineArrayLength <= 0)
+                    throw new TypeLoadException($"Inline array type '{declaringType.Namespace}.{declaringType.Name}' must have a positive length.");
+                if (declaringType.InstanceFields.Length != 1)
+                    throw new TypeLoadException($"Inline array type '{declaringType.Namespace}.{declaringType.Name}' must have exactly one instance field.");
+
+                declaringType.InlineArrayElementField = declaringType.InstanceFields[0];
+            }
         }
+
+        private bool TryGetInlineArrayLengthFromMetadata(RuntimeModule module, int typeToken, out int length)
+        {
+            length = 0;
+            int count = module.Md.GetRowCount(MetadataTableKind.CustomAttribute);
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = module.Md.GetCustomAttribute(rid);
+                if (row.ParentToken != typeToken)
+                    continue;
+                if (!IsInlineArrayAttributeType(module, row.AttributeTypeToken))
+                    continue;
+                if (TryReadInlineArrayLength(module.Md.GetBlob(row.Value), out length))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsInlineArrayAttributeType(RuntimeModule module, int attributeTypeToken)
+        {
+            int table = MetadataToken.Table(attributeTypeToken);
+            int rid = MetadataToken.Rid(attributeTypeToken);
+            string ns;
+            string name;
+
+            if (table == MetadataToken.TypeDef)
+            {
+                (ns, name) = Domain.GetTypeDefFullNameByRid(module, rid);
+            }
+            else if (table == MetadataToken.TypeRef)
+            {
+                var resolved = Domain.ResolveTypeRefFullName(module, rid);
+                ns = resolved.ns;
+                name = resolved.name;
+            }
+            else
+            {
+                return false;
+            }
+
+            return string.Equals(ns, "System.Runtime.CompilerServices", StringComparison.Ordinal) &&
+                   string.Equals(name, "InlineArrayAttribute", StringComparison.Ordinal);
+        }
+
+        private static bool TryReadInlineArrayLength(ReadOnlySpan<byte> blob, out int length)
+        {
+            length = 0;
+            try
+            {
+                var reader = new AttrBlobReader(blob);
+                int ctorParamCount = reader.ReadInt32();
+                for (int i = 0; i < ctorParamCount; i++)
+                    _ = reader.ReadInt32();
+
+                int ctorArgCount = reader.ReadInt32();
+                if (ctorArgCount != 1)
+                    return false;
+
+                _ = reader.ReadInt32();
+                byte kind = reader.ReadByte();
+                if (kind != 7)
+                    return false;
+
+                length = reader.ReadInt32();
+                return true;
+            }
+            catch
+            {
+                length = 0;
+                return false;
+            }
+        }
+
         private void BuildMethodsForType(RuntimeModule m, RuntimeType declaringType, int tdIndex, TypeDefRow td)
         {
             int startRid = td.MethodList;
@@ -3025,6 +3119,8 @@ namespace Cnidaria.Cs
         public int InstanceSize { get; internal set; }
         public bool ContainsGcPointers { get; internal set; }
         public int[] GcPointerOffsets { get; internal set; } = Array.Empty<int>();
+        public int InlineArrayLength { get; internal set; }
+        public RuntimeField? InlineArrayElementField { get; internal set; }
         public RuntimeType[] Interfaces { get; internal set; } = Array.Empty<RuntimeType>();
         public RuntimeField[] InstanceFields { get; internal set; } = Array.Empty<RuntimeField>();
         public RuntimeField[] StaticFields { get; internal set; } = Array.Empty<RuntimeField>();

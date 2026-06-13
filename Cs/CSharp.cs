@@ -68,7 +68,8 @@ namespace Cnidaria.Cs
 
             try
             {
-                var parser = new Parser(source);
+                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
                 AddDiagnostics(diagnostics, parser.Diagnostics);
@@ -248,7 +249,8 @@ namespace Cnidaria.Cs
 
             try
             {
-                var parser = new Parser(source);
+                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
                 AddDiagnostics(diagnostics, parser.Diagnostics);
@@ -479,11 +481,12 @@ namespace Cnidaria.Cs
 
                 host?.Invoke(new HostInterface(regVm, rts, modules));
 
+                int entryPc = image.GetMethod(entryRuntimeMethod.MethodId).EntryPc;
                 var sw = Stopwatch.StartNew();
                 if (initialArgs != null)
-                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits, initialArgs);
+                    regVm.Execute(entryPc, cts.Token, execLimits, initialArgs);
                 else
-                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits);
+                    regVm.Execute(entryPc, cts.Token, execLimits);
                 sw.Stop();
 
                 return (
@@ -733,7 +736,8 @@ namespace Cnidaria.Cs
                     external = (extMeta, extFuncs);
                 }
                 var swBuild = Stopwatch.StartNew();
-                var parser = new Parser(source);
+                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
                 AddDiagnostics(diagnostics, parser.Diagnostics);
@@ -839,11 +843,12 @@ namespace Cnidaria.Cs
 
                 host?.Invoke(new HostInterface(regVm, rts, modules));
 
+                int entryPc = backend.Image.GetMethod(entryRuntimeMethod.MethodId).EntryPc;
                 var sw = Stopwatch.StartNew();
                 if (initialArgs != null)
-                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits, initialArgs);
+                    regVm.Execute(entryPc, cts.Token, execLimits, initialArgs);
                 else
-                    regVm.Execute(entryRuntimeMethod, cts.Token, execLimits);
+                    regVm.Execute(entryPc, cts.Token, execLimits);
                 sw.Stop();
 
                 return (
@@ -889,8 +894,8 @@ namespace Cnidaria.Cs
                         return (string.Empty, diagnostics, ExecutionContext.Empty);
                     external = (extMeta, extFuncs);
                 }
-
-                var parser = new Parser(source);
+                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
                 AddDiagnostics(diagnostics, parser.Diagnostics);
@@ -1107,7 +1112,8 @@ namespace Cnidaria.Cs
             CompileLibraryCore(string source, string moduleName)
         {
             var diagnostics = new List<IDiagnostic>();
-            var parser = new Parser(source);
+            var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+            var parser = new Parser(source, options);
             var root = parser.Parse();
 
             foreach (var diag in parser.LexerDiagnostics)

@@ -212,6 +212,113 @@ namespace Cnidaria.Cs
             }
         }
     }
+    
+
+    internal static class InlineArrayFacts
+    {
+        internal readonly struct InlineArrayInfo
+        {
+            public NamedTypeSymbol Type { get; }
+            public int Length { get; }
+            public FieldSymbol ElementField { get; }
+            public TypeSymbol ElementType => ElementField.Type;
+
+            public InlineArrayInfo(NamedTypeSymbol type, int length, FieldSymbol elementField)
+            {
+                Type = type;
+                Length = length;
+                ElementField = elementField;
+            }
+        }
+        public static bool TryGetInfo(TypeSymbol type, out InlineArrayInfo info)
+        {
+            info = default;
+            if (type is not NamedTypeSymbol nt)
+                return false;
+
+            if (!TryGetLength(nt, out int length))
+                return false;
+
+            if (!TryGetElementField(nt, out var field))
+                return false;
+
+            info = new InlineArrayInfo(nt, length, field);
+            return true;
+        }
+
+        public static bool TryGetLength(NamedTypeSymbol type, out int length)
+        {
+            length = 0;
+            var attrs = type.OriginalDefinition.GetAttributes();
+            for (int i = 0; i < attrs.Length; i++)
+            {
+                var attr = attrs[i];
+                if (!IsInlineArrayAttribute(attr))
+                    continue;
+
+                var args = attr.ConstructorArguments;
+                if (args.Length == 1 && args[0].Value is int value)
+                {
+                    length = value;
+                    return true;
+                }
+
+                return false;
+            }
+
+            return false;
+        }
+
+        public static bool TryGetElementField(NamedTypeSymbol type, out FieldSymbol field)
+        {
+            field = null!;
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not FieldSymbol f || f.IsStatic || f.IsConst)
+                    continue;
+
+                if (field is not null)
+                {
+                    field = null!;
+                    return false;
+                }
+
+                field = f;
+            }
+
+            return field is not null;
+        }
+
+        public static bool IsInlineArrayAttribute(AttributeData attr)
+        {
+            var attrClass = attr.AttributeClass;
+            if (!string.Equals(attrClass.Name, "InlineArrayAttribute", StringComparison.Ordinal))
+                return false;
+
+            if (attrClass.ContainingSymbol is not NamespaceSymbol ns)
+                return false;
+
+            return string.Equals(GetNamespaceFullName(ns), "System.Runtime.CompilerServices", StringComparison.Ordinal);
+        }
+
+        private static string GetNamespaceFullName(NamespaceSymbol ns)
+        {
+            if (ns.IsGlobalNamespace)
+                return string.Empty;
+
+            var parts = new Stack<string>();
+            Symbol? cur = ns;
+            while (cur is NamespaceSymbol curNs && !curNs.IsGlobalNamespace)
+            {
+                parts.Push(curNs.Name);
+                cur = curNs.ContainingSymbol;
+            }
+
+            return string.Join(".", parts);
+        }
+    }
+
     public abstract class Symbol
     {
         public abstract SymbolKind Kind { get; }
@@ -1576,6 +1683,7 @@ namespace Cnidaria.Cs
 
         public override bool IsStatic => _original.IsStatic;
         public override bool IsConst => _original.IsConst;
+        public override bool IsReadOnly => _original.IsReadOnly;
         public override Optional<object> ConstantValueOpt => _original.ConstantValueOpt;
 
         public override TypeSymbol Type => _type;

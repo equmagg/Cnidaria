@@ -1830,9 +1830,16 @@ namespace Cnidaria.Cs
     {
         public ImmutableArray<GenTreeMethod> Methods { get; }
         public IReadOnlyDictionary<int, GenTreeMethod> MethodsByRuntimeMethodId { get; }
+        public RuntimeTypeSystem? TypeSystem { get; }
 
         public GenTreeProgram(ImmutableArray<GenTreeMethod> methods)
+            : this(null, methods)
         {
+        }
+
+        public GenTreeProgram(RuntimeTypeSystem? typeSystem, ImmutableArray<GenTreeMethod> methods)
+        {
+            TypeSystem = typeSystem;
             Methods = methods.IsDefault ? ImmutableArray<GenTreeMethod>.Empty : methods;
             var map = new Dictionary<int, GenTreeMethod>();
             foreach (var m in Methods)
@@ -1887,7 +1894,7 @@ namespace Cnidaria.Cs
             foreach (var item in _bodyByMethodId.Values)
                 BuildOne(item.module, item.body, item.method);
 
-            return new GenTreeProgram(SortedBuiltMethods());
+            return new GenTreeProgram(_rts, SortedBuiltMethods());
         }
 
         public GenTreeProgram BuildReachable(RuntimeModule entryModule, ImmutableArray<int> entryMethodTokens)
@@ -1948,7 +1955,7 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            return new GenTreeProgram(SortedBuiltMethods());
+            return new GenTreeProgram(_rts, SortedBuiltMethods());
 
             bool Enqueue(RuntimeMethod method)
             {

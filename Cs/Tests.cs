@@ -50,7 +50,8 @@ namespace Cnidaria.Cs
                 var (output, diagnostics, context) = Cnidaria.Cs.CSharp.Interpret(source, cts);
                 foreach (var diagnostic in diagnostics)
                 {
-                    output += $"{diagnostic.GetMessage()}\n";
+                    if(diagnostic.GetSeverity() == DiagnosticSeverity.Error)
+                        output += $"{diagnostic.GetMessage()}\n";
                 }
                 if(diagnostics.All(x => x.GetSeverity() != DiagnosticSeverity.Error))
                 {
@@ -1580,7 +1581,924 @@ IEnumerable<int> ProduceEvenNumbers(int upto)
     }
 }
 ", "02468");
-            
+            // 134 preprocessor skips inactive syntax garbage
+            RunTest(@"
+#if false
+""unterminated string
+#endif
+Console.WriteLine(134);
+", "134");
+            // 135 preprocessor #if true keeps active branch
+            RunTest(@"
+#if true
+Console.Write(1);
+#else
+Console.Write(2);
+#endif
+Console.Write(3);
+", "13");
+            // 136 int shift count masking
+            RunTest(@"
+int a = 1 << 31;
+int b = 1 << 32;
+int c = 8 >> 35;
+Console.Write(a == -2147483648);
+Console.Write(b);
+Console.Write(c);
+", "true11");
+
+            // 137 long shift count masking
+            RunTest(@"
+long a = 1L << 63;
+long b = 1L << 64;
+long c = 16L >> 68;
+Console.Write(a == unchecked((long)0x8000000000000000));
+Console.Write(b);
+Console.Write(c);
+", "true11");
+
+            // 138 signed integer division truncates toward zero
+            RunTest(@"
+Console.Write((-7 / 2));
+Console.Write(',');
+Console.Write((7 / -2));
+Console.Write(',');
+Console.Write((-7 / -2));
+", "-3,-3,3");
+
+            // 139 signed integer remainder sign follows dividend
+            RunTest(@"
+Console.Write((-7 % 2));
+Console.Write(',');
+Console.Write((7 % -2));
+Console.Write(',');
+Console.Write((-7 % -2));
+", "-1,1,-1");
+
+            // 140 compound assignment cast back byte
+            RunTest(@"
+byte b = 250;
+b += 10;
+Console.WriteLine(b);
+", "4");
+            // 141 nested compound assignment value result
+            RunTest(@"
+int x = 1;
+int y = 2;
+int z = (x += 10) + (y *= 20);
+Console.Write(x);
+Console.Write(',');
+Console.Write(y);
+Console.Write(',');
+Console.Write(z);
+", "11,40,51");
+            // 142 right associative assignment
+            RunTest(@"
+int a = 1;
+int b = 2;
+int c = 3;
+a = b = c = 9;
+Console.Write(a);
+Console.Write(b);
+Console.Write(c);
+", "999");
+            // 143 null coalescing right associativity
+            RunTest(@"
+string a = null;
+string b = null;
+string c = ""c"";
+Console.Write(a ?? b ?? c);
+", "c");
+            // 144 jagged array nested side effects
+            RunTest(@"
+int[][] a = new int[2][];
+a[0] = new int[] { 10, 20 };
+a[1] = new int[] { 30, 40 };
+int i = 0;
+int j = 0;
+a[i++][j++] += a[i][j];
+Console.Write(a[0][0]);
+Console.Write(',');
+Console.Write(i);
+Console.Write(',');
+Console.Write(j);
+", "50,1,1");
+            // 145 foreach iteration variable copy for struct
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int X;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S[] a = new S[1];
+        a[0].X = 5;
+        foreach (S s in a)
+        {
+            S t = s;
+            t.X = 9;
+        }
+        Console.WriteLine(a[0].X);
+    }
+}
+", "5");
+            // 146 default struct array zero initialization
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int A;
+    public int B;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S[] a = new S[2];
+        Console.Write(a[0].A);
+        Console.Write(a[0].B);
+        Console.Write(a[1].A);
+        Console.Write(a[1].B);
+    }
+}
+", "0000");
+            // 147 nested struct array field mutation
+            RunTest(@"
+namespace Ns;
+struct Inner
+{
+    public int X;
+}
+struct Outer
+{
+    public Inner I;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Outer[] a = new Outer[1];
+        a[0].I.X = 42;
+        Console.WriteLine(a[0].I.X);
+    }
+}
+", "42");
+            // 148 class field default null
+            RunTest(@"
+namespace Ns;
+class Node
+{
+    public Node Next;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Node n = new Node();
+        Console.WriteLine(n.Next == null);
+    }
+}
+", "true");
+            // 149 class array reference aliases
+            RunTest(@"
+namespace Ns;
+class Box
+{
+    public int X;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        Box b = new Box();
+        b.X = 3;
+        Box[] a = new Box[] { b, b };
+        a[0].X = 9;
+        Console.WriteLine(a[1].X);
+    }
+}
+", "9");
+            // 150 virtual call from base method
+            RunTest(@"
+namespace Ns;
+class A
+{
+    public virtual int F() { return 1; }
+    public int G() { return F() * 10; }
+}
+class B : A
+{
+    public override int F() { return 7; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        A a = new B();
+        Console.WriteLine(a.G());
+    }
+}
+", "70");
+            // 151 override calls base method
+            RunTest(@"
+namespace Ns;
+class A
+{
+    public virtual int F() { return 10; }
+}
+class B : A
+{
+    public override int F() { return base.F() + 5; }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        A a = new B();
+        Console.WriteLine(a.F());
+    }
+}
+", "15");
+            // 152 is operator with sealed type
+            RunTest(@"
+namespace Ns;
+class A { }
+class B : A { }
+class C : B { }
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        A x = new C();
+        Console.Write(x is A);
+        Console.Write(x is B);
+        Console.Write(x is C);
+        Console.Write(x is string);
+    }
+}
+", "truetruetruefalse");
+
+            // 153 explicit downcast
+            RunTest(@"
+namespace Ns;
+class A { public int X; }
+class B : A { public int Y; }
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        A a = new B();
+        a.X = 3;
+        B b = (B)a;
+        b.Y = 4;
+        Console.Write(b.X);
+        Console.Write(b.Y);
+    }
+}
+", "34");
+            // 154 boxing keeps struct copy
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int X;
+    public override string ToString() { return X.ToString(); }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S s;
+        s.X = 1;
+        object o1 = s;
+        s.X = 2;
+        object o2 = s;
+        Console.Write(o1.ToString());
+        Console.Write(o2.ToString());
+    }
+}
+", "12");
+
+            // 155 unbox explicit cast copy
+            RunTest(@"
+namespace Ns;
+struct S
+{
+    public int X;
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        S s;
+        s.X = 5;
+        object o = s;
+        S t = (S)o;
+        t.X = 9;
+        Console.Write(s.X);
+        Console.Write(t.X);
+    }
+}
+", "59");
+            // 156 basic generic method type inference
+            RunTest(@"
+T Id<T>(T x) => x;
+Console.Write(Id(7));
+Console.Write(Id(""x""));
+", "7x");
+            // 157 different generic type parameters
+            RunTest(@"
+string Pair<TA, TB>(TA a, TB b)
+{
+    return a.ToString() + "":"" + b.ToString();
+}
+Console.Write(Pair(12, ""ab""));
+", "12:ab");
+            // 158 params array is fresh per call
+            RunTest(@"
+int Mutate(params int[] xs)
+{
+    if (xs.Length > 0)
+        xs[0] = 99;
+    return xs.Length;
+}
+int a = Mutate(1, 2);
+int b = Mutate(3, 4, 5);
+Console.Write(a);
+Console.Write(b);
+", "23");
+            // 159 out argument target evaluated before call
+            RunTest(@"
+void M(out int x)
+{
+    x = 42;
+}
+int[] a = new int[] { 1, 2 };
+int i = 0;
+M(out a[i++]);
+Console.Write(a[0]);
+Console.Write(',');
+Console.Write(a[1]);
+Console.Write(',');
+Console.Write(i);
+", "42,2,1");
+            // 160 ref argument aliasing same local
+            RunTest(@"
+void M(ref int a, ref int b)
+{
+    a += 1;
+    b += 10;
+}
+int x = 0;
+M(ref x, ref x);
+Console.WriteLine(x);
+", "11");
+            // 161 local function captures by reference
+            RunTest(@"
+int x = 1;
+int F() => x;
+int a = F();
+x = 9;
+int b = F();
+Console.Write(a);
+Console.Write(b);
+", "19");
+            // 162 lambda captures mutated local
+            RunTest(@"
+int x = 1;
+Func<int> f = () => x;
+Console.Write(f());
+x = 7;
+Console.Write(f());
+", "17");
+            // 163 lambda captures independent invocation frames
+            RunTest(@"
+Func<int> Make(int x)
+{
+    return () => x;
+}
+var a = Make(1);
+var b = Make(2);
+Console.Write(a());
+Console.Write(b());
+", "12");
+            // 164 delegate combines invocation order
+            RunTest(@"
+int x = 0;
+Action a = () => x = x * 10 + 1;
+a += () => x = x * 10 + 2;
+a += () => x = x * 10 + 3;
+a();
+Console.WriteLine(x);
+", "123");
+            // 165 delegate remove last matching handler
+            RunTest(@"
+int x = 0;
+Action h1 = () => x = x * 10 + 1;
+Action h2 = () => x = x * 10 + 2;
+Action a = h1;
+a += h2;
+a -= h2;
+a();
+Console.WriteLine(x);
+", "1");
+            // 166 List<T> remove and index shift
+            RunTest(@"
+var l = new List<int>();
+l.Add(1);
+l.Add(2);
+l.Add(3);
+l.RemoveAt(1);
+Console.Write(l.Count);
+Console.Write(l[0]);
+Console.Write(l[1]);
+", "213");
+            // 167 List<T> foreach after mutation before enumeration
+            RunTest(@"
+var l = new List<int>();
+l.Add(4);
+l.Add(5);
+l.Add(6);
+int s = 0;
+foreach (int x in l)
+    s = s * 10 + x;
+Console.WriteLine(s);
+", "456");
+            // 168 string concatenation mixed primitive
+            RunTest(@"
+int x = 12;
+bool b = true;
+Console.Write(""x="" + x + "",b="" + b);
+", "x=12,b=True");
+            // 169 string interpolation evaluates left to right
+            RunTest(@"
+int x = 0;
+int Next() { x++; return x; }
+Console.Write($""{Next()}-{Next()}-{x}"");
+", "1-2-2");
+            // 170 string interpolation with escaped braces
+            RunTest(@"
+int x = 7;
+Console.Write($""{{{x}}}"");
+", "{7}");
+            // 171 verbatim string escape quotes
+            RunTest(@"
+string s = @""a""""b"";
+Console.Write(s);
+Console.Write(s.Length);
+", "a\"b3");
+            // 172 char escape values
+            RunTest(@"
+Console.Write((int)'\n');
+Console.Write(',');
+Console.Write((int)'\t');
+Console.Write(',');
+Console.Write((int)'\\');
+", "10,9,92");
+            // 173 switch default before cases
+            RunTest(@"
+int F(int x)
+{
+    switch (x)
+    {
+        default:
+            return 9;
+        case 1:
+            return 1;
+        case 2:
+            return 2;
+    }
+}
+Console.Write(F(1));
+Console.Write(F(2));
+Console.Write(F(3));
+", "129");
+            // 174 switch goto default from case
+            RunTest(@"
+int x = 0;
+switch (1)
+{
+    case 1:
+        x += 1;
+        goto default;
+    default:
+        x += 10;
+        break;
+}
+Console.WriteLine(x);
+", "11");
+            // 175 nested switch break only switch
+            RunTest(@"
+int s = 0;
+for (int i = 0; i < 3; i++)
+{
+    switch (i)
+    {
+        case 1:
+            break;
+        default:
+            s += 10;
+            break;
+    }
+    s += i;
+}
+Console.WriteLine(s);
+", "23");
+            // 176 continue inside switch inside loop
+            RunTest(@"
+int s = 0;
+for (int i = 0; i < 5; i++)
+{
+    switch (i)
+    {
+        case 1:
+        case 3:
+            continue;
+    }
+    s = s * 10 + i;
+}
+Console.WriteLine(s);
+", "24");
+            // 177 do while with continue still evaluates condition
+            RunTest(@"
+int i = 0;
+int s = 0;
+do
+{
+    i++;
+    if (i < 3)
+        continue;
+    s += i;
+}
+while (i < 5);
+Console.WriteLine(s);
+", "12");
+            // 178 try finally with return from method
+            RunTest(@"
+int F()
+{
+    try
+    {
+        return 1;
+    }
+    finally
+    {
+        Console.Write(2);
+    }
+}
+Console.Write(F());
+", "21");
+            // 179 catch exact exception type
+            RunTest(@"
+try
+{
+    throw new InvalidOperationException();
+}
+catch (ArgumentException)
+{
+    Console.Write(1);
+}
+catch (InvalidOperationException)
+{
+    Console.Write(2);
+}
+", "2");
+            // 180 catch base exception type
+            RunTest(@"
+try
+{
+    throw new InvalidOperationException();
+}
+catch (Exception)
+{
+    Console.Write(1);
+}
+", "1");
+            // 181 finally runs before catch in outer frame
+            RunTest(@"
+try
+{
+    try
+    {
+        Console.Write(1);
+        throw new InvalidOperationException();
+    }
+    finally
+    {
+        Console.Write(2);
+    }
+}
+catch (Exception)
+{
+    Console.Write(3);
+}
+", "123");
+            // 182 using disposes on exception
+            RunTest(@"
+namespace Ns;
+class C : IDisposable
+{
+    public void Dispose()
+    {
+        Console.Write(2);
+    }
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        try
+        {
+            using (var c = new C())
+            {
+                Console.Write(1);
+                throw new InvalidOperationException();
+            }
+        }
+        catch (Exception)
+        {
+            Console.Write(3);
+        }
+    }
+}
+", "123");
+            // 183 checked nested expression throws before assignment
+            RunTest(@"
+int x = 1;
+try
+{
+    x = checked(2147483647 + 1);
+}
+catch (OverflowException)
+{
+    Console.Write(x);
+}
+", "1");
+            // 184 unchecked nested expression wraps inside checked context
+            RunTest(@"
+try
+{
+    int x = checked(unchecked(2147483647 + 1));
+    Console.Write(x == -2147483648);
+}
+catch (OverflowException)
+{
+    Console.Write(""bad"");
+}
+", "true");
+            // 185 nullable default has no value
+            RunTest(@"
+Nullable<int> n = default(Nullable<int>);
+Console.Write(n.HasValue);
+", "false");
+            // 186 nullable null assignment
+            RunTest(@"
+int? n = 5;
+n = null;
+Console.Write(n.HasValue);
+", "false");
+            // 187 tuple names preserved
+            RunTest(@"
+(int left, int right) a = (3, 4);
+(int x, int y) b = a;
+Console.Write(b.x);
+Console.Write(b.y);
+", "34");
+            // 188 tuple assignment target evaluated before rhs
+            RunTest(@"
+int[] a = new int[] { 1, 2 };
+int i = 0;
+(a[i++], a[i++]) = (10, 20);
+Console.Write(a[0]);
+Console.Write(',');
+Console.Write(a[1]);
+Console.Write(',');
+Console.Write(i);
+", "10,20,2");
+            // 189 tuple nested deconstruction with discard
+            RunTest(@"
+var t = ((1, 2), (3, 4));
+int a;
+int d;
+((a, _), (_, d)) = t;
+Console.Write(a);
+Console.Write(d);
+", "14");
+            // 190 yield break
+            RunTest(@"
+IEnumerable<int> Gen()
+{
+    yield return 1;
+    yield break;
+    yield return 2;
+}
+foreach (int x in Gen())
+    Console.Write(x);
+", "1");
+            // 191 iterator local state survives MoveNext
+            RunTest(@"
+IEnumerable<int> Gen()
+{
+    int x = 1;
+    yield return x;
+    x += 10;
+    yield return x;
+}
+foreach (int x in Gen())
+    Console.Write(x);
+", "111");
+            // 192 yield return stops after consumer break
+            RunTest(@"
+int produced = 0;
+IEnumerable<int> Gen()
+{
+    for (int i = 0; i < 10; i++)
+    {
+        produced++;
+        yield return i;
+    }
+}
+foreach (int x in Gen())
+{
+    Console.Write(x);
+    if (x == 2)
+        break;
+}
+Console.Write("":"" + produced);
+", "012:3");
+            // 193 stackalloc indexing
+            RunTest(@"
+unsafe
+{
+    int* p = stackalloc int[3];
+    p[0] = 10;
+    p[1] = 20;
+    p[2] = p[0] + p[1];
+    Console.WriteLine(p[2]);
+}
+", "30");
+            // 194 pointer arithmetic
+            RunTest(@"
+unsafe
+{
+    int* p = stackalloc int[3];
+    *(p + 0) = 1;
+    *(p + 1) = 2;
+    *(p + 2) = 3;
+    Console.Write(*(p + 0));
+    Console.Write(*(p + 1));
+    Console.Write(*(p + 2));
+}
+", "123");
+            // 195 numeric casts sign extension
+            RunTest(@"
+sbyte a = -1;
+short b = a;
+int c = b;
+long d = c;
+Console.WriteLine(d);
+", "-1");
+            // 196 explicit narrowing signed
+            RunTest(@"
+int x = -1;
+byte b = unchecked((byte)x);
+Console.WriteLine(b);
+", "255");
+            // 197 float arithmetic
+            RunTest(@"
+float x = 1.5f;
+float y = 2.25f;
+Console.WriteLine(x + y == 3.75f);
+", "true");
+            // 198 double comparison with NaN
+            RunTest(@"
+double n = double.NaN;
+Console.Write(n == n);
+Console.Write(n != n);
+", "falsetrue");
+            // 199 Math.Min Max Abs
+            RunTest(@"
+Console.Write(Math.Min(3, 7));
+Console.Write(Math.Max(3, 7));
+Console.Write(Math.Abs(-5));
+", "375");
+            // 200 enum underlying values
+            RunTest(@"
+namespace Ns;
+enum E
+{
+    A = 1,
+    B = 5,
+    C = 6
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        E e = E.B;
+        Console.WriteLine((int)e);
+    }
+}
+", "5");
+            // 201 enum default zero
+            RunTest(@"
+namespace Ns;
+enum E
+{
+    A = 1
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        E e = default(E);
+        Console.WriteLine((int)e);
+    }
+}
+", "0");
+            // 202 enum bitwise operations
+            RunTest(@"
+namespace Ns;
+enum E
+{
+    A = 1,
+    B = 2,
+    C = 4
+}
+internal class Program
+{
+    public static void Main(string[] args)
+    {
+        E e = E.A | E.C;
+        Console.WriteLine((int)e);
+    }
+}
+", "5");
+            // 203 overload resolution params vs normal
+            RunTest(@"
+internal class Program
+{
+    static string F(int x) => ""normal"";
+    static string F(params int[] x) => ""params"";
+    public static void Main(string[] args)
+    {
+        Console.Write(F(1));
+        Console.Write(',');
+        Console.Write(F(1, 2));
+    }
+}
+", "normal,params");
+            // 204 overload resolution generic vs non-generic
+            RunTest(@"
+internal class Program
+{
+    static string F<T>(T x) => ""generic"";
+    static string F(int x) => ""int"";
+    public static void Main(string[] args)
+    {
+        Console.Write(F(1));
+        Console.Write(',');
+        Console.Write(F(""x""));
+    }
+}
+", "int,generic");
+            // 205 optional parameter default
+            RunTest(@"
+int F(int x, int y = 10)
+{
+    return x + y;
+}
+Console.Write(F(1));
+Console.Write(',');
+Console.Write(F(1, 2));
+", "11,3");
+            // 206 named arguments order
+            RunTest(@"
+int F(int a, int b, int c)
+{
+    return a * 100 + b * 10 + c;
+}
+Console.WriteLine(F(c: 3, a: 1, b: 2));
+", "123");
+            // 207 named and positional arguments
+            RunTest(@"
+int F(int a, int b, int c)
+{
+    return a * 100 + b * 10 + c;
+}
+Console.WriteLine(F(1, c: 3, b: 2));
+", "123");
+            // 208 inline array
+            RunTest(@"
+var buffer = new InlineArray10<int>();
+buffer[3] = 3;
+Console.Write(buffer[3]);
+", "3");
+
+
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)

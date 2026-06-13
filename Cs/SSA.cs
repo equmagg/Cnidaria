@@ -2999,11 +2999,15 @@ namespace Cnidaria.Cs
 
             var trackedList = new List<SsaSlot>(tracked);
             trackedList.Sort();
+
+            bool suppressScalarSsaForEh = cfg.ExceptionRegions.Length != 0 || method.Function.ExceptionHandlers.Length != 0;
+
             for (int i = 0; i < trackedList.Count; i++)
             {
                 var slot = trackedList[i];
                 var descriptor = descriptors[slot];
-                if (CanTrackAsScalar(slot, descriptor))
+
+                if (!suppressScalarSsaForEh && CanTrackAsScalar(slot, descriptor))
                 {
                     descriptor.MarkRegularPromotedScalar(i);
                 }
@@ -8625,6 +8629,9 @@ namespace Cnidaria.Cs
                 if (!_slotInfos.TryGetValue(operand.Value.Value.Slot, out var operandInfo))
                     return false;
 
+                if (!IsSemanticallyNoOpConversion(tree.Source.ConvKind, tree.Source.ConvFlags, operandInfo.StackKind))
+                    return false;
+
                 var sourceAbi = MachineAbi.ClassifyStorageValue(operandInfo.Type, operandInfo.StackKind);
                 var destinationAbi = MachineAbi.ClassifyStorageValue(tree.Source.Type, tree.Source.StackKind);
                 if (sourceAbi.PassingKind == destinationAbi.PassingKind &&
@@ -8635,6 +8642,42 @@ namespace Cnidaria.Cs
                     simplified = operand;
                     return true;
                 }
+
+                return false;
+            }
+
+            private static bool IsSemanticallyNoOpConversion(NumericConvKind targetKind, NumericConvFlags flags, GenStackKind sourceStackKind)
+            {
+                if ((flags & NumericConvFlags.Checked) != 0)
+                    return false;
+
+                if (targetKind is NumericConvKind.Bool or
+                    NumericConvKind.I1 or NumericConvKind.U1 or
+                    NumericConvKind.I2 or NumericConvKind.U2 or NumericConvKind.Char)
+                {
+                    return false;
+                }
+
+                if (targetKind is NumericConvKind.I4 or NumericConvKind.U4)
+                    return sourceStackKind == GenStackKind.I4;
+
+                if (targetKind is NumericConvKind.I8 or NumericConvKind.U8)
+                    return sourceStackKind == GenStackKind.I8;
+
+                if (targetKind == NumericConvKind.R4)
+                    return sourceStackKind == GenStackKind.R4;
+
+                if (targetKind == NumericConvKind.R8)
+                    return sourceStackKind == GenStackKind.R8;
+
+                if (targetKind == NumericConvKind.NativeInt)
+                    return sourceStackKind == GenStackKind.NativeInt ||
+                           (TargetArchitecture.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
+
+                if (targetKind == NumericConvKind.NativeUInt)
+                    return sourceStackKind == GenStackKind.NativeUInt ||
+                           sourceStackKind == GenStackKind.Ptr ||
+                           (TargetArchitecture.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
 
                 return false;
             }

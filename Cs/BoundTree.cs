@@ -359,6 +359,35 @@ namespace Cnidaria.Cs
         {
         }
     }
+    internal sealed class BoundInlineArrayElementAccessExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.InlineArrayElementAccess;
+        public BoundExpression Receiver { get; }
+        public FieldSymbol ElementField { get; }
+        public BoundExpression Index { get; }
+        public int Length { get; }
+        private readonly bool _isLValue;
+        public override bool IsLValue => _isLValue;
+
+        public BoundInlineArrayElementAccessExpression(
+            SyntaxNode syntax,
+            BoundExpression receiver,
+            FieldSymbol elementField,
+            BoundExpression index,
+            int length,
+            bool isLValue)
+            : base(syntax)
+        {
+            Receiver = receiver;
+            ElementField = elementField;
+            Index = index;
+            Length = length;
+            _isLValue = isLValue;
+            Type = elementField.Type;
+            HasErrors = receiver.HasErrors || index.HasErrors;
+        }
+    }
+
     internal sealed class BoundStackAllocArrayCreationExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.StackAllocArrayCreation;

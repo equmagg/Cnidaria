@@ -1329,6 +1329,9 @@ namespace Cnidaria.Cs
                     _il.Emit(BytecodeOp.Ldfld, operand0: tok, pop: 1, push: 1);
                 }
 
+                if (fs.Type is ByRefTypeSymbol byRefField)
+                    _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(byRefField.ElementType), pop: 1, push: 1);
+
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
 
@@ -1724,6 +1727,26 @@ namespace Cnidaria.Cs
                         throw new NotSupportedException("Cannot assign to a const field in lowered form.");
 
                     int tok = _tokens.GetFieldToken(fs);
+
+                    if (fs.Type is ByRefTypeSymbol byRefField && assignment.Right is not BoundRefExpression)
+                    {
+                        EmitLoadAddressOfLValue(leftField);
+                        EmitExpression(assignment.Right, EmitMode.Value);
+
+                        int elemTok = _tokens.GetTypeToken(byRefField.ElementType);
+                        if (mode == EmitMode.Discard)
+                        {
+                            _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0);
+                            return;
+                        }
+
+                        int spill = AllocateSpillLocal(assignment.Type);
+                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                        _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0);
+                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0);
+                        _il.Emit(BytecodeOp.Ldloc, operand0: spill, pop: 0, push: 1);
+                        return;
+                    }
 
                     if (fs.IsStatic)
                     {

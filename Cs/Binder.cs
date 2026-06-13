@@ -1513,6 +1513,7 @@ namespace Cnidaria.Cs
                 }
             }
             ValidateAttributeUsageApplications(applications, diagnostics);
+            ValidateInlineArrayTypes(compilation, trees, diagnostics);
         }
         private static void BindAttributeListsOnOwner(
             Compilation compilation,
@@ -1569,6 +1570,83 @@ namespace Cnidaria.Cs
             }
 
         }
+        private static void ValidateInlineArrayTypes(
+            Compilation compilation,
+            ImmutableArray<SyntaxTree> trees,
+            DiagnosticBag diagnostics)
+        {
+            var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+
+            for (int ti = 0; ti < trees.Length; ti++)
+            {
+                var tree = trees[ti];
+                if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
+                    continue;
+
+                foreach (var kv in declMap)
+                {
+                    if (kv.Value is not NamedTypeSymbol type || kv.Key is not TypeDeclarationSyntax syntax)
+                        continue;
+
+                    if (!seen.Add(type))
+                        continue;
+
+                    if (!InlineArrayFacts.TryGetLength(type, out int length))
+                        continue;
+
+                    var typeLocation = new Location(tree, syntax.Identifier.Span);
+                    if (type.TypeKind != TypeKind.Struct)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_INLINEARRAY001",
+                            DiagnosticSeverity.Error,
+                            "Inline array attribute can only be applied to a struct type.",
+                            typeLocation));
+                        continue;
+                    }
+
+                    if (length <= 0)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_INLINEARRAY002",
+                            DiagnosticSeverity.Error,
+                            "Inline array length must be greater than zero.",
+                            typeLocation));
+                    }
+
+                    int instanceFieldCount = 0;
+                    FieldSymbol? elementField = null;
+                    var members = type.GetMembers();
+                    for (int i = 0; i < members.Length; i++)
+                    {
+                        if (members[i] is FieldSymbol f && !f.IsStatic && !f.IsConst)
+                        {
+                            instanceFieldCount++;
+                            elementField = f;
+                        }
+                    }
+
+                    if (instanceFieldCount != 1)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_INLINEARRAY003",
+                            DiagnosticSeverity.Error,
+                            "Inline array struct must declare exactly one instance field.",
+                            typeLocation));
+                    }
+                    else if (elementField!.Type is ByRefTypeSymbol)
+                    {
+                        var loc = elementField.Locations.IsDefaultOrEmpty ? typeLocation : elementField.Locations[0];
+                        diagnostics.Add(new Diagnostic(
+                            "CN_INLINEARRAY004",
+                            DiagnosticSeverity.Error,
+                            "Inline array element field cannot be a ref field.",
+                            loc));
+                    }
+                }
+            }
+        }
+
         private static void ValidateAttributeUsageApplications(
             List<BoundAttributeApplication> applications,
             DiagnosticBag diagnostics)
@@ -7811,7 +7889,7 @@ namespace Cnidaria.Cs
                 var pRefKind = DeclarationBuilder.GetParameterRefKind(p);
                 if (pRefKind != ParameterRefKind.None && pt is not ByRefTypeSymbol)
                     pt = sigContext.Compilation.CreateByRefType(pt);
-                pb.Add(new ParameterSymbol(
+                var parameter = new ParameterSymbol(
                     pn,
                     sym,
                     pt,
@@ -7819,11 +7897,69 @@ namespace Cnidaria.Cs
                     isReadOnlyRef: DeclarationBuilder.IsReadOnlyByRefParameter(p),
                     refKind: pRefKind,
                     isScoped: DeclarationBuilder.IsScopedParameter(p),
-                    isParams: DeclarationBuilder.IsParamsParameter(p)));
+                    isParams: DeclarationBuilder.IsParamsParameter(p));
+
+                if (p.Default is not null)
+                    BindLocalFunctionParameterDefault(p, parameter, sigBinder, sigContext, diagnostics);
+
+                pb.Add(parameter);
             }
 
             sym.SetSignature(returnType, pb.ToImmutable());
             return sym;
+        }
+        private void BindLocalFunctionParameterDefault(
+            ParameterSyntax parameterSyntax,
+            ParameterSymbol parameter,
+            LocalScopeBinder sigBinder,
+            BindingContext sigContext,
+            DiagnosticBag diagnostics)
+        {
+            var def = parameterSyntax.Default;
+            if (def is null)
+                return;
+
+            if (parameter.RefKind != ParameterRefKind.None)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PARAMDEFAULT002",
+                    DiagnosticSeverity.Error,
+                    "Optional parameters cannot be ref/out/in.",
+                    new Location(sigContext.SemanticModel.SyntaxTree, def.Span)));
+                return;
+            }
+
+            if (parameter.IsParams)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PARAMDEFAULT003",
+                    DiagnosticSeverity.Error,
+                    "'params' parameters cannot have a default value.",
+                    new Location(sigContext.SemanticModel.SyntaxTree, def.Span)));
+                return;
+            }
+
+            var init = sigBinder.BindExpression(def.Value, sigContext, diagnostics);
+            init = sigBinder.ApplyConversion(
+                exprSyntax: def.Value,
+                expr: init,
+                targetType: parameter.Type,
+                diagnosticNode: parameterSyntax,
+                context: sigContext,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+
+            if (!init.ConstantValueOpt.HasValue)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PARAMDEFAULT001",
+                    DiagnosticSeverity.Error,
+                    "Optional parameter default value must be a compile-time constant.",
+                    new Location(sigContext.SemanticModel.SyntaxTree, def.Span)));
+                return;
+            }
+
+            parameter.SetDefaultValue(init.ConstantValueOpt);
         }
         private ImmutableArray<TypeParameterSymbol> DeclareLocalFunctionTypeParameters(
         LocalFunctionStatementSyntax lf,
@@ -9869,15 +10005,18 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(wholeSyntax);
             }
 
-            var conversion = ClassifyConversion(operand, patternType, context);
-            if (!IsConversionOfIsTypePattern(conversion))
+            if (!(ClassifyConversion(operand, patternType, context).Kind is ConversionKind.Identity
+                or ConversionKind.ImplicitReference
+                or ConversionKind.ExplicitReference
+                or ConversionKind.Boxing
+                or ConversionKind.Unboxing
+                or ConversionKind.NullLiteral))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS010",
-                    DiagnosticSeverity.Error,
-                    $"Cannot test expression of type '{operand.Type.Name}' against pattern type '{patternType.Name}'.",
+                    DiagnosticSeverity.Warning,
+                    $"Expression of type '{operand.Type.Name}' is never of type '{patternType.Name}'.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                return new BoundBadExpression(wholeSyntax);
             }
 
             var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
@@ -9890,15 +10029,6 @@ namespace Cnidaria.Cs
                 declaredLocalOpt: declaredLocalOpt,
                 isDiscard: isDiscard);
 
-        }
-        private static bool IsConversionOfIsTypePattern(Conversion conversion)
-        {
-            return conversion.Kind is ConversionKind.Identity
-                or ConversionKind.ImplicitReference
-                or ConversionKind.ExplicitReference
-                or ConversionKind.Boxing
-                or ConversionKind.Unboxing
-                or ConversionKind.NullLiteral;
         }
         private BoundExpression BindTupleExpression(TupleExpressionSyntax te, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -11495,6 +11625,109 @@ namespace Cnidaria.Cs
                 isLValue: canWriteProperty || allowCtorAutoPropWrite);
         }
 
+        private BoundExpression BindInlineArrayElementAccess(
+            ExpressionSyntax syntax,
+            BoundExpression receiver,
+            BracketedArgumentListSyntax argumentList,
+            BindValueKind valueKind,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            InlineArrayFacts.InlineArrayInfo info)
+        {
+            if (argumentList.Arguments.Count != 1)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_INLINEARRAY010",
+                    DiagnosticSeverity.Error,
+                    "Inline array element access expects exactly one index argument.",
+                    new Location(context.SemanticModel.SyntaxTree, argumentList.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            var argSyntax = argumentList.Arguments[0].Expression;
+            if (argSyntax is RangeExpressionSyntax)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_INLINEARRAY011",
+                    DiagnosticSeverity.Error,
+                    valueKind == BindValueKind.LValue
+                        ? "Cannot assign to an inline array slice."
+                        : "Inline array slicing is not implemented.",
+                    new Location(context.SemanticModel.SyntaxTree, argSyntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+            BoundExpression index;
+            if (argSyntax is PrefixUnaryExpressionSyntax pre && pre.Kind == SyntaxKind.IndexExpression)
+            {
+                var value = BindExpression(pre.Operand, context, diagnostics);
+                value = ApplyConversion(
+                    exprSyntax: pre.Operand,
+                    expr: value,
+                    targetType: intType,
+                    diagnosticNode: syntax,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+
+                index = new BoundBinaryExpression(
+                    syntax,
+                    BoundBinaryOperatorKind.Subtract,
+                    intType,
+                    new BoundLiteralExpression(syntax, intType, info.Length),
+                    value,
+                    Optional<object>.None,
+                    isChecked: false);
+            }
+            else
+            {
+                index = BindExpression(argSyntax, context, diagnostics);
+                index = ApplyConversion(
+                    exprSyntax: argSyntax,
+                    expr: index,
+                    targetType: intType,
+                    diagnosticNode: syntax,
+                    context: context,
+                    diagnostics: diagnostics,
+                    requireImplicit: true);
+            }
+
+            if (index.HasErrors)
+                return new BoundBadExpression(syntax);
+
+            if (valueKind == BindValueKind.LValue)
+            {
+                if (!receiver.IsLValue)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_INLINEARRAY012",
+                        DiagnosticSeverity.Error,
+                        "Cannot assign to an inline array element because the receiver is not a variable.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+
+                if (IsReadOnlyValueReceiver(receiver, context))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_INLINEARRAY013",
+                        DiagnosticSeverity.Error,
+                        "Cannot assign to an inline array element through a readonly receiver.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                    return new BoundBadExpression(syntax);
+                }
+            }
+
+            return new BoundInlineArrayElementAccessExpression(
+                syntax,
+                receiver,
+                info.ElementField,
+                index,
+                info.Length,
+                isLValue: receiver.IsLValue);
+        }
+
         private BoundExpression BindElementOnBoundReceiver(
             ExpressionSyntax syntax,
             BoundExpression receiver,
@@ -11539,6 +11772,9 @@ namespace Cnidaria.Cs
 
                 return new BoundArrayElementAccessExpression(syntax, arrayType.ElementType, receiver, indices.ToImmutable());
             }
+
+            if (InlineArrayFacts.TryGetInfo(receiver.Type, out var inlineArray))
+                return BindInlineArrayElementAccess(syntax, receiver, argumentList, valueKind, context, diagnostics, inlineArray);
 
             var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
             if (receiverType is not null)
@@ -12587,6 +12823,9 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics,
             ImmutableArray<BoundStatement>.Builder sideEffects)
         {
+            if (IsDeconstructionDiscardTarget(targetSyntax))
+                return;
+
             var lv = BindLValue(targetSyntax, context, diagnostics, requireReadable: false);
             var target = lv.Target;
             bool hasErrors = target.HasErrors || source.HasErrors;
@@ -12637,6 +12876,15 @@ namespace Cnidaria.Cs
                 assignment.SetHasErrors();
 
             sideEffects.Add(new BoundExpressionStatement(targetSyntax, assignment));
+        }
+        private bool IsDeconstructionDiscardTarget(ExpressionSyntax targetSyntax)
+        {
+            if (targetSyntax is ParenthesizedExpressionSyntax paren)
+                return IsDeconstructionDiscardTarget(paren.Expression);
+
+            return targetSyntax is IdentifierNameSyntax id &&
+                StringComparer.Ordinal.Equals(id.Identifier.ValueText, "_") &&
+                !IsNameDeclaredInEnclosingScopes("_");
         }
         private BoundExpression MakeTupleElementRead(
             ExpressionSyntax syntax,
@@ -12791,6 +13039,7 @@ namespace Cnidaria.Cs
                 BoundLocalExpression => true,
                 BoundParameterExpression => true,
                 BoundArrayElementAccessExpression => true,
+                BoundInlineArrayElementAccessExpression => true,
                 BoundPointerIndirectionExpression => true,
                 BoundPointerElementAccessExpression => true,
                 BoundMemberAccessExpression { Member: FieldSymbol } => true,
@@ -15325,16 +15574,17 @@ namespace Cnidaria.Cs
 
             if (type.TypeKind == TypeKind.Struct && boundArgs.Length == 0)
             {
-                bool hasDeclaredParameterlessCtor = false;
-                for (int i = 0; i < allCtorCandidates.Length; i++)
+                bool hasAccessibleParameterlessCtor = false;
+                for (int i = 0; i < ctorCandidates.Length; i++)
                 {
-                    if (allCtorCandidates[i].Parameters.Length == 0)
+                    if (ctorCandidates[i].Parameters.Length == 0)
                     {
-                        hasDeclaredParameterlessCtor = true;
+                        hasAccessibleParameterlessCtor = true;
                         break;
                     }
                 }
-                if (!hasDeclaredParameterlessCtor)
+
+                if (!hasAccessibleParameterlessCtor)
                     return new BoundObjectCreationExpression(syntax, type, constructorOpt: null, arguments: boundArgs);
             }
             if (ctorCandidates.IsDefaultOrEmpty)
@@ -20298,6 +20548,9 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(node);
                 }
 
+                if (InlineArrayFacts.TryGetInfo(expr.Type, out var inlineArrayRange))
+                    return BindInlineArrayElementAccess(node, expr, node.ArgumentList, bindValueKind, context, diagnostics, inlineArrayRange);
+
                 return BindSliceElementAccess(node, expr, range, context, diagnostics);
             }
             if (expr.Type is ArrayTypeSymbol at)
@@ -20466,6 +20719,9 @@ namespace Cnidaria.Cs
                 var access = new BoundArrayElementAccessExpression(node, at.ElementType, recvExpr, indices2.ToImmutable());
                 return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), access);
             }
+            if (InlineArrayFacts.TryGetInfo(expr.Type, out var inlineArray))
+                return BindInlineArrayElementAccess(node, expr, node.ArgumentList, bindValueKind, context, diagnostics, inlineArray);
+
             if (expr.Type is PointerTypeSymbol pt)
             {
                 EnsureUnsafe(node, context, diagnostics);
@@ -24355,14 +24611,14 @@ namespace Cnidaria.Cs
 
             if (nt.TypeKind == TypeKind.Struct && boundArgs.Length == 0)
             {
-                bool hasDeclaredParameterlessCtor = false;
-                for (int i = 0; i < allCtorCandidates.Length; i++)
-                    if (allCtorCandidates[i].Parameters.Length == 0)
+                bool hasAccessibleParameterlessCtor = false;
+                for (int i = 0; i < ctorCandidates.Length; i++)
+                    if (ctorCandidates[i].Parameters.Length == 0)
                     {
-                        hasDeclaredParameterlessCtor = true;
+                        hasAccessibleParameterlessCtor = true;
                         break;
                     }
-                if (!hasDeclaredParameterlessCtor)
+                if (!hasAccessibleParameterlessCtor)
                     return true;
             }
             if (ctorCandidates.IsDefaultOrEmpty)

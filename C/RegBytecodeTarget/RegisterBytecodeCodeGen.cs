@@ -11,25 +11,37 @@ namespace Cnidaria.C
     public sealed class RegisterBytecodeProgram
     {
         public CodeImage Image { get; }
-        public int EntryMethodId { get; }
+        public int EntryPc { get; }
         public int PrintfMethodId { get; }
         public IReadOnlyDictionary<FunctionSymbol, int> MethodIds { get; }
         public IReadOnlyDictionary<int, FunctionType?> SignaturesByMethodId { get; }
 
         public RegisterBytecodeProgram(
             CodeImage image,
-            int entryMethodId,
+            int entryPc,
             int printfMethodId,
             IReadOnlyDictionary<FunctionSymbol, int> methodIds,
             IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId)
         {
             Image = image ?? throw new ArgumentNullException(nameof(image));
-            EntryMethodId = entryMethodId;
+            if (entryPc < 0)
+                throw new ArgumentOutOfRangeException(nameof(entryPc));
+            EntryPc = entryPc;
             PrintfMethodId = printfMethodId;
             MethodIds = methodIds ?? throw new ArgumentNullException(nameof(methodIds));
             SignaturesByMethodId = signaturesByMethodId ?? throw new ArgumentNullException(nameof(signaturesByMethodId));
         }
         public RegisterBytecodeSyntheticRuntime CreateSyntheticRuntime()
+            => CreateSyntheticRuntime(MethodIds, SignaturesByMethodId, EntryPc, PrintfMethodId);
+
+        internal void RegisterSyntheticRuntimeMethods(RuntimeTypeSystem runtimeTypes)
+            => RegisterSyntheticRuntimeMethods(runtimeTypes, MethodIds, SignaturesByMethodId, PrintfMethodId);
+
+        internal static RegisterBytecodeSyntheticRuntime CreateSyntheticRuntime(
+            IReadOnlyDictionary<FunctionSymbol, int> methodIds,
+            IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId,
+            int entryPc,
+            int printfMethodId)
         {
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
             var stdModule = new RuntimeModule(
@@ -40,18 +52,27 @@ namespace Cnidaria.C
             modules.Add(stdModule.Name, stdModule);
 
             var runtimeTypes = new RuntimeTypeSystem(modules);
-            var entryMethod = RegisterSyntheticRuntimeMethods(runtimeTypes);
-            return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryMethod);
+            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId);
+            return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryPc);
         }
-        internal RuntimeMethod RegisterSyntheticRuntimeMethods(RuntimeTypeSystem runtimeTypes)
+
+        internal static void RegisterSyntheticRuntimeMethods(
+            RuntimeTypeSystem runtimeTypes,
+            IReadOnlyDictionary<FunctionSymbol, int> methodIds,
+            IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId,
+            int printfMethodId)
         {
             if (runtimeTypes is null)
                 throw new ArgumentNullException(nameof(runtimeTypes));
+            if (methodIds is null)
+                throw new ArgumentNullException(nameof(methodIds));
+            if (signaturesByMethodId is null)
+                throw new ArgumentNullException(nameof(signaturesByMethodId));
 
             var cProgramType = runtimeTypes.RegisterSyntheticType("c", "__c", "Program", RuntimeTypeKind.Class);
-            foreach (var pair in SignaturesByMethodId.OrderBy(static p => p.Key))
+            foreach (var pair in signaturesByMethodId.OrderBy(static p => p.Key))
             {
-                if (pair.Key == PrintfMethodId)
+                if (pair.Key == printfMethodId)
                     continue;
 
                 if (TryGetMethod(runtimeTypes, pair.Key, out _))
@@ -65,12 +86,11 @@ namespace Cnidaria.C
                     ? Array.Empty<RuntimeType>()
                     : signature.Parameters.Select(p => MapRuntimeType(runtimeTypes, p.Type)).ToArray();
 
-                var name = MethodIds.FirstOrDefault(m => m.Value == pair.Key).Key?.Name ?? ("fn_" + pair.Key.ToString(CultureInfo.InvariantCulture));
+                var name = methodIds.FirstOrDefault(m => m.Value == pair.Key).Key?.Name ?? $"fn_{pair.Key.ToString(CultureInfo.InvariantCulture)}";
                 runtimeTypes.RegisterSyntheticStaticMethod(cProgramType, name, returnType, parameters, implFlags: 0, methodId: pair.Key);
             }
 
-            RegisterCStringWriteInternalCall(runtimeTypes, PrintfMethodId);
-            return runtimeTypes.GetMethodById(EntryMethodId);
+            RegisterCStringWriteInternalCall(runtimeTypes, printfMethodId);
         }
 
         private static bool TryGetMethod(RuntimeTypeSystem runtimeTypes, int methodId, out RuntimeMethod? method)
@@ -174,10 +194,15 @@ namespace Cnidaria.C
         private readonly LirModule _module;
         private readonly TargetInfo _target;
         private readonly LSRAOptions _allocationOptions;
-        private readonly Assembler _assembler = new Assembler();
+        private Assembler _assembler = null!;
+        private RuntimeTypeSystem _runtimeTypes = null!;
+        private RegisterBytecodeSyntheticRuntime _syntheticRuntime = null!;
         private readonly Dictionary<FunctionSymbol, int> _methodIds = new Dictionary<FunctionSymbol, int>();
         private readonly Dictionary<string, int> _methodIdsByName = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly Dictionary<int, FunctionType?> _signatures = new Dictionary<int, FunctionType?>();
+        private readonly Dictionary<int, RuntimeMethod> _runtimeMethodsById = new Dictionary<int, RuntimeMethod>();
+        private readonly Dictionary<int, Label> _methodEntryLabels = new Dictionary<int, Label>();
+        private readonly List<FunctionPointerFixup> _functionPointerFixups = new List<FunctionPointerFixup>();
 
         private RegisterBytecodeCodeGenerator(LirModule module, LSRAOptions? allocationOptions)
         {
@@ -192,19 +217,25 @@ namespace Cnidaria.C
         private RegisterBytecodeProgram Generate()
         {
             if (_target.PointerSize != TargetArchitecture.PointerSize)
-                throw new NotSupportedException("Register-bytecode C backend currently supports only the VM native pointer size (" + TargetArchitecture.PointerSize.ToString(CultureInfo.InvariantCulture) + " bytes).");
+                throw new NotSupportedException($"Register-bytecode C backend currently supports only the VM native pointer size ({TargetArchitecture.PointerSize.ToString(CultureInfo.InvariantCulture)} bytes).");
 
             IndexMethods();
+            var entryMethodId = ResolveEntryMethodId();
+            CreateSyntheticRuntimeForEmission();
+            _assembler = new Assembler(_runtimeTypes);
+            CreateMethodEntryLabels();
 
             foreach (var function in _module.Functions)
                 EmitFunction(function);
 
-            var entry = ResolveEntryMethodId();
             var flags = ImageFlags.LittleEndian;
             if (_target.PointerSize == 4)
                 flags |= ImageFlags.Target32;
+
             var image = _assembler.Build(flags, validate: true);
-            return new RegisterBytecodeProgram(image, entry, PrintfMethodId, _methodIds, _signatures);
+            image = PatchFunctionPointerFixups(image);
+            var entryPc = ResolveMethodEntryPc(image, entryMethodId);
+            return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures);
         }
 
         private void IndexMethods()
@@ -238,6 +269,84 @@ namespace Cnidaria.C
             return _methodIds.Values.First();
         }
 
+        private void CreateSyntheticRuntimeForEmission()
+        {
+            _syntheticRuntime = RegisterBytecodeProgram.CreateSyntheticRuntime(_methodIds, _signatures, entryPc: 0, printfMethodId: PrintfMethodId);
+            _runtimeTypes = _syntheticRuntime.RuntimeTypes;
+            _runtimeMethodsById.Clear();
+
+            foreach (var methodId in _signatures.Keys)
+                _runtimeMethodsById[methodId] = _runtimeTypes.GetMethodById(methodId);
+
+            _runtimeMethodsById[PrintfMethodId] = _runtimeTypes.GetMethodById(PrintfMethodId);
+        }
+
+        private void CreateMethodEntryLabels()
+        {
+            _methodEntryLabels.Clear();
+            foreach (var methodId in _methodIds.Values.Distinct().OrderBy(static id => id))
+                _methodEntryLabels.Add(methodId, _assembler.CreateLabel());
+        }
+
+        private Label GetMethodEntryLabel(int methodId)
+        {
+            if (_methodEntryLabels.TryGetValue(methodId, out var label))
+                return label;
+            throw new MissingMethodException($"C method M{methodId} is not present in the register-bytecode image.");
+        }
+
+        private static int ResolveMethodEntryPc(CodeImage image, int methodId)
+        {
+            if (image is null)
+                throw new ArgumentNullException(nameof(image));
+            if (!image.MethodIndexByRuntimeMethodId.TryGetValue(methodId, out var methodIndex))
+                throw new MissingMethodException($"C method M{methodId} is not present in the register-bytecode image.");
+            return image.Methods[methodIndex].EntryPc;
+        }
+
+        private CodeImage PatchFunctionPointerFixups(CodeImage image)
+        {
+            if (_functionPointerFixups.Count == 0)
+                return image;
+
+            var code = image.Code.ToArray();
+            foreach (var fixup in _functionPointerFixups)
+            {
+                var targetPc = ResolveMethodEntryPc(image, fixup.MethodId);
+                if ((uint)fixup.Pc >= (uint)code.Length)
+                    throw new InvalidOperationException($"Invalid function-pointer fixup PC {fixup.Pc}.");
+
+                var old = code[fixup.Pc];
+                if (old.Op is not (Op.LiI32 or Op.LiI64))
+                    throw new InvalidOperationException($"Function-pointer fixup at PC {fixup.Pc} points at {old.Op}, not a load-immediate instruction.");
+
+                code[fixup.Pc] = new InstrDesc(old.Op, old.Rd, old.Rs1, old.Rs2, old.Rs3, old.Aux, targetPc);
+            }
+
+            return new CodeImage(
+                image.Flags,
+                code.ToImmutableArray(),
+                image.Methods,
+                image.EhRegions,
+                image.GcSafePoints,
+                image.GcRoots,
+                image.Unwind,
+                image.SwitchTable,
+                image.TypeLayouts,
+                ImmutableArray<VTableSlotRecord>.Empty,
+                image.Blob,
+                validate: true);
+        }
+
+        private RuntimeMethod GetRuntimeMethod(int methodId)
+        {
+            if (_runtimeMethodsById.TryGetValue(methodId, out var method))
+                return method;
+            method = _runtimeTypes.GetMethodById(methodId);
+            _runtimeMethodsById.Add(methodId, method);
+            return method;
+        }
+
         private void EmitFunction(LirFunction function)
         {
             if (function.Symbol is null || !_methodIds.TryGetValue(function.Symbol, out var methodId))
@@ -249,7 +358,7 @@ namespace Cnidaria.C
                 labels.Add(block, _assembler.CreateLabel());
 
             var context = new FunctionEmissionContext(this, function, allocation, labels);
-            _assembler.BeginMethod(methodId, ToStackFrameLayout(allocation.Frame));
+            _assembler.BeginMethod(methodId, GetMethodEntryLabel(methodId), -1, ToStackFrameLayout(allocation.Frame));
             context.EmitPrologue();
             context.EmitBlocks();
             context.EmitImplicitFallthroughTrap();
@@ -282,6 +391,23 @@ namespace Cnidaria.C
                 outgoingArgumentSlots: empty,
                 usesFramePointer: false,
                 frameModel: RegisterStackFrameModel.Leaf);
+        }
+
+
+        private readonly struct FunctionPointerFixup
+        {
+            public readonly int Pc;
+            public readonly int MethodId;
+
+            public FunctionPointerFixup(int pc, int methodId)
+            {
+                if (pc < 0)
+                    throw new ArgumentOutOfRangeException(nameof(pc));
+                if (methodId < 0)
+                    throw new ArgumentOutOfRangeException(nameof(methodId));
+                Pc = pc;
+                MethodId = methodId;
+            }
         }
 
         private sealed class FunctionEmissionContext
@@ -422,7 +548,7 @@ namespace Cnidaria.C
                         break;
 
                     default:
-                        throw Unsupported(instruction, "Unsupported LIR instruction kind: " + instruction.Kind + ".");
+                        throw Unsupported(instruction, $"Unsupported LIR instruction kind: {instruction.Kind}.");
                 }
             }
 
@@ -533,7 +659,7 @@ namespace Cnidaria.C
                 }
                 else
                 {
-                    throw Unsupported(instruction, "Unsupported unary operator '" + op + "'.");
+                    throw Unsupported(instruction, $"Unsupported unary operator '{op}'.");
                 }
 
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
@@ -697,7 +823,7 @@ namespace Cnidaria.C
                     MarshalCallArguments(instruction, startOperand: 1);
                     PrepareVariadicCall(instruction);
                     var directCallOp = CallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void), isInternal: false);
-                    EmitRawCall(directCallOp, methodId, CallFlags.None);
+                    EmitManagedDirectCall(directCallOp, methodId, CallFlags.None);
                     EmitCallResult(instruction);
                     return;
                 }
@@ -732,7 +858,7 @@ namespace Cnidaria.C
                 else
                     LoadOperandInto(arg, MachineRegister.X10);
 
-                EmitRawCall(Op.CallInternalVoid, methodId, CallFlags.InternalCall);
+                EmitInternalCall(Op.CallInternalVoid, methodId, CallFlags.InternalCall);
 
                 if (instruction.Result is not null)
                 {
@@ -1014,10 +1140,10 @@ namespace Cnidaria.C
 
                 return callee.Kind == LirOperandKind.Symbol &&
                        callee.Symbol is FunctionSymbol function &&
-                       TryGetRuntimeMethodId(function, out methodId, out isPrintf);
+                       TryGetCallableMethodId(function, out methodId, out isPrintf);
             }
 
-            private bool TryGetRuntimeMethodId(FunctionSymbol function, out int methodId, out bool isPrintf)
+            private bool TryGetCallableMethodId(FunctionSymbol function, out int methodId, out bool isPrintf)
             {
                 methodId = 0;
                 isPrintf = false;
@@ -1044,13 +1170,15 @@ namespace Cnidaria.C
 
             private bool TryMaterializeFunctionPointer(FunctionSymbol function, MachineRegister destination)
             {
-                if (!TryGetRuntimeMethodId(function, out var methodId, out _))
+                if (!TryGetCallableMethodId(function, out var methodId, out var isPrintf))
+                    return false;
+                if (isPrintf)
                     return false;
 
-                if (methodId >= int.MinValue && methodId <= int.MaxValue)
-                    _asm.LiI32(destination, methodId);
-                else
-                    _asm.LiI64(destination, methodId);
+                var pc = _owner._target.PointerSize == 4
+                    ? _asm.Emit(InstrDesc.Li(Op.LiI32, destination, 0))
+                    : _asm.Emit(InstrDesc.Li(Op.LiI64, destination, 0));
+                _owner._functionPointerFixups.Add(new FunctionPointerFixup(pc, methodId));
                 return true;
             }
 
@@ -1078,7 +1206,7 @@ namespace Cnidaria.C
                         if (operand.StackSlot is null)
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
                         EmitMem(LoadOpForType(operand.Type), preferred, MachineRegister.Invalid, offset, MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
                         return preferred;
 
@@ -1097,9 +1225,9 @@ namespace Cnidaria.C
                         {
                             if (TryMaterializeFunctionPointer(function, preferred))
                                 return preferred;
-                            throw new NotSupportedException("Cannot materialize external function pointer '" + function.Name + "' because it has no register-bytecode method id.");
+                            throw new NotSupportedException($"Cannot materialize external function pointer '{function.Name}' because it has no register-bytecode entry PC.");
                         }
-                        throw new NotSupportedException("Cannot materialize symbol '" + operand.Symbol.Name + "' as static data.");
+                        throw new NotSupportedException($"Cannot materialize symbol '{operand.Symbol.Name}' as static data.");
 
                     case LirOperandKind.Undefined:
                     case LirOperandKind.Void:
@@ -1111,7 +1239,7 @@ namespace Cnidaria.C
                         return preferred;
 
                     default:
-                        throw new NotSupportedException("Cannot load LIR operand kind " + operand.Kind + " into a register.");
+                        throw new NotSupportedException($"Cannot load LIR operand kind {operand.Kind} into a register.");
                 }
             }
 
@@ -1236,7 +1364,7 @@ namespace Cnidaria.C
                             if (address.StackSlot is null)
                                 throw new InvalidOperationException("Stack-slot address has no stack slot.");
                             if (!_allocation.Frame.StackSlotOffsets.TryGetValue(address.StackSlot, out var offset))
-                                throw new InvalidOperationException("Missing stack slot offset for " + address.StackSlot.Name + ".");
+                                throw new InvalidOperationException($"Missing stack slot offset for {address.StackSlot.Name}.");
                             return new AddressParts(MachineRegister.Invalid, MachineRegister.Invalid, checked(offset + address.Displacement), MemoryBase.StackPointer, 0);
                         }
 
@@ -1282,7 +1410,7 @@ namespace Cnidaria.C
                         throw new NotSupportedException("Mutable global/static C objects are not supported by the register-bytecode backend yet.");
 
                     default:
-                        throw new NotSupportedException("Unsupported LIR address kind " + address.Kind + ".");
+                        throw new NotSupportedException($"Unsupported LIR address kind {address.Kind}.");
                 }
             }
 
@@ -1322,7 +1450,7 @@ namespace Cnidaria.C
                         break;
 
                     default:
-                        throw new NotSupportedException("Unsupported materialized memory base " + parts.BaseKind + ".");
+                        throw new NotSupportedException($"Unsupported materialized memory base {parts.BaseKind}.");
                 }
 
                 if (parts.IndexRegister != MachineRegister.Invalid)
@@ -1393,7 +1521,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                throw Unsupported(instruction, "Unsupported conversion from " + srcType.ToDisplayString() + " to " + dstType.ToDisplayString() + ".");
+                throw Unsupported(instruction, $"Unsupported conversion from {srcType.ToDisplayString()} to {dstType.ToDisplayString()}.");
             }
 
             private void EmitFloatConversion(MachineRegister dst, MachineRegister src, QualifiedType srcType, QualifiedType dstType, LirInstruction instruction)
@@ -1430,7 +1558,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                throw Unsupported(instruction, "Unsupported floating conversion from " + srcType.ToDisplayString() + " to " + dstType.ToDisplayString() + ".");
+                throw Unsupported(instruction, $"Unsupported floating conversion from {srcType.ToDisplayString()} to {dstType.ToDisplayString()}.");
             }
 
             private void EmitUnaryNeg(MachineRegister dst, MachineRegister src, QualifiedType type)
@@ -1480,7 +1608,7 @@ namespace Cnidaria.C
                     ">=" => is64 ? (unsigned ? Op.U64Ge : Op.I64Ge) : (unsigned ? Op.U32Ge : Op.I32Ge),
                     "&&" => is64 ? Op.I64And : Op.I32And,
                     "||" => is64 ? Op.I64Or : Op.I32Or,
-                    _ => throw new NotSupportedException("Unsupported binary operator '" + text + "'."),
+                    _ => throw new NotSupportedException($"Unsupported binary operator '{text}'."),
                 };
             }
 
@@ -1499,7 +1627,7 @@ namespace Cnidaria.C
                     "<=" => f32 ? Op.F32Le : Op.F64Le,
                     ">" => f32 ? Op.F32Gt : Op.F64Gt,
                     ">=" => f32 ? Op.F32Ge : Op.F64Ge,
-                    _ => throw new NotSupportedException("Unsupported floating binary operator '" + text + "'."),
+                    _ => throw new NotSupportedException($"Unsupported floating binary operator '{text}'."),
                 };
             }
 
@@ -1512,7 +1640,7 @@ namespace Cnidaria.C
                     ValueKind.Float64 => Op.LdF64,
                     ValueKind.Pointer => Op.LdPtr,
                     ValueKind.General32 or ValueKind.General64 => LoadIntegerOp(type),
-                    _ => throw new NotSupportedException("Cannot load non-scalar type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException($"Cannot load non-scalar type {type.ToDisplayString()}."),
                 };
             }
 
@@ -1525,7 +1653,7 @@ namespace Cnidaria.C
                     2 => signed ? Op.LdI2 : Op.LdU2,
                     4 => signed ? Op.LdI4 : Op.LdU4,
                     8 => Op.LdI8,
-                    _ => throw new NotSupportedException("Cannot load integer type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException($"Cannot load integer type {type.ToDisplayString()}."),
                 };
             }
 
@@ -1538,7 +1666,7 @@ namespace Cnidaria.C
                     ValueKind.Float64 => Op.StF64,
                     ValueKind.Pointer => Op.StPtr,
                     ValueKind.General32 or ValueKind.General64 => StoreIntegerOp(type),
-                    _ => throw new NotSupportedException("Cannot store non-scalar type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException($"Cannot store non-scalar type {type.ToDisplayString()}."),
                 };
             }
 
@@ -1550,7 +1678,7 @@ namespace Cnidaria.C
                     2 => Op.StI2,
                     4 => Op.StI4,
                     8 => Op.StI8,
-                    _ => throw new NotSupportedException("Cannot store integer type " + type.ToDisplayString() + "."),
+                    _ => throw new NotSupportedException($"Cannot store integer type {type.ToDisplayString()}."),
                 };
             }
 
@@ -1603,8 +1731,11 @@ namespace Cnidaria.C
                 _asm.Emit(new InstrDesc(op, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs1), RegisterVmIsa.EncodeRegister(rs2), aux: aux, imm: imm));
             }
 
-            private void EmitRawCall(Op op, int methodId, CallFlags flags)
-                => _asm.Emit(InstrDesc.Call(op, methodId, flags));
+            private void EmitManagedDirectCall(Op op, int methodId, CallFlags flags)
+                => _asm.CallDirect(op, _owner.GetMethodEntryLabel(methodId), flags);
+
+            private void EmitInternalCall(Op op, int methodId, CallFlags flags)
+                => _asm.Emit(InstrDesc.Call(op, methodId, flags | CallFlags.InternalCall));
 
             private void EmitRawIndirectCall(Op op, MachineRegister targetMethodId, CallFlags flags)
                 => _asm.Emit(new InstrDesc(op, rs1: RegisterVmIsa.EncodeRegister(targetMethodId), aux: Aux.Call(flags)));
@@ -1652,7 +1783,7 @@ namespace Cnidaria.C
             }
 
             private NotSupportedException Unsupported(LirInstruction instruction, string message)
-                => new NotSupportedException(message + " LIR ordinal=" + instruction.Ordinal.ToString(CultureInfo.InvariantCulture) + ".");
+                => new NotSupportedException($"{message} LIR ordinal={instruction.Ordinal.ToString(CultureInfo.InvariantCulture)}.");
 
             private int SizeOf(QualifiedType type)
                 => Math.Max(0, _owner._target.SizeOf(type));
@@ -1728,7 +1859,7 @@ namespace Cnidaria.C
                 {
                     ValueKind.Float32 or ValueKind.Float64 => AbiRegisterClass.Floating,
                     ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => AbiRegisterClass.General,
-                    _ => throw new NotSupportedException("Value kind has no ABI register class: " + kind.ToString() + "."),
+                    _ => throw new NotSupportedException($"Value kind has no ABI register class: {kind}."),
                 };
             }
 

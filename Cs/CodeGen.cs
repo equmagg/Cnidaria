@@ -148,11 +148,11 @@ namespace Cnidaria.Cs
             }
 
             return new GenTreeBackendPipelineResult(
-                new GenTreeProgram(hirMethods.ToImmutable()),
+                new GenTreeProgram(program.TypeSystem, hirMethods.ToImmutable()),
                 ssaMethods is null ? null : new SsaProgram(ssaMethods.ToImmutable()),
-                new GenTreeProgram(rationalizedMethods.ToImmutable()),
-                new GenTreeProgram(loweredMethods.ToImmutable()),
-                new GenTreeProgram(allocatedMethods.ToImmutable()));
+                new GenTreeProgram(program.TypeSystem, rationalizedMethods.ToImmutable()),
+                new GenTreeProgram(program.TypeSystem, loweredMethods.ToImmutable()),
+                new GenTreeProgram(program.TypeSystem, allocatedMethods.ToImmutable()));
         }
 
         public static GenTreeBackendPipelineResult RunMethod(GenTreeMethod method, BackendOptions options)
@@ -516,12 +516,20 @@ namespace Cnidaria.Cs
             if (program is null) throw new ArgumentNullException(nameof(program));
             options ??= CodeGeneratorOptions.Default;
 
-            var state = new BuildState();
-            var asm = new Assembler();
+            var asm = new Assembler(program.TypeSystem);
+            var state = BuildState.Create(asm, program);
 
             ImageFlags flags = ImageFlags.LittleEndian;
             if (TargetArchitecture.PointerSize == 4)
                 flags |= ImageFlags.Target32;
+
+            var methodEntryLabels = new Dictionary<int, Label>(program.Methods.Length);
+            for (int i = 0; i < program.Methods.Length; i++)
+            {
+                var method = program.Methods[i];
+                if (!methodEntryLabels.TryAdd(method.RuntimeMethod.MethodId, asm.CreateLabel()))
+                    throw new InvalidOperationException($"Duplicate method in register code generation input: M{method.RuntimeMethod.MethodId}");
+            }
 
             for (int i = 0; i < program.Methods.Length; i++)
             {
@@ -530,9 +538,11 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("Code generation requires LSRA-annotated LIR. Run LinearScanRegisterAllocator.AllocateMethod before CodeGenerator.Build.");
                 if (method.StackFrame.UsesFramePointer)
                     flags |= ImageFlags.UsesFramePointer;
-                new MethodEmitter(asm, state, method, options).Emit();
+                new MethodEmitter(asm, state, method, methodEntryLabels, options).Emit();
                 method.SetPhase(GenTreeMethodPhase.CodeGenerated);
             }
+
+            new DelegateStubEmitter(asm, state, methodEntryLabels).EmitAll();
 
             return asm.Build(flags, validate: options.VerifyImage);
         }
@@ -540,9 +550,768 @@ namespace Cnidaria.Cs
         public static byte[] BuildBytes(GenTreeProgram program, CodeGeneratorOptions? options = null)
             => ImageSerializer.ToBytes(Build(program, options));
 
+        private readonly struct DelegateTargetThunkKey : IEquatable<DelegateTargetThunkKey>
+        {
+            public readonly int DelegateTypeId;
+            public readonly int TargetMethodId;
+            public readonly bool Closed;
+
+            public DelegateTargetThunkKey(int delegateTypeId, int targetMethodId, bool closed)
+            {
+                DelegateTypeId = delegateTypeId;
+                TargetMethodId = targetMethodId;
+                Closed = closed;
+            }
+
+            public bool Equals(DelegateTargetThunkKey other)
+                => DelegateTypeId == other.DelegateTypeId && TargetMethodId == other.TargetMethodId && Closed == other.Closed;
+
+            public override bool Equals(object? obj)
+                => obj is DelegateTargetThunkKey other && Equals(other);
+
+            public override int GetHashCode()
+                => HashCode.Combine(DelegateTypeId, TargetMethodId, Closed);
+        }
+
+        private sealed class DelegateTargetThunkInfo
+        {
+            public readonly RuntimeType DelegateType;
+            public readonly RuntimeMethod InvokeMethod;
+            public readonly RuntimeMethod TargetMethod;
+            public readonly bool Closed;
+            public readonly Label EntryLabel;
+
+            public DelegateTargetThunkInfo(RuntimeType delegateType, RuntimeMethod invokeMethod, RuntimeMethod targetMethod, bool closed, Label entryLabel)
+            {
+                DelegateType = delegateType;
+                InvokeMethod = invokeMethod;
+                TargetMethod = targetMethod;
+                Closed = closed;
+                EntryLabel = entryLabel;
+            }
+        }
+
+        private sealed class DelegateInvokeStubInfo
+        {
+            public readonly RuntimeMethod InvokeMethod;
+            public readonly Label EntryLabel;
+
+            public DelegateInvokeStubInfo(RuntimeMethod invokeMethod, Label entryLabel)
+            {
+                InvokeMethod = invokeMethod;
+                EntryLabel = entryLabel;
+            }
+        }
+
         private sealed class BuildState
         {
             public int GcRootCount;
+            private readonly Dictionary<DelegateTargetThunkKey, DelegateTargetThunkInfo> _delegateTargetThunks = new Dictionary<DelegateTargetThunkKey, DelegateTargetThunkInfo>();
+            private readonly Dictionary<int, DelegateInvokeStubInfo> _delegateInvokeStubs = new Dictionary<int, DelegateInvokeStubInfo>();
+
+            public IEnumerable<DelegateTargetThunkInfo> DelegateTargetThunks => _delegateTargetThunks.Values;
+            public IEnumerable<DelegateInvokeStubInfo> DelegateInvokeStubs => _delegateInvokeStubs.Values;
+
+            public static BuildState Create(Assembler asm, GenTreeProgram program)
+            {
+                if (asm is null) throw new ArgumentNullException(nameof(asm));
+                if (program is null) throw new ArgumentNullException(nameof(program));
+
+                var state = new BuildState();
+                for (int i = 0; i < program.Methods.Length; i++)
+                {
+                    foreach (GenTree node in program.Methods[i].LinearNodes)
+                    {
+                        if (node.TreeKind == GenTreeKind.NewDelegate)
+                        {
+                            RuntimeType delegateType = node.RuntimeType ?? node.Type ?? throw new InvalidOperationException("NewDelegate node has no delegate type.");
+                            RuntimeMethod target = node.Method ?? throw new InvalidOperationException("NewDelegate node has no target method.");
+                            RuntimeMethod invoke = ResolveDelegateInvoke(delegateType);
+                            bool closed = node.Uses.Length != 0;
+                            state.EnsureDelegateTargetThunk(asm, delegateType, invoke, target, closed);
+                        }
+                        else if (node.TreeKind == GenTreeKind.DelegateInvoke)
+                        {
+                            RuntimeMethod invoke = node.Method ?? throw new InvalidOperationException("DelegateInvoke node has no Invoke method.");
+                            state.EnsureDelegateInvokeStub(asm, invoke);
+                        }
+                    }
+                }
+
+                return state;
+            }
+
+            public Label DelegateTargetThunkLabel(RuntimeType delegateType, RuntimeMethod targetMethod, bool closed)
+            {
+                var key = new DelegateTargetThunkKey(delegateType.TypeId, targetMethod.MethodId, closed);
+                if (_delegateTargetThunks.TryGetValue(key, out var info))
+                    return info.EntryLabel;
+                throw new InvalidOperationException($"Missing delegate target thunk for T{delegateType.TypeId}, M{targetMethod.MethodId}, closed={closed}.");
+            }
+
+            public Label DelegateInvokeStubLabel(RuntimeMethod invokeMethod)
+            {
+                if (_delegateInvokeStubs.TryGetValue(invokeMethod.MethodId, out var info))
+                    return info.EntryLabel;
+                throw new InvalidOperationException($"Missing delegate invoke stub for M{invokeMethod.MethodId}.");
+            }
+
+            private void EnsureDelegateTargetThunk(Assembler asm, RuntimeType delegateType, RuntimeMethod invokeMethod, RuntimeMethod targetMethod, bool closed)
+            {
+                var key = new DelegateTargetThunkKey(delegateType.TypeId, targetMethod.MethodId, closed);
+                if (_delegateTargetThunks.ContainsKey(key))
+                    return;
+                _delegateTargetThunks.Add(key, new DelegateTargetThunkInfo(delegateType, invokeMethod, targetMethod, closed, asm.CreateLabel()));
+            }
+
+            private void EnsureDelegateInvokeStub(Assembler asm, RuntimeMethod invokeMethod)
+            {
+                if (_delegateInvokeStubs.ContainsKey(invokeMethod.MethodId))
+                    return;
+                _delegateInvokeStubs.Add(invokeMethod.MethodId, new DelegateInvokeStubInfo(invokeMethod, asm.CreateLabel()));
+            }
+
+            private static RuntimeMethod ResolveDelegateInvoke(RuntimeType delegateType)
+            {
+                for (RuntimeType? cur = delegateType; cur is not null; cur = cur.BaseType)
+                {
+                    RuntimeMethod[] methods = cur.Methods;
+                    for (int i = 0; i < methods.Length; i++)
+                    {
+                        RuntimeMethod method = methods[i];
+                        if (StringComparer.Ordinal.Equals(method.Name, "Invoke"))
+                            return method;
+                    }
+                }
+
+                throw new MissingMethodException(delegateType.Name, "Invoke");
+            }
+        }
+
+        private sealed class DelegateStubEmitter
+        {
+            private readonly Assembler _asm;
+            private readonly BuildState _state;
+            private readonly IReadOnlyDictionary<int, Label> _methodEntryLabels;
+
+            private const int PtrSize = TargetArchitecture.PointerSize;
+            private static readonly MachineRegister Scratch0 = MachineRegisters.BackendScratch;
+            private static readonly MachineRegister Scratch1 = MachineRegisters.ParallelCopyScratch0;
+            private static readonly MachineRegister Scratch2 = MachineRegisters.ParallelCopyScratch1;
+            private static readonly MachineRegister Scratch3 = MachineRegisters.TreeScratch3;
+
+            public DelegateStubEmitter(Assembler asm, BuildState state, IReadOnlyDictionary<int, Label> methodEntryLabels)
+            {
+                _asm = asm ?? throw new ArgumentNullException(nameof(asm));
+                _state = state ?? throw new ArgumentNullException(nameof(state));
+                _methodEntryLabels = methodEntryLabels ?? throw new ArgumentNullException(nameof(methodEntryLabels));
+            }
+
+            public void EmitAll()
+            {
+                foreach (var thunk in _state.DelegateTargetThunks)
+                    EmitTargetThunk(thunk);
+                foreach (var stub in _state.DelegateInvokeStubs)
+                    EmitInvokeStub(stub);
+            }
+
+            private void EmitInvokeStub(DelegateInvokeStubInfo info)
+            {
+                RuntimeMethod invoke = info.InvokeMethod;
+                int delegateLayout = _asm.InternTypeLayout(invoke.DeclaringType);
+                TypeLayoutRecord layout = _asm.GetTypeLayoutRecord(delegateLayout);
+                EnsureDelegateLayout(layout);
+
+                var incoming = BuildIncomingDelegateInvokeAbi(invoke);
+                int saveSize = AlignUp(incoming.TotalSaveSize, PtrSize);
+                int multicastStateSize = PtrSize * 3;
+                int outgoingSize = AlignUp(incoming.OutgoingStackSize, MachineAbi.StackArgumentSlotSize);
+                int frameSize = AlignUp(checked(saveSize + multicastStateSize + outgoingSize), 16);
+                int outgoingOffset = 0;
+                int saveOffset = outgoingSize;
+                int multicastListOffset = saveOffset + saveSize;
+                int multicastCountOffset = multicastListOffset + PtrSize;
+                int multicastIndexOffset = multicastCountOffset + PtrSize;
+                StackFrameLayout frame = SyntheticFrame(frameSize, outgoingOffset, outgoingSize, saveOffset, saveSize + multicastStateSize);
+
+                _asm.BeginMethod(-1, info.EntryLabel, -1, frame);
+                EmitStackAdjust(-frameSize);
+
+                SaveAbiBundle(incoming, saveOffset);
+
+                LoadSavedAbiSliceToRegister(incoming.LogicalArguments[0].Slices[0], saveOffset, Scratch0);
+                _asm.Emit(new InstrDesc(Op.NullCheck,
+                    rd: RegisterVmIsa.EncodeRegister(Scratch0),
+                    rs1: RegisterVmIsa.EncodeRegister(Scratch0),
+                    aux: Aux.Instruction(InstructionFlags.MayThrow)));
+
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch1, Scratch0, layout.DelegateInvocationCountOffset,
+                    aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+
+                Label multicast = _asm.CreateLabel();
+                Label done = _asm.CreateLabel();
+                _asm.LiI64(Scratch2, 1);
+                _asm.Branch(Op.BrI64Gt, Scratch1, Scratch2, multicast);
+
+                EmitSingleDelegateInvoke(layout, incoming, saveOffset, finalCall: true);
+                EmitReturnFor(invoke);
+
+                _asm.Bind(multicast);
+                EmitMulticastDelegateInvoke(layout, incoming, saveOffset, multicastListOffset, multicastCountOffset, multicastIndexOffset, done);
+                _asm.Bind(done);
+                EmitReturnFor(invoke);
+
+                EmitStackAdjust(frameSize);
+                _asm.EndMethod();
+            }
+
+            private void EmitSingleDelegateInvoke(TypeLayoutRecord layout, AbiBundle incoming, int saveOffset, bool finalCall)
+            {
+                RestoreAbiBundle(incoming, saveOffset);
+                LoadSavedAbiSliceToRegister(incoming.LogicalArguments[0].Slices[0], saveOffset, Scratch0);
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch1, Scratch0, layout.DelegateMethodPtrOffset,
+                    aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+                EmitIndirectCallFor(incoming.Method, Scratch1);
+            }
+
+            private void EmitMulticastDelegateInvoke(TypeLayoutRecord layout, AbiBundle incoming, int saveOffset, int listOffset, int countOffset, int indexOffset, Label done)
+            {
+                LoadSavedAbiSliceToRegister(incoming.LogicalArguments[0].Slices[0], saveOffset, Scratch0);
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch2, Scratch0, layout.DelegateInvocationListOffset,
+                    aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+                _asm.BrFalseRef(Scratch2, done);
+                StoreRegisterToFrame(Scratch2, RegisterClass.General, listOffset, PtrSize);
+                StoreRegisterToFrame(Scratch1, RegisterClass.General, countOffset, PtrSize);
+                _asm.LiI32(Scratch3, 0);
+                StoreRegisterToFrame(Scratch3, RegisterClass.General, indexOffset, 4);
+
+                Label loop = _asm.CreateLabel();
+                _asm.Bind(loop);
+                LoadFrameToRegister(Scratch3, RegisterClass.General, indexOffset, 4);
+                LoadFrameToRegister(Scratch1, RegisterClass.General, countOffset, PtrSize);
+                _asm.BrI32Ge(Scratch3, Scratch1, done);
+                LoadFrameToRegister(Scratch2, RegisterClass.General, listOffset, PtrSize);
+
+                EmitLoadDelegateArrayElement(Scratch0, Scratch2, Scratch3);
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch2, Scratch0, layout.DelegateMethodPtrOffset,
+                    aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+                StoreRegisterToSavedEntity(Scratch0, incoming.LogicalArguments[0], saveOffset);
+                RestoreAbiBundle(incoming, saveOffset);
+                EmitIndirectCallFor(incoming.Method, Scratch2);
+                LoadFrameToRegister(Scratch3, RegisterClass.General, indexOffset, 4);
+                _asm.I32AddImm(Scratch3, Scratch3, 1);
+                StoreRegisterToFrame(Scratch3, RegisterClass.General, indexOffset, 4);
+                _asm.J(loop);
+            }
+
+            private void EmitTargetThunk(DelegateTargetThunkInfo info)
+            {
+                RuntimeMethod invoke = info.InvokeMethod;
+                RuntimeMethod target = info.TargetMethod;
+                int delegateLayoutIndex = _asm.InternTypeLayout(info.DelegateType);
+                TypeLayoutRecord delegateLayout = _asm.GetTypeLayoutRecord(delegateLayoutIndex);
+                EnsureDelegateLayout(delegateLayout);
+
+                var incoming = BuildIncomingDelegateInvokeAbi(invoke);
+                var targetAbi = BuildTargetCallAbi(target, invoke, incoming, info.Closed);
+                int incomingSaveSize = AlignUp(incoming.TotalSaveSize, PtrSize);
+                int targetSaveSize = AlignUp(targetAbi.TotalSaveSize, PtrSize);
+                int outgoingSize = AlignUp(Math.Max(incoming.OutgoingStackSize, targetAbi.OutgoingStackSize), MachineAbi.StackArgumentSlotSize);
+                int frameSize = AlignUp(checked(outgoingSize + incomingSaveSize + targetSaveSize), 16);
+                int outgoingOffset = 0;
+                int incomingSaveOffset = outgoingSize;
+                int targetSaveOffset = outgoingSize + incomingSaveSize;
+                StackFrameLayout frame = SyntheticFrame(frameSize, outgoingOffset, outgoingSize, incomingSaveOffset, incomingSaveSize + targetSaveSize);
+
+                _asm.BeginMethod(-1, info.EntryLabel, -1, frame);
+                EmitStackAdjust(-frameSize);
+
+                SaveAbiBundle(incoming, incomingSaveOffset);
+                MaterializeTargetArguments(info, delegateLayout, incoming, incomingSaveOffset, targetAbi, targetSaveOffset);
+                RestoreAbiBundle(targetAbi, targetSaveOffset);
+
+                if (RequiresTypeInitializationBeforeCall(target))
+                {
+                    int declaringLayout = _asm.InternTypeLayout(target.DeclaringType);
+                    _asm.Emit(InstrDesc.Li(Op.LiStaticBase, Scratch0, declaringLayout,
+                        Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
+                }
+
+                EmitCallForTarget(target, targetAbi.CallFlags);
+                EmitReturnFor(target);
+
+                EmitStackAdjust(frameSize);
+                _asm.EndMethod();
+            }
+
+            private void MaterializeTargetArguments(
+                DelegateTargetThunkInfo info,
+                TypeLayoutRecord delegateLayout,
+                AbiBundle incoming,
+                int incomingSaveOffset,
+                AbiBundle targetAbi,
+                int targetSaveOffset)
+            {
+                if (incoming.HiddenReturnBuffer is not null && targetAbi.HiddenReturnBuffer is not null)
+                    CopySavedEntity(incoming.HiddenReturnBuffer.Value, incomingSaveOffset, targetAbi.HiddenReturnBuffer.Value, targetSaveOffset);
+
+                int targetArgCount = targetAbi.LogicalArguments.Length;
+                for (int i = 0; i < targetArgCount; i++)
+                {
+                    AbiEntity targetEntity = targetAbi.LogicalArguments[i];
+                    if (info.Closed && i == 0)
+                    {
+                        AbiEntity delegateThis = incoming.LogicalArguments[0];
+                        LoadSavedAbiSliceToRegister(delegateThis.Slices[0], incomingSaveOffset, Scratch0);
+                        _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch1, Scratch0, delegateLayout.DelegateTargetOffset,
+                            aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+                        StoreRegisterToSavedEntity(Scratch1, targetEntity, targetSaveOffset);
+                        continue;
+                    }
+
+                    int invokeArgIndex = 1 + i - (info.Closed ? 1 : 0);
+                    if ((uint)invokeArgIndex >= (uint)incoming.LogicalArguments.Length)
+                        throw new InvalidOperationException($"Delegate target thunk argument mismatch for M{info.TargetMethod.MethodId}.");
+                    CopySavedEntity(incoming.LogicalArguments[invokeArgIndex], incomingSaveOffset, targetEntity, targetSaveOffset);
+                }
+            }
+
+            private void EmitCallForTarget(RuntimeMethod target, CallFlags flags)
+            {
+                Op op = SelectCallOpForReturn(target, indirect: false, internalCall: target.HasInternalCall);
+                if (target.HasInternalCall)
+                {
+                    _asm.Emit(InstrDesc.Call(op, target.MethodId, flags | CallFlags.InternalCall));
+                    return;
+                }
+
+                if (!_methodEntryLabels.TryGetValue(target.MethodId, out Label label))
+                    throw new InvalidOperationException($"Delegate target M{target.MethodId} is not present in the linked register image.");
+                _asm.CallDirect(op, label, flags);
+            }
+
+            private void EmitIndirectCallFor(RuntimeMethod invoke, MachineRegister target)
+            {
+                Op op = SelectCallOpForReturn(invoke, indirect: true, internalCall: false);
+                _asm.Emit(new InstrDesc(op, rs1: RegisterVmIsa.EncodeRegister(target), aux: Aux.Call(BuildCallFlagsForSignature(invoke))));
+            }
+
+            private void EmitReturnFor(RuntimeMethod method)
+            {
+                if (MachineAbi.RequiresHiddenReturnBuffer(method) || method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void)
+                {
+                    _asm.RetVoid();
+                    return;
+                }
+
+                var abi = MachineAbi.ClassifyValue(method.ReturnType, MachineAbi.StackKindForType(method.ReturnType), isReturn: true);
+                if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                {
+                    if (abi.RegisterClass == RegisterClass.Float)
+                        _asm.RetF(MachineRegisters.FloatReturnValue0);
+                    else if (abi.ContainsGcPointers || method.ReturnType.IsReferenceType)
+                        _asm.RetRef(MachineRegisters.ReturnValue0);
+                    else
+                        _asm.RetI(MachineRegisters.ReturnValue0);
+                    return;
+                }
+
+                if (abi.PassingKind == AbiValuePassingKind.Void)
+                {
+                    _asm.RetVoid();
+                    return;
+                }
+
+                _asm.RetValue(MachineRegisters.ReturnValue0, Math.Max(1, abi.Size));
+            }
+
+            private static Op SelectCallOpForReturn(RuntimeMethod method, bool indirect, bool internalCall)
+            {
+                var abi = MachineAbi.ClassifyValue(method.ReturnType, MachineAbi.StackKindForType(method.ReturnType), isReturn: true);
+                bool isVoid = abi.PassingKind == AbiValuePassingKind.Void || MachineAbi.RequiresHiddenReturnBuffer(method);
+                bool isValue = !isVoid && abi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
+                bool isFloat = !isVoid && !isValue && (abi.RegisterClass == RegisterClass.Float || method.ReturnType.Name is "Single" or "Double");
+                bool isRef = !isVoid && !isValue && (abi.ContainsGcPointers || method.ReturnType.IsReferenceType);
+
+                if (internalCall)
+                {
+                    if (isVoid) return Op.CallInternalVoid;
+                    if (isValue) return Op.CallInternalValue;
+                    if (isFloat) return Op.CallInternalF;
+                    if (isRef) return Op.CallInternalRef;
+                    return Op.CallInternalI;
+                }
+
+                if (indirect)
+                {
+                    if (isVoid) return Op.CallIndirectVoid;
+                    if (isValue) return Op.CallIndirectValue;
+                    if (isFloat) return Op.CallIndirectF;
+                    if (isRef) return Op.CallIndirectRef;
+                    return Op.CallIndirectI;
+                }
+
+                if (isVoid) return Op.CallVoid;
+                if (isValue) return Op.CallValue;
+                if (isFloat) return Op.CallF;
+                if (isRef) return Op.CallRef;
+                return Op.CallI;
+            }
+
+            private static CallFlags BuildCallFlagsForSignature(RuntimeMethod method)
+            {
+                var flags = CallFlags.GcSafePoint | CallFlags.MayThrow;
+                if (MachineAbi.RequiresHiddenReturnBuffer(method))
+                    flags |= CallFlags.HiddenReturnBuffer;
+                return flags;
+            }
+
+            private AbiBundle BuildIncomingDelegateInvokeAbi(RuntimeMethod invoke)
+            {
+                return BuildAbiBundle(invoke, BuildCallFlagsForSignature(invoke));
+            }
+
+            private AbiBundle BuildTargetCallAbi(RuntimeMethod target, RuntimeMethod invoke, AbiBundle incoming, bool closed)
+            {
+                return BuildAbiBundle(target, BuildCallFlagsForSignature(target));
+            }
+
+            private AbiBundle BuildAbiBundle(RuntimeMethod method, CallFlags callFlags)
+            {
+                int logicalCount = LogicalArgumentCount(method);
+                int hiddenInsertion = MachineAbi.RequiresHiddenReturnBuffer(method)
+                    ? MachineAbi.HiddenReturnBufferInsertionIndex(method, logicalCount)
+                    : -1;
+                int general = 0;
+                int floating = 0;
+                int stack = 0;
+                AbiEntity? hidden = null;
+                var args = new AbiEntity[logicalCount];
+                int saveCursor = 0;
+                int maxStackSlot = -1;
+
+                for (int i = 0; i < logicalCount; i++)
+                {
+                    if (hiddenInsertion == i)
+                    {
+                        AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, PtrSize, ref general, ref floating, ref stack);
+                        hidden = new AbiEntity(null, ImmutableArray.Create(new AbiSlice(loc, RegisterClass.General, 0, PtrSize, saveCursor)));
+                        saveCursor = AlignUp(saveCursor + PtrSize, PtrSize);
+                        if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                    }
+
+                    RuntimeType argType = GetLogicalArgumentType(method, i);
+                    var slices = BuildArgumentSlices(argType, ref general, ref floating, ref stack, saveCursor, ref maxStackSlot);
+                    args[i] = new AbiEntity(argType, slices);
+                    int entitySize = 0;
+                    for (int s = 0; s < slices.Length; s++)
+                        entitySize = Math.Max(entitySize, slices[s].SaveOffset + slices[s].Size - saveCursor);
+                    saveCursor = AlignUp(saveCursor + Math.Max(PtrSize, entitySize), PtrSize);
+                }
+
+                if (hiddenInsertion == logicalCount)
+                {
+                    AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, PtrSize, ref general, ref floating, ref stack);
+                    hidden = new AbiEntity(null, ImmutableArray.Create(new AbiSlice(loc, RegisterClass.General, 0, PtrSize, saveCursor)));
+                    saveCursor = AlignUp(saveCursor + PtrSize, PtrSize);
+                    if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                }
+
+                int outgoingStackSize = maxStackSlot < 0 ? 0 : checked((maxStackSlot + 1) * MachineAbi.StackArgumentSlotSize);
+                return new AbiBundle(method, callFlags, hidden, args.ToImmutableArray(), saveCursor, outgoingStackSize);
+            }
+
+            private static ImmutableArray<AbiSlice> BuildArgumentSlices(RuntimeType type, ref int general, ref int floating, ref int stack, int saveBase, ref int maxStackSlot)
+            {
+                var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+                var builder = ImmutableArray.CreateBuilder<AbiSlice>();
+                switch (abi.PassingKind)
+                {
+                    case AbiValuePassingKind.Void:
+                        return ImmutableArray<AbiSlice>.Empty;
+                    case AbiValuePassingKind.ScalarRegister:
+                        {
+                            AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(abi.RegisterClass, abi.Size, ref general, ref floating, ref stack);
+                            if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                            builder.Add(new AbiSlice(loc, abi.RegisterClass, 0, Math.Max(1, abi.Size), saveBase));
+                            return builder.ToImmutable();
+                        }
+                    case AbiValuePassingKind.MultiRegister:
+                        {
+                            int aggregateStackSlot = -1;
+                            int aggregateStackBaseOffset = 0;
+                            var segments = MachineAbi.GetRegisterSegments(abi);
+                            for (int i = 0; i < segments.Length; i++)
+                            {
+                                var seg = segments[i];
+                                AbiArgumentLocation loc = MachineAbi.AssignAggregateSegmentArgumentLocation(seg, ref general, ref floating, ref stack, ref aggregateStackSlot, ref aggregateStackBaseOffset);
+                                if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                                builder.Add(new AbiSlice(loc, seg.RegisterClass, seg.Offset, seg.Size, checked(saveBase + seg.Offset)));
+                            }
+                            return builder.ToImmutable();
+                        }
+                    case AbiValuePassingKind.Stack:
+                    case AbiValuePassingKind.Indirect:
+                        {
+                            int size = abi.Size <= 0 ? PtrSize : abi.Size;
+                            AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, size);
+                            maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                            builder.Add(new AbiSlice(loc, RegisterClass.General, 0, size, saveBase));
+                            return builder.ToImmutable();
+                        }
+                    default:
+                        throw new InvalidOperationException("Unsupported ABI argument kind " + abi.PassingKind + ".");
+                }
+            }
+
+            private void SaveAbiBundle(AbiBundle bundle, int frameSaveBase)
+            {
+                if (bundle.HiddenReturnBuffer is not null)
+                    SaveAbiEntity(bundle.HiddenReturnBuffer.Value, frameSaveBase);
+                for (int i = 0; i < bundle.LogicalArguments.Length; i++)
+                    SaveAbiEntity(bundle.LogicalArguments[i], frameSaveBase);
+            }
+
+            private void RestoreAbiBundle(AbiBundle bundle, int frameSaveBase)
+            {
+                if (bundle.HiddenReturnBuffer is not null)
+                    RestoreAbiEntity(bundle.HiddenReturnBuffer.Value, frameSaveBase);
+                for (int i = 0; i < bundle.LogicalArguments.Length; i++)
+                    RestoreAbiEntity(bundle.LogicalArguments[i], frameSaveBase);
+            }
+
+            private void SaveAbiEntity(AbiEntity entity, int frameSaveBase)
+            {
+                for (int i = 0; i < entity.Slices.Length; i++)
+                {
+                    AbiSlice slice = entity.Slices[i];
+                    int dst = checked(frameSaveBase + slice.SaveOffset);
+                    if (slice.Location.IsRegister)
+                    {
+                        StoreRegisterToFrame(slice.RegisterClass == RegisterClass.Float ? slice.Location.Register : slice.Location.Register, slice.RegisterClass, dst, slice.Size);
+                    }
+                    else
+                    {
+                        int src = checked(slice.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + slice.Location.StackOffset);
+                        CopyMemory(MachineRegisters.ThreadPointer, src, MachineRegisters.StackPointer, dst, slice.Size);
+                    }
+                }
+            }
+
+            private void RestoreAbiEntity(AbiEntity entity, int frameSaveBase)
+            {
+                for (int i = 0; i < entity.Slices.Length; i++)
+                {
+                    AbiSlice slice = entity.Slices[i];
+                    int src = checked(frameSaveBase + slice.SaveOffset);
+                    if (slice.Location.IsRegister)
+                    {
+                        LoadFrameToRegister(slice.Location.Register, slice.RegisterClass, src, slice.Size);
+                    }
+                    else
+                    {
+                        int dst = checked(slice.Location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + slice.Location.StackOffset);
+                        CopyMemory(MachineRegisters.StackPointer, src, MachineRegisters.StackPointer, dst, slice.Size);
+                    }
+                }
+            }
+
+            private void CopySavedEntity(AbiEntity source, int sourceFrameBase, AbiEntity destination, int destinationFrameBase)
+            {
+                int count = Math.Min(source.Slices.Length, destination.Slices.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    AbiSlice src = source.Slices[i];
+                    AbiSlice dst = destination.Slices[i];
+                    int size = Math.Min(src.Size, dst.Size);
+                    CopyMemory(MachineRegisters.StackPointer, checked(sourceFrameBase + src.SaveOffset), MachineRegisters.StackPointer, checked(destinationFrameBase + dst.SaveOffset), size);
+                }
+            }
+
+            private void StoreRegisterToSavedEntity(MachineRegister source, AbiEntity destination, int destinationFrameBase)
+            {
+                for (int i = 0; i < destination.Slices.Length; i++)
+                {
+                    AbiSlice slice = destination.Slices[i];
+                    StoreRegisterToFrame(source, RegisterClass.General, checked(destinationFrameBase + slice.SaveOffset), Math.Min(slice.Size, PtrSize));
+                }
+            }
+
+            private void LoadSavedAbiSliceToRegister(AbiSlice slice, int frameSaveBase, MachineRegister destination)
+                => LoadFrameToRegister(destination, RegisterClass.General, checked(frameSaveBase + slice.SaveOffset), Math.Min(slice.Size, PtrSize));
+
+            private void EmitLoadDelegateArrayElement(MachineRegister destination, MachineRegister arrayRef, MachineRegister index)
+            {
+                _asm.I64AddImm(Scratch0, arrayRef, ArrayDataOffsetForEmitter());
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, destination, Scratch0, 0, index,
+                    aux: Aux.Memory(AlignLog2(PtrSize), AlignLog2(PtrSize), MemoryBase.Register)));
+            }
+
+            private static int ArrayDataOffsetForEmitter() => 16;
+
+            private void CopyMemory(MachineRegister srcBase, int srcOffset, MachineRegister dstBase, int dstOffset, int size)
+            {
+                int copied = 0;
+                while (copied < size)
+                {
+                    int left = size - copied;
+                    int chunk = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+                    Op ld = chunk switch { 1 => Op.LdU1, 2 => Op.LdU2, 4 => Op.LdI4, _ => Op.LdI8 };
+                    Op st = chunk switch { 1 => Op.StI1, 2 => Op.StI2, 4 => Op.StI4, _ => Op.StI8 };
+                    _asm.Emit(InstrDesc.Mem(ld, Scratch0, srcBase, srcOffset + copied, aux: Aux.Memory(0, AlignLog2(chunk), MemoryBase.Register, MemoryFlags.NoNullCheck)));
+                    _asm.Emit(InstrDesc.Mem(st, Scratch0, dstBase, dstOffset + copied, aux: Aux.Memory(0, AlignLog2(chunk), MemoryBase.Register, MemoryFlags.NoNullCheck)));
+                    copied += chunk;
+                }
+            }
+
+            private void StoreRegisterToFrame(MachineRegister source, RegisterClass registerClass, int offset, int size)
+            {
+                Op op = registerClass == RegisterClass.Float
+                    ? (size <= 4 ? Op.StF32 : Op.StF64)
+                    : (size <= 1 ? Op.StI1 : size <= 2 ? Op.StI2 : size <= 4 ? Op.StI4 : Op.StI8);
+                _asm.Emit(InstrDesc.Mem(op, source, MachineRegisters.StackPointer, offset,
+                    aux: Aux.Memory(0, AlignLog2(Math.Min(Math.Max(size, 1), 8)), MemoryBase.Register, MemoryFlags.NoNullCheck)));
+            }
+
+            private void LoadFrameToRegister(MachineRegister destination, RegisterClass registerClass, int offset, int size)
+            {
+                Op op = registerClass == RegisterClass.Float
+                    ? (size <= 4 ? Op.LdF32 : Op.LdF64)
+                    : (size <= 1 ? Op.LdU1 : size <= 2 ? Op.LdU2 : size <= 4 ? Op.LdI4 : Op.LdI8);
+                _asm.Emit(InstrDesc.Mem(op, destination, MachineRegisters.StackPointer, offset,
+                    aux: Aux.Memory(0, AlignLog2(Math.Min(Math.Max(size, 1), 8)), MemoryBase.Register, MemoryFlags.NoNullCheck)));
+            }
+
+            private void EmitStackAdjust(int delta)
+            {
+                if (delta == 0)
+                    return;
+                if (delta < 0)
+                    _asm.I64SubImm(MachineRegisters.StackPointer, MachineRegisters.StackPointer, -delta);
+                else
+                    _asm.I64AddImm(MachineRegisters.StackPointer, MachineRegisters.StackPointer, delta);
+            }
+
+            private static StackFrameLayout SyntheticFrame(int frameSize, int outgoingOffset, int outgoingSize, int spillOffset, int spillSize)
+            {
+                var empty = ImmutableArray<StackFrameSlot>.Empty;
+                return new StackFrameLayout(
+                    frameSize,
+                    frameAlignment: 16,
+                    calleeSaveAreaOffset: 0,
+                    calleeSaveAreaSize: 0,
+                    argumentHomeAreaOffset: 0,
+                    argumentHomeAreaSize: 0,
+                    localAreaOffset: 0,
+                    localAreaSize: 0,
+                    tempAreaOffset: 0,
+                    tempAreaSize: 0,
+                    spillAreaOffset: spillOffset,
+                    spillAreaSize: spillSize,
+                    outgoingArgumentAreaOffset: outgoingOffset,
+                    outgoingArgumentAreaSize: outgoingSize,
+                    argumentSlots: empty,
+                    localSlots: empty,
+                    tempSlots: empty,
+                    spillSlots: empty,
+                    calleeSavedSlots: empty,
+                    outgoingArgumentSlots: empty,
+                    usesFramePointer: false,
+                    frameModel: RegisterStackFrameModel.Leaf);
+            }
+
+            private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
+            {
+                if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                    return false;
+                if (target.IsStatic)
+                    return true;
+                return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
+            }
+
+            private static RuntimeType GetLogicalArgumentType(RuntimeMethod method, int logicalIndex)
+            {
+                if (method.HasThis)
+                {
+                    if (logicalIndex == 0)
+                        return method.DeclaringType;
+                    logicalIndex--;
+                }
+                if ((uint)logicalIndex >= (uint)method.ParameterTypes.Length)
+                    throw new ArgumentOutOfRangeException(nameof(logicalIndex));
+                return method.ParameterTypes[logicalIndex];
+            }
+
+            private static int LogicalArgumentCount(RuntimeMethod method)
+                => method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
+
+            private static void EnsureDelegateLayout(TypeLayoutRecord layout)
+            {
+                if (layout.DelegateTargetOffset < 0 || layout.DelegateMethodPtrOffset < 0 ||
+                    layout.DelegateInvocationListOffset < 0 || layout.DelegateInvocationCountOffset < 0)
+                    throw new TypeLoadException($"Delegate layout T{layout.RuntimeTypeId} is missing delegate field offsets.");
+            }
+
+            private static byte AlignLog2(int value)
+            {
+                value = Math.Max(1, value);
+                int log = 0;
+                while ((1 << log) < value) log++;
+                return checked((byte)log);
+            }
+
+            private static int AlignUp(int value, int alignment)
+                => alignment <= 1 ? value : checked((value + alignment - 1) & ~(alignment - 1));
+
+            private readonly struct AbiBundle
+            {
+                public readonly RuntimeMethod Method;
+                public readonly CallFlags CallFlags;
+                public readonly AbiEntity? HiddenReturnBuffer;
+                public readonly ImmutableArray<AbiEntity> LogicalArguments;
+                public readonly int TotalSaveSize;
+                public readonly int OutgoingStackSize;
+
+                public AbiBundle(RuntimeMethod method, CallFlags callFlags, AbiEntity? hiddenReturnBuffer, ImmutableArray<AbiEntity> logicalArguments, int totalSaveSize, int outgoingStackSize)
+                {
+                    Method = method;
+                    CallFlags = callFlags;
+                    HiddenReturnBuffer = hiddenReturnBuffer;
+                    LogicalArguments = logicalArguments;
+                    TotalSaveSize = totalSaveSize;
+                    OutgoingStackSize = outgoingStackSize;
+                }
+            }
+
+            private readonly struct AbiEntity
+            {
+                public readonly RuntimeType? Type;
+                public readonly ImmutableArray<AbiSlice> Slices;
+
+                public AbiEntity(RuntimeType? type, ImmutableArray<AbiSlice> slices)
+                {
+                    Type = type;
+                    Slices = slices;
+                }
+            }
+
+            private readonly struct AbiSlice
+            {
+                public readonly AbiArgumentLocation Location;
+                public readonly RegisterClass RegisterClass;
+                public readonly int Offset;
+                public readonly int Size;
+                public readonly int SaveOffset;
+
+                public AbiSlice(AbiArgumentLocation location, RegisterClass registerClass, int offset, int size, int saveOffset)
+                {
+                    Location = location;
+                    RegisterClass = registerClass;
+                    Offset = offset;
+                    Size = size;
+                    SaveOffset = saveOffset;
+                }
+            }
         }
 
         private sealed class MethodEmitter
@@ -550,6 +1319,7 @@ namespace Cnidaria.Cs
             private readonly Assembler _asm;
             private readonly BuildState _state;
             private readonly GenTreeMethod _method;
+            private readonly IReadOnlyDictionary<int, Label> _methodEntryLabels;
             private readonly CodeGeneratorOptions _options;
             private readonly Label[] _blockLabels;
             private readonly int[] _blockStartPc;
@@ -561,11 +1331,12 @@ namespace Cnidaria.Cs
             private readonly HashSet<int> _emittedGcSafePointPcs = new HashSet<int>();
             private int _currentEmitNextBlockId = -1;
 
-            public MethodEmitter(Assembler asm, BuildState state, GenTreeMethod method, CodeGeneratorOptions options)
+            public MethodEmitter(Assembler asm, BuildState state, GenTreeMethod method, IReadOnlyDictionary<int, Label> methodEntryLabels, CodeGeneratorOptions options)
             {
                 _asm = asm ?? throw new ArgumentNullException(nameof(asm));
                 _state = state ?? throw new ArgumentNullException(nameof(state));
                 _method = method ?? throw new ArgumentNullException(nameof(method));
+                _methodEntryLabels = methodEntryLabels ?? throw new ArgumentNullException(nameof(methodEntryLabels));
                 _options = options ?? throw new ArgumentNullException(nameof(options));
 
                 int blockCount = method.Blocks.Length;
@@ -585,10 +1356,11 @@ namespace Cnidaria.Cs
             public void Emit()
             {
                 int runtimeMethodId = _method.RuntimeMethod.MethodId;
+                int staticConstructorTypeLayoutIndex = ComputeStaticConstructorTypeLayoutIndex(_method.RuntimeMethod);
                 ushort methodFlags = _method.StackFrame.UsesFramePointer
                     ? (ushort)MethodFlags.UsesFramePointer
                     : (ushort)MethodFlags.None;
-                _asm.BeginMethod(runtimeMethodId, _method.StackFrame, methodFlags);
+                _asm.BeginMethod(runtimeMethodId, ResolveMethodEntryLabel(_method.RuntimeMethod), staticConstructorTypeLayoutIndex, _method.StackFrame, methodFlags);
 
                 int methodEntryPc = _asm.Pc;
                 var order = _method.LinearBlockOrder;
@@ -975,7 +1747,7 @@ namespace Cnidaria.Cs
                             RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 1)), imm: source.Int32));
                         return;
                     default:
-                        throw Unsupported(instruction, "unsupported tree kind " + instruction.TreeKind);
+                        throw Unsupported(instruction, $"unsupported tree kind {instruction.TreeKind}");
                 }
             }
             private void EmitStaticData(GenTree instruction, GenTree source)
@@ -1830,15 +2602,19 @@ namespace Cnidaria.Cs
                     if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect || IsAggregateValue(returnType, returnKind))
                     {
                         RegisterOperand sourceLocation = instruction.Uses.Length == 1 ? instruction.Uses[0] : _method.GetHome(value);
+                        int size = Math.Max(1, StorageSizeOf(returnType, returnKind, sourceLocation));
+                        if (TryEmitHiddenReturnBufferCopy(instruction, returnType, returnKind, sourceLocation, size))
+                            return;
+
                         if (sourceLocation.IsFrameSlot)
                         {
                             EmitLoadAddress(MachineRegisters.BackendScratch, sourceLocation);
-                            _asm.RetValue(MachineRegisters.BackendScratch, Math.Max(1, StorageSizeOf(returnType, returnKind, sourceLocation)));
+                            _asm.RetValue(MachineRegisters.BackendScratch, size);
                             return;
                         }
                         if (sourceLocation.IsRegister)
                         {
-                            _asm.RetValue(sourceLocation.Register, Math.Max(1, StorageSizeOf(returnType, returnKind, sourceLocation)));
+                            _asm.RetValue(sourceLocation.Register, size);
                             return;
                         }
                     }
@@ -1875,6 +2651,78 @@ namespace Cnidaria.Cs
                     _asm.RetI(rs);
             }
 
+
+            private bool TryEmitHiddenReturnBufferCopy(GenTree instruction, RuntimeType? returnType, GenStackKind returnKind, RegisterOperand sourceLocation, int size)
+            {
+                if (!MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod))
+                    return false;
+
+                if (!sourceLocation.IsRegister && !sourceLocation.IsFrameSlot)
+                    throw Unsupported(instruction, "hidden-return value source is neither register nor frame slot");
+
+                EmitAddressOf(MachineRegisters.BackendScratch, sourceLocation);
+                EmitLoadIncomingHiddenReturnBufferAddress(MachineRegisters.ParallelCopyScratch1);
+                EmitCopyAddressToAddress(returnType, returnKind, MachineRegisters.ParallelCopyScratch1, MachineRegisters.BackendScratch, Math.Max(1, size), InstructionFlags.MayThrow);
+                _asm.RetVoid();
+                return true;
+            }
+
+            private void EmitLoadIncomingHiddenReturnBufferAddress(MachineRegister dst)
+            {
+                var location = ComputeIncomingHiddenReturnBufferLocation();
+                if (location.IsRegister)
+                {
+                    _asm.MovPtr(dst, location.Register);
+                    return;
+                }
+
+                int offset = checked(location.StackSlotIndex * MachineAbi.StackArgumentSlotSize + location.StackOffset);
+                _asm.Emit(InstrDesc.Mem(Op.LdPtr, dst, MachineRegisters.ThreadPointer, offset, aux: Aux.Memory(0, AlignLog2(TargetArchitecture.PointerSize), MemoryBase.ThreadPointer)));
+            }
+
+            private AbiArgumentLocation ComputeIncomingHiddenReturnBufferLocation()
+            {
+                int insertionIndex = MachineAbi.HiddenReturnBufferInsertionIndex(_method.RuntimeMethod, _method.ArgTypes.Length);
+                if (insertionIndex < 0)
+                    throw new InvalidOperationException("Current method does not use a hidden return buffer: " + _method.RuntimeMethod);
+
+                int generalIndex = 0;
+                int floatIndex = 0;
+                int outgoingIndex = 0;
+                for (int i = 0; i < insertionIndex; i++)
+                    ConsumeAbiArgumentLocation(_method.ArgTypes[i], ref generalIndex, ref floatIndex, ref outgoingIndex);
+
+                return MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref generalIndex, ref floatIndex, ref outgoingIndex);
+            }
+
+            private static void ConsumeAbiArgumentLocation(RuntimeType type, ref int generalIndex, ref int floatIndex, ref int outgoingIndex)
+            {
+                var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
+                switch (abi.PassingKind)
+                {
+                    case AbiValuePassingKind.Void:
+                        return;
+                    case AbiValuePassingKind.ScalarRegister:
+                        _ = MachineAbi.AssignScalarArgumentLocation(abi.RegisterClass, abi.Size, ref generalIndex, ref floatIndex, ref outgoingIndex);
+                        return;
+                    case AbiValuePassingKind.MultiRegister:
+                        {
+                            int aggregateStackSlot = -1;
+                            int aggregateStackBaseOffset = 0;
+                            var segments = MachineAbi.GetRegisterSegments(abi);
+                            for (int i = 0; i < segments.Length; i++)
+                                _ = MachineAbi.AssignAggregateSegmentArgumentLocation(segments[i], ref generalIndex, ref floatIndex, ref outgoingIndex, ref aggregateStackSlot, ref aggregateStackBaseOffset);
+                            return;
+                        }
+                    case AbiValuePassingKind.Stack:
+                    case AbiValuePassingKind.Indirect:
+                        outgoingIndex++;
+                        return;
+                    default:
+                        throw new InvalidOperationException("Unsupported ABI argument passing kind: " + abi.PassingKind);
+                }
+            }
+
             private void EmitScalarReturnFromRegister(MachineRegister source, AbiValueInfo abi, RuntimeType? type, GenStackKind kind)
             {
                 if (abi.RegisterClass == RegisterClass.Float || MachineRegisters.GetClass(source) == RegisterClass.Float)
@@ -1907,24 +2755,20 @@ namespace Cnidaria.Cs
             {
                 var delegateType = source.RuntimeType ?? source.Type ?? throw Unsupported(instruction, "delegate node has no delegate type");
                 var targetMethod = source.Method ?? throw Unsupported(instruction, "delegate node has no target method");
+                int delegateTypeLayoutIndex = _asm.InternTypeLayout(delegateType);
                 var result = RequireResultRegister(instruction);
-                long descriptor = ((long)(uint)delegateType.TypeId << 32) | (uint)targetMethod.MethodId;
 
                 if (instruction.Uses.Length == 0)
                 {
-                    _asm.Emit(new InstrDesc(Op.NewDelegate, RegisterVmIsa.EncodeRegister(result),
-                        aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: descriptor));
+                    _asm.NewDelegate(result, delegateTypeLayoutIndex, _state.DelegateTargetThunkLabel(delegateType, targetMethod, closed: false));
                     return;
                 }
 
                 if (instruction.Uses.Length != 1)
                     throw Unsupported(instruction, "closed delegate construction requires exactly one target operand");
 
-                _asm.Emit(new InstrDesc(Op.NewDelegateClosed,
-                    RegisterVmIsa.EncodeRegister(result),
-                    RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
-                    aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow),
-                    imm: descriptor));
+                MachineRegister target = RequireUseRegister(instruction, 0);
+                _asm.NewDelegateClosed(result, target, delegateTypeLayoutIndex, _state.DelegateTargetThunkLabel(delegateType, targetMethod, closed: true));
             }
 
             private void EmitDelegateBinary(GenTree instruction, Op op)
@@ -1938,6 +2782,167 @@ namespace Cnidaria.Cs
                 _asm.Emit(InstrDesc.R(op, result, left, right,
                     Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
             }
+
+            private bool EmitKnownManagedCallPreamble(RuntimeMethod method)
+            {
+                if (!RequiresTypeInitializationBeforeCall(method))
+                    return false;
+
+                EmitStaticBase(MachineRegisters.BackendScratch, _asm.InternTypeLayout(method.DeclaringType));
+                return true;
+            }
+
+            private void EmitCallGcSafePointAfterPreamble(GenTree instruction, bool preambleEmitted)
+            {
+                if (!preambleEmitted || !_options.EmitGcInfo || !ShouldEmitGcReportPoint(instruction))
+                    return;
+
+                EmitGcSafePoint(_asm.Pc, instruction);
+            }
+
+            private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
+            {
+                if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                    return false;
+
+                if (target.IsStatic)
+                    return true;
+
+                return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
+            }
+
+            private void EmitReferenceTypeNewObjectThisArgument(MachineRegister obj, RuntimeMethod constructor)
+            {
+                int generalIndex = 0;
+                int floatIndex = 0;
+                int outgoingIndex = 0;
+                var location = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref generalIndex, ref floatIndex, ref outgoingIndex);
+                if (location.IsRegister)
+                {
+                    _asm.MovRef(location.Register, obj);
+                    return;
+                }
+
+                if (!_method.StackFrame.TryGetOutgoingArgumentSlot(location.StackSlotIndex, out var slot))
+                    throw new InvalidOperationException($"Reference newobj requires outgoing stack slot {location.StackSlotIndex} for this pointer, but the slot was not allocated.");
+
+                var destination = RegisterOperand.ForFrameSlot(
+                    RegisterClass.General,
+                    StackFrameSlotKind.OutgoingArgument,
+                    RegisterFrameBase.StackPointer,
+                    slot.Index,
+                    checked(slot.Offset + location.StackOffset),
+                    TargetArchitecture.PointerSize);
+                EmitStore(destination, obj, constructor.DeclaringType, GenStackKind.Ref);
+            }
+
+            private void EmitReferenceNewObjectAllocation(GenTree instruction, RuntimeMethod constructor, MachineRegister obj)
+            {
+                if (!IsSystemStringType(constructor.DeclaringType))
+                {
+                    _asm.AllocObj(obj, constructor.DeclaringType);
+                    return;
+                }
+
+                var length = MachineRegisters.ParallelCopyScratch1;
+                EmitStringConstructorLength(instruction, constructor, length);
+                _asm.Emit(new InstrDesc(
+                    Op.FastAllocateString,
+                    RegisterVmIsa.EncodeRegister(obj),
+                    RegisterVmIsa.EncodeRegister(length),
+                    aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
+            }
+
+            private void EmitStringConstructorLength(GenTree instruction, RuntimeMethod constructor, MachineRegister length)
+            {
+                RuntimeType[] parameters = constructor.ParameterTypes;
+
+                if (parameters.Length == 0)
+                {
+                    _asm.LiI32(length, 0);
+                    return;
+                }
+
+                if (parameters.Length == 1)
+                {
+                    RuntimeType p0 = parameters[0];
+                    if (IsCharArrayType(p0))
+                    {
+                        var value = RequireCallUse(instruction, 0, "string(char[]) value");
+                        var arrayRef = MachineRegisters.ParallelCopyScratch0;
+                        EmitLoadOperand(arrayRef, value, p0, GenStackKind.Ref);
+                        _asm.LdLen(length, arrayRef);
+                        return;
+                    }
+
+                    if (IsCharPointerType(p0))
+                    {
+                        var value = RequireCallUse(instruction, 0, "string(char*) value");
+                        var p = MachineRegisters.ParallelCopyScratch0;
+                        EmitLoadOperand(p, value, p0, GenStackKind.Ptr);
+                        EmitNullTerminatedCharPointerLength(length, p);
+                        return;
+                    }
+                }
+
+                if (parameters.Length == 2 && IsCharType(parameters[0]) && IsInt32Type(parameters[1]))
+                {
+                    var value = RequireCallUse(instruction, 1, "string(char,int) length");
+                    EmitLoadOperand(length, value, parameters[1], GenStackKind.I4);
+                    return;
+                }
+
+                if (parameters.Length == 3 && IsCharArrayType(parameters[0]) && IsInt32Type(parameters[1]) && IsInt32Type(parameters[2]))
+                {
+                    var value = RequireCallUse(instruction, 2, "string(char[],int,int) length");
+                    EmitLoadOperand(length, value, parameters[2], GenStackKind.I4);
+                    return;
+                }
+
+                _asm.LiI32(length, 0);
+            }
+
+            private void EmitNullTerminatedCharPointerLength(MachineRegister length, MachineRegister pointer)
+            {
+                var loop = _asm.CreateLabel();
+                var done = _asm.CreateLabel();
+                var ch = MachineRegisters.BackendScratch;
+
+                _asm.LiI32(length, 0);
+                _asm.Branch(Op.BrFalseRef, pointer, done);
+                _asm.Bind(loop);
+                _asm.Emit(InstrDesc.Mem(Op.LdU2, ch, pointer, 0, aux: Aux.Memory(1, 1)));
+                _asm.BrFalseI32(ch, done);
+                _asm.I32AddImm(length, length, 1);
+                _asm.I64AddImm(pointer, pointer, 2);
+                _asm.J(loop);
+                _asm.Bind(done);
+            }
+
+            private RegisterOperand RequireCallUse(GenTree instruction, int index, string context)
+            {
+                if ((uint)index >= (uint)instruction.Uses.Length)
+                    throw Unsupported(instruction, context + " is missing from call operands");
+                return instruction.Uses[index];
+            }
+
+            private static bool IsSystemStringType(RuntimeType type)
+                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(type.Name, "String");
+
+            private static bool IsCharType(RuntimeType type)
+                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(type.Name, "Char");
+
+            private static bool IsInt32Type(RuntimeType type)
+                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(type.Name, "Int32");
+
+            private static bool IsCharArrayType(RuntimeType type)
+                => type.Kind == RuntimeTypeKind.Array && type.ElementType is not null && IsCharType(type.ElementType);
+
+            private static bool IsCharPointerType(RuntimeType type)
+                => type.Kind == RuntimeTypeKind.Pointer && type.ElementType is not null && IsCharType(type.ElementType);
 
             private void EmitCallLike(GenTree instruction, GenTree source)
             {
@@ -1953,11 +2958,21 @@ namespace Cnidaria.Cs
                             throw Unsupported(instruction, "value-type newobj requires a hidden return buffer operand");
 
                         var flags = BuildCallFlags(method, Op.CallVoid) | CallFlags.HiddenReturnBuffer;
-                        _asm.Emit(InstrDesc.Call(Op.CallVoid, method.MethodId, flags));
+                        EmitCallGcSafePointAfterPreamble(instruction, EmitKnownManagedCallPreamble(method));
+                        _asm.CallDirect(Op.CallVoid, ResolveDirectCallTarget(instruction, method), flags);
                         return;
                     }
 
-                    _asm.NewObj(RequireResultRegister(instruction), method.MethodId);
+                    var objectHome = RequireSingleResult(instruction);
+                    if (!objectHome.IsFrameSlot)
+                        throw Unsupported(instruction, "reference newobj result must be a frame home so the allocated object survives the constructor call");
+
+                    var obj = MachineRegisters.BackendScratch;
+                    EmitReferenceNewObjectAllocation(instruction, method, obj);
+                    EmitStore(objectHome, obj, method.DeclaringType, GenStackKind.Ref);
+                    EmitReferenceTypeNewObjectThisArgument(obj, method);
+                    EmitCallGcSafePointAfterPreamble(instruction, EmitKnownManagedCallPreamble(method));
+                    _asm.CallDirect(Op.CallVoid, ResolveDirectCallTarget(instruction, method), BuildCallFlags(method, Op.CallVoid));
                     return;
                 }
 
@@ -1980,32 +2995,82 @@ namespace Cnidaria.Cs
 
                 if (instruction.TreeKind == GenTreeKind.VirtualCall)
                 {
-                    int dispatchSlot = method.DeclaringType.Kind == RuntimeTypeKind.Interface
-                        ? -1
-                        : method.VTableSlot;
-                    var site = new CallSiteRecord(
-                        -1,
-                        method.MethodId,
-                        method.MethodId,
-                        method.DeclaringType.TypeId,
-                        dispatchSlot,
-                        (CallFlags)aux);
-                    switch (op)
+                    MachineRegister receiver = RequireVirtualCallReceiverRegister(instruction);
+
+                    if (method.DeclaringType.Kind != RuntimeTypeKind.Interface && method.VTableSlot < 0)
                     {
-                        case Op.CallVirtVoid: _asm.CallVirtVoid(site); return;
-                        case Op.CallVirtI: _asm.CallVirtI(site); return;
-                        case Op.CallVirtF: _asm.CallVirtF(site); return;
-                        case Op.CallVirtRef: _asm.CallVirtRef(site); return;
-                        case Op.CallVirtValue: _asm.CallVirtValue(site); return;
-                        case Op.CallIfaceVoid: _asm.CallIfaceVoid(site); return;
-                        case Op.CallIfaceI: _asm.CallIfaceI(site); return;
-                        case Op.CallIfaceF: _asm.CallIfaceF(site); return;
-                        case Op.CallIfaceRef: _asm.CallIfaceRef(site); return;
-                        case Op.CallIfaceValue: _asm.CallIfaceValue(site); return;
+                        byte receiverEncoded = RegisterVmIsa.EncodeRegister(receiver);
+                        _asm.Emit(new InstrDesc(
+                            Op.NullCheck,
+                            rd: receiverEncoded,
+                            rs1: receiverEncoded,
+                            aux: Aux.Instruction(InstructionFlags.MayThrow)));
+
+                        Op directOp = SelectCallOp(GenTreeKind.Call, method, method.ReturnType, resultClass);
+                        CallFlags directFlags = BuildCallFlags(method, directOp);
+                        if ((directFlags & CallFlags.HiddenReturnBuffer) != 0 && !hasHiddenReturnBufferOperand)
+                            throw Unsupported(instruction, "hidden-return-buffer call has no materialized return buffer operand");
+                        if (hasHiddenReturnBufferOperand)
+                            directFlags |= CallFlags.HiddenReturnBuffer;
+
+                        if (IsInternalCallOp(directOp))
+                        {
+                            bool directInternalPreambleEmitted = EmitKnownManagedCallPreamble(method);
+                            EmitCallGcSafePointAfterPreamble(instruction, directInternalPreambleEmitted);
+                            _asm.Emit(InstrDesc.Call(directOp, method.MethodId, directFlags));
+                            return;
+                        }
+
+                        bool directPreambleEmitted = EmitKnownManagedCallPreamble(method);
+                        EmitCallGcSafePointAfterPreamble(instruction, directPreambleEmitted);
+                        _asm.CallDirect(directOp, ResolveDirectCallTarget(instruction, method), directFlags);
+                        return;
                     }
+
+                    MachineRegister target = MachineRegisters.BackendScratch;
+                    _asm.LdVTableEntry(target, receiver, method);
+                    EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted: false);
+                    _asm.Emit(new InstrDesc(
+                        op,
+                        rs1: RegisterVmIsa.EncodeRegister(target),
+                        aux: Aux.Call(callFlags)));
+                    return;
                 }
 
-                _asm.Emit(InstrDesc.Call(op, method.MethodId, (CallFlags)aux));
+                if (IsInternalCallOp(op))
+                {
+                    bool internalPreambleEmitted = EmitKnownManagedCallPreamble(method);
+                    EmitCallGcSafePointAfterPreamble(instruction, internalPreambleEmitted);
+                    _asm.Emit(InstrDesc.Call(op, method.MethodId, (CallFlags)aux));
+                    return;
+                }
+
+                if (instruction.TreeKind == GenTreeKind.DelegateInvoke)
+                {
+                    if (hasHiddenReturnBufferOperand)
+                        callFlags |= CallFlags.HiddenReturnBuffer;
+                    EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted: false);
+                    _asm.CallDirect(op, _state.DelegateInvokeStubLabel(method), callFlags);
+                    return;
+                }
+
+                bool preambleEmitted = EmitKnownManagedCallPreamble(method);
+                EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted);
+                _asm.CallDirect(op, ResolveDirectCallTarget(instruction, method), (CallFlags)aux);
+            }
+
+            private Label ResolveMethodEntryLabel(RuntimeMethod method)
+            {
+                if (!_methodEntryLabels.TryGetValue(method.MethodId, out Label label))
+                    throw new InvalidOperationException($"Method is not present in the linked register image: M{method.MethodId}");
+                return label;
+            }
+
+            private Label ResolveDirectCallTarget(GenTree instruction, RuntimeMethod method)
+            {
+                if (!_methodEntryLabels.TryGetValue(method.MethodId, out Label label))
+                    throw Unsupported(instruction, $"direct managed call target is not present in the linked register image: M{method.MethodId}");
+                return label;
             }
 
             private static bool HasHiddenReturnBufferOperand(GenTree instruction)
@@ -2017,6 +3082,18 @@ namespace Cnidaria.Cs
                 }
 
                 return false;
+            }
+
+            private MachineRegister RequireVirtualCallReceiverRegister(GenTree instruction)
+            {
+                for (int i = 0; i < instruction.Uses.Length; i++)
+                {
+                    if (i < instruction.UseRoles.Length && instruction.UseRoles[i] == OperandRole.HiddenReturnBuffer)
+                        continue;
+                    return RequireUseRegister(instruction, i);
+                }
+
+                throw Unsupported(instruction, "virtual call has no receiver ABI operand");
             }
 
             private void EmitRuntimeTypeCheck(GenTree instruction, GenTree source, Op op)
@@ -2128,11 +3205,13 @@ namespace Cnidaria.Cs
             private void EmitField(GenTree instruction, GenTree source)
             {
                 var field = source.Field ?? throw Unsupported(instruction, "field node without runtime field");
-                int fieldLayout = _asm.InternFieldLayout(field);
+                int fieldOffset = field.Offset;
+                int fieldSize = Math.Max(1, StorageSizeOf(field.FieldType, StackKindOf(field.FieldType)));
+                FieldAccessFlags fieldFlags = BuildFieldAccessFlags(field);
                 if (instruction.TreeKind == GenTreeKind.FieldAddr)
                 {
                     _asm.Emit(InstrDesc.Field(Op.LdFldAddr, RequireResultRegister(instruction),
-                        RequireUseRegister(instruction, 0), fieldLayout, Aux.Instruction(InstructionFlags.MayThrow)));
+                        RequireUseRegister(instruction, 0), fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
                     return;
                 }
 
@@ -2154,12 +3233,12 @@ namespace Cnidaria.Cs
                                 valueKind,
                                 "field store value",
                                 instance);
-                            _asm.Emit(InstrDesc.Field(Op.StFldObj, valueAddress, instance, fieldLayout, aux));
+                            _asm.Emit(InstrDesc.Field(Op.StFldObj, valueAddress, instance, fieldOffset, fieldSize, fieldFlags, aux));
                             return;
                         }
 
                         MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, instance);
-                        _asm.Emit(InstrDesc.Field(Op.LdFldAddr, address, instance, fieldLayout, Aux.Instruction(InstructionFlags.MayThrow)));
+                        _asm.Emit(InstrDesc.Field(Op.LdFldAddr, address, instance, fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
                         EmitMultiRegisterStoreToAddress(instruction, valueUseIndex, field.FieldType, valueKind, address);
                         return;
                     }
@@ -2169,7 +3248,7 @@ namespace Cnidaria.Cs
                     if (IsAggregateStorage(valueOperand, field.FieldType, singleValueKind))
                     {
                         EmitAddressOf(MachineRegisters.BackendScratch, valueOperand);
-                        _asm.Emit(InstrDesc.Field(Op.StFldObj, MachineRegisters.BackendScratch, instance, fieldLayout, aux));
+                        _asm.Emit(InstrDesc.Field(Op.StFldObj, MachineRegisters.BackendScratch, instance, fieldOffset, fieldSize, fieldFlags, aux));
                         return;
                     }
 
@@ -2183,12 +3262,12 @@ namespace Cnidaria.Cs
                             singleValueKind,
                             "field store value",
                             instance);
-                        _asm.Emit(InstrDesc.Field(Op.StFldObj, valueAddress, instance, fieldLayout, aux));
+                        _asm.Emit(InstrDesc.Field(Op.StFldObj, valueAddress, instance, fieldOffset, fieldSize, fieldFlags, aux));
                         return;
                     }
 
                     var value = RequireUseRegister(instruction, valueUseIndex);
-                    _asm.Emit(InstrDesc.Field(op, value, instance, fieldLayout, aux));
+                    _asm.Emit(InstrDesc.Field(op, value, instance, fieldOffset, fieldSize, fieldFlags, aux));
                     return;
                 }
                 var resultType = ResultRuntimeType(instruction, source);
@@ -2196,7 +3275,7 @@ namespace Cnidaria.Cs
                 if (instruction.Results.Length > 1)
                 {
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, RequireUseRegister(instruction, 0));
-                    _asm.Emit(InstrDesc.Field(Op.LdFldAddr, address, RequireUseRegister(instruction, 0), fieldLayout, Aux.Instruction(InstructionFlags.MayThrow)));
+                    _asm.Emit(InstrDesc.Field(Op.LdFldAddr, address, RequireUseRegister(instruction, 0), fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
                     EmitMultiRegisterLoadFromAddress(instruction, resultType, resultKind, address);
                     return;
                 }
@@ -2205,28 +3284,35 @@ namespace Cnidaria.Cs
                 {
                     EmitAddressOf(MachineRegisters.BackendScratch, RequireSingleResult(instruction));
                     _asm.Emit(InstrDesc.Field(Op.LdFldObj, MachineRegisters.BackendScratch,
-                        RequireUseRegister(instruction, 0), fieldLayout, Aux.Instruction(InstructionFlags.MayThrow)));
+                        RequireUseRegister(instruction, 0), fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
                     return;
                 }
 
                 _asm.Emit(InstrDesc.Field(SelectLoadFieldOp(resultType, resultKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction),
-                    RequireUseRegister(instruction, 0), fieldLayout, Aux.Instruction(InstructionFlags.MayThrow)));
+                    RequireUseRegister(instruction, 0), fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
             }
 
             private void EmitStaticField(GenTree instruction, GenTree source)
             {
                 var field = source.Field ?? throw Unsupported(instruction, "static field node without runtime field");
-                int fieldLayout = _asm.InternFieldLayout(field);
+                int declaringTypeLayout = _asm.InternTypeLayout(field.DeclaringType);
+                int fieldOffset = field.Offset;
+                int fieldSize = Math.Max(1, StorageSizeOf(field.FieldType, StackKindOf(field.FieldType)));
+
                 if (instruction.TreeKind == GenTreeKind.StaticFieldAddr)
                 {
-                    _asm.Emit(InstrDesc.StaticField(Op.LdSFldAddr, RequireResultRegister(instruction), fieldLayout));
+                    MachineRegister result = RequireResultRegister(instruction);
+                    EmitStaticFieldAddress(result, declaringTypeLayout, fieldOffset);
                     return;
                 }
 
                 if (instruction.TreeKind == GenTreeKind.StoreStaticField)
                 {
                     int valueUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 0, "static-field store value");
-                    ushort aux = StaticFieldStoreAux(field.FieldType);
+                    ushort aux = MemoryAuxForRegisterBase(field.FieldType, StaticFieldStoreInstructionFlags(field.FieldType));
+                    MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
+                    EmitStaticBase(address, declaringTypeLayout);
+
                     if (instruction.Uses.Length - valueUseIndex > 1)
                     {
                         GenStackKind valueKind = StackKindOf(field.FieldType);
@@ -2238,13 +3324,13 @@ namespace Cnidaria.Cs
                                 field.FieldType,
                                 valueKind,
                                 "static-field store value");
-                            _asm.Emit(InstrDesc.StaticField(Op.StSFldObj, valueAddress, fieldLayout, aux));
+                            EmitCopyAddressToAddress(field.FieldType, valueKind, address, valueAddress, fieldSize, StaticFieldStoreInstructionFlags(field.FieldType), fieldOffset);
                             return;
                         }
 
-                        MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
-                        _asm.Emit(InstrDesc.StaticField(Op.LdSFldAddr, address, fieldLayout));
-                        EmitMultiRegisterStoreToAddress(instruction, valueUseIndex, field.FieldType, valueKind, address);
+                        MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, address);
+                        EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                        EmitMultiRegisterStoreToAddress(instruction, valueUseIndex, field.FieldType, valueKind, fieldAddress);
                         return;
                     }
 
@@ -2253,12 +3339,12 @@ namespace Cnidaria.Cs
                     if (IsAggregateStorage(valueOperand, field.FieldType, singleValueKind))
                     {
                         EmitAddressOf(MachineRegisters.BackendScratch, valueOperand);
-                        _asm.Emit(InstrDesc.StaticField(Op.StSFldObj, MachineRegisters.BackendScratch, fieldLayout, aux));
+                        EmitCopyAddressToAddress(field.FieldType, singleValueKind, address, MachineRegisters.BackendScratch, fieldSize, StaticFieldStoreInstructionFlags(field.FieldType), fieldOffset);
                         return;
                     }
 
-                    var op = SelectStoreStaticFieldOp(field.FieldType, singleValueKind, valueOperand.RegisterClass, 0);
-                    if (op == Op.StSFldObj)
+                    var op = SelectStoreOpForStorage(field.FieldType, singleValueKind, valueOperand.RegisterClass, 0);
+                    if (op == Op.StObj)
                     {
                         MachineRegister valueAddress = MaterializeScalarAggregateHome(
                             instruction,
@@ -2266,19 +3352,20 @@ namespace Cnidaria.Cs
                             field.FieldType,
                             singleValueKind,
                             "static-field store value");
-                        _asm.Emit(InstrDesc.StaticField(Op.StSFldObj, valueAddress, fieldLayout, aux));
+                        EmitCopyAddressToAddress(field.FieldType, singleValueKind, address, valueAddress, fieldSize, StaticFieldStoreInstructionFlags(field.FieldType), fieldOffset);
                         return;
                     }
 
-                    _asm.Emit(InstrDesc.StaticField(op, RequireUseRegister(instruction, valueUseIndex), fieldLayout, aux));
+                    _asm.Emit(InstrDesc.Mem(op, RequireUseRegister(instruction, valueUseIndex), address, fieldOffset, aux: aux));
                     return;
                 }
+
                 var resultType = ResultRuntimeType(instruction, source);
                 var resultKind = ResultStackKind(instruction, source, resultType);
                 if (instruction.Results.Length > 1)
                 {
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
-                    _asm.Emit(InstrDesc.StaticField(Op.LdSFldAddr, address, fieldLayout));
+                    EmitStaticFieldAddress(address, declaringTypeLayout, fieldOffset);
                     EmitMultiRegisterLoadFromAddress(instruction, resultType, resultKind, address);
                     return;
                 }
@@ -2286,12 +3373,30 @@ namespace Cnidaria.Cs
                 if (RequireSingleResult(instruction).IsFrameSlot && IsAggregateStorage(RequireSingleResult(instruction), resultType, resultKind))
                 {
                     EmitAddressOf(MachineRegisters.BackendScratch, RequireSingleResult(instruction));
-                    _asm.Emit(InstrDesc.StaticField(Op.LdSFldObj, MachineRegisters.BackendScratch, fieldLayout));
+                    MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, MachineRegisters.BackendScratch);
+                    EmitStaticBase(address, declaringTypeLayout);
+                    EmitCopyAddressToAddress(resultType, resultKind, MachineRegisters.BackendScratch, address, fieldSize, InstructionFlags.None, sourceOffset: fieldOffset);
                     return;
                 }
 
-                _asm.Emit(InstrDesc.StaticField(SelectLoadStaticFieldOp(
-                    resultType, resultKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction), fieldLayout));
+                MachineRegister baseRegister = RequireSingleResult(instruction).RegisterClass == RegisterClass.General
+                    ? RequireResultRegister(instruction)
+                    : PickScratchRegister(instruction, RegisterClass.General);
+                EmitStaticBase(baseRegister, declaringTypeLayout);
+                _asm.Emit(InstrDesc.Mem(SelectLoadOpForStorage(
+                    resultType, resultKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction), baseRegister, fieldOffset,
+                    aux: MemoryAuxForRegisterBase(resultType)));
+            }
+
+            private void EmitStaticBase(MachineRegister destination, int declaringTypeLayout)
+                => _asm.Emit(InstrDesc.Li(Op.LiStaticBase, destination, declaringTypeLayout,
+                    Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
+
+            private void EmitStaticFieldAddress(MachineRegister destination, int declaringTypeLayout, int fieldOffset)
+            {
+                EmitStaticBase(destination, declaringTypeLayout);
+                if (fieldOffset != 0)
+                    _asm.I64AddImm(destination, destination, fieldOffset);
             }
 
             private void EmitIndirect(GenTree instruction, GenTree source)
@@ -2568,6 +3673,15 @@ namespace Cnidaria.Cs
                     return type.SizeOf;
                 return kind == GenStackKind.R8 || kind == GenStackKind.I8 ? 8 : 4;
             }
+            private void EmitLoadOperand(MachineRegister dst, RegisterOperand src, RuntimeType? type, GenStackKind kind)
+            {
+                if (src.IsRegister)
+                {
+                    EmitRegisterMove(dst, src.Register, type, kind, MachineRegisters.GetClass(dst));
+                    return;
+                }
+                EmitLoad(dst, src, type, kind);
+            }
             private void EmitLoad(MachineRegister dst, RegisterOperand src, RuntimeType? type, GenStackKind kind)
             {
                 if (!src.IsFrameSlot)
@@ -2619,7 +3733,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                throw new InvalidOperationException("Cannot take address of operand: " + operand.ToString());
+                throw new InvalidOperationException($"Cannot take address of operand: {operand}");
             }
 
             private void EmitInitAggregate(RegisterOperand destination, RuntimeType? type, GenStackKind kind)
@@ -2637,9 +3751,14 @@ namespace Cnidaria.Cs
                     aux: Aux.Instruction(InstructionFlags.MayThrow), imm: size));
             }
 
-            private void EmitCopyAddressToAddress(RuntimeType? type, GenStackKind kind, MachineRegister dstAddress, MachineRegister srcAddress, int size, InstructionFlags flags)
+            private void EmitCopyAddressToAddress(RuntimeType? type, GenStackKind kind, MachineRegister dstAddress, MachineRegister srcAddress, int size, InstructionFlags flags, int dstOffset = 0, int sourceOffset = 0)
             {
                 int copySize = size > 0 ? size : StorageSizeOf(type, kind);
+                if (dstOffset != 0)
+                    _asm.I64AddImm(dstAddress, dstAddress, dstOffset);
+                if (sourceOffset != 0)
+                    _asm.I64AddImm(srcAddress, srcAddress, sourceOffset);
+
                 if (type is not null)
                 {
                     _asm.Emit(new InstrDesc(Op.CpObj, RegisterVmIsa.EncodeRegister(dstAddress), RegisterVmIsa.EncodeRegister(srcAddress),
@@ -2808,7 +3927,7 @@ namespace Cnidaria.Cs
                 var source = instruction.Uses[valueUseIndex];
                 int size = StorageSizeOf(type, kind, source);
                 if (size <= 0 || size > 8)
-                    throw Unsupported(instruction, context + " cannot be materialized from one register; size=" + size.ToString());
+                    throw Unsupported(instruction, $"{context} cannot be materialized from one register; size={size}");
 
                 if (source.IsFrameSlot)
                 {
@@ -2837,7 +3956,7 @@ namespace Cnidaria.Cs
             private void EmitRawRegisterStoreToFrame(RegisterOperand destination, MachineRegister source, int size)
             {
                 if (!destination.IsFrameSlot)
-                    throw new InvalidOperationException("Raw aggregate materialization destination is not a frame slot: " + destination.ToString());
+                    throw new InvalidOperationException($"Raw aggregate materialization destination is not a frame slot: {destination}");
 
                 Op op = size switch
                 {
@@ -2845,7 +3964,7 @@ namespace Cnidaria.Cs
                     2 => Op.StI2,
                     4 => Op.StI4,
                     8 => Op.StI8,
-                    _ => throw new InvalidOperationException("Unsupported raw aggregate materialization size: " + size.ToString()),
+                    _ => throw new InvalidOperationException($"Unsupported raw aggregate materialization size: {size}"),
                 };
 
                 _asm.Emit(InstrDesc.Mem(op, source, FrameBaseRegister(destination), destination.FrameOffset, aux: FrameMemoryAux(destination)));
@@ -3225,7 +4344,7 @@ namespace Cnidaria.Cs
                     return useIndex;
                 }
 
-                throw Unsupported(instruction, context + " has no register use for operand " + operandIndex.ToString());
+                throw Unsupported(instruction, $"{context} has no register use for operand {operandIndex}");
             }
 
             private bool TryGetCodegenUseIndexForOperand(GenTree instruction, GenTree source, int operandIndex, out int useIndex)
@@ -3347,7 +4466,7 @@ namespace Cnidaria.Cs
                     RegisterFrameBase.FramePointer => MemoryBase.FramePointer,
                     RegisterFrameBase.StackPointer => MemoryBase.StackPointer,
                     RegisterFrameBase.IncomingArgumentBase => MemoryBase.ThreadPointer,
-                    _ => throw new InvalidOperationException("Invalid frame base: " + operand.FrameBase.ToString()),
+                    _ => throw new InvalidOperationException($"Invalid frame base: {operand.FrameBase}"),
                 };
 
             private static MachineRegister FrameBaseRegister(RegisterOperand operand)
@@ -3356,7 +4475,7 @@ namespace Cnidaria.Cs
                     RegisterFrameBase.FramePointer => MachineRegisters.FramePointer,
                     RegisterFrameBase.StackPointer => MachineRegisters.StackPointer,
                     RegisterFrameBase.IncomingArgumentBase => MachineRegisters.ThreadPointer,
-                    _ => throw new InvalidOperationException("Invalid frame base: " + operand.FrameBase.ToString()),
+                    _ => throw new InvalidOperationException($"Invalid frame base: {operand.FrameBase}"),
                 };
 
             private static ushort FrameMemoryAux(RegisterOperand operand)
@@ -3364,6 +4483,9 @@ namespace Cnidaria.Cs
 
             private static ushort MemoryAuxForRegisterBase(RuntimeType? type)
                 => Aux.Memory(0, AlignLog2(type?.AlignOf ?? 1), MemoryBase.Register);
+
+            private static ushort MemoryAuxForRegisterBase(RuntimeType? type, InstructionFlags flags)
+                => Aux.Memory(0, AlignLog2(type?.AlignOf ?? 1), MemoryBase.Register, flags);
 
             private static byte AlignLog2(int sizeOrAlign)
             {
@@ -3583,45 +4705,6 @@ namespace Cnidaria.Cs
                     _ => Op.StFldObj,
                 };
 
-            private static Op SelectLoadStaticFieldOp(RuntimeType type)
-                => SelectLoadStaticFieldOp(type, StackKindOf(type), RegisterClassForStorage(type, StackKindOf(type)), type.SizeOf);
-
-            private static Op SelectLoadStaticFieldOp(RuntimeType type, GenStackKind kind, RegisterClass registerClass, int storageSize) =>
-                SelectLoadFieldOp(type, kind, registerClass, storageSize) switch
-                {
-                    Op.LdFldI1 => Op.LdSFldI1,
-                    Op.LdFldU1 => Op.LdSFldU1,
-                    Op.LdFldI2 => Op.LdSFldI2,
-                    Op.LdFldU2 => Op.LdSFldU2,
-                    Op.LdFldI4 => Op.LdSFldI4,
-                    Op.LdFldU4 => Op.LdSFldU4,
-                    Op.LdFldI8 => Op.LdSFldI8,
-                    Op.LdFldN => Op.LdSFldN,
-                    Op.LdFldF32 => Op.LdSFldF32,
-                    Op.LdFldF64 => Op.LdSFldF64,
-                    Op.LdFldRef => Op.LdSFldRef,
-                    Op.LdFldPtr => Op.LdSFldPtr,
-                    _ => Op.LdSFldObj,
-                };
-
-            private static Op SelectStoreStaticFieldOp(RuntimeType type)
-                => SelectStoreStaticFieldOp(type, StackKindOf(type), RegisterClassForStorage(type, StackKindOf(type)), type.SizeOf);
-
-            private static Op SelectStoreStaticFieldOp(RuntimeType type, GenStackKind kind, RegisterClass registerClass, int storageSize) =>
-                SelectStoreFieldOp(type, kind, registerClass, storageSize) switch
-                {
-                    Op.StFldI1 => Op.StSFldI1,
-                    Op.StFldI2 => Op.StSFldI2,
-                    Op.StFldI4 => Op.StSFldI4,
-                    Op.StFldI8 => Op.StSFldI8,
-                    Op.StFldN => Op.StSFldN,
-                    Op.StFldF32 => Op.StSFldF32,
-                    Op.StFldF64 => Op.StSFldF64,
-                    Op.StFldRef => Op.StSFldRef,
-                    Op.StFldPtr => Op.StSFldPtr,
-                    _ => Op.StSFldObj,
-                };
-
             private static Op SelectLoadElementOp(RuntimeType? type, GenStackKind kind)
                 => SelectLoadElementOp(type, kind, RegisterClassForStorage(type, kind), type?.SizeOf ?? 0);
 
@@ -3661,6 +4744,19 @@ namespace Cnidaria.Cs
                     _ => Op.StElemObj,
                 };
 
+            private static FieldAccessFlags BuildFieldAccessFlags(RuntimeField field)
+            {
+                FieldAccessFlags flags = FieldAccessFlags.None;
+                if (field.DeclaringType.IsValueType)
+                    flags |= FieldAccessFlags.DeclaringTypeIsValueType;
+                if (field.FieldType.IsReferenceType || field.FieldType.ContainsGcPointers)
+                    flags |= FieldAccessFlags.FieldTypeContainsGcPointers;
+                return flags;
+            }
+
+            private static InstructionFlags StaticFieldStoreInstructionFlags(RuntimeType type)
+                => InstructionFlags.None;
+
             private static ushort ElementStoreAux(RuntimeType? type)
                 => type is not null && (type.IsReferenceType || type.ContainsGcPointers)
                     ? Aux.Instruction(InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)
@@ -3671,10 +4767,6 @@ namespace Cnidaria.Cs
                     ? Aux.Instruction(InstructionFlags.WriteBarrier | InstructionFlags.MayThrow)
                     : Aux.Instruction(InstructionFlags.MayThrow);
 
-            private static ushort StaticFieldStoreAux(RuntimeType type)
-                => type.ContainsGcPointers || type.IsReferenceType
-                    ? Aux.Instruction(InstructionFlags.WriteBarrier)
-                    : (ushort)0;
 
             private static GenStackKind StackKindOf(RuntimeType type)
             {
@@ -3692,6 +4784,16 @@ namespace Cnidaria.Cs
                 };
             }
 
+            private int ComputeStaticConstructorTypeLayoutIndex(RuntimeMethod method)
+            {
+                if (StringComparer.Ordinal.Equals(method.Name, ".cctor"))
+                    return _asm.InternTypeLayout(method.DeclaringType);
+                return MethodRecord.NoStaticConstructorTypeLayout;
+            }
+
+            private static bool IsInternalCallOp(Op op)
+                => op is Op.CallInternalVoid or Op.CallInternalI or Op.CallInternalF or Op.CallInternalRef or Op.CallInternalValue;
+
             private static Op SelectCallOp(GenTreeKind treeKind, RuntimeMethod method, RuntimeType returnType, RegisterClass resultClass)
             {
                 var returnKind = MachineAbi.StackKindForType(returnType);
@@ -3703,33 +4805,23 @@ namespace Cnidaria.Cs
                 bool internalCall = method.HasInternalCall;
                 bool delegateInvoke = treeKind == GenTreeKind.DelegateInvoke;
                 bool virt = treeKind == GenTreeKind.VirtualCall;
-                bool iface = virt && method.DeclaringType.Kind == RuntimeTypeKind.Interface;
 
                 if (delegateInvoke)
                 {
-                    if (isVoid) return Op.DelegateInvokeVoid;
-                    if (isValue) return Op.DelegateInvokeValue;
-                    if (isFloat) return Op.DelegateInvokeF;
-                    if (isRef) return Op.DelegateInvokeRef;
-                    return Op.DelegateInvokeI;
-                }
-
-                if (iface)
-                {
-                    if (isVoid) return Op.CallIfaceVoid;
-                    if (isValue) return Op.CallIfaceValue;
-                    if (isFloat) return Op.CallIfaceF;
-                    if (isRef) return Op.CallIfaceRef;
-                    return Op.CallIfaceI;
+                    if (isVoid) return Op.CallVoid;
+                    if (isValue) return Op.CallValue;
+                    if (isFloat) return Op.CallF;
+                    if (isRef) return Op.CallRef;
+                    return Op.CallI;
                 }
 
                 if (virt)
                 {
-                    if (isVoid) return Op.CallVirtVoid;
-                    if (isValue) return Op.CallVirtValue;
-                    if (isFloat) return Op.CallVirtF;
-                    if (isRef) return Op.CallVirtRef;
-                    return Op.CallVirtI;
+                    if (isVoid) return Op.CallIndirectVoid;
+                    if (isValue) return Op.CallIndirectValue;
+                    if (isFloat) return Op.CallIndirectF;
+                    if (isRef) return Op.CallIndirectRef;
+                    return Op.CallIndirectI;
                 }
 
                 if (internalCall)
@@ -3774,13 +4866,9 @@ namespace Cnidaria.Cs
                 var flags = CallFlags.GcSafePoint | CallFlags.MayThrow;
                 if (method.HasInternalCall || op is Op.CallInternalVoid or Op.CallInternalI or Op.CallInternalF or Op.CallInternalRef or Op.CallInternalValue)
                     flags |= CallFlags.InternalCall;
-                if ((op is Op.CallValue or Op.CallVirtValue or Op.CallIfaceValue or Op.CallInternalValue or Op.CallIndirectValue or Op.DelegateInvokeValue) &&
+                if ((op is Op.CallValue or Op.CallInternalValue or Op.CallIndirectValue) &&
                     MachineAbi.RequiresHiddenReturnBuffer(method))
                     flags |= CallFlags.HiddenReturnBuffer;
-                if (op is Op.CallVirtVoid or Op.CallVirtI or Op.CallVirtF or Op.CallVirtRef or Op.CallVirtValue)
-                    flags |= CallFlags.VirtualDispatch;
-                if (op is Op.CallIfaceVoid or Op.CallIfaceI or Op.CallIfaceF or Op.CallIfaceRef or Op.CallIfaceValue)
-                    flags |= CallFlags.InterfaceDispatch;
                 return flags;
             }
 
@@ -3819,6 +4907,9 @@ namespace Cnidaria.Cs
                     GenTreeKind.NewDelegate or
                     GenTreeKind.DelegateCombine or
                     GenTreeKind.DelegateRemove or
+                    GenTreeKind.StaticField or
+                    GenTreeKind.StaticFieldAddr or
+                    GenTreeKind.StoreStaticField or
                     GenTreeKind.NewArray or
                     GenTreeKind.Box or
                     GenTreeKind.UnboxAny or
@@ -3963,7 +5054,7 @@ namespace Cnidaria.Cs
             private int BlockStartPc(int blockId)
             {
                 if ((uint)blockId >= (uint)_blockStartPc.Length || _blockStartPc[blockId] < 0)
-                    throw new InvalidOperationException("Block B" + blockId.ToString() + " was not emitted.");
+                    throw new InvalidOperationException($"Block B{blockId} was not emitted.");
                 return _blockStartPc[blockId];
             }
 

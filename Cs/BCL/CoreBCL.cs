@@ -4,9 +4,6 @@ namespace System
 {
     public static class Environment
     {
-        internal const int SystemTarget = 32;
-        internal const bool Target64 = SystemTarget == 64;
-        internal const bool Target32 = SystemTarget == 32;
         internal const bool IsDebug = false;
         internal const bool IsRelease = !IsDebug;
         internal const string NewLineConst = "\n";
@@ -4602,10 +4599,11 @@ namespace System
 
         public IntPtr(long value)
         {
-            if (Environment.SystemTarget == 64)
-                _value = (nint)value;
-            else
-                _value = checked((nint)value);
+#if TARGET_64BIT
+            _value = (nint)value;
+#else
+            _value = checked((nint)value);
+#endif                
         }
 
         public unsafe IntPtr(void* value)
@@ -4618,35 +4616,41 @@ namespace System
 
         public static int Size
         {
-            get => Environment.SystemTarget / 8;
+#if TARGET_64BIT
+            get => 8;
+#else
+            get => 4;
+#endif
+
         }
 
         public static nint MaxValue
         {
-            get => unchecked((nint)(Environment.Target64
-                    ? 0x7fffffffffffffffL
-                    : 0x7fffffff));
+#if TARGET_64BIT
+            get => unchecked((nint)0x7fffffffffffffffL);
+#else
+            get => unchecked((nint)0x7fffffff);
+#endif
         }
 
         public static nint MinValue
         {
-            get => unchecked((nint)(Environment.Target64
-                    ? unchecked((long)0x8000000000000000L)
-                    : unchecked((int)0x80000000)));
+#if TARGET_64BIT
+get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
+#else
+            get => unchecked((nint)(unchecked((int)0x80000000)));
+#endif
         }
 
         public override bool Equals([NotNullWhen(true)] object? obj) => (obj is nint other) && Equals(other);
         public override int GetHashCode()
         {
-            if (Environment.Target64) 
-            {
-                long value = _value;
-                return value.GetHashCode();
-            }
-            else
-            {
-                return (int)_value;
-            }
+#if TARGET_64BIT
+            long value = _value;
+            return value.GetHashCode();
+#else
+            return (int)_value;
+#endif
         }
     }
     public readonly struct UIntPtr
@@ -4662,10 +4666,11 @@ namespace System
 
         public UIntPtr(ulong value)
         {
-            if (Environment.SystemTarget == 64)
-                _value = (nuint)value;
-            else
-                _value = checked((nuint)value);
+#if TARGET_64BIT
+            _value = (nuint)value;
+#else
+            _value = checked((nuint)value);
+#endif
         }
 
         public unsafe UIntPtr(void* value)
@@ -4675,21 +4680,22 @@ namespace System
 
         public static int Size
         {
-            get => Environment.SystemTarget / 8;
+#if TARGET_64BIT
+            get => 8;
+#else
+            get => 4;
+#endif
         }
 
         public override bool Equals([NotNullWhen(true)] object? obj) => (obj is nuint other) && Equals(other);
         public override int GetHashCode()
         {
-            if (Environment.Target64)
-            {
-                ulong value = _value;
-                return value.GetHashCode();
-            }
-            else
-            {
-                return (int)_value;
-            }
+#if TARGET_64BIT
+            ulong value = _value;
+            return value.GetHashCode();
+#else
+            return (int)_value;
+#endif
         }
     }
 
@@ -4710,8 +4716,8 @@ namespace System
         {
             if (array == null)
             {
-                //this = default;
-                return; // returns default
+                this = default;
+                return;
             }
             //if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
             //    ThrowHelper.ThrowArrayTypeMismatchException();
@@ -4764,20 +4770,17 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public Span<T> Slice(int start, int length)
         {
-            if (Environment.Target64)
+#if TARGET_64BIT
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
             {
-                if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
-                {
-                    throw new ArgumentOutOfRangeException();
-                }
+                throw new ArgumentOutOfRangeException();
             }
-            else
+#else
+            if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
             {
-                if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
-                {
-                    throw new ArgumentOutOfRangeException();
-                }
+                throw new ArgumentOutOfRangeException();
             }
+#endif
             return new Span<T>(ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)start /* force zero-extension */), length);
         }
     }
@@ -4842,20 +4845,17 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<T> Slice(int start, int length)
         {
-            if (Environment.Target64)
+#if TARGET_64BIT
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
             {
-                if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
-                {
-                    throw new ArgumentOutOfRangeException();
-                }
+                throw new ArgumentOutOfRangeException();
             }
-            else
+#else
+            if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
             {
-                if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
-                {
-                    throw new ArgumentOutOfRangeException();
-                }
+                throw new ArgumentOutOfRangeException();
             }
+#endif
             return new ReadOnlySpan<T>(ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)start), length);
         }
     }
@@ -10265,6 +10265,91 @@ namespace System.Runtime.CompilerServices
         }
         public Type BuilderType { get; }
         public string MethodName { get; }
+    }
+    [AttributeUsage(AttributeTargets.Struct, AllowMultiple = false)]
+    public sealed class InlineArrayAttribute : Attribute
+    {
+        public InlineArrayAttribute(int length)
+        {
+            Length = length;
+        }
+
+        public int Length { get; }
+    }
+    [InlineArray(2)]
+    public struct InlineArray2<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(3)]
+    public struct InlineArray3<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(4)]
+    public struct InlineArray4<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(5)]
+    public struct InlineArray5<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(6)]
+    public struct InlineArray6<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(7)]
+    public struct InlineArray7<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(8)]
+    public struct InlineArray8<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(9)]
+    public struct InlineArray9<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(10)]
+    public struct InlineArray10<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(11)]
+    public struct InlineArray11<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(12)]
+    public struct InlineArray12<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(13)]
+    public struct InlineArray13<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(14)]
+    public struct InlineArray14<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(15)]
+    public struct InlineArray15<T>
+    {
+        private T _element0;
+    }
+    [InlineArray(16)]
+    public struct InlineArray16<T>
+    {
+        private T _element0;
     }
     public sealed class SwitchExpressionException : InvalidOperationException
     {
