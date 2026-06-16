@@ -3425,6 +3425,126 @@ namespace Cnidaria.Cs
             return false;
         }
     }
+    internal static class NameConflictBinder
+    {
+        public static void BindAll(Compilation compilation, DiagnosticBag diagnostics)
+        {
+            var visited = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            VisitNamespace(compilation.SourceGlobalNamespace, diagnostics, visited);
+        }
+        private static void VisitNamespace(NamespaceSymbol ns, DiagnosticBag diagnostics, HashSet<NamedTypeSymbol> visited)
+        {
+            var namespaces = ns.GetNamespaceMembers();
+            for (int i = 0; i < namespaces.Length; i++)
+                VisitNamespace(namespaces[i], diagnostics, visited);
+            var types = ns.GetTypeMembers();
+            for (int i = 0; i < types.Length; i++)
+                VisitType(types[i], diagnostics, visited);
+        }
+        private static void VisitType(NamedTypeSymbol type, DiagnosticBag diagnostics, HashSet<NamedTypeSymbol> visited)
+        {
+            if (!visited.Add(type))
+                return;
+            ValidateDuplicateMethodSignatures(type, diagnostics);
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is NamedTypeSymbol nestedType)
+                    VisitType(nestedType, diagnostics, visited);
+            }
+        }
+        private static void ValidateDuplicateMethodSignatures(NamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            var members = type.GetMembers();
+            var seen = new List<MethodSymbol>();
+
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not MethodSymbol method)
+                    continue;
+
+                if (!IsSourceUserCallableMethod(method, out var methodReference))
+                    continue;
+
+                for (int j = 0; j < seen.Count; j++)
+                {
+                    var previous = seen[j];
+                    if (!HasSameMemberSignature(previous, method))
+                        continue;
+
+                    diagnostics.Add(new Diagnostic(
+                        "CS0111",
+                        DiagnosticSeverity.Error,
+                        $"Type '{type.Name}' already defines a member called '{method.Name}' with the same parameter types",
+                        new Location(methodReference.SyntaxTree, GetDiagnosticSpan(methodReference.Node))));
+                    break;
+                }
+
+                seen.Add(method);
+            }
+        }
+        private static bool IsSourceUserCallableMethod(MethodSymbol method, out SyntaxReference declaration)
+        {
+            declaration = default;
+
+            if (method is not SourceMethodSymbol)
+                return false;
+
+            var declarations = method.DeclaringSyntaxReferences;
+            if (declarations.IsDefaultOrEmpty)
+                return false;
+
+            var first = declarations[0];
+            if (first.Node is MethodDeclarationSyntax methodDeclaration)
+            {
+                if (methodDeclaration.ExplicitInterfaceSpecifier is not null)
+                    return false;
+
+                declaration = first;
+                return true;
+            }
+
+            if (first.Node is ConstructorDeclarationSyntax)
+            {
+                declaration = first;
+                return true;
+            }
+
+            return false;
+        }
+        private static TextSpan GetDiagnosticSpan(SyntaxNode node)
+        {
+            return node switch
+            {
+                MethodDeclarationSyntax md => md.Identifier.Span,
+                ConstructorDeclarationSyntax cd => cd.Identifier.Span,
+                _ => node.Span
+            };
+        }
+        private static bool HasSameMemberSignature(MethodSymbol left, MethodSymbol right)
+        {
+            if (!StringComparer.Ordinal.Equals(left.Name, right.Name))
+                return false;
+
+            if (left.TypeParameters.Length != right.TypeParameters.Length)
+                return false;
+
+            var leftParameters = left.Parameters;
+            var rightParameters = right.Parameters;
+            if (leftParameters.Length != rightParameters.Length)
+                return false;
+
+            for (int i = 0; i < leftParameters.Length; i++)
+            {
+                if (leftParameters[i].RefKind != rightParameters[i].RefKind)
+                    return false;
+
+                if (!LocalScopeBinder.AreSameType(leftParameters[i].Type, rightParameters[i].Type))
+                    return false;
+            }
+            return true;
+        }
+    }
     internal static class BaseTypeBinder
     {
         private sealed class NullRecorder : IBindingRecorder
@@ -7283,17 +7403,529 @@ namespace Cnidaria.Cs
         }
         private void ImportFlowingLocal(LocalSymbol local)
             => _locals[local.Name] = local;
-        private static void AddUniqueLocal(ImmutableArray<LocalSymbol>.Builder builder, LocalSymbol local)
+        internal void ReportControlFlowDiagnostics(
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            BoundStatement? body = null,
+            SyntaxNode? diagnosticNode = null)
         {
-            for (int i = 0; i < builder.Count; i++)
-            {
-                if (ReferenceEquals(builder[i], local))
-                    return;
-            }
-            builder.Add(local);
+            _flow.ReportUndefinedLabels(context, diagnostics);
+
+            if (body is not null)
+                ReportMissingReturnIfNeeded(body, diagnosticNode ?? body.Syntax, context, diagnostics);
         }
-        internal void ReportControlFlowDiagnostics(BindingContext context, DiagnosticBag diagnostics)
-            => _flow.ReportUndefinedLabels(context, diagnostics);
+
+        private sealed class Completion
+        {
+            public bool CanCompleteNormally { get; set; }
+            public HashSet<LabelSymbol> GotoTargets { get; } = new();
+            public HashSet<LabelSymbol> BreakTargets { get; } = new();
+            public HashSet<LabelSymbol> ContinueTargets { get; } = new();
+
+            public static Completion None() => new Completion();
+
+            public static Completion Normal()
+            {
+                var result = new Completion();
+                result.CanCompleteNormally = true;
+                return result;
+            }
+
+            public void Add(Completion other)
+            {
+                CanCompleteNormally |= other.CanCompleteNormally;
+                AddRange(GotoTargets, other.GotoTargets);
+                AddRange(BreakTargets, other.BreakTargets);
+                AddRange(ContinueTargets, other.ContinueTargets);
+            }
+
+            private static void AddRange(HashSet<LabelSymbol> target, HashSet<LabelSymbol> source)
+            {
+                foreach (var label in source)
+                    target.Add(label);
+            }
+        }
+
+        private static void ReportMissingReturnIfNeeded(
+            BoundStatement body,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (context.ContainingSymbol is not MethodSymbol method)
+                return;
+
+            if (!RequiresValueReturn(method))
+                return;
+
+            if (ContainsYieldStatement(body) && TryGetIteratorElementType(context.Compilation, method, out _))
+                return;
+
+            var completion = AnalyzeCompletion(body);
+            if (!completion.CanCompleteNormally)
+                return;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_FLOW016",
+                DiagnosticSeverity.Error,
+                string.Equals(method.Name, "<lambda>", StringComparison.Ordinal)
+                    ? "Not all code paths return a value in lambda expression."
+                    : $"'{method.Name}': not all code paths return a value.",
+                new Location(context.SemanticModel.SyntaxTree, GetMissingReturnDiagnosticSpan(diagnosticNode))));
+        }
+
+        private static bool RequiresValueReturn(MethodSymbol method)
+        {
+            if (method.IsConstructor)
+                return false;
+
+            var returnType = method.ReturnType;
+            if (returnType.SpecialType == SpecialType.System_Void)
+                return false;
+
+            return returnType.Kind != SymbolKind.Error;
+        }
+
+
+        private static TextSpan GetMissingReturnDiagnosticSpan(SyntaxNode node)
+        {
+            switch (node)
+            {
+                case MethodDeclarationSyntax method:
+                    return method.Identifier.Span;
+                case LocalFunctionStatementSyntax localFunction:
+                    return localFunction.Identifier.Span;
+                case OperatorDeclarationSyntax op:
+                    return op.OperatorToken.Span.Length != 0 ? op.OperatorToken.Span : op.OperatorKeyword.Span;
+                case ConversionOperatorDeclarationSyntax conversion:
+                    return conversion.Type.Span;
+                case AccessorDeclarationSyntax accessor:
+                    return accessor.Keyword.Span;
+                case LambdaExpressionSyntax lambda:
+                    return lambda.ArrowToken.Span.Length != 0 ? lambda.ArrowToken.Span : lambda.Span;
+                default:
+                    return node.Span;
+            }
+        }
+
+        private static Completion AnalyzeCompletion(BoundStatement statement)
+        {
+            switch (statement)
+            {
+                case BoundBadStatement:
+                    return Completion.Normal();
+
+                case BoundEmptyStatement:
+                case BoundExpressionStatement:
+                case BoundLocalDeclarationStatement:
+                case BoundLabelStatement:
+                case BoundLocalFunctionStatement:
+                    return Completion.Normal();
+
+                case BoundReturnStatement:
+                case BoundThrowStatement:
+                    return Completion.None();
+
+                case BoundYieldStatement yield:
+                    return yield.YieldKind == BoundYieldStatementKind.Break
+                        ? Completion.None()
+                        : Completion.Normal();
+
+                case BoundBreakStatement br:
+                    {
+                        var result = Completion.None();
+                        result.BreakTargets.Add(br.TargetLabel);
+                        return result;
+                    }
+
+                case BoundContinueStatement cont:
+                    {
+                        var result = Completion.None();
+                        result.ContinueTargets.Add(cont.TargetLabel);
+                        return result;
+                    }
+
+                case BoundGotoStatement go:
+                    {
+                        var result = Completion.None();
+                        result.GotoTargets.Add(go.TargetLabel);
+                        return result;
+                    }
+
+                case BoundConditionalGotoStatement conditionalGoto:
+                    return AnalyzeConditionalGotoCompletion(conditionalGoto);
+
+                case BoundBlockStatement block:
+                    return AnalyzeStatementSequence(FlattenStatementList(block.Statements));
+
+                case BoundStatementList list:
+                    return AnalyzeStatementSequence(FlattenStatementList(list.Statements));
+
+                case BoundIfStatement ifStatement:
+                    return AnalyzeIfCompletion(ifStatement);
+
+                case BoundWhileStatement whileStatement:
+                    return AnalyzeWhileCompletion(whileStatement);
+
+                case BoundDoWhileStatement doWhileStatement:
+                    return AnalyzeDoWhileCompletion(doWhileStatement);
+
+                case BoundForStatement forStatement:
+                    return AnalyzeForCompletion(forStatement);
+
+                case BoundForEachStatement forEachStatement:
+                    return AnalyzeForEachCompletion(forEachStatement);
+
+                case BoundUsingStatement usingStatement:
+                    return AnalyzeUsingCompletion(usingStatement);
+
+                case BoundFixedStatement fixedStatement:
+                    return AnalyzeCompletion(fixedStatement.Body);
+
+                case BoundTryStatement tryStatement:
+                    return AnalyzeTryCompletion(tryStatement);
+
+                case BoundCheckedStatement checkedStatement:
+                    return AnalyzeCompletion(checkedStatement.Statement);
+
+                case BoundUncheckedStatement uncheckedStatement:
+                    return AnalyzeCompletion(uncheckedStatement.Statement);
+
+                default:
+                    return Completion.Normal();
+            }
+        }
+
+        private static ImmutableArray<BoundStatement> FlattenStatementList(ImmutableArray<BoundStatement> statements)
+        {
+            var builder = ImmutableArray.CreateBuilder<BoundStatement>(statements.Length);
+            FlattenStatementList(statements, builder);
+            return builder.ToImmutable();
+        }
+
+        private static void FlattenStatementList(
+            ImmutableArray<BoundStatement> statements,
+            ImmutableArray<BoundStatement>.Builder builder)
+        {
+            for (int i = 0; i < statements.Length; i++)
+            {
+                if (statements[i] is BoundStatementList list)
+                    FlattenStatementList(list.Statements, builder);
+                else
+                    builder.Add(statements[i]);
+            }
+        }
+
+        private static Completion AnalyzeStatementSequence(ImmutableArray<BoundStatement> statements)
+        {
+            var result = Completion.None();
+
+            var labelToIndex = new Dictionary<LabelSymbol, int>();
+            for (int i = 0; i < statements.Length; i++)
+            {
+                if (statements[i] is BoundLabelStatement labelStatement && !labelToIndex.ContainsKey(labelStatement.Label))
+                    labelToIndex.Add(labelStatement.Label, i);
+            }
+
+            var reachable = new bool[statements.Length + 1];
+            var work = new Queue<int>();
+            Enqueue(0);
+
+            while (work.Count != 0)
+            {
+                var index = work.Dequeue();
+                if (index == statements.Length)
+                {
+                    result.CanCompleteNormally = true;
+                    continue;
+                }
+
+                var statement = statements[index];
+
+                if (statement is BoundLabelStatement)
+                {
+                    Enqueue(index + 1);
+                    continue;
+                }
+
+                if (statement is BoundGotoStatement gotoStatement)
+                {
+                    RouteGoto(gotoStatement.TargetLabel);
+                    continue;
+                }
+
+                if (statement is BoundConditionalGotoStatement conditionalGoto)
+                {
+                    RouteConditionalGoto(conditionalGoto, index + 1);
+                    continue;
+                }
+
+                var completion = AnalyzeCompletion(statement);
+                if (completion.CanCompleteNormally)
+                    Enqueue(index + 1);
+
+                RouteGotos(completion.GotoTargets);
+                AddRange(result.BreakTargets, completion.BreakTargets);
+                AddRange(result.ContinueTargets, completion.ContinueTargets);
+            }
+
+            return result;
+
+            void Enqueue(int index)
+            {
+                if ((uint)index > (uint)statements.Length)
+                    return;
+
+                if (reachable[index])
+                    return;
+
+                reachable[index] = true;
+                work.Enqueue(index);
+            }
+
+            void RouteGoto(LabelSymbol label)
+            {
+                if (labelToIndex.TryGetValue(label, out var targetIndex))
+                    Enqueue(targetIndex);
+                else
+                    result.GotoTargets.Add(label);
+            }
+
+            void RouteGotos(HashSet<LabelSymbol> labels)
+            {
+                foreach (var label in labels)
+                    RouteGoto(label);
+            }
+
+            void RouteConditionalGoto(BoundConditionalGotoStatement conditionalGoto, int fallThroughIndex)
+            {
+                if (TryGetBoolConstant(conditionalGoto.Condition, out var constant))
+                {
+                    if (constant == conditionalGoto.JumpIfTrue)
+                        RouteGoto(conditionalGoto.TargetLabel);
+                    else
+                        Enqueue(fallThroughIndex);
+
+                    return;
+                }
+
+                RouteGoto(conditionalGoto.TargetLabel);
+                Enqueue(fallThroughIndex);
+            }
+
+            static void AddRange(HashSet<LabelSymbol> target, HashSet<LabelSymbol> source)
+            {
+                foreach (var label in source)
+                    target.Add(label);
+            }
+        }
+
+        private static Completion AnalyzeConditionalGotoCompletion(BoundConditionalGotoStatement statement)
+        {
+            var result = Completion.None();
+            if (TryGetBoolConstant(statement.Condition, out var constant))
+            {
+                if (constant == statement.JumpIfTrue)
+                    result.GotoTargets.Add(statement.TargetLabel);
+                else
+                    result.CanCompleteNormally = true;
+
+                return result;
+            }
+
+            result.CanCompleteNormally = true;
+            result.GotoTargets.Add(statement.TargetLabel);
+            return result;
+        }
+
+        private static Completion AnalyzeIfCompletion(BoundIfStatement statement)
+        {
+            if (TryGetBoolConstant(statement.Condition, out var constant))
+                return constant
+                    ? AnalyzeCompletion(statement.Then)
+                    : statement.ElseOpt is null ? Completion.Normal() : AnalyzeCompletion(statement.ElseOpt);
+
+            var result = AnalyzeCompletion(statement.Then);
+            if (statement.ElseOpt is null)
+                result.CanCompleteNormally = true;
+            else
+                result.Add(AnalyzeCompletion(statement.ElseOpt));
+
+            return result;
+        }
+
+        private static Completion AnalyzeWhileCompletion(BoundWhileStatement statement)
+        {
+            if (TryGetBoolConstant(statement.Condition, out var constant) && !constant)
+                return Completion.Normal();
+
+            var body = AnalyzeCompletion(statement.Body);
+            var breaksLoop = body.BreakTargets.Remove(statement.BreakLabel);
+            body.ContinueTargets.Remove(statement.ContinueLabel);
+
+            var result = Completion.None();
+            result.CanCompleteNormally = breaksLoop || !IsConstantTrue(statement.Condition);
+            result.GotoTargets.UnionWith(body.GotoTargets);
+            result.BreakTargets.UnionWith(body.BreakTargets);
+            result.ContinueTargets.UnionWith(body.ContinueTargets);
+            return result;
+        }
+
+        private static Completion AnalyzeDoWhileCompletion(BoundDoWhileStatement statement)
+        {
+            var body = AnalyzeCompletion(statement.Body);
+            var breaksLoop = body.BreakTargets.Remove(statement.BreakLabel);
+            body.ContinueTargets.Remove(statement.ContinueLabel);
+
+            var result = Completion.None();
+            result.CanCompleteNormally = breaksLoop || (body.CanCompleteNormally && !IsConstantTrue(statement.Condition));
+            result.GotoTargets.UnionWith(body.GotoTargets);
+            result.BreakTargets.UnionWith(body.BreakTargets);
+            result.ContinueTargets.UnionWith(body.ContinueTargets);
+            return result;
+        }
+
+        private static Completion AnalyzeForCompletion(BoundForStatement statement)
+        {
+            if (statement.ConditionOpt is not null && TryGetBoolConstant(statement.ConditionOpt, out var constant) && !constant)
+                return Completion.Normal();
+
+            var body = AnalyzeCompletion(statement.Body);
+            var breaksLoop = body.BreakTargets.Remove(statement.BreakLabel);
+            body.ContinueTargets.Remove(statement.ContinueLabel);
+
+            var result = Completion.None();
+            result.CanCompleteNormally = breaksLoop || !IsConstantTrueOrMissing(statement.ConditionOpt);
+            result.GotoTargets.UnionWith(body.GotoTargets);
+            result.BreakTargets.UnionWith(body.BreakTargets);
+            result.ContinueTargets.UnionWith(body.ContinueTargets);
+            return result;
+        }
+
+        private static Completion AnalyzeForEachCompletion(BoundForEachStatement statement)
+        {
+            var body = AnalyzeCompletion(statement.Body);
+            body.BreakTargets.Remove(statement.BreakLabel);
+            body.ContinueTargets.Remove(statement.ContinueLabel);
+
+            var result = Completion.Normal();
+            result.GotoTargets.UnionWith(body.GotoTargets);
+            result.BreakTargets.UnionWith(body.BreakTargets);
+            result.ContinueTargets.UnionWith(body.ContinueTargets);
+            return result;
+        }
+
+        private static Completion AnalyzeUsingCompletion(BoundUsingStatement statement)
+        {
+            var body = AnalyzeCompletion(statement.Body);
+            var result = Completion.None();
+            result.CanCompleteNormally = body.CanCompleteNormally;
+            result.GotoTargets.UnionWith(body.GotoTargets);
+            result.BreakTargets.UnionWith(body.BreakTargets);
+            result.ContinueTargets.UnionWith(body.ContinueTargets);
+            return result;
+        }
+
+        private static Completion AnalyzeTryCompletion(BoundTryStatement statement)
+        {
+            var protectedCompletion = AnalyzeCompletion(statement.TryBlock);
+            for (int i = 0; i < statement.CatchBlocks.Length; i++)
+            {
+                var catchBlock = statement.CatchBlocks[i];
+                if (catchBlock.FilterOpt is not null &&
+                    TryGetBoolConstant(catchBlock.FilterOpt, out var filterValue) &&
+                    !filterValue)
+                {
+                    continue;
+                }
+
+                protectedCompletion.Add(AnalyzeCompletion(catchBlock.Body));
+            }
+
+            if (statement.FinallyBlockOpt is null)
+                return protectedCompletion;
+
+            var finallyCompletion = AnalyzeCompletion(statement.FinallyBlockOpt);
+            if (!finallyCompletion.CanCompleteNormally)
+                return finallyCompletion;
+
+            protectedCompletion.GotoTargets.UnionWith(finallyCompletion.GotoTargets);
+            protectedCompletion.BreakTargets.UnionWith(finallyCompletion.BreakTargets);
+            protectedCompletion.ContinueTargets.UnionWith(finallyCompletion.ContinueTargets);
+            return protectedCompletion;
+        }
+
+        private static bool IsConstantTrue(BoundExpression expression)
+            => TryGetBoolConstant(expression, out var value) && value;
+
+        private static bool IsConstantTrueOrMissing(BoundExpression? expression)
+            => expression is null || IsConstantTrue(expression);
+
+        private static bool ContainsYieldStatement(BoundStatement statement)
+        {
+            switch (statement)
+            {
+                case BoundYieldStatement:
+                    return true;
+
+                case BoundBlockStatement block:
+                    return ContainsYieldStatement(block.Statements);
+
+                case BoundStatementList list:
+                    return ContainsYieldStatement(list.Statements);
+
+                case BoundIfStatement ifStatement:
+                    return ContainsYieldStatement(ifStatement.Then) ||
+                           (ifStatement.ElseOpt is not null && ContainsYieldStatement(ifStatement.ElseOpt));
+
+                case BoundWhileStatement whileStatement:
+                    return ContainsYieldStatement(whileStatement.Body);
+
+                case BoundDoWhileStatement doWhileStatement:
+                    return ContainsYieldStatement(doWhileStatement.Body);
+
+                case BoundForStatement forStatement:
+                    return ContainsYieldStatement(forStatement.Body);
+
+                case BoundForEachStatement forEachStatement:
+                    return ContainsYieldStatement(forEachStatement.Body);
+
+                case BoundUsingStatement usingStatement:
+                    return ContainsYieldStatement(usingStatement.Body);
+
+                case BoundFixedStatement fixedStatement:
+                    return ContainsYieldStatement(fixedStatement.Body);
+
+                case BoundTryStatement tryStatement:
+                    if (ContainsYieldStatement(tryStatement.TryBlock))
+                        return true;
+
+                    for (int i = 0; i < tryStatement.CatchBlocks.Length; i++)
+                        if (ContainsYieldStatement(tryStatement.CatchBlocks[i].Body))
+                            return true;
+
+                    return tryStatement.FinallyBlockOpt is not null && ContainsYieldStatement(tryStatement.FinallyBlockOpt);
+
+                case BoundCheckedStatement checkedStatement:
+                    return ContainsYieldStatement(checkedStatement.Statement);
+
+                case BoundUncheckedStatement uncheckedStatement:
+                    return ContainsYieldStatement(uncheckedStatement.Statement);
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool ContainsYieldStatement(ImmutableArray<BoundStatement> statements)
+        {
+            for (int i = 0; i < statements.Length; i++)
+                if (ContainsYieldStatement(statements[i]))
+                    return true;
+
+            return false;
+        }
+
         private static IdentifierNameSyntax MakeIdentifierName(string name, TextSpan span)
             => new IdentifierNameSyntax(
                 new SyntaxToken(SyntaxKind.IdentifierToken, span, valueText: name, value: name, leadingTrivia: s_noTrivia, trailingTrivia: s_noTrivia));
@@ -8582,7 +9214,7 @@ namespace Cnidaria.Cs
                 body = new BoundBadStatement(bodySyntax as StatementSyntax ?? new EmptyStatementSyntax(default));
             }
 
-            bodyBinder.ReportControlFlowDiagnostics(bodyContext, diagnostics);
+            bodyBinder.ReportControlFlowDiagnostics(bodyContext, diagnostics, body, syntax);
 
             return new BoundLambdaExpression(
                 syntax,
@@ -8907,7 +9539,7 @@ namespace Cnidaria.Cs
         {
             var operandType = BindType(node.Type, context, diagnostics);
 
-            if(!DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "Type", arity: 0, out var systemType))
+            if (!DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "Type", arity: 0, out var systemType))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_TYPEOF000",
@@ -8919,8 +9551,8 @@ namespace Cnidaria.Cs
                 bad.SetType(new ErrorTypeSymbol("System.Type", containing: null, ImmutableArray<Location>.Empty));
                 return bad;
             }
-            
-            if(operandType is ByRefTypeSymbol)
+
+            if (operandType is ByRefTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_TYPEOF001",
@@ -9018,6 +9650,20 @@ namespace Cnidaria.Cs
 
                     try
                     {
+                        if (InlineArrayFacts.TryGetInfo(nt, out var inlineArray))
+                        {
+                            if (!TryGetStorageSizeAlign(inlineArray.ElementType, visiting, out int es, out int ea))
+                                return false;
+
+                            int inlineSize = checked(es * inlineArray.Length);
+                            size = AlignUp(inlineSize, ea);
+                            if (size == 0)
+                                size = 1;
+
+                            align = ea;
+                            return true;
+                        }
+
                         int offset = 0;
                         int maxAlign = 1;
 
@@ -10115,9 +10761,9 @@ namespace Cnidaria.Cs
             return new BoundTupleExpression(te, tupleType, elements.ToImmutable(), elementNames, hasErrors);
             static string? TryInferTupleElementName(ExpressionSyntax expr) => expr switch
             {
-                 IdentifierNameSyntax id => id.Identifier.ValueText,
-                 MemberAccessExpressionSyntax ma => GetSimpleName(ma.Name),
-                 _ => null
+                IdentifierNameSyntax id => id.Identifier.ValueText,
+                MemberAccessExpressionSyntax ma => GetSimpleName(ma.Name),
+                _ => null
             };
 
         }
@@ -11671,13 +12317,30 @@ namespace Cnidaria.Cs
                     diagnostics: diagnostics,
                     requireImplicit: true);
 
+                Optional<object> constantIndexOpt = Optional<object>.None;
+                if (!value.HasErrors && TryGetInt32Constant(value, out int fromEndOffset))
+                {
+                    long actualIndex = (long)info.Length - fromEndOffset;
+                    if (!ValidateInlineArrayConstantIndex(
+                        argSyntax,
+                        actualIndex,
+                        info.Length,
+                        context,
+                        diagnostics))
+                    {
+                        return new BoundBadExpression(syntax);
+                    }
+
+                    constantIndexOpt = new Optional<object>((int)actualIndex);
+                }
+
                 index = new BoundBinaryExpression(
                     syntax,
                     BoundBinaryOperatorKind.Subtract,
                     intType,
                     new BoundLiteralExpression(syntax, intType, info.Length),
                     value,
-                    Optional<object>.None,
+                    constantIndexOpt,
                     isChecked: false);
             }
             else
@@ -11691,6 +12354,17 @@ namespace Cnidaria.Cs
                     context: context,
                     diagnostics: diagnostics,
                     requireImplicit: true);
+
+                if (!index.HasErrors && TryGetInt32Constant(index, out int constantIndex) &&
+                    !ValidateInlineArrayConstantIndex(
+                        argSyntax,
+                        constantIndex,
+                        info.Length,
+                        context,
+                        diagnostics))
+                {
+                    return new BoundBadExpression(syntax);
+                }
             }
 
             if (index.HasErrors)
@@ -11726,6 +12400,52 @@ namespace Cnidaria.Cs
                 index,
                 info.Length,
                 isLValue: receiver.IsLValue);
+        }
+
+        private static bool ValidateInlineArrayConstantIndex(
+            SyntaxNode diagnosticNode,
+            long index,
+            int length,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (length > 0 && (ulong)index < (uint)length)
+                return true;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_INLINEARRAY014",
+                DiagnosticSeverity.Error,
+                "Index is outside the bounds of the inline array.",
+                new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+            return false;
+        }
+
+        private static bool TryGetInt32Constant(BoundExpression expression, out int value)
+        {
+            value = 0;
+            if (!expression.ConstantValueOpt.HasValue || expression.ConstantValueOpt.Value is null)
+                return false;
+
+            switch (expression.ConstantValueOpt.Value)
+            {
+                case int i:
+                    value = i;
+                    return true;
+                case sbyte i:
+                    value = i;
+                    return true;
+                case byte i:
+                    value = i;
+                    return true;
+                case short i:
+                    value = i;
+                    return true;
+                case ushort i:
+                    value = i;
+                    return true;
+            }
+
+            return false;
         }
 
         private BoundExpression BindElementOnBoundReceiver(
@@ -20213,6 +20933,8 @@ namespace Cnidaria.Cs
                 body = new BoundBadStatement(lf);
             }
 
+            bodyBinder.ReportControlFlowDiagnostics(bodyCtx, diagnostics, body, lf);
+
             return new BoundLocalFunctionStatement(lf, sym, body);
         }
         private BoundStatement BindLocalDeclaration(LocalDeclarationStatementSyntax ld, BindingContext context, DiagnosticBag diagnostics)
@@ -22191,9 +22913,35 @@ namespace Cnidaria.Cs
                 ?? context.Compilation.GetSpecialType(SpecialType.System_Void);
 
             if (rs.Expression is null)
-                return new BoundReturnStatement(rs, null);
+            {
+                var statement = new BoundReturnStatement(rs, null);
+                if (RequiresValueReturn(containingMethod, returnType))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_RET001",
+                        DiagnosticSeverity.Error,
+                        $"An object of a type convertible to '{returnType.Name}' is required.",
+                        new Location(context.SemanticModel.SyntaxTree, rs.Span)));
+                    statement.SetHasErrors();
+                }
+
+                return statement;
+            }
 
             var expr = BindExpression(rs.Expression, context, diagnostics);
+            if (returnType.SpecialType == SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_RET002",
+                    DiagnosticSeverity.Error,
+                    "Since this function returns void, a return keyword must not be followed by an object expression.",
+                    new Location(context.SemanticModel.SyntaxTree, rs.Expression.Span)));
+
+                var statement = new BoundReturnStatement(rs, expr);
+                statement.SetHasErrors();
+                return statement;
+            }
+
             if (returnType is ByRefTypeSymbol byRefReturnType)
             {
                 expr = BindRefReturningExpression(
@@ -22216,6 +22964,11 @@ namespace Cnidaria.Cs
                 requireImplicit: true);
             return new BoundReturnStatement(rs, expr);
         }
+
+        private static bool RequiresValueReturn(MethodSymbol? method, TypeSymbol returnType)
+            => method is not null && !method.IsConstructor &&
+               returnType.SpecialType != SpecialType.System_Void &&
+               returnType.Kind != SymbolKind.Error;
         private BoundStatement BindYield(YieldStatementSyntax ys, BindingContext context, DiagnosticBag diagnostics)
         {
             bool isYieldReturn = ys.Kind == SyntaxKind.YieldReturnStatement;

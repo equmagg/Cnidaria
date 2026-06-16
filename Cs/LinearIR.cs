@@ -433,6 +433,10 @@ namespace Cnidaria.Cs
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Argument, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
 
+                case GenTreeKind.TempAddr:
+                    return new LinearMemoryAccess(LinearMemoryAccessKind.Temporary, LinearMemoryAccessFlags.Address
+                        | LinearMemoryAccessFlags.ByRefAddress, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+
                 case GenTreeKind.Field:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Read
                         | LinearMemoryAccessFlags.NullCheck | TypeFlags(source.Type, source.StackKind),
@@ -595,6 +599,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Local => false,
                 GenTreeKind.Arg => false,
                 GenTreeKind.Temp => false,
+                GenTreeKind.TempAddr => false,
                 GenTreeKind.StaticField => false,
                 GenTreeKind.StaticFieldAddr => false,
                 GenTreeKind.Branch => false,
@@ -918,6 +923,10 @@ namespace Cnidaria.Cs
 
         public bool HasFlag(LinearRefPositionFlags flag) => (Flags & flag) != 0;
         public bool IsAbiSegment => AbiSegmentIndex >= 0;
+
+        public ulong KillRegisterMask => Kind == LinearRefPositionKind.Kill
+            ? RegisterMask
+            : 0;
 
         public override string ToString()
         {
@@ -1350,6 +1359,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.Local:
                     case GenTreeKind.Arg:
                     case GenTreeKind.Temp:
+                    case GenTreeKind.TempAddr:
                         return false;
                 }
 
@@ -1752,16 +1762,25 @@ namespace Cnidaria.Cs
 
             private void LowerDeadSsaDefinitionForSideEffects(SsaTree tree)
             {
-                var uses = LowerOperands(tree);
-
                 if (!MustMaterializeDeadSsaDefinitionSource(tree.Source))
+                {
+                    LowerOperandsForSideEffectsOnly(tree);
                     return;
+                }
+
+                var uses = LowerOperands(tree);
 
                 GenTree? result = RequiresCodegenResultForDeadDefinition(tree.Source)
                     ? NewTemp(tree.Source)
                     : null;
 
                 EmitTree(tree.Source, uses, result);
+            }
+
+            private void LowerOperandsForSideEffectsOnly(SsaTree tree)
+            {
+                for (int i = 0; i < tree.Operands.Length; i++)
+                    LowerForSideEffects(tree.Operands[i]);
             }
 
             private static bool MustMaterializeDeadSsaDefinitionSource(GenTree tree)
@@ -1829,6 +1848,9 @@ namespace Cnidaria.Cs
 
             private void LowerControlTransfer(GenTree tree)
             {
+                if (TryLowerContainedLocalLikeMultiRegisterReturn(tree))
+                    return;
+
                 var uses = LowerOperands(tree);
 
                 if (IsBackwardBranch(tree))
@@ -1841,8 +1863,40 @@ namespace Cnidaria.Cs
                 EmitTree(tree, uses, result);
             }
 
+            private bool TryLowerContainedLocalLikeMultiRegisterReturn(GenTree tree)
+            {
+                if (tree.Kind != GenTreeKind.Return || tree.Operands.Length != 1)
+                    return false;
+
+                var value = tree.Operands[0];
+                if (!IsDirectReturnableLocalLike(value))
+                    return false;
+
+                RuntimeType? returnType = value.LocalDescriptor?.Type ?? value.RuntimeType ?? value.Type;
+                if (returnType is null || !returnType.IsValueType)
+                    return false;
+
+                if (MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod))
+                    return false;
+
+                var returnKind = value.LocalDescriptor?.StackKind ?? MachineAbi.StackKindForType(returnType);
+                var abi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true);
+                if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
+                    return false;
+
+                value.IsContainedInLinear = true;
+                EmitTree(tree, ImmutableArray.Create(LirOperandFlags.Contained), result: null);
+                return true;
+            }
+
+            private static bool IsDirectReturnableLocalLike(GenTree value)
+                => value.Kind is GenTreeKind.Local or GenTreeKind.Temp;
+
             private void LowerControlTransfer(SsaTree tree)
             {
+                if (TryLowerContainedLocalLikeMultiRegisterReturn(tree.Source))
+                    return;
+
                 var uses = LowerOperands(tree);
 
                 if (IsBackwardBranch(tree.Source))
@@ -1926,7 +1980,7 @@ namespace Cnidaria.Cs
                     }
 
                     if ((uint)ssaIndex >= (uint)tree.Operands.Length)
-                        throw new InvalidOperationException("SSA local-field operand mapping is malformed for node " + tree.Source.Id.ToString() + ".");
+                        throw new InvalidOperationException($"SSA local-field operand mapping is malformed for node {tree.Source.Id}.");
 
                     var operandTree = tree.Operands[ssaIndex++];
                     sources.Add(operandTree.Source);
@@ -1945,7 +1999,7 @@ namespace Cnidaria.Cs
                 }
 
                 if (sources.Count - 1 > tree.Operands.Length)
-                    throw new InvalidOperationException("SSA local-field operand mapping has too many source operands for node " + tree.Source.Id.ToString() + ".");
+                    throw new InvalidOperationException($"SSA local-field operand mapping has too many source operands for node {tree.Source.Id}.");
 
                 tree.Source.SetOperands(sources.ToImmutable());
                 return flags.ToImmutable();
@@ -2006,7 +2060,8 @@ namespace Cnidaria.Cs
 
             private static bool TryCreateContainedOperand(GenTree parent, int operandIndex, GenTree operand, out LirOperandFlags result)
             {
-                if (CanContainBinaryImmediate(parent, operandIndex, operand))
+                if (CanContainBinaryImmediate(parent, operandIndex, operand) ||
+                    CanContainDefaultStoreValue(parent, operandIndex, operand))
                 {
                     operand.IsContainedInLinear = true;
                     result = LirOperandFlags.Contained;
@@ -2015,6 +2070,19 @@ namespace Cnidaria.Cs
 
                 result = LirOperandFlags.None;
                 return false;
+            }
+
+            private static bool CanContainDefaultStoreValue(GenTree parent, int operandIndex, GenTree operand)
+            {
+                if (operand.Kind != GenTreeKind.DefaultValue || operand.Operands.Length != 0)
+                    return false;
+
+                return parent.Kind switch
+                {
+                    GenTreeKind.StoreField => operandIndex == 1,
+                    GenTreeKind.StoreStaticField => operandIndex == 0,
+                    _ => false,
+                };
             }
 
             private static bool CanContainBinaryImmediate(GenTree parent, int operandIndex, GenTree operand)
@@ -2161,7 +2229,6 @@ namespace Cnidaria.Cs
 
                 var lowering = new GenTreeLinearLoweringInfo(
                     GenTreeLinearFlags.IsStandaloneLoweredNode |
-                    GenTreeLinearFlags.CallerSavedKill |
                     GenTreeLinearFlags.GcSafePoint,
                     0,
                     0);
@@ -2583,13 +2650,21 @@ namespace Cnidaria.Cs
                     if (node.RegisterResult is null || node.RegisterUses.Length != 1)
                         throw new InvalidOperationException("linear IR copy node must have one source and one destination value.");
 
+                    int copyUsePosition = usePosition;
+                    int copyDefPosition = defPosition;
+                    if (node.IsPhiCopy)
+                    {
+                        copyUsePosition = ComputePhiCopySourcePosition(layout, node);
+                        copyDefPosition = ComputePhiCopyDestinationPosition(layout, node);
+                    }
+
                     AddValueCopyRefPositions(
                         result,
                         method,
                         intervals,
                         node.LinearId,
-                        usePosition,
-                        defPosition,
+                        copyUsePosition,
+                        copyDefPosition,
                         operandIndex: 0,
                         sourceValue: node.RegisterUses[0],
                         destinationValue: node.RegisterResult);
@@ -2608,11 +2683,10 @@ namespace Cnidaria.Cs
                 }
 
                 if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                {
-                    AddRegisterKills(result, node, usePosition, RegisterClass.General, MachineRegisters.CallerSavedGprs);
-                    AddRegisterKills(result, node, usePosition, RegisterClass.Float, MachineRegisters.CallerSavedFprs);
-                }
+                    AddRegisterKills(result, node, usePosition, MachineRegisters.CallerSavedRegisters);
             }
+
+            AddInitialArgumentFixedRefPositions(result, method, layout);
 
             result.Sort(static (a, b) =>
             {
@@ -2643,6 +2717,124 @@ namespace Cnidaria.Cs
                 LinearRefPositionKind.Def => 3,
                 _ => 4,
             };
+
+        private static void AddInitialArgumentFixedRefPositions(
+            ImmutableArray<LinearRefPosition>.Builder result,
+            GenTreeMethod method,
+            PositionLayout layout)
+        {
+            if (method.Values.IsDefaultOrEmpty || method.ArgTypes.IsDefaultOrEmpty)
+                return;
+
+            for (int i = 0; i < method.Values.Length; i++)
+            {
+                var info = method.Values[i];
+                if (!IsInitialSsaArgumentValue(info))
+                    continue;
+
+                if ((uint)info.Value.SsaSlot.Index >= (uint)method.ArgTypes.Length)
+                    continue;
+
+                AddInitialArgumentFixedRefPositions(result, method, layout, info, info.Value.SsaSlot.Index);
+            }
+        }
+
+        private static bool IsInitialSsaArgumentValue(GenTreeValueInfo info)
+            => info.Value.IsSsaValue &&
+               info.Value.SsaSlot.Kind == SsaSlotKind.Arg &&
+               info.DefinitionBlockId < 0 &&
+               info.DefinitionNodeId < 0;
+
+        private static void AddInitialArgumentFixedRefPositions(
+            ImmutableArray<LinearRefPosition>.Builder result,
+            GenTreeMethod method,
+            PositionLayout layout,
+            GenTreeValueInfo info,
+            int argumentIndex)
+        {
+            int general = 0;
+            int floating = 0;
+            int hiddenReturnBufferInsertionIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
+                method.RuntimeMethod,
+                method.ArgTypes.Length);
+            int position = ComputeInitialDefinitionPosition(layout, info);
+
+            for (int i = 0; i <= argumentIndex; i++)
+            {
+                if (hiddenReturnBufferInsertionIndex == i)
+                    _ = GetMaybeArgumentRegister(RegisterClass.General, ref general, ref floating);
+
+                RuntimeType currentType = method.ArgTypes[i];
+                GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : StackKindForAbi(currentType);
+                var abi = i == argumentIndex
+                    ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false)
+                    : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
+
+                if (abi.PassingKind == AbiValuePassingKind.Void)
+                    continue;
+
+                if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                {
+                    var register = GetMaybeArgumentRegister(abi.RegisterClass, ref general, ref floating);
+                    if (i == argumentIndex && register != MachineRegister.Invalid)
+                    {
+                        result.Add(new LinearRefPosition(
+                            -1,
+                            position,
+                            -1,
+                            LinearRefPositionKind.Def,
+                            info.RepresentativeNode,
+                            abi.RegisterClass,
+                            register,
+                            GetValueRefFlags(info) | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister));
+                    }
+                    continue;
+                }
+
+                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                {
+                    var segments = MachineAbi.GetRegisterSegments(abi);
+                    for (int s = 0; s < segments.Length; s++)
+                    {
+                        var segment = segments[s];
+                        var register = GetMaybeArgumentRegister(segment.RegisterClass, ref general, ref floating);
+                        if (i == argumentIndex && register != MachineRegister.Invalid)
+                        {
+                            result.Add(new LinearRefPosition(
+                                -1,
+                                position,
+                                -1,
+                                s,
+                                segment.Offset,
+                                segment.Size,
+                                LinearRefPositionKind.Def,
+                                info.RepresentativeNode,
+                                segment.RegisterClass,
+                                register,
+                                WithSegmentGcFlags(GetValueRefFlags(info) | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister, segment)));
+                        }
+                    }
+                    continue;
+                }
+
+                if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                {
+                    continue;
+                }
+            }
+        }
+
+        private static MachineRegister GetMaybeArgumentRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+        {
+            if (registerClass == RegisterClass.Float)
+                return MachineRegisters.GetFloatArgumentRegister(floatIndex++);
+            if (registerClass == RegisterClass.General)
+                return MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
+            return MachineRegister.Invalid;
+        }
+
+        private static GenStackKind StackKindForAbi(RuntimeType? type)
+            => MachineAbi.StackKindForType(type);
 
         private static void AddValueCopyRefPositions(
             ImmutableArray<LinearRefPosition>.Builder result,
@@ -2918,6 +3110,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Local => false,
                 GenTreeKind.Arg => false,
                 GenTreeKind.Temp => false,
+                GenTreeKind.TempAddr => false,
                 GenTreeKind.StoreLocal => false,
                 GenTreeKind.StoreArg => false,
                 GenTreeKind.StoreTemp => false,
@@ -3041,10 +3234,7 @@ namespace Cnidaria.Cs
             {
                 var value = node.RegisterResult;
                 var info = method.GetValueInfo(value);
-                if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == true)
-                    AddHiddenReturnBufferDefRefPosition(result, node.LinearId, defPosition, value, info);
-                else
-                    AddReturnDefRefPositions(result, node.LinearId, defPosition, value, info, descriptor.ReturnAbi);
+                AddReturnDefRefPositions(result, node.LinearId, defPosition, value, info, descriptor.ReturnAbi);
             }
         }
 
@@ -3117,31 +3307,6 @@ namespace Cnidaria.Cs
                 LinearRefPositionKind.Use,
                 value,
                 info.RegisterClass,
-                MachineRegister.Invalid,
-                flags));
-        }
-
-        private static void AddHiddenReturnBufferDefRefPosition(
-            ImmutableArray<LinearRefPosition>.Builder result,
-            int nodeId,
-            int defPosition,
-            GenTree value,
-            GenTreeValueInfo info)
-        {
-            var flags = GetValueRefFlags(info) |
-                        LinearRefPositionFlags.StackOnly |
-                        LinearRefPositionFlags.ExposedMemory;
-            var registerClass = info.RegisterClass == RegisterClass.Invalid
-                ? RegisterClass.General
-                : info.RegisterClass;
-
-            result.Add(new LinearRefPosition(
-                nodeId,
-                defPosition,
-                -1,
-                LinearRefPositionKind.Def,
-                value,
-                registerClass,
                 MachineRegister.Invalid,
                 flags));
         }
@@ -3283,21 +3448,22 @@ namespace Cnidaria.Cs
             ImmutableArray<LinearRefPosition>.Builder result,
             GenTree node,
             int position,
-            RegisterClass registerClass,
             ImmutableArray<MachineRegister> registers)
         {
-            for (int i = 0; i < registers.Length; i++)
-            {
-                result.Add(new LinearRefPosition(
-                    node.LinearId,
-                    position,
-                    i,
-                    LinearRefPositionKind.Kill,
-                    value: null,
-                    registerClass,
-                    registers[i],
-                    LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.Internal));
-            }
+            ulong killMask = MachineRegisters.MaskOf(registers);
+            if (killMask == 0)
+                return;
+
+            result.Add(new LinearRefPosition(
+                node.LinearId,
+                position,
+                -1,
+                LinearRefPositionKind.Kill,
+                value: null,
+                RegisterClass.Invalid,
+                MachineRegister.Invalid,
+                LinearRefPositionFlags.Internal,
+                killMask));
         }
 
         private static LinearRefPositionFlags GetValueRefFlags(GenTreeValueInfo info)
@@ -3404,6 +3570,7 @@ namespace Cnidaria.Cs
             var localDefStarts = NewPositionMapArray(method.Blocks.Length);
             var usePositions = new Dictionary<GenTree, SortedSet<int>>();
             var defPositions = new Dictionary<GenTree, int>();
+            var phiCopies = new List<GenTree>();
 
             for (int i = 0; i < method.Values.Length; i++)
             {
@@ -3429,26 +3596,7 @@ namespace Cnidaria.Cs
                             groupEnd++;
 
                         for (int i = n; i <= groupEnd; i++)
-                        {
-                            var copy = block.LinearNodes[i];
-                            bool hasCopyDef = copy.RegisterResult is not null;
-                            for (int u = 0; u < copy.RegisterUses.Length; u++)
-                            {
-                                var use = copy.RegisterUses[u];
-                                int useEnd = ComputeUseEnd(copy, u, usePos, defPos, hasCopyDef);
-                                RecordUse(usePositions, localUseEnds[b], use, usePos, useEnd);
-                                if (!blockDefs[b].Contains(use))
-                                    blockUses[b].Add(use);
-                            }
-                        }
-
-                        for (int i = n; i <= groupEnd; i++)
-                        {
-                            var copy = block.LinearNodes[i];
-                            var resultValue = copy.RegisterResult;
-                            if (resultValue is not null)
-                                RecordDefinition(blockDefs[b], localDefStarts[b], defPositions, resultValue, defPos);
-                        }
+                            phiCopies.Add(block.LinearNodes[i]);
 
                         n = groupEnd;
                         continue;
@@ -3473,6 +3621,33 @@ namespace Cnidaria.Cs
                     }
 
                 }
+            }
+
+            for (int i = 0; i < phiCopies.Count; i++)
+            {
+                var copy = phiCopies[i];
+                if (copy.RegisterResult is null || copy.RegisterUses.Length != 1)
+                    throw new InvalidOperationException("linear IR phi copy node must have one source and one destination value.");
+
+                int fromBlockId = copy.LinearPhiCopyFromBlockId;
+                int toBlockId = copy.LinearPhiCopyToBlockId;
+                if ((uint)fromBlockId >= (uint)method.Blocks.Length ||
+                    (uint)toBlockId >= (uint)method.Blocks.Length)
+                {
+                    throw new InvalidOperationException($"linear IR phi copy node {copy.LinearId} has invalid edge B{fromBlockId}->B{toBlockId}.");
+                }
+
+                var sourceValue = copy.RegisterUses[0];
+                int usePosition = ComputePhiCopySourcePosition(layout, copy);
+                RecordUse(usePositions, localUseEnds[fromBlockId], sourceValue, usePosition, usePosition + 1);
+                if (!blockDefs[fromBlockId].Contains(sourceValue))
+                    blockUses[fromBlockId].Add(sourceValue);
+
+                var destinationValue = copy.RegisterResult;
+                int definitionPosition = ComputePhiCopyDestinationPosition(layout, copy);
+                RecordDefinition(blockDefs[toBlockId], localDefStarts[toBlockId], defPositions, destinationValue, definitionPosition);
+
+                blockUses[toBlockId].Remove(destinationValue);
             }
 
             var dataflowOrder = method.LinearBlockOrder.IsDefaultOrEmpty
@@ -3642,6 +3817,28 @@ namespace Cnidaria.Cs
                 return layout.BlockStartPositions[info.DefinitionBlockId];
 
             return layout.FirstPosition;
+        }
+
+        private static int ComputePhiCopySourcePosition(PositionLayout layout, GenTree node)
+        {
+            if (!node.IsPhiCopy)
+                throw new InvalidOperationException("Expected a phi copy node.");
+            if ((uint)node.LinearPhiCopyFromBlockId >= (uint)layout.BlockEndPositions.Length)
+                throw new InvalidOperationException($"Invalid phi-copy source block B{node.LinearPhiCopyFromBlockId} for node {node.LinearId}.");
+
+            int blockEnd = layout.BlockEndPositions[node.LinearPhiCopyFromBlockId];
+            int blockStart = layout.BlockStartPositions[node.LinearPhiCopyFromBlockId];
+            return blockEnd > blockStart ? blockEnd - 1 : blockStart;
+        }
+
+        private static int ComputePhiCopyDestinationPosition(PositionLayout layout, GenTree node)
+        {
+            if (!node.IsPhiCopy)
+                throw new InvalidOperationException("Expected a phi copy node.");
+            if ((uint)node.LinearPhiCopyToBlockId >= (uint)layout.BlockStartPositions.Length)
+                throw new InvalidOperationException($"Invalid phi-copy destination block B{node.LinearPhiCopyToBlockId} for node {node.LinearId}.");
+
+            return layout.BlockStartPositions[node.LinearPhiCopyToBlockId];
         }
 
         private static int ComputeUseEnd(GenTree node, int operandIndex, int usePosition, int defPosition, bool hasDef)
@@ -4195,9 +4392,9 @@ namespace Cnidaria.Cs
             {
                 int blockId = method.LinearBlockOrder[i];
                 if ((uint)blockId >= (uint)method.Blocks.Length)
-                    throw new InvalidOperationException("linear IR linear block order contains invalid block id B" + blockId.ToString() + ".");
+                    throw new InvalidOperationException($"linear IR linear block order contains invalid block id B{blockId}.");
                 if (seen[blockId])
-                    throw new InvalidOperationException("linear IR linear block order contains duplicate block id B" + blockId.ToString() + ".");
+                    throw new InvalidOperationException($"linear IR linear block order contains duplicate block id B{blockId}.");
                 seen[blockId] = true;
             }
         }
@@ -4457,10 +4654,16 @@ namespace Cnidaria.Cs
                 {
                     if (rp.Value is not null)
                         throw new InvalidOperationException($"linear IR kill ref-position must not carry a value: {rp}.");
-                    if (rp.FixedRegister == MachineRegister.Invalid)
-                        throw new InvalidOperationException($"linear IR kill ref-position must carry a fixed register: {rp}.");
-                    if (!MachineRegisters.IsRegisterInClass(rp.FixedRegister, rp.RegisterClass))
+                    if (rp.RegisterMask == 0)
+                        throw new InvalidOperationException($"linear IR kill ref-position must carry a non-empty kill register mask: {rp}.");
+                    if (rp.FixedRegister != MachineRegister.Invalid && (rp.RegisterMask & MachineRegisters.MaskOf(rp.FixedRegister)) == 0)
+                        throw new InvalidOperationException($"linear IR kill ref-position fixed register is not present in its kill mask: {rp}.");
+                    if (rp.FixedRegister != MachineRegister.Invalid &&
+                        rp.RegisterClass != RegisterClass.Invalid &&
+                        !MachineRegisters.IsRegisterInClass(rp.FixedRegister, rp.RegisterClass))
+                    {
                         throw new InvalidOperationException($"linear IR kill ref-position register does not match its class: {rp}.");
+                    }
                 }
                 else if (rp.Kind == LinearRefPositionKind.Internal)
                 {
@@ -4662,6 +4865,9 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Temp:
                     sb.Append("ldtmp t").Append(source.Int32);
+                    return;
+                case GenTreeKind.TempAddr:
+                    sb.Append("ldtmpa t").Append(source.Int32);
                     return;
                 case GenTreeKind.ExceptionObject:
                     sb.Append("exception");

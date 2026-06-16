@@ -2617,6 +2617,8 @@ namespace Cnidaria.Cs
                     return TryMakeSlot(node, SsaSlotKind.Arg, out slot);
                 case GenTreeKind.LocalAddr:
                     return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+                case GenTreeKind.TempAddr:
+                    return TryMakeSlot(node, SsaSlotKind.Temp, out slot);
                 default:
                     slot = default;
                     return false;
@@ -2681,6 +2683,9 @@ namespace Cnidaria.Cs
 
             if (node.Kind == GenTreeKind.LocalAddr)
                 return TryMakeSlot(node, SsaSlotKind.Local, out slot);
+
+            if (node.Kind == GenTreeKind.TempAddr)
+                return TryMakeSlot(node, SsaSlotKind.Temp, out slot);
 
             slot = default;
             return false;
@@ -2970,6 +2975,7 @@ namespace Cnidaria.Cs
                     CollectAddressExposed(statements[s], addressExposed);
             }
 
+            var localStorageByRefAliases = BuildLocalStorageByRefAliases(method);
             var structPromotionBlockedParents = BuildStructPromotionBlockedParents(method);
             var weightedUses = ComputeWeightedSlotUses(method, cfg);
             var allSlots = new List<SsaSlotInfo>();
@@ -3065,6 +3071,9 @@ namespace Cnidaria.Cs
                 if (exposed)
                     descriptor.MarkAddressExposed();
 
+                if (localStorageByRefAliases.Contains(slot))
+                    descriptor.MarkLocalStorageByRefAlias();
+
                 if (descriptor.IsStructField && structPromotionBlockedParents.Contains(descriptor.ParentLclNum))
                     descriptor.MarkMemoryAliased();
 
@@ -3095,7 +3104,7 @@ namespace Cnidaria.Cs
                 if (descriptor.AddressExposed || descriptor.MemoryAliased)
                     return false;
 
-                if (descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
+                if (descriptor.Pinned || descriptor.IsRefLike)
                     return false;
 
                 if (descriptor.Category is GenLocalCategory.AddressExposedLocal or GenLocalCategory.MemoryAliasedLocal or GenLocalCategory.ImplicitByRefPinnedRefLikeLocal)
@@ -3113,6 +3122,9 @@ namespace Cnidaria.Cs
             static bool CanTrackAsScalar(SsaSlot slot, GenLocalDescriptor descriptor)
             {
                 if (!CanTrackForLiveness(slot, descriptor))
+                    return false;
+
+                if (descriptor.IsImplicitByRef && descriptor.IsLocalStorageByRefAlias)
                     return false;
 
                 if (descriptor.Category == GenLocalCategory.PromotedStruct)
@@ -3179,6 +3191,63 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < node.Operands.Length; i++)
                 CollectAddressExposed(node.Operands[i], node, i, addressExposed);
+        }
+
+        private static HashSet<SsaSlot> BuildLocalStorageByRefAliases(GenTreeMethod method)
+        {
+            var aliases = new HashSet<SsaSlot>();
+            bool changed;
+            do
+            {
+                changed = false;
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    var statements = method.Blocks[b].Statements;
+                    for (int s = 0; s < statements.Length; s++)
+                        VisitStore(statements[s]);
+                }
+            }
+            while (changed);
+
+            return aliases;
+
+            void VisitStore(GenTree node)
+            {
+                if (SsaSlotHelpers.TryGetDirectStoreSlot(node, out var storeSlot) &&
+                    node.LocalDescriptor is { IsImplicitByRef: true } &&
+                    node.Operands.Length != 0 &&
+                    MayBeLocalStorageByRefValue(node.Operands[0], aliases))
+                {
+                    if (aliases.Add(storeSlot))
+                        changed = true;
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                    VisitStore(node.Operands[i]);
+            }
+        }
+
+        private static bool MayBeLocalStorageByRefValue(GenTree node, HashSet<SsaSlot> localStorageByRefAliases)
+        {
+            if (node is null)
+                return false;
+
+            if (node.Kind is GenTreeKind.ArgAddr or GenTreeKind.LocalAddr or GenTreeKind.TempAddr)
+                return true;
+
+            if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
+                return SsaSlotHelpers.TryGetDirectLoadSlot(node, out var slot) && localStorageByRefAliases.Contains(slot);
+
+            if (node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerToByRef or GenTreeKind.PointerElementAddr)
+            {
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (MayBeLocalStorageByRefValue(node.Operands[i], localStorageByRefAliases))
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private static HashSet<int> BuildStructPromotionBlockedParents(GenTreeMethod method)
@@ -3266,6 +3335,13 @@ namespace Cnidaria.Cs
                 else if (fieldAccess.Kind == SsaLocalAccessKind.FullDefinition)
                 {
                     AddDef(fieldAccess.Slot, DescriptorForFieldAccess(fieldAccess, node), weight, partial: false);
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (i == fieldAccess.ReceiverOperandIndex)
+                        continue;
+                    CountSlotUses(node.Operands[i], counts, weight);
                 }
                 return;
             }
@@ -4788,6 +4864,13 @@ namespace Cnidaria.Cs
                         Add(fieldAccess.Slot);
                     if (fieldAccess.IsDefinition)
                         Add(fieldAccess.Slot);
+
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (i == fieldAccess.ReceiverOperandIndex)
+                            continue;
+                        CountSlotUses(node.Operands[i], counts, weight);
+                    }
                     return;
                 }
 
@@ -7714,6 +7797,9 @@ namespace Cnidaria.Cs
                 if (_slotInfos.TryGetValue(useDescriptor.BaseLocal, out var useInfo) &&
                     _slotInfos.TryGetValue(candidateDescriptor.BaseLocal, out var candidateInfo))
                 {
+                    if (IsPromotedStructFieldSlot(useInfo) || IsPromotedStructFieldSlot(candidateInfo))
+                        return false;
+
                     if (useInfo.LocalDescriptor is not null && candidateInfo.LocalDescriptor is not null &&
                         useInfo.LocalDescriptor.DoNotEnregister != candidateInfo.LocalDescriptor.DoNotEnregister)
                     {
@@ -7726,6 +7812,9 @@ namespace Cnidaria.Cs
 
                 return true;
             }
+
+            private static bool IsPromotedStructFieldSlot(SsaSlotInfo info)
+                => info.LocalDescriptor is { Category: GenLocalCategory.PromotedStructField };
 
             private static int CopyPropLocalScore(SsaSlotInfo useInfo, SsaSlotInfo candidateInfo, bool preferCandidate)
             {
@@ -8543,6 +8632,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.Local:
                     case GenTreeKind.Arg:
                     case GenTreeKind.Temp:
+                    case GenTreeKind.TempAddr:
                         return false;
                 }
 
@@ -11268,6 +11358,9 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Temp:
                     sb.Append('t').Append(tree.Source.Int32);
+                    return;
+                case GenTreeKind.TempAddr:
+                    sb.Append("&t").Append(tree.Source.Int32);
                     return;
                 case GenTreeKind.LocalAddr:
                     sb.Append("&l").Append(tree.Source.Int32);

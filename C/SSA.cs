@@ -16,6 +16,7 @@ namespace Cnidaria.C
         public bool PromoteAggregateVariables { get; }
         public bool PromoteVolatileVariables { get; }
         public ValueNumberingOptions ValueNumbering { get; }
+        public SsaOptimizationOptions Optimization { get; }
 
         public SsaOptions(
             bool trackMemory = true,
@@ -23,7 +24,8 @@ namespace Cnidaria.C
             bool promoteAddressTakenVariables = false,
             bool promoteAggregateVariables = false,
             bool promoteVolatileVariables = false,
-            ValueNumberingOptions? valueNumbering = null)
+            ValueNumberingOptions? valueNumbering = null,
+            SsaOptimizationOptions? optimization = null)
         {
             TrackMemory = trackMemory;
             PromoteTemporaries = promoteTemporaries;
@@ -31,6 +33,33 @@ namespace Cnidaria.C
             PromoteAggregateVariables = promoteAggregateVariables;
             PromoteVolatileVariables = promoteVolatileVariables;
             ValueNumbering = valueNumbering ?? ValueNumberingOptions.Default;
+            Optimization = optimization ?? SsaOptimizationOptions.Default;
+        }
+    }
+
+    public sealed class SsaOptimizationOptions
+    {
+        public static SsaOptimizationOptions Default { get; } = new SsaOptimizationOptions();
+
+        public bool EnableConstantFolding { get; }
+        public bool EnableCopyPropagation { get; }
+        public bool EnableBranchFolding { get; }
+        public bool EnableDeadCodeElimination { get; }
+        public int MaxIterations { get; }
+
+        public SsaOptimizationOptions(
+            bool enableConstantFolding = true,
+            bool enableCopyPropagation = true,
+            bool enableValueNumberCopyPropagation = true,
+            bool enableBranchFolding = true,
+            bool enableDeadCodeElimination = true,
+            int maxIterations = 3)
+        {
+            EnableConstantFolding = enableConstantFolding;
+            EnableCopyPropagation = enableCopyPropagation;
+            EnableBranchFolding = enableBranchFolding;
+            EnableDeadCodeElimination = enableDeadCodeElimination;
+            MaxIterations = maxIterations < 1 ? 1 : maxIterations;
         }
     }
 
@@ -122,8 +151,13 @@ namespace Cnidaria.C
 
             options ??= SsaOptions.Default;
             var functions = ImmutableArray.CreateBuilder<SsaFunction>();
+            var target = controlFlowGraph.SemanticModel.Compilation.Options.Target;
             foreach (var function in controlFlowGraph.Functions)
-                functions.Add(SsaFunctionBuilder.Build(function, options));
+            {
+                var ssaFunction = SsaFunctionBuilder.Build(function, options);
+                ssaFunction = SsaOptimizer.Optimize(ssaFunction, target, options.Optimization, options.ValueNumbering);
+                functions.Add(ssaFunction);
+            }
 
             return new SsaGraph(controlFlowGraph, functions.ToImmutable());
         }

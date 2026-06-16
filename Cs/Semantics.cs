@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -714,6 +714,7 @@ namespace Cnidaria.Cs
 
             GenericConstraintBinder.BindAll(compilation, trees, bag);
             MemberSignatureBinder.BindAll(compilation, trees, bag);
+            NameConflictBinder.BindAll(compilation, bag);
             BaseTypeBinder.BindAll(compilation, trees, bag);
             ExplicitInterfaceImplementationBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
@@ -737,6 +738,7 @@ namespace Cnidaria.Cs
 
             GenericConstraintBinder.BindAll(compilation, trees, bag);
             MemberSignatureBinder.BindAll(compilation, trees, bag);
+            NameConflictBinder.BindAll(compilation, bag);
             BaseTypeBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
 
@@ -1767,7 +1769,7 @@ namespace Cnidaria.Cs
             if (body != null)
             {
                 boundBody = binder.BindStatement(body, ctx, diagnostics);
-                binder.ReportControlFlowDiagnostics(ctx, diagnostics);
+                binder.ReportControlFlowDiagnostics(ctx, diagnostics, boundBody, ownerSyntax);
             }
             else
             {
@@ -1889,7 +1891,7 @@ namespace Cnidaria.Cs
             if (body != null)
             {
                 boundBody = binder.BindStatement(body, ctx, diagnostics);
-                binder.ReportControlFlowDiagnostics(ctx, diagnostics);
+                binder.ReportControlFlowDiagnostics(ctx, diagnostics, boundBody, ownerSyntax);
             }
             else
             {

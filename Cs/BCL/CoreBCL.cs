@@ -1531,6 +1531,17 @@ namespace System
             if ((object)value == null) throw new ArgumentNullException("value");
             return IndexOf(value, 0) >= 0;
         }
+
+        public string ToLower() => ToLowerInvariant();
+        public string ToLowerInvariant()
+        {
+            return System.Globalization.TextInfo.Invariant.ToLower(this);
+        }
+        public string ToUpper() => ToUpperInvariant();
+        public string ToUpperInvariant()
+        {
+            return System.Globalization.TextInfo.Invariant.ToUpper(this);
+        }
     }
 
     public struct Boolean
@@ -1610,6 +1621,9 @@ namespace System
         public static bool IsAsciiLetterOrDigit(char c) => IsAsciiLetter(c) | IsBetween(c, '0', '9');
         public static bool IsAsciiLetterLower(char c) => IsBetween(c, 'a', 'z');
         public static bool IsAsciiLetterUpper(char c) => IsBetween(c, 'A', 'Z');
+
+        public static char ToLowerInvariant(char c) => System.Globalization.TextInfo.ToLowerInvariant(c);
+        public static char ToUpperInvariant(char c) => System.Globalization.TextInfo.ToUpperInvariant(c);
 
 
         public static bool IsWhiteSpace(char c)
@@ -3033,13 +3047,12 @@ namespace System
             char* buffer = stackalloc char[21]; // 20 digits + terminator
             char* p = buffer + 21;
 
-            ulong v = value;
             do
             {
-                ulong digit = v % 10ul;
-                v /= 10ul;
+                ulong digit = value % 10ul;
+                value /= 10ul;
                 *--p = (char)('0' + digit);
-            } while (v != 0ul);
+            } while (value != 0ul);
 
             int len = (int)((buffer + 21) - p);
             string s = String.FastAllocateString(len);
@@ -3248,15 +3261,12 @@ namespace System
         }
         private static unsafe ulong ComputeRoundedScaledDigits(ulong mantissa, int binaryExponent, int decimalScale)
         {
-            uint* numeratorStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
-            uint* denominatorStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
-            uint* remainderStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
-            uint* tempStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* numeratorStorage = stackalloc uint[DoubleFormatBigUIntMaxWords*4];
 
             BigUIntScratch numerator = CreateBigUIntScratch(numeratorStorage);
-            BigUIntScratch denominator = CreateBigUIntScratch(denominatorStorage);
-            BigUIntScratch remainder = CreateBigUIntScratch(remainderStorage);
-            BigUIntScratch temp = CreateBigUIntScratch(tempStorage);
+            BigUIntScratch denominator = CreateBigUIntScratch(numeratorStorage + DoubleFormatBigUIntMaxWords);
+            BigUIntScratch remainder = CreateBigUIntScratch(numeratorStorage + DoubleFormatBigUIntMaxWords * 2);
+            BigUIntScratch temp = CreateBigUIntScratch(numeratorStorage + DoubleFormatBigUIntMaxWords * 3);
 
             BigUIntSetUInt64(ref numerator, mantissa);
             if (binaryExponent >= 0)
@@ -3320,11 +3330,10 @@ namespace System
         }
         private static unsafe int ComparePositiveBinaryFloatToPowerOf10(ulong mantissa, int binaryExponent, int decimalExponent)
         {
-            uint* leftStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
-            uint* rightStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* storage = stackalloc uint[DoubleFormatBigUIntMaxWords * 2];
 
-            BigUIntScratch left = CreateBigUIntScratch(leftStorage);
-            BigUIntScratch right = CreateBigUIntScratch(rightStorage);
+            BigUIntScratch left = CreateBigUIntScratch(storage);
+            BigUIntScratch right = CreateBigUIntScratch(storage + DoubleFormatBigUIntMaxWords);
 
             BigUIntSetUInt64(ref left, mantissa);
             BigUIntSetUInt64(ref right, 1UL);
@@ -3355,11 +3364,10 @@ namespace System
         }
         private static unsafe int CompareDecimalToBinary(ulong decimalDigits, int decimalScale, ulong binaryMantissa, int binaryExponent)
         {
-            uint* leftStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
-            uint* rightStorage = stackalloc uint[DoubleFormatBigUIntMaxWords];
+            uint* storage = stackalloc uint[DoubleFormatBigUIntMaxWords * 2];
 
-            BigUIntScratch left = CreateBigUIntScratch(leftStorage);
-            BigUIntScratch right = CreateBigUIntScratch(rightStorage);
+            BigUIntScratch left = CreateBigUIntScratch(storage);
+            BigUIntScratch right = CreateBigUIntScratch(storage + DoubleFormatBigUIntMaxWords);
 
             BigUIntSetUInt64(ref left, decimalDigits);
             BigUIntSetUInt64(ref right, binaryMantissa);
@@ -7255,10 +7263,6 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     {
         void Dispose();
     }
-    public interface IFormatProvider
-    {
-        object GetFormat(Type formatType);
-    }
     public interface IConvertible
     {
         TypeCode GetTypeCode();
@@ -8262,18 +8266,15 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static ulong BigMul(ulong a, uint b, out ulong low)
         {
-            if(IntPtr.Size == 8)
-            {
-                return Math.BigMul((ulong)a, (ulong)b, out low);
-            }
-            else
-            {
-                ulong prodL = ((ulong)(uint)a) * b;
-                ulong prodH = (prodL >> 32) + (((ulong)(uint)(a >> 32)) * b);
+#if TARGET_64BIT
+            return Math.BigMul((ulong)a, (ulong)b, out low);
+#else
+            ulong prodL = ((ulong)(uint)a) * b;
+            ulong prodH = (prodL >> 32) + (((ulong)(uint)(a >> 32)) * b);
 
-                low = ((prodH << 32) | (uint)prodL);
-                return (prodH >> 32);
-            }
+            low = ((prodH << 32) | (uint)prodL);
+            return (prodH >> 32);
+#endif
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -8464,18 +8465,6 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
             double temp = CopySign(IntegerBoundary, a);
             return CopySign((a + temp) - temp, a);
-        }
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static double CopySign(double x, double y)
-        {
-            // This method is required to work for all inputs,
-            // including NaN, so we operate on the raw bits.
-            ulong xbits = BitConverter.DoubleToUInt64Bits(x);
-            ulong ybits = BitConverter.DoubleToUInt64Bits(y);
-
-            // Remove the sign from x, and remove everything but the sign from y
-            // Then, simply OR them to get the correct sign
-            return BitConverter.UInt64BitsToDouble((xbits & ~double.SignMask) | (ybits & double.SignMask));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -9910,15 +9899,12 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static void Write(ushort value) { Write((int)value); }
         public static unsafe void Write(int value)
         {
-            char* buffer = stackalloc char[12];
-            char* end = buffer + 11;
-            char* p = end;
+            char* p = stackalloc char[12] + 11;
             *p = '\0';
             if (value == unchecked((int)0x80000000)) //int.MinValue
             {
                 //-2147483648
-                char* min = stackalloc char[] { '-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\0' };
-                _Write(min);
+                _Write((char*)(stackalloc char[] { '-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\0' }));
                 return;
             }
             bool negative = value < 0;
@@ -9927,7 +9913,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
             do
             {
-                Int32 digit = value % 10;
+                int digit = value % 10;
                 value /= 10;
                 *--p = (char)('0' + digit);
             }
@@ -9940,9 +9926,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static void Write(uint value) { Write((long)value); }
         public static unsafe void Write(long value)
         {
-            char* buffer = stackalloc char[21];
-            char* end = buffer + 20;
-            char* p = end;
+            char* p = stackalloc char[21] + 20;
             *p = '\0';
 
             if (value == unchecked((long)0x8000000000000000)) // long.MinValue
@@ -9970,54 +9954,67 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
             _Write(p);
         }
-        public static void Write(ulong value) { Write(value.ToString()); }
-        public static void Write(float value) { Write((double)value); }
+        public static unsafe void Write(ulong value)
+        {
+            char* p = stackalloc char[21] + 20; // 20 digits + terminator
+            *p = '\0';
+
+            do
+            {
+                ulong digit = value % 10ul;
+                value /= 10ul;
+                *--p = (char)('0' + digit);
+            } while (value != 0ul);
+
+            _Write(p);
+        }
+        public static void Write(float value) { _Write(System.Number.FormatFloat(value, null, null)); }
         public static unsafe void Write(double value)
         {
-            _Write(value.ToString());
+            _Write(System.Number.FormatDouble(value, null, null));
         }
-        public static unsafe void Write(char value) { char* str = stackalloc char[] { value, '\0' }; _Write(str); }
+        public static unsafe void Write(char value) { uint terminated = value; _Write((char*)&terminated); }
         public static unsafe void Write(bool value)
         {
             if (value)
-            {
-                char* str = stackalloc char[] { 't', 'r', 'u', 'e', '\0' };
-                _Write(str);
-            }
+                _Write((char*)(stackalloc char[] { 't', 'r', 'u', 'e', '\0' }));
             else
-            {
-                char* str = stackalloc char[] { 'f', 'a', 'l', 's', 'e', '\0' };
-                _Write(str);
-            }
+                _Write((char*)(stackalloc char[] { 'f', 'a', 'l', 's', 'e', '\0' }));
         }
         public static unsafe void Write(char* value) { _Write(value); }
         public static void Write(ReadOnlySpan<char> value) { _Write(value); }
         public static void Write(string value) { _Write(value); }
         public static void Write(object value) { _Write(value.ToString()); }
 
-        public static void WriteLine() { Write('\n'); }
-        public static void WriteLine(sbyte value) { Write(value); Write('\n'); }
-        public static void WriteLine(byte value) { Write(value); Write('\n'); }
-        public static void WriteLine(short value) { Write(value); Write('\n'); }
-        public static void WriteLine(ushort value) { Write(value); Write('\n'); }
-        public static void WriteLine(int value) { Write(value); Write('\n'); }
-        public static void WriteLine(uint value) { Write(value); Write('\n'); }
-        public static void WriteLine(long value) { Write(value); Write('\n'); }
-        public static void WriteLine(ulong value) { Write(value); Write('\n'); }
-        public static void WriteLine(char value) { Write(value); Write('\n'); }
-        public static void WriteLine(bool value) { Write(value); Write('\n'); }
-        public static void WriteLine(float value) { Write(value); Write('\n'); }
-        public static void WriteLine(double value) { Write(value); Write('\n'); }
-        public static void WriteLine(string value) { Write(value); Write('\n'); }
-        public static void WriteLine(ReadOnlySpan<char> value) { Write(value); Write('\n'); }
-        public static unsafe void WriteLine(char* value) { Write(value); Write('\n'); }
-        public static void WriteLine(object value)
+        public unsafe static void WriteLine() { uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(sbyte value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(byte value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(short value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(ushort value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(int value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(uint value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(long value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(ulong value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(char value) { ulong s = (ulong)value | ((ulong)'\n' << 16); _Write((char*)&s); }
+        public unsafe static void WriteLine(bool value) 
+        {
+            if (value)
+                _Write((char*)(stackalloc char[] { 't', 'r', 'u', 'e', '\n', '\0' }));
+            else
+                _Write((char*)(stackalloc char[] { 'f', 'a', 'l', 's', 'e', '\n', '\0' }));
+        }
+        public unsafe static void WriteLine(float value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(double value) { Write(value); uint nl = '\n';  _Write((char*)&nl); }
+        public unsafe static void WriteLine(string value) { _Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(ReadOnlySpan<char> value) { _Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static unsafe void WriteLine(char* value) { _Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(object value)
         {
             if (value != null)
             {
-                Write(value);
+                _Write(value.ToString());
             }
-            Write('\n');
+            uint nl = '\n'; _Write((char*)&nl);
         }
         // intrinsics
         [MethodImpl(MethodImplOptions.InternalCall)]
@@ -10842,6 +10839,198 @@ namespace System.Globalization
             {
                 return s_InvariantCultureInfo;
             }
+        }
+    }
+    internal static class UnicodeUtility
+    {
+        /// <summary>
+        /// The Unicode replacement character U+FFFD.
+        /// </summary>
+        public const uint ReplacementChar = 0xFFFD;
+
+        public static int GetPlane(uint codePoint)
+        {
+            return (int)(codePoint >> 16);
+        }
+
+        public static int GetUtf16SequenceLength(uint value)
+        {
+            value -= 0x10000;   // if value < 0x10000, high byte = 0xFF; else high byte = 0x00
+            value += (2 << 24); // if value < 0x10000, high byte = 0x01; else high byte = 0x02
+            value >>= 24;       // shift high byte down
+            return (int)value;  // and return it
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void GetUtf16SurrogatesFromSupplementaryPlaneScalar(uint value, out char highSurrogateCodePoint, out char lowSurrogateCodePoint)
+        {
+            // This calculation comes from the Unicode specification, Table 3-5.
+
+            highSurrogateCodePoint = (char)((value + ((0xD800u - 0x40u) << 10)) >> 10);
+            lowSurrogateCodePoint = (char)((value & 0x3FFu) + 0xDC00u);
+        }
+
+        public static int GetUtf8SequenceLength(uint value)
+        {
+            int a = ((int)value - 0x0800) >> 31;
+
+            value ^= 0xF800u;
+            value -= 0xF880u;   // if scalar is 1 or 3 code units, high byte = 0xFF; else high byte = 0x00
+            value += (4 << 24); // if scalar is 1 or 3 code units, high byte = 0x03; else high byte = 0x04
+            value >>= 24;       // shift high byte down
+
+            // Final return value:
+            // - U+0000..U+007F => 3 + (-1) * 2 = 1
+            // - U+0080..U+07FF => 4 + (-1) * 2 = 2
+            // - U+0800..U+FFFF => 3 + ( 0) * 2 = 3
+            // - U+10000+       => 4 + ( 0) * 2 = 4
+            return (int)value + (a * 2);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsAsciiCodePoint(uint value) => value <= 0x7Fu;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsBmpCodePoint(uint value) => value <= 0xFFFFu;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsHighSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xD800U, 0xDBFFU);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsInRangeInclusive(uint value, uint lowerBound, uint upperBound) => (value - lowerBound) <= (upperBound - lowerBound);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsLowSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xDC00U, 0xDFFFU);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xD800U, 0xDFFFU);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsValidCodePoint(uint codePoint) => codePoint <= 0x10FFFFU;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsValidUnicodeScalar(uint value)
+        {
+            return ((value - 0x110000u) ^ 0xD800u) >= 0xFFEF0800u;
+        }
+    }
+    public sealed class TextInfo
+    {
+        private enum Tristate : byte
+        {
+            NotInitialized = 0,
+            False = 1,
+            True = 2
+        }
+
+        private bool _isReadOnly;
+
+        private readonly string _cultureName;
+        private readonly CultureData _cultureData;
+
+        private bool HasEmptyCultureName { get { return _cultureName.Length == 0; } }
+
+        // // Name of the text info we're using (ie: _cultureData.TextInfoName)
+        private readonly string _textInfoName;
+
+        private Tristate _isAsciiCasingSameAsInvariant = Tristate.NotInitialized;
+
+        // Invariant text info
+        internal static readonly TextInfo Invariant = new TextInfo(CultureData.Invariant, readOnly: true) { _isAsciiCasingSameAsInvariant = Tristate.True };
+
+        internal TextInfo(CultureData cultureData)
+        {
+            _cultureData = cultureData;
+            _cultureName = _cultureData.CultureName;
+            //_textInfoName = _cultureData.TextInfoName;
+
+        }
+
+        private TextInfo(CultureData cultureData, bool readOnly)
+            : this(cultureData)
+        {
+            SetReadOnlyState(readOnly);
+        }
+
+        internal void SetReadOnlyState(bool readOnly)
+        {
+            _isReadOnly = readOnly;
+        }
+
+        public string ToLower(string str)
+        {
+            if(str == null)
+                throw new ArgumentNullException();
+
+            string dstStr = String.FastAllocateString(str.Length);
+            ref char dst = ref dstStr.GetRawStringData();
+            ref char src = ref str.GetPinnableReference();
+
+            for (int i = 0; i < str.Length; i++)
+            {
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
+                    Char.ToLowerInvariant(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i));
+            }
+            return dstStr;
+                    
+        }
+
+        public string ToUpper(string str)
+        {
+            if (str == null)
+                throw new ArgumentNullException();
+
+            string dstStr = String.FastAllocateString(str.Length);
+            ref char dst = ref dstStr.GetRawStringData();
+            ref char src = ref str.GetPinnableReference();
+
+            for (int i = 0; i < str.Length; i++)
+            {
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
+                    Char.ToLowerInvariant(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i));
+            }
+            return dstStr;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static char ToLowerInvariant(char c)
+        {
+            if (UnicodeUtility.IsAsciiCodePoint(c))
+            {
+                return ToLowerAsciiInvariant(c);
+            }
+
+            throw new NotSupportedException();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static char ToUpperInvariant(char c)
+        {
+            if (UnicodeUtility.IsAsciiCodePoint(c))
+            {
+                return ToUpperAsciiInvariant(c);
+            }
+
+            throw new NotSupportedException();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static char ToLowerAsciiInvariant(char c)
+        {
+            if (Char.IsAsciiLetterUpper(c))
+            {
+                c = (char)(byte)(c | 0x20);
+            }
+            return c;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static char ToUpperAsciiInvariant(char c)
+        {
+            if (Char.IsAsciiLetterLower(c))
+            {
+                c = (char)(c & 0x5F); // = low 7 bits of ~0x20
+            }
+            return c;
         }
     }
     public enum CalendarAlgorithmType
@@ -12935,10 +13124,11 @@ namespace System.Numerics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int Log2(nuint value)
         {
-            if(IntPtr.Size == 8)
-                return Log2((ulong)value);
-            else
-                return Log2((uint)value);
+#if TARGET_64BIT
+            return Log2((ulong)value);
+#else
+            return Log2((uint)value);
+#endif
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int Log2(ulong value)
@@ -13011,36 +13201,29 @@ namespace System.Numerics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int PopCount(ulong value)
         {
-            if (IntPtr.Size == 8)
-            {
-                const ulong c1 = 0x_55555555_55555555ul;
-                const ulong c2 = 0x_33333333_33333333ul;
-                const ulong c3 = 0x_0F0F0F0F_0F0F0F0Ful;
-                const ulong c4 = 0x_01010101_01010101ul;
+#if TARGET_64BIT
+            const ulong c1 = 0x_55555555_55555555ul;
+            const ulong c2 = 0x_33333333_33333333ul;
+            const ulong c3 = 0x_0F0F0F0F_0F0F0F0Ful;
+            const ulong c4 = 0x_01010101_01010101ul;
 
-                value -= (value >> 1) & c1;
-                value = (value & c2) + ((value >> 2) & c2);
-                value = (((value + (value >> 4)) & c3) * c4) >> 56;
+            value -= (value >> 1) & c1;
+            value = (value & c2) + ((value >> 2) & c2);
+            value = (((value + (value >> 4)) & c3) * c4) >> 56;
 
-                return (int)value;
-            }
-            else
-            {
-                return PopCount((uint)value) // lo
+            return (int)value;
+#else
+            return PopCount((uint)value) // lo
                 + PopCount((uint)(value >> 32)); // hi
-            }
+#endif
         }
         public static int PopCount(nuint value)
         {
-            if (IntPtr.Size == 8)
-            {
-                return PopCount((ulong)value);
-            }
-            else
-            {
-                return PopCount((uint)value);
-            }
-                
+#if TARGET_64BIT
+            return PopCount((ulong)value);
+#else
+            return PopCount((uint)value);
+#endif
         }
 
 
@@ -16219,7 +16402,9 @@ namespace System.Collections.Generic
             Entry[] entries = new Entry[size];
 
             _freeList = -1;
-            _fastModMultiplier = HashHelpers.GetFastModMultiplier((uint)size); //#if TARGET_64BIT
+#if TARGET_64BIT
+            _fastModMultiplier = HashHelpers.GetFastModMultiplier((uint)size);
+#endif
             _buckets = buckets;
             _entries = entries;
 

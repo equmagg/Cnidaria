@@ -15,13 +15,15 @@ namespace Cnidaria.C
         public int PrintfMethodId { get; }
         public IReadOnlyDictionary<FunctionSymbol, int> MethodIds { get; }
         public IReadOnlyDictionary<int, FunctionType?> SignaturesByMethodId { get; }
+        public TargetInfo Target { get; }
 
         public RegisterBytecodeProgram(
             CodeImage image,
             int entryPc,
             int printfMethodId,
             IReadOnlyDictionary<FunctionSymbol, int> methodIds,
-            IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId)
+            IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId,
+            TargetInfo? target = null)
         {
             Image = image ?? throw new ArgumentNullException(nameof(image));
             if (entryPc < 0)
@@ -30,18 +32,20 @@ namespace Cnidaria.C
             PrintfMethodId = printfMethodId;
             MethodIds = methodIds ?? throw new ArgumentNullException(nameof(methodIds));
             SignaturesByMethodId = signaturesByMethodId ?? throw new ArgumentNullException(nameof(signaturesByMethodId));
+            Target = target ?? TargetInfo.RegisterBytecode;
         }
         public RegisterBytecodeSyntheticRuntime CreateSyntheticRuntime()
-            => CreateSyntheticRuntime(MethodIds, SignaturesByMethodId, EntryPc, PrintfMethodId);
+            => CreateSyntheticRuntime(MethodIds, SignaturesByMethodId, EntryPc, PrintfMethodId, Target);
 
         internal void RegisterSyntheticRuntimeMethods(RuntimeTypeSystem runtimeTypes)
-            => RegisterSyntheticRuntimeMethods(runtimeTypes, MethodIds, SignaturesByMethodId, PrintfMethodId);
+            => RegisterSyntheticRuntimeMethods(runtimeTypes, MethodIds, SignaturesByMethodId, PrintfMethodId, Target);
 
         internal static RegisterBytecodeSyntheticRuntime CreateSyntheticRuntime(
             IReadOnlyDictionary<FunctionSymbol, int> methodIds,
             IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId,
             int entryPc,
-            int printfMethodId)
+            int printfMethodId,
+            TargetInfo? target = null)
         {
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
             var stdModule = new RuntimeModule(
@@ -52,7 +56,7 @@ namespace Cnidaria.C
             modules.Add(stdModule.Name, stdModule);
 
             var runtimeTypes = new RuntimeTypeSystem(modules);
-            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId);
+            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId, target ?? TargetInfo.RegisterBytecode);
             return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryPc);
         }
 
@@ -60,7 +64,8 @@ namespace Cnidaria.C
             RuntimeTypeSystem runtimeTypes,
             IReadOnlyDictionary<FunctionSymbol, int> methodIds,
             IReadOnlyDictionary<int, FunctionType?> signaturesByMethodId,
-            int printfMethodId)
+            int printfMethodId,
+            TargetInfo? target = null)
         {
             if (runtimeTypes is null)
                 throw new ArgumentNullException(nameof(runtimeTypes));
@@ -68,6 +73,7 @@ namespace Cnidaria.C
                 throw new ArgumentNullException(nameof(methodIds));
             if (signaturesByMethodId is null)
                 throw new ArgumentNullException(nameof(signaturesByMethodId));
+            target ??= TargetInfo.RegisterBytecode;
 
             var cProgramType = runtimeTypes.RegisterSyntheticType("c", "__c", "Program", RuntimeTypeKind.Class);
             foreach (var pair in signaturesByMethodId.OrderBy(static p => p.Key))
@@ -81,10 +87,10 @@ namespace Cnidaria.C
                 var signature = pair.Value;
                 var returnType = signature is null
                     ? GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.Int)
-                    : MapRuntimeType(runtimeTypes, signature.ReturnType);
+                    : MapRuntimeType(runtimeTypes, signature.ReturnType, target);
                 var parameters = signature is null
                     ? Array.Empty<RuntimeType>()
-                    : signature.Parameters.Select(p => MapRuntimeType(runtimeTypes, p.Type)).ToArray();
+                    : signature.Parameters.Select(p => MapRuntimeType(runtimeTypes, p.Type, target)).ToArray();
 
                 var name = methodIds.FirstOrDefault(m => m.Value == pair.Key).Key?.Name ?? $"fn_{pair.Key.ToString(CultureInfo.InvariantCulture)}";
                 runtimeTypes.RegisterSyntheticStaticMethod(cProgramType, name, returnType, parameters, implFlags: 0, methodId: pair.Key);
@@ -120,19 +126,22 @@ namespace Cnidaria.C
             runtimeTypes.RegisterSyntheticStaticMethod(console, "_Write", voidType, new[] { bytePointer }, InternalCallImplFlag, methodId);
         }
 
-        private static RuntimeType MapRuntimeType(RuntimeTypeSystem runtimeTypes, QualifiedType type)
+        private static RuntimeType MapRuntimeType(RuntimeTypeSystem runtimeTypes, QualifiedType type, TargetInfo target)
         {
             if (type.Type is BuiltinType builtin)
                 return GetRuntimePrimitive(runtimeTypes, builtin.BuiltinKind);
 
             if (type.Type is PointerType pointer)
-                return runtimeTypes.GetPointerType(MapRuntimeType(runtimeTypes, pointer.PointeeType));
+                return runtimeTypes.GetPointerType(MapRuntimeType(runtimeTypes, pointer.PointeeType, target));
 
             if (type.Type is ArrayType array)
-                return runtimeTypes.GetPointerType(MapRuntimeType(runtimeTypes, array.ElementType));
+                return runtimeTypes.GetPointerType(MapRuntimeType(runtimeTypes, array.ElementType, target));
 
             if (type.Type is FunctionType)
                 return runtimeTypes.GetPointerType(GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.Void));
+
+            if (CAbi.IsAggregate(type))
+                return GetRuntimeAggregate(runtimeTypes, type, target);
 
             return GetRuntimePrimitive(runtimeTypes, BuiltinTypeKind.Int);
         }
@@ -175,6 +184,39 @@ namespace Cnidaria.C
             type.AlignOf = Math.Max(1, Math.Min(Math.Max(1, size), 8));
             return type;
         }
+
+        private static RuntimeType GetRuntimeAggregate(RuntimeTypeSystem runtimeTypes, QualifiedType type, TargetInfo target)
+        {
+            var size = Math.Max(1, target.SizeOf(type));
+            var align = Math.Max(1, target.AlignOf(type));
+            var name = BuildSyntheticAggregateTypeName(type, size, align);
+            var runtimeType = runtimeTypes.RegisterSyntheticType("c", "__c.abi", name, RuntimeTypeKind.Struct);
+            runtimeType.PrimitiveKind = RuntimePrimitiveKind.None;
+            runtimeType.SizeOf = size;
+            runtimeType.AlignOf = align;
+            runtimeType.InstanceSize = size;
+            runtimeType.StaticSize = 0;
+            runtimeType.StaticAlign = 1;
+            runtimeType.ContainsGcPointers = false;
+            runtimeType.GcPointerOffsets = Array.Empty<int>();
+            runtimeType.InstanceFields = Array.Empty<RuntimeField>();
+            return runtimeType;
+        }
+
+        private static string BuildSyntheticAggregateTypeName(QualifiedType type, int size, int align)
+        {
+            var display = type.ToDisplayString();
+            uint hash = 2166136261u;
+            for (var i = 0; i < display.Length; i++)
+            {
+                hash ^= display[i];
+                hash *= 16777619u;
+            }
+
+            return "agg_" + hash.ToString("X8", CultureInfo.InvariantCulture)
+                + "_s" + size.ToString(CultureInfo.InvariantCulture)
+                + "_a" + align.ToString(CultureInfo.InvariantCulture);
+        }
     }
 
     public sealed class RegisterBytecodeCodeGenerator
@@ -216,6 +258,9 @@ namespace Cnidaria.C
 
         private RegisterBytecodeProgram Generate()
         {
+            if (_target.Architecture != TargetArchitectureKind.RegisterBytecode)
+                throw new NotSupportedException($"Register-bytecode C backend cannot emit target architecture '{_target.Architecture}'. Use TargetInfo.RegisterBytecode for this backend.");
+
             if (_target.PointerSize != TargetArchitecture.PointerSize)
                 throw new NotSupportedException($"Register-bytecode C backend currently supports only the VM native pointer size ({TargetArchitecture.PointerSize.ToString(CultureInfo.InvariantCulture)} bytes).");
 
@@ -235,7 +280,7 @@ namespace Cnidaria.C
             var image = _assembler.Build(flags, validate: true);
             image = PatchFunctionPointerFixups(image);
             var entryPc = ResolveMethodEntryPc(image, entryMethodId);
-            return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures);
+            return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures, _target);
         }
 
         private void IndexMethods()
@@ -271,7 +316,7 @@ namespace Cnidaria.C
 
         private void CreateSyntheticRuntimeForEmission()
         {
-            _syntheticRuntime = RegisterBytecodeProgram.CreateSyntheticRuntime(_methodIds, _signatures, entryPc: 0, printfMethodId: PrintfMethodId);
+            _syntheticRuntime = RegisterBytecodeProgram.CreateSyntheticRuntime(_methodIds, _signatures, entryPc: 0, printfMethodId: PrintfMethodId, target: _target);
             _runtimeTypes = _syntheticRuntime.RuntimeTypes;
             _runtimeMethodsById.Clear();
 
@@ -416,8 +461,10 @@ namespace Cnidaria.C
             private readonly LirFunction _function;
             private readonly AllocationResult _allocation;
             private readonly IReadOnlyDictionary<LirBlock, Label> _labels;
+            private readonly Dictionary<LirBlock, LirBlock?> _nextBlocks;
             private readonly Assembler _asm;
             private readonly ParameterState _parameters = new ParameterState();
+            private LirBlock? _currentBlock;
 
             public FunctionEmissionContext(
                 RegisterBytecodeCodeGenerator owner,
@@ -430,6 +477,27 @@ namespace Cnidaria.C
                 _allocation = allocation;
                 _labels = labels;
                 _asm = owner._assembler;
+                _nextBlocks = BuildNextBlockMap(function);
+
+                var returnType = function.Symbol?.FunctionType?.ReturnType ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
+                if (CAbi.RequiresHiddenReturnBuffer(owner._target, returnType))
+                {
+                    var cursor = new AbiCursor();
+                    _ = CAbi.AssignHiddenReturnBufferLocation(owner._target, ref cursor, owner._allocationOptions.StackArgumentSlotSize);
+                    SyncParameterState(cursor);
+                }
+            }
+
+            private static Dictionary<LirBlock, LirBlock?> BuildNextBlockMap(LirFunction function)
+            {
+                var result = new Dictionary<LirBlock, LirBlock?>();
+                for (var i = 0; i < function.Blocks.Length; i++)
+                {
+                    var next = i + 1 < function.Blocks.Length ? function.Blocks[i + 1] : null;
+                    result.Add(function.Blocks[i], next);
+                }
+
+                return result;
             }
 
             public void EmitPrologue()
@@ -442,6 +510,9 @@ namespace Cnidaria.C
                     EmitMem(Op.StPtr, VarArgsRegister, MachineRegister.Invalid, frame.VarArgsPointerOffset,
                         MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
 
+                if (frame.HasHiddenReturnBuffer)
+                    StoreIncomingHiddenReturnBufferAddress(frame.HiddenReturnBufferOffset);
+
                 foreach (var pair in frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
                 {
                     var op = IsFloatRegister(pair.Key) ? Op.StF64 : Op.StI8;
@@ -449,14 +520,41 @@ namespace Cnidaria.C
                 }
             }
 
+            private void StoreIncomingHiddenReturnBufferAddress(int frameOffset)
+            {
+                var cursor = new AbiCursor();
+                var location = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                if (location.Kind == AbiLocationKind.Register)
+                {
+                    EmitMem(Op.StPtr, location.Register, MachineRegister.Invalid, frameOffset,
+                        MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                    return;
+                }
+
+                if (location.Kind == AbiLocationKind.Stack)
+                {
+                    EmitMem(Op.LdPtr, GpScratch0, MachineRegister.Invalid,
+                        location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
+                        MachineRegister.Invalid, MemoryBase.ThreadPointer, _owner._target.PointerAlignment);
+                    EmitMem(Op.StPtr, GpScratch0, MachineRegister.Invalid, frameOffset,
+                        MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                    return;
+                }
+
+                throw new InvalidOperationException("Invalid hidden return buffer ABI location.");
+            }
+
             public void EmitBlocks()
             {
                 foreach (var block in _function.Blocks)
                 {
+                    _currentBlock = block;
                     _asm.Bind(_labels[block]);
                     foreach (var instruction in block.Instructions)
                         EmitInstruction(instruction);
                 }
+
+                _currentBlock = null;
             }
 
             public void EmitImplicitFallthroughTrap()
@@ -528,7 +626,8 @@ namespace Cnidaria.C
                         break;
 
                     case LirInstructionKind.Jump:
-                        _asm.J(LabelOf(instruction.Target));
+                        if (!IsFallthroughTarget(instruction.Target))
+                            _asm.J(LabelOf(instruction.Target));
                         break;
 
                     case LirInstructionKind.Branch:
@@ -557,36 +656,62 @@ namespace Cnidaria.C
                 if (instruction.Result is null)
                     return;
 
-                var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var type = instruction.Result.Type;
-                var cls = RegisterClassOf(ClassifyValue(type));
-                if (cls == AbiRegisterClass.Floating)
+                var value = CAbi.ClassifyValue(_owner._target, type);
+                var cursor = ToAbiCursor(_parameters);
+
+                if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
-                    if (_parameters.Float < 8)
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                    for (var i = 0; i < value.Segments.Length; i++)
                     {
-                        MoveRegister(destination, (MachineRegister)((int)MachineRegister.F10 + _parameters.Float));
-                        _parameters.Float++;
+                        var segment = value.Segments[i];
+                        var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                        if (loc.Kind == AbiLocationKind.Register)
+                        {
+                            EmitStoreRawBitsToAddress(loc.Register, destinationAddress, segment.Offset, segment.Size);
+                        }
+                        else if (loc.Kind == AbiLocationKind.Stack)
+                        {
+                            EmitLoadRawBitsFromMemory(GpScratch1, MachineRegister.Invalid, loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), MemoryBase.ThreadPointer, segment.Size);
+                            EmitStoreRawBitsToAddress(GpScratch1, destinationAddress, segment.Offset, segment.Size);
+                        }
+                        else
+                        {
+                            throw Unsupported(instruction, "Invalid aggregate parameter ABI location.");
+                        }
                     }
-                    else
-                    {
-                        EmitMem(LoadOpForType(type), destination, MachineRegister.Invalid, checked(_parameters.Stack * 8), MachineRegister.Invalid, MemoryBase.ThreadPointer, AlignmentOf(type));
-                        _parameters.Stack++;
-                    }
+
+                    SyncParameterState(cursor);
+                    return;
+                }
+
+                if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(type))
+                {
+                    var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                    MaterializeIncomingStackAddress(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), GpScratch1);
+                    EmitRaw(Op.CpBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: value.Size);
+                    SyncParameterState(cursor);
+                    return;
+                }
+
+                var scalarLocation = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+                if (scalarLocation.Kind == AbiLocationKind.Register)
+                {
+                    MoveRegister(destination, scalarLocation.Register);
+                }
+                else if (scalarLocation.Kind == AbiLocationKind.Stack)
+                {
+                    EmitMem(LoadOpForType(type), destination, MachineRegister.Invalid, scalarLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), MachineRegister.Invalid, MemoryBase.ThreadPointer, AlignmentOf(type));
                 }
                 else
                 {
-                    if (_parameters.Integer < 8)
-                    {
-                        MoveRegister(destination, (MachineRegister)((int)MachineRegister.X10 + _parameters.Integer));
-                        _parameters.Integer++;
-                    }
-                    else
-                    {
-                        EmitMem(LoadOpForType(type), destination, MachineRegister.Invalid, checked(_parameters.Stack * 8), MachineRegister.Invalid, MemoryBase.ThreadPointer, AlignmentOf(type));
-                        _parameters.Stack++;
-                    }
+                    throw Unsupported(instruction, "Invalid scalar parameter ABI location.");
                 }
 
+                SyncParameterState(cursor);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
 
@@ -597,6 +722,12 @@ namespace Cnidaria.C
                 if (instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Copy-like instruction has no source operand.");
 
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    EmitAggregateCopyToRegisterStorage(instruction.Result, instruction.Operands[0], instruction);
+                    return;
+                }
+
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 LoadOperandInto(instruction.Operands[0], destination);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
@@ -606,6 +737,14 @@ namespace Cnidaria.C
             {
                 if (instruction.Result is null)
                     return;
+
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                    _asm.LiI32(GpScratch1, 0);
+                    EmitRaw(Op.InitBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(instruction.Result.Type)));
+                    return;
+                }
 
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 if (IsFloatType(instruction.Result.Type))
@@ -678,11 +817,118 @@ namespace Cnidaria.C
                 var rightType = instruction.Operands[1].Type;
                 var usesFloatingOperands = IsFloatType(leftType) || IsFloatType(rightType);
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+                var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
+                if (!usesFloatingOperands && TryEmitBinaryImmediate(instruction, dst, op))
+                {
+                    StoreWritableRegisterIfSpilled(instruction.Result, dst);
+                    return;
+                }
+
                 var left = LoadOperand(instruction.Operands[0], usesFloatingOperands ? FpScratch1 : GpScratch1);
                 var right = LoadOperand(instruction.Operands[1], usesFloatingOperands ? FpScratch2 : GpScratch2);
-                var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
                 EmitRaw(op, dst, left, right, MayThrow(op));
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
+            }
+
+            private bool TryEmitBinaryImmediate(LirInstruction instruction, MachineRegister destination, Op binaryOp)
+            {
+                if (instruction.Operands.Length != 2 || instruction.Operands[1].Kind != LirOperandKind.Immediate)
+                    return false;
+
+                if (!TrySelectBinaryImmediateOp(binaryOp, out var immediateOp))
+                    return false;
+
+                if (!TryGetIntegerImmediate(instruction.Operands[1].Immediate, out var immediate))
+                    return false;
+
+                var left = LoadOperand(instruction.Operands[0], GpScratch1);
+                EmitI64Imm(immediateOp, destination, left, immediate);
+                return true;
+            }
+
+            private static bool TrySelectBinaryImmediateOp(Op binaryOp, out Op immediateOp)
+            {
+                switch (binaryOp)
+                {
+                    case Op.I32Add: immediateOp = Op.I32AddImm; return true;
+                    case Op.I32Sub: immediateOp = Op.I32SubImm; return true;
+                    case Op.I32Mul: immediateOp = Op.I32MulImm; return true;
+                    case Op.I32And: immediateOp = Op.I32AndImm; return true;
+                    case Op.I32Or: immediateOp = Op.I32OrImm; return true;
+                    case Op.I32Xor: immediateOp = Op.I32XorImm; return true;
+                    case Op.I32Shl: immediateOp = Op.I32ShlImm; return true;
+                    case Op.I32Shr: immediateOp = Op.I32ShrImm; return true;
+                    case Op.U32Shr: immediateOp = Op.U32ShrImm; return true;
+                    case Op.I32Eq: immediateOp = Op.I32EqImm; return true;
+                    case Op.I32Ne: immediateOp = Op.I32NeImm; return true;
+                    case Op.I32Lt: immediateOp = Op.I32LtImm; return true;
+                    case Op.I32Le: immediateOp = Op.I32LeImm; return true;
+                    case Op.I32Gt: immediateOp = Op.I32GtImm; return true;
+                    case Op.I32Ge: immediateOp = Op.I32GeImm; return true;
+                    case Op.U32Lt: immediateOp = Op.U32LtImm; return true;
+                    case Op.I64Add: immediateOp = Op.I64AddImm; return true;
+                    case Op.I64Sub: immediateOp = Op.I64SubImm; return true;
+                    case Op.I64Mul: immediateOp = Op.I64MulImm; return true;
+                    case Op.I64And: immediateOp = Op.I64AndImm; return true;
+                    case Op.I64Or: immediateOp = Op.I64OrImm; return true;
+                    case Op.I64Xor: immediateOp = Op.I64XorImm; return true;
+                    case Op.I64Shl: immediateOp = Op.I64ShlImm; return true;
+                    case Op.I64Shr: immediateOp = Op.I64ShrImm; return true;
+                    case Op.U64Shr: immediateOp = Op.U64ShrImm; return true;
+                    case Op.I64Eq: immediateOp = Op.I64EqImm; return true;
+                    case Op.I64Ne: immediateOp = Op.I64NeImm; return true;
+                    case Op.I64Lt: immediateOp = Op.I64LtImm; return true;
+                    case Op.I64Le: immediateOp = Op.I64LeImm; return true;
+                    case Op.I64Gt: immediateOp = Op.I64GtImm; return true;
+                    case Op.I64Ge: immediateOp = Op.I64GeImm; return true;
+                    case Op.U64Lt: immediateOp = Op.U64LtImm; return true;
+                    default:
+                        immediateOp = Op.Invalid;
+                        return false;
+                }
+            }
+
+            private static bool TryGetIntegerImmediate(object? value, out long immediate)
+            {
+                switch (value)
+                {
+                    case null:
+                        immediate = 0;
+                        return true;
+                    case bool b:
+                        immediate = b ? 1 : 0;
+                        return true;
+                    case byte b:
+                        immediate = b;
+                        return true;
+                    case sbyte s:
+                        immediate = s;
+                        return true;
+                    case short s:
+                        immediate = s;
+                        return true;
+                    case ushort u:
+                        immediate = u;
+                        return true;
+                    case int i:
+                        immediate = i;
+                        return true;
+                    case uint u:
+                        immediate = u;
+                        return true;
+                    case long l:
+                        immediate = l;
+                        return true;
+                    case ulong u when u <= long.MaxValue:
+                        immediate = (long)u;
+                        return true;
+                    case char c:
+                        immediate = c;
+                        return true;
+                    default:
+                        immediate = 0;
+                        return false;
+                }
             }
 
             private bool TryEmitPointerBinary(LirInstruction instruction)
@@ -776,6 +1022,14 @@ namespace Cnidaria.C
                 if (instruction.Result is null || instruction.Address is null)
                     throw Unsupported(instruction, "Invalid load instruction.");
 
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                    MaterializeAddress(instruction.Address, GpScratch1);
+                    EmitRaw(Op.CpBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(instruction.Result.Type)));
+                    return;
+                }
+
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
                 EmitMem(LoadOpForType(instruction.Result.Type), dst, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind,
@@ -789,6 +1043,16 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Invalid store instruction.");
 
                 var storeType = instruction.Address.ElementType;
+                if (IsAggregateType(storeType))
+                {
+                    if (instruction.Operands.Length == 0)
+                        throw Unsupported(instruction, "Aggregate store has no source operand.");
+                    MaterializeAddress(instruction.Address, GpScratch0);
+                    MaterializeOperandStorageAddress(instruction.Operands[0], GpScratch1, instruction);
+                    EmitRaw(Op.CpBlk, GpScratch0, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(storeType)));
+                    return;
+                }
+
                 var src = LoadOperand(instruction.Operands[0], IsFloatType(instruction.Operands[0].Type) ? FpScratch0 : GpScratch0);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
                 EmitMem(StoreOpForType(storeType), src, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(storeType), parts.ScaleLog2);
@@ -820,19 +1084,21 @@ namespace Cnidaria.C
                         return;
                     }
 
+                    var directCallFlags = BuildCallFlags(instruction);
                     MarshalCallArguments(instruction, startOperand: 1);
                     PrepareVariadicCall(instruction);
                     var directCallOp = CallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void), isInternal: false);
-                    EmitManagedDirectCall(directCallOp, methodId, CallFlags.None);
+                    EmitManagedDirectCall(directCallOp, methodId, directCallFlags);
                     EmitCallResult(instruction);
                     return;
                 }
 
+                var indirectCallFlags = BuildCallFlags(instruction);
                 MarshalCallArguments(instruction, startOperand: 1);
                 PrepareVariadicCall(instruction);
                 var target = LoadOperand(callee, GpScratch0);
                 var indirectCallOp = IndirectCallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void));
-                EmitRawIndirectCall(indirectCallOp, target, CallFlags.None);
+                EmitRawIndirectCall(indirectCallOp, target, indirectCallFlags);
                 EmitCallResult(instruction);
             }
 
@@ -840,6 +1106,20 @@ namespace Cnidaria.C
             {
                 if (instruction.Result is null)
                     return;
+
+                var value = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, isReturn: true);
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    if (value.PassingKind == AbiPassingKind.Indirect)
+                    {
+                        // The callee wrote directly into the hidden return buffer
+                        return;
+                    }
+
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                    EmitRaw(Op.CpBlk, destinationAddress, MachineRegisters.ReturnValue0, MachineRegister.Invalid, imm: Math.Max(1, value.Size));
+                    return;
+                }
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var ret = RegisterClassOf(ClassifyValue(instruction.Result.Type)) == AbiRegisterClass.Floating ? MachineRegister.F10 : MachineRegister.X10;
@@ -907,6 +1187,8 @@ namespace Cnidaria.C
                 for (var i = 0; i < variadicCount; i++)
                 {
                     var operand = instruction.Operands[firstVariadicOperand + i];
+                    if (IsAggregateType(operand.Type))
+                        throw Unsupported(instruction, "Aggregate variadic arguments are not supported yet.");
                     var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch0 : GpScratch0);
                     EmitMem(StoreOpForType(operand.Type), source, MachineRegister.Invalid,
                         checked(baseOffset + i * _owner._allocationOptions.StackArgumentSlotSize), MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
@@ -916,71 +1198,51 @@ namespace Cnidaria.C
             }
             private int CountStackArgumentSlots(LirInstruction instruction, int startOperand)
             {
-                var integer = 0;
-                var floating = 0;
-                var stack = 0;
-
-                for (var i = startOperand; i < instruction.Operands.Length; i++)
-                {
-                    var operand = instruction.Operands[i];
-                    var cls = RegisterClassOf(ClassifyValue(operand.Type));
-                    if (cls == AbiRegisterClass.Floating)
-                    {
-                        if (floating++ >= 8)
-                            stack++;
-                    }
-                    else
-                    {
-                        if (integer++ >= 8)
-                            stack++;
-                    }
-                }
-
-                return stack;
+                var bytes = CAbi.ComputeOutgoingArgumentAreaSize(
+                    instruction,
+                    startOperand,
+                    _owner._target,
+                    _owner._allocationOptions.StackArgumentSlotSize,
+                    includeVariadicHomeArea: false);
+                return CAbi.SlotsFor(bytes, _owner._allocationOptions.StackArgumentSlotSize);
             }
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
             {
-                var integer = 0;
-                var floating = 0;
-                var stack = 0;
-
+                var cursor = new AbiCursor();
+                MarshalHiddenReturnBufferArgument(instruction, ref cursor);
                 for (var i = startOperand; i < instruction.Operands.Length; i++)
+                    MarshalCallArgument(instruction, instruction.Operands[i], ref cursor);
+            }
+
+            private CallFlags BuildCallFlags(LirInstruction instruction)
+            {
+                if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
+                    return CallFlags.HiddenReturnBuffer;
+                return CallFlags.None;
+            }
+
+            private void MarshalHiddenReturnBufferArgument(LirInstruction instruction, ref AbiCursor cursor)
+            {
+                if (instruction.Result is null || !CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
+                    return;
+
+                var location = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var address = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
+                if (location.Kind == AbiLocationKind.Register)
                 {
-                    var operand = instruction.Operands[i];
-                    var cls = RegisterClassOf(ClassifyValue(operand.Type));
-                    if (cls == AbiRegisterClass.Floating)
-                    {
-                        if (floating < 8)
-                        {
-                            var target = (MachineRegister)((int)MachineRegister.F10 + floating++);
-                            LoadOperandInto(operand, target);
-                        }
-                        else
-                        {
-                            var src = LoadOperand(operand, FpScratch0);
-                            EmitMem(StoreOpForType(operand.Type), src, MachineRegister.Invalid,
-                                checked(_allocation.Frame.OutgoingArgumentAreaOffset + stack * 8),
-                                MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
-                            stack++;
-                        }
-                    }
-                    else
-                    {
-                        if (integer < 8)
-                        {
-                            var target = (MachineRegister)((int)MachineRegister.X10 + integer++);
-                            LoadOperandInto(operand, target);
-                        }
-                        else
-                        {
-                            var src = LoadOperand(operand, GpScratch0);
-                            EmitMem(StoreOpForType(operand.Type), src, MachineRegister.Invalid,
-                                checked(_allocation.Frame.OutgoingArgumentAreaOffset + stack * 8),
-                                MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
-                            stack++;
-                        }
-                    }
+                    MoveRegister(location.Register, address);
+                    return;
                 }
+
+                if (location.Kind == AbiLocationKind.Stack)
+                {
+                    EmitMem(Op.StPtr, address, MachineRegister.Invalid,
+                        checked(_allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                        MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                    return;
+                }
+
+                throw Unsupported(instruction, "Invalid hidden return buffer ABI location.");
             }
 
             private void EmitBranch(LirInstruction instruction)
@@ -988,7 +1250,10 @@ namespace Cnidaria.C
                 if (instruction.Operands.Length != 1)
                     throw Unsupported(instruction, "Branch expects one condition operand.");
 
+                var trueFallsThrough = IsFallthroughTarget(instruction.TrueTarget);
+                var falseFallsThrough = IsFallthroughTarget(instruction.FalseTarget);
                 var type = instruction.Operands[0].Type;
+
                 if (IsFloatType(type))
                 {
                     if (IsLongDouble(type))
@@ -996,14 +1261,37 @@ namespace Cnidaria.C
 
                     var condf = LoadOperand(instruction.Operands[0], FpScratch0);
                     EmitLiFloat(FpScratch1, 0.0, type);
+
+                    if (trueFallsThrough && !falseFallsThrough)
+                    {
+                        _asm.Branch(IsFloat32(type) ? Op.BrF32Eq : Op.BrF64Eq, condf, FpScratch1, LabelOf(instruction.FalseTarget));
+                        return;
+                    }
+
                     _asm.Branch(IsFloat32(type) ? Op.BrF32Ne : Op.BrF64Ne, condf, FpScratch1, LabelOf(instruction.TrueTarget));
-                    _asm.J(LabelOf(instruction.FalseTarget));
+                    if (!falseFallsThrough)
+                        _asm.J(LabelOf(instruction.FalseTarget));
                     return;
                 }
 
                 var cond = LoadOperand(instruction.Operands[0], GpScratch0);
-                _asm.Branch(Is64BitInteger(type) || IsPointerLike(type) ? Op.BrTrueI64 : Op.BrTrueI32, cond, LabelOf(instruction.TrueTarget));
-                _asm.J(LabelOf(instruction.FalseTarget));
+                if (trueFallsThrough && !falseFallsThrough)
+                {
+                    _asm.Branch(BranchOpForTruth(type, branchIfTrue: false), cond, LabelOf(instruction.FalseTarget));
+                    return;
+                }
+
+                _asm.Branch(BranchOpForTruth(type, branchIfTrue: true), cond, LabelOf(instruction.TrueTarget));
+                if (!falseFallsThrough)
+                    _asm.J(LabelOf(instruction.FalseTarget));
+            }
+
+            private Op BranchOpForTruth(QualifiedType type, bool branchIfTrue)
+            {
+                if (Is64BitInteger(type) || IsPointerLike(type))
+                    return branchIfTrue ? Op.BrTrueI64 : Op.BrFalseI64;
+
+                return branchIfTrue ? Op.BrTrueI32 : Op.BrFalseI32;
             }
 
             private void EmitSwitch(LirInstruction instruction)
@@ -1031,34 +1319,51 @@ namespace Cnidaria.C
                         _asm.SwitchI32(key, first, count);
                 }
 
-                _asm.J(LabelOf(instruction.Target));
+                if (!IsFallthroughTarget(instruction.Target))
+                    _asm.J(LabelOf(instruction.Target));
             }
 
             private void EmitReturn(LirInstruction instruction)
             {
-                if (instruction.Operands.Length != 0)
-                {
-                    var operand = instruction.Operands[0];
-                    if (RegisterClassOf(ClassifyValue(operand.Type)) == AbiRegisterClass.Floating)
-                        LoadOperandInto(operand, MachineRegister.F10);
-                    else
-                        LoadOperandInto(operand, MachineRegister.X10);
-                }
-
-                EmitEpilogue();
-
                 if (instruction.Operands.Length == 0 || IsVoid(instruction.Operands[0].Type))
                 {
+                    EmitEpilogue();
                     _asm.RetVoid();
+                    return;
                 }
-                else if (RegisterClassOf(ClassifyValue(instruction.Operands[0].Type)) == AbiRegisterClass.Floating)
+
+                var operand = instruction.Operands[0];
+                if (IsAggregateType(operand.Type))
                 {
+                    var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: true);
+                    MaterializeOperandStorageAddress(operand, GpScratch0, instruction);
+                    var sourceAddress = GpScratch0;
+
+                    if (value.PassingKind == AbiPassingKind.Indirect)
+                    {
+                        MaterializeIncomingHiddenReturnBufferAddress(GpScratch1);
+                        EmitRaw(Op.CpBlk, GpScratch1, sourceAddress, MachineRegister.Invalid, imm: Math.Max(1, value.Size));
+                        EmitEpilogue();
+                        _asm.RetVoid();
+                        return;
+                    }
+
+                    EmitEpilogue();
+                    _asm.RetValue(sourceAddress, Math.Max(1, value.Size));
+                    return;
+                }
+
+                if (RegisterClassOf(ClassifyValue(operand.Type)) == AbiRegisterClass.Floating)
+                {
+                    LoadOperandInto(operand, MachineRegister.F10);
+                    EmitEpilogue();
                     _asm.RetF(MachineRegister.F10);
+                    return;
                 }
-                else
-                {
-                    _asm.RetI(MachineRegister.X10);
-                }
+
+                LoadOperandInto(operand, MachineRegister.X10);
+                EmitEpilogue();
+                _asm.RetI(MachineRegister.X10);
             }
 
             private void EmitEpilogue()
@@ -1079,38 +1384,223 @@ namespace Cnidaria.C
                 if (instruction.ParallelCopies.Length == 0)
                     return;
 
-                var physicalCopies = ImmutableArray.CreateBuilder<LirParallelCopy>(instruction.ParallelCopies.Length);
+                var physicalCopiesBuilder = ImmutableArray.CreateBuilder<LirParallelCopy>(instruction.ParallelCopies.Length);
                 foreach (var copy in instruction.ParallelCopies)
                 {
                     if (RequiresPhysicalParallelCopy(copy))
-                        physicalCopies.Add(copy);
+                        physicalCopiesBuilder.Add(copy);
                 }
-                if (physicalCopies.Count == 0)
+
+                if (physicalCopiesBuilder.Count == 0)
                     return;
-                if (_allocation.Frame.ParallelCopyTempSize < physicalCopies.Count * 8)
+
+                var physicalCopies = physicalCopiesBuilder.ToImmutable();
+                if (TryEmitDirectParallelCopies(physicalCopies, instruction))
+                    return;
+
+                EmitParallelCopyThroughTemporaries(physicalCopies, instruction);
+            }
+
+            private bool TryEmitDirectParallelCopies(ImmutableArray<LirParallelCopy> copies, LirInstruction instruction)
+            {
+                if (copies.Length == 1)
+                {
+                    EmitDirectParallelCopy(copies[0], instruction);
+                    return true;
+                }
+
+                foreach (var copy in copies)
+                {
+                    if (IsAggregateType(copy.Destination.Type))
+                        return false;
+                }
+
+                if (HasPhysicalStorageClobber(copies))
+                    return false;
+
+                foreach (var copy in copies)
+                    EmitDirectParallelCopy(copy, instruction);
+
+                return true;
+            }
+
+            private bool HasPhysicalStorageClobber(ImmutableArray<LirParallelCopy> copies)
+            {
+                for (var i = 0; i < copies.Length; i++)
+                {
+                    var hasDestinationRegister = TryGetDestinationPhysicalRegister(copies[i].Destination, out var destinationRegister);
+                    var hasDestinationStackOffset = TryGetDestinationStackOffset(copies[i].Destination, out var destinationStackOffset);
+                    if (!hasDestinationRegister && !hasDestinationStackOffset)
+                        continue;
+
+                    for (var j = 0; j < copies.Length; j++)
+                    {
+                        if (i == j && ReferencesSamePhysicalStorage(copies[j].Source, copies[i].Destination))
+                            continue;
+
+                        if (hasDestinationRegister &&
+                            TryGetOperandPhysicalRegister(copies[j].Source, out var sourceRegister) &&
+                            sourceRegister == destinationRegister)
+                        {
+                            return true;
+                        }
+
+                        if (hasDestinationStackOffset &&
+                            TryGetOperandStackOffset(copies[j].Source, out var sourceStackOffset) &&
+                            sourceStackOffset == destinationStackOffset)
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+
+            private void EmitDirectParallelCopy(LirParallelCopy copy, LirInstruction instruction)
+            {
+                if (!RequiresPhysicalParallelCopy(copy))
+                    return;
+
+                if (ReferencesSamePhysicalStorage(copy.Source, copy.Destination))
+                    return;
+
+                if (IsAggregateType(copy.Destination.Type))
+                {
+                    EmitAggregateCopyToRegisterStorage(copy.Destination, copy.Source, instruction);
+                    return;
+                }
+
+                var destination = GetWritableRegister(copy.Destination, GpScratch0, FpScratch0);
+                LoadOperandInto(copy.Source, destination);
+                StoreWritableRegisterIfSpilled(copy.Destination, destination);
+            }
+
+            private bool ReferencesSamePhysicalStorage(LirOperand source, LirVirtualRegister destination)
+            {
+                if (source.Kind != LirOperandKind.Register || source.Register is null)
+                    return false;
+
+                if (!_allocation.TryGetAllocation(source.Register, out var sourceAllocation) ||
+                    !_allocation.TryGetAllocation(destination, out var destinationAllocation))
+                {
+                    return false;
+                }
+
+                if (!sourceAllocation.IsSpilled && !destinationAllocation.IsSpilled)
+                    return sourceAllocation.PhysicalRegister == destinationAllocation.PhysicalRegister;
+
+                if (sourceAllocation.IsSpilled && destinationAllocation.IsSpilled)
+                    return sourceAllocation.StackOffset == destinationAllocation.StackOffset;
+
+                return false;
+            }
+
+            private bool TryGetDestinationPhysicalRegister(LirVirtualRegister destination, out MachineRegister register)
+            {
+                register = MachineRegister.Invalid;
+                if (!_allocation.TryGetAllocation(destination, out var allocation) || allocation.IsSpilled)
+                    return false;
+
+                register = allocation.PhysicalRegister;
+                return register != MachineRegister.Invalid;
+            }
+
+            private bool TryGetOperandPhysicalRegister(LirOperand operand, out MachineRegister register)
+            {
+                register = MachineRegister.Invalid;
+                if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                    return false;
+
+                if (!_allocation.TryGetAllocation(operand.Register, out var allocation) || allocation.IsSpilled)
+                    return false;
+
+                register = allocation.PhysicalRegister;
+                return register != MachineRegister.Invalid;
+            }
+
+            private bool TryGetDestinationStackOffset(LirVirtualRegister destination, out int stackOffset)
+            {
+                stackOffset = -1;
+                if (!_allocation.TryGetAllocation(destination, out var allocation) || !allocation.IsSpilled)
+                    return false;
+
+                stackOffset = allocation.StackOffset;
+                return stackOffset >= 0;
+            }
+
+            private bool TryGetOperandStackOffset(LirOperand operand, out int stackOffset)
+            {
+                stackOffset = -1;
+                if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                    return false;
+
+                if (!_allocation.TryGetAllocation(operand.Register, out var allocation) || !allocation.IsSpilled)
+                    return false;
+
+                stackOffset = allocation.StackOffset;
+                return stackOffset >= 0;
+            }
+
+            private void EmitParallelCopyThroughTemporaries(ImmutableArray<LirParallelCopy> physicalCopies, LirInstruction instruction)
+            {
+                var tempOffsets = new int[physicalCopies.Length];
+                var tempCursor = 0;
+                for (var i = 0; i < physicalCopies.Length; i++)
+                {
+                    tempOffsets[i] = tempCursor;
+                    tempCursor = checked(tempCursor + ParallelCopyTempSlotSize(physicalCopies[i]));
+                }
+
+                if (_allocation.Frame.ParallelCopyTempSize < tempCursor)
                     throw Unsupported(instruction, "Parallel-copy temporary area was not reserved.");
 
-                for (var i = 0; i < physicalCopies.Count; i++)
+                for (var i = 0; i < physicalCopies.Length; i++)
                 {
                     var copy = physicalCopies[i];
+                    var tempOffset = checked(_allocation.Frame.ParallelCopyTempOffset + tempOffsets[i]);
+                    if (IsAggregateType(copy.Destination.Type))
+                    {
+                        MaterializeOperandStorageAddress(copy.Source, GpScratch1, instruction);
+                        EmitI64Imm(Op.I64AddImm, GpScratch0, Sp, tempOffset);
+                        EmitRaw(Op.CpBlk, GpScratch0, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(copy.Destination.Type)));
+                        continue;
+                    }
+
                     var isFloat = IsFloatType(copy.Destination.Type);
                     var src = LoadOperand(copy.Source, isFloat ? FpScratch0 : GpScratch0);
                     EmitMem(isFloat ? Op.StF64 : Op.StI8, src, MachineRegister.Invalid,
-                        checked(_allocation.Frame.ParallelCopyTempOffset + i * 8),
-                        MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                        tempOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
                 }
 
-                for (var i = 0; i < physicalCopies.Count; i++)
+                for (var i = 0; i < physicalCopies.Length; i++)
                 {
                     var copy = physicalCopies[i];
+                    var tempOffset = checked(_allocation.Frame.ParallelCopyTempOffset + tempOffsets[i]);
+                    if (IsAggregateType(copy.Destination.Type))
+                    {
+                        var dstAddress = MaterializeVirtualRegisterStorageAddress(copy.Destination, GpScratch0);
+                        EmitI64Imm(Op.I64AddImm, GpScratch1, Sp, tempOffset);
+                        EmitRaw(Op.CpBlk, dstAddress, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(copy.Destination.Type)));
+                        continue;
+                    }
+
                     var isFloat = IsFloatType(copy.Destination.Type);
                     var dst = GetWritableRegister(copy.Destination, GpScratch0, FpScratch0);
                     EmitMem(isFloat ? Op.LdF64 : Op.LdI8, dst, MachineRegister.Invalid,
-                        checked(_allocation.Frame.ParallelCopyTempOffset + i * 8),
-                        MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                        tempOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
                     StoreWritableRegisterIfSpilled(copy.Destination, dst);
                 }
             }
+            private int ParallelCopyTempSlotSize(LirParallelCopy copy)
+            {
+                var size = Math.Max(SizeOfStorage(copy.Destination.Type), SizeOfStorage(copy.Source.Type));
+                return CAbi.AlignUp(Math.Max(_owner._allocationOptions.SpillSlotSize, size), _owner._allocationOptions.SpillSlotAlignment);
+            }
+
+            private int SizeOfStorage(QualifiedType type)
+                => Math.Max(1, SizeOf(type));
+
             private static bool RequiresPhysicalParallelCopy(LirParallelCopy copy)
             {
                 if (copy.Destination.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory)
@@ -1245,6 +1735,9 @@ namespace Cnidaria.C
 
             private MachineRegister LoadVirtualRegister(LirVirtualRegister register, MachineRegister preferred)
             {
+                if (IsAggregateType(register.Type))
+                    throw new NotSupportedException("Aggregate virtual register " + register.Name + " cannot be loaded as a scalar register.");
+
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return alloc.PhysicalRegister;
@@ -1256,6 +1749,9 @@ namespace Cnidaria.C
 
             private MachineRegister GetWritableRegister(LirVirtualRegister register, MachineRegister generalScratch, MachineRegister floatScratch)
             {
+                if (IsAggregateType(register.Type))
+                    throw new NotSupportedException("Aggregate virtual register " + register.Name + " must be accessed through its storage address.");
+
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return alloc.PhysicalRegister;
@@ -1265,6 +1761,9 @@ namespace Cnidaria.C
 
             private void StoreWritableRegisterIfSpilled(LirVirtualRegister register, MachineRegister source)
             {
+                if (IsAggregateType(register.Type))
+                    throw new NotSupportedException("Aggregate virtual register " + register.Name + " must be stored with a block copy.");
+
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return;
@@ -1272,6 +1771,234 @@ namespace Cnidaria.C
                 EmitMem(IsFloatType(register.Type) ? Op.StF64 : Op.StI8, source, MachineRegister.Invalid,
                     alloc.StackOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
             }
+            private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
+            {
+                var alloc = _allocation[register];
+                if (!alloc.IsSpilled)
+                    throw new NotSupportedException("Aggregate virtual register " + register.Name + " must be stack-backed.");
+
+                EmitI64Imm(Op.I64AddImm, destination, Sp, alloc.StackOffset);
+                return destination;
+            }
+
+            private void MaterializeOperandStorageAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
+            {
+                switch (operand.Kind)
+                {
+                    case LirOperandKind.Register:
+                        if (operand.Register is null)
+                            throw new InvalidOperationException("Register operand has no register.");
+                        MaterializeVirtualRegisterStorageAddress(operand.Register, destination);
+                        return;
+
+                    case LirOperandKind.StackSlot:
+                        if (operand.StackSlot is null)
+                            throw new InvalidOperationException("Stack-slot operand has no stack slot.");
+                        if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
+                        EmitI64Imm(Op.I64AddImm, destination, Sp, offset);
+                        return;
+
+                    case LirOperandKind.Address:
+                        if (operand.Address is null)
+                            throw new InvalidOperationException("Address operand has no address.");
+                        MaterializeAddress(operand.Address, destination);
+                        return;
+
+                    case LirOperandKind.Undefined:
+                    case LirOperandKind.Void:
+                    case LirOperandKind.None:
+                        throw Unsupported(instruction, "Undefined aggregate operand has no storage address.");
+
+                    default:
+                        throw Unsupported(instruction, $"Cannot materialize storage address for aggregate operand kind {operand.Kind}.");
+                }
+            }
+
+            private void EmitAggregateCopyToRegisterStorage(LirVirtualRegister destination, LirOperand source, LirInstruction instruction)
+            {
+                var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, GpScratch0);
+                var size = Math.Max(1, SizeOf(destination.Type));
+                if (source.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                {
+                    _asm.LiI32(GpScratch1, 0);
+                    EmitRaw(Op.InitBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: size);
+                    return;
+                }
+
+                MaterializeOperandStorageAddress(source, GpScratch1, instruction);
+                EmitRaw(Op.CpBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: size);
+            }
+
+            private void MaterializeIncomingStackAddress(int offset, MachineRegister destination)
+            {
+                EmitI64Imm(Op.I64AddImm, destination, MachineRegisters.ThreadPointer, offset);
+            }
+
+            private void MaterializeIncomingHiddenReturnBufferAddress(MachineRegister destination)
+            {
+                if (_allocation.Frame.HasHiddenReturnBuffer)
+                {
+                    EmitMem(Op.LdPtr, destination, MachineRegister.Invalid, _allocation.Frame.HiddenReturnBufferOffset,
+                        MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                    return;
+                }
+
+                var cursor = new AbiCursor();
+                var location = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                if (location.Kind == AbiLocationKind.Register)
+                {
+                    MoveRegister(destination, location.Register);
+                    return;
+                }
+
+                if (location.Kind == AbiLocationKind.Stack)
+                {
+                    EmitMem(Op.LdPtr, destination, MachineRegister.Invalid,
+                        location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
+                        MachineRegister.Invalid, MemoryBase.ThreadPointer, _owner._target.PointerAlignment);
+                    return;
+                }
+
+                throw new InvalidOperationException("Invalid hidden return buffer ABI location.");
+            }
+
+            private void MaterializeOutgoingStackAddress(int offset, MachineRegister destination)
+            {
+                EmitI64Imm(Op.I64AddImm, destination, Sp, checked(_allocation.Frame.OutgoingArgumentAreaOffset + offset));
+            }
+
+            private void EmitLoadRawBitsFromAddress(MachineRegister address, int offset, MachineRegister destination, int size)
+                => EmitLoadRawBitsFromMemory(destination, address, offset, MemoryBase.Register, size);
+
+            private void EmitLoadRawBitsFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, MemoryBase memoryBase, int size)
+            {
+                size = Math.Max(1, size);
+                switch (size)
+                {
+                    case 1:
+                        EmitMem(Op.LdU1, destination, baseRegister, offset, MachineRegister.Invalid, memoryBase, 1);
+                        return;
+                    case 2:
+                        EmitMem(Op.LdU2, destination, baseRegister, offset, MachineRegister.Invalid, memoryBase, 2);
+                        return;
+                    case 4:
+                        EmitMem(Op.LdU4, destination, baseRegister, offset, MachineRegister.Invalid, memoryBase, 4);
+                        return;
+                    case 8:
+                        EmitMem(Op.LdI8, destination, baseRegister, offset, MachineRegister.Invalid, memoryBase, 8);
+                        return;
+                }
+
+                _asm.LiI64(destination, 0);
+                for (var i = 0; i < size; i++)
+                {
+                    EmitMem(Op.LdU1, GpScratch2, baseRegister, checked(offset + i), MachineRegister.Invalid, memoryBase, 1);
+                    if (i != 0)
+                        EmitI64Imm(Op.I64ShlImm, GpScratch2, GpScratch2, i * 8);
+                    EmitRaw(Op.I64Or, destination, destination, GpScratch2);
+                }
+            }
+
+            private void EmitStoreRawBitsToAddress(MachineRegister source, MachineRegister address, int offset, int size)
+                => EmitStoreRawBitsToMemory(source, address, offset, MemoryBase.Register, size);
+
+            private void EmitStoreRawBitsToMemory(MachineRegister source, MachineRegister baseRegister, int offset, MemoryBase memoryBase, int size)
+            {
+                size = Math.Max(1, size);
+                switch (size)
+                {
+                    case 1:
+                        EmitMem(Op.StI1, source, baseRegister, offset, MachineRegister.Invalid, memoryBase, 1);
+                        return;
+                    case 2:
+                        EmitMem(Op.StI2, source, baseRegister, offset, MachineRegister.Invalid, memoryBase, 2);
+                        return;
+                    case 4:
+                        EmitMem(Op.StI4, source, baseRegister, offset, MachineRegister.Invalid, memoryBase, 4);
+                        return;
+                    case 8:
+                        EmitMem(Op.StI8, source, baseRegister, offset, MachineRegister.Invalid, memoryBase, 8);
+                        return;
+                }
+
+                for (var i = 0; i < size; i++)
+                {
+                    if (i == 0)
+                    {
+                        EmitMem(Op.StI1, source, baseRegister, offset, MachineRegister.Invalid, memoryBase, 1);
+                    }
+                    else
+                    {
+                        EmitI64Imm(Op.U64ShrImm, GpScratch2, source, i * 8);
+                        EmitMem(Op.StI1, GpScratch2, baseRegister, checked(offset + i), MachineRegister.Invalid, memoryBase, 1);
+                    }
+                }
+            }
+
+            private void MarshalCallArgument(LirInstruction instruction, LirOperand operand, ref AbiCursor cursor)
+            {
+                var value = CAbi.ClassifyValue(_owner._target, operand.Type);
+                if (value.PassingKind == AbiPassingKind.MultiRegister)
+                {
+                    MaterializeOperandStorageAddress(operand, GpScratch1, instruction);
+                    foreach (var segment in value.Segments)
+                    {
+                        var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                        if (loc.Kind == AbiLocationKind.Register)
+                        {
+                            EmitLoadRawBitsFromAddress(GpScratch1, segment.Offset, loc.Register, segment.Size);
+                        }
+                        else if (loc.Kind == AbiLocationKind.Stack)
+                        {
+                            EmitLoadRawBitsFromAddress(GpScratch1, segment.Offset, GpScratch0, segment.Size);
+                            EmitStoreRawBitsToMemory(GpScratch0, MachineRegister.Invalid, checked(_allocation.Frame.OutgoingArgumentAreaOffset + loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), MemoryBase.StackPointer, segment.Size);
+                        }
+                        else
+                        {
+                            throw Unsupported(instruction, "Invalid aggregate argument ABI location.");
+                        }
+                    }
+                    return;
+                }
+
+                if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(operand.Type))
+                {
+                    var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    MaterializeOperandStorageAddress(operand, GpScratch1, instruction);
+                    MaterializeOutgoingStackAddress(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), GpScratch0);
+                    EmitRaw(Op.CpBlk, GpScratch0, GpScratch1, MachineRegister.Invalid, imm: value.Size);
+                    return;
+                }
+
+                var scalar = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                if (scalar.Kind == AbiLocationKind.Register)
+                {
+                    LoadOperandInto(operand, scalar.Register);
+                }
+                else if (scalar.Kind == AbiLocationKind.Stack)
+                {
+                    var src = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch0 : GpScratch0);
+                    EmitMem(StoreOpForType(operand.Type), src, MachineRegister.Invalid,
+                        checked(_allocation.Frame.OutgoingArgumentAreaOffset + scalar.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                        MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
+                }
+                else if (scalar.Kind != AbiLocationKind.None)
+                {
+                    throw Unsupported(instruction, "Invalid scalar argument ABI location.");
+                }
+            }
+
+            private static AbiCursor ToAbiCursor(ParameterState state)
+                => new AbiCursor { Integer = state.Integer, Float = state.Float, Stack = state.Stack };
+
+            private void SyncParameterState(AbiCursor cursor)
+            {
+                _parameters.Integer = cursor.Integer;
+                _parameters.Float = cursor.Float;
+                _parameters.Stack = cursor.Stack;
+            }
+
 
             private void EmitImmediate(MachineRegister destination, object? value, QualifiedType type)
             {
@@ -1684,6 +2411,14 @@ namespace Cnidaria.C
 
             private Op CallOpForReturn(QualifiedType returnType, bool isInternal)
             {
+                if (IsAggregateType(returnType))
+                {
+                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true);
+                    if (abi.PassingKind == AbiPassingKind.Indirect)
+                        return isInternal ? Op.CallInternalVoid : Op.CallVoid;
+                    return isInternal ? Op.CallInternalValue : Op.CallValue;
+                }
+
                 return ClassifyValue(returnType) switch
                 {
                     ValueKind.Void => isInternal ? Op.CallInternalVoid : Op.CallVoid,
@@ -1695,6 +2430,12 @@ namespace Cnidaria.C
 
             private Op IndirectCallOpForReturn(QualifiedType returnType)
             {
+                if (IsAggregateType(returnType))
+                {
+                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true);
+                    return abi.PassingKind == AbiPassingKind.Indirect ? Op.CallIndirectVoid : Op.CallIndirectValue;
+                }
+
                 return ClassifyValue(returnType) switch
                 {
                     ValueKind.Void => Op.CallIndirectVoid,
@@ -1775,6 +2516,14 @@ namespace Cnidaria.C
                     _asm.LiF64Bits(destination, BitConverter.DoubleToInt64Bits(value));
             }
 
+            private bool IsFallthroughTarget(LirBlock? target)
+            {
+                if (target is null || _currentBlock is null)
+                    return false;
+
+                return _nextBlocks.TryGetValue(_currentBlock, out var next) && ReferenceEquals(next, target);
+            }
+
             private Label LabelOf(LirBlock? block)
             {
                 if (block is null || !_labels.TryGetValue(block, out var label))
@@ -1806,6 +2555,9 @@ namespace Cnidaria.C
 
             private static bool IsPointerLike(QualifiedType type)
                 => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
+
+            private static bool IsAggregateType(QualifiedType type)
+                => CAbi.IsAggregate(type);
 
             private static bool IsIntegerLike(QualifiedType type)
                 => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloatType(type) && !IsVoid(type);
@@ -1965,11 +2717,6 @@ namespace Cnidaria.C
                 UnsupportedAggregate,
             }
 
-            private enum AbiRegisterClass
-            {
-                General,
-                Floating,
-            }
         }
     }
 }

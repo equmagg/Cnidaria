@@ -315,6 +315,30 @@ namespace Cnidaria.C
 
     public enum CharSignedness : byte { Signed, Unsigned, ImplementationDefined }
 
+    public enum TargetArchitectureKind : byte
+    {
+        RegisterBytecode,
+        RiscV32,
+        RiscV64,
+        X86,
+        X64,
+    }
+
+    [Flags]
+    public enum TargetArchitectureFeatures : ulong
+    {
+        None = 0,
+        RiscVM = 1UL << 0,
+        RiscVA = 1UL << 1,
+        RiscVF = 1UL << 2,
+        RiscVD = 1UL << 3,
+        RiscVC = 1UL << 4,
+        RiscVV = 1UL << 5,
+        X86Sse2 = 1UL << 16,
+        X86Avx = 1UL << 17,
+        X86Avx2 = 1UL << 18,
+    }
+
     public readonly struct PrimitiveLayout
     {
         public int Size { get; }
@@ -334,23 +358,27 @@ namespace Cnidaria.C
 
     public sealed class TargetInfo
     {
-        public static TargetInfo Default { get; } = new TargetInfo(
-            pointerSize: 4,
-            pointerAlignment: 4,
-            registerSize: 8,
-            registerAlignment: 8,
-            charLayout: new PrimitiveLayout(1, 1),
-            shortLayout: new PrimitiveLayout(2, 2),
-            intLayout: new PrimitiveLayout(4, 4),
-            longLayout: new PrimitiveLayout(8, 8),
-            longLongLayout: new PrimitiveLayout(8, 8),
-            floatLayout: new PrimitiveLayout(4, 4),
-            doubleLayout: new PrimitiveLayout(8, 8),
-            longDoubleLayout: new PrimitiveLayout(16, 16),
-            boolLayout: new PrimitiveLayout(1, 1),
-            endianness: Endianness.Little,
-            charSignedness: CharSignedness.ImplementationDefined);
+        public static TargetInfo RegisterBytecode { get; } = CreateRegisterBytecode();
 
+        public static TargetInfo Default => RegisterBytecode;
+
+        public static TargetInfo ForArchitecture(
+            TargetArchitectureKind architecture,
+            TargetArchitectureFeatures features = TargetArchitectureFeatures.None)
+        {
+            return architecture switch
+            {
+                TargetArchitectureKind.RegisterBytecode => RegisterBytecode.WithFeatures(features),
+                TargetArchitectureKind.RiscV32 => CreateILP32(TargetArchitectureKind.RiscV32, features),
+                TargetArchitectureKind.X86 => CreateILP32(TargetArchitectureKind.X86, features),
+                TargetArchitectureKind.RiscV64 => CreateLP64(TargetArchitectureKind.RiscV64, features),
+                TargetArchitectureKind.X64 => CreateLP64(TargetArchitectureKind.X64, features),
+                _ => throw new ArgumentOutOfRangeException(nameof(architecture)),
+            };
+        }
+
+        public TargetArchitectureKind Architecture { get; }
+        public TargetArchitectureFeatures ArchitectureFeatures { get; }
         public int PointerSize { get; }
         public int PointerAlignment { get; }
         public int RegisterSize { get; }
@@ -384,7 +412,9 @@ namespace Cnidaria.C
             PrimitiveLayout longDoubleLayout,
             PrimitiveLayout boolLayout,
             Endianness endianness,
-            CharSignedness charSignedness)
+            CharSignedness charSignedness,
+            TargetArchitectureKind architecture = TargetArchitectureKind.RegisterBytecode,
+            TargetArchitectureFeatures architectureFeatures = TargetArchitectureFeatures.None)
         {
             if (pointerSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(pointerSize));
@@ -395,6 +425,8 @@ namespace Cnidaria.C
             if (registerAlignment <= 0)
                 throw new ArgumentOutOfRangeException(nameof(registerAlignment));
 
+            Architecture = architecture;
+            ArchitectureFeatures = architectureFeatures;
             PointerSize = pointerSize;
             PointerAlignment = pointerAlignment;
             RegisterSize = registerSize;
@@ -411,6 +443,86 @@ namespace Cnidaria.C
             Endianness = endianness;
             CharSignedness = charSignedness;
         }
+
+
+        public TargetInfo WithFeatures(TargetArchitectureFeatures features)
+            => new TargetInfo(
+                PointerSize,
+                PointerAlignment,
+                RegisterSize,
+                RegisterAlignment,
+                CharLayout,
+                ShortLayout,
+                IntLayout,
+                LongLayout,
+                LongLongLayout,
+                FloatLayout,
+                DoubleLayout,
+                LongDoubleLayout,
+                BoolLayout,
+                Endianness,
+                CharSignedness,
+                Architecture,
+                features);
+
+        private static TargetInfo CreateRegisterBytecode()
+            => new TargetInfo(
+                pointerSize: 4,
+                pointerAlignment: 4,
+                registerSize: 8,
+                registerAlignment: 8,
+                charLayout: new PrimitiveLayout(1, 1),
+                shortLayout: new PrimitiveLayout(2, 2),
+                intLayout: new PrimitiveLayout(4, 4),
+                longLayout: new PrimitiveLayout(8, 8),
+                longLongLayout: new PrimitiveLayout(8, 8),
+                floatLayout: new PrimitiveLayout(4, 4),
+                doubleLayout: new PrimitiveLayout(8, 8),
+                longDoubleLayout: new PrimitiveLayout(16, 16),
+                boolLayout: new PrimitiveLayout(1, 1),
+                endianness: Endianness.Little,
+                charSignedness: CharSignedness.ImplementationDefined,
+                architecture: TargetArchitectureKind.RegisterBytecode);
+
+        private static TargetInfo CreateILP32(TargetArchitectureKind architecture, TargetArchitectureFeatures features)
+            => new TargetInfo(
+                pointerSize: 4,
+                pointerAlignment: 4,
+                registerSize: 4,
+                registerAlignment: 4,
+                charLayout: new PrimitiveLayout(1, 1),
+                shortLayout: new PrimitiveLayout(2, 2),
+                intLayout: new PrimitiveLayout(4, 4),
+                longLayout: new PrimitiveLayout(4, 4),
+                longLongLayout: new PrimitiveLayout(8, 8),
+                floatLayout: new PrimitiveLayout(4, 4),
+                doubleLayout: new PrimitiveLayout(8, 8),
+                longDoubleLayout: new PrimitiveLayout(16, 16),
+                boolLayout: new PrimitiveLayout(1, 1),
+                endianness: Endianness.Little,
+                charSignedness: CharSignedness.ImplementationDefined,
+                architecture: architecture,
+                architectureFeatures: features);
+
+        private static TargetInfo CreateLP64(TargetArchitectureKind architecture, TargetArchitectureFeatures features)
+            => new TargetInfo(
+                pointerSize: 8,
+                pointerAlignment: 8,
+                registerSize: 8,
+                registerAlignment: 8,
+                charLayout: new PrimitiveLayout(1, 1),
+                shortLayout: new PrimitiveLayout(2, 2),
+                intLayout: new PrimitiveLayout(4, 4),
+                longLayout: new PrimitiveLayout(8, 8),
+                longLongLayout: new PrimitiveLayout(8, 8),
+                floatLayout: new PrimitiveLayout(4, 4),
+                doubleLayout: new PrimitiveLayout(8, 8),
+                longDoubleLayout: new PrimitiveLayout(16, 16),
+                boolLayout: new PrimitiveLayout(1, 1),
+                endianness: Endianness.Little,
+                charSignedness: CharSignedness.ImplementationDefined,
+                architecture: architecture,
+                architectureFeatures: features);
 
         public int SizeOf(QualifiedType type)
             => SizeOf(type.Type);

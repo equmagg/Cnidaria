@@ -47,6 +47,7 @@ namespace Cnidaria.Cs
         Arg,
         ArgAddr,
         Temp,
+        TempAddr,
         ExceptionObject,
 
         Unary,
@@ -189,6 +190,7 @@ namespace Cnidaria.Cs
         InlineArg,
         InlineLocal,
         InlineReturn,
+        StructMaterialization,
     }
 
     internal readonly struct GenTemp
@@ -243,6 +245,8 @@ namespace Cnidaria.Cs
         MemoryAliased = 1 << 8,
         InSsa = 1 << 9,
         Tracked = 1 << 10,
+        IsStructMaterializationTemp = 1 << 11,
+        IsLocalStorageByRefAlias = 1 << 12,
     }
 
     [Flags]
@@ -364,7 +368,7 @@ namespace Cnidaria.Cs
         public override string ToString()
         {
             if (Origin == GenTreeValueOrigin.TreeNode)
-                return Node is null ? "<tree:null>" : "t" + Node.Id.ToString();
+                return Node is null ? "<tree:null>" : $"t{Node.Id}";
             string prefix = LocalKind switch
             {
                 GenLocalKind.Argument => "arg",
@@ -373,8 +377,8 @@ namespace Cnidaria.Cs
                 _ => "local",
             };
             return HasSsaName
-                ? "V" + SsaSlot.LclNum.ToString() + "_" + SsaVersion.ToString()
-                : prefix + Index.ToString();
+                ? $"V{SsaSlot.LclNum}_{SsaVersion}"
+                : $"{prefix}{Index}";
         }
     }
 
@@ -411,6 +415,8 @@ namespace Cnidaria.Cs
         public bool Pinned { get => (LocalFlags & GenLocalFlags.IsPinned) != 0; internal set => SetLocalFlag(GenLocalFlags.IsPinned, value); }
         public bool IsRefLike { get => (LocalFlags & GenLocalFlags.IsRefLike) != 0; internal set => SetLocalFlag(GenLocalFlags.IsRefLike, value); }
         public bool IsStructField { get => (LocalFlags & GenLocalFlags.IsStructField) != 0; internal set => SetLocalFlag(GenLocalFlags.IsStructField, value); }
+        public bool IsStructMaterializationTemp { get => (LocalFlags & GenLocalFlags.IsStructMaterializationTemp) != 0; internal set => SetLocalFlag(GenLocalFlags.IsStructMaterializationTemp, value); }
+        public bool IsLocalStorageByRefAlias { get => (LocalFlags & GenLocalFlags.IsLocalStorageByRefAlias) != 0; internal set => SetLocalFlag(GenLocalFlags.IsLocalStorageByRefAlias, value); }
         public bool MemoryAliased { get => (LocalFlags & GenLocalFlags.MemoryAliased) != 0; internal set => SetLocalFlag(GenLocalFlags.MemoryAliased, value); }
         public bool HasMemoryAlias => AddressExposed || MemoryAliased;
         public MachineRegister RegNum { get; internal set; } = MachineRegister.Invalid;
@@ -450,7 +456,8 @@ namespace Cnidaria.Cs
             Promoted = promotedParent || promotedField;
             SsaPromoted = false;
             LRACandidate = false;
-            DoNotEnregister = promotedParent || AddressExposed || MemoryAliased || IsCompilerTemp || IsImplicitByRef || Pinned || IsRefLike;
+            IsLocalStorageByRefAlias = false;
+            DoNotEnregister = promotedParent || AddressExposed || MemoryAliased || IsCompilerTemp || Pinned || IsRefLike;
             if (promotedField && !AddressExposed && !MemoryAliased && !IsImplicitByRef && !Pinned && !IsRefLike)
                 DoNotEnregister = false;
             UseCount = 0;
@@ -466,6 +473,7 @@ namespace Cnidaria.Cs
         internal void ResetPreSsaClassification()
         {
             bool wasPromotedField = IsStructField && ParentLclNum >= 0 && PromotedField is not null;
+            bool wasStructMaterializationTemp = IsStructMaterializationTemp;
             int oldParentLclNum = ParentLclNum;
             int oldFieldOrdinal = FieldOrdinal;
             int oldFieldOffset = FieldOffset;
@@ -482,6 +490,9 @@ namespace Cnidaria.Cs
             _promotedFieldsByFieldId.Clear();
             _promotedFieldsByOffset.Clear();
 
+            if (wasStructMaterializationTemp)
+                IsStructMaterializationTemp = true;
+
             if (wasPromotedField)
             {
                 MarkPromotedStructField(
@@ -492,11 +503,17 @@ namespace Cnidaria.Cs
                     oldPromotedField);
             }
 
-            if (Kind == GenLocalKind.Temporary)
+            if (Kind == GenLocalKind.Temporary && !wasPromotedField)
             {
-                IsCompilerTemp = true;
-                if (!wasPromotedField)
+                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type))
+                {
+                    MarkPromotedStructParent();
+                }
+                else
+                {
+                    IsCompilerTemp = true;
                     Category = GenLocalCategory.CompilerTemp;
+                }
             }
             ClassifySpecialStorage();
             ResetTrackingAndLivenessState();
@@ -510,13 +527,23 @@ namespace Cnidaria.Cs
             if (IsKnownRefLike(Type))
                 IsRefLike = true;
 
-            if (IsImplicitByRef || Pinned || IsRefLike)
+            if (Pinned || IsRefLike)
             {
                 Category = GenLocalCategory.ImplicitByRefPinnedRefLikeLocal;
                 DoNotEnregister = true;
                 SsaPromoted = false;
                 LRACandidate = false;
             }
+        }
+
+        internal void MarkLocalStorageByRefAlias()
+        {
+            if (!IsImplicitByRef)
+                return;
+
+            IsLocalStorageByRefAlias = true;
+            SsaPromoted = false;
+            LRACandidate = false;
         }
 
         internal void MarkAddressExposed()
@@ -548,6 +575,7 @@ namespace Cnidaria.Cs
 
             Promoted = true;
             MemoryAliased = false;
+            IsCompilerTemp = false;
             Category = GenLocalCategory.PromotedStruct;
             DoNotEnregister = true;
             SsaPromoted = false;
@@ -560,6 +588,7 @@ namespace Cnidaria.Cs
         {
             IsStructField = true;
             Promoted = true;
+            IsCompilerTemp = false;
             ParentLclNum = parentLclNum;
             FieldOrdinal = ordinal;
             FieldOffset = offset;
@@ -596,11 +625,14 @@ namespace Cnidaria.Cs
 
         internal void MarkRegularPromotedScalar(int denseVarIndex)
         {
-            if (HasMemoryAlias || IsImplicitByRef || Pinned || IsRefLike)
-                throw new InvalidOperationException("Cannot mark memory-aliased local as an SSA scalar: " + this + ".");
+            if (HasMemoryAlias || Pinned || IsRefLike)
+                throw new InvalidOperationException($"Cannot mark memory-aliased local as an SSA scalar: {this}.");
+
+            if (IsImplicitByRef && IsLocalStorageByRefAlias)
+                throw new InvalidOperationException($"Cannot mark local-storage byref alias as an SSA scalar: {this}.");
 
             if (IsStructField && Category != GenLocalCategory.PromotedStructField)
-                throw new InvalidOperationException("Cannot mark malformed promoted struct field as an SSA scalar: " + this + ".");
+                throw new InvalidOperationException($"Cannot mark malformed promoted struct field as an SSA scalar: {this}.");
 
             Tracked = true;
             VarIndex = denseVarIndex;
@@ -650,6 +682,14 @@ namespace Cnidaria.Cs
         private void SetLocalFlag(GenLocalFlags flag, bool value)
         {
             LocalFlags = value ? (LocalFlags | flag) : (LocalFlags & ~flag);
+        }
+
+        internal static bool IsPromotableStructMaterializationType(RuntimeType? type)
+        {
+            return type is not null &&
+                   type.IsValueType &&
+                   type.Kind == RuntimeTypeKind.Struct &&
+                   type.InstanceFields.Length != 0;
         }
 
         private static bool IsKnownRefLike(RuntimeType? type)
@@ -713,12 +753,12 @@ namespace Cnidaria.Cs
             }
 
             if (descriptors.Length <= SsaConfig.ReservedSsaNumber || descriptors[SsaConfig.ReservedSsaNumber] is not null)
-                throw new InvalidOperationException("SSA descriptor table must reserve index zero for " + ValueKey + ".");
+                throw new InvalidOperationException($"SSA descriptor table must reserve index zero for {ValueKey}.");
 
             for (int i = SsaConfig.FirstSsaNumber; i < descriptors.Length; i++)
             {
                 if (descriptors[i] is null || descriptors[i].SsaNumber != i)
-                    throw new InvalidOperationException("SSA descriptor table is not dense for " + ValueKey + ".");
+                    throw new InvalidOperationException($"SSA descriptor table is not dense for {ValueKey}.");
             }
 
             _ssaDescriptors = descriptors;
@@ -730,7 +770,7 @@ namespace Cnidaria.Cs
                 throw new ArgumentOutOfRangeException(nameof(ssaVersion));
             var descriptor = _ssaDescriptors[ssaVersion];
             if (descriptor is null || descriptor.SsaNumber != ssaVersion)
-                throw new InvalidOperationException("SSA descriptor table is not dense for " + ValueKey + ".");
+                throw new InvalidOperationException($"SSA descriptor table is not dense for {ValueKey}.");
             return descriptor;
         }
 
@@ -774,18 +814,18 @@ namespace Cnidaria.Cs
                 GenLocalKind.Temporary => "T",
                 _ => "L",
             };
-            return prefix + Index.ToString() + "#" + LclNum.ToString() + " " + Category.ToString() + (Tracked ? " tracked=" + VarIndex.ToString() : " untracked") +
-                   " uses=" + UseCount.ToString() + "/" + WeightedUseCount.ToString("0.##") +
-                   " defs=" + DefCount.ToString() + "/" + WeightedDefCount.ToString("0.##") +
-                   (PartialDefCount != 0 ? " partial-defs=" + PartialDefCount.ToString() : string.Empty) +
-                   (Register ? " reg=" + MachineRegisters.Format(RegNum) : " home=" + FrameHome.ToString()) +
+            return $"{prefix}{Index}#{LclNum} {Category}" + (Tracked ? $" tracked={VarIndex}" : " untracked") +
+                   $" uses={UseCount}/{WeightedUseCount:0.##}" +
+                   $" defs={DefCount}/{WeightedDefCount:0.##}" +
+                   (PartialDefCount != 0 ? $" partial-defs={PartialDefCount}" : string.Empty) +
+                   (Register ? $" reg={MachineRegisters.Format(RegNum)}" : $" home={FrameHome}") +
                    (Spilled ? " spilled" : string.Empty) +
                    (AddressExposed ? " addr-exposed" : string.Empty) +
                    (Promoted ? " promoted" : string.Empty) +
-                   (IsStructField ? " parent=" + ParentLclNum.ToString() + " fld=" + (PromotedField?.Name ?? FieldOrdinal.ToString()) : string.Empty) +
+                   (IsStructField ? $" parent={ParentLclNum} fld={PromotedField?.Name ?? FieldOrdinal.ToString()}" : string.Empty) +
                    (SsaPromoted ? " ssa" : string.Empty) +
-                   (HasSsaDescriptors ? " ssa-defs=" + (_ssaDescriptors.Length - 1).ToString() : string.Empty) +
-                   (HasSsaAllocations ? " ssa-allocs=" + _ssaAllocations.Count.ToString() : string.Empty);
+                   (HasSsaDescriptors ? $" ssa-defs={_ssaDescriptors.Length - 1}" : string.Empty) +
+                   (HasSsaAllocations ? $" ssa-allocs={_ssaAllocations.Count}" : string.Empty);
         }
     }
 
@@ -812,7 +852,7 @@ namespace Cnidaria.Cs
             Owner = owner;
         }
 
-        public override string ToString() => MachineRegisters.Format(Register) + "@" + RefPosition.ToString();
+        public override string ToString() => $"{MachineRegisters.Format(Register)}@{RefPosition}";
     }
 
     internal sealed class GenTreeLsraInfo
@@ -918,9 +958,7 @@ namespace Cnidaria.Cs
         {
             get
             {
-                if (Kind == GenTreeKind.GcPoll)
-                    return true;
-                if (Kind is GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill or GenTreeKind.StackFrameOp)
+                if (Kind is GenTreeKind.GcPoll or GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill or GenTreeKind.StackFrameOp)
                     return false;
                 return GenTreeLinearLoweringClassifier
                     .Classify(this, RegisterResult, RegisterUses)
@@ -1128,7 +1166,7 @@ namespace Cnidaria.Cs
         public RegisterValueLocation GetRegisterLocation(int position, bool isReturn = false)
         {
             if (RegisterAllocation is null)
-                throw new InvalidOperationException("GenTree node has no register allocation: " + this + ".");
+                throw new InvalidOperationException($"GenTree node has no register allocation: {this}.");
 
             var abi = MachineAbi.ClassifyValue(Type, StackKind, isReturn);
             return RegisterAllocation.ValueLocationAt(position, abi);
@@ -1202,16 +1240,16 @@ namespace Cnidaria.Cs
         private static void ValidateStatementTreeList(GenTree root, ImmutableArray<GenTree> treeList)
         {
             if (treeList.IsDefaultOrEmpty)
-                throw new InvalidOperationException("Statement tree-list is empty for root " + root.Id.ToString() + ".");
+                throw new InvalidOperationException($"Statement tree-list is empty for root {root.Id}.");
 
             if (!ReferenceEquals(treeList[treeList.Length - 1], root))
-                throw new InvalidOperationException("Statement tree-list root is not last in execution order for root " + root.Id.ToString() + ".");
+                throw new InvalidOperationException($"Statement tree-list root is not last in execution order for root {root.Id}.");
 
             var ordinalByNode = new Dictionary<GenTree, int>(ReferenceEqualityComparer<GenTree>.Instance);
             for (int i = 0; i < treeList.Length; i++)
             {
                 if (!ordinalByNode.TryAdd(treeList[i], i))
-                    throw new InvalidOperationException("Statement tree-list contains duplicate node " + treeList[i].Id.ToString() + ".");
+                    throw new InvalidOperationException($"Statement tree-list contains duplicate node {treeList[i].Id}.");
             }
 
             for (int i = 0; i < treeList.Length; i++)
@@ -1221,7 +1259,7 @@ namespace Cnidaria.Cs
                 {
                     var operand = node.Operands[op];
                     if (!ordinalByNode.TryGetValue(operand, out int operandOrdinal))
-                        throw new InvalidOperationException("Statement tree-list for root " + root.Id.ToString() + " does not contain operand " + operand.Id.ToString() + " of node " + node.Id.ToString() + ".");
+                        throw new InvalidOperationException($"Statement tree-list for root {root.Id} does not contain operand {operand.Id} of node {node.Id}.");
                 }
             }
         }
@@ -1354,6 +1392,7 @@ namespace Cnidaria.Cs
             Temps = temps.IsDefault ? ImmutableArray<GenTemp>.Empty : temps;
             ArgDescriptors = BuildArgDescriptors(ArgTypes);
             LocalDescriptors = BuildLocalDescriptors(LocalTypes, ArgDescriptors.Length);
+            MarkAddressExposedFromBytecode(Function, ArgDescriptors, LocalDescriptors);
             TempDescriptors = BuildTempDescriptors(Temps, ArgDescriptors.Length + LocalDescriptors.Length);
             AllLocalDescriptors = BuildAllLocalDescriptors(ArgDescriptors, LocalDescriptors, TempDescriptors);
             AttachLocalDescriptorsToTrees(blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks);
@@ -1385,6 +1424,28 @@ namespace Cnidaria.Cs
             clone.AttachLocalDescriptorsToTrees(blocks);
             return clone;
         }
+        private static void MarkAddressExposedFromBytecode(
+            BytecodeFunction function,
+            ImmutableArray<GenLocalDescriptor> args,
+            ImmutableArray<GenLocalDescriptor> locals)
+        {
+            var instructions = function.Instructions;
+            for (int i = 0; i < instructions.Length; i++)
+            {
+                var ins = instructions[i];
+                if (ins.Op == BytecodeOp.Ldarga)
+                {
+                    if ((uint)ins.Operand0 < (uint)args.Length && GenTreeMethodBuilder.AddressUseMayEscape(instructions, i))
+                        args[ins.Operand0].MarkAddressExposed();
+                }
+                else if (ins.Op == BytecodeOp.Ldloca)
+                {
+                    if ((uint)ins.Operand0 < (uint)locals.Length && GenTreeMethodBuilder.AddressUseMayEscape(instructions, i))
+                        locals[ins.Operand0].MarkAddressExposed();
+                }
+            }
+        }
+
 
         private static ImmutableArray<GenLocalDescriptor> BuildArgDescriptors(ImmutableArray<RuntimeType> args)
         {
@@ -1392,7 +1453,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < args.Length; i++)
             {
                 var stackKind = StackKindForDescriptor(args[i]);
-                var category = IsSpecialByrefPinnedOrRefLike(args[i], stackKind)
+                var category = IsRefLikeDescriptorType(args[i])
                     ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
                     : GenLocalCategory.Unclassified;
                 builder.Add(new GenLocalDescriptor(i, GenLocalKind.Argument, i, args[i], stackKind, category));
@@ -1406,7 +1467,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < locals.Length; i++)
             {
                 var stackKind = StackKindForDescriptor(locals[i]);
-                var category = IsSpecialByrefPinnedOrRefLike(locals[i], stackKind)
+                var category = IsRefLikeDescriptorType(locals[i])
                     ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
                     : GenLocalCategory.Unclassified;
                 builder.Add(new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Local, i, locals[i], stackKind, category));
@@ -1420,9 +1481,26 @@ namespace Cnidaria.Cs
             for (int i = 0; i < temps.Length; i++)
             {
                 var temp = temps[i];
-                var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, GenLocalCategory.CompilerTemp);
-                descriptor.IsCompilerTemp = true;
-                descriptor.DoNotEnregister = true;
+                bool isStructMaterialization = temp.Kind == GenTempKind.StructMaterialization;
+                bool canPromoteTemp = temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineArg or GenTempKind.InlineLocal or GenTempKind.InlineReturn;
+                bool promoteParent = canPromoteTemp && LclVarDsc.IsPromotableStructMaterializationType(temp.Type);
+                var category = promoteParent ? GenLocalCategory.PromotedStruct : GenLocalCategory.CompilerTemp;
+                var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, category);
+
+                if (isStructMaterialization)
+                    descriptor.IsStructMaterializationTemp = true;
+
+                if (promoteParent)
+                {
+                    descriptor.IsCompilerTemp = false;
+                    descriptor.MarkPromotedStructParent();
+                }
+                else
+                {
+                    descriptor.IsCompilerTemp = true;
+                    descriptor.DoNotEnregister = true;
+                }
+
                 builder.Add(descriptor);
             }
             return builder.ToImmutable();
@@ -1446,11 +1524,8 @@ namespace Cnidaria.Cs
             return builder.ToImmutable();
         }
 
-        private static bool IsSpecialByrefPinnedOrRefLike(RuntimeType? type, GenStackKind stackKind)
+        private static bool IsRefLikeDescriptorType(RuntimeType? type)
         {
-            if (stackKind == GenStackKind.ByRef || type?.Kind == RuntimeTypeKind.ByRef)
-                return true;
-
             if (type is null)
                 return false;
 
@@ -1645,6 +1720,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case GenTreeKind.Temp:
+                    case GenTreeKind.TempAddr:
                     case GenTreeKind.StoreTemp:
                         if ((uint)node.Int32 < (uint)tempByIndex.Length)
                         {
@@ -1803,7 +1879,7 @@ namespace Cnidaria.Cs
             if (isReturn)
                 return value.GetRegisterLocation(value.RegisterAllocation?.DefinitionPosition ?? 0, isReturn: true);
             if (value.RegisterAllocation is null)
-                throw new InvalidOperationException("No LSRA home is attached to GenTree value " + value + ".");
+                throw new InvalidOperationException($"No LSRA home is attached to GenTree value {value}.");
             return value.RegisterLocationAtDefinition;
         }
 
@@ -1815,13 +1891,13 @@ namespace Cnidaria.Cs
             if (_valueInfoByRepresentativeNode.TryGetValue(value, out info))
                 return info;
 
-            throw new InvalidOperationException("Unknown linear GenTree value " + value.LinearValueKey + ".");
+            throw new InvalidOperationException($"Unknown linear GenTree value {value.LinearValueKey}.");
         }
 
         public GenTreeValueInfo GetValueInfo(GenTreeValueKey value)
         {
             if (!_valueInfoByNode.TryGetValue(value, out var info))
-                throw new InvalidOperationException("Unknown linear GenTree value " + value + ".");
+                throw new InvalidOperationException($"Unknown linear GenTree value {value}.");
             return info;
         }
     }
@@ -2385,6 +2461,7 @@ namespace Cnidaria.Cs
 
         private readonly List<GenTemp> _temps = new();
         private readonly HashSet<int> _materializedImporterTempIds = new();
+        private readonly HashSet<int> _structMaterializationTempIds = new();
         private readonly Dictionary<(int StartPc, int Depth), GenTemp> _stackEntryTemps = new();
         private readonly Dictionary<int, GenTemp> _dupTemps = new();
         private readonly HashSet<int> _createdDupTempIds = new();
@@ -2394,6 +2471,9 @@ namespace Cnidaria.Cs
         private readonly List<RuntimeMethod> _virtualDependencies = new();
         private readonly Dictionary<int, RuntimeType> _instantiatedTypes = new();
         private readonly HashSet<int> _activeInlineMethods = new();
+
+        private bool[] _addressExposedArgs = Array.Empty<bool>();
+        private bool[] _addressExposedLocals = Array.Empty<bool>();
 
         private const int InlineAlwaysBudget = 24;
         private const int InlineDiscretionaryBudget = 48;
@@ -2434,6 +2514,7 @@ namespace Cnidaria.Cs
         {
             _argTypes = BuildArgTypes(_method);
             _localTypes = BuildLocalTypes();
+            ComputeImportAddressExposure();
             _stackDepthAtPc = ComputeStackDepths();
 
             var leaders = ComputeLeaders(_stackDepthAtPc);
@@ -2467,7 +2548,53 @@ namespace Cnidaria.Cs
                 result[i] = _rts.ResolveTypeInMethodContext(_module, _body.LocalTypeTokens[i], _method);
             return result;
         }
+        private void ComputeImportAddressExposure()
+        {
+            _addressExposedArgs = new bool[_argTypes.Length];
+            _addressExposedLocals = new bool[_localTypes.Length];
 
+            var instructions = _body.Instructions;
+            for (int i = 0; i < instructions.Length; i++)
+            {
+                var ins = instructions[i];
+                if (ins.Op == BytecodeOp.Ldarga)
+                {
+                    if ((uint)ins.Operand0 < (uint)_addressExposedArgs.Length && AddressUseMayEscape(instructions, i))
+                        _addressExposedArgs[ins.Operand0] = true;
+                }
+                else if (ins.Op == BytecodeOp.Ldloca)
+                {
+                    if ((uint)ins.Operand0 < (uint)_addressExposedLocals.Length && AddressUseMayEscape(instructions, i))
+                        _addressExposedLocals[ins.Operand0] = true;
+                }
+            }
+        }
+        internal static bool AddressUseMayEscape(ImmutableArray<Instruction> instructions, int addressProducerIndex)
+        {
+            int positionFromTop = 0;
+            for (int i = addressProducerIndex + 1; i < instructions.Length; i++)
+            {
+                var ins = instructions[i];
+                int pop = Math.Max((short)0, ins.Pop);
+                if (pop > positionFromTop)
+                    return !IsNonEscapingLocalAddressConsumer(ins.Op);
+
+                positionFromTop = positionFromTop - pop + Math.Max((short)0, ins.Push);
+
+                if (ins.Op == BytecodeOp.Dup && positionFromTop == 1)
+                    return true;
+
+                if (MayInterruptLinearAddressUseScan(ins.Op))
+                    return true;
+            }
+
+            return true;
+        }
+        internal static bool IsNonEscapingLocalAddressConsumer(BytecodeOp op)
+            => op is BytecodeOp.Ldfld or BytecodeOp.Stfld;
+        internal static bool MayInterruptLinearAddressUseScan(BytecodeOp op)
+            => op is BytecodeOp.Br or BytecodeOp.Brtrue or BytecodeOp.Brfalse or
+            BytecodeOp.Ret or BytecodeOp.Throw or BytecodeOp.Rethrow or BytecodeOp.Endfinally;
         private RuntimeType GetArgType(RuntimeMethod method, int argIndex)
         {
             if (method.HasThis)
@@ -2574,7 +2701,8 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Stloc:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreLocal, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
+                            var targetType = CheckedLocalType(ins.Operand0, pc);
+                            AppendLocalLikeStore(statements, stack, pc, ins.Op, GenTreeKind.StoreLocal, GenTreeKind.LocalAddr, ins.Operand0, targetType, value.Node);
                             break;
                         }
 
@@ -2596,7 +2724,8 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Starg:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreArg, pc, ins.Op, operands: One(value.Node), int32: ins.Operand0));
+                            var targetType = CheckedArgType(ins.Operand0, pc);
+                            AppendLocalLikeStore(statements, stack, pc, ins.Op, GenTreeKind.StoreArg, GenTreeKind.ArgAddr, ins.Operand0, targetType, value.Node);
                             break;
                         }
 
@@ -2718,7 +2847,8 @@ namespace Cnidaria.Cs
                             var value = Pop(stack, pc, ins.Op);
                             var address = Pop(stack, pc, ins.Op);
                             var t = ResolveType(ins.Operand0);
-                            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreIndirect, pc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
+                            if (!TryRetargetStructMaterializationToAddress(statements, pc, ins.Op, address.Node, t, value.Node))
+                                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreIndirect, pc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
                             break;
                         }
 
@@ -3006,6 +3136,24 @@ namespace Cnidaria.Cs
         }
         private static bool RangesIntersect(int aStart, int aEnd, int bStart, int bEnd)
             => aStart < bEnd && bStart < aEnd;
+        private bool PcInExceptionRegion(int pc)
+        {
+            if (_body.ExceptionHandlers.Length == 0)
+                return false;
+
+            for (int i = 0; i < _body.ExceptionHandlers.Length; i++)
+            {
+                var h = _body.ExceptionHandlers[i];
+                if ((uint)(pc - h.TryStartPc) < (uint)(h.TryEndPc - h.TryStartPc) ||
+                    (uint)(pc - h.HandlerStartPc) < (uint)(h.HandlerEndPc - h.HandlerStartPc))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private bool PcInExceptionHandlerRegion(int pc)
         {
             if (_body.ExceptionHandlers.Length == 0)
@@ -3270,6 +3418,9 @@ namespace Cnidaria.Cs
             if (value.StackKind == GenStackKind.Void)
                 return false;
 
+            if (value.Kind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+                return false;
+
             const GenTreeFlags materializeFlags =
                 GenTreeFlags.ContainsCall |
                 GenTreeFlags.CanThrow |
@@ -3331,6 +3482,1016 @@ namespace Cnidaria.Cs
         private StackValue TempLoad(int pc, BytecodeOp sourceOp, GenTemp temp)
         {
             return new StackValue(Node(GenTreeKind.Temp, pc, sourceOp, type: temp.Type, stackKind: temp.StackKind, int32: temp.Index), temp.Type, temp.StackKind);
+        }
+
+        private StackValue TempAddress(int pc, BytecodeOp sourceOp, GenTemp temp)
+        {
+            var byRefType = temp.Type is null ? null : _rts.GetByRefType(temp.Type);
+            return new StackValue(Node(GenTreeKind.TempAddr, pc, sourceOp, type: byRefType, stackKind: GenStackKind.ByRef, int32: temp.Index), byRefType, GenStackKind.ByRef);
+        }
+
+        private GenTemp CreateStructMaterializationTemp(RuntimeType type)
+        {
+            int index = _nextTempIndex++;
+            var temp = new GenTemp(index, GenTempKind.StructMaterialization, type, StackKindOf(type));
+            _temps.Add(temp);
+            _structMaterializationTempIds.Add(index);
+            return temp;
+        }
+
+        private bool TryGetTempByIndex(int index, out GenTemp temp)
+        {
+            for (int i = 0; i < _temps.Count; i++)
+            {
+                if (_temps[i].Index == index)
+                {
+                    temp = _temps[i];
+                    return true;
+                }
+            }
+
+            temp = default;
+            return false;
+        }
+
+        private void AppendLocalLikeStore(
+            List<GenTree> statements,
+            List<StackValue> stack,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTreeKind storeKind,
+            GenTreeKind addressKind,
+            int index,
+            RuntimeType? targetType,
+            GenTree value)
+        {
+            if (targetType is not null &&
+                TryRetargetStructMaterializationToLocalLikeStore(statements, pc, sourceOp, storeKind, addressKind, index, targetType, value))
+            {
+                return;
+            }
+
+            if (targetType is not null &&
+                CanUseFieldWiseStructStoreForDestination(addressKind, index) &&
+                TryAppendFieldWiseStructStore(statements, stack, pc, sourceOp, addressKind, index, targetType, value))
+            {
+                return;
+            }
+
+            AppendImporterStatement(statements, stack, Node(storeKind, pc, sourceOp, operands: One(value), int32: index));
+        }
+        private bool TryRetargetStructMaterializationToLocalLikeStore(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTreeKind storeKind,
+            GenTreeKind addressKind,
+            int index,
+            RuntimeType targetType,
+            GenTree value)
+        {
+            if (addressKind == GenTreeKind.TempAddr && value.Kind == GenTreeKind.Temp && value.Int32 == index)
+                return false;
+
+            if (PcInExceptionRegion(pc))
+                return false;
+
+            if (TryGetTrailingStructMaterialization(statements, value, targetType, out var temp, out var ctorCall, out int rewriteStart))
+            {
+                if (!CanRetargetStructMaterializationToLocalLikeDestination(addressKind, index, ctorCall))
+                    return false;
+
+                statements.RemoveRange(rewriteStart, statements.Count - rewriteStart);
+                EmitStructDefaultInitializationToLocalLike(statements, pc, sourceOp, storeKind, addressKind, index, targetType);
+                var destinationAddress = CreateLocalLikeAddress(pc, sourceOp, addressKind, index, targetType);
+                AppendRetargetedStructConstructorCall(statements, ctorCall, destinationAddress);
+                RemoveEliminatedStructMaterializationTemp(temp);
+                return true;
+            }
+
+            if (TryGetTrailingInlineStructMaterializationThroughCopyChain(statements, value, targetType, out temp, out var inlinePlan, out var copyTempIds))
+            {
+                if (!CanRetargetInlineStructMaterializationToLocalLikeDestination(addressKind, index, inlinePlan))
+                    return false;
+
+                statements.RemoveRange(inlinePlan.RewriteStart, statements.Count - inlinePlan.RewriteStart);
+                if (inlinePlan.NeedsDefaultInitialization)
+                    EmitStructDefaultInitializationToLocalLike(statements, pc, sourceOp, storeKind, addressKind, index, targetType);
+
+                AppendRetargetedInlineStructMaterialization(statements, inlinePlan, temp, () => CreateLocalLikeAddress(pc, sourceOp, addressKind, index, targetType));
+                RemoveEliminatedStructMaterializationTemp(temp);
+                RemoveEliminatedTempIndexes(inlinePlan.AliasTempIds);
+                RemoveEliminatedTempIndexes(copyTempIds);
+                return true;
+            }
+
+            if (TryGetTrailingInlineStructMaterialization(statements, value, targetType, out temp, out inlinePlan))
+            {
+                if (!CanRetargetInlineStructMaterializationToLocalLikeDestination(addressKind, index, inlinePlan))
+                    return false;
+
+                statements.RemoveRange(inlinePlan.RewriteStart, statements.Count - inlinePlan.RewriteStart);
+                if (inlinePlan.NeedsDefaultInitialization)
+                    EmitStructDefaultInitializationToLocalLike(statements, pc, sourceOp, storeKind, addressKind, index, targetType);
+
+                AppendRetargetedInlineStructMaterialization(statements, inlinePlan, temp, () => CreateLocalLikeAddress(pc, sourceOp, addressKind, index, targetType));
+                RemoveEliminatedStructMaterializationTemp(temp);
+                RemoveEliminatedTempIndexes(inlinePlan.AliasTempIds);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryRetargetStructMaterializationToAddress(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTree destinationAddress,
+            RuntimeType targetType,
+            GenTree value)
+        {
+            if (!IsReusableStructDestinationAddress(destinationAddress))
+                return false;
+
+            if (PcInExceptionRegion(pc))
+                return false;
+
+            if (TryGetTrailingStructMaterialization(statements, value, targetType, out var temp, out var ctorCall, out int rewriteStart))
+            {
+                if (!CanRetargetStructMaterializationToMemoryDestination(ctorCall))
+                    return false;
+
+                statements.RemoveRange(rewriteStart, statements.Count - rewriteStart);
+                EmitStructDefaultInitializationThroughAddress(statements, pc, sourceOp, targetType, () => CloneAddressNode(destinationAddress));
+                AppendRetargetedStructConstructorCall(statements, ctorCall, CloneAddressNode(destinationAddress));
+                RemoveEliminatedStructMaterializationTemp(temp);
+                return true;
+            }
+
+            if (TryGetTrailingInlineStructMaterializationThroughCopyChain(statements, value, targetType, out temp, out var inlinePlan, out var copyTempIds))
+            {
+                if (!CanRetargetInlineStructMaterializationToMemoryDestination(inlinePlan))
+                    return false;
+
+                statements.RemoveRange(inlinePlan.RewriteStart, statements.Count - inlinePlan.RewriteStart);
+                if (inlinePlan.NeedsDefaultInitialization)
+                    EmitStructDefaultInitializationThroughAddress(statements, pc, sourceOp, targetType, () => CloneAddressNode(destinationAddress));
+
+                AppendRetargetedInlineStructMaterialization(statements, inlinePlan, temp, () => CloneAddressNode(destinationAddress));
+                RemoveEliminatedStructMaterializationTemp(temp);
+                RemoveEliminatedTempIndexes(inlinePlan.AliasTempIds);
+                RemoveEliminatedTempIndexes(copyTempIds);
+                return true;
+            }
+
+            if (TryGetTrailingInlineStructMaterialization(statements, value, targetType, out temp, out inlinePlan))
+            {
+                if (!CanRetargetInlineStructMaterializationToMemoryDestination(inlinePlan))
+                    return false;
+
+                statements.RemoveRange(inlinePlan.RewriteStart, statements.Count - inlinePlan.RewriteStart);
+                if (inlinePlan.NeedsDefaultInitialization)
+                    EmitStructDefaultInitializationThroughAddress(statements, pc, sourceOp, targetType, () => CloneAddressNode(destinationAddress));
+
+                AppendRetargetedInlineStructMaterialization(statements, inlinePlan, temp, () => CloneAddressNode(destinationAddress));
+                RemoveEliminatedStructMaterializationTemp(temp);
+                RemoveEliminatedTempIndexes(inlinePlan.AliasTempIds);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool CanRetargetStructMaterializationToLocalLikeDestination(GenTreeKind destinationAddressKind, int destinationIndex, GenTree ctorCall)
+        {
+            for (int i = 1; i < ctorCall.Operands.Length; i++)
+            {
+                var arg = ctorCall.Operands[i];
+                if (HasStructMaterializationOrderingHazard(arg))
+                    return false;
+
+                if (ReferencesLocalLikeDestination(arg, destinationAddressKind, destinationIndex))
+                    return false;
+
+                if (DestinationMayBeExternallyAliased(destinationAddressKind, destinationIndex) && HasAliasingMemoryAccess(arg))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool CanRetargetStructMaterializationToMemoryDestination(GenTree ctorCall)
+        {
+            for (int i = 1; i < ctorCall.Operands.Length; i++)
+            {
+                if (HasStructMaterializationOrderingHazard(ctorCall.Operands[i]) || HasAliasingMemoryAccess(ctorCall.Operands[i]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private sealed class InlineStructMaterializationPlan
+        {
+            public int RewriteStart;
+            public bool SawDefaultInitialization;
+            public bool WritesAllInstanceFields;
+            public readonly List<GenTree> FieldStores = new();
+            public readonly HashSet<int> AliasTempIds = new();
+            public readonly HashSet<RuntimeField> WrittenFields = new();
+
+            public bool NeedsDefaultInitialization => SawDefaultInitialization && !WritesAllInstanceFields;
+        }
+
+        private bool CanRetargetInlineStructMaterializationToLocalLikeDestination(
+            GenTreeKind destinationAddressKind,
+            int destinationIndex,
+            InlineStructMaterializationPlan plan)
+        {
+            for (int i = 0; i < plan.FieldStores.Count; i++)
+            {
+                var value = plan.FieldStores[i].Operands[1];
+                if (HasStructMaterializationOrderingHazard(value))
+                    return false;
+
+                if (ReferencesLocalLikeDestination(value, destinationAddressKind, destinationIndex))
+                    return false;
+
+                if (DestinationMayBeExternallyAliased(destinationAddressKind, destinationIndex) && HasAliasingMemoryAccess(value))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool CanRetargetInlineStructMaterializationToMemoryDestination(InlineStructMaterializationPlan plan)
+        {
+            for (int i = 0; i < plan.FieldStores.Count; i++)
+            {
+                var value = plan.FieldStores[i].Operands[1];
+                if (HasStructMaterializationOrderingHazard(value) || HasAliasingMemoryAccess(value))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool TryGetTrailingInlineStructMaterializationThroughCopyChain(
+            List<GenTree> statements,
+            GenTree value,
+            RuntimeType targetType,
+            out GenTemp temp,
+            out InlineStructMaterializationPlan plan,
+            out HashSet<int> copyTempIds)
+        {
+            temp = default;
+            plan = null!;
+            copyTempIds = new HashSet<int>();
+
+            if (value.Kind != GenTreeKind.Temp || statements.Count == 0)
+                return false;
+
+            int end = statements.Count;
+            var current = value;
+            while (end > 0)
+            {
+                if (current.Kind != GenTreeKind.Temp)
+                    return false;
+
+                int copyTempIndex = current.Int32;
+                if (!TryGetTempByIndex(copyTempIndex, out var copyTemp) || !IsElidableStructCopyTemp(copyTemp) || !ReferenceEquals(copyTemp.Type, targetType))
+                    return false;
+
+                var copy = statements[end - 1];
+                if (!TryGetTrailingTempStructCopy(copy, copyTempIndex, targetType, out var source))
+                    return false;
+
+                if (HasTempReferenceBefore(statements, end - 1, copyTempIndex))
+                    return false;
+
+                copyTempIds.Add(copyTempIndex);
+                end--;
+
+                var prefix = end == statements.Count ? statements : statements.GetRange(0, end);
+                if (TryGetTrailingInlineStructMaterialization(prefix, source, targetType, out temp, out plan))
+                    return true;
+
+                current = source;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetTrailingTempStructCopy(GenTree statement, int destinationTempIndex, RuntimeType targetType, out GenTree source)
+        {
+            source = null!;
+
+            if (statement.Kind != GenTreeKind.StoreTemp || statement.Int32 != destinationTempIndex || statement.Operands.Length != 1)
+                return false;
+
+            source = statement.Operands[0];
+            return source.Kind == GenTreeKind.Temp && ReferenceEquals(source.Type, targetType);
+        }
+
+        private static bool IsElidableStructCopyTemp(GenTemp temp)
+        {
+            return temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineLocal or GenTempKind.InlineReturn or GenTempKind.StackSpill;
+        }
+
+        private static bool HasTempReferenceBefore(List<GenTree> statements, int stop, int tempIndex)
+        {
+            for (int i = 0; i < stop; i++)
+            {
+                if (ReferencesTempIndex(statements[i], tempIndex))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool ReferencesTempIndex(GenTree tree, int tempIndex)
+        {
+            if (tree.Int32 == tempIndex && tree.Kind is GenTreeKind.Temp or GenTreeKind.TempAddr or GenTreeKind.StoreTemp)
+                return true;
+
+            var operands = tree.Operands;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                if (ReferencesTempIndex(operands[i], tempIndex))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TryGetTrailingInlineStructMaterialization(
+            List<GenTree> statements,
+            GenTree value,
+            RuntimeType targetType,
+            out GenTemp temp,
+            out InlineStructMaterializationPlan plan)
+        {
+            temp = default;
+            plan = null!;
+
+            if (value.Kind != GenTreeKind.Temp)
+                return false;
+
+            if (!TryGetTempByIndex(value.Int32, out temp) || !IsElidableStructConstructionTemp(temp) || !ReferenceEquals(temp.Type, targetType))
+                return false;
+
+            if (!ReferenceEquals(value.Type, targetType) || statements.Count == 0)
+                return false;
+
+            for (int start = 0; start < statements.Count; start++)
+            {
+                if (!TryAnalyzeInlineStructMaterializationSegment(statements, start, temp, targetType, out var candidate))
+                    continue;
+
+                if (HasStructMaterializationReferenceBefore(statements, start, temp, candidate.AliasTempIds))
+                    continue;
+
+                plan = candidate;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsElidableStructConstructionTemp(GenTemp temp)
+        {
+            return temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineLocal or GenTempKind.InlineReturn;
+        }
+
+        private bool TryAnalyzeInlineStructMaterializationSegment(
+            List<GenTree> statements,
+            int start,
+            GenTemp temp,
+            RuntimeType targetType,
+            out InlineStructMaterializationPlan plan)
+        {
+            plan = new InlineStructMaterializationPlan { RewriteStart = start };
+            bool beforeCtorStores = true;
+            bool sawMaterializationStatement = false;
+
+            for (int i = start; i < statements.Count; i++)
+            {
+                var statement = statements[i];
+
+                if (TryGetStructMaterializationAliasDefinition(statement, temp, plan.AliasTempIds, out int aliasTempId))
+                {
+                    plan.AliasTempIds.Add(aliasTempId);
+                    sawMaterializationStatement = true;
+                    continue;
+                }
+
+                if (beforeCtorStores && IsStructDefaultInitializationForTempOrAlias(statement, temp, targetType, plan.AliasTempIds))
+                {
+                    plan.SawDefaultInitialization = true;
+                    sawMaterializationStatement = true;
+                    continue;
+                }
+
+                if (TryGetStructMaterializationFieldStore(statement, temp, targetType, plan.AliasTempIds, out var field, out var fieldValue))
+                {
+                    if (ReferencesStructMaterializationStorage(fieldValue, temp, plan.AliasTempIds))
+                        return false;
+
+                    beforeCtorStores = false;
+                    sawMaterializationStatement = true;
+                    plan.FieldStores.Add(statement);
+                    plan.WrittenFields.Add(field);
+                    continue;
+                }
+
+                return false;
+            }
+
+            if (!sawMaterializationStatement)
+                return false;
+
+            if (plan.FieldStores.Count == 0 && !plan.SawDefaultInitialization)
+                return false;
+
+            plan.WritesAllInstanceFields = plan.FieldStores.Count != 0 && AllInstanceFieldsWritten(targetType, plan.WrittenFields);
+            if (!plan.SawDefaultInitialization && !plan.WritesAllInstanceFields)
+                return false;
+
+            return true;
+        }
+
+        private static bool TryGetStructMaterializationAliasDefinition(
+            GenTree statement,
+            GenTemp temp,
+            HashSet<int> aliasTempIds,
+            out int aliasTempId)
+        {
+            aliasTempId = -1;
+
+            if (statement.Kind != GenTreeKind.StoreTemp || statement.Operands.Length != 1)
+                return false;
+
+            if (!IsStructMaterializationAddress(statement.Operands[0], temp, aliasTempIds))
+                return false;
+
+            if (statement.Int32 == temp.Index || aliasTempIds.Contains(statement.Int32))
+                return false;
+
+            aliasTempId = statement.Int32;
+            return true;
+        }
+
+        private static bool IsStructDefaultInitializationForTempOrAlias(
+            GenTree statement,
+            GenTemp temp,
+            RuntimeType valueType,
+            HashSet<int> aliasTempIds)
+        {
+            if (statement.Kind == GenTreeKind.StoreTemp && statement.Int32 == temp.Index)
+                return statement.Operands.Length == 1 && IsDefaultValueOfType(statement.Operands[0], valueType);
+
+            if (statement.Kind == GenTreeKind.StoreField && statement.Operands.Length == 2)
+            {
+                if (!IsStructMaterializationAddress(statement.Operands[0], temp, aliasTempIds))
+                    return false;
+
+                if (statement.Field is null || statement.Field.IsStatic || !ReferenceEquals(statement.Field.DeclaringType, valueType))
+                    return false;
+
+                return IsDefaultValue(statement.Operands[1]);
+            }
+
+            return false;
+        }
+
+        private static bool TryGetStructMaterializationFieldStore(
+            GenTree statement,
+            GenTemp temp,
+            RuntimeType targetType,
+            HashSet<int> aliasTempIds,
+            out RuntimeField field,
+            out GenTree fieldValue)
+        {
+            field = null!;
+            fieldValue = null!;
+
+            if (statement.Kind != GenTreeKind.StoreField || statement.Operands.Length != 2)
+                return false;
+
+            if (statement.Field is null || statement.Field.IsStatic || !ReferenceEquals(statement.Field.DeclaringType, targetType))
+                return false;
+
+            if (!IsStructMaterializationAddress(statement.Operands[0], temp, aliasTempIds))
+                return false;
+
+            field = statement.Field;
+            fieldValue = statement.Operands[1];
+            return true;
+        }
+
+        private static bool IsStructMaterializationAddress(GenTree node, GenTemp temp, HashSet<int> aliasTempIds)
+        {
+            if (node.Kind == GenTreeKind.TempAddr && node.Int32 == temp.Index)
+                return true;
+
+            if (node.Kind == GenTreeKind.Temp && aliasTempIds.Contains(node.Int32))
+                return true;
+
+            return false;
+        }
+
+        private static bool ReferencesStructMaterializationStorage(GenTree tree, GenTemp temp, HashSet<int> aliasTempIds)
+        {
+            if (IsStructMaterializationAddress(tree, temp, aliasTempIds))
+                return true;
+
+            var operands = tree.Operands;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                if (ReferencesStructMaterializationStorage(operands[i], temp, aliasTempIds))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool HasStructMaterializationReferenceBefore(
+            List<GenTree> statements,
+            int stop,
+            GenTemp temp,
+            HashSet<int> aliasTempIds)
+        {
+            for (int i = 0; i < stop; i++)
+            {
+                if (ReferencesStructMaterializationStorage(statements[i], temp, aliasTempIds))
+                    return true;
+
+                if (statements[i].Kind == GenTreeKind.StoreTemp && aliasTempIds.Contains(statements[i].Int32))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool AllInstanceFieldsWritten(RuntimeType targetType, HashSet<RuntimeField> writtenFields)
+        {
+            var fields = targetType.InstanceFields;
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (!field.IsStatic && !writtenFields.Contains(field))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void AppendRetargetedInlineStructMaterialization(
+            List<GenTree> statements,
+            InlineStructMaterializationPlan plan,
+            GenTemp temp,
+            Func<GenTree> createDestinationAddress)
+        {
+            for (int i = 0; i < plan.FieldStores.Count; i++)
+            {
+                var store = plan.FieldStores[i];
+                var fieldValue = CloneTreeReplacingStructMaterializationStorage(store.Operands[1], temp, plan.AliasTempIds, createDestinationAddress);
+                statements.Add(Node(GenTreeKind.StoreField, store.Pc, store.SourceOp,
+                    operands: Two(createDestinationAddress(), fieldValue), field: store.Field, int64: store.Int64, runtimeType: store.RuntimeType));
+            }
+        }
+
+        private GenTree CloneTreeReplacingStructMaterializationStorage(
+            GenTree node,
+            GenTemp temp,
+            HashSet<int> aliasTempIds,
+            Func<GenTree> createDestinationAddress)
+        {
+            if (IsStructMaterializationAddress(node, temp, aliasTempIds))
+                return createDestinationAddress();
+
+            var operands = node.Operands;
+            ImmutableArray<GenTree> clonedOperands = ImmutableArray<GenTree>.Empty;
+            if (operands.Length != 0)
+            {
+                var builder = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
+                for (int i = 0; i < operands.Length; i++)
+                    builder.Add(CloneTreeReplacingStructMaterializationStorage(operands[i], temp, aliasTempIds, createDestinationAddress));
+                clonedOperands = builder.ToImmutable();
+            }
+
+            return Node(node.Kind, node.Pc, node.SourceOp,
+                type: node.Type,
+                stackKind: node.StackKind,
+                operands: clonedOperands,
+                int32: node.Int32,
+                int64: node.Int64,
+                text: node.Text,
+                runtimeType: node.RuntimeType,
+                field: node.Field,
+                method: node.Method,
+                convKind: node.ConvKind,
+                convFlags: node.ConvFlags,
+                targetPc: node.TargetPc,
+                targetBlockId: node.TargetBlockId);
+        }
+
+        private bool DestinationMayBeExternallyAliased(GenTreeKind destinationAddressKind, int destinationIndex)
+        {
+            return destinationAddressKind switch
+            {
+                GenTreeKind.LocalAddr => (uint)destinationIndex < (uint)_addressExposedLocals.Length && _addressExposedLocals[destinationIndex],
+                GenTreeKind.ArgAddr => (uint)destinationIndex < (uint)_addressExposedArgs.Length && _addressExposedArgs[destinationIndex],
+                _ => false,
+            };
+        }
+
+        private static bool ReferencesLocalLikeDestination(GenTree tree, GenTreeKind destinationAddressKind, int destinationIndex)
+        {
+            if (IsDestinationLocalLikeUse(tree, destinationAddressKind, destinationIndex))
+                return true;
+
+            var operands = tree.Operands;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                if (ReferencesLocalLikeDestination(operands[i], destinationAddressKind, destinationIndex))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsDestinationLocalLikeUse(GenTree tree, GenTreeKind destinationAddressKind, int destinationIndex)
+        {
+            return destinationAddressKind switch
+            {
+                GenTreeKind.LocalAddr => tree.Int32 == destinationIndex && (tree.Kind == GenTreeKind.Local || tree.Kind == GenTreeKind.LocalAddr || tree.Kind == GenTreeKind.StoreLocal),
+                GenTreeKind.ArgAddr => tree.Int32 == destinationIndex && (tree.Kind == GenTreeKind.Arg || tree.Kind == GenTreeKind.ArgAddr || tree.Kind == GenTreeKind.StoreArg),
+                GenTreeKind.TempAddr => tree.Int32 == destinationIndex && (tree.Kind == GenTreeKind.Temp || tree.Kind == GenTreeKind.TempAddr || tree.Kind == GenTreeKind.StoreTemp),
+                _ => false,
+            };
+        }
+
+        private static bool HasStructMaterializationOrderingHazard(GenTree tree)
+        {
+            const GenTreeFlags hazardFlags = GenTreeFlags.ContainsCall |
+                                             GenTreeFlags.CanThrow |
+                                             GenTreeFlags.SideEffect |
+                                             GenTreeFlags.MemoryRead |
+                                             GenTreeFlags.MemoryWrite |
+                                             GenTreeFlags.GlobalRef |
+                                             GenTreeFlags.Indirect |
+                                             GenTreeFlags.Allocation |
+                                             GenTreeFlags.ControlFlow |
+                                             GenTreeFlags.ExceptionFlow;
+            return (tree.Flags & hazardFlags) != 0;
+        }
+
+        private static bool HasAliasingMemoryAccess(GenTree tree)
+        {
+            const GenTreeFlags aliasingFlags = GenTreeFlags.ContainsCall |
+                                               GenTreeFlags.SideEffect |
+                                               GenTreeFlags.MemoryRead |
+                                               GenTreeFlags.MemoryWrite |
+                                               GenTreeFlags.GlobalRef |
+                                               GenTreeFlags.Indirect |
+                                               GenTreeFlags.AddressExposed;
+            return (tree.Flags & aliasingFlags) != 0;
+        }
+
+        private static bool IsReusableStructDestinationAddress(GenTree address)
+        {
+            return address.Kind == GenTreeKind.LocalAddr ||
+                   address.Kind == GenTreeKind.ArgAddr ||
+                   address.Kind == GenTreeKind.TempAddr;
+        }
+
+        private bool TryGetTrailingStructMaterialization(
+            List<GenTree> statements,
+            GenTree value,
+            RuntimeType targetType,
+            out GenTemp temp,
+            out GenTree ctorCall,
+            out int rewriteStart)
+        {
+            temp = default;
+            ctorCall = null!;
+            rewriteStart = -1;
+
+            if (value.Kind != GenTreeKind.Temp || !_structMaterializationTempIds.Contains(value.Int32))
+                return false;
+
+            if (!TryGetTempByIndex(value.Int32, out temp) || temp.Kind != GenTempKind.StructMaterialization || !ReferenceEquals(temp.Type, targetType))
+                return false;
+
+            if (!ReferenceEquals(value.Type, targetType) || statements.Count == 0)
+                return false;
+
+            var trailing = statements[statements.Count - 1];
+            if (trailing.Kind != GenTreeKind.Eval || trailing.Operands.Length != 1)
+                return false;
+
+            ctorCall = trailing.Operands[0];
+            if (ctorCall.Kind != GenTreeKind.Call || ctorCall.StackKind != GenStackKind.Void || ctorCall.Method is null)
+                return false;
+
+            if (ctorCall.Operands.Length == 0 || !ReferenceEquals(ctorCall.Method.DeclaringType, targetType))
+                return false;
+
+            if (!IsTempAddressFor(ctorCall.Operands[0], temp))
+                return false;
+
+            int first = statements.Count - 1;
+            bool sawInitialization = false;
+            while (first > 0 && IsStructDefaultInitializationForTemp(statements[first - 1], temp, targetType))
+            {
+                sawInitialization = true;
+                first--;
+            }
+
+            if (HasInstanceFields(targetType) && !sawInitialization)
+                return false;
+
+            rewriteStart = first;
+            return true;
+        }
+
+        private static bool IsTempAddressFor(GenTree node, GenTemp temp)
+        {
+            return node.Kind == GenTreeKind.TempAddr && node.Int32 == temp.Index;
+        }
+
+        private static bool IsStructDefaultInitializationForTemp(GenTree statement, GenTemp temp, RuntimeType valueType)
+        {
+            if (statement.Kind == GenTreeKind.StoreTemp && statement.Int32 == temp.Index)
+                return IsDefaultValueOfType(statement.Operands[0], valueType);
+
+            if (statement.Kind == GenTreeKind.StoreField && statement.Operands.Length == 2)
+            {
+                if (!IsTempAddressFor(statement.Operands[0], temp))
+                    return false;
+
+                if (statement.Field is null || statement.Field.IsStatic)
+                    return false;
+
+                return IsDefaultValue(statement.Operands[1]);
+            }
+
+            return false;
+        }
+
+        private static bool IsDefaultValueOfType(GenTree node, RuntimeType type)
+        {
+            return node.Kind == GenTreeKind.DefaultValue && ReferenceEquals(node.RuntimeType, type);
+        }
+
+        private static bool IsDefaultValue(GenTree node)
+        {
+            return node.Kind == GenTreeKind.DefaultValue;
+        }
+
+        private static bool HasInstanceFields(RuntimeType type)
+        {
+            if (type.Kind != RuntimeTypeKind.Struct)
+                return false;
+
+            var fields = type.InstanceFields;
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (!fields[i].IsStatic)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void EmitStructDefaultInitializationToLocalLike(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTreeKind storeKind,
+            GenTreeKind addressKind,
+            int index,
+            RuntimeType valueType)
+        {
+            if (EmitStructDefaultInitializationToAddress(statements, pc, sourceOp, valueType,
+                    () => CreateLocalLikeAddress(pc, sourceOp, addressKind, index, valueType)))
+            {
+                return;
+            }
+
+            var init = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: valueType, stackKind: StackKindOf(valueType), runtimeType: valueType);
+            statements.Add(Node(storeKind, pc, sourceOp, operands: One(init), int32: index));
+        }
+
+        private void EmitStructDefaultInitializationThroughAddress(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            RuntimeType valueType,
+            Func<GenTree> createDestinationAddress)
+        {
+            if (EmitStructDefaultInitializationToAddress(statements, pc, sourceOp, valueType, createDestinationAddress))
+                return;
+
+            var init = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: valueType, stackKind: StackKindOf(valueType), runtimeType: valueType);
+            statements.Add(Node(GenTreeKind.StoreIndirect, pc, sourceOp, operands: Two(createDestinationAddress(), init), runtimeType: valueType));
+        }
+
+        private bool EmitStructDefaultInitializationToAddress(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            RuntimeType valueType,
+            Func<GenTree> createDestinationAddress)
+        {
+            if (valueType.Kind != RuntimeTypeKind.Struct)
+                return false;
+
+            if (valueType.InstanceFields.Length == 0)
+                return true;
+
+            if (!CanExpandStructFieldWise(valueType))
+                return false;
+
+            var fields = valueType.InstanceFields;
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (field.IsStatic)
+                    continue;
+
+                var fieldDefault = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: field.FieldType, stackKind: StackKindOf(field.FieldType), runtimeType: field.FieldType);
+                statements.Add(Node(GenTreeKind.StoreField, pc, sourceOp,
+                    operands: Two(createDestinationAddress(), fieldDefault), field: field, runtimeType: field.FieldType));
+            }
+
+            return true;
+        }
+
+        private void AppendRetargetedStructConstructorCall(
+            List<GenTree> statements,
+            GenTree originalCall,
+            GenTree destinationAddress)
+        {
+            var argsBuilder = ImmutableArray.CreateBuilder<GenTree>(originalCall.Operands.Length);
+            argsBuilder.Add(destinationAddress);
+            for (int i = 1; i < originalCall.Operands.Length; i++)
+                argsBuilder.Add(originalCall.Operands[i]);
+
+            var call = Node(GenTreeKind.Call, originalCall.Pc, originalCall.SourceOp, stackKind: GenStackKind.Void,
+                operands: argsBuilder.ToImmutable(), int32: originalCall.Int32, int64: originalCall.Int64, method: originalCall.Method);
+            statements.Add(Node(GenTreeKind.Eval, originalCall.Pc, originalCall.SourceOp, operands: One(call)));
+        }
+
+        private void RemoveEliminatedStructMaterializationTemp(GenTemp temp)
+        {
+            RemoveEliminatedTempIndex(temp.Index);
+        }
+
+        private void RemoveEliminatedTempIndexes(IEnumerable<int> tempIndexes)
+        {
+            foreach (int tempIndex in tempIndexes)
+                RemoveEliminatedTempIndex(tempIndex);
+        }
+
+        private void RemoveEliminatedTempIndex(int tempIndex)
+        {
+            for (int i = _temps.Count - 1; i >= 0; i--)
+            {
+                if (_temps[i].Index == tempIndex)
+                    _temps.RemoveAt(i);
+            }
+
+            _structMaterializationTempIds.Remove(tempIndex);
+            _materializedImporterTempIds.Remove(tempIndex);
+            _dupTemps.Remove(tempIndex);
+            _createdDupTempIds.Remove(tempIndex);
+        }
+
+        private bool CanUseFieldWiseStructStoreForDestination(GenTreeKind destinationAddressKind, int destinationIndex)
+        {
+            return destinationAddressKind switch
+            {
+                GenTreeKind.LocalAddr => (uint)destinationIndex >= (uint)_addressExposedLocals.Length || !_addressExposedLocals[destinationIndex],
+                GenTreeKind.ArgAddr => (uint)destinationIndex >= (uint)_addressExposedArgs.Length || !_addressExposedArgs[destinationIndex],
+                _ => true,
+            };
+        }
+
+        private bool TryAppendFieldWiseStructStore(
+            List<GenTree> statements,
+            List<StackValue> stack,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTreeKind destinationAddressKind,
+            int destinationIndex,
+            RuntimeType destinationType,
+            GenTree value)
+        {
+            if (!CanExpandStructFieldWise(destinationType))
+                return false;
+
+            bool sourceIsDefault = value.Kind == GenTreeKind.DefaultValue && ReferenceEquals(value.RuntimeType, destinationType);
+            GenTree? sourceAddress = null;
+            if (!sourceIsDefault && !TryCreateAddressForStructValue(pc, sourceOp, value, destinationType, out sourceAddress))
+                return false;
+
+            var fields = destinationType.InstanceFields;
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (field.IsStatic)
+                    continue;
+
+                GenTree fieldValue = sourceIsDefault
+                    ? Node(GenTreeKind.DefaultValue, pc, sourceOp, type: field.FieldType, stackKind: StackKindOf(field.FieldType), runtimeType: field.FieldType)
+                    : Node(GenTreeKind.Field, pc, BytecodeOp.Ldfld, type: field.FieldType, stackKind: StackKindOf(field.FieldType), operands: One(CloneAddressNode(sourceAddress!)), field: field, runtimeType: field.FieldType);
+
+                GenTree destinationAddress = CreateLocalLikeAddress(pc, sourceOp, destinationAddressKind, destinationIndex, destinationType);
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreField, pc, sourceOp, operands: Two(destinationAddress, fieldValue), field: field, runtimeType: field.FieldType));
+            }
+
+            return true;
+        }
+
+        private bool TryCreateAddressForStructValue(int pc, BytecodeOp sourceOp, GenTree value, RuntimeType expectedType, out GenTree address)
+        {
+            if (!ReferenceEquals(value.Type, expectedType))
+            {
+                address = null!;
+                return false;
+            }
+
+            switch (value.Kind)
+            {
+                case GenTreeKind.Local:
+                    address = CreateLocalLikeAddress(pc, sourceOp, GenTreeKind.LocalAddr, value.Int32, expectedType);
+                    return true;
+
+                case GenTreeKind.Arg:
+                    address = CreateLocalLikeAddress(pc, sourceOp, GenTreeKind.ArgAddr, value.Int32, expectedType);
+                    return true;
+
+                case GenTreeKind.Temp:
+                    if (!TryGetTempByIndex(value.Int32, out var temp) || !ReferenceEquals(temp.Type, expectedType))
+                    {
+                        address = null!;
+                        return false;
+                    }
+                    address = TempAddress(pc, sourceOp, temp).Node;
+                    return true;
+            }
+
+            address = null!;
+            return false;
+        }
+
+        private GenTree CreateLocalLikeAddress(int pc, BytecodeOp sourceOp, GenTreeKind addressKind, int index, RuntimeType targetType)
+        {
+            var byRefType = _rts.GetByRefType(targetType);
+            return Node(addressKind, pc, sourceOp, type: byRefType, stackKind: GenStackKind.ByRef, int32: index);
+        }
+
+        private GenTree CloneAddressNode(GenTree address)
+        {
+            return Node(address.Kind, address.Pc, address.SourceOp, type: address.Type, stackKind: address.StackKind, int32: address.Int32);
+        }
+
+        private static bool CanExpandStructFieldWise(RuntimeType? type)
+        {
+            if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct || type.InstanceFields.Length == 0)
+                return false;
+
+            if (StackKindOf(type) != GenStackKind.Value)
+                return false;
+
+            return HasNonOverlappingInstanceFields(type.InstanceFields);
+        }
+
+        private static bool HasNonOverlappingInstanceFields(RuntimeField[] fields)
+        {
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (fields[i].IsStatic)
+                    continue;
+
+                int iStart = fields[i].Offset;
+                int iEnd = iStart + Math.Max(1, fields[i].FieldType.SizeOf);
+                for (int j = i + 1; j < fields.Length; j++)
+                {
+                    if (fields[j].IsStatic)
+                        continue;
+
+                    int jStart = fields[j].Offset;
+                    int jEnd = jStart + Math.Max(1, fields[j].FieldType.SizeOf);
+                    if (iStart < jEnd && jStart < iEnd)
+                        return false;
+                }
+            }
+
+            return true;
         }
 
         private void EmitUnary(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
@@ -3660,8 +4821,89 @@ namespace Cnidaria.Cs
 
             var t = ctor.DeclaringType;
             MarkInstantiatedType(t);
+
+            if (t.IsValueType)
+            {
+                EmitValueTypeNewObject(stack, statements, pc, ins.Op, ins.Operand0, argCount, args, ctor, t);
+                return;
+            }
+
             PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, pc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: ins.Operand0, method: ctor, runtimeType: t));
+        }
+
+        private void EmitValueTypeNewObject(
+            List<StackValue> stack,
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            int methodToken,
+            int userArgCount,
+            ImmutableArray<GenTree> userArgs,
+            RuntimeMethod ctor,
+            RuntimeType valueType)
+        {
+            if (!valueType.IsValueType)
+                throw Fail(pc, sourceOp, "Value-type materialization requires a value-type constructor.");
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, sourceOp);
+
+            var temp = CreateStructMaterializationTemp(valueType);
+            EmitStructDefaultInitialization(statements, stack, pc, sourceOp, temp, valueType);
+
+            var ctorArgsBuilder = ImmutableArray.CreateBuilder<GenTree>(userArgCount + 1);
+            ctorArgsBuilder.Add(TempAddress(pc, sourceOp, temp).Node);
+            ctorArgsBuilder.AddRange(userArgs);
+            var ctorArgs = ctorArgsBuilder.ToImmutable();
+
+            if (TryInlineCall(ctor, ctorArgs, statements, pc, sourceOp, out var inlineResult))
+            {
+                if (inlineResult is not null)
+                    AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, sourceOp, operands: One(inlineResult)));
+
+                Push(stack, TempLoad(pc, sourceOp, temp));
+                return;
+            }
+
+            var call = Node(GenTreeKind.Call, pc, sourceOp, stackKind: GenStackKind.Void, operands: ctorArgs,
+                int32: userArgCount + 1, int64: methodToken, method: ctor);
+            AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, sourceOp, operands: One(call)));
+            Push(stack, TempLoad(pc, sourceOp, temp));
+        }
+
+        private void EmitStructDefaultInitialization(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp, GenTemp temp, RuntimeType valueType)
+        {
+            if (TryEmitFieldWiseStructDefaultInitialization(statements, stack, pc, sourceOp, temp, valueType))
+                return;
+
+            var init = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: valueType, stackKind: StackKindOf(valueType), runtimeType: valueType);
+            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreTemp, pc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
+        }
+
+        private bool TryEmitFieldWiseStructDefaultInitialization(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp, GenTemp temp, RuntimeType valueType)
+        {
+            if (valueType.Kind != RuntimeTypeKind.Struct)
+                return false;
+
+            if (valueType.InstanceFields.Length == 0)
+                return true;
+
+            if (!CanExpandStructFieldWise(valueType))
+                return false;
+
+            var fields = valueType.InstanceFields;
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (field.IsStatic)
+                    continue;
+
+                var fieldDefault = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: field.FieldType, stackKind: StackKindOf(field.FieldType), runtimeType: field.FieldType);
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreField, pc, sourceOp,
+                    operands: Two(TempAddress(pc, sourceOp, temp).Node, fieldDefault), field: field, runtimeType: field.FieldType));
+            }
+
+            return true;
         }
 
         private bool TryInlineCall(
@@ -3740,10 +4982,7 @@ namespace Cnidaria.Cs
                         if (ins.Pop == 1)
                         {
                             var returnValue = Pop(inlineStack, callPc, ins.Op);
-
-                            var returnTemp = CreateInlineTemp(GenTempKind.InlineReturn, returnValue.Type, returnValue.StackKind);
-                            AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(returnValue.Node), int32: returnTemp.Index));
-                            result = TempLoad(callPc, ins.Op, returnTemp).Node;
+                            result = returnValue.Node;
                         }
                         else
                         {
@@ -3815,6 +5054,10 @@ namespace Cnidaria.Cs
                             Push(inlineStack, LoadInlineArg(argTemps, argSubstitutions, ins.Operand0, callPc, ins.Op));
                             break;
 
+                        case BytecodeOp.Ldarga:
+                            Push(inlineStack, TempAddress(callPc, ins.Op, CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op)));
+                            break;
+
                         case BytecodeOp.Ldthis:
                             Push(inlineStack, LoadInlineArg(argTemps, argSubstitutions, 0, callPc, ins.Op));
                             break;
@@ -3823,7 +5066,7 @@ namespace Cnidaria.Cs
                             {
                                 var value = Pop(inlineStack, callPc, ins.Op);
                                 var temp = CheckedInlineArgTemp(argTemps, ins.Operand0, callPc, ins.Op);
-                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                                AppendLocalLikeStore(statements, inlineStack, callPc, ins.Op, GenTreeKind.StoreTemp, GenTreeKind.TempAddr, temp.Index, temp.Type, value.Node);
                                 break;
                             }
 
@@ -3831,11 +5074,15 @@ namespace Cnidaria.Cs
                             Push(inlineStack, TempLoad(callPc, ins.Op, CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op)));
                             break;
 
+                        case BytecodeOp.Ldloca:
+                            Push(inlineStack, TempAddress(callPc, ins.Op, CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op)));
+                            break;
+
                         case BytecodeOp.Stloc:
                             {
                                 var value = Pop(inlineStack, callPc, ins.Op);
                                 var temp = CheckedInlineLocalTemp(localTemps, ins.Operand0, callPc, ins.Op);
-                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreTemp, callPc, ins.Op, operands: One(value.Node), int32: temp.Index));
+                                AppendLocalLikeStore(statements, inlineStack, callPc, ins.Op, GenTreeKind.StoreTemp, GenTreeKind.TempAddr, temp.Index, temp.Type, value.Node);
                                 break;
                             }
 
@@ -3935,7 +5182,8 @@ namespace Cnidaria.Cs
                                 var value = Pop(inlineStack, callPc, ins.Op);
                                 var address = Pop(inlineStack, callPc, ins.Op);
                                 var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
-                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
+                                if (!TryRetargetStructMaterializationToAddress(statements, callPc, ins.Op, address.Node, t, value.Node))
+                                    AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.StoreIndirect, callPc, ins.Op, operands: Two(address.Node, value.Node), runtimeType: t));
                                 break;
                             }
 
@@ -3988,8 +5236,6 @@ namespace Cnidaria.Cs
                                 break;
                             }
 
-                        case BytecodeOp.Ldloca:
-                        case BytecodeOp.Ldarga:
                         case BytecodeOp.Br:
                         case BytecodeOp.Leave:
                         case BytecodeOp.Brtrue:
@@ -4102,6 +5348,8 @@ namespace Cnidaria.Cs
 
             var argLoadCounts = new int[argCount];
             var argStoreCounts = new int[argCount];
+            var argAddressCounts = new int[argCount];
+            var localAddressCounts = new int[body.LocalTypeTokens.Length];
             var localNeedsInit = new bool[body.LocalTypeTokens.Length];
             var localDefinitelyAssigned = new bool[body.LocalTypeTokens.Length];
 
@@ -4134,7 +5382,7 @@ namespace Cnidaria.Cs
                 if (!CanTranslateInlineOpcode(ins.Op))
                     return false;
 
-                if (!NoteInlineOperandUse(ins, argLoadCounts, argStoreCounts, localNeedsInit, localDefinitelyAssigned))
+                if (!NoteInlineOperandUse(ins, argLoadCounts, argStoreCounts, argAddressCounts, localAddressCounts, localNeedsInit, localDefinitelyAssigned))
                     return false;
 
                 instructionCount++;
@@ -4160,6 +5408,8 @@ namespace Cnidaria.Cs
                 body.Instructions.Length,
                 argLoadCounts,
                 argStoreCounts,
+                argAddressCounts,
+                localAddressCounts,
                 localNeedsInit,
                 mostlyLoadStore,
                 looksLikeWrapper,
@@ -4172,6 +5422,8 @@ namespace Cnidaria.Cs
             Instruction ins,
             int[] argLoadCounts,
             int[] argStoreCounts,
+            int[] argAddressCounts,
+            int[] localAddressCounts,
             bool[] localNeedsInit,
             bool[] localDefinitelyAssigned)
         {
@@ -4189,6 +5441,12 @@ namespace Cnidaria.Cs
                     argLoadCounts[ins.Operand0]++;
                     return true;
 
+                case BytecodeOp.Ldarga:
+                    if ((uint)ins.Operand0 >= (uint)argAddressCounts.Length)
+                        return false;
+                    argAddressCounts[ins.Operand0]++;
+                    return true;
+
                 case BytecodeOp.Starg:
                     if ((uint)ins.Operand0 >= (uint)argStoreCounts.Length)
                         return false;
@@ -4198,6 +5456,14 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Ldloc:
                     if ((uint)ins.Operand0 >= (uint)localNeedsInit.Length)
                         return false;
+                    if (!localDefinitelyAssigned[ins.Operand0])
+                        localNeedsInit[ins.Operand0] = true;
+                    return true;
+
+                case BytecodeOp.Ldloca:
+                    if ((uint)ins.Operand0 >= (uint)localAddressCounts.Length)
+                        return false;
+                    localAddressCounts[ins.Operand0]++;
                     if (!localDefinitelyAssigned[ins.Operand0])
                         localNeedsInit[ins.Operand0] = true;
                     return true;
@@ -4226,12 +5492,13 @@ namespace Cnidaria.Cs
 
         private static bool IsInlineLoadStoreOpcode(BytecodeOp op)
         {
-            return op is BytecodeOp.Ldarg or BytecodeOp.Ldthis or BytecodeOp.Ldloc or BytecodeOp.Ldc_I4 or
-                BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R4 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull or
-                BytecodeOp.Ldstr or BytecodeOp.DefaultValue or BytecodeOp.Sizeof or BytecodeOp.TypeIsValueType or
-                BytecodeOp.Starg or BytecodeOp.Stloc or BytecodeOp.Ldfld or BytecodeOp.Ldflda or
-                BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Stobj or
-                BytecodeOp.Ldelem or BytecodeOp.Ldelema or BytecodeOp.Stelem or BytecodeOp.Pop;
+            return op is BytecodeOp.Ldarg or BytecodeOp.Ldarga or BytecodeOp.Ldthis or BytecodeOp.Ldloc or
+                         BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R4 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull or
+                         BytecodeOp.Ldstr or BytecodeOp.DefaultValue or BytecodeOp.Sizeof or BytecodeOp.TypeIsValueType or
+                         BytecodeOp.Starg or BytecodeOp.Stloc or BytecodeOp.Ldfld or BytecodeOp.Ldflda or
+                         BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Stobj or
+                         BytecodeOp.Ldelem or BytecodeOp.Ldelema or BytecodeOp.Stelem or BytecodeOp.Pop or
+                         BytecodeOp.Ldloca or BytecodeOp.Ldc_I4;
         }
 
         private static bool IsPureInlineArgument(GenTree arg)
@@ -4250,11 +5517,15 @@ namespace Cnidaria.Cs
                 GenTreeFlags.Ordered |
                 GenTreeFlags.AddressExposed;
 
-            if ((arg.Flags & badFlags) != 0)
+            var disallowed = badFlags;
+            if (arg.Kind == GenTreeKind.TempAddr)
+                disallowed &= ~GenTreeFlags.AddressExposed;
+
+            if ((arg.Flags & disallowed) != 0)
                 return false;
 
             return arg.Kind is GenTreeKind.ConstI4 or GenTreeKind.ConstI8 or GenTreeKind.ConstR4Bits or GenTreeKind.ConstR8Bits or
-                GenTreeKind.ConstNull or GenTreeKind.ConstString or GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp or
+                GenTreeKind.ConstNull or GenTreeKind.ConstString or GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp or GenTreeKind.TempAddr or
                 GenTreeKind.DefaultValue or GenTreeKind.SizeOf or GenTreeKind.Unary or GenTreeKind.Binary or GenTreeKind.Conv;
         }
 
@@ -4262,6 +5533,8 @@ namespace Cnidaria.Cs
         {
             private readonly int[] _argLoadCounts;
             private readonly int[] _argStoreCounts;
+            private readonly int[] _argAddressCounts;
+            private readonly int[] _localAddressCounts;
             private readonly bool[] _localNeedsInit;
 
             public int Cost { get; }
@@ -4276,6 +5549,8 @@ namespace Cnidaria.Cs
                 int codeSize,
                 int[] argLoadCounts,
                 int[] argStoreCounts,
+                int[] argAddressCounts,
+                int[] localAddressCounts,
                 bool[] localNeedsInit,
                 bool mostlyLoadStore,
                 bool looksLikeWrapper,
@@ -4286,6 +5561,8 @@ namespace Cnidaria.Cs
                 CodeSize = codeSize;
                 _argLoadCounts = argLoadCounts ?? Array.Empty<int>();
                 _argStoreCounts = argStoreCounts ?? Array.Empty<int>();
+                _argAddressCounts = argAddressCounts ?? Array.Empty<int>();
+                _localAddressCounts = localAddressCounts ?? Array.Empty<int>();
                 _localNeedsInit = localNeedsInit ?? Array.Empty<bool>();
                 MostlyLoadStore = mostlyLoadStore;
                 LooksLikeWrapper = looksLikeWrapper;
@@ -4295,10 +5572,15 @@ namespace Cnidaria.Cs
 
             public bool CanSubstituteArgument(int index, GenTree arg)
             {
-                if ((uint)index >= (uint)_argLoadCounts.Length || (uint)index >= (uint)_argStoreCounts.Length)
+                if ((uint)index >= (uint)_argLoadCounts.Length ||
+                    (uint)index >= (uint)_argStoreCounts.Length ||
+                    (uint)index >= (uint)_argAddressCounts.Length)
+                {
                     return false;
+                }
 
                 return _argStoreCounts[index] == 0 &&
+                    _argAddressCounts[index] == 0 &&
                     _argLoadCounts[index] == 1 &&
                     IsPureInlineArgument(arg);
             }
@@ -4325,8 +5607,10 @@ namespace Cnidaria.Cs
                 BytecodeOp.TypeIsValueType or
                 BytecodeOp.Ldloc or
                 BytecodeOp.Stloc or
+                BytecodeOp.Ldloca or
                 BytecodeOp.Ldarg or
                 BytecodeOp.Starg or
+                BytecodeOp.Ldarga or
                 BytecodeOp.Ldthis or
                 BytecodeOp.Add or
                 BytecodeOp.Add_Ovf or
@@ -4581,6 +5865,13 @@ namespace Cnidaria.Cs
             AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
+            MarkInstantiatedType(t);
+            if (t.IsValueType)
+            {
+                EmitValueTypeNewObject(stack, statements, callPc, ins.Op, ins.Operand0, argCount, args, ctor, t);
+                return;
+            }
+
             PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, callPc, ins.Op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: ins.Operand0, method: ctor, runtimeType: t));
         }
@@ -4831,7 +6122,8 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.LocalAddr:
                 case GenTreeKind.ArgAddr:
-                    flags |= GenTreeFlags.LocalUse | GenTreeFlags.AddressExposed;
+                case GenTreeKind.TempAddr:
+                    flags |= GenTreeFlags.LocalUse;
                     break;
 
                 case GenTreeKind.StoreLocal:
@@ -5221,6 +6513,17 @@ namespace Cnidaria.Cs
 
     internal static class GenTreeDumper
     {
+        private static bool TryAppendOperand(StringBuilder sb, GenTree node, int index)
+        {
+            if ((uint)index < (uint)node.Operands.Length)
+            {
+                AppendNode(sb, node.Operands[index]);
+                return true;
+            }
+
+            sb.Append("<missing-op").Append(index).Append('>');
+            return false;
+        }
 
         internal static void AppendNode(StringBuilder sb, GenTree node)
         {
@@ -5259,6 +6562,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.Temp:
                     sb.Append('t').Append(node.Int32);
                     return;
+                case GenTreeKind.TempAddr:
+                    sb.Append("&t").Append(node.Int32);
+                    return;
                 case GenTreeKind.DefaultValue:
                     sb.Append("default(").Append(TypeName(node.RuntimeType)).Append(')');
                     return;
@@ -5277,9 +6583,9 @@ namespace Cnidaria.Cs
                     if (node.Operands.Length == 2)
                     {
                         sb.Append('(');
-                        AppendNode(sb, node.Operands[0]);
+                        TryAppendOperand(sb, node, 0);
                         sb.Append(' ').Append(node.SourceOp).Append(' ');
-                        AppendNode(sb, node.Operands[1]);
+                        TryAppendOperand(sb, node, 1);
                         sb.Append(')');
                         return;
                     }
@@ -5312,7 +6618,7 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.Field:
                 case GenTreeKind.FieldAddr:
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     sb.Append(node.Kind == GenTreeKind.FieldAddr ? ".&" : ".");
                     sb.Append(FieldName(node.Field));
                     return;
@@ -5334,24 +6640,24 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.StoreLocal:
                     sb.Append('l').Append(node.Int32).Append(" = ");
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     return;
                 case GenTreeKind.StoreArg:
                     sb.Append('a').Append(node.Int32).Append(" = ");
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     return;
                 case GenTreeKind.StoreTemp:
                     sb.Append('t').Append(node.Int32).Append(" = ");
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     return;
                 case GenTreeKind.StoreField:
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     sb.Append('.').Append(FieldName(node.Field)).Append(" = ");
-                    AppendNode(sb, node.Operands[1]);
+                    TryAppendOperand(sb, node, 1);
                     return;
                 case GenTreeKind.StoreStaticField:
                     sb.Append(FieldName(node.Field)).Append(" = ");
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     return;
                 case GenTreeKind.NewArray:
                     sb.Append("newarr ").Append(TypeName(node.RuntimeType)).Append('[');
@@ -5360,18 +6666,18 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.ArrayElement:
                 case GenTreeKind.ArrayElementAddr:
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     sb.Append('[');
-                    AppendNode(sb, node.Operands[1]);
+                    TryAppendOperand(sb, node, 1);
                     sb.Append(']');
                     if (node.Kind == GenTreeKind.ArrayElementAddr) sb.Append(".addr");
                     return;
                 case GenTreeKind.StoreArrayElement:
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     sb.Append('[');
-                    AppendNode(sb, node.Operands[1]);
+                    TryAppendOperand(sb, node, 1);
                     sb.Append("] = ");
-                    AppendNode(sb, node.Operands[2]);
+                    TryAppendOperand(sb, node, 2);
                     return;
                 case GenTreeKind.ArrayDataRef:
                     sb.Append("arrayDataRef(");
@@ -5441,7 +6747,7 @@ namespace Cnidaria.Cs
                 case GenTreeKind.BranchTrue:
                 case GenTreeKind.BranchFalse:
                     sb.Append(node.Kind == GenTreeKind.BranchTrue ? "brtrue " : "brfalse ");
-                    AppendNode(sb, node.Operands[0]);
+                    TryAppendOperand(sb, node, 0);
                     sb.Append(" -> B").Append(node.TargetBlockId).Append(" pc ").Append(node.TargetPc);
                     return;
                 case GenTreeKind.Return:
@@ -5482,19 +6788,19 @@ namespace Cnidaria.Cs
         {
             if (type is null) return "?";
             if (string.IsNullOrEmpty(type.Namespace)) return type.Name;
-            return type.Namespace + "." + type.Name;
+            return $"{type.Namespace}.{type.Name}";
         }
 
         private static string FieldName(RuntimeField? field)
         {
             if (field is null) return "<field?>";
-            return TypeName(field.DeclaringType) + "." + field.Name;
+            return $"{TypeName(field.DeclaringType)}.{field.Name}";
         }
 
         private static string MethodName(RuntimeMethod? method)
         {
             if (method is null) return "<method?>";
-            return TypeName(method.DeclaringType) + "." + method.Name;
+            return $"{TypeName(method.DeclaringType)}.{method.Name}";
         }
 
         private static string Escape(string s)

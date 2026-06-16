@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -310,7 +310,7 @@ namespace Cnidaria.Cs
                 AddUnique(appModule);
 
                 var rts = new RuntimeTypeSystem(modules);
-                ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
+                ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta, builtFuncs);
                 //int entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
                 var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
                 var backend = BackendPipeline.CompileProgram(genTreeProgram);
@@ -325,10 +325,12 @@ namespace Cnidaria.Cs
                 return (null, diagnostics);
             }
         }
-        private static ImmutableArray<int> FindRunnableRegisterRoots(IMetadataView appMeta)
+        private static ImmutableArray<int> FindRunnableRegisterRoots(IMetadataView appMeta, IReadOnlyDictionary<int, BytecodeFunction> appFunctions)
         {
             if (appMeta is null)
                 throw new ArgumentNullException(nameof(appMeta));
+            if (appFunctions is null)
+                throw new ArgumentNullException(nameof(appFunctions));
 
             var roots = ImmutableArray.CreateBuilder<int>();
             var seen = new HashSet<int>();
@@ -342,6 +344,9 @@ namespace Cnidaria.Cs
                 if (rid <= 0 || rid > appMeta.GetRowCount(MetadataTableKind.MethodDef))
                     return;
 
+                if (!appFunctions.ContainsKey(methodToken))
+                    return;
+
                 if (seen.Add(methodToken))
                     roots.Add(methodToken);
             }
@@ -349,35 +354,49 @@ namespace Cnidaria.Cs
             if (BytecodeBuilder.TryFindEntryPointMethodDef(appMeta, out int mainToken))
                 Add(mainToken);
 
-            var attributesByParent = BuildAttributeMap(appMeta);
-
-            foreach (int methodToken in EnumerateMethodDefTokens(appMeta))
+            foreach (int methodToken in appFunctions.Keys.OrderBy(x => x))
             {
-                if (!attributesByParent.TryGetValue(methodToken, out var attrs))
+                if (!IsPotentialRegisterEntryRoot(appMeta, methodToken))
                     continue;
 
-                for (int i = 0; i < attrs.Count; i++)
-                {
-                    var attr = attrs[i];
-
-                    if (attr.Target != AttributeApplicationTarget.Method)
-                        continue;
-
-                    string name = NormalizeAttrName(attr.Name);
-
-                    if (StringComparer.Ordinal.Equals(name, "Command") ||
-                        StringComparer.Ordinal.Equals(name, "Button"))
-                    {
-                        Add(methodToken);
-                        break;
-                    }
-                }
+                Add(methodToken);
             }
 
             if (roots.Count == 0)
-                throw new InvalidOperationException("No runnable entry roots found in module metadata.");
+                throw new InvalidOperationException("No runnable entry roots found in module bytecode.");
 
             return roots.ToImmutable();
+        }
+        private static bool IsPotentialRegisterEntryRoot(IMetadataView metadata, int methodToken)
+        {
+            if (MetadataToken.Table(methodToken) != MetadataToken.MethodDef)
+                return false;
+
+            int rid = MetadataToken.Rid(methodToken);
+            if (rid <= 0 || rid > metadata.GetRowCount(MetadataTableKind.MethodDef))
+                return false;
+
+            var method = metadata.GetMethodDef(rid);
+            string methodName = metadata.GetString(method.Name);
+
+            if ((method.Flags & 0x0800) != 0) // MethodAttributes.SpecialName
+                return false;
+
+            if (methodName is ".ctor" or ".cctor")
+                return false;
+
+            var sig = new SigReader(metadata.GetBlob(method.Signature));
+            byte callConv = sig.ReadByte();
+
+            bool hasThis = (callConv & 0x20) != 0;
+            if (hasThis)
+                return false;
+
+            if ((callConv & 0x10) != 0) // GENERIC
+                _ = sig.ReadCompressedUInt();
+
+            _ = sig.ReadCompressedUInt(); // parameter count
+            return TryReadVoidReturnType(ref sig);
         }
         public static (string output, List<IDiagnostic> diagnostics, ExecutionContext context) Interpret(
             byte[] runnableAppImage,
@@ -449,7 +468,7 @@ namespace Cnidaria.Cs
                     }
                 }
                 var rts = new RuntimeTypeSystem(modules);
-                HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta);
+                HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta, appFuncs);
                 var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
                 swBuild.Stop();
 
@@ -504,9 +523,10 @@ namespace Cnidaria.Cs
             IReadOnlyDictionary<string, RuntimeModule> modules,
             RuntimeTypeSystem rts,
             RuntimeModule appModule,
-            IMetadataView appMeta)
+            IMetadataView appMeta,
+            IReadOnlyDictionary<int, BytecodeFunction> appFunctions)
         {
-            ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
+            ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta, appFunctions);
             _ = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
         }
         private static byte[] SerializeRegisterRunnableApplication(byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage)

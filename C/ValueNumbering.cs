@@ -543,11 +543,14 @@ namespace Cnidaria.C
         }
 
         private ValueNumber NumberConstant(GimpleConstantValue constant)
+            => NumberConstantValue(constant.Value, constant.Type);
+
+        private ValueNumber NumberConstantValue(object? value, QualifiedType type)
             => GetCanonicalNumber(
                 ValueNumberKind.Constant,
-                constant.Type,
+                type,
                 ValueNumberOperation.Constant,
-                NormalizeConstantKey(constant.Value),
+                NormalizeConstantKey(value),
                 ImmutableArray<ValueNumber>.Empty);
 
         private ValueNumber NumberCompositeExpression(
@@ -592,6 +595,9 @@ namespace Cnidaria.C
             if (expression.IsAddress && expression.Original is GimpleIndirectExpression && childNumbers.Length == 1)
                 return childNumbers[0];
 
+            if (TryFoldCompositeExpression(expression, childNumbers, out var folded))
+                return folded;
+
             var operation = GetOperation(expression);
             var operatorKey = GetOperatorKey(expression.Original);
             var operands = CanonicalizeOperands(expression.Original, childNumbers);
@@ -616,6 +622,200 @@ namespace Cnidaria.C
                 ? operands
                 : ImmutableArray.Create(operands[1], operands[0]);
         }
+
+        private bool TryFoldCompositeExpression(SsaExpression expression, ImmutableArray<ValueNumber> childNumbers, out ValueNumber folded)
+        {
+            if (expression.ContainsCall || expression.ReadsMemory || expression.WritesMemory)
+            {
+                folded = null!;
+                return false;
+            }
+
+            if (expression.Original is GimpleUnaryExpression unary && childNumbers.Length == 1)
+                return TryFoldUnaryExpression(unary, childNumbers[0], expression.Children, out folded);
+
+            if (expression.Original is GimpleBinaryExpression binary && childNumbers.Length == 2)
+                return TryFoldBinaryExpression(binary, childNumbers, expression.Children, out folded);
+
+            folded = null!;
+            return false;
+        }
+
+        private bool TryFoldUnaryExpression(
+            GimpleUnaryExpression unary,
+            ValueNumber operandNumber,
+            ImmutableArray<SsaExpression> children,
+            out ValueNumber folded)
+        {
+            switch (unary.OperatorToken.Kind)
+            {
+                case SyntaxKind.PlusToken:
+                    folded = operandNumber;
+                    return true;
+
+                case SyntaxKind.BangToken when children.Length == 1 && TryGetIntegerConstant(children[0], out var value):
+                    folded = NumberConstantValue(value == 0 ? 1 : 0, unary.Type);
+                    return true;
+            }
+
+            folded = null!;
+            return false;
+        }
+
+        private bool TryFoldBinaryExpression(
+            GimpleBinaryExpression binary,
+            ImmutableArray<ValueNumber> childNumbers,
+            ImmutableArray<SsaExpression> children,
+            out ValueNumber folded)
+        {
+            var kind = binary.OperatorToken.Kind;
+            var left = childNumbers[0];
+            var right = childNumbers[1];
+            var canUseIntegerIdentities = IsIntegerLike(binary.Type) || IsPointerLike(binary.Type);
+
+            if (canUseIntegerIdentities)
+            {
+                if (kind == SyntaxKind.PlusToken)
+                {
+                    if (children.Length == 2 && TryGetIntegerConstant(children[1], out var rightValue) && rightValue == 0)
+                    {
+                        folded = left;
+                        return true;
+                    }
+
+                    if (children.Length == 2 && TryGetIntegerConstant(children[0], out var leftValue) && leftValue == 0)
+                    {
+                        folded = right;
+                        return true;
+                    }
+                }
+
+                if (kind == SyntaxKind.MinusToken &&
+                    children.Length == 2 &&
+                    TryGetIntegerConstant(children[1], out var subtractValue) &&
+                    subtractValue == 0)
+                {
+                    folded = left;
+                    return true;
+                }
+            }
+
+            if (IsIntegerLike(binary.Type))
+            {
+                if (kind == SyntaxKind.StarToken)
+                {
+                    if (children.Length == 2 && TryGetIntegerConstant(children[1], out var rightValue) && rightValue == 1)
+                    {
+                        folded = left;
+                        return true;
+                    }
+
+                    if (children.Length == 2 && TryGetIntegerConstant(children[0], out var leftValue) && leftValue == 1)
+                    {
+                        folded = right;
+                        return true;
+                    }
+                }
+
+                if (kind == SyntaxKind.SlashToken &&
+                    children.Length == 2 &&
+                    TryGetIntegerConstant(children[1], out var divisor) &&
+                    divisor == 1)
+                {
+                    folded = left;
+                    return true;
+                }
+
+                if (ReferenceEquals(left, right))
+                {
+                    switch (kind)
+                    {
+                        case SyntaxKind.AmpersandToken:
+                        case SyntaxKind.PipeToken:
+                            folded = left;
+                            return true;
+
+                        case SyntaxKind.HatToken:
+                        case SyntaxKind.MinusToken:
+                            folded = NumberConstantValue(0, binary.Type);
+                            return true;
+                    }
+                }
+            }
+
+            if (ReferenceEquals(left, right) && (IsIntegerLike(binary.Left.Type) || IsPointerLike(binary.Left.Type)))
+            {
+                switch (kind)
+                {
+                    case SyntaxKind.EqualsEqualsToken:
+                        folded = NumberConstantValue(1, binary.Type);
+                        return true;
+
+                    case SyntaxKind.BangEqualsToken:
+                        folded = NumberConstantValue(0, binary.Type);
+                        return true;
+                }
+            }
+
+            folded = null!;
+            return false;
+        }
+
+        private static bool TryGetIntegerConstant(SsaExpression expression, out long value)
+        {
+            if (expression.Original is GimpleConstantValue constant && TryConvertIntegerConstant(constant.Value, out value))
+                return true;
+
+            value = 0;
+            return false;
+        }
+
+        private static bool TryConvertIntegerConstant(object? constant, out long value)
+        {
+            switch (constant)
+            {
+                case null:
+                    value = 0;
+                    return true;
+                case bool b:
+                    value = b ? 1 : 0;
+                    return true;
+                case byte b:
+                    value = b;
+                    return true;
+                case sbyte s:
+                    value = s;
+                    return true;
+                case short s:
+                    value = s;
+                    return true;
+                case ushort u:
+                    value = u;
+                    return true;
+                case int i:
+                    value = i;
+                    return true;
+                case uint u:
+                    value = u;
+                    return true;
+                case long l:
+                    value = l;
+                    return true;
+                case ulong u when u <= long.MaxValue:
+                    value = (long)u;
+                    return true;
+                case char c:
+                    value = c;
+                    return true;
+                default:
+                    value = 0;
+                    return false;
+            }
+        }
+
+        private static bool IsPointerLike(QualifiedType type)
+            => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
+
 
         private bool IsCommutative(GimpleBinaryExpression binary)
         {

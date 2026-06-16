@@ -322,6 +322,12 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.LocalUse;
                     break;
 
+                case GenTreeKind.LocalAddr:
+                case GenTreeKind.ArgAddr:
+                case GenTreeKind.TempAddr:
+                    flags |= GenTreeFlags.LocalUse;
+                    break;
+
                 case GenTreeKind.StoreField:
                 case GenTreeKind.StoreStaticField:
                 case GenTreeKind.StoreIndirect:
@@ -518,6 +524,7 @@ namespace Cnidaria.Cs
 
             var asm = new Assembler(program.TypeSystem);
             var state = BuildState.Create(asm, program);
+            InternMethodSignatureLayouts(asm, program); // intern signatures in case method is used as entry point
 
             ImageFlags flags = ImageFlags.LittleEndian;
             if (TargetArchitecture.PointerSize == 4)
@@ -547,8 +554,29 @@ namespace Cnidaria.Cs
             return asm.Build(flags, validate: options.VerifyImage);
         }
 
-        public static byte[] BuildBytes(GenTreeProgram program, CodeGeneratorOptions? options = null)
-            => ImageSerializer.ToBytes(Build(program, options));
+        private static void InternMethodSignatureLayouts(Assembler asm, GenTreeProgram program)
+        {
+            if (asm is null) throw new ArgumentNullException(nameof(asm));
+            if (program is null) throw new ArgumentNullException(nameof(program));
+
+            for (int i = 0; i < program.Methods.Length; i++)
+            {
+                RuntimeMethod method = program.Methods[i].RuntimeMethod;
+
+                asm.InternTypeLayout(method.DeclaringType);
+
+                if (!IsVoidType(method.ReturnType))
+                    asm.InternTypeLayout(method.ReturnType);
+
+                RuntimeType[] parameters = method.ParameterTypes;
+                for (int p = 0; p < parameters.Length; p++)
+                    asm.InternTypeLayout(parameters[p]);
+            }
+
+            static bool IsVoidType(RuntimeType type)
+                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(type.Name, "Void");
+        }
 
         private readonly struct DelegateTargetThunkKey : IEquatable<DelegateTargetThunkKey>
         {
@@ -1636,6 +1664,7 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.LocalAddr:
                     case GenTreeKind.ArgAddr:
+                    case GenTreeKind.TempAddr:
                         EmitAddressTree(instruction, source);
                         return;
                     case GenTreeKind.ExceptionObject:
@@ -2060,6 +2089,10 @@ namespace Cnidaria.Cs
                         if (!_method.StackFrame.TryGetArgumentSlot(source.Int32, out slot))
                             throw new InvalidOperationException("No finalized frame slot for argument " + source.Int32 + ".");
                         break;
+                    case GenTreeKind.TempAddr:
+                        if (!_method.StackFrame.TryGetTempSlot(source.Int32, out slot))
+                            throw new InvalidOperationException("No finalized frame slot for temp " + source.Int32 + ".");
+                        break;
                     default:
                         throw new InvalidOperationException("Unsupported address tree source: " + source.Kind + ".");
                 }
@@ -2099,6 +2132,7 @@ namespace Cnidaria.Cs
                         break;
                     case GenTreeKind.Temp:
                     case GenTreeKind.StoreTemp:
+                    case GenTreeKind.TempAddr:
                         if (!_method.StackFrame.TryGetTempSlot(source.Int32, out slot))
                             throw new InvalidOperationException("No finalized frame slot for temp " + source.Int32 + ".");
                         break;
@@ -2569,6 +2603,9 @@ namespace Cnidaria.Cs
             {
                 if (instruction.Uses.Length == 0)
                 {
+                    if (TryEmitContainedLocalLikeMultiRegisterReturn(instruction, source))
+                        return;
+
                     _asm.RetVoid();
                     return;
                 }
@@ -2743,12 +2780,100 @@ namespace Cnidaria.Cs
                 if (!first.IsRegister)
                     throw Unsupported(instruction, "multi-register return first fragment is not an ABI register");
 
-                if (segments[0].RegisterClass == RegisterClass.Float || MachineRegisters.GetClass(first.Register) == RegisterClass.Float)
-                    _asm.RetF(first.Register);
-                else if (segments[0].ContainsGcPointers)
-                    _asm.RetRef(first.Register);
+                EmitMultiRegisterReturnFromFirstRegister(first.Register, segments[0]);
+            }
+
+            private bool TryEmitContainedLocalLikeMultiRegisterReturn(GenTree instruction, GenTree source)
+            {
+                if (source.Kind != GenTreeKind.Return || source.Operands.Length != 1)
+                    return false;
+
+                var value = source.Operands[0];
+                if (value.Kind is not (GenTreeKind.Local or GenTreeKind.Temp))
+                    return false;
+
+                RuntimeType? returnType = value.LocalDescriptor?.Type ?? value.RuntimeType ?? value.Type;
+                if (returnType is null || !returnType.IsValueType)
+                    return false;
+
+                if (MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod))
+                    return false;
+
+                var returnKind = value.LocalDescriptor?.StackKind ?? StackKindOf(returnType);
+                var abi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true);
+                if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
+                    return false;
+
+                var segments = MachineAbi.GetRegisterSegments(abi);
+                if (segments.Length == 0)
+                    return false;
+
+                var slot = FrameSlotOperandForLocalLike(value, returnType, returnKind, RegisterClass.General);
+                int generalReturnIndex = 0;
+                int floatReturnIndex = 0;
+                MachineRegister firstRegister = MachineRegister.Invalid;
+                AbiRegisterSegment firstSegment = default;
+
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    var segment = segments[i];
+                    var dst = GetReturnRegister(segment.RegisterClass, ref generalReturnIndex, ref floatReturnIndex);
+                    if (dst == MachineRegister.Invalid)
+                        throw Unsupported(instruction, $"multi-register return has no ABI register for fragment {i}");
+
+                    var src = FrameSlotFragment(slot, segment);
+                    EmitLoad(dst, src, null, StackKindForSegment(segment));
+
+                    if (i == 0)
+                    {
+                        firstRegister = dst;
+                        firstSegment = segment;
+                    }
+                }
+
+                EmitMultiRegisterReturnFromFirstRegister(firstRegister, firstSegment);
+                return true;
+            }
+
+            private void EmitMultiRegisterReturnFromFirstRegister(MachineRegister firstRegister, AbiRegisterSegment firstSegment)
+            {
+                if (firstSegment.RegisterClass == RegisterClass.Float || MachineRegisters.GetClass(firstRegister) == RegisterClass.Float)
+                    _asm.RetF(firstRegister);
+                else if (firstSegment.ContainsGcPointers)
+                    _asm.RetRef(firstRegister);
                 else
-                    _asm.RetI(first.Register);
+                    _asm.RetI(firstRegister);
+            }
+
+            private static MachineRegister GetReturnRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+            {
+                if (registerClass == RegisterClass.Float)
+                {
+                    int index = floatIndex++;
+                    return index switch
+                    {
+                        0 => MachineRegisters.FloatReturnValue0,
+                        1 => MachineRegisters.FloatReturnValue1,
+                        2 => MachineRegisters.FloatReturnValue2,
+                        3 => MachineRegisters.FloatReturnValue3,
+                        _ => MachineRegister.Invalid,
+                    };
+                }
+
+                if (registerClass == RegisterClass.General)
+                {
+                    int index = generalIndex++;
+                    return index switch
+                    {
+                        0 => MachineRegisters.ReturnValue0,
+                        1 => MachineRegisters.ReturnValue1,
+                        2 => MachineRegisters.ReturnValue2,
+                        3 => MachineRegisters.ReturnValue3,
+                        _ => MachineRegister.Invalid,
+                    };
+                }
+
+                return MachineRegister.Invalid;
             }
 
             private void EmitNewDelegate(GenTree instruction, GenTree source)
@@ -2953,15 +3078,7 @@ namespace Cnidaria.Cs
                 if (instruction.TreeKind == GenTreeKind.NewObject)
                 {
                     if (method.DeclaringType.IsValueType)
-                    {
-                        if (!hasHiddenReturnBufferOperand)
-                            throw Unsupported(instruction, "value-type newobj requires a hidden return buffer operand");
-
-                        var flags = BuildCallFlags(method, Op.CallVoid) | CallFlags.HiddenReturnBuffer;
-                        EmitCallGcSafePointAfterPreamble(instruction, EmitKnownManagedCallPreamble(method));
-                        _asm.CallDirect(Op.CallVoid, ResolveDirectCallTarget(instruction, method), flags);
-                        return;
-                    }
+                        throw Unsupported(instruction, "value-type newobj must not reach codegen as an opaque NewObject node");
 
                     var objectHome = RequireSingleResult(instruction);
                     if (!objectHome.IsFrameSlot)
@@ -3217,10 +3334,17 @@ namespace Cnidaria.Cs
 
                 if (instruction.TreeKind == GenTreeKind.StoreField)
                 {
+                    if (TryEmitSsaPromotedFieldDefinition(instruction, source))
+                        return;
+
                     int instanceUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 0, "field store instance");
-                    int valueUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 1, "field store value");
                     var instance = RequireUseRegister(instruction, instanceUseIndex);
                     ushort aux = FieldStoreAux(field.FieldType);
+
+                    if (TryEmitDefaultFieldStore(instruction, source, field, instance, fieldOffset, fieldSize, fieldFlags, aux))
+                        return;
+
+                    int valueUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 1, "field store value");
                     if (instruction.Uses.Length - valueUseIndex > 1)
                     {
                         GenStackKind valueKind = StackKindOf(field.FieldType);
@@ -3308,11 +3432,14 @@ namespace Cnidaria.Cs
 
                 if (instruction.TreeKind == GenTreeKind.StoreStaticField)
                 {
-                    int valueUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 0, "static-field store value");
                     ushort aux = MemoryAuxForRegisterBase(field.FieldType, StaticFieldStoreInstructionFlags(field.FieldType));
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
                     EmitStaticBase(address, declaringTypeLayout);
 
+                    if (TryEmitDefaultStaticFieldStore(instruction, source, field, declaringTypeLayout, address, fieldOffset, fieldSize, aux))
+                        return;
+
+                    int valueUseIndex = RequireCodegenUseIndexForOperand(instruction, source, 0, "static-field store value");
                     if (instruction.Uses.Length - valueUseIndex > 1)
                     {
                         GenStackKind valueKind = StackKindOf(field.FieldType);
@@ -3740,15 +3867,21 @@ namespace Cnidaria.Cs
             {
                 int size = StorageSizeOf(type, kind, destination);
                 EmitAddressOf(MachineRegisters.BackendScratch, destination);
+                EmitInitAggregateAddress(MachineRegisters.BackendScratch, type, kind, size);
+            }
+
+            private void EmitInitAggregateAddress(MachineRegister address, RuntimeType? type, GenStackKind kind, int size)
+            {
                 if (type is not null)
                 {
-                    _asm.Emit(new InstrDesc(Op.InitObj, RegisterVmIsa.EncodeRegister(MachineRegisters.BackendScratch),
+                    _asm.Emit(new InstrDesc(Op.InitObj, RegisterVmIsa.EncodeRegister(address),
                         aux: Aux.Instruction(AggregateWriteFlags(type, InstructionFlags.MayThrow)), imm: _asm.InternTypeLayout(type)));
                     return;
                 }
 
-                _asm.Emit(new InstrDesc(Op.InitBlk, RegisterVmIsa.EncodeRegister(MachineRegisters.BackendScratch),
-                    aux: Aux.Instruction(InstructionFlags.MayThrow), imm: size));
+                int initSize = size > 0 ? size : StorageSizeOf(type, kind);
+                _asm.Emit(new InstrDesc(Op.InitBlk, RegisterVmIsa.EncodeRegister(address),
+                    aux: Aux.Instruction(InstructionFlags.MayThrow), imm: initSize));
             }
 
             private void EmitCopyAddressToAddress(RuntimeType? type, GenStackKind kind, MachineRegister dstAddress, MachineRegister srcAddress, int size, InstructionFlags flags, int dstOffset = 0, int sourceOffset = 0)
@@ -3980,6 +4113,131 @@ namespace Cnidaria.Cs
                     result[i] = registers[i];
                 result[registers.Length] = extra;
                 return result;
+            }
+
+            private bool TryEmitSsaPromotedFieldDefinition(GenTree instruction, GenTree source)
+            {
+                if (!source.SsaStoreTargetName.HasValue)
+                    return false;
+
+                if (source.LocalDescriptor is not { IsStructField: true })
+                    return false;
+
+                if (source.Operands.Length != instruction.RegisterUses.Length)
+                    return false;
+
+                if (instruction.Results.Length == 0 && instruction.Uses.Length == 0)
+                {
+                    _asm.Nop();
+                    return true;
+                }
+
+                if (instruction.Results.Length != instruction.Uses.Length)
+                    throw Unsupported(instruction, "SSA promoted field definition has mismatched source and destination fragment counts");
+
+                for (int i = 0; i < instruction.Results.Length; i++)
+                {
+                    var destinationValue = i < instruction.RegisterResults.Length ? instruction.RegisterResults[i] : null;
+                    var sourceValue = i < instruction.RegisterUses.Length ? instruction.RegisterUses[i] : null;
+                    var pseudo = CreateSyntheticMoveTree(
+                        instruction,
+                        instruction.Results[i],
+                        instruction.Uses[i],
+                        destinationValue,
+                        sourceValue,
+                        instruction.Comment ?? "SSA promoted field definition move");
+                    EmitMove(pseudo);
+                }
+
+                return true;
+            }
+
+            private bool TryEmitDefaultFieldStore(
+                GenTree instruction,
+                GenTree source,
+                RuntimeField field,
+                MachineRegister instance,
+                int fieldOffset,
+                int fieldSize,
+                FieldAccessFlags fieldFlags,
+                ushort aux)
+            {
+                if (source.Operands.Length <= 1 || source.Operands[1].Kind != GenTreeKind.DefaultValue)
+                    return false;
+
+                RuntimeType fieldType = field.FieldType;
+                GenStackKind fieldKind = StackKindOf(fieldType);
+
+                if (fieldType.IsValueType && !IsScalarValueType(fieldType))
+                {
+                    MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, instance);
+                    _asm.Emit(InstrDesc.Field(Op.LdFldAddr, fieldAddress, instance, fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
+                    EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
+                    return true;
+                }
+
+                RegisterClass valueClass = RegisterClassForStorage(fieldType, fieldKind);
+                if (valueClass == RegisterClass.Invalid)
+                    valueClass = RegisterClass.General;
+
+                MachineRegister value = PickScratchRegister(instruction, valueClass, instance);
+                EmitZeroToRegister(value, fieldType, fieldKind, valueClass, fieldSize);
+
+                Op op = SelectStoreFieldOp(fieldType, fieldKind, valueClass, fieldSize);
+                if (op == Op.StFldObj)
+                {
+                    MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, instance, value);
+                    _asm.Emit(InstrDesc.Field(Op.LdFldAddr, fieldAddress, instance, fieldOffset, fieldSize, fieldFlags, Aux.Instruction(InstructionFlags.MayThrow)));
+                    EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
+                    return true;
+                }
+
+                _asm.Emit(InstrDesc.Field(op, value, instance, fieldOffset, fieldSize, fieldFlags, aux));
+                return true;
+            }
+
+            private bool TryEmitDefaultStaticFieldStore(
+                GenTree instruction,
+                GenTree source,
+                RuntimeField field,
+                int declaringTypeLayout,
+                MachineRegister staticBase,
+                int fieldOffset,
+                int fieldSize,
+                ushort aux)
+            {
+                if (source.Operands.Length == 0 || source.Operands[0].Kind != GenTreeKind.DefaultValue)
+                    return false;
+
+                RuntimeType fieldType = field.FieldType;
+                GenStackKind fieldKind = StackKindOf(fieldType);
+
+                if (fieldType.IsValueType && !IsScalarValueType(fieldType))
+                {
+                    MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, staticBase);
+                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                    EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
+                    return true;
+                }
+
+                RegisterClass valueClass = RegisterClassForStorage(fieldType, fieldKind);
+                if (valueClass == RegisterClass.Invalid)
+                    valueClass = RegisterClass.General;
+
+                MachineRegister value = PickScratchRegister(instruction, valueClass, staticBase);
+                EmitZeroToRegister(value, fieldType, fieldKind, valueClass, fieldSize);
+
+                Op op = SelectStoreOpForStorage(fieldType, fieldKind, valueClass, fieldSize);
+                if (op == Op.StObj)
+                {
+                    MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, staticBase, value);
+                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                    EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
+                    return true;
+                }
+
+                _asm.Emit(InstrDesc.Mem(op, value, staticBase, fieldOffset, aux: aux));
+                return true;
             }
 
             private MachineRegister MaterializeMultiRegisterAggregateHome(

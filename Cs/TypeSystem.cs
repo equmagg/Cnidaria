@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -2825,6 +2825,9 @@ namespace Cnidaria.Cs
 
             var typeArgs = t.GenericTypeArguments;
 
+            t.InlineArrayLength = genericDef.InlineArrayLength;
+            t.InlineArrayElementField = null;
+
             t.BaseType = genericDef.BaseType is null
                 ? null
                 : SubstituteRuntimeType(genericDef.BaseType, typeArgs);
@@ -2839,6 +2842,8 @@ namespace Cnidaria.Cs
                     var src = genericDef.InstanceFields[i];
                     var ft = SubstituteRuntimeType(src.FieldType, typeArgs);
                     inst[i] = new RuntimeField(_nextFieldId++, t, src.Name, ft, isStatic: false);
+                    if (ReferenceEquals(src, genericDef.InlineArrayElementField))
+                        t.InlineArrayElementField = inst[i];
                 }
 
                 for (int i = 0; i < genericDef.StaticFields.Length; i++)

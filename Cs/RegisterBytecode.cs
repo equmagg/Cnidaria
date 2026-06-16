@@ -2066,6 +2066,7 @@ namespace Cnidaria.Cs
         public int InternTypeLayout(RuntimeType type)
         {
             if (type is null) throw new ArgumentNullException(nameof(type));
+            _rts?.EnsureRuntimeTypeReady(type);
             if (_typeLayoutByRuntimeTypeId.TryGetValue(type.TypeId, out int existing))
                 return existing;
 

@@ -1059,6 +1059,7 @@ namespace Cnidaria.Cs
             : base(syntax)
         {
             Expression = expression;
+            HasErrors = expression?.HasErrors ?? false;
         }
     }
     internal sealed class BoundThrowStatement : BoundStatement

@@ -958,8 +958,10 @@ namespace Cnidaria.Cs
             bool needsHiddenReturnBuffer = false;
             bool hiddenReturnBufferInserted = false;
             GenTree? hiddenReturnBufferValue = default;
-            bool valueTypeNewObject = isNewObject && callee?.DeclaringType.IsValueType == true;
-            bool referenceTypeNewObject = isNewObject && !valueTypeNewObject && callee?.HasThis == true;
+            if (isNewObject && callee?.DeclaringType.IsValueType == true)
+                throw new InvalidOperationException("Value-type newobj must be lowered into a struct materialization temp and a void constructor call before ABI classification.");
+
+            bool referenceTypeNewObject = isNewObject && callee?.HasThis == true;
 
             if (referenceTypeNewObject)
             {
@@ -975,7 +977,7 @@ namespace Cnidaria.Cs
             {
                 var resultInfo = getValueInfo(resultValue);
                 returnAbi = ClassifyValue(resultInfo.Type, resultInfo.StackKind, isReturn: true);
-                if (returnAbi.PassingKind == AbiValuePassingKind.Indirect || valueTypeNewObject)
+                if (returnAbi.PassingKind == AbiValuePassingKind.Indirect)
                 {
                     needsHiddenReturnBuffer = true;
                     hiddenReturnBufferValue = resultValue;
@@ -983,7 +985,7 @@ namespace Cnidaria.Cs
             }
 
             int hiddenReturnBufferInsertionIndex = needsHiddenReturnBuffer
-                ? (valueTypeNewObject ? 0 : (callee is null ? 0 : HiddenReturnBufferInsertionIndex(callee, arguments.Length)))
+                ? (callee is null ? 0 : HiddenReturnBufferInsertionIndex(callee, arguments.Length))
                 : -1;
 
             if (hiddenReturnBufferInsertionIndex == 0)
@@ -3153,7 +3155,18 @@ namespace Cnidaria.Cs
                     list.Add(source[i]);
             }
 
-            list.Sort(static (a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+            list.Sort(static (a, b) =>
+            {
+                int c = a.Start.CompareTo(b.Start);
+                if (c != 0)
+                    return c;
+                if (a.Location.IsRegister != b.Location.IsRegister)
+                    return a.Location.IsRegister ? -1 : 1;
+                c = a.End.CompareTo(b.End);
+                if (c != 0)
+                    return c;
+                return a.Location.ToString().CompareTo(b.Location.ToString());
+            });
             if (list.Count == 0)
                 return ImmutableArray<RegisterAllocationSegment>.Empty;
 
@@ -3399,7 +3412,18 @@ namespace Cnidaria.Cs
                     list.Add(source[i]);
             }
 
-            list.Sort(static (a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+            list.Sort(static (a, b) =>
+            {
+                int c = a.Start.CompareTo(b.Start);
+                if (c != 0)
+                    return c;
+                if (a.Location.IsRegister != b.Location.IsRegister)
+                    return a.Location.IsRegister ? -1 : 1;
+                c = a.End.CompareTo(b.End);
+                if (c != 0)
+                    return c;
+                return a.Location.ToString().CompareTo(b.Location.ToString());
+            });
             if (list.Count == 0)
                 return ImmutableArray<RegisterAllocationSegment>.Empty;
 
@@ -3927,7 +3951,7 @@ namespace Cnidaria.Cs
             private readonly int[] _blockStartPositions;
             private readonly int[] _blockEndPositions;
             private readonly ImmutableArray<int> _callPositions;
-            private readonly ImmutableArray<LinearRefPosition> _fixedKillRefPositions;
+            private readonly ImmutableArray<LinearRefPosition> _killRefPositions;
             private readonly Dictionary<int, ImmutableArray<GenTreeInternalRegister>.Builder> _allocatedInternalRegisters = new();
             private readonly Dictionary<GenTree, List<AllocationInterval>> _intervalsByNode = new();
             private readonly Dictionary<GenTree, RegisterOperand> _aggregateHomes = new();
@@ -3954,8 +3978,8 @@ namespace Cnidaria.Cs
                 _preferences = BuildPreferences(method);
                 _registerPreferences = BuildRegisterPreferences(method);
                 _nodePositions = BuildPositionLayout(method, _linearBlockOrder, out _blockStartPositions, out _blockEndPositions);
-                _callPositions = BuildCallPositions(method, _nodePositions);
-                _fixedKillRefPositions = BuildFixedKillRefPositions(method, _nodePositions, _options);
+                _callPositions = BuildCallPositions(method);
+                _killRefPositions = BuildKillRefPositions(method, _nodePositions, _options);
                 _refPositionsByValue = BuildRefPositionsByValue(method);
                 _refPositionsByValueSegment = BuildRefPositionsByValueSegment(_refPositionsByValue);
                 _hardUseRefPositions = BuildHardUseRefPositions(method);
@@ -4178,6 +4202,7 @@ namespace Cnidaria.Cs
             {
                 IntervalStart = 0,
                 InternalRefPosition = 1,
+                KillRefPosition = 2,
             }
 
             private readonly struct AllocationStreamItem
@@ -4203,10 +4228,16 @@ namespace Cnidaria.Cs
                 public LinearRefPosition RefPosition { get; }
 
                 public static AllocationStreamItem ForInterval(AllocationInterval interval)
-                    => new AllocationStreamItem(interval.Start, AllocationStreamItemKind.IntervalStart, interval, default);
+                    => ForInterval(interval, interval.Start);
+
+                public static AllocationStreamItem ForInterval(AllocationInterval interval, int position)
+                    => new AllocationStreamItem(position, AllocationStreamItemKind.IntervalStart, interval, default);
 
                 public static AllocationStreamItem ForInternalRefPosition(LinearRefPosition refPosition)
                     => new AllocationStreamItem(refPosition.Position, AllocationStreamItemKind.InternalRefPosition, null, refPosition);
+
+                public static AllocationStreamItem ForKillRefPosition(LinearRefPosition refPosition)
+                    => new AllocationStreamItem(refPosition.Position, AllocationStreamItemKind.KillRefPosition, null, refPosition);
             }
 
             private void AllocateIntervals()
@@ -4225,26 +4256,48 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
+                    if (item.Kind == AllocationStreamItemKind.KillRefPosition)
+                    {
+                        ProcessKillRefPosition(item.RefPosition, allocationStream, ref i);
+                        continue;
+                    }
+
                     var current = item.Interval!;
+                    int allocationStart = current.FirstLivePositionAtOrAfter(item.Position);
+                    if (allocationStart == int.MaxValue || allocationStart >= current.End)
+                    {
+                        AssignHome(current);
+                        continue;
+                    }
+
+                    if (current.HasAssignedRegister && current.AssignedRegisterEnd > allocationStart)
+                        continue;
+
+                    if (allocationStart >= current.PermanentSpillStart)
+                    {
+                        AssignHome(current);
+                        continue;
+                    }
+
                     if (current.IsEmpty)
                     {
                         AssignHome(current);
                         continue;
                     }
 
-                    if (current.RequiresStackHome)
+                    if (current.MustStayInMemory)
                     {
                         Spill(current);
                         continue;
                     }
 
-                    if (TryAllocatePreferredRegister(current))
+                    if (TryAllocatePreferredRegister(current, allocationStart, allocationStream, ref i))
                         continue;
 
-                    if (TryAllocateFreeRegister(current))
+                    if (TryAllocateFreeRegister(current, allocationStart, allocationStream, ref i))
                         continue;
 
-                    AllocateBlockedRegister(current);
+                    AllocateBlockedRegister(current, allocationStart, allocationStream, ref i);
                 }
             }
 
@@ -4262,33 +4315,52 @@ namespace Cnidaria.Cs
                         result.Add(AllocationStreamItem.ForInternalRefPosition(refPosition));
                 }
 
-                result.Sort(static (a, b) =>
-                {
-                    int c = a.Position.CompareTo(b.Position);
-                    if (c != 0)
-                        return c;
+                for (int i = 0; i < _killRefPositions.Length; i++)
+                    result.Add(AllocationStreamItem.ForKillRefPosition(_killRefPositions[i]));
 
-                    c = a.Kind.CompareTo(b.Kind);
-                    if (c != 0)
-                        return c;
-
-                    if (a.Kind == AllocationStreamItemKind.IntervalStart)
-                    {
-                        var left = a.Interval!;
-                        var right = b.Interval!;
-                        c = left.Value.Id.CompareTo(right.Value.Id);
-                        if (c != 0)
-                            return c;
-                        return left.AbiSegmentIndex.CompareTo(right.AbiSegmentIndex);
-                    }
-
-                    c = a.RefPosition.NodeId.CompareTo(b.RefPosition.NodeId);
-                    if (c != 0)
-                        return c;
-                    return a.RefPosition.OperandIndex.CompareTo(b.RefPosition.OperandIndex);
-                });
-
+                result.Sort(CompareAllocationStreamItems);
                 return result;
+            }
+
+            private static int CompareAllocationStreamItems(AllocationStreamItem a, AllocationStreamItem b)
+            {
+                int c = a.Position.CompareTo(b.Position);
+                if (c != 0)
+                    return c;
+
+                c = a.Kind.CompareTo(b.Kind);
+                if (c != 0)
+                    return c;
+
+                if (a.Kind == AllocationStreamItemKind.IntervalStart)
+                {
+                    var left = a.Interval!;
+                    var right = b.Interval!;
+                    c = left.Value.Id.CompareTo(right.Value.Id);
+                    if (c != 0)
+                        return c;
+                    return left.AbiSegmentIndex.CompareTo(right.AbiSegmentIndex);
+                }
+
+                c = a.RefPosition.NodeId.CompareTo(b.RefPosition.NodeId);
+                if (c != 0)
+                    return c;
+                c = a.RefPosition.OperandIndex.CompareTo(b.RefPosition.OperandIndex);
+                if (c != 0)
+                    return c;
+                return a.RefPosition.FixedRegister.CompareTo(b.RefPosition.FixedRegister);
+            }
+
+            private void InsertAllocationStreamItem(
+                List<AllocationStreamItem> stream,
+                ref int currentIndex,
+                AllocationStreamItem item)
+            {
+                int insertAt = currentIndex + 1;
+                while (insertAt < stream.Count && CompareAllocationStreamItems(stream[insertAt], item) <= 0)
+                    insertAt++;
+
+                stream.Insert(insertAt, item);
             }
 
             private void AllocateInternalRefPosition(LinearRefPosition internalRef)
@@ -4446,8 +4518,7 @@ namespace Cnidaria.Cs
                         continue;
 
                     _active.RemoveAt(i);
-                    SplitToSpill(owner, position);
-                    _handled.Add(owner);
+                    SpillFrom(owner, position);
                     return;
                 }
 
@@ -4489,23 +4560,27 @@ namespace Cnidaria.Cs
 
                     if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
-                        _aggregateHomes[source.Value] = CreateAggregateHome(abi);
                         var segments = MachineAbi.GetRegisterSegments(abi);
                         var fragments = new List<AllocationInterval>(segments.Length);
 
                         for (int s = 0; s < segments.Length; s++)
                         {
                             var segment = segments[s];
-                            var segmentUses = GetAllocationUsePositionsForValueSegment(source.Value, s, source.UsePositions);
+                            var segmentRefs = GetAllocationRefPositionsForValueSegment(source.Value, s, out bool segmentHasRefPositions);
+                            var segmentUses = GetAllocationUsePositionsFromRefPositions(segmentRefs, source.UsePositions, segmentHasRefPositions);
+                            bool stackOnly = RefPositionsRequireStackHome(source.Value, s);
+                            bool exceptionHome = RequiresExceptionEdgeStackHome(source, valueInfo);
                             var interval = new AllocationInterval(
                                 source.Value,
                                 segment.RegisterClass,
                                 source.Ranges,
                                 segmentUses,
+                                segmentRefs,
                                 source.DefinitionPosition,
                                 CrossesCall(source.Ranges),
                                 requiresSingleLocation: RequiresSingleLocation(source),
-                                requiresStackHome: RefPositionsRequireStackHome(source.Value, s) || IsLiveAcrossExceptionEdge(source),
+                                requiresStackHome: stackOnly || exceptionHome,
+                                mustStayInMemory: stackOnly || exceptionHome,
                                 stackHomeSize: segment.Size,
                                 stackHomeAlignment: abi.Alignment <= 0 ? TargetArchitecture.PointerSize : abi.Alignment,
                                 abiSegmentIndex: s,
@@ -4519,20 +4594,24 @@ namespace Cnidaria.Cs
                         continue;
                     }
                     {
-                        var scalarUses = GetAllocationUsePositionsForValueSegment(source.Value, -1, source.UsePositions);
-                        bool requiresStackHome =
-                            MachineAbi.RequiresStackHome(valueInfo.Type, valueInfo.StackKind) ||
-                            RefPositionsRequireStackHome(source.Value, -1) ||
-                            IsLiveAcrossExceptionEdge(source);
+                        var scalarRefs = GetAllocationRefPositionsForValueSegment(source.Value, -1, out bool scalarHasRefPositions);
+                        var scalarUses = GetAllocationUsePositionsFromRefPositions(scalarRefs, source.UsePositions, scalarHasRefPositions);
+                        bool abiStackHome = MachineAbi.RequiresStackHome(valueInfo.Type, valueInfo.StackKind);
+                        bool stackOnly = RefPositionsRequireStackHome(source.Value, -1);
+                        bool exceptionHome = RequiresExceptionEdgeStackHome(source, valueInfo);
+                        bool requiresStackHome = abiStackHome || stackOnly || exceptionHome;
+                        bool mustStayInMemory = abiStackHome || stackOnly || exceptionHome;
                         var interval = new AllocationInterval(
                             source.Value,
                             valueInfo.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : valueInfo.RegisterClass,
                             source.Ranges,
                             scalarUses,
+                            scalarRefs,
                             source.DefinitionPosition,
                             CrossesCall(source.Ranges),
                             requiresSingleLocation: RequiresSingleLocation(source),
                             requiresStackHome,
+                            mustStayInMemory,
                             stackHomeSize: abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size,
                             stackHomeAlignment: abi.Alignment <= 0 ? TargetArchitecture.PointerSize : abi.Alignment);
                         _intervalsByNode.Add(interval.Value, new List<AllocationInterval> { interval });
@@ -4581,11 +4660,49 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool IsLiveAt(LinearLiveInterval interval, int position)
+            private bool RequiresExceptionEdgeStackHome(LinearLiveInterval interval, GenTreeValueInfo valueInfo)
             {
-                for (int i = 0; i < interval.Ranges.Length; i++)
+                if (!IsLiveAcrossExceptionEdge(interval))
+                    return false;
+
+                if (!IsDescriptorBackedValue(valueInfo))
+                    return false;
+
+                return NeedsPreciseStackHomeAtNonLocalControlFlow(valueInfo);
+            }
+
+            private static bool IsDescriptorBackedValue(GenTreeValueInfo valueInfo)
+                => valueInfo.Value.IsLocalDescriptor || valueInfo.Value.IsSsaValue;
+
+            private static bool NeedsPreciseStackHomeAtNonLocalControlFlow(GenTreeValueInfo valueInfo)
+            {
+                var abi = MachineAbi.ClassifyStorageValue(valueInfo.Type, valueInfo.StackKind);
+                if (abi.ContainsGcPointers)
+                    return true;
+
+                if (valueInfo.StackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
+                    return true;
+
+                var type = valueInfo.Type;
+                if (type is null)
+                    return false;
+
+                return type.IsReferenceType ||
+                       type.ContainsGcPointers ||
+                       type.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam;
+            }
+
+            private static bool IsLiveAt(LinearLiveInterval interval, int position)
+                => IsLiveAt(interval.Ranges, position);
+
+            private static bool IsLiveAt(ImmutableArray<LinearLiveRange> ranges, int position)
+            {
+                if (ranges.IsDefaultOrEmpty)
+                    return false;
+
+                for (int i = 0; i < ranges.Length; i++)
                 {
-                    var range = interval.Ranges[i];
+                    var range = ranges[i];
                     if (range.Start <= position && position < range.End)
                         return true;
                 }
@@ -4606,32 +4723,59 @@ namespace Cnidaria.Cs
             }
 
 
-            private ImmutableArray<int> GetAllocationUsePositionsForValueSegment(GenTree value, int abiSegmentIndex, ImmutableArray<int> fallback)
+            private ImmutableArray<LinearRefPosition> GetAllocationRefPositionsForValueSegment(
+                GenTree value,
+                int abiSegmentIndex,
+                out bool hasAnyRefPositions)
             {
                 var refs = GetRefPositionsForValueSegment(value, abiSegmentIndex);
+                hasAnyRefPositions = refs.Length != 0;
                 if (refs.Length == 0)
-                    return fallback;
-                var positions = ImmutableArray.CreateBuilder<int>();
-                int last = int.MinValue;
+                    return ImmutableArray<LinearRefPosition>.Empty;
 
+                var result = ImmutableArray.CreateBuilder<LinearRefPosition>(refs.Length);
                 for (int i = 0; i < refs.Length; i++)
                 {
                     var rp = refs[i];
-
-                    if (rp.Kind != LinearRefPositionKind.Use && rp.Kind != LinearRefPositionKind.Def)
+                    if (!IsAllocationRequiredRefPosition(rp))
                         continue;
 
-                    if (IsAllocationOptionalRefPosition(rp))
+                    result.Add(rp);
+                }
+
+                return result.ToImmutable();
+            }
+
+            private static ImmutableArray<int> GetAllocationUsePositionsFromRefPositions(
+                ImmutableArray<LinearRefPosition> refPositions,
+                ImmutableArray<int> fallback,
+                bool hasAnyRefPositions)
+            {
+                if (refPositions.Length == 0)
+                    return (hasAnyRefPositions || fallback.IsDefault) ? ImmutableArray<int>.Empty : fallback;
+
+                var positions = ImmutableArray.CreateBuilder<int>(refPositions.Length);
+                int last = int.MinValue;
+
+                for (int i = 0; i < refPositions.Length; i++)
+                {
+                    int position = refPositions[i].Position;
+                    if (position == last)
                         continue;
 
-                    if (rp.Position == last)
-                        continue;
-
-                    positions.Add(rp.Position);
-                    last = rp.Position;
+                    positions.Add(position);
+                    last = position;
                 }
 
                 return positions.ToImmutable();
+            }
+
+            private static bool IsAllocationRequiredRefPosition(LinearRefPosition refPosition)
+            {
+                if (refPosition.Kind != LinearRefPositionKind.Use && refPosition.Kind != LinearRefPositionKind.Def)
+                    return false;
+
+                return !IsAllocationOptionalRefPosition(refPosition);
             }
 
             private static bool IsAllocationOptionalRefPosition(LinearRefPosition refPosition)
@@ -4643,14 +4787,19 @@ namespace Cnidaria.Cs
                 return (refPosition.Flags & LinearRefPositionFlags.RegOptional) != 0;
             }
 
-            private RegisterOperand CreateAggregateHome(AbiValueInfo abi)
+            private RegisterOperand GetOrCreateAggregateHome(GenTree value, AbiValueInfo abi)
             {
+                if (_aggregateHomes.TryGetValue(value, out var home))
+                    return home;
+
                 int slot = _nextSpillSlot++;
-                return RegisterOperand.ForSpillSlot(
+                home = RegisterOperand.ForSpillSlot(
                     RegisterClass.General,
                     slot,
                     offset: 0,
                     size: abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size);
+                _aggregateHomes[value] = home;
+                return home;
             }
 
             private void UpdateActiveAndInactive(int position)
@@ -4686,23 +4835,30 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private bool TryAllocatePreferredRegister(AllocationInterval current)
+            private bool TryAllocatePreferredRegister(
+                AllocationInterval current,
+                int allocationStart,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
-                if (TryAllocatePreferredMachineRegister(current))
+                if (TryAllocatePreferredMachineRegister(current, allocationStart, stream, ref streamIndex))
                     return true;
 
-                if (TryAllocatePreferredValueRegister(current, _phiPreferences))
+                if (TryAllocatePreferredValueRegister(current, allocationStart, _phiPreferences, stream, ref streamIndex))
                     return true;
 
                 if (!_options.PreferCopySourceRegister)
                     return false;
 
-                return TryAllocatePreferredValueRegister(current, _preferences);
+                return TryAllocatePreferredValueRegister(current, allocationStart, _preferences, stream, ref streamIndex);
             }
 
             private bool TryAllocatePreferredValueRegister(
                 AllocationInterval current,
-                Dictionary<GenTree, List<GenTree>> preferences)
+                int allocationStart,
+                Dictionary<GenTree, List<GenTree>> preferences,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
                 if (!preferences.TryGetValue(current.Value, out var preferredValues))
                     return false;
@@ -4710,17 +4866,17 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < preferredValues.Count; i++)
                 {
                     var preferred = preferredValues[i];
-                    if (!_allocations.TryGetValue(preferred, out var preferredAllocation))
+                    if (!TryGetAllocationForValue(preferred, out var preferredAllocation))
                         continue;
 
-                    var home = preferredAllocation.LocationAt(current.Start);
+                    var home = preferredAllocation.LocationAt(allocationStart);
                     if (!home.IsRegister)
                         continue;
 
                     if (home.RegisterClass != current.RegisterClass)
                         continue;
 
-                    if (!TryAssignPreferredRegister(current, home.Register))
+                    if (!TryAssignPreferredRegister(current, allocationStart, home.Register, stream, ref streamIndex))
                         continue;
 
                     return true;
@@ -4729,28 +4885,42 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private bool TryAllocatePreferredMachineRegister(AllocationInterval current)
+            private bool TryAllocatePreferredMachineRegister(
+                AllocationInterval current,
+                int allocationStart,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
-                return TryAllocatePreferredMachineRegister(current, current.AbiSegmentIndex);
+                return TryAllocatePreferredMachineRegister(current, allocationStart, current.AbiSegmentIndex, stream, ref streamIndex);
             }
 
-            private bool TryAllocatePreferredMachineRegister(AllocationInterval current, int abiSegmentIndex)
+            private bool TryAllocatePreferredMachineRegister(
+                AllocationInterval current,
+                int allocationStart,
+                int abiSegmentIndex,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
                 if (!_registerPreferences.TryGetValue(new AllocationPreferenceKey(current.Value, abiSegmentIndex), out var preferredRegisters))
                     return false;
 
                 for (int i = 0; i < preferredRegisters.Count; i++)
                 {
-                    if (TryAssignPreferredRegister(current, preferredRegisters[i]))
+                    if (TryAssignPreferredRegister(current, allocationStart, preferredRegisters[i], stream, ref streamIndex))
                         return true;
                 }
 
                 return false;
             }
 
-            private bool TryAssignPreferredRegister(AllocationInterval current, MachineRegister register)
+            private bool TryAssignPreferredRegister(
+                AllocationInterval current,
+                int allocationStart,
+                MachineRegister register,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
-                if (current.RequiresStackHome)
+                if (current.MustStayInMemory)
                     return false;
 
                 if (register == MachineRegister.Invalid)
@@ -4762,16 +4932,23 @@ namespace Cnidaria.Cs
                 if (!IsAllocatable(register))
                     return false;
 
-                int freeUntil = FirstRegisterConflictPosition(register, current);
-                int segmentEnd = ComputeRegisterSegmentEnd(current, register, freeUntil);
-                if (segmentEnd <= current.Start)
+                if (!RegisterAllowedAtRefPosition(current, register, allocationStart))
                     return false;
 
-                AssignRegisterSegment(current, register, segmentEnd);
+                int freeUntil = FirstRegisterConflictPosition(register, current, allocationStart);
+                int segmentEnd = ComputeRegisterSegmentEnd(current, allocationStart, register, freeUntil);
+                if (segmentEnd <= allocationStart)
+                    return false;
+
+                AssignRegisterSegment(current, allocationStart, register, segmentEnd, stream, ref streamIndex);
                 return true;
             }
 
-            private bool TryAllocateFreeRegister(AllocationInterval current)
+            private bool TryAllocateFreeRegister(
+                AllocationInterval current,
+                int allocationStart,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
                 MachineRegister bestRegister = MachineRegister.Invalid;
                 int bestSegmentEnd = -1;
@@ -4780,8 +4957,11 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < registers.Length; i++)
                 {
                     var reg = registers[i];
-                    int freeUntil = FirstRegisterConflictPosition(reg, current);
-                    int segmentEnd = ComputeRegisterSegmentEnd(current, reg, freeUntil);
+                    if (!RegisterAllowedAtRefPosition(current, reg, allocationStart))
+                        continue;
+
+                    int freeUntil = FirstRegisterConflictPosition(reg, current, allocationStart);
+                    int segmentEnd = ComputeRegisterSegmentEnd(current, allocationStart, reg, freeUntil);
                     if (segmentEnd > bestSegmentEnd)
                     {
                         bestSegmentEnd = segmentEnd;
@@ -4789,16 +4969,20 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (bestRegister == MachineRegister.Invalid || bestSegmentEnd <= current.Start)
+                if (bestRegister == MachineRegister.Invalid || bestSegmentEnd <= allocationStart)
                     return false;
 
-                AssignRegisterSegment(current, bestRegister, bestSegmentEnd);
+                AssignRegisterSegment(current, allocationStart, bestRegister, bestSegmentEnd, stream, ref streamIndex);
                 return true;
             }
 
-            private void AllocateBlockedRegister(AllocationInterval current)
+            private void AllocateBlockedRegister(
+                AllocationInterval current,
+                int allocationStart,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
-                int currentNextUse = current.NextUseAfterOrAt(current.Start);
+                int currentNextUse = current.NextUseAfterOrAt(allocationStart);
 
                 MachineRegister bestRegister = MachineRegister.Invalid;
                 int bestBlockingNextUse = -1;
@@ -4808,10 +4992,13 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < registers.Length; i++)
                 {
                     var reg = registers[i];
-                    int blockingNextUse = NextUseOfBlockingIntervals(reg, current);
-                    int conflict = FirstRegisterConflictPosition(reg, current);
-                    int segmentEnd = ComputeRegisterSegmentEnd(current, reg, conflict);
-                    if (segmentEnd <= current.Start)
+                    if (!RegisterAllowedAtRefPosition(current, reg, allocationStart))
+                        continue;
+
+                    int blockingNextUse = NextUseOfBlockingIntervals(reg, current, allocationStart);
+                    int conflict = FirstRegisterConflictPosition(reg, current, allocationStart);
+                    int segmentEnd = ComputeRegisterSegmentEnd(current, allocationStart, reg, conflict);
+                    if (segmentEnd <= allocationStart)
                         continue;
 
                     if (blockingNextUse > bestBlockingNextUse ||
@@ -4825,12 +5012,12 @@ namespace Cnidaria.Cs
 
                 if (bestRegister == MachineRegister.Invalid || currentNextUse >= bestBlockingNextUse)
                 {
-                    Spill(current);
+                    SpillFrom(current, allocationStart);
                     return;
                 }
 
-                SplitBlockingIntervals(bestRegister, current, bestSegmentEnd);
-                AssignRegisterSegment(current, bestRegister, bestSegmentEnd);
+                SplitBlockingIntervals(bestRegister, current, allocationStart, bestSegmentEnd, stream, ref streamIndex);
+                AssignRegisterSegment(current, allocationStart, bestRegister, bestSegmentEnd, stream, ref streamIndex);
             }
 
             private bool IsAllocatable(MachineRegister register)
@@ -4850,43 +5037,183 @@ namespace Cnidaria.Cs
 
             private bool IsRegisterClassCompatible(MachineRegister register, AllocationInterval interval)
             {
-                if (!MachineRegisters.IsRegisterInClass(register, interval.RegisterClass))
-                    return false;
-
-                if (_options.RespectCallClobbers && interval.CrossesCall && MachineRegisters.IsCallerSaved(register))
-                    return false;
-
-                return true;
+                return MachineRegisters.IsRegisterInClass(register, interval.RegisterClass);
             }
 
-            private int ComputeRegisterSegmentEnd(AllocationInterval interval, MachineRegister register, int freeUntil)
+            private int ComputeRegisterSegmentEnd(AllocationInterval interval, int start, MachineRegister register, int freeUntil)
             {
                 if (!IsRegisterClassCompatible(register, interval))
-                    return interval.Start;
+                    return start;
+
+                if (!RegisterAllowedAtRefPosition(interval, register, start))
+                    return start;
 
                 int end = freeUntil < interval.End ? freeUntil : interval.End;
-                if (end <= interval.Start)
-                    return interval.Start;
+                if (end <= start)
+                    return start;
 
-                int incompatibleFixedUse = FirstIncompatibleFixedRefPosition(interval, register, interval.Start, end);
-                if (incompatibleFixedUse < end)
-                    end = incompatibleFixedUse;
+                int nextKillLimit = FirstKillLimitForRegister(interval, register, start, end);
+                if (nextKillLimit < end)
+                    end = nextKillLimit;
 
-                if (_options.RespectCallClobbers)
-                {
-                    int fixedKillSplit = FirstFixedRegisterKillPosition(register, interval, interval.Start, end);
-                    if (fixedKillSplit < end)
-                        end = fixedKillSplit;
-                }
-
-                if (interval.RequiresSingleLocation && end < interval.End)
-                    return interval.Start;
+                int incompatibleRefPosition = FirstIncompatibleRequiredRefPosition(interval, register, start, end);
+                if (incompatibleRefPosition < end)
+                    end = incompatibleRefPosition;
 
                 return end;
             }
 
-            private int FirstIncompatibleFixedRefPosition(AllocationInterval interval, MachineRegister register, int start, int end)
+            private void ProcessKillRefPosition(
+                LinearRefPosition kill,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
+                if (kill.Kind != LinearRefPositionKind.Kill)
+                    return;
+
+                ulong killedRegisters = GetKillRegisterMask(kill);
+                if (killedRegisters == 0)
+                    return;
+
+                ProcessKillRefPositionInList(_active, kill.Position, killedRegisters, stream, ref streamIndex);
+                ProcessKillRefPositionInList(_inactive, kill.Position, killedRegisters, stream, ref streamIndex);
+            }
+
+            private void ProcessKillRefPositionInList(
+                List<AllocationInterval> intervals,
+                int killPosition,
+                ulong killedRegisters,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                for (int i = intervals.Count - 1; i >= 0; i--)
+                {
+                    var interval = intervals[i];
+                    var register = interval.AssignedRegister;
+                    if (register == MachineRegister.Invalid)
+                        continue;
+                    if ((killedRegisters & MachineRegisters.MaskOf(register)) == 0)
+                        continue;
+                    if (!interval.CrossesPosition(killPosition))
+                        continue;
+
+                    intervals.RemoveAt(i);
+                    FreeKilledInterval(interval, register, killPosition, stream, ref streamIndex);
+                    _handled.Add(interval);
+                }
+            }
+
+            private void FreeKilledInterval(
+                AllocationInterval interval,
+                MachineRegister killedRegister,
+                int killPosition,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                int spillStart = KillSpillSegmentStart(interval, killedRegister, killPosition);
+                int nextRefPosition = NextRequiredRefPositionAfter(interval, killPosition);
+                int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
+                if (spillEnd < spillStart)
+                    spillEnd = spillStart;
+
+                if (interval.AssignedRegisterEnd > spillStart)
+                    interval.SplitAssignedRegisterToSpill(spillStart, spillEnd, GetOrCreateSpillHome(interval));
+                else
+                {
+                    interval.AssignedRegister = MachineRegister.Invalid;
+                    interval.AssignedRegisterEnd = spillStart;
+                    if (spillEnd > spillStart)
+                        interval.AddSegment(spillStart, spillEnd, GetOrCreateSpillHome(interval));
+                }
+
+                AssignHome(interval);
+
+                if (nextRefPosition != int.MaxValue && nextRefPosition < interval.End)
+                    ScheduleContinuationAt(interval, nextRefPosition, stream, ref streamIndex);
+            }
+
+            private int FirstIncompatibleRequiredRefPosition(AllocationInterval interval, MachineRegister register, int start, int end)
+            {
+                int conflict = FirstConflictingFixedRegisterReservation(interval, register, start, end);
+                int lastPosition = int.MinValue;
+
+                for (int i = 0; i < interval.RefPositions.Length; i++)
+                {
+                    var rp = interval.RefPositions[i];
+                    if (rp.Position < start)
+                        continue;
+                    if (rp.Position >= end)
+                        break;
+                    if (rp.Position == lastPosition)
+                        continue;
+
+                    lastPosition = rp.Position;
+                    if (!interval.Covers(rp.Position) && !interval.CrossesPosition(rp.Position))
+                        continue;
+
+                    if (!RegisterAllowedAtRefPosition(interval, register, rp.Position) && rp.Position < conflict)
+                        conflict = rp.Position;
+                }
+
+                return conflict;
+            }
+
+            private bool RegisterAllowedAtRefPosition(AllocationInterval interval, MachineRegister register, int position)
+            {
+                if (register == MachineRegister.Invalid)
+                    return false;
+
+                if (!MachineRegisters.IsRegisterInClass(register, interval.RegisterClass))
+                    return false;
+
+                ulong requiredMask = RequiredRegisterMaskAt(interval, position);
+                return requiredMask == 0 || (requiredMask & MachineRegisters.MaskOf(register)) != 0;
+            }
+
+            private static ulong RequiredRegisterMaskAt(AllocationInterval interval, int position)
+            {
+                ulong requiredMask = 0;
+                bool hasRequiredMask = false;
+
+                for (int i = 0; i < interval.RefPositions.Length; i++)
+                {
+                    var rp = interval.RefPositions[i];
+                    if (rp.Position < position)
+                        continue;
+                    if (rp.Position > position)
+                        break;
+
+                    ulong mask = RefPositionRegisterMask(rp);
+                    if (!hasRequiredMask)
+                    {
+                        requiredMask = mask;
+                        hasRequiredMask = true;
+                    }
+                    else
+                    {
+                        requiredMask &= mask;
+                    }
+                }
+
+                return hasRequiredMask ? requiredMask : 0;
+            }
+
+            private static ulong RefPositionRegisterMask(LinearRefPosition refPosition)
+            {
+                if (refPosition.FixedRegister != MachineRegister.Invalid)
+                    return MachineRegisters.MaskOf(refPosition.FixedRegister);
+
+                if (refPosition.RegisterMask != 0)
+                    return refPosition.RegisterMask;
+
+                return MachineRegisters.DefaultMaskForClass(refPosition.RegisterClass);
+            }
+
+            private int FirstConflictingFixedRegisterReservation(AllocationInterval interval, MachineRegister register, int start, int end)
+            {
+                if (register == MachineRegister.Invalid)
+                    return int.MaxValue;
+
                 for (int i = 0; i < _method.RefPositions.Length; i++)
                 {
                     var rp = _method.RefPositions[i];
@@ -4894,58 +5221,31 @@ namespace Cnidaria.Cs
                         continue;
                     if (rp.Position >= end)
                         break;
-                    if (rp.FixedRegister == MachineRegister.Invalid || rp.FixedRegister == register)
+                    if (rp.FixedRegister != register)
                         continue;
                     if (rp.Kind is not (LinearRefPositionKind.Use or LinearRefPositionKind.Def))
                         continue;
-                    if (rp.Value is null || !rp.Value.Equals(interval.Value))
+                    if (!interval.CrossesPosition(rp.Position) && !interval.Covers(rp.Position))
                         continue;
-                    if (interval.IsAbiFragment)
-                    {
-                        if (rp.AbiSegmentIndex != interval.AbiSegmentIndex)
-                            continue;
-                    }
-                    else if (rp.IsAbiSegment)
-                    {
+
+                    if (RefPositionBelongsToInterval(rp, interval))
                         continue;
-                    }
-                    if (interval.CrossesPosition(rp.Position) || interval.Covers(rp.Position))
-                        return rp.Position;
+
+                    return rp.Position;
                 }
 
                 return int.MaxValue;
             }
 
-            private int FirstFixedRegisterKillPosition(MachineRegister register, AllocationInterval interval, int start, int end)
+            private static bool RefPositionBelongsToInterval(LinearRefPosition rp, AllocationInterval interval)
             {
-                for (int i = 0; i < _fixedKillRefPositions.Length; i++)
-                {
-                    var kill = _fixedKillRefPositions[i];
-                    if (kill.Position < start)
-                        continue;
-                    if (kill.Position >= end)
-                        break;
-                    if (kill.FixedRegister == register && interval.CrossesPosition(kill.Position))
-                        return kill.Position;
-                }
+                if (rp.Value is null || !rp.Value.Equals(interval.Value))
+                    return false;
 
-                return int.MaxValue;
-            }
+                if (interval.IsAbiFragment)
+                    return rp.AbiSegmentIndex == interval.AbiSegmentIndex;
 
-            private int FirstCallerSavedSplitPosition(AllocationInterval interval, int start, int end)
-            {
-                for (int i = 0; i < _callPositions.Length; i++)
-                {
-                    int callPosition = _callPositions[i];
-                    if (callPosition < start)
-                        continue;
-                    if (callPosition >= end)
-                        break;
-                    if (interval.CrossesPosition(callPosition))
-                        return callPosition;
-                }
-
-                return int.MaxValue;
+                return !rp.IsAbiSegment;
             }
 
             private bool CrossesCall(ImmutableArray<LinearLiveRange> ranges)
@@ -5019,68 +5319,47 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            private static ImmutableArray<int> BuildCallPositions(GenTreeMethod method, Dictionary<int, int> nodePositions)
+            private static ImmutableArray<int> BuildCallPositions(GenTreeMethod method)
             {
                 var positions = new SortedSet<int>();
                 for (int i = 0; i < method.RefPositions.Length; i++)
                 {
                     var rp = method.RefPositions[i];
-                    if (rp.Kind == LinearRefPositionKind.Kill && rp.FixedRegister != MachineRegister.Invalid)
+                    if (rp.Kind == LinearRefPositionKind.Kill && GetKillRegisterMask(rp) != 0)
                         positions.Add(rp.Position);
                 }
 
-                if (positions.Count == 0)
-                {
-                    for (int i = 0; i < method.LinearNodes.Length; i++)
-                    {
-                        var node = method.LinearNodes[i];
-                        if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                            continue;
-                        if (!nodePositions.TryGetValue(node.LinearId, out int position))
-                            throw new InvalidOperationException("Missing GenTree LIR position for call node " + node.LinearId + ".");
-                        positions.Add(position);
-                    }
-                }
 
                 return positions.ToImmutableArray();
             }
 
-            private static ImmutableArray<LinearRefPosition> BuildFixedKillRefPositions(
+            private static ImmutableArray<LinearRefPosition> BuildKillRefPositions(
                 GenTreeMethod method, Dictionary<int, int> nodePositions, RegisterAllocatorOptions options)
             {
+                if (!options.RespectCallClobbers)
+                    return ImmutableArray<LinearRefPosition>.Empty;
+
                 var kills = ImmutableArray.CreateBuilder<LinearRefPosition>();
+                var killPositions = new HashSet<int>();
                 for (int i = 0; i < method.RefPositions.Length; i++)
                 {
                     var rp = method.RefPositions[i];
-                    if (rp.Kind == LinearRefPositionKind.Kill && rp.FixedRegister != MachineRegister.Invalid)
-                        kills.Add(rp);
+                    if (rp.Kind != LinearRefPositionKind.Kill || GetKillRegisterMask(rp) == 0)
+                        continue;
+
+                    kills.Add(NormalizeKillRefPosition(rp));
+                    killPositions.Add(rp.Position);
                 }
 
-                if (kills.Count == 0)
+                for (int n = 0; n < method.LinearNodes.Length; n++)
                 {
-                    for (int n = 0; n < method.LinearNodes.Length; n++)
-                    {
-                        var node = method.LinearNodes[n];
-                        if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                            continue;
-                        if (!nodePositions.TryGetValue(node.LinearId, out int position))
-                            throw new InvalidOperationException("Missing GenTree LIR position for caller-saved kill node " + node.LinearId + ".");
-
-                        var killed = MachineRegisters.CallerSavedRegisters;
-                        for (int r = 0; r < killed.Length; r++)
-                        {
-                            var register = killed[r];
-                            kills.Add(new LinearRefPosition(
-                                node.LinearId,
-                                position,
-                                -1,
-                                LinearRefPositionKind.Kill,
-                                null,
-                                MachineRegisters.GetClass(register),
-                                register,
-                                LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.Internal));
-                        }
-                    }
+                    var node = method.LinearNodes[n];
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
+                        continue;
+                    if (!nodePositions.TryGetValue(node.LinearId, out int position))
+                        throw new InvalidOperationException("Missing GenTree LIR position for caller-saved kill node " + node.LinearId + ".");
+                    if (!killPositions.Contains(position))
+                        throw new InvalidOperationException("Caller-saved kill node " + node.LinearId + " has no LSRA kill RefPosition at LIR position " + position + ".");
                 }
 
                 kills.Sort(static (a, b) =>
@@ -5088,18 +5367,241 @@ namespace Cnidaria.Cs
                     int c = a.Position.CompareTo(b.Position);
                     if (c != 0)
                         return c;
-                    c = a.FixedRegister.CompareTo(b.FixedRegister);
+                    c = a.NodeId.CompareTo(b.NodeId);
                     if (c != 0)
                         return c;
-                    return a.NodeId.CompareTo(b.NodeId);
+                    return GetKillRegisterMask(a).CompareTo(GetKillRegisterMask(b));
                 });
-                return kills.ToImmutable();
+                return CoalesceKillRefPositions(kills);
             }
+
+            private static ulong GetKillRegisterMask(LinearRefPosition kill)
+            {
+                if (kill.Kind != LinearRefPositionKind.Kill)
+                    return 0;
+
+                ulong mask = kill.RegisterMask;
+                if (kill.FixedRegister != MachineRegister.Invalid)
+                    mask |= MachineRegisters.MaskOf(kill.FixedRegister);
+                return mask;
+            }
+
+            private static LinearRefPosition NormalizeKillRefPosition(LinearRefPosition kill)
+            {
+                ulong mask = GetKillRegisterMask(kill);
+                if (mask == 0)
+                    throw new InvalidOperationException("Kill ref position has an empty register mask.");
+
+                if (kill.FixedRegister == MachineRegister.Invalid &&
+                    kill.RegisterClass == RegisterClass.Invalid &&
+                    kill.Value is null &&
+                    kill.RegisterMask == mask)
+                {
+                    return kill;
+                }
+
+                return new LinearRefPosition(
+                    kill.NodeId,
+                    kill.Position,
+                    kill.OperandIndex,
+                    LinearRefPositionKind.Kill,
+                    null,
+                    RegisterClass.Invalid,
+                    MachineRegister.Invalid,
+                    (kill.Flags | LinearRefPositionFlags.Internal) & ~LinearRefPositionFlags.FixedRegister,
+                    mask);
+            }
+
+            private static ImmutableArray<LinearRefPosition> CoalesceKillRefPositions(
+                ImmutableArray<LinearRefPosition>.Builder kills)
+            {
+                if (kills.Count == 0)
+                    return ImmutableArray<LinearRefPosition>.Empty;
+
+                var result = ImmutableArray.CreateBuilder<LinearRefPosition>();
+                LinearRefPosition current = kills[0];
+                ulong currentMask = GetKillRegisterMask(current);
+
+                for (int i = 1; i < kills.Count; i++)
+                {
+                    var kill = kills[i];
+                    if (kill.Position == current.Position && kill.NodeId == current.NodeId)
+                    {
+                        currentMask |= GetKillRegisterMask(kill);
+                        continue;
+                    }
+
+                    result.Add(new LinearRefPosition(
+                        current.NodeId,
+                        current.Position,
+                        -1,
+                        LinearRefPositionKind.Kill,
+                        null,
+                        RegisterClass.Invalid,
+                        MachineRegister.Invalid,
+                        LinearRefPositionFlags.Internal,
+                        currentMask));
+
+                    current = kill;
+                    currentMask = GetKillRegisterMask(kill);
+                }
+
+                result.Add(new LinearRefPosition(
+                    current.NodeId,
+                    current.Position,
+                    -1,
+                    LinearRefPositionKind.Kill,
+                    null,
+                    RegisterClass.Invalid,
+                    MachineRegister.Invalid,
+                    LinearRefPositionFlags.Internal,
+                    currentMask));
+
+                return result.ToImmutable();
+            }
+
+            private int FirstKillLimitForRegister(
+                AllocationInterval interval,
+                MachineRegister register,
+                int start,
+                int end)
+            {
+                if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
+                    return int.MaxValue;
+
+                ulong registerMask = MachineRegisters.MaskOf(register);
+                for (int i = 0; i < _killRefPositions.Length; i++)
+                {
+                    var kill = _killRefPositions[i];
+                    if (kill.Position < start)
+                        continue;
+                    if (kill.Position >= end)
+                        break;
+                    if ((GetKillRegisterMask(kill) & registerMask) == 0)
+                        continue;
+                    if (!interval.CrossesPosition(kill.Position))
+                        continue;
+
+                    return UseAtPositionNeedsPreKillLocation(interval, kill.Position)
+                        ? kill.Position + 1
+                        : kill.Position;
+                }
+
+                return int.MaxValue;
+            }
+
+            private int KillSpillSegmentStart(AllocationInterval interval, MachineRegister register, int killPosition)
+                => UseAtPositionNeedsPreKillLocation(interval, killPosition)
+                    ? killPosition + 1
+                    : killPosition;
+
+            private bool TryGetKillPositionEndingRegisterSegment(
+                AllocationInterval interval,
+                MachineRegister register,
+                int segmentEnd,
+                out int killPosition)
+            {
+                killPosition = -1;
+                if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
+                    return false;
+
+                ulong registerMask = MachineRegisters.MaskOf(register);
+                for (int i = 0; i < _killRefPositions.Length; i++)
+                {
+                    var kill = _killRefPositions[i];
+                    if (kill.Position > segmentEnd)
+                        break;
+                    if ((GetKillRegisterMask(kill) & registerMask) == 0)
+                        continue;
+                    if (!interval.CrossesPosition(kill.Position))
+                        continue;
+
+                    int expectedEnd = UseAtPositionNeedsPreKillLocation(interval, kill.Position)
+                        ? kill.Position + 1
+                        : kill.Position;
+                    if (expectedEnd != segmentEnd)
+                        continue;
+
+                    killPosition = kill.Position;
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool IsCallArgumentUse(LinearRefPosition refPosition)
+            {
+                if (refPosition.Kind != LinearRefPositionKind.Use)
+                    return false;
+
+                if (!_nodeByLinearId.TryGetValue(refPosition.NodeId, out var node))
+                    return false;
+
+                return IsAbiCall(node);
+            }
+
+            private bool UseAtPositionNeedsPreKillLocation(AllocationInterval interval, int position)
+            {
+                for (int i = 0; i < _method.RefPositions.Length; i++)
+                {
+                    var rp = _method.RefPositions[i];
+                    if (rp.Position < position)
+                        continue;
+                    if (rp.Position > position)
+                        break;
+                    if (rp.Kind != LinearRefPositionKind.Use || rp.Value is null)
+                        continue;
+                    if (!rp.Value.Equals(interval.Value))
+                        continue;
+                    if (interval.IsAbiFragment)
+                    {
+                        if (rp.AbiSegmentIndex != interval.AbiSegmentIndex)
+                            continue;
+                    }
+                    else if (rp.IsAbiSegment)
+                    {
+                        continue;
+                    }
+
+                    if ((rp.Flags & LinearRefPositionFlags.StackOnly) != 0)
+                        continue;
+
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool IsRegisterKilledAtPosition(MachineRegister register, int position)
+            {
+                if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
+                    return false;
+
+                ulong registerMask = MachineRegisters.MaskOf(register);
+                for (int i = 0; i < _killRefPositions.Length; i++)
+                {
+                    var kill = _killRefPositions[i];
+                    if (kill.Position < position)
+                        continue;
+                    if (kill.Position > position)
+                        break;
+                    if ((GetKillRegisterMask(kill) & registerMask) != 0)
+                        return true;
+                }
+
+                return false;
+            }
+
+            private static int NextRequiredRefPositionAfter(AllocationInterval interval, int position)
+                => interval.NextRequiredRefPositionAfter(position);
+
+            private static int NextRequiredRefPositionAtOrAfter(AllocationInterval interval, int position)
+                => interval.NextRequiredRefPositionAtOrAfter(position);
 
             private static bool IsAbiCall(GenTree node)
                 => node.HasLoweringFlag(GenTreeLinearFlags.AbiCall);
 
-            private int FirstRegisterConflictPosition(MachineRegister register, AllocationInterval current)
+            private int FirstRegisterConflictPosition(MachineRegister register, AllocationInterval current, int start)
             {
                 int conflict = int.MaxValue;
 
@@ -5108,7 +5610,7 @@ namespace Cnidaria.Cs
                     var active = _active[i];
                     if (active.AssignedRegister == register)
                     {
-                        int p = active.FirstRegisterIntersection(current);
+                        int p = active.FirstRegisterIntersection(current, start, int.MaxValue);
                         if (p < conflict)
                             conflict = p;
                     }
@@ -5119,7 +5621,7 @@ namespace Cnidaria.Cs
                     var inactive = _inactive[i];
                     if (inactive.AssignedRegister == register)
                     {
-                        int p = inactive.FirstRegisterIntersection(current);
+                        int p = inactive.FirstRegisterIntersection(current, start, int.MaxValue);
                         if (p < conflict)
                             conflict = p;
                     }
@@ -5128,16 +5630,16 @@ namespace Cnidaria.Cs
                 return conflict;
             }
 
-            private int NextUseOfBlockingIntervals(MachineRegister register, AllocationInterval current)
+            private int NextUseOfBlockingIntervals(MachineRegister register, AllocationInterval current, int start)
             {
                 int nextUse = int.MaxValue;
 
                 for (int i = 0; i < _active.Count; i++)
                 {
                     var active = _active[i];
-                    if (active.AssignedRegister == register && active.FirstRegisterIntersection(current) != int.MaxValue)
+                    if (active.AssignedRegister == register && active.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
                     {
-                        int use = active.NextUseAfterOrAt(current.Start);
+                        int use = active.NextUseAfterOrAt(start);
                         if (use < nextUse)
                             nextUse = use;
                     }
@@ -5146,9 +5648,9 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _inactive.Count; i++)
                 {
                     var inactive = _inactive[i];
-                    if (inactive.AssignedRegister == register && inactive.FirstRegisterIntersection(current) != int.MaxValue)
+                    if (inactive.AssignedRegister == register && inactive.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
                     {
-                        int use = inactive.NextUseAfterOrAt(current.Start);
+                        int use = inactive.NextUseAfterOrAt(start);
                         if (use < nextUse)
                             nextUse = use;
                     }
@@ -5157,18 +5659,24 @@ namespace Cnidaria.Cs
                 return nextUse;
             }
 
-            private void SplitBlockingIntervals(MachineRegister register, AllocationInterval current, int currentRegisterEnd)
+            private void SplitBlockingIntervals(
+                MachineRegister register,
+                AllocationInterval current,
+                int currentStart,
+                int currentRegisterEnd,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
                 for (int i = _active.Count - 1; i >= 0; i--)
                 {
                     var active = _active[i];
                     if (active.AssignedRegister == register)
                     {
-                        int split = active.FirstRegisterIntersection(current, current.Start, currentRegisterEnd);
+                        int split = active.FirstRegisterIntersection(current, currentStart, currentRegisterEnd);
                         if (split != int.MaxValue)
                         {
                             _active.RemoveAt(i);
-                            SplitToSpill(active, split);
+                            SplitToSpill(active, split, stream, ref streamIndex);
                             _handled.Add(active);
                         }
                     }
@@ -5179,56 +5687,158 @@ namespace Cnidaria.Cs
                     var inactive = _inactive[i];
                     if (inactive.AssignedRegister == register)
                     {
-                        int split = inactive.FirstRegisterIntersection(current, current.Start, currentRegisterEnd);
+                        int split = inactive.FirstRegisterIntersection(current, currentStart, currentRegisterEnd);
                         if (split != int.MaxValue)
                         {
                             _inactive.RemoveAt(i);
-                            SplitToSpill(inactive, split);
+                            SplitToSpill(inactive, split, stream, ref streamIndex);
                             _handled.Add(inactive);
                         }
                     }
                 }
             }
 
-            private void AssignRegisterSegment(AllocationInterval interval, MachineRegister register, int segmentEnd)
+            private void AssignRegisterSegment(
+                AllocationInterval interval,
+                int start,
+                MachineRegister register,
+                int segmentEnd,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
                 if (!MachineRegisters.IsRegisterInClass(register, interval.RegisterClass))
                     throw new InvalidOperationException(
                         $"Cannot assign {MachineRegisters.Format(register)} to {interval.RegisterClass} interval {interval.Value}.");
-                if (segmentEnd <= interval.Start)
+                if (segmentEnd <= start)
                     throw new InvalidOperationException($"Register segment for {interval.Value} is empty.");
-                if (interval.RequiresSingleLocation && segmentEnd < interval.End)
-                    throw new InvalidOperationException($"Cannot partially split CFG-live interval {interval.Value}.");
+
+                int killPosition = -1;
+                bool endedByKill =
+                    segmentEnd < interval.End &&
+                    TryGetKillPositionEndingRegisterSegment(interval, register, segmentEnd, out killPosition);
 
                 var registerHome = RegisterOperand.ForRegister(register);
                 interval.AssignedRegister = register;
                 interval.AssignedRegisterEnd = segmentEnd;
-                interval.AddSegment(interval.Start, segmentEnd, registerHome);
+                interval.AddSegment(start, segmentEnd, registerHome);
 
-                if (segmentEnd < interval.End)
-                    interval.AddSegment(segmentEnd, interval.End, GetOrCreateSpillHome(interval));
+                if (endedByKill)
+                {
+                    int spillStart = KillSpillSegmentStart(interval, register, killPosition);
+                    int nextRefPosition = NextRequiredRefPositionAfter(interval, killPosition);
+                    int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
+                    if (spillEnd < spillStart)
+                        spillEnd = spillStart;
 
-                AssignHome(interval);
+                    interval.AddSegment(spillStart, spillEnd, GetOrCreateSpillHome(interval));
+                    AssignHome(interval);
 
-                if (interval.Covers(interval.Start))
+                    if (nextRefPosition != int.MaxValue && nextRefPosition < interval.End)
+                        ScheduleContinuationAt(interval, nextRefPosition, stream, ref streamIndex);
+                }
+                else
+                {
+                    if (segmentEnd < interval.End)
+                        AddFutureSplitSpill(interval, segmentEnd, stream, ref streamIndex);
+                    else
+                        AssignHome(interval);
+                }
+
+                if (interval.Covers(start))
                     _active.Add(interval);
                 else
                     _inactive.Add(interval);
             }
 
-            private void SplitToSpill(AllocationInterval interval, int splitPosition)
+            private void AddFutureSplitSpill(
+                AllocationInterval interval,
+                int splitPosition,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
             {
-                var spillHome = GetOrCreateSpillHome(interval);
-                if (interval.RequiresSingleLocation)
-                    interval.ReplaceWithSingleSegment(interval.Start, interval.End, spillHome);
+                int nextRefPosition = NextRequiredRefPositionAtOrAfter(interval, splitPosition);
+                int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
+                if (spillEnd < splitPosition)
+                    spillEnd = splitPosition;
+
+                if (spillEnd == splitPosition)
+                    interval.EndAssignedRegisterAt(splitPosition);
                 else
-                    interval.SplitAssignedRegisterToSpill(splitPosition, spillHome);
+                    interval.AddSpillSegmentAfterAssignedRegister(splitPosition, spillEnd, GetOrCreateSpillHome(interval));
                 AssignHome(interval);
+
+                if (nextRefPosition != int.MaxValue && nextRefPosition < interval.End)
+                    ScheduleContinuationAt(interval, nextRefPosition, stream, ref streamIndex);
+            }
+
+            private void ScheduleContinuation(
+                AllocationInterval interval,
+                int position,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                int next = interval.FirstLivePositionAtOrAfter(position);
+                ScheduleContinuationAt(interval, next, stream, ref streamIndex);
+            }
+
+            private void ScheduleContinuationAt(
+                AllocationInterval interval,
+                int next,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                if (next == int.MaxValue || next >= interval.End)
+                    return;
+
+                for (int i = streamIndex + 1; i < stream.Count; i++)
+                {
+                    var item = stream[i];
+                    if (item.Position > next)
+                        break;
+                    if (item.Position == next &&
+                        item.Kind == AllocationStreamItemKind.IntervalStart &&
+                        ReferenceEquals(item.Interval, interval))
+                    {
+                        return;
+                    }
+                }
+
+                InsertAllocationStreamItem(stream, ref streamIndex, AllocationStreamItem.ForInterval(interval, next));
+            }
+
+            private void SplitToSpill(
+                AllocationInterval interval,
+                int splitPosition,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                int nextRefPosition = NextRequiredRefPositionAtOrAfter(interval, splitPosition);
+                int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
+                if (spillEnd < splitPosition)
+                    spillEnd = splitPosition;
+
+                if (spillEnd == splitPosition)
+                    interval.EndAssignedRegisterAt(splitPosition);
+                else
+                    interval.SplitAssignedRegisterToSpill(splitPosition, spillEnd, GetOrCreateSpillHome(interval));
+                AssignHome(interval);
+
+                if (nextRefPosition != int.MaxValue && nextRefPosition < interval.End)
+                    ScheduleContinuationAt(interval, nextRefPosition, stream, ref streamIndex);
             }
 
             private void Spill(AllocationInterval interval)
             {
+                interval.MarkPermanentlySpilledFrom(interval.Start);
                 interval.ReplaceWithSingleSegment(interval.Start, interval.End, GetOrCreateSpillHome(interval));
+                AssignHome(interval);
+                _handled.Add(interval);
+            }
+
+            private void SpillFrom(AllocationInterval interval, int start)
+            {
+                interval.MarkPermanentlySpilledFrom(start);
+                interval.SplitAssignedRegisterToSpill(start, start, GetOrCreateSpillHome(interval));
                 AssignHome(interval);
                 _handled.Add(interval);
             }
@@ -5253,9 +5863,9 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                RegisterOperand home = interval.RequiresStackHome
-                    ? GetOrCreateSpillHome(interval)
-                    : interval.PrimaryHome;
+                RegisterOperand home = interval.PrimaryHome;
+                if (interval.MustStayInMemory || interval.HasMemoryLocationSegment)
+                    home = GetOrCreateSpillHome(interval);
 
                 _allocations[interval.Value] = new RegisterAllocationInfo(
                     interval.Value,
@@ -5291,8 +5901,16 @@ namespace Cnidaria.Cs
                         interval.ToRegisterAllocationSegments()));
                 }
 
-                if (!_aggregateHomes.TryGetValue(value, out var aggregateHome))
-                    aggregateHome = RegisterOperand.None;
+                RegisterOperand aggregateHome = RegisterOperand.None;
+                for (int i = 0; i < intervals.Count; i++)
+                {
+                    var interval = intervals[i];
+                    if (interval.IsAbiFragment && (interval.MustStayInMemory || interval.HasMemoryLocationSegment))
+                    {
+                        aggregateHome = GetOrCreateAggregateHome(value, abi);
+                        break;
+                    }
+                }
 
                 return new RegisterAllocationInfo(
                     value,
@@ -5318,6 +5936,11 @@ namespace Cnidaria.Cs
                     var linearBlock = _method.Blocks[b];
                     var nodes = ImmutableArray.CreateBuilder<GenTree>(linearBlock.LinearNodes.Length);
                     var emittedSplitPositions = new HashSet<int>();
+                    var pendingPositionSplitMoves = GetPositionSplitMovePositionsForBlock(
+                        splitPlan.PositionMoves,
+                        _blockStartPositions[b],
+                        _blockEndPositions[b]);
+                    int pendingPositionSplitMoveIndex = 0;
                     bool emittedExitMoves = false;
 
                     void EmitPositionSplitMoves(int position)
@@ -5326,38 +5949,77 @@ namespace Cnidaria.Cs
                             EmitSplitMovesAtPosition(b, position, getCopyScratchSlot, splitPlan.PositionMoves, nodes, all);
                     }
 
+                    void EmitPendingPositionSplitMovesThrough(int position)
+                    {
+                        while (pendingPositionSplitMoveIndex < pendingPositionSplitMoves.Length &&
+                               pendingPositionSplitMoves[pendingPositionSplitMoveIndex] <= position)
+                        {
+                            EmitPositionSplitMoves(pendingPositionSplitMoves[pendingPositionSplitMoveIndex]);
+                            pendingPositionSplitMoveIndex++;
+                        }
+                    }
+
                     void EmitExitSplitMoves()
                     {
                         if (emittedExitMoves)
                             return;
 
                         emittedExitMoves = true;
-                        EmitBlockSplitMoves(b, getCopyScratchSlot, splitPlan.BlockExitMoves, nodes, all);
+                        EmitBlockExitSplitMoves(b, getCopyScratchSlot, splitPlan, nodes, all);
                     }
 
-                    EmitBlockSplitMoves(b, getCopyScratchSlot, splitPlan.BlockEntryMoves, nodes, all);
-                    EmitPositionSplitMoves(_blockStartPositions[b]);
+                    EmitBlockEntrySplitMoves(b, getCopyScratchSlot, splitPlan, nodes, all);
+                    EmitPendingPositionSplitMovesThrough(_blockStartPositions[b]);
 
                     for (int n = 0; n < linearBlock.LinearNodes.Length; n++)
                     {
                         var node = linearBlock.LinearNodes[n];
                         int position = GetNodePosition(node);
+                        bool isTerminator = IsBlockTerminatorNode(node);
 
-                        EmitPositionSplitMoves(position);
-
-                        if (IsBlockTerminatorNode(node))
-                            EmitExitSplitMoves();
-
-                        if (IsPhiCopyNode(node))
+                        if (IsAbiCall(node))
                         {
+                            EmitPendingPositionSplitMovesThrough(position);
+
+                            EmitCallLikeTreeNode(
+                                node,
+                                getCopyScratchSlot,
+                                nodes,
+                                all);
+
+                            if (!isTerminator)
+                                EmitPendingPositionSplitMovesThrough(position + 1);
+
+                            continue;
+                        }
+
+                        EmitPendingPositionSplitMovesThrough(position);
+
+                        if (isTerminator)
+                        {
+                            EmitPendingPositionSplitMovesThrough(_blockEndPositions[b] - 1);
+                            EmitExitSplitMoves();
+                        }
+
+                        if (node.IsPhiCopy)
+                        {
+                            bool isPredecessorExitPhiGroup = IsPredecessorExitPhiGroup(node, b);
+                            if (isPredecessorExitPhiGroup)
+                            {
+                                EmitPendingPositionSplitMovesThrough(_blockEndPositions[b] - 1);
+                            }
+
                             n = EmitPhiCopyGroup(
                                 linearBlock.LinearNodes,
                                 n,
                                 b,
+                                splitPlan,
                                 EmitPositionSplitMoves,
+                                emitPostPhiPositionMoves: !isPredecessorExitPhiGroup,
                                 getCopyScratchSlot,
                                 nodes,
                                 all);
+                            continue;
                         }
                         else if (node.LinearKind == GenTreeLinearKind.Copy)
                         {
@@ -5372,9 +6034,11 @@ namespace Cnidaria.Cs
                             EmitTreeNodeSequence(node, nodes, all);
                         }
 
-                        EmitPositionSplitMoves(position + 1);
+                        if (!isTerminator)
+                            EmitPendingPositionSplitMovesThrough(position + 1);
                     }
 
+                    EmitPendingPositionSplitMovesThrough(_blockEndPositions[b] - 1);
                     EmitExitSplitMoves();
 
                     linearBlock.SetLinearNodes(nodes.ToImmutable());
@@ -5395,11 +6059,61 @@ namespace Cnidaria.Cs
                 return ImmutableArray.Create(blockArray);
             }
 
+            private static ImmutableArray<int> GetPositionSplitMovePositionsForBlock(
+                Dictionary<int, List<RegisterResolvedMove>> positionMoves,
+                int blockStart,
+                int blockEnd)
+            {
+                if (positionMoves.Count == 0 || blockEnd <= blockStart)
+                    return ImmutableArray<int>.Empty;
+
+                var positions = new List<int>();
+                foreach (var kv in positionMoves)
+                {
+                    if (kv.Value.Count == 0)
+                        continue;
+
+                    int position = kv.Key;
+                    if (blockStart <= position && position < blockEnd)
+                        positions.Add(position);
+                }
+
+                if (positions.Count == 0)
+                    return ImmutableArray<int>.Empty;
+
+                positions.Sort();
+                return positions.ToImmutableArray();
+            }
+
+            private readonly struct SplitEdgeKey : IEquatable<SplitEdgeKey>
+            {
+                public readonly int FromBlockId;
+                public readonly int ToBlockId;
+
+                public SplitEdgeKey(int fromBlockId, int toBlockId)
+                {
+                    FromBlockId = fromBlockId;
+                    ToBlockId = toBlockId;
+                }
+
+                public bool Equals(SplitEdgeKey other)
+                    => FromBlockId == other.FromBlockId && ToBlockId == other.ToBlockId;
+
+                public override bool Equals(object? obj)
+                    => obj is SplitEdgeKey other && Equals(other);
+
+                public override int GetHashCode()
+                    => HashCode.Combine(FromBlockId, ToBlockId);
+
+                public override string ToString()
+                    => $"B{FromBlockId}->B{ToBlockId}";
+            }
+
             private sealed class SplitResolutionPlan
             {
                 public readonly Dictionary<int, List<RegisterResolvedMove>> PositionMoves = new();
-                public readonly Dictionary<int, List<RegisterResolvedMove>> BlockEntryMoves = new();
-                public readonly Dictionary<int, List<RegisterResolvedMove>> BlockExitMoves = new();
+                public readonly Dictionary<SplitEdgeKey, List<RegisterResolvedMove>> BlockEntryMoves = new();
+                public readonly Dictionary<SplitEdgeKey, List<RegisterResolvedMove>> BlockExitMoves = new();
             }
 
             private SplitResolutionPlan BuildSplitResolutionPlan()
@@ -5409,9 +6123,13 @@ namespace Cnidaria.Cs
                 foreach (var allocation in _allocations.Values)
                 {
                     AddSplitTransitionMoves(plan, allocation.Value, allocation.Segments);
+                    AddCfgEdgeResolutionMoves(plan, allocation.Value, allocation.Ranges, allocation.Segments);
 
                     for (int f = 0; f < allocation.Fragments.Length; f++)
+                    {
                         AddSplitTransitionMoves(plan, allocation.Value, allocation.Fragments[f].Segments);
+                        AddCfgEdgeResolutionMoves(plan, allocation.Value, allocation.Ranges, allocation.Fragments[f].Segments);
+                    }
                 }
 
                 return plan;
@@ -5429,75 +6147,244 @@ namespace Cnidaria.Cs
                     if (previous.Location.Equals(current.Location))
                         continue;
 
-                    if (TryGetBlockStartingAtPosition(current.Start, out int toBlockId))
-                    {
-                        AddCfgEdgeResolutionMoves(plan, value, segments, toBlockId);
-                        continue;
-                    }
-
-                    AddMove(plan.PositionMoves, current.Start, new RegisterResolvedMove(
+                    var move = new RegisterResolvedMove(
                         previous.Location,
                         current.Location,
                         value,
                         value,
-                        MoveFlags.Split));
+                        MoveFlags.Split);
+
+                    int movePosition = SplitTransitionMovePosition(previous, current);
+                    if (movePosition == current.Start && TryGetBlockStartingAtPosition(current.Start, out _))
+                        continue;
+
+                    AddMove(plan.PositionMoves, movePosition, move);
                 }
+            }
+
+            private int SplitTransitionMovePosition(RegisterAllocationSegment previous, RegisterAllocationSegment current)
+            {
+                if (previous.Location.IsRegister &&
+                    current.Location.IsMemoryOperand &&
+                    current.Start == previous.End &&
+                    current.Start > previous.Start &&
+                    IsRegisterKilledAtPosition(previous.Location.Register, current.Start - 1))
+                {
+                    return current.Start - 1;
+                }
+
+                return current.Start;
             }
 
             private void AddCfgEdgeResolutionMoves(
                 SplitResolutionPlan plan,
                 GenTree value,
-                ImmutableArray<RegisterAllocationSegment> segments,
-                int toBlockId)
+                ImmutableArray<LinearLiveRange> ranges,
+                ImmutableArray<RegisterAllocationSegment> segments)
             {
-                if ((uint)toBlockId >= (uint)_method.Cfg.Blocks.Length)
-                    throw new InvalidOperationException($"Invalid split target block B{toBlockId}.");
-
-                var toBlock = _method.Cfg.Blocks[toBlockId];
-                int toPosition = _blockStartPositions[toBlockId];
-                if (!TryGetLocationAt(segments, toPosition, out var destination))
+                if (segments.IsDefaultOrEmpty || ranges.IsDefaultOrEmpty)
                     return;
 
-                for (int p = 0; p < toBlock.Predecessors.Length; p++)
+                for (int b = 0; b < _method.Cfg.Blocks.Length; b++)
                 {
-                    var edge = toBlock.Predecessors[p];
-                    if (edge.Kind == CfgEdgeKind.Exception)
+                    var fromBlock = _method.Cfg.Blocks[b];
+                    int fromPosition = _blockEndPositions[b];
+                    if (!IsLiveAt(ranges, fromPosition))
+                        continue;
+                    if (!TryGetLocationAt(segments, fromPosition, out var source))
+                        continue;
+
+                    for (int s = 0; s < fromBlock.Successors.Length; s++)
                     {
-                        if (TryGetLocationAt(segments, _blockEndPositions[edge.FromBlockId], out var exceptionSource) &&
-                            !exceptionSource.Equals(destination))
+                        var edge = fromBlock.Successors[s];
+                        if ((uint)edge.ToBlockId >= (uint)_method.Cfg.Blocks.Length)
+                            throw new InvalidOperationException($"Invalid split target block B{edge.ToBlockId}.");
+
+                        int toPosition = _blockStartPositions[edge.ToBlockId];
+                        if (!IsLiveAt(ranges, toPosition))
+                            continue;
+                        if (!TryGetLocationAt(segments, toPosition, out var destination))
+                            continue;
+
+                        if (source.Equals(destination))
+                            continue;
+
+                        if (edge.Kind == CfgEdgeKind.Exception)
                         {
                             throw new InvalidOperationException(
                                 $"Cannot resolve split of {value} on exception edge {edge}: exception edges cannot execute register moves. " +
                                 "The value must remain stack-homed or have the same location at both sides of the edge.");
                         }
+
+                        AddNormalEdgeMove(
+                            plan,
+                            edge,
+                            new RegisterResolvedMove(source, destination, value, value, MoveFlags.Split));
+                    }
+                }
+            }
+
+            private static bool BlockContainsNonSelfPhiDestination(GenTreeBlock block, CfgEdge edge, GenTreeValueKey key)
+            {
+                var nodes = block.LinearNodes;
+                for (int i = 0; i < nodes.Length; i++)
+                {
+                    var node = nodes[i];
+                    if (!node.IsPhiCopy ||
+                        node.LinearPhiCopyFromBlockId != edge.FromBlockId ||
+                        node.LinearPhiCopyToBlockId != edge.ToBlockId ||
+                        node.RegisterResult is null ||
+                        !node.RegisterResult.LinearValueKey.Equals(key))
+                    {
                         continue;
                     }
 
-                    int fromPosition = _blockEndPositions[edge.FromBlockId];
-                    if (!TryGetLocationAt(segments, fromPosition, out var source))
-                        continue;
-                    if (source.Equals(destination))
+                    if (node.RegisterUses.Length == 0)
+                        return true;
+
+                    for (int u = 0; u < node.RegisterUses.Length; u++)
+                    {
+                        if (!node.RegisterUses[u].LinearValueKey.Equals(key))
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private static bool BlockContainsPhiCopyForEdge(GenTreeBlock block, SplitEdgeKey key)
+            {
+                var nodes = block.LinearNodes;
+                for (int i = 0; i < nodes.Length; i++)
+                {
+                    var node = nodes[i];
+                    if (node.IsPhiCopy &&
+                        node.LinearPhiCopyFromBlockId == key.FromBlockId &&
+                        node.LinearPhiCopyToBlockId == key.ToBlockId)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private bool EdgeHasPhiCopyGroup(SplitEdgeKey key)
+            {
+                if ((uint)key.FromBlockId < (uint)_method.Blocks.Length &&
+                    BlockContainsPhiCopyForEdge(_method.Blocks[key.FromBlockId], key))
+                {
+                    return true;
+                }
+
+                if ((uint)key.ToBlockId < (uint)_method.Blocks.Length &&
+                    BlockContainsPhiCopyForEdge(_method.Blocks[key.ToBlockId], key))
+                {
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static void AddAndRemoveEdgeMoves(
+                Dictionary<SplitEdgeKey, List<RegisterResolvedMove>> map,
+                SplitEdgeKey key,
+                List<RegisterResolvedMove> moves)
+            {
+                if (!map.TryGetValue(key, out var edgeMoves) || edgeMoves.Count == 0)
+                    return;
+
+                if (moves.Count == 0)
+                {
+                    moves.AddRange(edgeMoves);
+                    map.Remove(key);
+                    return;
+                }
+
+                for (int i = 0; i < edgeMoves.Count; i++)
+                {
+                    var edgeMove = edgeMoves[i];
+                    if (IsCoveredByNonSelfPhiMove(edgeMove, moves))
                         continue;
 
-                    var move = new RegisterResolvedMove(source, destination, value, value, MoveFlags.Split);
-                    AddNormalEdgeMove(plan, edge, move);
+                    moves.Add(edgeMove);
                 }
+
+                map.Remove(key);
             }
+
+            private static bool IsCoveredByNonSelfPhiMove(RegisterResolvedMove edgeMove, List<RegisterResolvedMove> phiMoves)
+            {
+                var destinationValue = edgeMove.DestinationValue;
+                if (destinationValue is null || edgeMove.SourceValue is null)
+                    return false;
+
+                if (!edgeMove.SourceValue.LinearValueKey.Equals(destinationValue.LinearValueKey))
+                    return false;
+
+                for (int i = 0; i < phiMoves.Count; i++)
+                {
+                    var phiMove = phiMoves[i];
+                    if ((phiMove.MoveFlags & MoveFlags.ParallelCopy) == 0)
+                        continue;
+
+                    if (phiMove.DestinationValue is null || phiMove.SourceValue is null)
+                        continue;
+
+                    if (!phiMove.DestinationValue.LinearValueKey.Equals(destinationValue.LinearValueKey))
+                        continue;
+
+                    if (phiMove.SourceValue.LinearValueKey.Equals(phiMove.DestinationValue.LinearValueKey))
+                        continue;
+
+                    if (!phiMove.Destination.Equals(edgeMove.Destination))
+                        continue;
+
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static bool IsPredecessorExitPhiGroup(GenTree groupHead, int blockId)
+                => groupHead.IsPhiCopy &&
+                   groupHead.LinearBlockId == blockId &&
+                   groupHead.LinearPhiCopyFromBlockId == blockId &&
+                   groupHead.LinearPhiCopyToBlockId != blockId;
+
+            private void AddMatchingEdgeSplitMovesToPhiGroup(
+                SplitResolutionPlan splitPlan,
+                GenTree groupHead,
+                List<RegisterResolvedMove> moves)
+            {
+                var key = new SplitEdgeKey(groupHead.LinearPhiCopyFromBlockId, groupHead.LinearPhiCopyToBlockId);
+
+                if (groupHead.LinearBlockId != key.FromBlockId && groupHead.LinearBlockId != key.ToBlockId)
+                {
+                    throw new InvalidOperationException(
+                        $"Phi copy group for edge {key} is placed in unrelated block B{groupHead.LinearBlockId}.");
+                }
+
+                AddAndRemoveEdgeMoves(splitPlan.BlockExitMoves, key, moves);
+                AddAndRemoveEdgeMoves(splitPlan.BlockEntryMoves, key, moves);
+            }
+
 
             private void AddNormalEdgeMove(SplitResolutionPlan plan, CfgEdge edge, RegisterResolvedMove move)
             {
                 int normalPreds = CountNormalPredecessors(edge.ToBlockId);
                 int normalSuccs = CountNormalSuccessors(edge.FromBlockId);
+                var key = new SplitEdgeKey(edge.FromBlockId, edge.ToBlockId);
 
                 if (normalPreds == 1)
                 {
-                    AddMove(plan.BlockEntryMoves, edge.ToBlockId, move);
+                    AddMove(plan.BlockEntryMoves, key, move);
                     return;
                 }
 
                 if (normalSuccs == 1)
                 {
-                    AddMove(plan.BlockExitMoves, edge.FromBlockId, move);
+                    AddMove(plan.BlockExitMoves, key, move);
                     return;
                 }
 
@@ -5564,10 +6451,11 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static void AddMove(
-                Dictionary<int, List<RegisterResolvedMove>> movesByKey,
-                int key,
+            private static void AddMove<TKey>(
+                Dictionary<TKey, List<RegisterResolvedMove>> movesByKey,
+                TKey key,
                 RegisterResolvedMove move)
+                where TKey : notnull
             {
                 if (!movesByKey.TryGetValue(key, out var moves))
                 {
@@ -5575,26 +6463,119 @@ namespace Cnidaria.Cs
                     movesByKey.Add(key, moves);
                 }
 
-                moves.Add(move);
+                AddUniqueMove(moves, move);
             }
 
-            private void EmitBlockSplitMoves(
+            private void EmitBlockEntrySplitMoves(
                 int blockId,
                 Func<int> getCopyScratchSlot,
-                Dictionary<int, List<RegisterResolvedMove>> splitMovesByBlock,
+                SplitResolutionPlan splitPlan,
                 ImmutableArray<GenTree>.Builder blockLinearNodes,
                 ImmutableArray<GenTree>.Builder allNodes)
             {
-                if (!splitMovesByBlock.TryGetValue(blockId, out var moves) || moves.Count == 0)
-                    return;
-
-                EmitResolvedSplitMoves(
+                EmitEdgeSplitMovesForBlock(
                     blockId,
-                    blockId,
+                    isEntry: true,
                     getCopyScratchSlot,
-                    moves,
+                    splitPlan,
                     blockLinearNodes,
                     allNodes);
+            }
+
+            private void EmitBlockExitSplitMoves(
+                int blockId,
+                Func<int> getCopyScratchSlot,
+                SplitResolutionPlan splitPlan,
+                ImmutableArray<GenTree>.Builder blockLinearNodes,
+                ImmutableArray<GenTree>.Builder allNodes)
+            {
+                EmitEdgeSplitMovesForBlock(
+                    blockId,
+                    isEntry: false,
+                    getCopyScratchSlot,
+                    splitPlan,
+                    blockLinearNodes,
+                    allNodes);
+            }
+
+            private void EmitEdgeSplitMovesForBlock(
+                int blockId,
+                bool isEntry,
+                Func<int> getCopyScratchSlot,
+                SplitResolutionPlan splitPlan,
+                ImmutableArray<GenTree>.Builder blockLinearNodes,
+                ImmutableArray<GenTree>.Builder allNodes)
+            {
+                var map = isEntry ? splitPlan.BlockEntryMoves : splitPlan.BlockExitMoves;
+                if (map.Count == 0)
+                    return;
+
+                var keys = new List<SplitEdgeKey>();
+                foreach (var kv in map)
+                {
+                    var key = kv.Key;
+                    if (isEntry)
+                    {
+                        if (key.ToBlockId != blockId)
+                            continue;
+                    }
+                    else
+                    {
+                        if (key.FromBlockId != blockId)
+                            continue;
+                    }
+
+                    if (EdgeHasPhiCopyGroup(key))
+                        continue;
+
+                    keys.Add(key);
+                }
+
+                if (keys.Count == 0)
+                    return;
+
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    var key = keys[i];
+                    if (!map.TryGetValue(key, out var edgeMoves) || edgeMoves.Count == 0)
+                        continue;
+
+                    map.Remove(key);
+                    EmitResolvedEdgeSplitMoves(
+                        blockId,
+                        key,
+                        getCopyScratchSlot,
+                        edgeMoves,
+                        blockLinearNodes,
+                        allNodes);
+                }
+            }
+
+            private void EmitResolvedEdgeSplitMoves(
+                int blockId,
+                SplitEdgeKey key,
+                Func<int> getCopyScratchSlot,
+                List<RegisterResolvedMove> moves,
+                ImmutableArray<GenTree>.Builder blockLinearNodes,
+                ImmutableArray<GenTree>.Builder allNodes)
+            {
+                if (moves.Count == 0)
+                    return;
+
+                var resolved = RegisterParallelCopyResolver.Resolve(
+                    key.FromBlockId,
+                    key.ToBlockId,
+                    new List<RegisterResolvedMove>(moves),
+                    getCopyScratchSlot,
+                    _options.ParallelCopyScratchRegister0,
+                    _options.ParallelCopyFloatScratchRegister0,
+                    ref _nextNodeId,
+                    CanEmitDirectMemoryMove,
+                    phiCopyFromBlockId: key.FromBlockId,
+                    phiCopyToBlockId: key.ToBlockId);
+
+                for (int i = 0; i < resolved.Length; i++)
+                    AppendMoveNode(blockId, resolved[i], blockLinearNodes, allNodes);
             }
 
             private void EmitSplitMovesAtPosition(
@@ -5615,6 +6596,70 @@ namespace Cnidaria.Cs
                     moves,
                     blockLinearNodes,
                     allNodes);
+            }
+
+            private static void AddUniqueMove(List<RegisterResolvedMove> moves, RegisterResolvedMove move)
+            {
+                for (int i = 0; i < moves.Count; i++)
+                {
+                    var existing = moves[i];
+                    if (!existing.Source.Equals(move.Source) ||
+                        !existing.Destination.Equals(move.Destination))
+                    {
+                        continue;
+                    }
+
+                    if (!TryMergeMoveValue(existing.SourceValue, move.SourceValue, out var sourceValue) ||
+                        !TryMergeMoveValue(existing.DestinationValue, move.DestinationValue, out var destinationValue))
+                    {
+                        continue;
+                    }
+
+                    moves[i] = new RegisterResolvedMove(
+                        existing.Source,
+                        existing.Destination,
+                        sourceValue,
+                        destinationValue,
+                        existing.MoveFlags | move.MoveFlags);
+                    return;
+                }
+
+                moves.Add(move);
+            }
+
+            private static bool TryMergeMoveValue(GenTree? left, GenTree? right, out GenTree? merged)
+            {
+                if (left is null)
+                {
+                    merged = right;
+                    return true;
+                }
+
+                if (right is null)
+                {
+                    merged = left;
+                    return true;
+                }
+
+                if (SameValue(left, right))
+                {
+                    merged = left;
+                    return true;
+                }
+
+                merged = null;
+                return false;
+            }
+
+            private static bool SameValue(GenTree? left, GenTree? right)
+            {
+                if (ReferenceEquals(left, right))
+                    return true;
+
+                if (left is null || right is null)
+                    return false;
+
+                return left.LinearValueKey.Equals(right.LinearValueKey);
             }
 
             private void AppendMoveNode(
@@ -5690,7 +6735,21 @@ namespace Cnidaria.Cs
                    node.Uses.Length == 1;
 
             private static bool IsRedundantMove(GenTree node)
-                => IsMoveNode(node) && node.Results[0].Equals(node.Uses[0]);
+            {
+                if (!IsMoveNode(node) || !node.Results[0].Equals(node.Uses[0]))
+                    return false;
+
+                return !IsLogicalValueRename(node);
+            }
+
+            private static bool IsLogicalValueRename(GenTree node)
+            {
+                var resultValue = SingleRegisterResultValue(node);
+                var useValue = SingleRegisterUseValue(node);
+                return resultValue is not null &&
+                       useValue is not null &&
+                       !resultValue.LinearValueKey.Equals(useValue.LinearValueKey);
+            }
 
             private static bool TryFoldMoveWithPrevious(
                 GenTree previous,
@@ -5849,7 +6908,70 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
+                if (CanForwardAdjacentRegisterCopy(previous, current))
+                {
+                    var sourceValue = SingleRegisterUseValue(previous) ?? SingleRegisterUseValue(current);
+                    rewritten = GenTreeLirFactory.Move(
+                        current.LinearId >= 0 ? current.LinearId : current.Id,
+                        blockId,
+                        ordinal,
+                        current.Results[0],
+                        previous.Uses[0],
+                        SingleRegisterResultValue(current),
+                        sourceValue,
+                        comment: current.Comment is null ? "forward adjacent register copy" : current.Comment + "; forward adjacent register copy",
+                        moveFlags: StripReloadSpill(current.MoveFlags),
+                        phiCopyFromBlockId: current.LinearPhiCopyFromBlockId,
+                        phiCopyToBlockId: current.LinearPhiCopyToBlockId);
+                    return true;
+                }
+
                 return false;
+            }
+
+            private static bool CanForwardAdjacentRegisterCopy(GenTree previous, GenTree current)
+            {
+                if (previous.MoveKind != MoveKind.Register || current.MoveKind != MoveKind.Register)
+                    return false;
+
+                if (!previous.Results[0].IsRegister || !previous.Uses[0].IsRegister ||
+                    !current.Results[0].IsRegister || !current.Uses[0].IsRegister)
+                {
+                    return false;
+                }
+
+                if (!previous.Results[0].Equals(current.Uses[0]))
+                    return false;
+
+                if (!IsNonGcBitwiseMove(previous) || !IsNonGcBitwiseMove(current))
+                    return false;
+
+                return true;
+            }
+
+            private static bool IsNonGcBitwiseMove(GenTree node)
+            {
+                var resultValue = SingleRegisterResultValue(node);
+                var useValue = SingleRegisterUseValue(node);
+                return !MayCarryGcManagedPointer(resultValue) && !MayCarryGcManagedPointer(useValue);
+            }
+
+            private static bool MayCarryGcManagedPointer(GenTree? value)
+            {
+                if (value is null)
+                    return false;
+
+                if (value.StackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
+                    return true;
+
+                var type = value.Type;
+                if (type is null)
+                    return false;
+
+                if (type.Kind == RuntimeTypeKind.ByRef)
+                    return true;
+
+                return !type.IsValueType || type.ContainsGcPointers;
             }
 
             private static MoveFlags StripReloadSpill(MoveFlags flags)
@@ -5869,10 +6991,15 @@ namespace Cnidaria.Cs
                 ImmutableArray<GenTree>.Builder blockLinearNodes,
                 ImmutableArray<GenTree>.Builder allNodes)
             {
+                var effectiveMoves = SimplifySameValuePositionSplitMoves(moves);
+                effectiveMoves = RetargetSameValuePositionSplitSources(effectiveMoves);
+                if (effectiveMoves.Count == 0)
+                    return;
+
                 var resolved = RegisterParallelCopyResolver.Resolve(
                     insertionBlockId,
                     toBlockId,
-                    new List<RegisterResolvedMove>(moves),
+                    effectiveMoves,
                     getCopyScratchSlot,
                     _options.ParallelCopyScratchRegister0,
                     _options.ParallelCopyFloatScratchRegister0,
@@ -5883,125 +7010,150 @@ namespace Cnidaria.Cs
                     AppendMoveNode(insertionBlockId, resolved[i], blockLinearNodes, allNodes);
             }
 
-            private static bool IsBlockTerminatorNode(GenTree node)
-                => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
-                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
-
-
-            private ImmutableArray<RegisterOperand> GetIncomingArgumentOperands(
-                int argumentIndex,
-                RuntimeType? argumentType,
-                GenStackKind stackKind,
-                RegisterClass argumentClass,
-                AbiValueInfo argumentAbi)
+            private static List<RegisterResolvedMove> SimplifySameValuePositionSplitMoves(List<RegisterResolvedMove> moves)
             {
-                int general = 0;
-                int floating = 0;
-                int incomingStackSlot = 0;
-                int hiddenReturnBufferInsertionIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
-                    _method.RuntimeMethod,
-                    _method.ArgTypes.Length);
+                if (moves.Count < 2)
+                    return new List<RegisterResolvedMove>(moves);
 
-                for (int i = 0; i <= argumentIndex; i++)
+                var keep = new bool[moves.Count];
+                Array.Fill(keep, true);
+
+                for (int i = 0; i < moves.Count; i++)
                 {
-                    if (hiddenReturnBufferInsertionIndex == i)
-                        ConsumeHiddenReturnBuffer(ref general, ref incomingStackSlot);
-
-                    RuntimeType currentType = _method.ArgTypes[i];
-                    GenStackKind currentStackKind = i == argumentIndex ? stackKind : StackKindForAbi(currentType);
-                    var abi = i == argumentIndex
-                        ? argumentAbi
-                        : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
-
-                    if (abi.PassingKind == AbiValuePassingKind.Void)
+                    if (!keep[i])
                         continue;
 
-                    if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
-                    {
-                        MachineRegister reg = GetMaybeArgumentRegister(abi.RegisterClass, ref general, ref floating);
-                        int abiStackSlot = -1;
-                        if (reg == MachineRegister.Invalid)
-                            abiStackSlot = incomingStackSlot++;
-
-                        if (i == argumentIndex)
-                        {
-                            if (reg != MachineRegister.Invalid)
-                                return ImmutableArray.Create(RegisterOperand.ForRegister(reg));
-
-                            return ImmutableArray.Create(ForIncomingAbiStackSlot(
-                                abi.RegisterClass == RegisterClass.Invalid ? argumentClass : abi.RegisterClass,
-                                abiStackSlot,
-                                0,
-                                Math.Max(1, abi.Size)));
-                        }
+                    var reload = moves[i];
+                    if (!IsReloadForStableHomeRoundTrip(reload))
                         continue;
-                    }
 
-                    if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                    for (int j = 0; j < moves.Count; j++)
                     {
-                        var segments = MachineAbi.GetRegisterSegments(abi);
-                        int baseIncomingSlot = -1;
+                        if (i == j || !keep[j])
+                            continue;
 
-                        var operands = ImmutableArray.CreateBuilder<RegisterOperand>(segments.Length);
-                        for (int s = 0; s < segments.Length; s++)
-                        {
-                            var segment = segments[s];
-                            var reg = GetMaybeArgumentRegister(segment.RegisterClass, ref general, ref floating);
-                            if (reg != MachineRegister.Invalid)
-                            {
-                                operands.Add(RegisterOperand.ForRegister(reg));
-                            }
-                            else
-                            {
-                                if (baseIncomingSlot < 0)
-                                    baseIncomingSlot = incomingStackSlot++;
-                                operands.Add(ForIncomingAbiStackSlot(segment.RegisterClass, baseIncomingSlot, segment.Offset, segment.Size));
-                            }
-                        }
+                        var spill = moves[j];
+                        if (!IsRedundantRoundTripStore(reload, spill))
+                            continue;
 
-                        if (i == argumentIndex)
-                            return operands.ToImmutable();
-                        continue;
-                    }
+                        if (HasOtherWriterToLocation(moves, keep, reload.Source, i, j))
+                            continue;
 
-                    int aggregateStackSlot = incomingStackSlot++;
-                    if (i == argumentIndex)
-                    {
-                        return ImmutableArray.Create(ForIncomingAbiStackSlot(
-                            argumentClass == RegisterClass.Invalid ? RegisterClass.General : argumentClass,
-                            aggregateStackSlot,
-                            0,
-                            abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size));
+                        keep[j] = false;
+                        break;
                     }
                 }
 
-                throw new InvalidOperationException($"Invalid incoming argument index {argumentIndex}.");
+                var result = new List<RegisterResolvedMove>(moves.Count);
+                for (int i = 0; i < moves.Count; i++)
+                {
+                    if (keep[i])
+                        result.Add(moves[i]);
+                }
+
+                return result;
             }
 
-            private static RegisterOperand ForIncomingAbiStackSlot(
-                RegisterClass registerClass,
-                int abiStackSlot,
-                int offset,
-                int size)
+            private static List<RegisterResolvedMove> RetargetSameValuePositionSplitSources(List<RegisterResolvedMove> moves)
             {
-                if (abiStackSlot < 0)
-                    throw new ArgumentOutOfRangeException(nameof(abiStackSlot));
+                if (moves.Count < 2)
+                    return moves;
 
-                return RegisterOperand.ForFrameSlot(
-                    registerClass == RegisterClass.Invalid ? RegisterClass.General : registerClass,
-                    StackFrameSlotKind.Argument,
-                    RegisterFrameBase.IncomingArgumentBase,
-                    abiStackSlot,
-                    checked(abiStackSlot * MachineAbi.StackArgumentSlotSize + offset),
-                    size <= 0 ? TargetArchitecture.PointerSize : size);
+                var result = new List<RegisterResolvedMove>(moves);
+                for (int i = 0; i < result.Count; i++)
+                {
+                    var move = result[i];
+                    if (!IsSameValueMove(move))
+                        continue;
+
+                    var source = move.Source;
+                    var sourceValue = move.SourceValue;
+                    var seen = new HashSet<RegisterOperand>();
+                    while (TryFindSameValueProducer(result, i, source, sourceValue, out var producer))
+                    {
+                        if (!seen.Add(source))
+                            break;
+
+                        source = producer.Source;
+                        sourceValue = producer.SourceValue;
+                    }
+
+                    if (!source.Equals(move.Source))
+                        result[i] = move.WithSource(source, sourceValue);
+                }
+
+                return result;
             }
 
-            private static void ConsumeHiddenReturnBuffer(ref int generalIndex, ref int incomingStackSlot)
+            private static bool TryFindSameValueProducer(
+                List<RegisterResolvedMove> moves,
+                int consumerIndex,
+                RegisterOperand source,
+                GenTree? sourceValue,
+                out RegisterResolvedMove producer)
             {
-                var retBufferRegister = MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
-                if (retBufferRegister == MachineRegister.Invalid)
-                    incomingStackSlot++;
+                for (int i = 0; i < moves.Count; i++)
+                {
+                    if (i == consumerIndex)
+                        continue;
+
+                    var candidate = moves[i];
+                    if (!candidate.Destination.Equals(source))
+                        continue;
+                    if (!SameValue(candidate.DestinationValue, sourceValue))
+                        continue;
+                    if (!IsSameValueMove(candidate))
+                        continue;
+
+                    producer = candidate;
+                    return true;
+                }
+
+                producer = default;
+                return false;
             }
+
+            private static bool IsSameValueMove(RegisterResolvedMove move)
+                => SameValue(move.SourceValue, move.DestinationValue);
+
+            private static bool IsReloadForStableHomeRoundTrip(RegisterResolvedMove move)
+                => move.Source.IsMemoryOperand &&
+                   move.Destination.IsRegister &&
+                   move.SourceValue is not null &&
+                   move.DestinationValue is not null &&
+                   move.SourceValue.LinearValueKey.Equals(move.DestinationValue.LinearValueKey);
+
+            private static bool IsRedundantRoundTripStore(RegisterResolvedMove reload, RegisterResolvedMove spill)
+                => spill.Source.Equals(reload.Destination) &&
+                   spill.Destination.Equals(reload.Source) &&
+                   spill.SourceValue is not null &&
+                   spill.DestinationValue is not null &&
+                   spill.SourceValue.LinearValueKey.Equals(spill.DestinationValue.LinearValueKey) &&
+                   reload.SourceValue is not null &&
+                   spill.SourceValue.LinearValueKey.Equals(reload.SourceValue.LinearValueKey);
+
+            private static bool HasOtherWriterToLocation(
+                List<RegisterResolvedMove> moves,
+                bool[] keep,
+                RegisterOperand location,
+                int firstExcludedIndex,
+                int secondExcludedIndex)
+            {
+                for (int i = 0; i < moves.Count; i++)
+                {
+                    if (!keep[i] || i == firstExcludedIndex || i == secondExcludedIndex)
+                        continue;
+
+                    if (moves[i].Destination.Equals(location))
+                        return true;
+                }
+
+                return false;
+            }
+
+            private static bool IsBlockTerminatorNode(GenTree node)
+                => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
+                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
 
             private static MachineRegister GetMaybeArgumentRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
             {
@@ -6012,8 +7164,6 @@ namespace Cnidaria.Cs
                 return MachineRegister.Invalid;
             }
 
-            private static GenStackKind StackKindForAbi(RuntimeType? type)
-                => MachineAbi.StackKindForType(type);
 
             private void EmitGcPollNode(
                 GenTree node,
@@ -6031,8 +7181,6 @@ namespace Cnidaria.Cs
                 allNodes.Add(pollNode);
             }
 
-            private static bool IsPhiCopyNode(GenTree node)
-                => node.IsPhiCopy;
 
             private static bool IsSamePhiCopyGroup(GenTree left, GenTree right)
                 => left.IsPhiCopy &&
@@ -6060,7 +7208,9 @@ namespace Cnidaria.Cs
                 ImmutableArray<GenTree> nodes,
                 int firstIndex,
                 int blockId,
+                SplitResolutionPlan splitPlan,
                 Action<int> emitBlockSplitMoves,
+                bool emitPostPhiPositionMoves,
                 Func<int> getCopyScratchSlot,
                 ImmutableArray<GenTree>.Builder blockLinearNodes,
                 ImmutableArray<GenTree>.Builder allNodes)
@@ -6095,6 +7245,8 @@ namespace Cnidaria.Cs
                     lastIndex = i;
                 }
 
+                AddMatchingEdgeSplitMovesToPhiGroup(splitPlan, groupHead, moves);
+
                 EmitResolvedPhiCopyMoves(
                     blockId,
                     groupHead.LinearPhiCopyFromBlockId,
@@ -6105,10 +7257,13 @@ namespace Cnidaria.Cs
                     allNodes);
                 EmitPendingAggregateHomeStores(blockId, aggregateHomeStores, blockLinearNodes, allNodes);
 
-                for (int i = firstIndex; i <= lastIndex; i++)
+                if (emitPostPhiPositionMoves)
                 {
-                    int position = GetNodePosition(nodes[i]);
-                    emitBlockSplitMoves(position + 1);
+                    for (int i = firstIndex; i <= lastIndex; i++)
+                    {
+                        int position = GetNodePosition(nodes[i]);
+                        emitBlockSplitMoves(position + 1);
+                    }
                 }
 
                 return lastIndex;
@@ -6157,7 +7312,8 @@ namespace Cnidaria.Cs
                     ref _nextNodeId,
                     CanEmitDirectMemoryMove,
                     phiCopyFromBlockId: fromBlockId,
-                    phiCopyToBlockId: toBlockId);
+                    phiCopyToBlockId: toBlockId,
+                    preserveIdentityMoves: true);
 
                 for (int i = 0; i < resolved.Length; i++)
                     AppendMoveNode(blockId, resolved[i], blockLinearNodes, allNodes);
@@ -6213,8 +7369,10 @@ namespace Cnidaria.Cs
                             $"Cannot lower scalar/aggregate phi copy as a parallel copy: {sourceValue} -> {destinationValue}.");
                     }
 
-                    var destinationLocation = ValueLocationForDefinition(destinationValue, position + 1, destinationAbi);
-                    var sourceLocation = ValueLocationForUse(sourceValue, position, sourceAbi);
+                    int destinationPosition = PhiDestinationPosition(node);
+                    int sourcePosition = PhiSourcePosition(node);
+                    var destinationLocation = ValueLocationForDefinition(destinationValue, destinationPosition, destinationAbi);
+                    var sourceLocation = ValueLocationForUse(sourceValue, sourcePosition, sourceAbi);
                     if (destinationLocation.Count != sourceLocation.Count)
                     {
                         throw new InvalidOperationException(
@@ -6243,17 +7401,17 @@ namespace Cnidaria.Cs
 
                     aggregateHomeStores.Add(new PendingAggregateHomeStore(
                         destinationValue,
-                        position + 1,
+                        destinationPosition,
                         destinationAbi,
                         destinationLocation));
                     return true;
                 }
 
-                var scalarDestination = HomeForDefinition(destinationValue, position + 1);
+                var scalarDestination = HomeForDefinition(destinationValue, PhiDestinationPosition(node));
                 if (scalarDestination.IsNone)
                     return true;
 
-                var scalarSource = HomeForUse(sourceValue, position);
+                var scalarSource = HomeForUse(sourceValue, PhiSourcePosition(node));
                 if (scalarSource.IsNone)
                 {
                     throw new InvalidOperationException(
@@ -6268,6 +7426,24 @@ namespace Cnidaria.Cs
                     MoveFlags.ParallelCopy));
 
                 return true;
+            }
+
+            private int PhiSourcePosition(GenTree node)
+            {
+                if ((uint)node.LinearPhiCopyFromBlockId >= (uint)_blockEndPositions.Length)
+                    throw new InvalidOperationException($"Invalid phi-copy source block B{node.LinearPhiCopyFromBlockId} for {node}.");
+
+                int blockEnd = _blockEndPositions[node.LinearPhiCopyFromBlockId];
+                int blockStart = _blockStartPositions[node.LinearPhiCopyFromBlockId];
+                return blockEnd > blockStart ? blockEnd - 1 : blockStart;
+            }
+
+            private int PhiDestinationPosition(GenTree node)
+            {
+                if ((uint)node.LinearPhiCopyToBlockId >= (uint)_blockStartPositions.Length)
+                    throw new InvalidOperationException($"Invalid phi-copy destination block B{node.LinearPhiCopyToBlockId} for {node}.");
+
+                return _blockStartPositions[node.LinearPhiCopyToBlockId];
             }
 
             private void EmitCopyNode(
@@ -6454,7 +7630,7 @@ namespace Cnidaria.Cs
                         source,
                         value,
                         value,
-                        comment + " fragment " + i.ToString(),
+                        $"{comment} fragment {i}",
                         blockLinearNodes,
                         allNodes);
                 }
@@ -6491,7 +7667,7 @@ namespace Cnidaria.Cs
                         source,
                         value,
                         value,
-                        comment + " fragment " + i.ToString(),
+                        $"{comment} fragment {i}",
                         blockLinearNodes,
                         allNodes);
                 }
@@ -6590,7 +7766,7 @@ namespace Cnidaria.Cs
 
                 if (IsAbiCall(node))
                 {
-                    EmitCallLikeTreeNode(node, blockLinearNodes, allNodes);
+                    EmitCallLikeTreeNode(node, () => _nextSpillSlot++, blockLinearNodes, allNodes);
                     return;
                 }
 
@@ -6966,9 +8142,16 @@ namespace Cnidaria.Cs
 
             private void EmitCallLikeTreeNode(
                 GenTree node,
+                Func<int> getCopyScratchSlot,
                 ImmutableArray<GenTree>.Builder blockLinearNodes,
                 ImmutableArray<GenTree>.Builder allNodes)
             {
+                if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == true)
+                {
+                    throw new InvalidOperationException(
+                        "Value-type newobj must be lowered into a struct materialization temp and a void constructor call before register allocation.");
+                }
+
                 int position = GetNodePosition(node);
                 int definitionPosition = position + 1;
                 var targets = ImmutableArray.CreateBuilder<RegisterOperand>();
@@ -6976,12 +8159,10 @@ namespace Cnidaria.Cs
                 var callUseRoles = ImmutableArray.CreateBuilder<OperandRole>();
                 var registerMoves = new List<RegisterResolvedMove>();
                 var stackMoves = new List<RegisterResolvedMove>();
-                bool valueTypeNewObject = node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == true;
-                bool referenceTypeNewObject = node.Kind == GenTreeKind.NewObject && !valueTypeNewObject;
-                var descriptor = MachineAbi.BuildCallDescriptor(node.RegisterUses, _method.GetValueInfo, node.RegisterResult, node.Method, node.Kind == GenTreeKind.NewObject);
+                bool referenceTypeNewObject = node.Kind == GenTreeKind.NewObject;
+                var descriptor = MachineAbi.BuildCallDescriptor(node.RegisterUses, _method.GetValueInfo, node.RegisterResult, node.Method, referenceTypeNewObject);
 
                 RegisterOperand finalResult = RegisterOperand.None;
-                RegisterOperand valueTypeNewObjectBuffer = RegisterOperand.None;
                 RegisterOperand callResult = RegisterOperand.None;
                 GenTree? nodeResultValue = null;
                 AbiValueInfo resultAbi = descriptor.ReturnAbi;
@@ -6993,7 +8174,7 @@ namespace Cnidaria.Cs
                     resultValueOpt = resultValue;
                     finalResult = HomeForDefinition(resultValue, definitionPosition);
                     if (finalResult.IsNone &&
-                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || valueTypeNewObject || referenceTypeNewObject))
+                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || referenceTypeNewObject))
                     {
                         int homeSize = referenceTypeNewObject
                             ? TargetArchitecture.PointerSize
@@ -7005,22 +8186,9 @@ namespace Cnidaria.Cs
                             homeSize);
                     }
 
-                    if (valueTypeNewObject)
-                    {
-                        int bufferSize = Math.Max(MachineAbi.StackArgumentSlotSize, Math.Max(1, resultAbi.Size));
-                        valueTypeNewObjectBuffer = finalResult.IsFrameSlot
-                            ? finalResult
-                            : RegisterOperand.ForSpillSlot(RegisterClass.General, _nextSpillSlot++, 0, bufferSize);
-                    }
-
                     if (!finalResult.IsNone)
                     {
-                        if (valueTypeNewObject)
-                        {
-                            callResult = RegisterOperand.None;
-                            nodeResultValue = null;
-                        }
-                        else if (referenceTypeNewObject)
+                        if (referenceTypeNewObject)
                         {
                             callResult = finalResult.IsFrameSlot
                                 ? finalResult
@@ -7050,22 +8218,6 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (valueTypeNewObject && !valueTypeNewObjectBuffer.IsNone)
-                {
-                    RuntimeType returnBufferType = node.Method?.DeclaringType
-                        ?? throw new InvalidOperationException("Value-type newobj has no declaring type.");
-                    var initBuffer = GenTreeLirFactory.DefaultValue(
-                        _nextNodeId++,
-                        node.LinearBlockId,
-                        blockLinearNodes.Count,
-                        valueTypeNewObjectBuffer,
-                        returnBufferType,
-                        MachineAbi.StackKindForType(returnBufferType),
-                        "newobj value return buffer init");
-                    blockLinearNodes.Add(initBuffer);
-                    allNodes.Add(initBuffer);
-                }
-
                 for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
                 {
                     var segment = descriptor.ArgumentSegments[i];
@@ -7078,11 +8230,10 @@ namespace Cnidaria.Cs
 
                     if (segment.IsHiddenReturnBuffer)
                     {
-                        var retBuffer = valueTypeNewObject ? valueTypeNewObjectBuffer : finalResult;
-                        if (node.RegisterResult is null || retBuffer.IsNone)
+                        if (node.RegisterResult is null || finalResult.IsNone)
                             throw new InvalidOperationException("ABI call result has no addressable hidden return buffer home.");
 
-                        source = retBuffer.AsAddress();
+                        source = finalResult.AsAddress();
                         role = OperandRole.HiddenReturnBuffer;
                         moveFlags |= MoveFlags.HiddenReturnBuffer;
                         moveSourceValue = null;
@@ -7130,16 +8281,16 @@ namespace Cnidaria.Cs
                         allNodes);
                 }
 
+                int scratchSlot = -1;
+                int GetScratchSlot()
+                {
+                    if (scratchSlot < 0)
+                        scratchSlot = getCopyScratchSlot();
+                    return scratchSlot;
+                }
+
                 if (registerMoves.Count != 0)
                 {
-                    int scratchSlot = -1;
-                    int GetScratchSlot()
-                    {
-                        if (scratchSlot < 0)
-                            scratchSlot = _nextSpillSlot++;
-                        return scratchSlot;
-                    }
-
                     var setup = RegisterParallelCopyResolver.Resolve(
                         node.LinearBlockId,
                         node.LinearBlockId,
@@ -7168,56 +8319,6 @@ namespace Cnidaria.Cs
                     linearOperands: node.OperandFlags);
                 blockLinearNodes.Add(callNode);
                 allNodes.Add(callNode);
-
-                if (valueTypeNewObject && resultValueOpt is not null && !finalResult.IsNone)
-                {
-                    var resultValue = resultValueOpt;
-                    if (resultAbi.PassingKind == AbiValuePassingKind.MultiRegister)
-                    {
-                        var segments = MachineAbi.GetRegisterSegments(resultAbi);
-                        var destinationLocation = ValueLocationForDefinition(resultValue, definitionPosition, resultAbi);
-                        for (int i = 0; i < segments.Length; i++)
-                        {
-                            var segment = segments[i];
-                            var destination = destinationLocation.IsFragmented ? destinationLocation[i] : OperandAtOffset(finalResult, segment);
-                            var source = OperandAtOffset(valueTypeNewObjectBuffer, segment);
-                            EmitMoveSequence(
-                                node.LinearBlockId,
-                                destination,
-                                source,
-                                destinationValue: resultValue,
-                                sourceValue: resultValue,
-                                comment: "newobj value result fragment",
-                                blockLinearNodes,
-                                allNodes);
-                        }
-
-                        EmitAggregateHomeStores(
-                            node.LinearBlockId,
-                            resultValue,
-                            definitionPosition,
-                            resultAbi,
-                            destinationLocation,
-                            "newobj value result aggregate home",
-                            blockLinearNodes,
-                            allNodes);
-                        return;
-                    }
-
-                    if (!finalResult.Equals(valueTypeNewObjectBuffer))
-                    {
-                        EmitMoveSequence(
-                            node.LinearBlockId,
-                            finalResult,
-                            valueTypeNewObjectBuffer,
-                            destinationValue: resultValue,
-                            sourceValue: resultValue,
-                            comment: "newobj value result",
-                            blockLinearNodes,
-                            allNodes);
-                    }
-                    return;
-                }
 
                 if (resultValueOpt is not null && !finalResult.IsNone)
                 {
@@ -7694,6 +8795,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.Local => false,
                     GenTreeKind.Arg => false,
                     GenTreeKind.Temp => false,
+                    GenTreeKind.TempAddr => false,
                     GenTreeKind.StoreLocal => false,
                     GenTreeKind.StoreArg => false,
                     GenTreeKind.StoreTemp => false,
@@ -7909,7 +9011,7 @@ namespace Cnidaria.Cs
                         _ = GetMaybeArgumentRegister(RegisterClass.General, ref general, ref floating);
 
                     RuntimeType currentType = method.ArgTypes[i];
-                    GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : StackKindForAbi(currentType);
+                    GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : MachineAbi.StackKindForType(currentType);
                     var abi = i == argumentIndex
                         ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false)
                         : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
@@ -8084,10 +9186,12 @@ namespace Cnidaria.Cs
             public RegisterClass RegisterClass { get; }
             public ImmutableArray<LinearLiveRange> Ranges { get; }
             public ImmutableArray<int> UsePositions { get; }
+            public ImmutableArray<LinearRefPosition> RefPositions { get; }
             public int DefinitionPosition { get; }
             public bool CrossesCall { get; }
             public bool RequiresSingleLocation { get; }
             public bool RequiresStackHome { get; }
+            public bool MustStayInMemory { get; }
             public int StackHomeSize { get; }
             public int StackHomeAlignment { get; }
             public int AbiSegmentIndex { get; }
@@ -8098,6 +9202,7 @@ namespace Cnidaria.Cs
             public MachineRegister AssignedRegister { get; set; } = MachineRegister.Invalid;
             public int AssignedRegisterEnd { get; set; }
             public int SpillSlot { get; set; } = -1;
+            public int PermanentSpillStart { get; private set; } = int.MaxValue;
 
             private readonly List<AllocationSegment> _segments = new();
 
@@ -8115,15 +9220,31 @@ namespace Cnidaria.Cs
                 }
             }
 
+            public bool HasMemoryLocationSegment
+            {
+                get
+                {
+                    for (int i = 0; i < _segments.Count; i++)
+                    {
+                        if (_segments[i].Location.IsMemoryOperand)
+                            return true;
+                    }
+
+                    return false;
+                }
+            }
+
             public AllocationInterval(
                 GenTree value,
                 RegisterClass registerClass,
                 ImmutableArray<LinearLiveRange> ranges,
                 ImmutableArray<int> usePositions,
+                ImmutableArray<LinearRefPosition> refPositions,
                 int definitionPosition,
                 bool crossesCall,
                 bool requiresSingleLocation,
                 bool requiresStackHome,
+                bool mustStayInMemory,
                 int stackHomeSize = 0,
                 int stackHomeAlignment = 1,
                 int abiSegmentIndex = -1,
@@ -8145,10 +9266,12 @@ namespace Cnidaria.Cs
                 RegisterClass = registerClass;
                 Ranges = ranges.IsDefault ? ImmutableArray<LinearLiveRange>.Empty : ranges;
                 UsePositions = usePositions.IsDefault ? ImmutableArray<int>.Empty : usePositions;
+                RefPositions = refPositions.IsDefault ? ImmutableArray<LinearRefPosition>.Empty : refPositions;
                 DefinitionPosition = definitionPosition;
                 CrossesCall = crossesCall;
                 RequiresSingleLocation = requiresSingleLocation;
                 RequiresStackHome = requiresStackHome;
+                MustStayInMemory = mustStayInMemory;
                 StackHomeSize = stackHomeSize;
                 StackHomeAlignment = stackHomeAlignment;
                 AbiSegmentIndex = abiSegmentIndex;
@@ -8273,6 +9396,64 @@ namespace Cnidaria.Cs
                 return int.MaxValue;
             }
 
+            public int NextRequiredRefPositionAfter(int position)
+            {
+                for (int i = 0; i < RefPositions.Length; i++)
+                {
+                    int refPosition = RefPositions[i].Position;
+                    if (refPosition > position)
+                        return refPosition;
+                }
+
+                for (int i = 0; i < UsePositions.Length; i++)
+                {
+                    int usePosition = UsePositions[i];
+                    if (usePosition > position)
+                        return usePosition;
+                }
+
+                return int.MaxValue;
+            }
+
+            public int NextRequiredRefPositionAtOrAfter(int position)
+            {
+                for (int i = 0; i < RefPositions.Length; i++)
+                {
+                    int refPosition = RefPositions[i].Position;
+                    if (refPosition >= position)
+                        return refPosition;
+                }
+
+                for (int i = 0; i < UsePositions.Length; i++)
+                {
+                    int usePosition = UsePositions[i];
+                    if (usePosition >= position)
+                        return usePosition;
+                }
+
+                return int.MaxValue;
+            }
+
+            public void MarkPermanentlySpilledFrom(int position)
+            {
+                if (position < PermanentSpillStart)
+                    PermanentSpillStart = position;
+            }
+
+            public int FirstLivePositionAtOrAfter(int position)
+            {
+                for (int i = 0; i < Ranges.Length; i++)
+                {
+                    var range = Ranges[i];
+                    if (position < range.Start)
+                        return range.Start;
+                    if (position < range.End)
+                        return position;
+                }
+
+                return int.MaxValue;
+            }
+
             public void AddSegment(int start, int end, RegisterOperand location)
             {
                 if (end <= start || location.IsNone)
@@ -8293,21 +9474,75 @@ namespace Cnidaria.Cs
                 AddSegment(start, end, location);
             }
 
-            public void SplitAssignedRegisterToSpill(int splitPosition, RegisterOperand spillHome)
+            public void EndAssignedRegisterAt(int splitPosition)
+            {
+                if (!HasAssignedRegister)
+                    return;
+
+                MachineRegister splitRegister = AssignedRegister;
+                TrimAssignedRegisterAt(splitRegister, splitPosition);
+                if (AssignedRegisterEnd > splitPosition)
+                    AssignedRegisterEnd = splitPosition;
+                NormalizeSegments();
+            }
+
+            public void SplitAssignedRegisterToSpill(int splitPosition, int spillEnd, RegisterOperand spillHome)
             {
                 if (spillHome.IsNone)
                     throw new ArgumentOutOfRangeException(nameof(spillHome));
+                if (spillEnd < splitPosition)
+                    throw new ArgumentOutOfRangeException(nameof(spillEnd));
+
+                int spillSegmentEnd = spillEnd == splitPosition ? End : spillEnd;
 
                 if (!HasAssignedRegister)
                 {
-                    AddSegment(splitPosition, End, spillHome);
+                    RemoveSegmentsOverlapping(splitPosition, spillSegmentEnd);
+                    AddSegment(splitPosition, spillSegmentEnd, spillHome);
                     return;
                 }
+
+                MachineRegister splitRegister = AssignedRegister;
+                TrimAssignedRegisterAt(splitRegister, splitPosition);
+                RemoveSegmentsOverlapping(splitPosition, spillSegmentEnd);
+
+                AssignedRegister = MachineRegister.Invalid;
+                AssignedRegisterEnd = splitPosition;
+                AddSegment(splitPosition, spillSegmentEnd, spillHome);
+                NormalizeSegments();
+            }
+
+            public void AddSpillSegmentAfterAssignedRegister(int splitPosition, int spillEnd, RegisterOperand spillHome)
+            {
+                if (spillHome.IsNone)
+                    throw new ArgumentOutOfRangeException(nameof(spillHome));
+                if (spillEnd < splitPosition)
+                    throw new ArgumentOutOfRangeException(nameof(spillEnd));
+
+                int spillSegmentEnd = spillEnd == splitPosition ? End : spillEnd;
+
+                if (HasAssignedRegister)
+                {
+                    MachineRegister splitRegister = AssignedRegister;
+                    TrimAssignedRegisterAt(splitRegister, splitPosition);
+                    if (AssignedRegisterEnd > splitPosition)
+                        AssignedRegisterEnd = splitPosition;
+                }
+
+                RemoveSegmentsOverlapping(splitPosition, spillSegmentEnd);
+                AddSegment(splitPosition, spillSegmentEnd, spillHome);
+                NormalizeSegments();
+            }
+
+            private void TrimAssignedRegisterAt(MachineRegister register, int splitPosition)
+            {
+                if (register == MachineRegister.Invalid)
+                    return;
 
                 for (int i = _segments.Count - 1; i >= 0; i--)
                 {
                     var segment = _segments[i];
-                    if (!segment.Location.IsRegister || segment.Location.Register != AssignedRegister)
+                    if (!segment.Location.IsRegister || segment.Location.Register != register)
                         continue;
                     if (splitPosition <= segment.Start)
                     {
@@ -8318,11 +9553,37 @@ namespace Cnidaria.Cs
                         segment.End = splitPosition;
                     }
                 }
+            }
 
-                AssignedRegister = MachineRegister.Invalid;
-                AssignedRegisterEnd = splitPosition;
-                AddSegment(splitPosition, End, spillHome);
-                NormalizeSegments();
+            private void RemoveSegmentsOverlapping(int start, int end)
+            {
+                if (end <= start)
+                    return;
+
+                for (int i = _segments.Count - 1; i >= 0; i--)
+                {
+                    var segment = _segments[i];
+                    if (segment.End <= start || segment.Start >= end)
+                        continue;
+
+                    if (segment.Start < start && segment.End > end)
+                    {
+                        _segments.Add(new AllocationSegment(end, segment.End, segment.Location));
+                        segment.End = start;
+                    }
+                    else if (segment.Start < start)
+                    {
+                        segment.End = start;
+                    }
+                    else if (segment.End > end)
+                    {
+                        segment.Start = end;
+                    }
+                    else
+                    {
+                        _segments.RemoveAt(i);
+                    }
+                }
             }
 
             public ImmutableArray<RegisterAllocationSegment> ToRegisterAllocationSegments()
@@ -8343,7 +9604,18 @@ namespace Cnidaria.Cs
                 if (_segments.Count <= 1)
                     return;
 
-                _segments.Sort(static (a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+                _segments.Sort(static (a, b) =>
+                {
+                    int c = a.Start.CompareTo(b.Start);
+                    if (c != 0)
+                        return c;
+                    if (a.Location.IsRegister != b.Location.IsRegister)
+                        return a.Location.IsRegister ? -1 : 1;
+                    c = a.End.CompareTo(b.End);
+                    if (c != 0)
+                        return c;
+                    return a.Location.ToString().CompareTo(b.Location.ToString());
+                });
 
                 int w = 0;
                 for (int r = 0; r < _segments.Count; r++)
@@ -8705,6 +9977,8 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, SpillSpec> _spillSpecs = new();
             private readonly Dictionary<int, OutgoingArgumentSpec> _outgoingArgumentSpecs = new();
             private readonly Dictionary<int, StackFrameSlot> _spillSlots = new();
+            private readonly HashSet<int> _explicitLocalSlots = new();
+            private readonly HashSet<int> _explicitTempSlots = new();
             private StackFrameLayout _layout = StackFrameLayout.Empty;
 
             public MethodBuilder(RegisterAllocatedMethod method, RegisterStackLayoutOptions options)
@@ -8717,6 +9991,8 @@ namespace Cnidaria.Cs
             {
                 CollectSpillSlotsFromAllocations();
                 CollectSpillSlotsFromLinearNodes();
+                CollectExplicitUserSlotsFromAllocations();
+                CollectExplicitUserSlotsFromLinearNodes();
                 CollectOutgoingArgumentSlotsFromLinearNodes();
                 _layout = BuildLayout();
 
@@ -8789,6 +10065,134 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < nodes.Length; i++)
                         CollectSpillSlotsFromNode(nodes[i]);
                 }
+            }
+
+            private void CollectExplicitUserSlotsFromAllocations()
+            {
+                for (int i = 0; i < _method.Allocations.Length; i++)
+                {
+                    var allocation = _method.Allocations[i];
+                    CollectExplicitUserSlotFromOperand(allocation.Home);
+
+                    for (int s = 0; s < allocation.Segments.Length; s++)
+                        CollectExplicitUserSlotFromOperand(allocation.Segments[s].Location);
+
+                    for (int f = 0; f < allocation.Fragments.Length; f++)
+                    {
+                        var fragment = allocation.Fragments[f];
+                        CollectExplicitUserSlotFromOperand(fragment.Home);
+
+                        for (int s = 0; s < fragment.Segments.Length; s++)
+                            CollectExplicitUserSlotFromOperand(fragment.Segments[s].Location);
+                    }
+                }
+            }
+
+            private void CollectExplicitUserSlotsFromLinearNodes()
+            {
+                for (int b = 0; b < _method.Blocks.Length; b++)
+                {
+                    var nodes = _method.Blocks[b].LinearNodes;
+                    for (int i = 0; i < nodes.Length; i++)
+                        CollectExplicitUserSlotsFromNode(nodes[i]);
+                }
+            }
+
+            private void CollectExplicitUserSlotsFromNode(GenTree node)
+            {
+                CollectExplicitUserSlotFromLocalLikeNode(node);
+
+                for (int i = 0; i < node.Results.Length; i++)
+                    CollectExplicitUserSlotFromOperand(node.Results[i]);
+
+                for (int i = 0; i < node.Uses.Length; i++)
+                    CollectExplicitUserSlotFromOperand(node.Uses[i]);
+            }
+
+            private void CollectExplicitUserSlotFromLocalLikeNode(GenTree node)
+            {
+                if (node.LocalDescriptor is { IsStructField: true })
+                    return;
+
+                switch (node.Kind)
+                {
+                    case GenTreeKind.Local:
+                    case GenTreeKind.StoreLocal:
+                        if ((uint)node.Int32 < (uint)_method.GenTreeMethod.LocalTypes.Length &&
+                            SurvivingLocalLikeNodeRequiresHome(node))
+                        {
+                            _explicitLocalSlots.Add(node.Int32);
+                        }
+                        return;
+
+                    case GenTreeKind.LocalAddr:
+                        if ((uint)node.Int32 < (uint)_method.GenTreeMethod.LocalTypes.Length)
+                            _explicitLocalSlots.Add(node.Int32);
+                        return;
+
+                    case GenTreeKind.Temp:
+                    case GenTreeKind.StoreTemp:
+                        if (ContainsTempIndex(_method.GenTreeMethod.Temps, node.Int32) &&
+                            SurvivingLocalLikeNodeRequiresHome(node))
+                        {
+                            _explicitTempSlots.Add(node.Int32);
+                        }
+                        return;
+
+                    case GenTreeKind.TempAddr:
+                        if (ContainsTempIndex(_method.GenTreeMethod.Temps, node.Int32))
+                            _explicitTempSlots.Add(node.Int32);
+                        return;
+                }
+            }
+
+            private static bool SurvivingLocalLikeNodeRequiresHome(GenTree node)
+            {
+                var descriptor = node.LocalDescriptor;
+                if (descriptor is null)
+                    return true;
+
+                if (descriptor.IsStructField)
+                    return false;
+
+                // A promoted aggregate parent normally has no physical home. If a full-width
+                // Local/Temp or StoreLocal/StoreTemp survived promotion, CodeGen will materialize it
+                // through the parent frame slot, so the slot must exist even though field locals may
+                // also be promoted independently.
+                if (descriptor.Category == GenLocalCategory.PromotedStruct &&
+                    descriptor.HasPromotedStructFields &&
+                    !descriptor.AddressExposed &&
+                    !descriptor.MemoryAliased)
+                {
+                    return true;
+                }
+
+                if (descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.DoNotEnregister || !descriptor.SsaPromoted)
+                    return true;
+
+                var type = descriptor.Type ?? node.RuntimeType ?? node.Type;
+                var stackKind = descriptor.StackKind == GenStackKind.Unknown ? node.StackKind : descriptor.StackKind;
+
+                if (MachineAbi.RequiresStackHome(type, stackKind))
+                    return true;
+
+                if (type is not null && type.IsValueType && type.ContainsGcPointers)
+                    return true;
+
+                var abi = MachineAbi.ClassifyValue(type, stackKind, isReturn: false);
+                return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister;
+            }
+
+            private void CollectExplicitUserSlotFromOperand(RegisterOperand operand)
+            {
+                if (operand.IsLocalSlot)
+                {
+                    _explicitLocalSlots.Add(operand.FrameSlotIndex);
+                    return;
+                }
+
+                if (operand.IsTempSlot)
+                    _explicitTempSlots.Add(operand.FrameSlotIndex);
             }
 
             private void CollectSpillSlotsFromNode(GenTree node)
@@ -8933,7 +10337,7 @@ namespace Cnidaria.Cs
                 int localOffset = cursor;
                 var localSlots = ImmutableArray.CreateBuilder<StackFrameSlot>();
                 if (_options.AllocateLocalSlots)
-                    AllocateTypedSlots(StackFrameSlotKind.Local, _method.GenTreeMethod.LocalTypes, localSlots, ref cursor);
+                    AllocateLocalSlots(localSlots, ref cursor);
                 int localSize = cursor - localOffset;
 
                 cursor = AlignUp(cursor, frameAlignment);
@@ -9039,17 +10443,6 @@ namespace Cnidaria.Cs
 
                 foreach (var register in used)
                     AllocateSavedRegisterSlot(slots, ref cursor, ref index, StackFrameSlotKind.CalleeSavedRegister, register);
-            }
-
-            private bool UsesCalleeSavedRegister()
-            {
-                for (int i = 0; i < _method.Allocations.Length; i++)
-                {
-                    if (AllocationUsesCalleeSavedRegister(_method.Allocations[i]))
-                        return true;
-                }
-
-                return false;
             }
 
             private bool UsesSpecificCalleeSavedRegister(MachineRegister register)
@@ -9173,18 +10566,90 @@ namespace Cnidaria.Cs
                 cursor = checked(cursor + size);
             }
 
-            private void AllocateTypedSlots(
-                StackFrameSlotKind kind,
-                ImmutableArray<RuntimeType> types,
-                ImmutableArray<StackFrameSlot>.Builder slots,
-                ref int cursor)
+            private void AllocateLocalSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
+                var descriptors = _method.GenTreeMethod.LocalDescriptors;
+                var types = _method.GenTreeMethod.LocalTypes;
                 for (int i = 0; i < types.Length; i++)
                 {
+                    if (!RequiresLocalOrTempHome(StackFrameSlotKind.Local, i, _explicitLocalSlots, descriptors))
+                        continue;
+
                     var storage = StorageForType(types[i]);
                     cursor = AlignUp(cursor, storage.Alignment);
-                    slots.Add(new StackFrameSlot(kind, i, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, types[i]));
+                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Local, i, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, types[i]));
                     cursor = checked(cursor + storage.Size);
+                }
+
+                ValidateExplicitUserSlots(StackFrameSlotKind.Local, _explicitLocalSlots, types.Length);
+            }
+
+            private bool RequiresLocalOrTempHome(
+                StackFrameSlotKind kind,
+                int index,
+                HashSet<int> explicitSlots,
+                ImmutableArray<GenLocalDescriptor> descriptors)
+            {
+                if (explicitSlots.Contains(index))
+                    return true;
+
+                if (!TryGetTopLevelDescriptor(kind, index, descriptors, out var descriptor))
+                    return true;
+
+                if (descriptor.Category == GenLocalCategory.PromotedStruct &&
+                    descriptor.HasPromotedStructFields &&
+                    !descriptor.AddressExposed &&
+                    !descriptor.MemoryAliased)
+                    return false;
+
+                if (descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.DoNotEnregister)
+                    return true;
+
+                if (!descriptor.SsaPromoted)
+                    return true;
+
+                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind))
+                    return true;
+
+                if (descriptor.Type is not null && descriptor.Type.IsValueType && descriptor.Type.ContainsGcPointers)
+                    return true;
+
+                return false;
+            }
+
+            private static bool TryGetTopLevelDescriptor(
+                StackFrameSlotKind kind,
+                int index,
+                ImmutableArray<GenLocalDescriptor> descriptors,
+                out GenLocalDescriptor descriptor)
+            {
+                GenLocalKind localKind = kind switch
+                {
+                    StackFrameSlotKind.Local => GenLocalKind.Local,
+                    StackFrameSlotKind.Temp => GenLocalKind.Temporary,
+                    _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+                };
+
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var candidate = descriptors[i];
+                    if (candidate.Kind == localKind && !candidate.IsStructField && candidate.Index == index)
+                    {
+                        descriptor = candidate;
+                        return true;
+                    }
+                }
+
+                descriptor = null!;
+                return false;
+            }
+
+            private static void ValidateExplicitUserSlots(StackFrameSlotKind kind, HashSet<int> explicitSlots, int slotCount)
+            {
+                foreach (int index in explicitSlots)
+                {
+                    if ((uint)index >= (uint)slotCount)
+                        throw new InvalidOperationException(kind + " slot " + index.ToString() + " is referenced by LIR but no such slot exists in the method frame table.");
                 }
             }
 
@@ -9392,9 +10857,13 @@ namespace Cnidaria.Cs
             private void AllocateTempSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
                 var temps = _method.GenTreeMethod.Temps;
+                var descriptors = _method.GenTreeMethod.TempDescriptors;
                 for (int i = 0; i < temps.Length; i++)
                 {
                     var temp = temps[i];
+                    if (!RequiresLocalOrTempHome(StackFrameSlotKind.Temp, temp.Index, _explicitTempSlots, descriptors))
+                        continue;
+
                     var storage = temp.Type is null
                         ? StorageForStackKind(temp.StackKind)
                         : StorageForType(temp.Type);
@@ -9403,6 +10872,25 @@ namespace Cnidaria.Cs
                     slots.Add(new StackFrameSlot(StackFrameSlotKind.Temp, temp.Index, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, temp.Type));
                     cursor = checked(cursor + storage.Size);
                 }
+
+                ValidateExplicitTempSlots(_explicitTempSlots, temps);
+            }
+
+            private static void ValidateExplicitTempSlots(HashSet<int> explicitSlots, ImmutableArray<GenTemp> temps)
+            {
+                foreach (int index in explicitSlots)
+                {
+                    if (!ContainsTempIndex(temps, index))
+                        throw new InvalidOperationException("Temp slot " + index.ToString() + " is referenced by LIR but no such temp exists in the method frame table.");
+                }
+            }
+
+            private static bool ContainsTempIndex(ImmutableArray<GenTemp> temps, int index)
+            {
+                for (int i = 0; i < temps.Length; i++)
+                    if (temps[i].Index == index)
+                        return true;
+                return false;
             }
 
             private void AllocateSpillSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
@@ -10033,7 +11521,13 @@ namespace Cnidaria.Cs
                 if (!NeedsHomeGcReporting(descriptor.Type, descriptor.StackKind))
                     return false;
 
-                return descriptor.AddressExposed || descriptor.DoNotEnregister || descriptor.MemoryAliased || !descriptor.SsaPromoted;
+                if (descriptor.Category == GenLocalCategory.PromotedStruct &&
+                    descriptor.HasPromotedStructFields &&
+                    !descriptor.AddressExposed &&
+                    !descriptor.MemoryAliased)
+                    return false;
+
+                return descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.DoNotEnregister || !descriptor.SsaPromoted;
             }
 
             private void EmitZeroFrameSlot(int blockId, ImmutableArray<GenTree>.Builder nodes, StackFrameSlot slot)
@@ -11102,7 +12596,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < method.LinearNodes.Length; i++)
                 {
                     var node = method.LinearNodes[i];
-                    if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill) && node.LinearKind != GenTreeLinearKind.GcPoll)
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
                         continue;
 
                     int key = node.LinearId >= 0 ? node.LinearId : node.Id;
@@ -11146,7 +12640,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.Call => true,
                     GenTreeKind.VirtualCall => true,
                     GenTreeKind.DelegateInvoke => true,
-                    GenTreeKind.NewObject => method.DeclaringType.IsValueType,
+                    GenTreeKind.NewObject => true,
                     _ => false,
                 };
             }
@@ -11187,7 +12681,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    if (!TryGetGcRootKind(info, out var rootKind))
+                    if (!TryGetGcRootKind(info.Type, info.StackKind, out var rootKind))
                         continue;
 
                     for (int s = 0; s < allocation.Segments.Length; s++)
@@ -11506,14 +13000,15 @@ namespace Cnidaria.Cs
                 if (valueInfo.Type is not null && valueInfo.Type.IsValueType && valueInfo.Type.ContainsGcPointers)
                     return true;
 
-                return TryGetGcRootKind(valueInfo, out _);
+                return TryGetGcRootKind(valueInfo.Type, valueInfo.StackKind, out _);
             }
 
             private static bool IsDescriptorStore(GenTree node)
                 => node.Kind is GenTreeKind.StoreArg or GenTreeKind.StoreLocal or GenTreeKind.StoreTemp;
 
             private static bool IsDescriptorRead(GenTree node)
-                => node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp;
+                => node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp or
+                   GenTreeKind.ArgAddr or GenTreeKind.LocalAddr or GenTreeKind.TempAddr;
 
             private Dictionary<GenLocalDescriptor, GenTree> BuildHomeRootOwners()
             {
@@ -11583,7 +13078,13 @@ namespace Cnidaria.Cs
                 if (!NeedsHomeGcReporting(descriptor.Type, descriptor.StackKind))
                     return false;
 
-                return !descriptor.SsaPromoted || descriptor.AddressExposed || descriptor.DoNotEnregister;
+                if (descriptor.Category == GenLocalCategory.PromotedStruct &&
+                    descriptor.HasPromotedStructFields &&
+                    !descriptor.AddressExposed &&
+                    !descriptor.MemoryAliased)
+                    return false;
+
+                return descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.DoNotEnregister || !descriptor.SsaPromoted;
             }
 
             private static bool ShouldReportDescriptorHomeForEntireMethod(GenLocalDescriptor descriptor)
@@ -11591,13 +13092,21 @@ namespace Cnidaria.Cs
                 if (!ShouldReportDescriptorHome(descriptor))
                     return false;
 
-                if (descriptor.AddressExposed || descriptor.DoNotEnregister || !descriptor.Tracked)
-                    return true;
+                return !CanUsePreciseDescriptorHomeLiveness(descriptor);
+            }
+
+            private static bool CanUsePreciseDescriptorHomeLiveness(GenLocalDescriptor descriptor)
+            {
+                if (!descriptor.Tracked)
+                    return false;
+
+                if (descriptor.AddressExposed || descriptor.MemoryAliased)
+                    return false;
 
                 if (descriptor.Type is not null && descriptor.Type.IsValueType && descriptor.Type.ContainsGcPointers)
-                    return true;
+                    return false;
 
-                return false;
+                return true;
             }
 
             private bool TryGetHomeSlot(StackFrameSlotKind slotKind, int index, out StackFrameSlot slot)
@@ -11667,8 +13176,6 @@ namespace Cnidaria.Cs
                     if (!TryGetLinearPosition(node, out int position))
                         continue;
 
-                    bool excludeCallerSavedRegisterOperands = IsCallerFrameSuspendingManagedCall(node);
-
                     int count = Math.Min(node.Uses.Length, node.RegisterUses.Length);
                     for (int u = 0; u < count; u++)
                     {
@@ -11678,13 +13185,6 @@ namespace Cnidaria.Cs
                         var location = node.Uses[u];
                         if (location.IsNone)
                             continue;
-
-                        if (excludeCallerSavedRegisterOperands &&
-                            location.IsRegister &&
-                            MachineRegisters.IsCallerSaved(location.Register))
-                        {
-                            continue;
-                        }
 
                         var value = node.RegisterUses[u];
                         if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(value.LinearValueKey, out var info))
@@ -11726,7 +13226,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                if (!TryGetGcRootKind(info, out var rootKind))
+                if (!TryGetGcRootKind(info.Type, info.StackKind, out var rootKind))
                     return;
 
                 AddLiveRangeSlices(
@@ -12347,9 +13847,6 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool TryGetGcRootKind(GenTreeValueInfo info, out RegisterGcRootKind kind)
-                => TryGetGcRootKind(info.Type, info.StackKind, out kind);
-
             private static Dictionary<int, GenTree> BuildLinearTreeMap(GenTreeMethod method)
             {
                 var result = new Dictionary<int, GenTree>();
@@ -12526,9 +14023,8 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException($"post-LSRA CFG location invariant failed: invalid edge {edge}.");
 
                     var state = BuildExpectedLocationState(method, layout.BlockEndPositions[edge.FromBlockId]);
-                    ApplyTrailingPhiCopies(method, edge, method.Blocks[edge.FromBlockId], state);
+                    ApplyTrailingEdgeMoves(method, edge, method.Blocks[edge.FromBlockId], state);
                     ApplyLeadingSyntheticMoves(method, edge, method.Blocks[edge.ToBlockId], state);
-                    ApplyMissingSemanticPhiCopies(method, layout, edge, state);
                     VerifyEdgeLiveInLocations(method, layout, edge, state);
                 }
             }
@@ -12587,19 +14083,37 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void ApplyTrailingPhiCopies(
+        private static void ApplyTrailingEdgeMoves(
             RegisterAllocatedMethod method,
             CfgEdge edge,
             GenTreeBlock block,
             Dictionary<GenTreeValueKey, RegisterValueLocation> state)
         {
-            for (int i = 0; i < block.LinearNodes.Length; i++)
-            {
-                var node = block.LinearNodes[i];
-                if (!node.IsPhiCopy)
-                    continue;
+            var nodes = block.LinearNodes;
+            if (nodes.Length == 0)
+                return;
 
-                if (IsMatchingEntryPhiCopy(edge, node))
+            int end = nodes.Length - 1;
+            while (end >= 0 && IsVerifierBlockTerminatorNode(nodes[end]))
+                end--;
+
+            int start = end;
+            while (start >= 0)
+            {
+                var node = nodes[start];
+                if (IsBlockEntrySplitMove(node) || node.IsPhiCopy)
+                {
+                    start--;
+                    continue;
+                }
+
+                break;
+            }
+
+            for (int i = start + 1; i <= end; i++)
+            {
+                var node = nodes[i];
+                if (IsMatchingEntryPhiCopy(edge, node) || IsBlockEntrySplitMove(node))
                     ApplyNodeEffectsToLocationState(method, node, state);
             }
         }
@@ -12622,25 +14136,8 @@ namespace Cnidaria.Cs
                 if (node.IsPhiCopy)
                     continue;
 
-                if (IsBlockEntrySplitMove(node))
-                {
-                    ApplyNodeEffectsToLocationState(method, node, state);
-                    continue;
-                }
-
                 break;
             }
-        }
-
-        private static void ApplyMissingSemanticPhiCopies(
-            RegisterAllocatedMethod method,
-            AllocatorVerifierPositionLayout layout,
-            CfgEdge edge,
-            Dictionary<GenTreeValueKey, RegisterValueLocation> state)
-        {
-            ApplyMissingSemanticPhiCopiesFromBlock(method, layout, edge, method.GenTreeMethod.Blocks[edge.FromBlockId], state);
-            if (edge.ToBlockId != edge.FromBlockId)
-                ApplyMissingSemanticPhiCopiesFromBlock(method, layout, edge, method.GenTreeMethod.Blocks[edge.ToBlockId], state);
         }
 
         private static void ApplyMissingSemanticPhiCopiesFromBlock(
@@ -12661,10 +14158,10 @@ namespace Cnidaria.Cs
 
                 var destination = node.RegisterResult;
                 var destinationKey = destination.LinearValueKey;
+                var source = node.RegisterUses[0];
                 if (state.ContainsKey(destinationKey))
                     continue;
 
-                var source = node.RegisterUses[0];
                 if (!TryGetSourceLocationForSemanticPhi(method, layout, edge, source, state, out var sourceLocation))
                     continue;
 
@@ -12725,6 +14222,10 @@ namespace Cnidaria.Cs
             => node.IsPhiCopy &&
                node.LinearPhiCopyFromBlockId == edge.FromBlockId &&
                node.LinearPhiCopyToBlockId == edge.ToBlockId;
+
+        private static bool IsVerifierBlockTerminatorNode(GenTree node)
+            => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
+               GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
 
         private static bool IsBlockEntrySplitMove(GenTree node)
             => GenTreeLirKinds.IsCopyKind(node.Kind) &&
@@ -12923,15 +14424,6 @@ namespace Cnidaria.Cs
 
             allocation = null!;
             return false;
-        }
-
-        private static Dictionary<GenTreeValueKey, RegisterValueLocation> CloneState(
-            IReadOnlyDictionary<GenTreeValueKey, RegisterValueLocation> source)
-        {
-            var result = new Dictionary<GenTreeValueKey, RegisterValueLocation>(source.Count);
-            foreach (var kv in source)
-                result.Add(kv.Key, kv.Value);
-            return result;
         }
 
         private static bool LocationsEqual(RegisterValueLocation actual, RegisterValueLocation expected)
@@ -13559,7 +15051,7 @@ namespace Cnidaria.Cs
             {
                 var value = method.GenTreeMethod.Values[i].RepresentativeNode;
                 if (!method.AllocationByNode.ContainsKey(value))
-                    throw new InvalidOperationException($"Missing register allocation for {value}.");
+                    throw new InvalidOperationException("Missing register allocation for " + FormatAllocationValue(value) + ".");
             }
         }
 
@@ -13613,7 +15105,7 @@ namespace Cnidaria.Cs
                 {
                     var segment = allocation.Segments[s];
                     if (segment.Location.IsRegister)
-                        result.Add(new LocatedRegisterSegment(allocation, segment, allocation.Value.ToString()));
+                        result.Add(new LocatedRegisterSegment(allocation, segment, FormatAllocationValue(allocation.Value)));
                 }
 
                 for (int f = 0; f < allocation.Fragments.Length; f++)
@@ -13626,13 +15118,25 @@ namespace Cnidaria.Cs
                             result.Add(new LocatedRegisterSegment(
                                 allocation,
                                 segment,
-                                allocation.Value + "#" + fragment.SegmentIndex.ToString()));
+                                FormatAllocationValue(allocation.Value) + "#" + fragment.SegmentIndex.ToString()));
                     }
                 }
             }
 
             return result;
         }
+
+        private static string FormatAllocationValue(GenTree value)
+        {
+            if (value is null)
+                return "<null>";
+
+            if (value.HasSsaUse || value.HasSsaDefinition)
+                return value.LinearValueKey.ToString();
+
+            return value.Kind.ToString() + "#" + value.Id.ToString();
+        }
+
         private static bool RangesIntersect(ImmutableArray<LinearLiveRange> left, ImmutableArray<LinearLiveRange> right, int minPosition, int maxPosition)
         {
             int i = 0;
@@ -13671,7 +15175,8 @@ namespace Cnidaria.Cs
                 for (int c = 0; c < callPositions.Length; c++)
                 {
                     int callPos = callPositions[c];
-                    if (!segment.Contains(callPos))
+
+                    if (!segment.Contains(callPos + 1))
                         continue;
 
                     if (RangesCrossCall(allocation.Ranges, callPos))
@@ -13690,31 +15195,10 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.RefPositions.Length; i++)
             {
                 var rp = method.RefPositions[i];
-                if (rp.Kind == LinearRefPositionKind.Kill && rp.FixedRegister != MachineRegister.Invalid)
+                if (rp.Kind == LinearRefPositionKind.Kill && rp.RegisterMask != 0)
                     positions.Add(rp.Position);
             }
 
-            if (positions.Count == 0)
-            {
-                int position = 0;
-                var order = method.LinearBlockOrder.IsDefaultOrEmpty
-                    ? LinearBlockOrder.Compute(method.Cfg)
-                    : method.LinearBlockOrder;
-
-                for (int o = 0; o < order.Length; o++)
-                {
-                    int b = order[o];
-                    var nodes = method.Blocks[b].LinearNodes;
-                    for (int n = 0; n < nodes.Length; n++)
-                    {
-                        var node = nodes[n];
-                        if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                            positions.Add(position);
-                        position += 2;
-                    }
-                    position += 2;
-                }
-            }
 
             return positions.ToImmutableArray();
         }
@@ -13989,7 +15473,7 @@ namespace Cnidaria.Cs
                         if (node.Results.Length != 1)
                             throw new InvalidOperationException("Scalar call-like result must have exactly one result operand.");
 
-                        if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType != true)
+                        if (node.Kind == GenTreeKind.NewObject)
                         {
                             if (!node.Results[0].IsFrameSlot)
                                 throw new InvalidOperationException("Reference newobj result must be a frame home that preserves the object across the constructor call.");

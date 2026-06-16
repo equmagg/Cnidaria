@@ -2414,6 +2414,7 @@ namespace Cnidaria.Cs
                         return FuncWithException(node, ValueNumberFunction.UnboxAny, operands);
                     case GenTreeKind.LocalAddr:
                     case GenTreeKind.ArgAddr:
+                    case GenTreeKind.TempAddr:
                         return LocalAddress(node, blockId);
                     case GenTreeKind.FieldAddr:
                         return FieldAddress(node, operands, blockId);

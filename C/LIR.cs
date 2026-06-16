@@ -611,6 +611,9 @@ namespace Cnidaria.C
         private readonly Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), LirBlock> _edgeSplitBlocks = new();
         private readonly Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), List<LirParallelCopy>> _edgeCopies = new();
         private readonly Dictionary<LirBlock, List<LirInstruction>> _instructions = new();
+        private readonly HashSet<SsaName> _usedSsaNames = new();
+        private readonly HashSet<ControlFlowBlock> _reachableControlFlowBlocks = new();
+        private readonly Dictionary<ControlFlowBlock, SsaBlock> _ssaBlocksByControlFlowBlock = new();
 
         private int _nextInstructionOrdinal;
         private SsaInstruction? _currentInstruction;
@@ -634,6 +637,8 @@ namespace Cnidaria.C
         {
             IndexPromotedVariables();
             ScanLocalDeclarations();
+            IndexReachableControlFlowBlocks();
+            IndexUsedSsaNames();
             CreateVirtualRegistersForSsaNames();
             CreateBaseBlocks();
             CreateParameterStackSlots();
@@ -687,6 +692,83 @@ namespace Cnidaria.C
             }
         }
 
+        private void IndexReachableControlFlowBlocks()
+        {
+            _reachableControlFlowBlocks.Clear();
+            _ssaBlocksByControlFlowBlock.Clear();
+            if (_function.Blocks.Length == 0)
+                return;
+
+            foreach (var block in _function.Blocks)
+            {
+                if (!_ssaBlocksByControlFlowBlock.ContainsKey(block.ControlFlowBlock))
+                    _ssaBlocksByControlFlowBlock.Add(block.ControlFlowBlock, block);
+            }
+
+            if (!_ssaBlocksByControlFlowBlock.TryGetValue(_controlFlowFunction.Entry, out var entry))
+                entry = _function.Blocks[0];
+
+            var stack = new Stack<SsaBlock>();
+            _reachableControlFlowBlocks.Add(entry.ControlFlowBlock);
+            stack.Push(entry);
+
+            while (stack.Count != 0)
+            {
+                var block = stack.Pop();
+                foreach (var successor in EnumerateOptimizedSuccessors(block))
+                {
+                    if (successor.IsExit)
+                        continue;
+
+                    if (!_reachableControlFlowBlocks.Add(successor))
+                        continue;
+
+                    if (_ssaBlocksByControlFlowBlock.TryGetValue(successor, out var successorBlock))
+                        stack.Push(successorBlock);
+                }
+            }
+        }
+
+        private IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(SsaBlock block)
+        {
+            var terminator = block.Instructions.Length == 0 ? null : block.Instructions[^1].Statement;
+            switch (terminator)
+            {
+                case GimpleGotoStatement gotoStatement:
+                    if (_controlFlowFunction.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
+                        yield return gotoTarget;
+                    yield break;
+
+                case GimpleConditionalGotoStatement conditional:
+                    if (_controlFlowFunction.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
+                        yield return trueTarget;
+                    if (_controlFlowFunction.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
+                        yield return falseTarget;
+                    yield break;
+
+                case GimpleSwitchStatement switchStatement:
+                    var seen = new HashSet<ControlFlowBlock>();
+                    foreach (var switchCase in switchStatement.Cases)
+                    {
+                        if (_controlFlowFunction.TryGetBlock(switchCase.Target, out var caseTarget) && caseTarget is not null && seen.Add(caseTarget))
+                            yield return caseTarget;
+                    }
+
+                    if (_controlFlowFunction.TryGetBlock(switchStatement.DefaultLabel, out var defaultTarget) && defaultTarget is not null && seen.Add(defaultTarget))
+                        yield return defaultTarget;
+                    yield break;
+
+                case GimpleReturnStatement:
+                    yield break;
+            }
+
+            foreach (var edge in block.ControlFlowBlock.Successors)
+            {
+                if (!edge.Target.IsExit)
+                    yield return edge.Target;
+            }
+        }
+
         private void CreateVirtualRegistersForSsaNames()
         {
             foreach (var definition in _function.Definitions)
@@ -697,18 +779,57 @@ namespace Cnidaria.C
                 if (_registersByName.ContainsKey(definition.Name))
                     continue;
 
+                if (!IsSsaNameUsed(definition.Name))
+                    continue;
+
                 _function.ValueNumbering.TryGetValueNumber(definition.Name, out var valueNumber);
                 var register = NewVirtualRegister(definition.Name.Type, definition.Name, valueNumber);
                 _registersByName.Add(definition.Name, register);
             }
         }
 
+        private void IndexUsedSsaNames()
+        {
+            foreach (var block in _function.Blocks)
+            {
+                if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
+                    continue;
+
+                foreach (var phi in block.Phis)
+                {
+                    foreach (var operand in phi.Operands)
+                    {
+                        if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != SsaVariableKind.Memory)
+                            _usedSsaNames.Add(operand.Value);
+                    }
+                }
+
+                foreach (var instruction in block.Instructions)
+                {
+                    foreach (var use in instruction.Uses)
+                    {
+                        if (use.Kind != SsaUseKind.Memory && !use.Name.IsUndefined && use.Name.Variable.Kind != SsaVariableKind.Memory)
+                            _usedSsaNames.Add(use.Name);
+                    }
+                }
+            }
+        }
+
+        private bool IsSsaNameUsed(SsaName name)
+            => _usedSsaNames.Contains(name);
+
         private void CreateBaseBlocks()
         {
             foreach (var controlFlowBlock in _controlFlowFunction.RealBlocks)
             {
-                if (!controlFlowBlock.IsReachable && !_options.PreserveUnreachableBlocks)
-                    continue;
+                if (!_options.PreserveUnreachableBlocks)
+                {
+                    if (!controlFlowBlock.IsReachable)
+                        continue;
+
+                    if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(controlFlowBlock))
+                        continue;
+                }
 
                 var block = NewBlock(GetBlockName(controlFlowBlock), controlFlowBlock, isEdgeSplit: false);
                 _blocksByControlFlowBlock.Add(controlFlowBlock, block);
@@ -739,6 +860,9 @@ namespace Cnidaria.C
 
                 foreach (var phi in block.Phis)
                 {
+                    if (phi.Result.Variable.Kind == SsaVariableKind.Memory || !IsSsaNameUsed(phi.Result))
+                        continue;
+
                     if (!_blocksByControlFlowBlock.ContainsKey(phi.Block))
                         continue;
 
@@ -768,10 +892,45 @@ namespace Cnidaria.C
             {
                 var source = pair.Key.Source;
                 var target = pair.Key.Target;
+                if (!RequiresEdgeSplitForCopies(source, target))
+                    continue;
+
                 var name = "edge_" + source.Ordinal.ToString(CultureInfo.InvariantCulture) + "_to_" + target.Ordinal.ToString(CultureInfo.InvariantCulture);
                 var split = NewBlock(name, sourceBlock: source, isEdgeSplit: true);
                 _edgeSplitBlocks.Add(pair.Key, split);
             }
+        }
+
+        private bool RequiresEdgeSplitForCopies(ControlFlowBlock source, ControlFlowBlock target)
+        {
+            if (!_edgeCopies.ContainsKey((source, target)))
+                return false;
+
+            return !CanInlineEdgeCopies(source, target);
+        }
+
+        private bool CanInlineEdgeCopies(ControlFlowBlock source, ControlFlowBlock target)
+        {
+            if (!_ssaBlocksByControlFlowBlock.TryGetValue(source, out var sourceBlock))
+                return source.UniqueSuccessors.Length == 1 && ReferenceEquals(source.UniqueSuccessors[0], target);
+
+            var successorCount = 0;
+            foreach (var successor in EnumerateOptimizedSuccessors(sourceBlock))
+            {
+                if (successor.IsExit)
+                    continue;
+
+                if (!ReferenceEquals(successor, target))
+                    return false;
+
+                successorCount++;
+            }
+
+            if (successorCount != 1)
+                return false;
+
+            var terminator = sourceBlock.Instructions.Length == 0 ? null : sourceBlock.Instructions[^1].Statement;
+            return terminator is null or GimpleGotoStatement or GimpleConditionalGotoStatement;
         }
 
         private void TranslateBaseBlocks()
@@ -910,7 +1069,13 @@ namespace Cnidaria.C
 
             if (definition is not null)
             {
+                if (!IsSsaNameUsed(definition.Name))
+                    return;
+
                 var destination = GetRegister(definition.Name);
+                if (value.ReferencesSameRegister(destination))
+                    return;
+
                 _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
                 Emit(block, LirInstructionKind.Copy, destination, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assignment, sourceValue: assignment.Value, sourceInstruction: instruction, valueNumber: valueNumber);
                 return;
@@ -948,6 +1113,18 @@ namespace Cnidaria.C
                 : EmitValue(block, conditional.Condition);
             var trueTarget = ResolveTarget(instruction.Block, conditional.WhenTrue, conditional);
             var falseTarget = ResolveTarget(instruction.Block, conditional.WhenFalse, conditional);
+
+            if (ReferenceEquals(trueTarget, falseTarget))
+            {
+                EmitJump(block, instruction.Block, conditional.WhenTrue, conditional);
+                return;
+            }
+
+            if (TryGetImmediateTruth(condition, out var truth))
+            {
+                EmitJump(block, instruction.Block, truth ? conditional.WhenTrue : conditional.WhenFalse, conditional);
+                return;
+            }
 
             Emit(block, LirInstructionKind.Branch, null, ImmutableArray.Create(condition), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: trueTarget, falseTarget: falseTarget, sourceStatement: conditional, sourceValue: conditional.Condition, sourceInstruction: instruction, valueNumber: null);
         }
@@ -1417,18 +1594,57 @@ namespace Cnidaria.C
                 return;
             }
 
-            var target = Redirect(source, nonExitSuccessors[0].Target);
-            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
-                parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
-                sourceInstruction: null, valueNumber: null);
+            EmitJumpToControlFlowTarget(block, source, nonExitSuccessors[0].Target, statement: null, sourceInstruction: null);
         }
 
         private void EmitJump(LirBlock block, ControlFlowBlock source, GimpleLabel targetLabel, GimpleStatement statement)
         {
-            var target = ResolveTarget(source, targetLabel, statement);
-            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
-                parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null, 
-                sourceInstruction: _currentInstruction, valueNumber: null);
+            if (_controlFlowFunction.TryGetBlock(targetLabel, out var target) && target is not null)
+            {
+                EmitJumpToControlFlowTarget(block, source, target, statement, _currentInstruction);
+                return;
+            }
+
+            _problems.Add(new LirProblem(LirProblemKind.MissingTarget, source, statement, $"Missing LIR target for label '{targetLabel.Name}'."));
+            EmitJumpToBlock(block, _blocksByControlFlowBlock.TryGetValue(source, out var self) ? self : _blocks[0], statement, _currentInstruction);
+        }
+
+        private void EmitJumpToControlFlowTarget(
+            LirBlock block,
+            ControlFlowBlock source,
+            ControlFlowBlock target,
+            GimpleStatement? statement,
+            SsaInstruction? sourceInstruction)
+        {
+            if (_edgeSplitBlocks.TryGetValue((source, target), out var split))
+            {
+                EmitJumpToBlock(block, split, statement, sourceInstruction);
+                return;
+            }
+
+            EmitEdgeCopies(block, source, target);
+            EmitJumpToBlock(block, GetBaseBlock(target), statement, sourceInstruction);
+        }
+
+        private void EmitJumpToBlock(
+            LirBlock block,
+            LirBlock target,
+            GimpleStatement? statement,
+            SsaInstruction? sourceInstruction)
+        {
+            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null,
+                sourceInstruction: sourceInstruction, valueNumber: null);
+        }
+
+        private void EmitEdgeCopies(LirBlock block, ControlFlowBlock source, ControlFlowBlock target)
+        {
+            if (!_edgeCopies.TryGetValue((source, target), out var copies) || copies.Count == 0)
+                return;
+
+            Emit(block, LirInstructionKind.ParallelCopy, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: copies.ToImmutableArray(), switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null,
+                sourceInstruction: null, valueNumber: null);
         }
 
         private LirBlock ResolveTarget(ControlFlowBlock source, GimpleLabel label, GimpleStatement statement)
@@ -1722,6 +1938,64 @@ namespace Cnidaria.C
 
         private static string TokenText(SyntaxToken token)
             => string.IsNullOrEmpty(token.Text) ? token.Kind.ToString() : token.Text;
+
+        private static bool TryGetImmediateTruth(LirOperand operand, out bool truth)
+        {
+            if (operand.Kind != LirOperandKind.Immediate)
+            {
+                truth = false;
+                return false;
+            }
+
+            switch (operand.Immediate)
+            {
+                case null:
+                    truth = false;
+                    return true;
+                case bool value:
+                    truth = value;
+                    return true;
+                case char value:
+                    truth = value != 0;
+                    return true;
+                case byte value:
+                    truth = value != 0;
+                    return true;
+                case sbyte value:
+                    truth = value != 0;
+                    return true;
+                case short value:
+                    truth = value != 0;
+                    return true;
+                case ushort value:
+                    truth = value != 0;
+                    return true;
+                case int value:
+                    truth = value != 0;
+                    return true;
+                case uint value:
+                    truth = value != 0;
+                    return true;
+                case long value:
+                    truth = value != 0;
+                    return true;
+                case ulong value:
+                    truth = value != 0;
+                    return true;
+                case float value:
+                    truth = value != 0.0f;
+                    return true;
+                case double value:
+                    truth = value != 0.0;
+                    return true;
+                case decimal value:
+                    truth = value != 0m;
+                    return true;
+                default:
+                    truth = false;
+                    return false;
+            }
+        }
 
         private static bool SameType(QualifiedType left, QualifiedType right)
             => string.Equals(left.ToDisplayString(), right.ToDisplayString(), StringComparison.Ordinal);
