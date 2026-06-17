@@ -891,14 +891,31 @@ namespace Cnidaria.Cs
         public readonly int FilterStartPc;
         public readonly int CatchTypeId;
         public readonly int ParentRegionIndex;
+        public readonly int SourceTryStartPc;
+        public readonly int SourceTryEndPc;
+        public readonly int SourceHandlerStartPc;
+        public readonly int SourceHandlerIndex;
         public readonly byte Kind;
         public readonly byte Reserved0;
         public readonly ushort Reserved1;
 
-        public EhRegionRecord(EhRegionKind kind, int tryStartPc, int tryEndPc, int handlerStartPc, int handlerEndPc, int filterStartPc = -1, int catchTypeId = -1, int parentRegionIndex = -1)
+        public EhRegionRecord(
+            EhRegionKind kind,
+            int tryStartPc,
+            int tryEndPc,
+            int handlerStartPc,
+            int handlerEndPc,
+            int filterStartPc = -1,
+            int catchTypeId = -1,
+            int parentRegionIndex = -1,
+            int sourceTryStartPc = -1,
+            int sourceTryEndPc = -1,
+            int sourceHandlerStartPc = -1,
+            int sourceHandlerIndex = -1)
         {
             if (tryStartPc < 0 || tryEndPc < tryStartPc) throw new ArgumentOutOfRangeException(nameof(tryStartPc));
             if (handlerStartPc < 0 || handlerEndPc < handlerStartPc) throw new ArgumentOutOfRangeException(nameof(handlerStartPc));
+            if (sourceTryStartPc >= 0 && sourceTryEndPc < sourceTryStartPc) throw new ArgumentOutOfRangeException(nameof(sourceTryEndPc));
             Kind = (byte)kind;
             TryStartPc = tryStartPc;
             TryEndPc = tryEndPc;
@@ -907,6 +924,10 @@ namespace Cnidaria.Cs
             FilterStartPc = filterStartPc;
             CatchTypeId = catchTypeId;
             ParentRegionIndex = parentRegionIndex;
+            SourceTryStartPc = sourceTryStartPc >= 0 ? sourceTryStartPc : tryStartPc;
+            SourceTryEndPc = sourceTryEndPc >= 0 ? sourceTryEndPc : tryEndPc;
+            SourceHandlerStartPc = sourceHandlerStartPc >= 0 ? sourceHandlerStartPc : handlerStartPc;
+            SourceHandlerIndex = sourceHandlerIndex;
             Reserved0 = 0;
             Reserved1 = 0;
         }
@@ -1453,8 +1474,8 @@ namespace Cnidaria.Cs
                     ValidatePcRangeInMethod(region.HandlerStartPc, region.HandlerEndPc, method.EntryPc, methodEndPc, "EH handler range");
                     if (region.FilterStartPc >= 0 && (region.FilterStartPc < method.EntryPc || region.FilterStartPc >= methodEndPc))
                         throw new InvalidOperationException("EH filter starts outside its method.");
-                    if (region.ParentRegionIndex >= 0 && region.ParentRegionIndex >= EhRegions.Length)
-                        throw new InvalidOperationException("EH region has invalid parent region index.");
+                    if (region.ParentRegionIndex >= 0 && region.ParentRegionIndex >= method.EhCount)
+                        throw new InvalidOperationException("EH region has invalid method-local parent region index.");
                 }
 
                 for (int i = 0; i < method.GcSafePointCount; i++)

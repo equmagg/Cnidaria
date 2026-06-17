@@ -5,516 +5,6 @@ using System.Diagnostics;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class CodeGeneratorOptions
-    {
-        public static CodeGeneratorOptions Default { get; } = new CodeGeneratorOptions();
-
-        public bool EmitExceptionRegions { get; set; } = true;
-        public bool EmitGcInfo { get; set; } = true;
-        public bool EmitUnwindInfo { get; set; } = true;
-        public bool VerifyImage { get; set; } = true;
-    }
-
-
-    internal sealed class BackendOptions
-    {
-        public static BackendOptions Default { get; } = new BackendOptions();
-
-        public bool IncludeExceptionEdges { get; set; } = true;
-        public bool SplitCriticalEdgesBeforeSsa { get; set; } = true;
-        public bool BuildSsa { get; set; } = true;
-        public bool OptimizeSsa { get; set; } = true;
-        public bool ValidateHir { get; set; } = true;
-        public bool ValidateSsa { get; set; } = true;
-
-        public SsaOptimizationOptions SsaOptimizationOptions { get; set; } = SsaOptimizationOptions.DefaultWithoutValidation;
-        public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
-        public RegisterAllocatorOptions RegisterAllocatorOptions { get; set; } = RegisterAllocatorOptions.Default;
-        public CodeGeneratorOptions CodeGeneratorOptions { get; set; } = CodeGeneratorOptions.Default;
-    }
-
-    internal sealed class BackendResult
-    {
-        public GenTreeProgram HirProgram { get; }
-        public SsaProgram? SsaProgram { get; }
-        public GenTreeProgram RationalizedProgram { get; }
-        public GenTreeProgram LoweredProgram { get; }
-        public GenTreeProgram RegisterAllocatedProgram { get; }
-        public CodeImage Image { get; }
-
-        public BackendResult(
-            GenTreeProgram hirProgram,
-            SsaProgram? ssaProgram,
-            GenTreeProgram rationalizedProgram,
-            GenTreeProgram loweredProgram,
-            GenTreeProgram registerAllocatedProgram,
-            CodeImage image)
-        {
-            HirProgram = hirProgram ?? throw new ArgumentNullException(nameof(hirProgram));
-            SsaProgram = ssaProgram;
-            RationalizedProgram = rationalizedProgram ?? throw new ArgumentNullException(nameof(rationalizedProgram));
-            LoweredProgram = loweredProgram ?? throw new ArgumentNullException(nameof(loweredProgram));
-            RegisterAllocatedProgram = registerAllocatedProgram ?? throw new ArgumentNullException(nameof(registerAllocatedProgram));
-            Image = image ?? throw new ArgumentNullException(nameof(image));
-        }
-    }
-
-    internal sealed class GenTreeBackendPipelineResult
-    {
-        public GenTreeProgram HirProgram { get; }
-        public SsaProgram? SsaProgram { get; }
-        public GenTreeProgram RationalizedProgram { get; }
-        public GenTreeProgram LoweredProgram { get; }
-        public GenTreeProgram RegisterAllocatedProgram { get; }
-
-        public GenTreeBackendPipelineResult(
-            GenTreeProgram hirProgram,
-            SsaProgram? ssaProgram,
-            GenTreeProgram rationalizedProgram,
-            GenTreeProgram loweredProgram,
-            GenTreeProgram registerAllocatedProgram)
-        {
-            HirProgram = hirProgram ?? throw new ArgumentNullException(nameof(hirProgram));
-            SsaProgram = ssaProgram;
-            RationalizedProgram = rationalizedProgram ?? throw new ArgumentNullException(nameof(rationalizedProgram));
-            LoweredProgram = loweredProgram ?? throw new ArgumentNullException(nameof(loweredProgram));
-            RegisterAllocatedProgram = registerAllocatedProgram ?? throw new ArgumentNullException(nameof(registerAllocatedProgram));
-        }
-    }
-
-    internal static class BackendPipeline
-    {
-        public static BackendResult CompileProgram(GenTreeProgram program, BackendOptions? options = null)
-        {
-            if (program is null)
-                throw new ArgumentNullException(nameof(program));
-
-            options ??= BackendOptions.Default;
-            var swCompile = Stopwatch.StartNew();
-            var lowered = GenTreeBackendPipeline.RunProgram(program, options);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions);
-            swCompile.Stop();
-            return new BackendResult(
-                lowered.HirProgram,
-                lowered.SsaProgram,
-                lowered.RationalizedProgram,
-                lowered.LoweredProgram,
-                lowered.RegisterAllocatedProgram,
-                image);
-        }
-
-        public static BackendResult CompileMethod(GenTreeMethod method, BackendOptions? options = null)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-
-            options ??= BackendOptions.Default;
-            var lowered = GenTreeBackendPipeline.RunMethod(method, options);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions);
-            return new BackendResult(
-                lowered.HirProgram,
-                lowered.SsaProgram,
-                lowered.RationalizedProgram,
-                lowered.LoweredProgram,
-                lowered.RegisterAllocatedProgram,
-                image);
-        }
-    }
-
-    internal static class GenTreeBackendPipeline
-    {
-        public static GenTreeBackendPipelineResult RunProgram(GenTreeProgram program, BackendOptions options)
-        {
-            if (program is null)
-                throw new ArgumentNullException(nameof(program));
-            if (options is null)
-                throw new ArgumentNullException(nameof(options));
-
-            var hirMethods = ImmutableArray.CreateBuilder<GenTreeMethod>(program.Methods.Length);
-            var ssaMethods = options.BuildSsa ? ImmutableArray.CreateBuilder<SsaMethod>(program.Methods.Length) : null;
-            var rationalizedMethods = ImmutableArray.CreateBuilder<GenTreeMethod>(program.Methods.Length);
-            var loweredMethods = ImmutableArray.CreateBuilder<GenTreeMethod>(program.Methods.Length);
-            var allocatedMethods = ImmutableArray.CreateBuilder<GenTreeMethod>(program.Methods.Length);
-
-            for (int i = 0; i < program.Methods.Length; i++)
-            {
-                var method = CompileMethodThroughLsra(program.Methods[i], options, out var hir, out var ssa, out var rationalized, out var lowered);
-                hirMethods.Add(hir);
-                if (ssa is not null)
-                    ssaMethods!.Add(ssa);
-                rationalizedMethods.Add(rationalized);
-                loweredMethods.Add(lowered);
-                allocatedMethods.Add(method);
-            }
-
-            return new GenTreeBackendPipelineResult(
-                new GenTreeProgram(program.TypeSystem, hirMethods.ToImmutable()),
-                ssaMethods is null ? null : new SsaProgram(ssaMethods.ToImmutable()),
-                new GenTreeProgram(program.TypeSystem, rationalizedMethods.ToImmutable()),
-                new GenTreeProgram(program.TypeSystem, loweredMethods.ToImmutable()),
-                new GenTreeProgram(program.TypeSystem, allocatedMethods.ToImmutable()));
-        }
-
-        public static GenTreeBackendPipelineResult RunMethod(GenTreeMethod method, BackendOptions options)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-            if (options is null)
-                throw new ArgumentNullException(nameof(options));
-
-            var allocated = CompileMethodThroughLsra(method, options, out var hir, out var ssa, out var rationalized, out var lowered);
-            return new GenTreeBackendPipelineResult(
-                new GenTreeProgram(ImmutableArray.Create(hir)),
-                ssa is null ? null : new SsaProgram(ImmutableArray.Create(ssa)),
-                new GenTreeProgram(ImmutableArray.Create(rationalized)),
-                new GenTreeProgram(ImmutableArray.Create(lowered)),
-                new GenTreeProgram(ImmutableArray.Create(allocated)));
-        }
-
-        private static GenTreeMethod CompileMethodThroughLsra(
-            GenTreeMethod importedMethod,
-            BackendOptions options,
-            out GenTreeMethod hirMethod,
-            out SsaMethod? ssaMethod,
-            out GenTreeMethod rationalizedMethod,
-            out GenTreeMethod loweredMethod)
-        {
-            hirMethod = PrepareHir(importedMethod, options);
-            ssaMethod = null;
-
-            if (options.BuildSsa)
-            {
-                ssaMethod = GenTreeSsaBuilder.BuildMethod(
-                    hirMethod,
-                    hirMethod.Cfg,
-                    hirMethod.HirLiveness,
-                    validate: options.ValidateSsa);
-
-                if (options.OptimizeSsa)
-                {
-                    ssaMethod = SsaOptimizer.OptimizeMethod(ssaMethod, options.SsaOptimizationOptions);
-                    hirMethod = ssaMethod.GenTreeMethod;
-                    hirMethod.AttachSsa(ssaMethod, optimized: true);
-                }
-                else
-                {
-                    ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod, validate: options.ValidateSsa);
-                    hirMethod = ssaMethod.GenTreeMethod;
-                    hirMethod.AttachSsa(ssaMethod, optimized: false);
-                }
-
-                if (options.ValidateSsa)
-                    SsaVerifier.Verify(ssaMethod);
-            }
-
-            var lirOptions = CreateLirOptions(options);
-            rationalizedMethod = GenTreeLinearIrRationalizer.RationalizeMethod(hirMethod, ssaMethod, lirOptions);
-            loweredMethod = GenTreeLinearLowerer.LowerMethod(rationalizedMethod, lirOptions);
-            return LinearScanRegisterAllocator.AllocateMethod(loweredMethod, options.RegisterAllocatorOptions);
-        }
-
-        private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
-        {
-            method = GenTreeMorpher.MorphMethod(method);
-            method = GenTreeLocalRewriter.RewriteMethod(method);
-
-            if (options.SplitCriticalEdgesBeforeSsa)
-            {
-                var split = GenTreeCriticalEdgeSplitter.SplitCriticalEdges(method);
-                if (!ReferenceEquals(split, method))
-                {
-                    method = GenTreeMorpher.MorphMethod(split);
-                    method = GenTreeLocalRewriter.RewriteMethod(method);
-                }
-            }
-
-            var cfg = ControlFlowGraph.Build(method, options.IncludeExceptionEdges);
-            method.AttachFlowGraph(cfg);
-
-            var liveness = GenTreeLocalLiveness.Build(method, cfg);
-            method.AttachHirLiveness(liveness);
-
-            if (options.ValidateHir)
-                GenTreeHirVerifier.Verify(method, cfg, liveness);
-
-            return method;
-        }
-
-        private static LinearRationalizationOptions CreateLirOptions(BackendOptions options)
-        {
-            return new LinearRationalizationOptions
-            {
-                IncludeExceptionEdges = options.IncludeExceptionEdges,
-                Validate = options.RationalizationOptions.Validate,
-            };
-        }
-    }
-
-    internal static class GenTreeMorpher
-    {
-        public static GenTreeMethod MorphMethod(GenTreeMethod method)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-
-            for (int b = 0; b < method.Blocks.Length; b++)
-            {
-                var statements = method.Blocks[b].Statements;
-                for (int s = 0; s < statements.Length; s++)
-                    NormalizeFlags(statements[s]);
-            }
-
-            method.SetPhase(GenTreeMethodPhase.MorphedHir);
-            return method;
-        }
-
-        private static GenTreeFlags NormalizeFlags(GenTree node)
-        {
-            var flags = node.Flags;
-            for (int i = 0; i < node.Operands.Length; i++)
-            {
-                var childFlags = NormalizeFlags(node.Operands[i]);
-                if ((childFlags & GenTreeFlags.ContainsCall) != 0)
-                    flags |= GenTreeFlags.ContainsCall;
-                if ((childFlags & GenTreeFlags.CanThrow) != 0)
-                    flags |= GenTreeFlags.CanThrow;
-                if ((childFlags & GenTreeFlags.SideEffect) != 0)
-                    flags |= GenTreeFlags.SideEffect;
-                if ((childFlags & GenTreeFlags.MemoryRead) != 0)
-                    flags |= GenTreeFlags.MemoryRead;
-                if ((childFlags & GenTreeFlags.MemoryWrite) != 0)
-                    flags |= GenTreeFlags.MemoryWrite;
-            }
-
-            switch (node.Kind)
-            {
-                case GenTreeKind.Call:
-                case GenTreeKind.VirtualCall:
-                case GenTreeKind.DelegateInvoke:
-                case GenTreeKind.NewObject:
-                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
-                    break;
-
-                case GenTreeKind.NewDelegate:
-                case GenTreeKind.DelegateCombine:
-                case GenTreeKind.DelegateRemove:
-                case GenTreeKind.NewArray:
-                case GenTreeKind.Box:
-                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
-                    break;
-
-                case GenTreeKind.Field:
-                case GenTreeKind.StaticField:
-                case GenTreeKind.LoadIndirect:
-                case GenTreeKind.ArrayElement:
-                    flags |= GenTreeFlags.MemoryRead;
-                    break;
-
-                case GenTreeKind.StoreLocal:
-                case GenTreeKind.StoreArg:
-                case GenTreeKind.StoreTemp:
-                    flags |= GenTreeFlags.LocalDef | GenTreeFlags.SideEffect;
-                    break;
-
-                case GenTreeKind.Local:
-                case GenTreeKind.Arg:
-                case GenTreeKind.Temp:
-                    flags |= GenTreeFlags.LocalUse;
-                    break;
-
-                case GenTreeKind.LocalAddr:
-                case GenTreeKind.ArgAddr:
-                case GenTreeKind.TempAddr:
-                    flags |= GenTreeFlags.LocalUse;
-                    break;
-
-                case GenTreeKind.StoreField:
-                case GenTreeKind.StoreStaticField:
-                case GenTreeKind.StoreIndirect:
-                case GenTreeKind.StoreArrayElement:
-                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect;
-                    break;
-
-                case GenTreeKind.Branch:
-                case GenTreeKind.BranchTrue:
-                case GenTreeKind.BranchFalse:
-                case GenTreeKind.Return:
-                case GenTreeKind.Throw:
-                case GenTreeKind.Rethrow:
-                case GenTreeKind.EndFinally:
-                    flags |= GenTreeFlags.ControlFlow;
-                    break;
-            }
-
-            node.Flags = flags;
-            return flags;
-        }
-    }
-
-    internal static class GenTreeLocalRewriter
-    {
-        public static GenTreeMethod RewriteMethod(GenTreeMethod method)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-
-            ResetDescriptors(method.ArgDescriptors);
-            ResetDescriptors(method.LocalDescriptors);
-            ResetDescriptors(method.TempDescriptors);
-
-            for (int b = 0; b < method.Blocks.Length; b++)
-            {
-                var statements = method.Blocks[b].Statements;
-                for (int s = 0; s < statements.Length; s++)
-                    MarkAddressExposed(statements[s]);
-            }
-
-            method.EnsurePromotedStructFieldLocals();
-
-            SealDescriptors(method.ArgDescriptors);
-            SealDescriptors(method.LocalDescriptors);
-            SealDescriptors(method.TempDescriptors);
-            method.SetPhase(GenTreeMethodPhase.LocalRewrittenHir);
-            return method;
-        }
-
-        private static void ResetDescriptors(ImmutableArray<GenLocalDescriptor> descriptors)
-        {
-            for (int i = 0; i < descriptors.Length; i++)
-            {
-                var descriptor = descriptors[i];
-                descriptor.ResetPreSsaClassification();
-            }
-        }
-
-        private static void SealDescriptors(ImmutableArray<GenLocalDescriptor> descriptors)
-        {
-            for (int i = 0; i < descriptors.Length; i++)
-            {
-                var descriptor = descriptors[i];
-                descriptor.ClassifySpecialStorage();
-                if (descriptor.AddressExposed)
-                {
-                    descriptor.MarkAddressExposed();
-                }
-                else if (descriptor.MemoryAliased)
-                {
-                    descriptor.MarkMemoryAliased();
-                }
-                else if (descriptor.IsCompilerTemp)
-                {
-                    descriptor.MarkUntracked();
-                    descriptor.Category = GenLocalCategory.CompilerTemp;
-                }
-                else if (descriptor.Category == GenLocalCategory.Unclassified)
-                {
-                    descriptor.Category = GenLocalCategory.UntrackedLocal;
-                }
-            }
-        }
-
-        private static void MarkAddressExposed(GenTree node)
-        {
-            MarkAddressExposed(node, parent: null, operandIndex: -1);
-        }
-
-        private static void MarkAddressExposed(GenTree node, GenTree? parent, int operandIndex)
-        {
-            if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _))
-            {
-                if (parent is not null && SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex))
-                {
-                    node.Flags &= ~GenTreeFlags.AddressExposed;
-                    node.LocalDescriptor?.MarkPromotedStructParent();
-                }
-                else if (node.LocalDescriptor is not null)
-                {
-                    node.LocalDescriptor.MarkAddressExposed();
-                    node.Flags |= GenTreeFlags.AddressExposed;
-                }
-            }
-
-            for (int i = 0; i < node.Operands.Length; i++)
-                MarkAddressExposed(node.Operands[i], node, i);
-
-            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var localFieldAccess))
-            {
-                var descriptor = localFieldAccess.Receiver?.LocalDescriptor ?? node.LocalDescriptor;
-                if (descriptor is not null)
-                    descriptor.MarkPromotedStructParent();
-
-                GenTreeFlags flags = GenTreeFlags.None;
-                for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags;
-
-                flags |= GenTreeFlags.Indirect;
-                if (localFieldAccess.IsUse || localFieldAccess.IsPartialDefinition)
-                    flags |= GenTreeFlags.LocalUse;
-                if (localFieldAccess.IsDefinition)
-                {
-                    flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered;
-                    if (localFieldAccess.IsPartialDefinition)
-                        flags |= GenTreeFlags.VarUseAsg;
-                }
-
-                node.Flags = flags;
-            }
-        }
-    }
-
-    internal static class GenTreeHirVerifier
-    {
-        public static void Verify(GenTreeMethod method, ControlFlowGraph cfg, GenTreeLocalLiveness liveness)
-        {
-            if (method is null)
-                throw new ArgumentNullException(nameof(method));
-            if (cfg is null)
-                throw new ArgumentNullException(nameof(cfg));
-            if (liveness is null)
-                throw new ArgumentNullException(nameof(liveness));
-            if (cfg.Blocks.Length != method.Blocks.Length)
-                throw new InvalidOperationException("HIR verifier found a CFG/method block count mismatch.");
-            if (liveness.Cfg != cfg)
-                throw new InvalidOperationException("HIR verifier found liveness for a different CFG instance.");
-            if (liveness.LiveIn.Length != method.Blocks.Length || liveness.LiveOut.Length != method.Blocks.Length)
-                throw new InvalidOperationException("HIR verifier found malformed liveness block sets.");
-
-            for (int b = 0; b < method.Blocks.Length; b++)
-            {
-                var block = method.Blocks[b];
-                if (block.Id != b)
-                    throw new InvalidOperationException($"HIR block id mismatch: expected B{b}, found B{block.Id}.");
-
-                for (int i = 0; i < block.SuccessorBlockIds.Length; i++)
-                {
-                    int succ = block.SuccessorBlockIds[i];
-                    if ((uint)succ >= (uint)method.Blocks.Length)
-                        throw new InvalidOperationException($"HIR block B{b} has invalid successor B{succ}.");
-                }
-
-                for (int s = 0; s < block.Statements.Length; s++)
-                    VerifyTree(block.Statements[s], expectedParent: null, blockId: b, operandIndex: -1);
-            }
-        }
-
-        private static void VerifyTree(GenTree node, GenTree? expectedParent, int blockId, int operandIndex)
-        {
-            if (node.Parent != expectedParent)
-                throw new InvalidOperationException($"HIR parent link mismatch in B{blockId}: {node}.");
-
-            if (node.LinearId >= 0)
-                throw new InvalidOperationException($"HIR node already has LIR id before rationalization: {node.LinearId}.");
-
-            if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _) &&
-                node.LocalDescriptor is { AddressExposed: false } &&
-                (expectedParent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(expectedParent, operandIndex)))
-                throw new InvalidOperationException($"HIR address-exposed local was not marked: {node}.");
-
-            for (int i = 0; i < node.Operands.Length; i++)
-                VerifyTree(node.Operands[i], node, blockId, i);
-        }
-    }
-
     internal static class CodeGenerator
     {
         public static CodeImage Build(GenTreeProgram program, CodeGeneratorOptions? options = null)
@@ -2582,6 +2072,12 @@ namespace Cnidaria.Cs
 
             private void EmitConditionalBranch(GenTree instruction, GenTree source)
             {
+                if (instruction.Uses.Length == 2 && IsCompareOp(source.SourceOp))
+                {
+                    EmitCompareBranch(instruction, source);
+                    return;
+                }
+
                 if (instruction.Uses.Length != 1)
                     throw Unsupported(instruction, "conditional branch requires one condition register");
 
@@ -2598,6 +2094,94 @@ namespace Cnidaria.Cs
                 };
                 _asm.Branch(op, rs, target);
             }
+
+            private void EmitCompareBranch(GenTree instruction, GenTree source)
+            {
+                if (instruction.Uses.Length != 2)
+                    throw Unsupported(instruction, "compare branch requires two operand registers");
+                if (source.Operands.Length != 2)
+                    throw Unsupported(instruction, "compare branch source requires two operands");
+
+                var left = RequireUseRegister(instruction, 0);
+                var right = RequireUseRegister(instruction, 1);
+                var target = LabelForTarget(source);
+                bool branchWhenTrue = instruction.TreeKind == GenTreeKind.BranchTrue;
+                var kind = OperandStackKind(instruction, source, 0);
+                var type = OperandType(instruction, source, 0);
+
+                Op op;
+                if (IsFloat32Value(type, kind))
+                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64: false, unsigned: false, floating: true);
+                else if (IsFloat64Value(type, kind))
+                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64: true, unsigned: false, floating: true);
+                else if (kind is GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef)
+                {
+                    op = source.SourceOp switch
+                    {
+                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrRefEq : Op.BrRefNe,
+                        _ => throw Unsupported(instruction, "unsupported reference compare branch opcode " + source.SourceOp),
+                    };
+                }
+                else
+                {
+                    bool is64 = Is64BitBranchInteger(type, kind);
+                    bool unsigned = IsUnsignedInteger(type, kind) || source.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un;
+                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64, unsigned, floating: false);
+                }
+
+                _asm.Branch(op, left, right, target);
+            }
+
+            private Op CompareBranchOp(GenTree instruction, BytecodeOp compareOp, bool branchWhenTrue, bool is64, bool unsigned, bool floating)
+            {
+                if (floating)
+                {
+                    if (is64)
+                    {
+                        return compareOp switch
+                        {
+                            BytecodeOp.Ceq => branchWhenTrue ? Op.BrF64Eq : Op.BrF64Ne,
+                            BytecodeOp.Clt when branchWhenTrue => Op.BrF64Lt,
+                            BytecodeOp.Cgt when branchWhenTrue => Op.BrF64Gt,
+                            _ => throw Unsupported(instruction, "unsupported f64 compare branch opcode " + compareOp),
+                        };
+                    }
+
+                    return compareOp switch
+                    {
+                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrF32Eq : Op.BrF32Ne,
+                        BytecodeOp.Clt when branchWhenTrue => Op.BrF32Lt,
+                        BytecodeOp.Cgt when branchWhenTrue => Op.BrF32Gt,
+                        _ => throw Unsupported(instruction, "unsupported f32 compare branch opcode " + compareOp),
+                    };
+                }
+
+                if (is64)
+                {
+                    return compareOp switch
+                    {
+                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrI64Eq : Op.BrI64Ne,
+                        BytecodeOp.Clt => branchWhenTrue ? (unsigned ? Op.BrU64Lt : Op.BrI64Lt) : (unsigned ? Op.BrU64Ge : Op.BrI64Ge),
+                        BytecodeOp.Clt_Un => branchWhenTrue ? Op.BrU64Lt : Op.BrU64Ge,
+                        BytecodeOp.Cgt => branchWhenTrue ? (unsigned ? Op.BrU64Gt : Op.BrI64Gt) : (unsigned ? Op.BrU64Le : Op.BrI64Le),
+                        BytecodeOp.Cgt_Un => branchWhenTrue ? Op.BrU64Gt : Op.BrU64Le,
+                        _ => throw Unsupported(instruction, "unsupported i64 compare branch opcode " + compareOp),
+                    };
+                }
+
+                return compareOp switch
+                {
+                    BytecodeOp.Ceq => branchWhenTrue ? Op.BrI32Eq : Op.BrI32Ne,
+                    BytecodeOp.Clt => branchWhenTrue ? (unsigned ? Op.BrU32Lt : Op.BrI32Lt) : (unsigned ? Op.BrU32Ge : Op.BrI32Ge),
+                    BytecodeOp.Clt_Un => branchWhenTrue ? Op.BrU32Lt : Op.BrU32Ge,
+                    BytecodeOp.Cgt => branchWhenTrue ? (unsigned ? Op.BrU32Gt : Op.BrI32Gt) : (unsigned ? Op.BrU32Le : Op.BrI32Le),
+                    BytecodeOp.Cgt_Un => branchWhenTrue ? Op.BrU32Gt : Op.BrU32Le,
+                    _ => throw Unsupported(instruction, "unsupported i32 compare branch opcode " + compareOp),
+                };
+            }
+
+            private static bool IsCompareOp(BytecodeOp op)
+                => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
 
             private void EmitReturn(GenTree instruction, GenTree source)
             {
@@ -4326,7 +3910,7 @@ namespace Cnidaria.Cs
             {
                 if (op is Op.I32Div or Op.I32Rem or Op.U32Div or Op.U32Rem or
                     Op.I64Div or Op.I64Rem or Op.U64Div or Op.U64Rem)
-                    return true;
+                    return DivRemInstructionMayThrow(source);
 
                 if (op is Op.I32AddOvf or Op.I32SubOvf or Op.I32MulOvf or
                     Op.U32AddOvf or Op.U32SubOvf or Op.U32MulOvf or
@@ -4342,6 +3926,17 @@ namespace Cnidaria.Cs
 
                 return source.Kind is GenTreeKind.Conv or GenTreeKind.CastClass or GenTreeKind.UnboxAny
                     && source.CanThrow;
+            }
+
+            private static bool DivRemInstructionMayThrow(GenTree source)
+            {
+                if (source.Kind != GenTreeKind.Binary)
+                    return true;
+
+                if (source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+                    return true;
+
+                return GenTreeArithmeticSemantics.DivRemCanThrow(source);
             }
 
             private Label LabelForTarget(GenTree source)
@@ -4772,8 +4367,15 @@ namespace Cnidaria.Cs
             private static bool Is64BitInteger(RuntimeType? type, GenStackKind kind)
                 => kind == GenStackKind.I8 || type?.Name is "Int64" or "UInt64";
 
+            private static bool Is64BitBranchInteger(RuntimeType? type, GenStackKind kind)
+                => Is64BitInteger(type, kind) ||
+                   (TargetArchitecture.PointerSize == 8 && (kind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef)) ||
+                   (TargetArchitecture.PointerSize == 8 && (type?.PrimitiveKind is RuntimePrimitiveKind.NativeInt or RuntimePrimitiveKind.NativeUInt));
+
             private static bool IsUnsignedInteger(RuntimeType? type, GenStackKind kind)
-                => kind == GenStackKind.NativeUInt || type?.Name is "Byte" or "UInt16" or "UInt32" or "UInt64" or "UIntPtr" or "Char" or "Boolean";
+                => kind == GenStackKind.NativeUInt ||
+                   (type?.PrimitiveKind is RuntimePrimitiveKind.Boolean or RuntimePrimitiveKind.Char or RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.UInt16 or RuntimePrimitiveKind.UInt32 or RuntimePrimitiveKind.UInt64 or RuntimePrimitiveKind.NativeUInt) ||
+                   (type?.Name is "Byte" or "UInt16" or "UInt32" or "UInt64" or "UIntPtr" or "Char" or "Boolean");
 
             private static RegisterClass RegisterClassForStorage(RuntimeType? type, GenStackKind kind)
             {
@@ -5189,11 +4791,14 @@ namespace Cnidaria.Cs
                         position = 0;
                 }
 
+                int currentFuncletIndex = FuncletIndexForBlock(instruction.BlockId);
                 int rootStart = _state.GcRootCount;
                 var roots = new List<GcRootRecord>();
                 for (int i = 0; i < _method.GcLiveRanges.Length; i++)
                 {
                     var range = _method.GcLiveRanges[i];
+                    if (range.FuncletIndex != currentFuncletIndex)
+                        continue;
                     if (range.StartPosition <= position && position < range.EndPosition)
                     {
                         var record = ToGcRootRecord(range);
@@ -5210,6 +4815,22 @@ namespace Cnidaria.Cs
                 }
 
                 _asm.AddGcSafePoint(new GcSafePointRecord(pc, rootStart, roots.Count));
+            }
+
+            private int FuncletIndexForBlock(int blockId)
+            {
+                var funclets = _method.Funclets;
+                for (int i = 0; i < funclets.Length; i++)
+                {
+                    var blocks = funclets[i].BlockIds;
+                    for (int b = 0; b < blocks.Length; b++)
+                    {
+                        if (blocks[b] == blockId)
+                            return funclets[i].Index;
+                    }
+                }
+
+                return 0;
             }
 
             private static bool ContainsSameGcRootCell(List<GcRootRecord> roots, GcRootRecord candidate)
@@ -5288,15 +4909,25 @@ namespace Cnidaria.Cs
             private void EmitExceptionRegions()
             {
                 var regions = _method.Cfg.ExceptionRegions;
-                for (int i = 0; i < regions.Length; i++)
+                if (regions.Length == 0)
+                    return;
+
+                var regionOrder = EhFuncletLayout.ComputeVmRegionOrder(_method.Cfg);
+                var localEhIndexByCfgRegionIndex = new Dictionary<int, int>(regionOrder.Length);
+                for (int i = 0; i < regionOrder.Length; i++)
+                    localEhIndexByCfgRegionIndex[regions[regionOrder[i]].Index] = i;
+
+                for (int i = 0; i < regionOrder.Length; i++)
                 {
-                    var region = regions[i];
-                    int tryStart = BlockStartPc(region.TryStartBlockId);
-                    int tryEnd = BlockRangeEndPc(region.TryEndBlockIdExclusive);
-                    int handlerStart = BlockStartPc(region.HandlerStartBlockId);
-                    int handlerEnd = BlockRangeEndPc(region.HandlerEndBlockIdExclusive);
+                    var region = regions[regionOrder[i]];
+                    GetTryNativeRange(region, out int tryStart, out int tryEnd);
+                    GetFuncletNativeRange(region, out int handlerStart, out int handlerEnd);
                     int filterStart = region.Kind == CfgExceptionRegionKind.Filter ? handlerStart : -1;
                     int catchTypeId = region.Kind == CfgExceptionRegionKind.Catch && region.CatchTypeToken != 0 ? region.CatchTypeToken : -1;
+                    int parentLocalIndex = -1;
+                    if (region.ParentIndex >= 0 && localEhIndexByCfgRegionIndex.TryGetValue(region.ParentIndex, out int mappedParent))
+                        parentLocalIndex = mappedParent;
+
                     var kind = region.Kind switch
                     {
                         CfgExceptionRegionKind.Catch => catchTypeId < 0 ? EhRegionKind.CatchAll : EhRegionKind.Catch,
@@ -5305,7 +4936,80 @@ namespace Cnidaria.Cs
                         CfgExceptionRegionKind.Filter => EhRegionKind.Filter,
                         _ => EhRegionKind.CatchAll,
                     };
-                    _asm.AddExceptionRegion(new EhRegionRecord(kind, tryStart, tryEnd, handlerStart, handlerEnd, filterStart, catchTypeId, region.ParentIndex));
+                    _asm.AddExceptionRegion(new EhRegionRecord(
+                        kind,
+                        tryStart,
+                        tryEnd,
+                        handlerStart,
+                        handlerEnd,
+                        filterStart,
+                        catchTypeId,
+                        parentLocalIndex,
+                        region.TryStartPc,
+                        region.TryEndPc,
+                        region.HandlerStartPc,
+                        region.SourceHandlerIndex));
+                }
+            }
+
+            private void GetTryNativeRange(CfgExceptionRegion region, out int tryStart, out int tryEnd)
+            {
+                var blocks = EhFuncletLayout.BuildTryBlockIds(_method.Cfg, region);
+                if (blocks.Length == 0)
+                {
+                    tryStart = BlockStartPc(region.TryStartBlockId);
+                    tryEnd = BlockRangeEndPc(region.TryEndBlockIdExclusive);
+                    return;
+                }
+
+                EnsureContiguousNativeBlocks(blocks, "EH try");
+                tryStart = BlockStartPc(blocks[0]);
+                tryEnd = BlockEndPc(blocks[blocks.Length - 1]);
+            }
+
+            private void GetFuncletNativeRange(CfgExceptionRegion region, out int handlerStart, out int handlerEnd)
+            {
+                var blocks = EhFuncletLayout.BuildFuncletBlockIds(_method.Cfg, region);
+                if (blocks.Length == 0)
+                {
+                    handlerStart = BlockStartPc(region.HandlerStartBlockId);
+                    handlerEnd = BlockRangeEndPc(region.HandlerEndBlockIdExclusive);
+                    return;
+                }
+
+                EnsureContiguousNativeBlocks(blocks, "EH handler");
+                handlerStart = BlockStartPc(blocks[0]);
+                handlerEnd = BlockEndPc(blocks[blocks.Length - 1]);
+            }
+
+            private void EnsureContiguousNativeBlocks(ImmutableArray<int> blocks, string rangeName)
+            {
+                if (blocks.Length <= 1)
+                    return;
+
+                var members = new HashSet<int>();
+                for (int i = 0; i < blocks.Length; i++)
+                    members.Add(blocks[i]);
+
+                int firstIndex = -1;
+                int lastIndex = -1;
+                var order = _method.LinearBlockOrder;
+                for (int i = 0; i < order.Length; i++)
+                {
+                    if (!members.Contains(order[i]))
+                        continue;
+                    if (firstIndex < 0)
+                        firstIndex = i;
+                    lastIndex = i;
+                }
+
+                if (firstIndex < 0 || lastIndex < firstIndex)
+                    throw new InvalidOperationException(rangeName + " range contains blocks that were not emitted.");
+
+                for (int i = firstIndex; i <= lastIndex; i++)
+                {
+                    if (!members.Contains(order[i]))
+                        throw new InvalidOperationException(rangeName + " native range is not contiguous in funclet layout.");
                 }
             }
 
@@ -5314,6 +5018,13 @@ namespace Cnidaria.Cs
                 if ((uint)blockId >= (uint)_blockStartPc.Length || _blockStartPc[blockId] < 0)
                     throw new InvalidOperationException($"Block B{blockId} was not emitted.");
                 return _blockStartPc[blockId];
+            }
+
+            private int BlockEndPc(int blockId)
+            {
+                if ((uint)blockId >= (uint)_blockEndPc.Length || _blockEndPc[blockId] < 0)
+                    throw new InvalidOperationException($"Block B{blockId} was not emitted.");
+                return _blockEndPc[blockId];
             }
 
             private int BlockRangeEndPc(int endBlockIdExclusive)

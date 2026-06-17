@@ -915,9 +915,9 @@ namespace Cnidaria.Cs
                     case Op.LdElemPtr:
                         {
                             var type = TypeLayout(ins.Imm);
-                            SetGpr(ins.Rd, 
-                                type.IsReferenceType || type.IsPointerLike || type.IsNativeInt 
-                                    ? ReadNativeUnchecked(ArrayEA(ins)) 
+                            SetGpr(ins.Rd,
+                                type.IsReferenceType || type.IsPointerLike || type.IsNativeInt
+                                    ? ReadNativeUnchecked(ArrayEA(ins))
                                     : ReadI64Unchecked(ArrayEA(ins)));
                         }
                         break;
@@ -1904,7 +1904,7 @@ namespace Cnidaria.Cs
                 case PendingContinuationKind.None:
                     return;
                 case PendingContinuationKind.Leave:
-                    _pc = targetPc;
+                    ContinueLeaveAfterFinally(_pc - 1, targetPc);
                     return;
                 case PendingContinuationKind.Throw:
                     ThrowManaged(_currentExceptionRef, _pc - 1, preserveExistingThrowSite: true);
@@ -1916,17 +1916,42 @@ namespace Cnidaria.Cs
                 case PendingContinuationKind.ReturnValueAddress:
                     {
                         ReturnPayloadKind payloadKind = ReturnPayloadFromContinuation(kind);
-                        if (payloadKind == ReturnPayloadKind.Float)
-                            SetFpr(MachineRegisters.FloatReturnValue0, i0);
-                        else if (payloadKind != ReturnPayloadKind.None)
-                            SetGpr(MachineRegisters.ReturnValue0, i0);
-                        RestoreSavedRegistersForCurrentFrame();
-                        ReturnFromCurrentFrame(payloadKind);
+                        ContinueReturnAfterFinally(_pc - 1, payloadKind, i0);
                         return;
                     }
                 default:
                     throw new InvalidOperationException("Invalid finally continuation.");
             }
+        }
+
+        private void ContinueLeaveAfterFinally(int fromPc, int targetPc)
+        {
+            if (TryFindEnclosingFinally(fromPc, targetPc, out var nextFinally))
+            {
+                SetTopContinuation(PendingContinuationKind.Leave, targetPc, 0);
+                _pc = nextFinally.HandlerStartPc;
+                return;
+            }
+
+            _pc = targetPc;
+        }
+
+        private void ContinueReturnAfterFinally(int fromPc, ReturnPayloadKind payloadKind, long i0)
+        {
+            if (TryFindEnclosingFinally(fromPc, targetPc: -1, out var nextFinally))
+            {
+                SetTopContinuation(ContinuationFromReturnPayload(payloadKind), -1, i0);
+                _pc = nextFinally.HandlerStartPc;
+                return;
+            }
+
+            if (payloadKind == ReturnPayloadKind.Float)
+                SetFpr(MachineRegisters.FloatReturnValue0, i0);
+            else if (payloadKind != ReturnPayloadKind.None)
+                SetGpr(MachineRegisters.ReturnValue0, i0);
+
+            RestoreSavedRegistersForCurrentFrame();
+            ReturnFromCurrentFrame(payloadKind);
         }
 
         private void ThrowManaged(long exceptionRef, int throwPc, bool preserveExistingThrowSite)
@@ -2122,50 +2147,76 @@ namespace Cnidaria.Cs
         }
         private bool TryFindHandler(int pc, int exceptionRef, out EhRegionRecord handler)
         {
-            var m = _image.Methods[_currentMethodIndex];
-            int bestSpan = int.MaxValue;
+            var method = _image.Methods[_currentMethodIndex];
             handler = default;
-            bool found = false;
-            RuntimeType? exceptionType = null;
-            if (exceptionRef != 0)
-                exceptionType = GetObjectTypeFromRef(exceptionRef);
+            if (method.EhCount == 0 || pc < 0)
+                return false;
 
-            for (int i = 0; i < m.EhCount; i++)
+            RuntimeType? exceptionType = exceptionRef != 0 ? GetObjectTypeFromRef(exceptionRef) : null;
+            var activeRegions = new List<int>();
+            for (int i = 0; i < method.EhCount; i++)
             {
-                var h = _image.EhRegions[m.EhStartIndex + i];
-                if (pc < h.TryStartPc || pc >= h.TryEndPc)
-                    continue;
-                int span = h.TryEndPc - h.TryStartPc;
-                if (span >= bestSpan)
-                    continue;
-                var kind = (EhRegionKind)h.Kind;
-                if (kind == EhRegionKind.Finally || kind == EhRegionKind.Fault)
+                if (IsPcProtectedByRegion(method, pc, i))
+                    activeRegions.Add(i);
+            }
+
+            if (activeRegions.Count == 0)
+                return false;
+
+            activeRegions.Sort((left, right) => CompareEhDispatchOrder(method, left, right));
+            for (int i = 0; i < activeRegions.Count; i++)
+            {
+                var candidate = _image.EhRegions[method.EhStartIndex + activeRegions[i]];
+                var kind = (EhRegionKind)candidate.Kind;
+                if (kind == EhRegionKind.Finally || kind == EhRegionKind.Fault || IsMatchingCatch(candidate, exceptionType))
                 {
-                    bestSpan = span;
-                    handler = h;
-                    found = true;
-                    continue;
-                }
-                if (kind == EhRegionKind.CatchAll)
-                {
-                    bestSpan = span;
-                    handler = h;
-                    found = true;
-                    continue;
-                }
-                if (kind == EhRegionKind.Catch && exceptionType is not null)
-                {
-                    var catchType = ResolveCatchType(h.CatchTypeId);
-                    if (IsAssignableTo(exceptionType, catchType))
-                    {
-                        bestSpan = span;
-                        handler = h;
-                        found = true;
-                    }
+                    handler = candidate;
+                    return true;
                 }
             }
-            return found;
+
+            return false;
         }
+
+        private int CompareEhDispatchOrder(MethodRecord method, int leftLocalIndex, int rightLocalIndex)
+        {
+            if (leftLocalIndex == rightLocalIndex)
+                return 0;
+
+            var left = _image.EhRegions[method.EhStartIndex + leftLocalIndex];
+            var right = _image.EhRegions[method.EhStartIndex + rightLocalIndex];
+            int leftSpan = SourceTrySpan(left);
+            int rightSpan = SourceTrySpan(right);
+
+            int c = leftSpan.CompareTo(rightSpan);
+            if (c != 0) return c;
+            c = right.SourceTryStartPc.CompareTo(left.SourceTryStartPc);
+            if (c != 0) return c;
+            c = left.SourceTryEndPc.CompareTo(right.SourceTryEndPc);
+            if (c != 0) return c;
+            c = left.SourceHandlerIndex.CompareTo(right.SourceHandlerIndex);
+            if (c != 0) return c;
+            c = left.SourceHandlerStartPc.CompareTo(right.SourceHandlerStartPc);
+            if (c != 0) return c;
+            return leftLocalIndex.CompareTo(rightLocalIndex);
+        }
+
+        private static int SourceTrySpan(EhRegionRecord region)
+            => region.SourceTryEndPc - region.SourceTryStartPc;
+
+        private bool IsMatchingCatch(EhRegionRecord region, RuntimeType? exceptionType)
+        {
+            var kind = (EhRegionKind)region.Kind;
+            if (kind == EhRegionKind.CatchAll)
+                return true;
+
+            if (kind != EhRegionKind.Catch || exceptionType is null)
+                return false;
+
+            var catchType = ResolveCatchType(region.CatchTypeId);
+            return IsAssignableTo(exceptionType, catchType);
+        }
+
         private RuntimeType ResolveCatchType(int catchTypeTokenOrId)
         {
             int table = MetadataToken.Table(catchTypeTokenOrId);
@@ -2188,12 +2239,13 @@ namespace Cnidaria.Cs
                 var h = _image.EhRegions[m.EhStartIndex + i];
                 if ((EhRegionKind)h.Kind != EhRegionKind.Finally)
                     continue;
-                if (fromPc < h.TryStartPc || fromPc >= h.TryEndPc)
+                if (!IsPcProtectedByRegion(m, fromPc, i))
                     continue;
-                if (targetPc >= h.TryStartPc && targetPc < h.TryEndPc)
+                if (targetPc >= 0 && IsPcProtectedByRegion(m, targetPc, i))
                     continue;
-                int span = h.TryEndPc - h.TryStartPc;
-                if (span < bestSpan)
+
+                int span = SourceTrySpan(h);
+                if (span < bestSpan || (span == bestSpan && h.SourceHandlerIndex < region.SourceHandlerIndex))
                 {
                     bestSpan = span;
                     region = h;
@@ -2201,6 +2253,51 @@ namespace Cnidaria.Cs
                 }
             }
             return found;
+        }
+
+        private bool IsPcProtectedByRegion(MethodRecord method, int pc, int localRegionIndex)
+        {
+            if ((uint)localRegionIndex >= (uint)method.EhCount)
+                return false;
+
+            var region = _image.EhRegions[method.EhStartIndex + localRegionIndex];
+            if (pc >= region.TryStartPc && pc < region.TryEndPc)
+                return true;
+
+            int current = FindInnermostHandlerRegionIndexContainingPc(method, pc);
+            int guard = 0;
+            while (current >= 0 && guard++ < method.EhCount)
+            {
+                var currentRegion = _image.EhRegions[method.EhStartIndex + current];
+                int parent = currentRegion.ParentRegionIndex;
+                if (parent == localRegionIndex)
+                    return true;
+                if ((uint)parent >= (uint)method.EhCount)
+                    return false;
+                current = parent;
+            }
+
+            return false;
+        }
+
+        private int FindInnermostHandlerRegionIndexContainingPc(MethodRecord method, int pc)
+        {
+            int best = -1;
+            int bestSpan = int.MaxValue;
+            for (int i = 0; i < method.EhCount; i++)
+            {
+                var region = _image.EhRegions[method.EhStartIndex + i];
+                if (pc < region.HandlerStartPc || pc >= region.HandlerEndPc)
+                    continue;
+
+                int span = region.HandlerEndPc - region.HandlerStartPc;
+                if (span < bestSpan || (span == bestSpan && i > best))
+                {
+                    best = i;
+                    bestSpan = span;
+                }
+            }
+            return best;
         }
 
         internal string? HostReadString(VmValue v, CancellationToken ct)
@@ -2799,7 +2896,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            if (p.Kind == RuntimeTypeKind.Pointer && 
+            if (p.Kind == RuntimeTypeKind.Pointer &&
                 p.ElementType is not null && (p.ElementType.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int8 ||
                 (p.ElementType.Namespace == "System" && (p.ElementType.Name == "Byte" || p.ElementType.Name == "SByte"))))
             {
@@ -5283,7 +5380,7 @@ namespace Cnidaria.Cs
         private void SetFpr(byte register, long bits)
             => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - (byte)MachineRegister.F0) = bits;
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SetFpr(MachineRegister register, long bits) 
+        private void SetFpr(MachineRegister register, long bits)
             => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - MachineRegister.F0) = bits;
         //  => SetFpr(RegisterVmIsa.EncodeRegister(register), bits); trust the compiler to avoid mistakes here
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -6049,7 +6146,7 @@ namespace Cnidaria.Cs
                 if (writable) CheckWritableRange(abs, size);
                 return;
             }
-                
+
             throw new AccessViolationException();
         }
 

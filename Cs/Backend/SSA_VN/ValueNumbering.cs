@@ -1401,19 +1401,37 @@ namespace Cnidaria.Cs
                             break;
                         if (IsOne(args[0])) { folded = args[1]; return true; }
                         if (IsOne(args[1])) { folded = args[0]; return true; }
+                        if (IsAllBitsSet(args[0])) { folded = VNForFunc(stackKind, type, ValueNumberFunction.Neg, args[1]); return true; }
+                        if (IsAllBitsSet(args[1])) { folded = VNForFunc(stackKind, type, ValueNumberFunction.Neg, args[0]); return true; }
                         if (IsZero(args[0]) || IsZero(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
+                        if (TryGetPositivePowerOfTwoShift(args[0], out int leftMulShift))
+                        { folded = VNForFunc(stackKind, type, ValueNumberFunction.Shl, args[1], VNForInt32(leftMulShift)); return true; }
+                        if (TryGetPositivePowerOfTwoShift(args[1], out int rightMulShift))
+                        { folded = VNForFunc(stackKind, type, ValueNumberFunction.Shl, args[0], VNForInt32(rightMulShift)); return true; }
                         break;
                     case ValueNumberFunction.Div:
-                    case ValueNumberFunction.DivUn:
                         if (!integerLike)
                             break;
                         if (IsOne(args[1])) { folded = args[0]; return true; }
                         break;
+                    case ValueNumberFunction.DivUn:
+                        if (!integerLike)
+                            break;
+                        if (IsOne(args[1])) { folded = args[0]; return true; }
+                        if (TryGetPositivePowerOfTwoShift(args[1], out int divShift))
+                        { folded = VNForFunc(stackKind, type, ValueNumberFunction.ShrUn, args[0], VNForInt32(divShift)); return true; }
+                        break;
                     case ValueNumberFunction.Rem:
+                        if (!integerLike)
+                            break;
+                        if (IsOne(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
+                        break;
                     case ValueNumberFunction.RemUn:
                         if (!integerLike)
                             break;
                         if (IsOne(args[1])) { folded = ZeroForStackKind(stackKind); return true; }
+                        if (TryGetUnsignedPowerOfTwoMask(args[1], stackKind, out ValueNumber remMask))
+                        { folded = VNForFunc(stackKind, type, ValueNumberFunction.And, args[0], remMask); return true; }
                         break;
                     case ValueNumberFunction.And:
                         if (!integerLike)
@@ -1593,12 +1611,56 @@ namespace Cnidaria.Cs
                     c.Kind == ValueNumberConstantKind.Int64 && c.A == -1);
         }
 
+        private bool TryGetPositivePowerOfTwoShift(ValueNumber vn, out int shift)
+        {
+            shift = 0;
+            if (!TryGetConstant(vn, out var c) || !IsIntegerConstant(c))
+                return false;
+
+            ulong value = c.Kind == ValueNumberConstantKind.Int64
+                ? (ulong)c.A
+                : (uint)c.A;
+
+            if (value <= 1 || (value & (value - 1)) != 0)
+                return false;
+
+            while ((value >>= 1) != 0)
+                shift++;
+            return true;
+        }
+
+        private bool TryGetUnsignedPowerOfTwoMask(ValueNumber vn, GenStackKind stackKind, out ValueNumber mask)
+        {
+            mask = NoVN;
+            if (!TryGetConstant(vn, out var c) || !IsIntegerConstant(c))
+                return false;
+
+            bool useI8 = UsesEightByteInteger(stackKind) || c.Kind == ValueNumberConstantKind.Int64;
+            ulong value = c.Kind == ValueNumberConstantKind.Int64
+                ? (ulong)c.A
+                : (uint)c.A;
+
+            if (value <= 1 || (value & (value - 1)) != 0)
+                return false;
+
+            ulong rawMask = value - 1;
+            mask = useI8
+                ? VNForInt64(unchecked((long)rawMask))
+                : VNForInt32(unchecked((int)(uint)rawMask));
+            return true;
+        }
+
+        private static bool UsesEightByteInteger(GenStackKind stackKind)
+            => stackKind == GenStackKind.I8 ||
+               ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) &&
+                TargetArchitecture.PointerSize == 8);
+
         private bool IsEffectiveZeroShift(ValueNumber vn, GenStackKind stackKind)
         {
             if (!TryGetConstant(vn, out var c) || !IsIntegerConstant(c))
                 return false;
 
-            int mask = stackKind == GenStackKind.I8 ? 0x3f : 0x1f;
+            int mask = UsesEightByteInteger(stackKind) ? 0x3f : 0x1f;
             return (((int)c.A) & mask) == 0;
         }
 
@@ -3181,10 +3243,14 @@ namespace Cnidaria.Cs
                         if (IsCheckedOverflowBinaryOp(node.SourceOp))
                             result = AddException(result, ValueNumberFunction.OverflowExc, normalValue);
 
-                        if (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
+                        if ((node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) &&
+                            GenTreeArithmeticSemantics.IsIntegralArithmeticType(node.Type, node.StackKind))
                         {
-                            result = AddException(result, ValueNumberFunction.DivideByZeroExc, OperandNormal(operands, 1));
-                            if (node.SourceOp is BytecodeOp.Div or BytecodeOp.Rem)
+                            ValueNumber dividend = OperandNormal(operands, 0);
+                            ValueNumber divisor = OperandNormal(operands, 1);
+                            if (DivRemMayThrowDivideByZero(node, divisor))
+                                result = AddException(result, ValueNumberFunction.DivideByZeroExc, divisor);
+                            if (SignedDivRemMayThrowArithmetic(node, dividend, divisor))
                                 result = AddException(result, ValueNumberFunction.ArithmeticExc, normalValue, _store.VNForInt32((int)node.SourceOp));
                         }
                         break;
@@ -3276,6 +3342,64 @@ namespace Cnidaria.Cs
                 if ((uint)index >= (uint)operands.Length)
                     return ValueNumberStore.NoVN;
                 return _store.VNNormalValue(operands[index][category]);
+            }
+
+            private bool DivRemMayThrowDivideByZero(GenTree node, ValueNumber divisor)
+            {
+                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind);
+                return !TryGetIntegralConstant(divisor, bits, out _, out ulong unsignedDivisor) || unsignedDivisor == 0;
+            }
+
+            private bool SignedDivRemMayThrowArithmetic(GenTree node, ValueNumber dividend, ValueNumber divisor)
+            {
+                if (node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Rem))
+                    return false;
+
+                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind);
+                if (TryGetIntegralConstant(divisor, bits, out long signedDivisor, out ulong unsignedDivisor))
+                {
+                    if (unsignedDivisor == 0 || signedDivisor != -1)
+                        return false;
+                }
+
+                if (TryGetIntegralConstant(dividend, bits, out long signedDividend, out _))
+                    return GenTreeArithmeticSemantics.IsSignedMinValue(signedDividend, bits);
+
+                return true;
+            }
+
+            private bool TryGetIntegralConstant(ValueNumber value, int bits, out long signedValue, out ulong unsignedValue)
+            {
+                if (_store.TryGetConstant(value, out var key))
+                {
+                    if (key.Kind == ValueNumberConstantKind.Int32)
+                    {
+                        int v = unchecked((int)key.A);
+                        signedValue = v;
+                        unsignedValue = unchecked((uint)v);
+                        return true;
+                    }
+
+                    if (key.Kind == ValueNumberConstantKind.Int64)
+                    {
+                        if (bits <= 32)
+                        {
+                            int v = unchecked((int)key.A);
+                            signedValue = v;
+                            unsignedValue = unchecked((uint)v);
+                        }
+                        else
+                        {
+                            signedValue = key.A;
+                            unsignedValue = unchecked((ulong)key.A);
+                        }
+                        return true;
+                    }
+                }
+
+                signedValue = 0;
+                unsignedValue = 0;
+                return false;
             }
 
             private ValueNumber AddException(ValueNumber set, ValueNumberFunction function, params ValueNumber[] args)
