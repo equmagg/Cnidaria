@@ -196,19 +196,10 @@ namespace Cnidaria.Cs
             }
 
             var statements = block.Statements;
-            if (statements.Length != 0)
+            if (statements.Length != 0 &&
+                TryRewriteBlockStatements(block, statements, splitInfo, ref nextTreeId, out var rewrittenStatements))
             {
-                var last = statements[statements.Length - 1];
-                if (TryRewriteTerminator(block, last, splitInfo, ref nextTreeId, out var rewrittenLast, out var appendedBranch))
-                {
-                    var rewritten = ImmutableArray.CreateBuilder<GenTree>(statements.Length + (appendedBranch is null ? 0 : 1));
-                    for (int i = 0; i + 1 < statements.Length; i++)
-                        rewritten.Add(statements[i]);
-                    rewritten.Add(rewrittenLast);
-                    if (appendedBranch is not null)
-                        rewritten.Add(appendedBranch);
-                    statements = rewritten.ToImmutable();
-                }
+                statements = rewrittenStatements;
             }
 
             return new GenTreeBlock(
@@ -222,6 +213,92 @@ namespace Cnidaria.Cs
                 statements,
                 successors.ToImmutable(),
                 successorPcs.ToImmutable());
+        }
+
+        private static bool TryRewriteBlockStatements(
+            GenTreeBlock block,
+            ImmutableArray<GenTree> statements,
+            Dictionary<(int from, int to), SplitEdgeInfo> splitInfo,
+            ref int nextTreeId,
+            out ImmutableArray<GenTree> rewrittenStatements)
+        {
+            rewrittenStatements = statements;
+
+            if (TryGetConditionalTransfer(statements, out var conditional, out var appendedFallThrough))
+            {
+                int conditionalIndex = appendedFallThrough is null ? statements.Length - 1 : statements.Length - 2;
+                int appendedIndex = appendedFallThrough is null ? -1 : statements.Length - 1;
+                GenTree rewrittenConditional = conditional;
+                GenTree? rewrittenAppended = appendedFallThrough;
+                GenTree? appendedBranch = null;
+                bool changed = false;
+
+                if (conditional.TargetBlockId >= 0 &&
+                    splitInfo.TryGetValue((block.Id, conditional.TargetBlockId), out var conditionalInfo))
+                {
+                    rewrittenConditional = CloneWithTarget(conditional, conditional.Kind, conditional.SourceOp, conditionalInfo.SplitPc, conditionalInfo.SplitBlockId);
+                    changed = true;
+                }
+
+                if (appendedFallThrough is not null)
+                {
+                    if (appendedFallThrough.TargetBlockId >= 0 &&
+                        splitInfo.TryGetValue((block.Id, appendedFallThrough.TargetBlockId), out var appendedInfo))
+                    {
+                        rewrittenAppended = CloneWithTarget(appendedFallThrough, appendedFallThrough.Kind, appendedFallThrough.SourceOp, appendedInfo.SplitPc, appendedInfo.SplitBlockId);
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < block.SuccessorBlockIds.Length; i++)
+                    {
+                        int successor = block.SuccessorBlockIds[i];
+                        if (successor == conditional.TargetBlockId)
+                            continue;
+
+                        if (splitInfo.TryGetValue((block.Id, successor), out var fallThroughInfo))
+                        {
+                            appendedBranch = CreateBranchToSplit(conditional, fallThroughInfo, ref nextTreeId);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!changed)
+                    return false;
+
+                var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length + (appendedBranch is null ? 0 : 1));
+                for (int i = 0; i < statements.Length; i++)
+                {
+                    if (i == conditionalIndex)
+                        builder.Add(rewrittenConditional);
+                    else if (i == appendedIndex && rewrittenAppended is not null)
+                        builder.Add(rewrittenAppended);
+                    else
+                        builder.Add(statements[i]);
+                }
+
+                if (appendedBranch is not null)
+                    builder.Add(appendedBranch);
+
+                rewrittenStatements = builder.ToImmutable();
+                return true;
+            }
+
+            var last = statements[statements.Length - 1];
+            if (!TryRewriteTerminator(block, last, splitInfo, ref nextTreeId, out var rewrittenLast, out var appendedBranchForTerminator))
+                return false;
+
+            var rewritten = ImmutableArray.CreateBuilder<GenTree>(statements.Length + (appendedBranchForTerminator is null ? 0 : 1));
+            for (int i = 0; i + 1 < statements.Length; i++)
+                rewritten.Add(statements[i]);
+            rewritten.Add(rewrittenLast);
+            if (appendedBranchForTerminator is not null)
+                rewritten.Add(appendedBranchForTerminator);
+            rewrittenStatements = rewritten.ToImmutable();
+            return true;
         }
 
         private static bool TryRewriteTerminator(

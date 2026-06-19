@@ -2,6 +2,7 @@
 ![build](https://img.shields.io/badge/build-passing-brightgreen) ![dotnet](https://img.shields.io/badge/.NET-10.0-blue)
 
 Cnidaria the **interpreter** and compiler for primarily **C#** and multiple other languages (currently C).
+
 It is *THE solution to use modern C# as an embedded/scripting language*. Be it DSL, in-game scripting or remote code execution.
 While it strives to cover almost all of C# syntax and be very close in semantics, it is primarily designed for small, fast and reasonably simple embedded scripts. 
 As such, is does not follow CoreCLR behaviour one to one.
@@ -34,7 +35,7 @@ Console.WriteLine(output);
 ## Pipeline
 We roughly follow Roslyn/RyuJiT compilation phases.
 Stack-based bytecode, being an IL analogue, can be directly interpreted for near zero startup time.
-For more complex and performant scripts you can compile it into low level register bytecode, sacrificing some compilation time for all the serious optimizations.
+For more complex and performant scripts you can compile it into low level register bytecode, sacrificing some compilation time for all the serious optimizations and performance.
 
 Source code -> stack bytecode path mimics Roslyn pipeline
 ```
@@ -47,12 +48,36 @@ Bytecode Emiter > stack-based bytecode > stack-based VM
 
 stack bytecode -> register bytecode path mimics RyuJiT pipeline
 ```
-stack-based bytecode > Import/Morth/Inline > GenTree HIR
-CFG/SSA notation > SSA optimization > rationalization > LIR
-LSRA (register allocation) > CodeGen > register bytecode > register VM
+stack-based bytecode > Import/Morph/Inline/Physical Promotion > GenTree HIR
+CFG/SSA anotation > VN-based SSA optimization > rationalization > LIR
+LSRA (register allocation) > target specific CodeGen > target > register VM (if target is register bytecode)
+```
+SSA/VN-based optimizations we currenly implement in order:
+Constant folding
+Сonstant/fact propagation
+Copy propagation
+Redundant Branch Optimization
+Common Subexpression Elimination
+Dead Code Elimination
+Strength reduction
+---
+
+# С
+For C we avoid stack-based VM entirely and map it to C# Register VM, which is low level enough to host C without issues, allowing for future interop.
+C compilation steps go as follows
+```
+Preprocessor+Lexer > Token stream
+Parser > AST (Syntax only)
+Binder > BoundTree (Semantics)
+Declarator + Gimplifier > GIMPLE (Lowering)
+> CFG (Control Flow Graph)
+> SSA (Static Single Assignment form)
+> LIR (Linear IR)
+> LSRA (Register Allocator)
+> target specific CodeGen > target
 ```
 
-## C Hello World
+### C Hello World
 
 ```cs
 var code = """

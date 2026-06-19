@@ -645,6 +645,15 @@ namespace Cnidaria.C
             var parallelCopyTempOffset = offset;
             offset = checked(offset + parallelCopyTempSize);
 
+            // Floating-point immediates are materialized by storing their raw bits through
+            // an integer register and then loading them into an FPR. Keep this scratch
+            // slot separate from the parallel-copy temporary area because an immediate
+            // can be used while parallel-copy temporaries already contain live data.
+            offset = AlignUp(offset, _options.SpillSlotAlignment);
+            var floatingImmediateTempOffset = offset;
+            var floatingImmediateTempSize = AlignUp(Math.Max(8, _options.SpillSlotSize), _options.SpillSlotAlignment);
+            offset = checked(offset + floatingImmediateTempSize);
+
             var usedRegisters = allocations.Values
                 .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
                 .Select(static a => a.PhysicalRegister)
@@ -678,6 +687,8 @@ namespace Cnidaria.C
                 spillAreaSize,
                 parallelCopyTempOffset,
                 parallelCopyTempSize,
+                floatingImmediateTempOffset,
+                floatingImmediateTempSize,
                 savedRegisterAreaOffset,
                 savedRegisterAreaSize,
                 stackSlotOffsets,
@@ -1051,6 +1062,8 @@ namespace Cnidaria.C
         public int SpillAreaSize { get; }
         public int ParallelCopyTempOffset { get; }
         public int ParallelCopyTempSize { get; }
+        public int FloatingImmediateTempOffset { get; }
+        public int FloatingImmediateTempSize { get; }
         public int SavedRegisterAreaOffset { get; }
         public int SavedRegisterAreaSize { get; }
         public int VarArgsPointerOffset { get; }
@@ -1078,6 +1091,8 @@ namespace Cnidaria.C
             int spillAreaSize,
             int parallelCopyTempOffset,
             int parallelCopyTempSize,
+            int floatingImmediateTempOffset,
+            int floatingImmediateTempSize,
             int savedRegisterAreaOffset,
             int savedRegisterAreaSize,
             IReadOnlyDictionary<LirStackSlot, int> stackSlotOffsets,
@@ -1094,6 +1109,8 @@ namespace Cnidaria.C
             SpillAreaSize = spillAreaSize;
             ParallelCopyTempOffset = parallelCopyTempOffset;
             ParallelCopyTempSize = parallelCopyTempSize;
+            FloatingImmediateTempOffset = floatingImmediateTempOffset;
+            FloatingImmediateTempSize = floatingImmediateTempSize;
             SavedRegisterAreaOffset = savedRegisterAreaOffset;
             SavedRegisterAreaSize = savedRegisterAreaSize;
             VarArgsPointerOffset = varArgsPointerOffset;

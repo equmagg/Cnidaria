@@ -17,6 +17,7 @@ namespace Cnidaria.Cs
             var memoryDefinitionsByKind = BuildMemoryDefinitionsByKind(memoryDefinitions);
             var localLiveness = SsaLocalLiveness.Build(method);
             VerifyDescriptorTables(method, definitions);
+            VerifySourceTreeIdentity(method);
             VerifyLclVarDscState(method);
             VerifyPrunedSsaLiveness(method, localLiveness);
             VerifyValueNumberBindings(method, definitions, memoryDefinitions);
@@ -32,6 +33,64 @@ namespace Cnidaria.Cs
 
                 for (int s = 0; s < block.Statements.Length; s++)
                     VerifyStatement(method, definitions, definitionsBySlot, memoryDefinitions, memoryDefinitionsByKind, localLiveness, block.Id, s, block.Statements[s]);
+            }
+        }
+
+        private static void VerifySourceTreeIdentity(SsaMethod method)
+        {
+            if (!ReferenceEquals(method.GenTreeMethod.Ssa, method))
+            {
+                var attached = method.GenTreeMethod.Ssa;
+                if (attached is not null && !ReferenceEquals(attached.GenTreeMethod, method.GenTreeMethod))
+                    throw new InvalidOperationException("SSA method is attached to a different GenTree method.");
+            }
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var block = method.Blocks[b];
+                if ((uint)block.Id >= (uint)method.GenTreeMethod.Blocks.Length)
+                    throw new InvalidOperationException($"SSA block B{block.Id} has no matching GenTree block.");
+
+                var genBlock = method.GenTreeMethod.Blocks[block.Id];
+                if (genBlock.Id != block.Id)
+                    throw new InvalidOperationException($"SSA block B{block.Id} does not match GenTree block B{genBlock.Id}.");
+
+                if (block.Statements.Length != genBlock.Statements.Length)
+                    throw new InvalidOperationException($"SSA block B{block.Id} statement count does not match GenTree block.");
+
+                if (block.StatementTreeLists.Length != genBlock.StatementTreeLists.Length)
+                    throw new InvalidOperationException($"SSA block B{block.Id} statement tree-list count does not match GenTree block.");
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                {
+                    VerifySourceTreeIdentity(block.Statements[s], genBlock.Statements[s]);
+                    VerifySourceTreeListIdentity(block.Id, s, block.StatementTreeLists[s], genBlock.StatementTreeLists[s]);
+                }
+            }
+        }
+
+        private static void VerifySourceTreeIdentity(SsaTree tree, GenTree source)
+        {
+            if (!ReferenceEquals(tree.Source, source))
+                throw new InvalidOperationException($"SSA tree view points at node {tree.Source.Id}, but GenTree contains node {source.Id}.");
+
+            var operands = tree.Operands;
+            if (operands.Length != source.Operands.Length)
+                throw new InvalidOperationException($"SSA tree view for node {source.Id} has stale operand count.");
+
+            for (int i = 0; i < operands.Length; i++)
+                VerifySourceTreeIdentity(operands[i], source.Operands[i]);
+        }
+
+        private static void VerifySourceTreeListIdentity(int blockId, int statementIndex, ImmutableArray<SsaTree> ssaTreeList, ImmutableArray<GenTree> genTreeList)
+        {
+            if (ssaTreeList.Length != genTreeList.Length)
+                throw new InvalidOperationException($"SSA tree-list length differs from GenTree tree-list at B{blockId}:S{statementIndex}.");
+
+            for (int i = 0; i < ssaTreeList.Length; i++)
+            {
+                if (!ReferenceEquals(ssaTreeList[i].Source, genTreeList[i]))
+                    throw new InvalidOperationException($"SSA tree-list node at B{blockId}:S{statementIndex}:T{i} points at node {ssaTreeList[i].Source.Id}, but GenTree has node {genTreeList[i].Id}.");
             }
         }
 
@@ -546,7 +605,7 @@ namespace Cnidaria.Cs
             {
                 var value = tree.LocalFieldBaseValue.Value;
                 if (!definitions.TryGetValue(value, out var definition))
-                    throw new InvalidOperationException("Tree node {tree.Source.Id} uses missing local-field base SSA value {value}.");
+                    throw new InvalidOperationException($"Tree node {tree.Source.Id} uses missing local-field base SSA value {value}.");
                 AddLocalUse(localUses, definition.Descriptor, blockId, isPhi: false);
             }
 
@@ -554,7 +613,7 @@ namespace Cnidaria.Cs
             {
                 var value = tree.MemoryUses[i];
                 if (!memoryDefinitions.TryGetValue(value, out var definition))
-                    throw new InvalidOperationException("Tree node {tree.Source.Id} uses missing memory SSA value {value}.");
+                    throw new InvalidOperationException($"Tree node {tree.Source.Id} uses missing memory SSA value {value}.");
                 AddMemoryUse(memoryUses, definition.Descriptor, blockId, isPhi: false);
             }
 

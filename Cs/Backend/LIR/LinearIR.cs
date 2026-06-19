@@ -569,6 +569,9 @@ namespace Cnidaria.Cs
             if (!memoryAccess.IsNone)
                 return false;
 
+            if (source.Kind == GenTreeKind.Box && IsStackHomeBoxSource(source))
+                return false;
+
             return source.Kind switch
             {
                 GenTreeKind.Nop => false,
@@ -587,6 +590,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.StaticField => false,
                 GenTreeKind.StaticFieldAddr => false,
                 GenTreeKind.Branch => false,
+                GenTreeKind.Return => false,
                 GenTreeKind.Rethrow => false,
                 GenTreeKind.EndFinally => false,
                 _ => true,
@@ -595,7 +599,7 @@ namespace Cnidaria.Cs
 
         private static byte InternalGeneralRegisterCount(GenTree source, GenTree? result, LinearMemoryAccess memoryAccess)
         {
-            int count = source.Kind switch
+            int count = source.Kind == GenTreeKind.Box && IsStackHomeBoxSource(source) ? 1 : source.Kind switch
             {
                 GenTreeKind.ArrayElement => ArrayElementLoadGeneralScratchCount(result),
                 GenTreeKind.ArrayElementAddr => 1,
@@ -645,6 +649,15 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Node {source.Id} requires too many internal float registers.");
 
             return (byte)count;
+        }
+
+        private static bool IsStackHomeBoxSource(GenTree node)
+        {
+            if (node.Operands.IsDefaultOrEmpty)
+                return false;
+
+            var operand = node.Operands[0].RegisterResult ?? node.Operands[0];
+            return MachineAbi.IsBlockCopyValue(operand.RuntimeType ?? operand.Type, operand.StackKind);
         }
 
         private static GenTree? MultiRegisterOperandValue(GenTree node, int operandIndex)

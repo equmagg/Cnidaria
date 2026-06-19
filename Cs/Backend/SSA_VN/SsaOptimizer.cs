@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Text;
 
 namespace Cnidaria.Cs
 {
@@ -11,14 +10,14 @@ namespace Cnidaria.Cs
         public static SsaOptimizationOptions DefaultWithoutValidation => new SsaOptimizationOptions { Validate = false };
 
         public bool Validate { get; set; } = true;
-        public bool PropagateConstants { get; set; } = true;
-        public bool FoldConstants { get; set; } = true;
-        public bool SimplifyAlgebraicIdentities { get; set; } = true;
-        public bool RemoveDeadDefinitions { get; set; } = true;
-        public bool CopyPropagate { get; set; } = true;
-        public bool FoldRedundantBranches { get; set; } = true;
-        public bool JumpThreadBranches { get; set; } = true;
-        public bool RemoveUnreachableBlocks { get; set; } = true;
+        public bool EnableConstantPropagation { get; set; } = true;
+        public bool EnableConstantFolding { get; set; } = true;
+        public bool EnableDeadDefinitionsElimination { get; set; } = true;
+        public bool EnableCopyPropagation { get; set; } = true;
+        public bool EnableCommonSubexpressionElimination { get; set; } = true;
+        public bool EnableRedundantBranchOptimization { get; set; } = true;
+        public bool EnableBranchJumpThreading { get; set; } = true;
+        public bool EnableDeadCodeElimination { get; set; } = true;
         public int MaxBranchOptimizationPasses { get; set; } = 4;
         public int MaxIterations { get; set; } = 8;
     }
@@ -148,7 +147,7 @@ namespace Cnidaria.Cs
                     current = EnsureValueNumbers(current);
 
                     var pointLiveness = SsaLocalLiveness.Build(current);
-                    OptimizationResult copyProp = _options.CopyPropagate
+                    OptimizationResult copyProp = _options.EnableCopyPropagation
                         ? CopyPropagate(current, pointLiveness)
                         : new OptimizationResult(current.Blocks, changed: false);
 
@@ -159,16 +158,20 @@ namespace Cnidaria.Cs
                     pointLiveness = SsaLocalLiveness.Build(afterCopyProp);
                     var facts = ComputeFacts(afterCopyProp);
                     var rewrite = Rewrite(afterCopyProp, facts, pointLiveness);
-                    var afterRewrite = WithBlocks(afterCopyProp, rewrite.Blocks);
+                    var afterRewrite = rewrite.Changed
+                        ? WithBlocks(afterCopyProp, rewrite.Blocks)
+                        : afterCopyProp;
 
-                    OptimizationResult dce = _options.RemoveDeadDefinitions
+                    OptimizationResult dce = _options.EnableDeadDefinitionsElimination
                         ? EliminateDeadDefinitions(afterRewrite)
                         : new OptimizationResult(afterRewrite.Blocks, changed: false);
 
-                    var next = WithBlocks(afterRewrite, dce.Blocks);
+                    var next = dce.Changed
+                        ? WithBlocks(afterRewrite, dce.Blocks)
+                        : afterRewrite;
                     bool changed = copyProp.Changed || rewrite.Changed || dce.Changed;
 
-                    if ((_options.FoldRedundantBranches || _options.JumpThreadBranches || _options.RemoveUnreachableBlocks) &&
+                    if ((_options.EnableRedundantBranchOptimization || _options.EnableBranchJumpThreading || _options.EnableDeadCodeElimination) &&
                         _options.MaxBranchOptimizationPasses > 0)
                     {
                         next = EnsureValueNumbers(next);
@@ -192,23 +195,16 @@ namespace Cnidaria.Cs
                     current = EnsureValueNumbers(next);
                 }
 
-                var useDefLinks = ExtractUseDefLinks(current.ValueDefinitions);
-                var definitions = BuildValueDefinitions(current.Slots, current.InitialValues, current.Blocks, useDefLinks);
-                var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(current.InitialMemoryValues, current.Blocks);
-                GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, current.Blocks);
-                var localDescriptors = BuildSsaLocalDescriptors(current.Slots, definitions, current.SsaLocalDescriptors);
-                var finalWithoutVn = new SsaMethod(
-                    current.GenTreeMethod,
-                    current.Cfg,
-                    current.Slots,
-                    current.InitialValues,
-                    definitions,
-                    current.Blocks,
-                    valueNumbers: null,
-                    ssaLocalDescriptors: localDescriptors,
-                    initialMemoryValues: current.InitialMemoryValues,
-                    memoryDefinitions: memoryDefinitions);
-                return SsaValueNumbering.BuildMethod(finalWithoutVn);
+                current = EnsureValueNumbers(current);
+
+                if (_options.EnableCommonSubexpressionElimination)
+                {
+                    var cse = SsaCommonSubexpressionEliminator.OptimizeMethod(current, _options, _nextSyntheticTreeId);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, cse.NextSyntheticTreeId);
+                    current = cse.Method;
+                }
+
+                return EnsureValueNumbers(current);
             }
 
 
@@ -252,6 +248,7 @@ namespace Cnidaria.Cs
                     anyChange = true;
                     current = RebuildSsaAfterFlowRewrite(current, passResult.Method);
                     current = EnsureValueNumbers(current);
+                    nextTreeId = Math.Max(nextTreeId, MaxTreeId(current) + 1);
                 }
 
                 return new FlowOptimizationResult(current, anyChange, nextTreeId);
@@ -305,20 +302,23 @@ namespace Cnidaria.Cs
                 {
                     BuildBranchIndex();
 
-                    if (_branches.Count == 0)
-                        return new FlowRewriteResult(_method.GenTreeMethod, false, _nextTreeId);
+                    if (_branches.Count != 0)
+                    {
+                        if (_options.EnableRedundantBranchOptimization)
+                            FoldBranches();
 
-                    if (_options.FoldRedundantBranches)
-                        FoldBranches();
+                        if (_options.EnableBranchJumpThreading)
+                            ThreadBranches();
+                    }
 
-                    if (_options.JumpThreadBranches)
-                        ThreadBranches();
+                    if (UpdateFlowGraph())
+                        _changed = true;
 
-                    if (!_changed && !_options.RemoveUnreachableBlocks)
+                    if (!_changed && !_options.EnableDeadCodeElimination)
                         return new FlowRewriteResult(_method.GenTreeMethod, false, _nextTreeId);
 
                     var blocks = FreezeBlocks();
-                    if (_options.RemoveUnreachableBlocks)
+                    if (_options.EnableDeadCodeElimination)
                     {
                         var compacted = RemoveUnreachableBlocks(blocks, out bool removed);
                         if (removed)
@@ -364,7 +364,8 @@ namespace Cnidaria.Cs
                     if (!BranchIsStillConditional(branch))
                         return;
 
-                    if (TryGetConstantBranchValue(branch, out bool constantValue))
+                    if (TryGetConstantBranchValue(branch, out bool constantValue) ||
+                        TryGetForwardSubstitutedBranchValue(branch, out constantValue))
                     {
                         ReplaceWithUnconditionalBranch(branch, branch.TargetFor(constantValue));
                         return;
@@ -387,8 +388,12 @@ namespace Cnidaria.Cs
                         var branch = branches[i];
                         if (!BranchIsStillConditional(branch))
                             continue;
-                        if (!branch.CompareNormalValueNumber.IsValid)
+                        if (!branch.CompareNormalValueNumber.IsValid &&
+                            !HasOnlyBranchConditionPhi(branch) &&
+                            !BranchHasForwardSubstitutableCondition(branch))
+                        {
                             continue;
+                        }
                         if (!CanThreadThrough(branch))
                             continue;
 
@@ -407,7 +412,7 @@ namespace Cnidaria.Cs
                                 continue;
 
                             int target = branch.TargetFor(value);
-                            if (target == branch.BlockId)
+                            if (target == branch.BlockId || target == predId)
                                 continue;
 
                             RedirectNormalEdge(predId, branch.BlockId, target);
@@ -415,17 +420,533 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                private bool UpdateFlowGraph()
+                {
+                    bool modified = false;
+                    int passLimit = Math.Max(1, _method.Blocks.Length * 4);
+
+                    while (passLimit-- > 0)
+                    {
+                        bool changed = false;
+                        var predecessorCounts = ComputeNormalPredecessorCounts();
+
+                        for (int blockId = 0; blockId < _method.Blocks.Length; blockId++)
+                        {
+                            if (blockId != 0 && predecessorCounts[blockId] == 0)
+                                continue;
+
+                            if (TryFoldSyntacticConstantConditional(blockId) ||
+                                TryRemoveDegenerateConditional(blockId) ||
+                                TryCompactBlock(blockId, predecessorCounts) ||
+                                TryRemoveRedundantBranchToNext(blockId) ||
+                                TryOptimizeJumpToEmptyUnconditional(blockId))
+                            {
+                                changed = true;
+                                modified = true;
+                                break;
+                            }
+                        }
+
+                        if (!changed)
+                            break;
+                    }
+
+                    return modified;
+                }
+
+                private int[] ComputeNormalPredecessorCounts()
+                {
+                    var counts = new int[_method.Blocks.Length];
+                    for (int blockId = 0; blockId < _method.Blocks.Length; blockId++)
+                    {
+                        var successors = GetSuccessors(blockId);
+                        for (int i = 0; i < successors.Length; i++)
+                        {
+                            int successor = successors[i];
+                            if ((uint)successor < (uint)counts.Length)
+                                counts[successor]++;
+                        }
+                    }
+                    return counts;
+                }
+
+                private bool TryFoldSyntacticConstantConditional(int blockId)
+                {
+                    var statements = GetStatements(blockId);
+                    if (!TryGetConditionalTransfer(statements, out var conditional, out _, out int conditionalIndex, out int appendedIndex))
+                        return false;
+                    if (conditional.Operands.Length != 1)
+                        return false;
+                    if (!TryEvaluateConditionAsConstant(conditional.Operands[0], out bool value))
+                        return false;
+                    if (!TryGetCurrentBranchTargets(blockId, conditional, out int trueTarget, out int falseTarget))
+                        return false;
+
+                    SetBlockReplacingConditionalWithUnconditionalTransfer(
+                        blockId,
+                        statements,
+                        conditional,
+                        conditionalIndex,
+                        appendedIndex,
+                        value ? trueTarget : falseTarget,
+                        preserveConditionEffects: false);
+                    return true;
+                }
+
+                private bool TryEvaluateConditionAsConstant(GenTree condition, out bool value)
+                {
+                    if (TryGetSourceConstant(condition, out var constant))
+                        return TryConvertConstantToBoolean(constant, out value);
+
+                    if (TryGetBranchConditionSsaValue(condition, out var name) && TryGetSsaBooleanConstant(name, out value))
+                        return true;
+
+                    value = false;
+                    return false;
+                }
+
+                private bool TryRemoveDegenerateConditional(int blockId)
+                {
+                    var statements = GetStatements(blockId);
+                    if (!TryGetConditionalTransfer(statements, out var conditional, out _, out int conditionalIndex, out int appendedIndex))
+                        return false;
+                    if (conditional.Operands.Length != 1)
+                        return false;
+                    if (!TryGetCurrentBranchTargets(blockId, conditional, out int trueTarget, out int falseTarget))
+                        return false;
+                    if (trueTarget != falseTarget)
+                        return false;
+
+                    SetBlockReplacingConditionalWithUnconditionalTransfer(
+                        blockId,
+                        statements,
+                        conditional,
+                        conditionalIndex,
+                        appendedIndex,
+                        trueTarget,
+                        preserveConditionEffects: true);
+                    return true;
+                }
+
+                private bool TryRemoveRedundantBranchToNext(int blockId)
+                {
+                    if ((uint)(blockId + 1) >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    var statements = GetStatements(blockId);
+                    if (statements.IsDefaultOrEmpty)
+                        return false;
+
+                    if (TryGetConditionalTransfer(statements, out _, out var appendedFallThrough, out _, out int appendedIndex) &&
+                        appendedFallThrough is not null &&
+                        appendedFallThrough.TargetBlockId == blockId + 1 &&
+                        SameEhRegion(blockId, blockId + 1))
+                    {
+                        var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length - 1);
+                        for (int i = 0; i < statements.Length; i++)
+                        {
+                            if (i != appendedIndex)
+                                builder.Add(statements[i]);
+                        }
+
+                        SetBlock(
+                            blockId,
+                            builder.ToImmutable(),
+                            GetSuccessors(blockId),
+                            SuccessorPcsFor(GetSuccessors(blockId)),
+                            GenTreeBlockJumpKind.Conditional);
+                        return true;
+                    }
+
+                    if (!TryGetUnconditionalBranch(blockId, out var branch, out int target))
+                        return false;
+                    if (target != blockId + 1)
+                        return false;
+                    if (branch.SourceOp != BytecodeOp.Br)
+                        return false;
+                    if (!SameEhRegion(blockId, target))
+                        return false;
+
+                    var withoutBranch = RemoveLastStatement(statements);
+                    SetBlock(
+                        blockId,
+                        withoutBranch,
+                        ImmutableArray.Create(target),
+                        ImmutableArray.Create(TargetPc(target)),
+                        GenTreeBlockJumpKind.FallThrough);
+                    return true;
+                }
+
+                private bool TryOptimizeJumpToEmptyUnconditional(int blockId)
+                {
+                    var successors = GetSuccessors(blockId);
+                    if (successors.IsDefaultOrEmpty)
+                        return false;
+
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int destination = successors[i];
+                        if (!IsEmptyUnconditionalBlock(destination, out int newTarget))
+                            continue;
+                        if (newTarget == destination || (uint)newTarget >= (uint)_method.Blocks.Length)
+                            continue;
+                        if (UniqueSuccessor(newTarget) == destination)
+                            continue;
+                        if (!CanBypassBlock(blockId, destination, newTarget))
+                            continue;
+
+                        if (RedirectNormalEdge(blockId, destination, newTarget))
+                            return true;
+                    }
+
+                    return false;
+                }
+
+                private bool TryCompactBlock(int blockId, int[] predecessorCounts)
+                {
+                    if (!_options.EnableDeadCodeElimination)
+                        return false;
+                    if (!TryGetUnconditionalBranch(blockId, out _, out int target))
+                        return false;
+                    if (target != blockId + 1 || (uint)target >= (uint)_method.Blocks.Length)
+                        return false;
+                    if ((uint)target >= (uint)predecessorCounts.Length || predecessorCounts[target] != 1)
+                        return false;
+                    if (!CanCompactBlock(blockId, target))
+                        return false;
+
+                    var blockStatements = RemoveLastStatement(GetStatements(blockId));
+                    var targetStatements = GetStatements(target);
+                    var builder = ImmutableArray.CreateBuilder<GenTree>(blockStatements.Length + targetStatements.Length);
+                    for (int i = 0; i < blockStatements.Length; i++)
+                        builder.Add(blockStatements[i]);
+                    for (int i = 0; i < targetStatements.Length; i++)
+                        builder.Add(RemapTreeTarget(targetStatements[i], target, blockId));
+
+                    var targetSuccessors = GetSuccessors(target);
+                    var successors = ImmutableArray.CreateBuilder<int>(targetSuccessors.Length);
+                    for (int i = 0; i < targetSuccessors.Length; i++)
+                    {
+                        int successor = targetSuccessors[i] == target ? blockId : targetSuccessors[i];
+                        if (!Contains(successors, successor))
+                            successors.Add(successor);
+                    }
+
+                    var rewrittenSuccessors = successors.ToImmutable();
+                    if (WouldHaveCriticalEdges(blockId, rewrittenSuccessors))
+                        return false;
+
+                    SetBlock(
+                        blockId,
+                        builder.ToImmutable(),
+                        rewrittenSuccessors,
+                        SuccessorPcsFor(rewrittenSuccessors),
+                        GetJumpKind(target));
+                    return true;
+                }
+
+                private bool TryGetCurrentBranchTargets(int blockId, GenTree terminator, out int trueTarget, out int falseTarget)
+                {
+                    trueTarget = -1;
+                    falseTarget = -1;
+
+                    int branchTarget = terminator.TargetBlockId;
+                    if ((uint)branchTarget >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    int otherTarget = -1;
+                    if (TryGetConditionalTransfer(
+                            GetStatements(blockId),
+                            out var currentConditional,
+                            out var currentAppendedFallThrough,
+                            out _,
+                            out _) &&
+                        currentConditional.Id == terminator.Id &&
+                        currentAppendedFallThrough is not null)
+                    {
+                        otherTarget = currentAppendedFallThrough.TargetBlockId;
+                        if ((uint)otherTarget >= (uint)_method.Blocks.Length)
+                            return false;
+                    }
+                    else
+                    {
+                        var successors = GetSuccessors(blockId);
+                        for (int i = 0; i < successors.Length; i++)
+                        {
+                            int successor = successors[i];
+                            if ((uint)successor >= (uint)_method.Blocks.Length)
+                                return false;
+                            if (successor == branchTarget)
+                                continue;
+                            if (otherTarget >= 0 && otherTarget != successor)
+                                return false;
+                            otherTarget = successor;
+                        }
+
+                        if (otherTarget < 0)
+                        {
+                            int fallThrough = blockId + 1;
+                            if ((uint)fallThrough < (uint)_method.Blocks.Length && fallThrough != branchTarget)
+                                otherTarget = fallThrough;
+                        }
+                    }
+
+                    if (otherTarget < 0)
+                        return false;
+
+                    if (terminator.Kind == GenTreeKind.BranchTrue)
+                    {
+                        trueTarget = branchTarget;
+                        falseTarget = otherTarget;
+                    }
+                    else if (terminator.Kind == GenTreeKind.BranchFalse)
+                    {
+                        trueTarget = otherTarget;
+                        falseTarget = branchTarget;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+
+                    return true;
+                }
+
+                private bool TryGetUnconditionalBranch(int blockId, out GenTree branch, out int targetBlockId)
+                {
+                    branch = null!;
+                    targetBlockId = -1;
+
+                    var statements = GetStatements(blockId);
+                    if (statements.IsDefaultOrEmpty)
+                        return false;
+                    if (TryGetConditionalTransfer(statements, out _, out _, out _, out _))
+                        return false;
+
+                    var last = statements[statements.Length - 1];
+                    if (last.Kind != GenTreeKind.Branch)
+                        return false;
+                    if ((uint)last.TargetBlockId >= (uint)_method.Blocks.Length)
+                        return false;
+
+                    branch = last;
+                    targetBlockId = last.TargetBlockId;
+                    return true;
+                }
+
+                private bool IsEmptyUnconditionalBlock(int blockId, out int targetBlockId)
+                {
+                    targetBlockId = -1;
+                    if ((uint)blockId >= (uint)_method.Blocks.Length)
+                        return false;
+                    if (!TryGetUnconditionalBranch(blockId, out _, out targetBlockId))
+                        return false;
+                    return GetStatements(blockId).Length == 1;
+                }
+
+                private int UniqueSuccessor(int blockId)
+                {
+                    if ((uint)blockId >= (uint)_method.Blocks.Length)
+                        return -1;
+
+                    var successors = GetSuccessors(blockId);
+                    return successors.Length == 1 ? successors[0] : -1;
+                }
+
+                private bool CanBypassBlock(int fromBlockId, int bypassBlockId, int newTargetId)
+                {
+                    if ((uint)fromBlockId >= (uint)_method.Blocks.Length ||
+                        (uint)bypassBlockId >= (uint)_method.Blocks.Length ||
+                        (uint)newTargetId >= (uint)_method.Blocks.Length)
+                    {
+                        return false;
+                    }
+
+                    if (IsProtectedBoundary(bypassBlockId))
+                        return false;
+
+                    if (IsInTryRegion(bypassBlockId) && !SameTryRegion(fromBlockId, bypassBlockId))
+                        return false;
+
+                    if (IsInTryRegion(newTargetId) && !SameTryRegion(fromBlockId, newTargetId))
+                        return false;
+
+                    return true;
+                }
+
+                private bool CanCompactBlock(int blockId, int targetBlockId)
+                {
+                    if ((uint)blockId >= (uint)_method.Blocks.Length || (uint)targetBlockId >= (uint)_method.Blocks.Length)
+                        return false;
+                    if (targetBlockId == 0 || IsProtectedBoundary(targetBlockId))
+                        return false;
+                    if (!SameEhRegion(blockId, targetBlockId))
+                        return false;
+
+                    var targetSsaBlock = _method.Blocks[targetBlockId];
+                    if (targetSsaBlock.Phis.Length != 0 || targetSsaBlock.MemoryPhis.Length != 0)
+                        return false;
+
+                    return true;
+                }
+
+                private bool SameEhRegion(int leftBlockId, int rightBlockId)
+                {
+                    if ((uint)leftBlockId >= (uint)_method.Cfg.Blocks.Length || (uint)rightBlockId >= (uint)_method.Cfg.Blocks.Length)
+                        return false;
+
+                    var left = _method.Cfg.Blocks[leftBlockId];
+                    var right = _method.Cfg.Blocks[rightBlockId];
+                    return SequenceEqual(left.TryRegionIndexes, right.TryRegionIndexes) &&
+                           SequenceEqual(left.HandlerRegionIndexes, right.HandlerRegionIndexes);
+                }
+
+                private bool SameTryRegion(int leftBlockId, int rightBlockId)
+                {
+                    if ((uint)leftBlockId >= (uint)_method.Cfg.Blocks.Length || (uint)rightBlockId >= (uint)_method.Cfg.Blocks.Length)
+                        return false;
+
+                    return SequenceEqual(_method.Cfg.Blocks[leftBlockId].TryRegionIndexes, _method.Cfg.Blocks[rightBlockId].TryRegionIndexes);
+                }
+
+                private bool IsInTryRegion(int blockId)
+                    => (uint)blockId < (uint)_method.Cfg.Blocks.Length && _method.Cfg.Blocks[blockId].IsInTryRegion;
+
+                private bool IsProtectedBoundary(int blockId)
+                {
+                    if ((uint)blockId >= (uint)_method.GenTreeMethod.Blocks.Length)
+                        return true;
+
+                    var flags = _method.GenTreeMethod.Blocks[blockId].Flags;
+                    if ((flags & (GenTreeBlockFlags.Entry | GenTreeBlockFlags.TryEntry | GenTreeBlockFlags.HandlerEntry)) != 0)
+                        return true;
+
+                    if ((uint)blockId >= (uint)_method.Cfg.Blocks.Length)
+                        return true;
+
+                    var cfgBlock = _method.Cfg.Blocks[blockId];
+                    return cfgBlock.IsHandlerEntry || cfgBlock.IsInHandlerRegion;
+                }
+
+                private static bool SequenceEqual(ImmutableArray<int> left, ImmutableArray<int> right)
+                {
+                    if (left.Length != right.Length)
+                        return false;
+                    for (int i = 0; i < left.Length; i++)
+                    {
+                        if (left[i] != right[i])
+                            return false;
+                    }
+                    return true;
+                }
+
+                private void SetBlockReplacingConditionalWithUnconditionalTransfer(
+                    int blockId,
+                    ImmutableArray<GenTree> statements,
+                    GenTree conditional,
+                    int conditionalIndex,
+                    int appendedIndex,
+                    int targetBlockId,
+                    bool preserveConditionEffects)
+                {
+                    var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length + 1);
+                    for (int i = 0; i < statements.Length; i++)
+                    {
+                        if (i == conditionalIndex || i == appendedIndex)
+                            continue;
+
+                        builder.Add(statements[i]);
+                    }
+
+                    if (preserveConditionEffects && conditional.Operands.Length == 1 && !IsPureCondition(conditional.Operands[0]))
+                        builder.Add(NewEval(conditional.Pc, conditional.Operands[0]));
+
+                    var successors = ImmutableArray.Create(targetBlockId);
+                    bool fallThrough = targetBlockId == blockId + 1 && SameEhRegion(blockId, targetBlockId);
+                    if (!fallThrough)
+                        builder.Add(NewUnconditionalBranch(conditional.Pc, targetBlockId));
+
+                    SetBlock(
+                        blockId,
+                        builder.ToImmutable(),
+                        successors,
+                        SuccessorPcsFor(successors),
+                        fallThrough ? GenTreeBlockJumpKind.FallThrough : GenTreeBlockJumpKind.Always);
+                }
+
+                private static ImmutableArray<GenTree> RemoveLastStatement(ImmutableArray<GenTree> statements)
+                {
+                    if (statements.Length == 0)
+                        return ImmutableArray<GenTree>.Empty;
+
+                    var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length - 1);
+                    for (int i = 0; i + 1 < statements.Length; i++)
+                        builder.Add(statements[i]);
+                    return builder.ToImmutable();
+                }
+
+                private GenTreeBlockJumpKind GetJumpKind(int blockId)
+                    => _edits.TryGetValue(blockId, out var edit)
+                        ? edit.JumpKind
+                        : _method.GenTreeMethod.Blocks[blockId].JumpKind;
+
+                private GenTree RemapTreeTarget(GenTree tree, int oldTargetBlockId, int newTargetBlockId)
+                {
+                    ImmutableArray<GenTree>.Builder? operands = null;
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                    {
+                        var operand = RemapTreeTarget(tree.Operands[i], oldTargetBlockId, newTargetBlockId);
+                        if (!ReferenceEquals(operand, tree.Operands[i]) && operands is null)
+                        {
+                            operands = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
+                            for (int j = 0; j < i; j++)
+                                operands.Add(tree.Operands[j]);
+                        }
+
+                        operands?.Add(operand);
+                    }
+
+                    bool targetChanged = tree.TargetBlockId == oldTargetBlockId;
+                    if (operands is null && !targetChanged)
+                        return tree;
+
+                    int targetBlockId = targetChanged ? newTargetBlockId : tree.TargetBlockId;
+                    int targetPc = targetChanged ? TargetPc(newTargetBlockId) : tree.TargetPc;
+                    return new GenTree(
+                        tree.Id,
+                        tree.Kind,
+                        tree.Pc,
+                        tree.SourceOp,
+                        tree.Type,
+                        tree.StackKind,
+                        tree.Flags,
+                        operands?.ToImmutable() ?? tree.Operands,
+                        int32: tree.Int32,
+                        int64: tree.Int64,
+                        text: tree.Text,
+                        runtimeType: tree.RuntimeType,
+                        field: tree.Field,
+                        method: tree.Method,
+                        convKind: tree.ConvKind,
+                        convFlags: tree.ConvFlags,
+                        targetPc: targetPc,
+                        targetBlockId: targetBlockId);
+                }
+
                 private bool TryBuildBranchInfo(SsaBlock ssaBlock, out BranchInfo branch)
                 {
                     branch = default;
 
-                    var block = ssaBlock.CfgBlock.SourceBlock;
-                    if (block.Statements.IsDefaultOrEmpty)
+                    if ((uint)ssaBlock.Id >= (uint)_method.GenTreeMethod.Blocks.Length)
                         return false;
 
-                    if (!TryGetConditionalTransfer(
-                            block.Statements,
-                            out var terminator,
+                    var block = _method.GenTreeMethod.Blocks[ssaBlock.Id];
+                    if (ssaBlock.Statements.IsDefaultOrEmpty)
+                        return false;
+
+                    if (!TryGetSsaConditionalTransfer(
+                            ssaBlock.Statements,
+                            out var terminatorTree,
                             out _,
                             out _,
                             out _))
@@ -433,11 +954,12 @@ namespace Cnidaria.Cs
                         return false;
                     }
 
-                    if (terminator.Operands.Length != 1)
+                    var terminator = terminatorTree.Source;
+                    if (terminatorTree.Operands.Length != 1 || terminator.Operands.Length != 1)
                         return false;
 
-                    var condition = terminator.Operands[0];
-                    if (!IsPureCondition(condition))
+                    var conditionTree = terminatorTree.Operands[0];
+                    if (!IsPureCondition(conditionTree))
                         return false;
 
                     if (!TryGetNormalBranchTargets(block, terminator, out int trueTarget, out int falseTarget))
@@ -446,14 +968,14 @@ namespace Cnidaria.Cs
                         return false;
 
                     ValueNumber compareNormalVN = ValueNumberStore.NoVN;
-                    _ = TryGetLiberalNormalRelopValueNumber(condition, out compareNormalVN);
+                    _ = TryGetLiberalNormalRelopValueNumber(conditionTree.Source, out compareNormalVN);
 
                     branch = new BranchInfo(
                         ssaBlock.Id,
                         block,
                         ssaBlock,
                         terminator,
-                        condition,
+                        conditionTree,
                         compareNormalVN,
                         trueTarget,
                         falseTarget);
@@ -464,6 +986,45 @@ namespace Cnidaria.Cs
                     ImmutableArray<GenTree> statements,
                     out GenTree conditional,
                     out GenTree? appendedFallThrough,
+                    out int conditionalIndex,
+                    out int appendedIndex)
+                {
+                    conditional = null!;
+                    appendedFallThrough = null;
+                    conditionalIndex = -1;
+                    appendedIndex = -1;
+
+                    if (statements.IsDefaultOrEmpty)
+                        return false;
+
+                    var last = statements[statements.Length - 1];
+                    if (last.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                    {
+                        conditional = last;
+                        conditionalIndex = statements.Length - 1;
+                        return true;
+                    }
+
+                    if (last.Kind == GenTreeKind.Branch && statements.Length >= 2)
+                    {
+                        var previous = statements[statements.Length - 2];
+                        if (previous.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse)
+                        {
+                            conditional = previous;
+                            appendedFallThrough = last;
+                            conditionalIndex = statements.Length - 2;
+                            appendedIndex = statements.Length - 1;
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                private bool TryGetSsaConditionalTransfer(
+                    ImmutableArray<SsaTree> statements,
+                    out SsaTree conditional,
+                    out SsaTree? appendedFallThrough,
                     out int conditionalIndex,
                     out int appendedIndex)
                 {
@@ -555,27 +1116,43 @@ namespace Cnidaria.Cs
                         return false;
 
                     int otherTarget = -1;
-                    var successors = GetSuccessors(block.Id);
-                    for (int i = 0; i < successors.Length; i++)
+                    if (TryGetConditionalTransfer(
+                            GetStatements(block.Id),
+                            out var currentConditional,
+                            out var currentAppendedFallThrough,
+                            out _,
+                            out _) &&
+                        currentConditional.Id == terminator.Id &&
+                        currentAppendedFallThrough is not null)
                     {
-                        int succ = successors[i];
-                        if ((uint)succ >= (uint)_method.Blocks.Length)
+                        otherTarget = currentAppendedFallThrough.TargetBlockId;
+                        if ((uint)otherTarget >= (uint)_method.Blocks.Length)
                             return false;
-
-                        if (succ == branchTarget)
-                            continue;
-
-                        if (otherTarget >= 0 && otherTarget != succ)
-                            return false;
-
-                        otherTarget = succ;
                     }
-
-                    if (otherTarget < 0)
+                    else
                     {
-                        int fallThrough = block.Id + 1;
-                        if ((uint)fallThrough < (uint)_method.Blocks.Length && fallThrough != branchTarget)
-                            otherTarget = fallThrough;
+                        var successors = GetSuccessors(block.Id);
+                        for (int i = 0; i < successors.Length; i++)
+                        {
+                            int succ = successors[i];
+                            if ((uint)succ >= (uint)_method.Blocks.Length)
+                                return false;
+
+                            if (succ == branchTarget)
+                                continue;
+
+                            if (otherTarget >= 0 && otherTarget != succ)
+                                return false;
+
+                            otherTarget = succ;
+                        }
+
+                        if (otherTarget < 0)
+                        {
+                            int fallThrough = block.Id + 1;
+                            if ((uint)fallThrough < (uint)_method.Blocks.Length && fallThrough != branchTarget)
+                                otherTarget = fallThrough;
+                        }
                     }
 
                     if (otherTarget < 0)
@@ -617,20 +1194,333 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    switch (branch.Condition.Kind)
+                    if (TryEvaluateSsaConditionAsConstant(branch.ConditionTree, out value))
+                        return true;
+
+                    return TryEvaluateConditionAsConstant(branch.Condition, out value);
+                }
+
+                private bool TryGetForwardSubstitutedBranchValue(BranchInfo branch, out bool value)
+                {
+                    value = false;
+
+                    if (!TryFindForwardSubstitution(branch, out var substitution))
+                        return false;
+
+                    return TryEvaluateSsaTreeWithSubstitution(branch.ConditionTree, substitution, out var constant) &&
+                           TryConvertConstantToBoolean(constant, out value);
+                }
+
+                private bool BranchHasForwardSubstitutableCondition(BranchInfo branch)
+                    => TryFindForwardSubstitution(branch, out _);
+
+                private bool TryFindForwardSubstitution(BranchInfo branch, out LocalConstSubstitution substitution)
+                {
+                    substitution = default;
+
+                    if (!TryGetSubstitutableBranchSlot(branch.ConditionTree, out var slot))
+                        return false;
+                    if (!CanForwardSubstituteSlot(slot))
+                        return false;
+
+                    var statements = GetStatements(branch.BlockId);
+                    if (!TryGetConditionalTransfer(statements, out _, out _, out int conditionalIndex, out _))
+                        return false;
+
+                    return TryFindLocalConstantDefinitionBefore(statements, conditionalIndex, slot, out substitution);
+                }
+
+                private bool TryFindLocalConstantDefinitionBefore(ImmutableArray<GenTree> statements, int exclusiveEnd, SsaSlot slot, out LocalConstSubstitution substitution)
+                {
+                    substitution = default;
+
+                    int end = Math.Min(exclusiveEnd, statements.Length);
+                    for (int i = end - 1; i >= 0; i--)
                     {
-                        case GenTreeKind.ConstI4:
-                            value = branch.Condition.Int32 != 0;
-                            return true;
-                        case GenTreeKind.ConstI8:
-                            value = branch.Condition.Int64 != 0;
-                            return true;
-                        case GenTreeKind.ConstNull:
-                            value = false;
-                            return true;
-                        default:
+                        var statement = statements[i];
+                        if (!SsaSlotHelpers.TryGetDirectStoreSlot(statement, out var storeSlot))
+                            continue;
+                        if (!storeSlot.Equals(slot))
+                            continue;
+                        if (statement.Operands.Length == 0)
                             return false;
+
+                        var value = statement.Operands[statement.Operands.Length - 1];
+                        if (!TryEvaluateTreeAsConstant(value, out var constant))
+                            return false;
+
+                        substitution = new LocalConstSubstitution(slot, constant);
+                        return true;
                     }
+
+                    return false;
+                }
+
+                private bool TryInferPredecessorLocalStoreValue(BranchInfo branch, int predId, out bool value)
+                {
+                    value = false;
+
+                    if ((uint)predId >= (uint)_method.Blocks.Length)
+                        return false;
+                    if (!TryGetSubstitutableBranchSlot(branch.ConditionTree, out var slot))
+                        return false;
+                    if (!CanForwardSubstituteSlot(slot))
+                        return false;
+
+                    var predStatements = GetStatements(predId);
+                    int end = predStatements.Length;
+                    if (end != 0)
+                    {
+                        var last = predStatements[end - 1];
+                        if (last.Kind == GenTreeKind.Branch)
+                            end--;
+                        else if (TryGetConditionalTransfer(predStatements, out _, out _, out int conditionalIndex, out _))
+                            end = conditionalIndex;
+                    }
+
+                    return TryFindLocalConstantDefinitionBefore(predStatements, end, slot, out var substitution) &&
+                           TryEvaluateSsaTreeWithSubstitution(branch.ConditionTree, substitution, out var constant) &&
+                           TryConvertConstantToBoolean(constant, out value);
+                }
+
+                private bool TryGetSubstitutableBranchSlot(GenTree tree, out SsaSlot slot)
+                {
+                    if (SsaSlotHelpers.TryGetDirectLoadSlot(tree, out slot))
+                        return true;
+
+                    if (tree.Kind is GenTreeKind.Unary or GenTreeKind.Conv or GenTreeKind.Binary)
+                    {
+                        bool found = false;
+                        for (int i = 0; i < tree.Operands.Length; i++)
+                        {
+                            if (!TryGetSubstitutableBranchSlot(tree.Operands[i], out var operandSlot))
+                                continue;
+
+                            if (found && !slot.Equals(operandSlot))
+                            {
+                                slot = default;
+                                return false;
+                            }
+
+                            slot = operandSlot;
+                            found = true;
+                        }
+
+                        if (found)
+                            return true;
+                    }
+
+                    slot = default;
+                    return false;
+                }
+
+                private bool TryGetSubstitutableBranchSlot(SsaTree tree, out SsaSlot slot)
+                {
+                    if (SsaSlotHelpers.TryGetDirectLoadSlot(tree.Source, out slot))
+                        return true;
+
+                    if (tree.Kind is GenTreeKind.Unary or GenTreeKind.Conv or GenTreeKind.Binary)
+                    {
+                        bool found = false;
+                        for (int i = 0; i < tree.Operands.Length; i++)
+                        {
+                            if (!TryGetSubstitutableBranchSlot(tree.Operands[i], out var operandSlot))
+                                continue;
+
+                            if (found && !slot.Equals(operandSlot))
+                            {
+                                slot = default;
+                                return false;
+                            }
+
+                            slot = operandSlot;
+                            found = true;
+                        }
+
+                        if (found)
+                            return true;
+                    }
+
+                    slot = default;
+                    return false;
+                }
+
+                private bool TryEvaluateSsaConditionAsConstant(SsaTree condition, out bool value)
+                {
+                    if (TryEvaluateSsaTreeWithSubstitution(condition, default, out var constant) &&
+                        TryConvertConstantToBoolean(constant, out value))
+                    {
+                        return true;
+                    }
+
+                    value = false;
+                    return false;
+                }
+
+                private bool TryEvaluateSsaTreeWithSubstitution(SsaTree tree, LocalConstSubstitution substitution, out ConstValue constant)
+                {
+                    if (TryGetSourceConstant(tree.Source, out constant))
+                        return true;
+
+                    if (substitution.IsValid &&
+                        SsaSlotHelpers.TryGetDirectLoadSlot(tree.Source, out var slot) &&
+                        slot.Equals(substitution.Slot))
+                    {
+                        constant = substitution.Constant;
+                        return true;
+                    }
+
+                    if (_method.ValueNumbers is not null &&
+                        TryGetConservativeNormalValueNumber(tree.Source, out var vn) &&
+                        TryGetConstantFromValueNumber(vn, out constant))
+                    {
+                        return true;
+                    }
+
+                    if (tree.HasMemoryEffects ||
+                        (tree.Source.Flags & (GenTreeFlags.SideEffect |
+                                              GenTreeFlags.MemoryRead |
+                                              GenTreeFlags.MemoryWrite |
+                                              GenTreeFlags.CanThrow |
+                                              GenTreeFlags.ExceptionFlow |
+                                              GenTreeFlags.Ordered |
+                                              GenTreeFlags.ContainsCall)) != 0)
+                    {
+                        constant = default;
+                        return false;
+                    }
+
+                    if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
+                    {
+                        if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
+                            TryFoldUnary(tree.Source, operand, out constant))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
+                    {
+                        if (!CanFoldComparisonOperands(tree.Operands[0].Source.StackKind, tree.Operands[1].Source.StackKind) &&
+                            IsComparisonOpcode(tree.Source.SourceOp))
+                        {
+                            constant = default;
+                            return false;
+                        }
+
+                        if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var left) &&
+                            TryEvaluateSsaTreeWithSubstitution(tree.Operands[1], substitution, out var right) &&
+                            TryFoldBinary(tree.Source, left, right, out constant))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
+                    {
+                        if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
+                            TryFoldConversion(tree.Source, operand, out constant))
+                        {
+                            return true;
+                        }
+                    }
+
+                    constant = default;
+                    return false;
+                }
+
+                private bool TryEvaluateTreeAsConstant(GenTree tree, out ConstValue constant)
+                {
+                    if (TryGetSourceConstant(tree, out constant))
+                        return true;
+
+                    if ((tree.Flags & (GenTreeFlags.SideEffect |
+                                       GenTreeFlags.MemoryRead |
+                                       GenTreeFlags.MemoryWrite |
+                                       GenTreeFlags.CanThrow |
+                                       GenTreeFlags.ExceptionFlow |
+                                       GenTreeFlags.Ordered |
+                                       GenTreeFlags.ContainsCall)) != 0)
+                    {
+                        constant = default;
+                        return false;
+                    }
+
+                    return TryEvaluateTreeWithSubstitution(tree, default, out constant);
+                }
+
+                private bool TryEvaluateTreeWithSubstitution(GenTree tree, LocalConstSubstitution substitution, out ConstValue constant)
+                {
+                    if (TryGetSourceConstant(tree, out constant))
+                        return true;
+
+                    if (substitution.IsValid &&
+                        SsaSlotHelpers.TryGetDirectLoadSlot(tree, out var slot) &&
+                        slot.Equals(substitution.Slot))
+                    {
+                        constant = substitution.Constant;
+                        return true;
+                    }
+
+                    if (_method.ValueNumbers is not null &&
+                        TryGetConservativeNormalValueNumber(tree, out var vn) &&
+                        TryGetConstantFromValueNumber(vn, out constant))
+                    {
+                        return true;
+                    }
+
+                    if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
+                    {
+                        if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
+                            TryFoldUnary(tree, operand, out constant))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
+                    {
+                        if (!CanFoldComparisonOperands(tree.Operands[0].StackKind, tree.Operands[1].StackKind) &&
+                            IsComparisonOpcode(tree.SourceOp))
+                        {
+                            constant = default;
+                            return false;
+                        }
+
+                        if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var left) &&
+                            TryEvaluateTreeWithSubstitution(tree.Operands[1], substitution, out var right) &&
+                            TryFoldBinary(tree, left, right, out constant))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
+                    {
+                        if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
+                            TryFoldConversion(tree, operand, out constant))
+                        {
+                            return true;
+                        }
+                    }
+
+                    constant = default;
+                    return false;
+                }
+
+                private static bool IsComparisonOpcode(BytecodeOp op)
+                    => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+
+                private bool CanForwardSubstituteSlot(SsaSlot slot)
+                {
+                    for (int i = 0; i < _method.Slots.Length; i++)
+                    {
+                        var info = _method.Slots[i];
+                        if (!info.Slot.Equals(slot))
+                            continue;
+
+                        return !info.AddressExposed &&
+                               !info.MemoryAliased &&
+                               (IsIntegerLike(info.StackKind) || IsReferenceLike(info.StackKind));
+                    }
+
+                    return false;
                 }
 
                 private bool TryInferBranchValueFromDominators(BranchInfo branch, out bool value)
@@ -676,7 +1566,13 @@ namespace Cnidaria.Cs
                 {
                     value = false;
 
+                    if (TryInferPhiInputValue(branch, predId, out value))
+                        return true;
+
                     if (TryInferDirectPredecessorValue(branch, predId, branch.BlockId, out value))
+                        return true;
+
+                    if (TryInferPredecessorLocalStoreValue(branch, predId, out value))
                         return true;
 
                     int child = branch.BlockId;
@@ -686,6 +1582,9 @@ namespace Cnidaria.Cs
                     while (limit-- > 0)
                     {
                         if (TryInferDirectPredecessorValue(branch, probe, child, out value))
+                            return true;
+
+                        if (TryInferPredecessorLocalStoreValue(branch, probe, out value))
                             return true;
 
                         if (!IsTransparentUnconditionalBlock(probe))
@@ -700,6 +1599,145 @@ namespace Cnidaria.Cs
                     }
 
                     return false;
+                }
+
+                private bool TryInferPhiInputValue(BranchInfo branch, int predId, out bool value)
+                {
+                    value = false;
+
+                    if (!TryGetBranchConditionSsaValue(branch.Condition, out var conditionName))
+                        return false;
+
+                    if (!_method.TryGetSsaDescriptor(conditionName, out var descriptor) || !descriptor.IsPhi || descriptor.Phi is null)
+                        return false;
+
+                    var phi = descriptor.Phi;
+                    if (phi.BlockId != branch.BlockId || !phi.Target.Equals(conditionName))
+                        return false;
+
+                    bool found = false;
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        var input = phi.Inputs[i];
+                        if (input.PredecessorBlockId != predId)
+                            continue;
+
+                        if (!TryGetSsaBooleanConstant(input.Value, out bool inputValue))
+                            return false;
+
+                        if (found && value != inputValue)
+                            return false;
+
+                        value = inputValue;
+                        found = true;
+                    }
+
+                    return found;
+                }
+
+                private static bool TryGetBranchConditionSsaValue(GenTree condition, out SsaValueName name)
+                {
+                    if (condition.SsaValueName.HasValue)
+                    {
+                        name = condition.SsaValueName.Value;
+                        return true;
+                    }
+
+                    name = default;
+                    return false;
+                }
+
+                private bool TryGetSsaBooleanConstant(SsaValueName name, out bool value)
+                {
+                    value = false;
+
+                    if (!_method.TryGetSsaDescriptor(name, out var descriptor))
+                        return false;
+
+                    if (TryGetConstantFromDescriptor(descriptor, out var constant))
+                        return TryConvertConstantToBoolean(constant, out value);
+
+                    if (descriptor.DefNode is not null && TryGetSourceConstant(descriptor.DefNode, out constant))
+                        return TryConvertConstantToBoolean(constant, out value);
+
+                    return false;
+                }
+
+                private bool TryGetConstantFromDescriptor(SsaDescriptor descriptor, out ConstValue constant)
+                {
+                    constant = default;
+                    if (_method.ValueNumbers is null)
+                        return false;
+
+                    var vn = NormalValueNumber(_method, descriptor.ValueNumbers.Conservative);
+                    if (!vn.IsValid)
+                        return false;
+
+                    if (!_method.ValueNumbers.Store.TryGetConstant(vn, out var key))
+                        return false;
+
+                    switch (key.Kind)
+                    {
+                        case ValueNumberConstantKind.Int32:
+                            constant = ConstValue.ForI4((int)key.A);
+                            return true;
+                        case ValueNumberConstantKind.Int64:
+                            constant = ConstValue.ForI8(key.A);
+                            return true;
+                        case ValueNumberConstantKind.Null:
+                            constant = ConstValue.Null;
+                            return true;
+                        default:
+                            return false;
+                    }
+                }
+
+                private bool TryGetConstantFromValueNumber(ValueNumber vn, out ConstValue constant)
+                {
+                    constant = default;
+                    if (_method.ValueNumbers is null)
+                        return false;
+
+                    vn = NormalValueNumber(_method, vn);
+                    if (!vn.IsValid)
+                        return false;
+
+                    if (!_method.ValueNumbers.Store.TryGetConstant(vn, out var key))
+                        return false;
+
+                    switch (key.Kind)
+                    {
+                        case ValueNumberConstantKind.Int32:
+                            constant = ConstValue.ForI4((int)key.A);
+                            return true;
+                        case ValueNumberConstantKind.Int64:
+                            constant = ConstValue.ForI8(key.A);
+                            return true;
+                        case ValueNumberConstantKind.Null:
+                            constant = ConstValue.Null;
+                            return true;
+                        default:
+                            return false;
+                    }
+                }
+
+                private static bool TryConvertConstantToBoolean(ConstValue constant, out bool value)
+                {
+                    switch (constant.Kind)
+                    {
+                        case ConstKind.I4:
+                            value = constant.I4 != 0;
+                            return true;
+                        case ConstKind.I8:
+                            value = constant.I8 != 0;
+                            return true;
+                        case ConstKind.Null:
+                            value = false;
+                            return true;
+                        default:
+                            value = false;
+                            return false;
+                    }
                 }
 
                 private bool TryInferDirectPredecessorValue(BranchInfo branch, int predId, int edgeTarget, out bool value)
@@ -750,7 +1788,10 @@ namespace Cnidaria.Cs
 
                 private bool CanThreadThrough(BranchInfo branch)
                 {
-                    if (branch.SsaBlock.Phis.Length != 0 || branch.SsaBlock.MemoryPhis.Length != 0)
+                    if (branch.SsaBlock.MemoryPhis.Length != 0)
+                        return false;
+
+                    if (branch.SsaBlock.Phis.Length != 0 && !HasOnlyBranchConditionPhi(branch))
                         return false;
 
                     var statements = GetStatements(branch.BlockId);
@@ -761,6 +1802,15 @@ namespace Cnidaria.Cs
                         return false;
 
                     return statements.Length == 1 || (statements.Length == 2 && appendedFallThrough is not null);
+                }
+
+                private bool HasOnlyBranchConditionPhi(BranchInfo branch)
+                {
+                    if (branch.SsaBlock.Phis.Length != 1)
+                        return false;
+
+                    return TryGetBranchConditionSsaValue(branch.Condition, out var conditionName) &&
+                           branch.SsaBlock.Phis[0].Target.Equals(conditionName);
                 }
 
                 private bool IsTransparentUnconditionalBlock(int blockId)
@@ -812,6 +1862,56 @@ namespace Cnidaria.Cs
                            conditional.Id == branch.Terminator.Id;
                 }
 
+                private bool WouldCreateCriticalEdge(int fromBlockId, int oldTargetId, int newTargetId)
+                {
+                    var successors = GetSuccessors(fromBlockId);
+                    bool hasOld = false;
+                    var rewrittenSuccessors = ImmutableArray.CreateBuilder<int>(successors.Length);
+
+                    for (int i = 0; i < successors.Length; i++)
+                    {
+                        int successor = successors[i];
+                        if (successor == oldTargetId)
+                        {
+                            hasOld = true;
+                            successor = newTargetId;
+                        }
+
+                        if (!Contains(rewrittenSuccessors, successor))
+                            rewrittenSuccessors.Add(successor);
+                    }
+
+                    return hasOld && WouldHaveCriticalEdges(fromBlockId, rewrittenSuccessors.ToImmutable());
+                }
+
+                private bool WouldHaveCriticalEdges(int fromBlockId, ImmutableArray<int> rewrittenSuccessors)
+                {
+                    if (rewrittenSuccessors.Length <= 1)
+                        return false;
+
+                    for (int s = 0; s < rewrittenSuccessors.Length; s++)
+                    {
+                        int successor = rewrittenSuccessors[s];
+                        int predecessorCount = 0;
+
+                        for (int blockId = 0; blockId < _method.Blocks.Length; blockId++)
+                        {
+                            ImmutableArray<int> blockSuccessors = blockId == fromBlockId
+                                ? rewrittenSuccessors
+                                : GetSuccessors(blockId);
+
+                            if (Contains(blockSuccessors, successor))
+                            {
+                                predecessorCount++;
+                                if (predecessorCount > 1)
+                                    return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                }
+
                 private void ReplaceWithUnconditionalBranch(BranchInfo branch, int targetBlockId)
                 {
                     if ((uint)targetBlockId >= (uint)_method.Blocks.Length)
@@ -821,33 +1921,28 @@ namespace Cnidaria.Cs
                     if (!TryGetConditionalTransfer(statements, out var conditional, out _, out int conditionalIndex, out int appendedIndex))
                         return;
 
-                    var builder = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
-                    for (int i = 0; i < statements.Length; i++)
-                    {
-                        if (i == conditionalIndex || i == appendedIndex)
-                            continue;
-
-                        builder.Add(statements[i]);
-                    }
-                    builder.Add(NewUnconditionalBranch(conditional.Pc, targetBlockId));
-
-                    SetBlock(
+                    SetBlockReplacingConditionalWithUnconditionalTransfer(
                         branch.BlockId,
-                        builder.ToImmutable(),
-                        ImmutableArray.Create(targetBlockId),
-                        ImmutableArray.Create(TargetPc(targetBlockId)),
-                        GenTreeBlockJumpKind.Always);
+                        statements,
+                        conditional,
+                        conditionalIndex,
+                        appendedIndex,
+                        targetBlockId,
+                        preserveConditionEffects: false);
                 }
 
-                private void RedirectNormalEdge(int fromBlockId, int oldTargetId, int newTargetId)
+                private bool RedirectNormalEdge(int fromBlockId, int oldTargetId, int newTargetId)
                 {
                     if ((uint)fromBlockId >= (uint)_method.Blocks.Length ||
                         (uint)oldTargetId >= (uint)_method.Blocks.Length ||
                         (uint)newTargetId >= (uint)_method.Blocks.Length ||
                         oldTargetId == newTargetId)
                     {
-                        return;
+                        return false;
                     }
+
+                    if (WouldCreateCriticalEdge(fromBlockId, oldTargetId, newTargetId))
+                        return false;
 
                     var successors = GetSuccessors(fromBlockId);
                     bool hasOld = false;
@@ -866,13 +1961,13 @@ namespace Cnidaria.Cs
                     }
 
                     if (!hasOld)
-                        return;
+                        return false;
 
                     var statements = GetStatements(fromBlockId);
                     if (statements.Length == 0)
                     {
                         if (successors.Length != 1)
-                            return;
+                            return false;
 
                         SetBlock(
                             fromBlockId,
@@ -880,7 +1975,7 @@ namespace Cnidaria.Cs
                             ImmutableArray.Create(newTargetId),
                             ImmutableArray.Create(TargetPc(newTargetId)),
                             GenTreeBlockJumpKind.Always);
-                        return;
+                        return true;
                     }
 
                     if (TryGetConditionalTransfer(
@@ -893,23 +1988,15 @@ namespace Cnidaria.Cs
                         var rewrittenSuccs = succBuilder.ToImmutable();
                         if (rewrittenSuccs.Length == 1)
                         {
-                            var collapsed = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
-                            for (int i = 0; i < statements.Length; i++)
-                            {
-                                if (i == conditionalIndex || i == appendedIndex)
-                                    continue;
-
-                                collapsed.Add(statements[i]);
-                            }
-                            collapsed.Add(NewUnconditionalBranch(conditional.Pc, rewrittenSuccs[0]));
-
-                            SetBlock(
+                            SetBlockReplacingConditionalWithUnconditionalTransfer(
                                 fromBlockId,
-                                collapsed.ToImmutable(),
-                                rewrittenSuccs,
-                                SuccessorPcsFor(rewrittenSuccs),
-                                GenTreeBlockJumpKind.Always);
-                            return;
+                                statements,
+                                conditional,
+                                conditionalIndex,
+                                appendedIndex,
+                                rewrittenSuccs[0],
+                                preserveConditionEffects: true);
+                            return true;
                         }
 
                         var builder = statements.ToBuilder();
@@ -932,14 +2019,14 @@ namespace Cnidaria.Cs
                             rewrittenSuccs,
                             SuccessorPcsFor(rewrittenSuccs),
                             GenTreeBlockJumpKind.Conditional);
-                        return;
+                        return true;
                     }
 
                     var last = statements[statements.Length - 1];
                     if (last.Kind == GenTreeKind.Branch)
                     {
                         if (last.TargetBlockId != oldTargetId)
-                            return;
+                            return false;
 
                         var builder = statements.ToBuilder();
                         builder[builder.Count - 1] = CloneTreeWithTarget(last, newTargetId);
@@ -950,7 +2037,10 @@ namespace Cnidaria.Cs
                             ImmutableArray.Create(newTargetId),
                             ImmutableArray.Create(TargetPc(newTargetId)),
                             GenTreeBlockJumpKind.Always);
+                        return true;
                     }
+
+                    return false;
                 }
 
                 private void SetBlock(
@@ -1234,6 +2324,17 @@ namespace Cnidaria.Cs
                         targetPc: TargetPc(targetBlockId),
                         targetBlockId: targetBlockId);
 
+                private GenTree NewEval(int pc, GenTree operand)
+                    => new GenTree(
+                        _nextTreeId++,
+                        GenTreeKind.Eval,
+                        pc,
+                        BytecodeOp.Pop,
+                        null,
+                        GenStackKind.Void,
+                        operand.Flags,
+                        ImmutableArray.Create(operand));
+
                 private GenTree CloneTreeWithTarget(GenTree tree, int targetBlockId)
                     => new GenTree(
                         tree.Id,
@@ -1313,6 +2414,17 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
+                private static bool Contains(ImmutableArray<int> values, int value)
+                {
+                    for (int i = 0; i < values.Length; i++)
+                    {
+                        if (values[i] == value)
+                            return true;
+                    }
+
+                    return false;
+                }
+
                 private static bool IsPureCondition(GenTree tree)
                 {
                     if ((tree.Flags & (GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite | GenTreeFlags.CanThrow | GenTreeFlags.ExceptionFlow | GenTreeFlags.Ordered)) != 0)
@@ -1327,13 +2439,45 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
+                private static bool IsPureCondition(SsaTree tree)
+                {
+                    if (tree.HasMemoryEffects)
+                        return false;
+
+                    if ((tree.Source.Flags & (GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite | GenTreeFlags.CanThrow | GenTreeFlags.ExceptionFlow | GenTreeFlags.Ordered)) != 0)
+                        return false;
+
+                    for (int i = 0; i < tree.Operands.Length; i++)
+                    {
+                        if (!IsPureCondition(tree.Operands[i]))
+                            return false;
+                    }
+
+                    return true;
+                }
+
+                private readonly struct LocalConstSubstitution
+                {
+                    public readonly SsaSlot Slot;
+                    public readonly ConstValue Constant;
+                    public readonly bool IsValid;
+
+                    public LocalConstSubstitution(SsaSlot slot, ConstValue constant)
+                    {
+                        Slot = slot;
+                        Constant = constant;
+                        IsValid = true;
+                    }
+                }
+
                 private readonly struct BranchInfo
                 {
                     public readonly int BlockId;
                     public readonly GenTreeBlock Block;
                     public readonly SsaBlock SsaBlock;
                     public readonly GenTree Terminator;
-                    public readonly GenTree Condition;
+                    public readonly SsaTree ConditionTree;
+                    public GenTree Condition => ConditionTree.Source;
                     public readonly ValueNumber CompareNormalValueNumber;
                     public readonly int TrueTarget;
                     public readonly int FalseTarget;
@@ -1343,7 +2487,7 @@ namespace Cnidaria.Cs
                         GenTreeBlock block,
                         SsaBlock ssaBlock,
                         GenTree terminator,
-                        GenTree condition,
+                        SsaTree conditionTree,
                         ValueNumber compareNormalValueNumber,
                         int trueTarget,
                         int falseTarget)
@@ -1352,7 +2496,7 @@ namespace Cnidaria.Cs
                         Block = block;
                         SsaBlock = ssaBlock;
                         Terminator = terminator;
-                        Condition = condition;
+                        ConditionTree = conditionTree;
                         CompareNormalValueNumber = compareNormalValueNumber;
                         TrueTarget = trueTarget;
                         FalseTarget = falseTarget;
@@ -1978,7 +3122,7 @@ namespace Cnidaria.Cs
                 if (method.ValueNumbers is null)
                     return facts;
 
-                if (_options.PropagateConstants)
+                if (_options.EnableConstantPropagation)
                 {
                     for (int i = 0; i < method.ValueDefinitions.Length; i++)
                     {
@@ -2014,10 +3158,10 @@ namespace Cnidaria.Cs
                 if (TryGetSourceConstant(tree.Source, out var sourceConstant))
                     return ValueFact.ForConstant(sourceConstant);
 
-                if (_options.FoldConstants && TryGetTreeConstant(method, tree, out var vnConstant))
+                if (_options.EnableConstantFolding && TryGetTreeConstant(method, tree, out var vnConstant))
                     return ValueFact.ForConstant(vnConstant);
 
-                if (!_options.FoldConstants)
+                if (!_options.EnableConstantFolding)
                     return ValueFact.Unknown;
 
                 if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
@@ -2171,34 +3315,7 @@ namespace Cnidaria.Cs
                 {
                     var block = method.Blocks[b];
                     var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
-                    for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        var newInputs = ImmutableArray.CreateBuilder<SsaPhiInput>(phi.Inputs.Length);
-                        bool phiChanged = false;
-
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                        {
-                            var input = phi.Inputs[i];
-                            _ = NormalizeValue(input.Value, facts);
-                            newInputs.Add(input);
-                        }
-
-                        var rewrittenPhi = phiChanged
-                            ? new SsaPhi(phi.BlockId, phi.Slot, phi.Target, newInputs.ToImmutable())
-                            : phi;
-
-                        if (PhiIsTrivial(rewrittenPhi, facts))
-                        {
-                            changed = true;
-                            continue;
-                        }
-
-                        if (phiChanged)
-                            changed = true;
-
-                        phis.Add(rewrittenPhi);
-                    }
+                    phis.AddRange(block.Phis);
 
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
                     var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
@@ -2224,7 +3341,7 @@ namespace Cnidaria.Cs
 
             private bool PhiIsTrivial(SsaPhi phi, Dictionary<SsaValueName, ValueFact> facts)
             {
-                if (!_options.PropagateConstants)
+                if (!_options.EnableConstantPropagation)
                     return false;
 
                 var fact = NormalizeValue(phi.Target, facts);
@@ -2315,7 +3432,7 @@ namespace Cnidaria.Cs
                 if (candidate.Value.HasValue)
                 {
                     var fact = NormalizeValue(candidate.Value.Value, facts);
-                    if (_options.PropagateConstants && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(candidate.Source, fact.Constant))
+                    if (_options.EnableConstantPropagation && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(candidate.Source, fact.Constant))
                     {
                         changed = true;
                         return new SsaTree(CreateConstantTree(candidate.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
@@ -2324,7 +3441,7 @@ namespace Cnidaria.Cs
                     return candidate;
                 }
 
-                if (_options.SimplifyAlgebraicIdentities && TrySimplifyTree(method, candidate, facts, out var simplified))
+                if (TrySimplifyTree(method, candidate, facts, out var simplified))
                 {
                     if (CanUseReplacementTreeAt(method, pointLiveness, candidate, simplified, blockId, statementIndex))
                     {
@@ -2333,7 +3450,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (_options.FoldConstants && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source) && !HasObservableEffect(candidate))
+                if (_options.EnableConstantFolding && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source) && !HasObservableEffect(candidate))
                 {
                     var fact = EvaluateTree(method, candidate, facts);
                     if (fact.Kind == ValueFactKind.Constant &&
@@ -2465,14 +3582,7 @@ namespace Cnidaria.Cs
                 {
                     var block = method.Blocks[b];
                     var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
-                    for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        if (live.Contains(phi.Target))
-                            phis.Add(phi);
-                        else
-                            changed = true;
-                    }
+                    phis.AddRange(block.Phis);
 
                     var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
                     var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
@@ -3511,401 +4621,57 @@ namespace Cnidaria.Cs
                 };
             }
 
-            private static SsaMethod WithBlocks(SsaMethod method, ImmutableArray<SsaBlock> blocks)
+            private SsaMethod WithBlocks(SsaMethod method, ImmutableArray<SsaBlock> blocks)
             {
-                var compacted = CompactSsaNumbers(method.InitialValues, method.ValueDefinitions, blocks);
-                var definitions = BuildValueDefinitions(method.Slots, compacted.InitialValues, compacted.Blocks, compacted.UseDefLinks);
-                var memoryDefinitions = GenTreeSsaBuilder.BuildMemoryDefinitions(method.InitialMemoryValues, compacted.Blocks);
-                GenTreeSsaBuilder.AnnotateSsaUses(definitions, memoryDefinitions, compacted.Blocks);
-                var localDescriptors = BuildSsaLocalDescriptors(method.Slots, definitions, method.SsaLocalDescriptors);
-                return new SsaMethod(
-                    method.GenTreeMethod,
-                    method.Cfg,
-                    method.Slots,
-                    compacted.InitialValues,
-                    definitions,
-                    compacted.Blocks,
-                    valueNumbers: null,
-                    ssaLocalDescriptors: localDescriptors,
-                    initialMemoryValues: method.InitialMemoryValues,
-                    memoryDefinitions: memoryDefinitions);
+                var rewrittenBlocks = MaterializeGenTreeBlocks(method.GenTreeMethod.Blocks, blocks);
+                var rewritten = method.GenTreeMethod.CloneWithBlocks(rewrittenBlocks);
+                return RebuildSsaAfterGenTreeRewrite(method, rewritten);
             }
 
-            private readonly struct SsaCompactionResult
+            private SsaMethod RebuildSsaAfterGenTreeRewrite(SsaMethod previous, GenTreeMethod rewritten)
             {
-                public readonly ImmutableArray<SsaValueName> InitialValues;
-                public readonly ImmutableArray<SsaBlock> Blocks;
-                public readonly ImmutableArray<SsaUseDefLink> UseDefLinks;
+                bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
+                var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
+                rewritten.AttachFlowGraph(cfg);
 
-                public SsaCompactionResult(ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaBlock> blocks, ImmutableArray<SsaUseDefLink> useDefLinks)
-                {
-                    InitialValues = initialValues;
-                    Blocks = blocks;
-                    UseDefLinks = useDefLinks.IsDefault ? ImmutableArray<SsaUseDefLink>.Empty : useDefLinks;
-                }
+                var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
+                rewritten.AttachHirLiveness(liveness);
+
+                var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
+                return EnsureValueNumbers(rebuilt);
             }
 
-            private static SsaCompactionResult CompactSsaNumbers(
-                ImmutableArray<SsaValueName> initialValues, ImmutableArray<SsaValueDefinition> previousDefinitions, ImmutableArray<SsaBlock> blocks)
+            private static ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(ImmutableArray<GenTreeBlock> originalBlocks, ImmutableArray<SsaBlock> ssaBlocks)
             {
-                var map = new Dictionary<SsaValueName, SsaValueName>();
-                var nextBySlot = new Dictionary<SsaSlot, int>();
-                var compactedInitialValues = ImmutableArray.CreateBuilder<SsaValueName>(initialValues.Length);
+                if (originalBlocks.Length != ssaBlocks.Length)
+                    throw new InvalidOperationException("SSA block count does not match GenTree block count.");
 
-                for (int i = 0; i < initialValues.Length; i++)
+                var result = ImmutableArray.CreateBuilder<GenTreeBlock>(originalBlocks.Length);
+                for (int i = 0; i < originalBlocks.Length; i++)
                 {
-                    var oldInitial = initialValues[i];
-                    var newInitial = new SsaValueName(oldInitial.Slot, SsaConfig.FirstSsaNumber);
-                    if (!map.TryAdd(oldInitial, newInitial))
-                        throw new InvalidOperationException($"Duplicate initial SSA value {oldInitial}.");
-                    nextBySlot[oldInitial.Slot] = SsaConfig.FirstSsaNumber;
-                    compactedInitialValues.Add(newInitial);
-                }
+                    var original = originalBlocks[i];
+                    var ssaBlock = ssaBlocks[i];
+                    if (original.Id != ssaBlock.Id)
+                        throw new InvalidOperationException("SSA block B" + ssaBlock.Id.ToString() + " is not aligned with GenTree block B" + original.Id.ToString() + ".");
 
-                for (int b = 0; b < blocks.Length; b++)
-                {
-                    var block = blocks[b];
-                    for (int p = 0; p < block.Phis.Length; p++)
-                        AssignDefinition(block.Phis[p].Target);
+                    var statements = ImmutableArray.CreateBuilder<GenTree>(ssaBlock.Statements.Length);
+                    for (int s = 0; s < ssaBlock.Statements.Length; s++)
+                        statements.Add(ssaBlock.Statements[s].Source);
 
-                    for (int n = 0; n < block.TreeList.Length; n++)
-                    {
-                        var tree = block.TreeList[n].Tree;
-                        if (tree.StoreTarget.HasValue)
-                            AssignDefinition(tree.StoreTarget.Value);
-                    }
-                }
-
-                var compactedBlocks = ImmutableArray.CreateBuilder<SsaBlock>(blocks.Length);
-                for (int b = 0; b < blocks.Length; b++)
-                {
-                    var block = blocks[b];
-                    var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
-                    for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        var inputs = ImmutableArray.CreateBuilder<SsaPhiInput>(phi.Inputs.Length);
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                        {
-                            var input = phi.Inputs[i];
-                            inputs.Add(new SsaPhiInput(input.PredecessorBlockId, MapUse(input.Value, "phi input")));
-                        }
-
-                        phis.Add(new SsaPhi(block.Id, phi.Slot, MapDefinition(phi.Target), inputs.ToImmutable()));
-                    }
-
-                    var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
-                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
-                    for (int s = 0; s < block.Statements.Length; s++)
-                    {
-                        var rewritten = RewriteStatement(block.Statements[s], block.StatementTreeLists[s]);
-                        statements.Add(rewritten.Root);
-                        statementTreeLists.Add(rewritten.TreeList);
-                    }
-
-                    compactedBlocks.Add(new SsaBlock(
-                        block.CfgBlock,
-                        phis.ToImmutable(),
+                    result.Add(new GenTreeBlock(
+                        original.Id,
+                        original.StartPc,
+                        original.EndPcExclusive,
+                        original.EntryStackDepth,
+                        original.ExitStackDepth,
+                        original.JumpKind,
+                        original.Flags,
                         statements.ToImmutable(),
-                        block.MemoryPhis,
-                        block.MemoryIn,
-                        block.MemoryOut,
-                        statementTreeLists: statementTreeLists.ToImmutable()));
-                }
-
-                var initialList = new List<SsaValueName>(compactedInitialValues.Count);
-                for (int i = 0; i < compactedInitialValues.Count; i++)
-                    initialList.Add(compactedInitialValues[i]);
-                initialList.Sort();
-                var compactedUseDefs = ImmutableArray.CreateBuilder<SsaUseDefLink>();
-                for (int i = 0; i < previousDefinitions.Length; i++)
-                {
-                    var descriptor = previousDefinitions[i].Descriptor;
-                    if (!descriptor.HasUseDefSsaNum)
-                        continue;
-
-                    var oldDef = descriptor.Name;
-                    var oldUse = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
-                    if (map.TryGetValue(oldDef, out var compactedDef) && map.TryGetValue(oldUse, out var compactedUse))
-                        compactedUseDefs.Add(new SsaUseDefLink(compactedDef, compactedUse));
-                }
-
-                return new SsaCompactionResult(initialList.ToImmutableArray(), compactedBlocks.ToImmutable(), compactedUseDefs.ToImmutable());
-
-                void AssignDefinitions(SsaTree tree)
-                {
-                    for (int i = 0; i < tree.Operands.Length; i++)
-                        AssignDefinitions(tree.Operands[i]);
-
-                    if (tree.StoreTarget.HasValue)
-                        AssignDefinition(tree.StoreTarget.Value);
-                }
-
-                void AssignDefinition(SsaValueName oldName)
-                {
-                    if (oldName.Version <= SsaConfig.ReservedSsaNumber)
-                        throw new InvalidOperationException($"Non-initial SSA definition reused the reserved SSA number: {oldName}.");
-                    if (map.ContainsKey(oldName))
-                        throw new InvalidOperationException($"Duplicate active SSA definition {oldName}.");
-
-                    int next = nextBySlot.TryGetValue(oldName.Slot, out int current) ? current + 1 : SsaConfig.FirstSsaNumber;
-                    var newName = new SsaValueName(oldName.Slot, next);
-                    nextBySlot[oldName.Slot] = next;
-                    map.Add(oldName, newName);
-                }
-
-                SsaValueName MapDefinition(SsaValueName oldName)
-                {
-                    if (map.TryGetValue(oldName, out var newName))
-                        return newName;
-                    throw new InvalidOperationException($"Active SSA definition {oldName} was not assigned a compact SSA number.");
-                }
-
-                SsaValueName MapUse(SsaValueName oldName, string context)
-                {
-                    if (map.TryGetValue(oldName, out var newName))
-                        return newName;
-                    throw new InvalidOperationException($"SSA {context} uses removed or never-defined value {oldName}.");
-                }
-
-                (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteStatement(SsaTree root, ImmutableArray<SsaTree> treeList)
-                {
-                    var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-                    var rewrittenTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length);
-
-                    for (int i = 0; i < treeList.Length; i++)
-                    {
-                        var rewritten = RewriteNode(treeList[i], rewrittenByTree);
-                        rewrittenByTree[treeList[i]] = rewritten;
-                        rewrittenTreeList.Add(rewritten);
-                    }
-
-                    var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : RewriteNode(root, rewrittenByTree);
-                    return (rewrittenRoot, ProjectReachableTreeList(rewrittenRoot, rewrittenTreeList.ToImmutable()));
-                }
-
-                SsaTree RewriteNode(SsaTree tree, Dictionary<SsaTree, SsaTree> rewrittenByTree)
-                {
-                    var operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
-                    for (int i = 0; i < tree.Operands.Length; i++)
-                    {
-                        if (!rewrittenByTree.TryGetValue(tree.Operands[i], out var rewrittenOperand))
-                            rewrittenOperand = RewriteNode(tree.Operands[i], rewrittenByTree);
-                        operands.Add(rewrittenOperand);
-                    }
-
-                    SsaValueName? value = tree.Value.HasValue
-                        ? MapUse(tree.Value.Value, "tree use")
-                        : null;
-                    SsaValueName? target = tree.StoreTarget.HasValue
-                        ? MapDefinition(tree.StoreTarget.Value)
-                        : null;
-                    SsaValueName? localFieldBase = tree.LocalFieldBaseValue.HasValue
-                        ? MapUse(tree.LocalFieldBaseValue.Value, "local field base")
-                        : null;
-                    return new SsaTree(
-                        tree.Source, operands.ToImmutable(), value, target, localFieldBase, tree.LocalField, tree.MemoryUses, tree.MemoryDefinitions);
-                }
-            }
-
-            private static ImmutableArray<SsaUseDefLink> ExtractUseDefLinks(ImmutableArray<SsaValueDefinition> definitions)
-            {
-                var result = ImmutableArray.CreateBuilder<SsaUseDefLink>();
-                for (int i = 0; i < definitions.Length; i++)
-                {
-                    var descriptor = definitions[i].Descriptor;
-                    if (!descriptor.HasUseDefSsaNum)
-                        continue;
-
-                    var definition = descriptor.Name;
-                    var use = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
-                    result.Add(new SsaUseDefLink(definition, use));
+                        original.SuccessorBlockIds,
+                        original.SuccessorPcs));
                 }
 
                 return result.ToImmutable();
-            }
-
-            private static ImmutableArray<SsaValueDefinition> BuildValueDefinitions(
-                ImmutableArray<SsaSlotInfo> slots,
-                ImmutableArray<SsaValueName> initialValues,
-                ImmutableArray<SsaBlock> blocks,
-                ImmutableArray<SsaUseDefLink> useDefLinks)
-            {
-                var infoBySlot = new Dictionary<SsaSlot, SsaSlotInfo>();
-                for (int i = 0; i < slots.Length; i++)
-                    infoBySlot[slots[i].Slot] = slots[i];
-
-                var definitions = new List<SsaValueDefinition>();
-                var seen = new HashSet<SsaValueName>();
-
-                for (int i = 0; i < initialValues.Length; i++)
-                {
-                    var name = initialValues[i];
-                    var info = GetSlotInfo(infoBySlot, name.Slot);
-                    Add(new SsaValueDefinition(new SsaDescriptor(
-                    name.Slot,
-                    name.Version,
-                    SsaDefinitionKind.Initial,
-                    -1,
-                    -1,
-                    -1,
-                    defNode: null,
-                    info.Type,
-                    info.StackKind)));
-                }
-
-                for (int b = 0; b < blocks.Length; b++)
-                {
-                    var block = blocks[b];
-                    for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        var info = GetSlotInfo(infoBySlot, phi.Target.Slot);
-                        Add(new SsaValueDefinition(new SsaDescriptor(
-                        phi.Target.Slot,
-                        phi.Target.Version,
-                        SsaDefinitionKind.Phi,
-                        block.Id,
-                        -1,
-                        -1,
-                        defNode: null,
-                        info.Type,
-                        info.StackKind,
-                        defBlock: block.CfgBlock,
-                        phiDescriptor: phi)));
-                    }
-
-                    for (int i = 0; i < block.TreeList.Length; i++)
-                        CollectDefinition(block.TreeList[i].Tree, block, block.TreeList[i].StatementIndex);
-                }
-
-                definitions.Sort(static (a, b) => a.Name.CompareTo(b.Name));
-                return definitions.ToImmutableArray();
-
-                void CollectDefinition(SsaTree tree, SsaBlock block, int statementIndex)
-                {
-                    int blockId = block.Id;
-
-                    if (!tree.StoreTarget.HasValue)
-                        return;
-
-                    var name = tree.StoreTarget.Value;
-                    var info = GetSlotInfo(infoBySlot, name.Slot);
-                    int useDefSsaNum = SsaConfig.ReservedSsaNumber;
-                    for (int i = 0; i < useDefLinks.Length; i++)
-                    {
-                        if (useDefLinks[i].Definition.Equals(name))
-                        {
-                            useDefSsaNum = useDefLinks[i].Use.Version;
-                            break;
-                        }
-                    }
-
-                    Add(new SsaValueDefinition(new SsaDescriptor(
-                        name.Slot,
-                        name.Version,
-                        SsaDefinitionKind.Store,
-                        blockId,
-                        statementIndex,
-                        tree.Source.Id,
-                        tree.Source,
-                        info.Type,
-                        info.StackKind,
-                        useDefSsaNum,
-                        block.CfgBlock)));
-                }
-
-                void Add(SsaValueDefinition definition)
-                {
-                    if (!seen.Add(definition.Name))
-                        throw new InvalidOperationException($"Duplicate SSA definition {definition.Name}.");
-                    definitions.Add(definition);
-                }
-            }
-
-            private static ImmutableArray<SsaLocalDescriptor> BuildSsaLocalDescriptors(
-                ImmutableArray<SsaSlotInfo> slots,
-                ImmutableArray<SsaValueDefinition> valueDefinitions,
-                ImmutableArray<SsaLocalDescriptor> previousDescriptors)
-            {
-                var previousBySlot = new Dictionary<SsaSlot, SsaLocalDescriptor>();
-                for (int i = 0; i < previousDescriptors.Length; i++)
-                    previousBySlot[previousDescriptors[i].Slot] = previousDescriptors[i];
-
-                var descriptorsBySlot = new Dictionary<SsaSlot, List<SsaDescriptor>>();
-                for (int i = 0; i < valueDefinitions.Length; i++)
-                {
-                    var descriptor = valueDefinitions[i].Descriptor;
-                    if (!descriptorsBySlot.TryGetValue(descriptor.BaseLocal, out var list))
-                    {
-                        list = new List<SsaDescriptor>();
-                        descriptorsBySlot.Add(descriptor.BaseLocal, list);
-                    }
-                    list.Add(descriptor);
-                }
-
-                var result = ImmutableArray.CreateBuilder<SsaLocalDescriptor>(slots.Length);
-                for (int i = 0; i < slots.Length; i++)
-                {
-                    var info = slots[i];
-                    descriptorsBySlot.TryGetValue(info.Slot, out var list);
-                    var perSsaData = DensePerSsaData(info.Slot, list);
-                    previousBySlot.TryGetValue(info.Slot, out var previous);
-                    var local = new SsaLocalDescriptor(
-                        info.Slot,
-                        info.Type,
-                        info.StackKind,
-                        info.AddressExposed,
-                        previous?.IsSsaPromoted ?? perSsaData.Length != 0,
-                        previous?.LocalDescriptor,
-                        perSsaData);
-                    previous?.LocalDescriptor?.SetSsaDescriptors(perSsaData);
-                    result.Add(local);
-                }
-
-                return result.ToImmutable();
-
-                static ImmutableArray<SsaDescriptor> DensePerSsaData(SsaSlot slot, List<SsaDescriptor>? descriptors)
-                {
-                    if (descriptors is null || descriptors.Count == 0)
-                        return ImmutableArray<SsaDescriptor>.Empty;
-
-                    int max = -1;
-                    for (int i = 0; i < descriptors.Count; i++)
-                        max = Math.Max(max, descriptors[i].SsaNumber);
-
-                    var table = new SsaDescriptor?[max + 1];
-                    for (int i = 0; i < descriptors.Count; i++)
-                    {
-                        var descriptor = descriptors[i];
-                        if (table[descriptor.SsaNumber] is not null)
-                            throw new InvalidOperationException($"Duplicate SSA descriptor {descriptor.Name}.");
-                        table[descriptor.SsaNumber] = descriptor;
-                    }
-
-                    var builder = ImmutableArray.CreateBuilder<SsaDescriptor>(table.Length);
-                    for (int i = 0; i < table.Length; i++)
-                    {
-                        if (i == SsaConfig.ReservedSsaNumber)
-                        {
-                            builder.Add(null!);
-                            continue;
-                        }
-
-                        if (table[i] is null)
-                            throw new InvalidOperationException($"Missing SSA descriptor {slot}_{i}.");
-                        builder.Add(table[i]!);
-                    }
-                    return builder.ToImmutable();
-                }
-            }
-
-            private static SsaSlotInfo GetSlotInfo(Dictionary<SsaSlot, SsaSlotInfo> infoBySlot, SsaSlot slot)
-            {
-                if (infoBySlot.TryGetValue(slot, out var info))
-                    return info;
-                return new SsaSlotInfo(
-                    slot, null, GenStackKind.Unknown, addressExposed: true, memoryAliased: true, category: GenLocalCategory.AddressExposedLocal);
             }
 
             private static int MaxTreeId(SsaMethod method)

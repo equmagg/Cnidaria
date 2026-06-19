@@ -560,12 +560,12 @@ namespace Cnidaria.Cs
         public bool AllocateTempSlots { get; set; } = true;
         public bool SaveUsedCalleeSavedRegisters { get; set; } = true;
 
-        public bool SaveFramePointerWhenFrameIsUsed { get; set; } = true;
+        public bool SaveFramePointerWhenFrameIsUsed { get; set; } = false;
 
         public bool UseFramePointerForFunclets { get; set; } = true;
 
         public bool SaveReturnAddressForNonLeafMethods { get; set; } = true;
-        public bool SaveReturnAddressForLeafMethods { get; set; } = true;
+        public bool SaveReturnAddressForLeafMethods { get; set; } = false;
 
         public int OutgoingArgumentSlotCount { get; set; }
     }

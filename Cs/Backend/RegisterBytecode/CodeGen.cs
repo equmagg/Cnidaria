@@ -515,7 +515,7 @@ namespace Cnidaria.Cs
                         AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, PtrSize, ref general, ref floating, ref stack);
                         hidden = new AbiEntity(null, ImmutableArray.Create(new AbiSlice(loc, RegisterClass.General, 0, PtrSize, saveCursor)));
                         saveCursor = AlignUp(saveCursor + PtrSize, PtrSize);
-                        if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                        if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, MachineAbi.LastStackSlotIndex(loc));
                     }
 
                     RuntimeType argType = GetLogicalArgumentType(method, i);
@@ -532,7 +532,7 @@ namespace Cnidaria.Cs
                     AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, PtrSize, ref general, ref floating, ref stack);
                     hidden = new AbiEntity(null, ImmutableArray.Create(new AbiSlice(loc, RegisterClass.General, 0, PtrSize, saveCursor)));
                     saveCursor = AlignUp(saveCursor + PtrSize, PtrSize);
-                    if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                    if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, MachineAbi.LastStackSlotIndex(loc));
                 }
 
                 int outgoingStackSize = maxStackSlot < 0 ? 0 : checked((maxStackSlot + 1) * MachineAbi.StackArgumentSlotSize);
@@ -550,7 +550,7 @@ namespace Cnidaria.Cs
                     case AbiValuePassingKind.ScalarRegister:
                         {
                             AbiArgumentLocation loc = MachineAbi.AssignScalarArgumentLocation(abi.RegisterClass, abi.Size, ref general, ref floating, ref stack);
-                            if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                            if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, MachineAbi.LastStackSlotIndex(loc));
                             builder.Add(new AbiSlice(loc, abi.RegisterClass, 0, Math.Max(1, abi.Size), saveBase));
                             return builder.ToImmutable();
                         }
@@ -563,7 +563,7 @@ namespace Cnidaria.Cs
                             {
                                 var seg = segments[i];
                                 AbiArgumentLocation loc = MachineAbi.AssignAggregateSegmentArgumentLocation(seg, ref general, ref floating, ref stack, ref aggregateStackSlot, ref aggregateStackBaseOffset);
-                                if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                                if (loc.IsStack) maxStackSlot = Math.Max(maxStackSlot, MachineAbi.LastStackSlotIndex(loc));
                                 builder.Add(new AbiSlice(loc, seg.RegisterClass, seg.Offset, seg.Size, checked(saveBase + seg.Offset)));
                             }
                             return builder.ToImmutable();
@@ -572,8 +572,10 @@ namespace Cnidaria.Cs
                     case AbiValuePassingKind.Indirect:
                         {
                             int size = abi.Size <= 0 ? PtrSize : abi.Size;
-                            AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, size);
-                            maxStackSlot = Math.Max(maxStackSlot, loc.StackSlotIndex);
+                            int stackSlot = stack;
+                            stack = checked(stack + MachineAbi.StackSlotsForArgumentSize(size));
+                            AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stackSlot, 0, size);
+                            maxStackSlot = Math.Max(maxStackSlot, MachineAbi.LastStackSlotIndex(loc));
                             builder.Add(new AbiSlice(loc, RegisterClass.General, 0, size, saveBase));
                             return builder.ToImmutable();
                         }
@@ -1120,7 +1122,6 @@ namespace Cnidaria.Cs
                 {
                     case GenTreeKind.Nop:
                     case GenTreeKind.Eval:
-                        _asm.Nop();
                         return;
                     case GenTreeKind.ConstI4:
                         _asm.LiI32(RequireResultRegister(instruction), source.Int32);
@@ -1451,7 +1452,7 @@ namespace Cnidaria.Cs
                     var use = instruction.Uses[0];
                     var slot = FrameSlotOperandForLocalLike(source, valueType, valueKind,
                         use.RegisterClass == RegisterClass.Invalid ? RegisterClassForStorage(valueType, valueKind) : use.RegisterClass);
-                    if (IsAggregateStorage(use, valueType, valueKind))
+                    if (IsAggregateStorage(use, valueType, valueKind) || use.IsFrameSlot)
                     {
                         EmitMemoryToMemory(slot, use, valueType, valueKind);
                         return;
@@ -2187,8 +2188,8 @@ namespace Cnidaria.Cs
             {
                 if (instruction.Uses.Length == 0)
                 {
-                    if (TryEmitContainedLocalLikeMultiRegisterReturn(instruction, source))
-                        return;
+                    if (source.Operands.Length != 0)
+                        throw Unsupported(instruction, "value return reached codegen without ABI return operands");
 
                     _asm.RetVoid();
                     return;
@@ -2284,12 +2285,28 @@ namespace Cnidaria.Cs
                 EmitAddressOf(MachineRegisters.BackendScratch, sourceLocation);
                 EmitLoadIncomingHiddenReturnBufferAddress(MachineRegisters.ParallelCopyScratch1);
                 EmitCopyAddressToAddress(returnType, returnKind, MachineRegisters.ParallelCopyScratch1, MachineRegisters.BackendScratch, Math.Max(1, size), InstructionFlags.MayThrow);
-                _asm.RetVoid();
                 return true;
             }
 
             private void EmitLoadIncomingHiddenReturnBufferAddress(MachineRegister dst)
             {
+                int homeIndex = _method.ArgTypes.Length;
+                if (_method.StackFrame.TryGetArgumentSlot(homeIndex, out StackFrameSlot homeSlot))
+                {
+                    var frameBase = _method.StackFrame.UsesFramePointer
+                        ? RegisterFrameBase.FramePointer
+                        : RegisterFrameBase.StackPointer;
+                    var home = RegisterOperand.ForFrameSlot(
+                        RegisterClass.General,
+                        StackFrameSlotKind.Argument,
+                        frameBase,
+                        homeSlot.Index,
+                        homeSlot.Offset,
+                        TargetArchitecture.PointerSize);
+                    EmitLoad(dst, home, null, GenStackKind.Ptr);
+                    return;
+                }
+
                 var location = ComputeIncomingHiddenReturnBufferLocation();
                 if (location.IsRegister)
                 {
@@ -2337,8 +2354,11 @@ namespace Cnidaria.Cs
                         }
                     case AbiValuePassingKind.Stack:
                     case AbiValuePassingKind.Indirect:
-                        outgoingIndex++;
-                        return;
+                        {
+                            int size = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                            outgoingIndex = checked(outgoingIndex + MachineAbi.StackSlotsForArgumentSize(size));
+                            return;
+                        }
                     default:
                         throw new InvalidOperationException("Unsupported ABI argument passing kind: " + abi.PassingKind);
                 }
@@ -2365,58 +2385,6 @@ namespace Cnidaria.Cs
                     throw Unsupported(instruction, "multi-register return first fragment is not an ABI register");
 
                 EmitMultiRegisterReturnFromFirstRegister(first.Register, segments[0]);
-            }
-
-            private bool TryEmitContainedLocalLikeMultiRegisterReturn(GenTree instruction, GenTree source)
-            {
-                if (source.Kind != GenTreeKind.Return || source.Operands.Length != 1)
-                    return false;
-
-                var value = source.Operands[0];
-                if (value.Kind is not (GenTreeKind.Local or GenTreeKind.Temp))
-                    return false;
-
-                RuntimeType? returnType = value.LocalDescriptor?.Type ?? value.RuntimeType ?? value.Type;
-                if (returnType is null || !returnType.IsValueType)
-                    return false;
-
-                if (MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod))
-                    return false;
-
-                var returnKind = value.LocalDescriptor?.StackKind ?? StackKindOf(returnType);
-                var abi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true);
-                if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
-                    return false;
-
-                var segments = MachineAbi.GetRegisterSegments(abi);
-                if (segments.Length == 0)
-                    return false;
-
-                var slot = FrameSlotOperandForLocalLike(value, returnType, returnKind, RegisterClass.General);
-                int generalReturnIndex = 0;
-                int floatReturnIndex = 0;
-                MachineRegister firstRegister = MachineRegister.Invalid;
-                AbiRegisterSegment firstSegment = default;
-
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    var segment = segments[i];
-                    var dst = GetReturnRegister(segment.RegisterClass, ref generalReturnIndex, ref floatReturnIndex);
-                    if (dst == MachineRegister.Invalid)
-                        throw Unsupported(instruction, $"multi-register return has no ABI register for fragment {i}");
-
-                    var src = FrameSlotFragment(slot, segment);
-                    EmitLoad(dst, src, null, StackKindForSegment(segment));
-
-                    if (i == 0)
-                    {
-                        firstRegister = dst;
-                        firstSegment = segment;
-                    }
-                }
-
-                EmitMultiRegisterReturnFromFirstRegister(firstRegister, firstSegment);
-                return true;
             }
 
             private void EmitMultiRegisterReturnFromFirstRegister(MachineRegister firstRegister, AbiRegisterSegment firstSegment)
@@ -3402,14 +3370,16 @@ namespace Cnidaria.Cs
                     EmitLoadAddress(dst, src);
                     return;
                 }
-                _asm.Emit(InstrDesc.Mem(SelectLoadOp(type, kind, src.RegisterClass, src.FrameSlotSize), dst, FrameBaseRegister(src), src.FrameOffset, aux: FrameMemoryAux(src)));
+                var destinationClass = MachineRegisters.GetClass(dst);
+                _asm.Emit(InstrDesc.Mem(SelectLoadOp(type, kind, destinationClass, src.FrameSlotSize), dst, FrameBaseRegister(src), src.FrameOffset, aux: FrameMemoryAux(src)));
             }
 
             private void EmitStore(RegisterOperand dst, MachineRegister src, RuntimeType? type, GenStackKind kind)
             {
                 if (!dst.IsFrameSlot)
                     throw new InvalidOperationException("All post-LSRA memory operands must be finalized frame slots. Operand: " + dst);
-                _asm.Emit(InstrDesc.Mem(SelectStoreOp(type, kind, dst.RegisterClass, dst.FrameSlotSize), src, FrameBaseRegister(dst), dst.FrameOffset, aux: FrameMemoryAux(dst)));
+                var sourceClass = MachineRegisters.GetClass(src);
+                _asm.Emit(InstrDesc.Mem(SelectStoreOp(type, kind, sourceClass, dst.FrameSlotSize), src, FrameBaseRegister(dst), dst.FrameOffset, aux: FrameMemoryAux(dst)));
             }
 
             private void EmitMemoryToMemory(RegisterOperand dst, RegisterOperand src, RuntimeType? type, GenStackKind kind)
@@ -3707,14 +3677,14 @@ namespace Cnidaria.Cs
                 if (source.LocalDescriptor is not { IsStructField: true })
                     return false;
 
-                if (source.Operands.Length != instruction.RegisterUses.Length)
-                    return false;
-
                 if (instruction.Results.Length == 0 && instruction.Uses.Length == 0)
                 {
                     _asm.Nop();
                     return true;
                 }
+
+                if (instruction.Uses.Length == 0 && TryEmitSsaPromotedFieldDefaultDefinition(instruction, source))
+                    return true;
 
                 if (instruction.Results.Length != instruction.Uses.Length)
                     throw Unsupported(instruction, "SSA promoted field definition has mismatched source and destination fragment counts");
@@ -3733,6 +3703,34 @@ namespace Cnidaria.Cs
                     EmitMove(pseudo);
                 }
 
+                return true;
+            }
+
+            private bool TryEmitSsaPromotedFieldDefaultDefinition(GenTree instruction, GenTree source)
+            {
+                if (source.Operands.Length <= 1 || source.Operands[1].Kind != GenTreeKind.DefaultValue)
+                    return false;
+
+                var field = source.Field ?? throw Unsupported(instruction, "SSA promoted field definition has no runtime field");
+                RuntimeType fieldType = field.FieldType;
+                GenStackKind fieldKind = StackKindOf(fieldType);
+
+                if (instruction.Results.Length > 1)
+                {
+                    var segments = RegisterSegmentsForStorage(fieldType, fieldKind);
+                    if (segments.Length != instruction.Results.Length)
+                        throw Unsupported(instruction, "SSA promoted field default definition fragment count does not match storage ABI");
+
+                    for (int i = 0; i < instruction.Results.Length; i++)
+                    {
+                        var destination = instruction.Results[i];
+                        var segment = segments[i];
+                        EmitZeroToOperand(instruction, destination, null, StackKindForSegment(segment));
+                    }
+                    return true;
+                }
+
+                EmitZeroToOperand(instruction, RequireSingleResult(instruction), fieldType, fieldKind);
                 return true;
             }
 
@@ -4472,7 +4470,7 @@ namespace Cnidaria.Cs
             {
                 if (type is not null && type.IsValueType && !IsScalarValueType(type))
                     return Op.LdObj;
-                if (registerClass == RegisterClass.Float || kind is GenStackKind.R4 or GenStackKind.R8)
+                if (registerClass == RegisterClass.Float || (registerClass == RegisterClass.Invalid && (kind == GenStackKind.R4 || kind == GenStackKind.R8)))
                     return kind == GenStackKind.R4 || type?.Name == "Single" || storageSize == 4 ? Op.LdF32 : Op.LdF64;
                 if (kind is GenStackKind.Ref or GenStackKind.Null || (type?.IsReferenceType ?? false))
                     return Op.LdRef;
@@ -4503,7 +4501,7 @@ namespace Cnidaria.Cs
             {
                 if (type is not null && type.IsValueType && !IsScalarValueType(type))
                     return Op.StObj;
-                if (registerClass == RegisterClass.Float || kind is GenStackKind.R4 or GenStackKind.R8)
+                if (registerClass == RegisterClass.Float || (registerClass == RegisterClass.Invalid && (kind == GenStackKind.R4 || kind == GenStackKind.R8)))
                     return kind == GenStackKind.R4 || type?.Name == "Single" || storageSize == 4 ? Op.StF32 : Op.StF64;
                 if (kind is GenStackKind.Ref or GenStackKind.Null || (type?.IsReferenceType ?? false))
                     return Op.StRef;

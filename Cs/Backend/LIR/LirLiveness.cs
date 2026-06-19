@@ -965,6 +965,7 @@ namespace Cnidaria.Cs
             var usePositions = new Dictionary<GenTree, SortedSet<int>>();
             var defPositions = new Dictionary<GenTree, int>();
             var phiCopies = new List<GenTree>();
+            var ssaValueNodes = new Dictionary<SsaValueName, GenTree>();
 
             for (int i = 0; i < method.Values.Length; i++)
             {
@@ -972,6 +973,9 @@ namespace Cnidaria.Cs
                 var value = info.RepresentativeNode;
                 usePositions[value] = new SortedSet<int>();
                 defPositions[value] = ComputeInitialDefinitionPosition(layout, info);
+
+                if (info.Value.IsSsaValue)
+                    ssaValueNodes[new SsaValueName(info.Value.SsaSlot, info.Value.SsaVersion)] = value;
             }
 
             for (int b = 0; b < method.Blocks.Length; b++)
@@ -1043,6 +1047,15 @@ namespace Cnidaria.Cs
 
                 blockUses[toBlockId].Remove(destinationValue);
             }
+
+            RecordIdentityPhiInputUses(
+                method,
+                layout,
+                ssaValueNodes,
+                usePositions,
+                localUseEnds,
+                blockUses,
+                blockDefs);
 
             var dataflowOrder = method.LinearBlockOrder.IsDefaultOrEmpty
                 ? LinearBlockOrder.Compute(method.Cfg)
@@ -1202,6 +1215,49 @@ namespace Cnidaria.Cs
                left.LinearPhiCopyFromBlockId == right.LinearPhiCopyFromBlockId &&
                left.LinearPhiCopyToBlockId == right.LinearPhiCopyToBlockId;
 
+        private static void RecordIdentityPhiInputUses(
+            GenTreeMethod method,
+            PositionLayout layout,
+            IReadOnlyDictionary<SsaValueName, GenTree> ssaValueNodes,
+            Dictionary<GenTree, SortedSet<int>> usePositions,
+            Dictionary<GenTree, int>[] localUseEnds,
+            HashSet<GenTree>[] blockUses,
+            HashSet<GenTree>[] blockDefs)
+        {
+            var ssa = method.Ssa;
+            if (ssa is null)
+                return;
+
+            for (int b = 0; b < ssa.Blocks.Length; b++)
+            {
+                var block = ssa.Blocks[b];
+                for (int p = 0; p < block.Phis.Length; p++)
+                {
+                    var phi = block.Phis[p];
+                    if (!ssaValueNodes.TryGetValue(phi.Target, out var targetValue))
+                        continue;
+
+                    for (int i = 0; i < phi.Inputs.Length; i++)
+                    {
+                        var input = phi.Inputs[i];
+                        if (!input.Value.Equals(phi.Target))
+                            continue;
+
+                        int fromBlockId = input.PredecessorBlockId;
+                        if ((uint)fromBlockId >= (uint)method.Blocks.Length)
+                            throw new InvalidOperationException($"SSA phi input references invalid predecessor B{fromBlockId}.");
+
+                        int usePosition = ComputePhiInputSourcePosition(layout, fromBlockId);
+                        int useEnd = layout.BlockEndPositions[fromBlockId] + 1;
+                        RecordUse(usePositions, localUseEnds[fromBlockId], targetValue, usePosition, useEnd);
+
+                        if (!blockDefs[fromBlockId].Contains(targetValue))
+                            blockUses[fromBlockId].Add(targetValue);
+                    }
+                }
+            }
+        }
+
         private static int ComputeInitialDefinitionPosition(PositionLayout layout, GenTreeValueInfo info)
         {
             if (info.DefinitionNodeId >= 0 && layout.NodePositions.TryGetValue(info.DefinitionNodeId, out int nodePos))
@@ -1220,8 +1276,13 @@ namespace Cnidaria.Cs
             if ((uint)node.LinearPhiCopyFromBlockId >= (uint)layout.BlockEndPositions.Length)
                 throw new InvalidOperationException($"Invalid phi-copy source block B{node.LinearPhiCopyFromBlockId} for node {node.LinearId}.");
 
-            int blockEnd = layout.BlockEndPositions[node.LinearPhiCopyFromBlockId];
-            int blockStart = layout.BlockStartPositions[node.LinearPhiCopyFromBlockId];
+            return ComputePhiInputSourcePosition(layout, node.LinearPhiCopyFromBlockId);
+        }
+
+        private static int ComputePhiInputSourcePosition(PositionLayout layout, int fromBlockId)
+        {
+            int blockEnd = layout.BlockEndPositions[fromBlockId];
+            int blockStart = layout.BlockStartPositions[fromBlockId];
             return blockEnd > blockStart ? blockEnd - 1 : blockStart;
         }
 
@@ -1239,16 +1300,14 @@ namespace Cnidaria.Cs
         {
             int end = usePosition + 1;
 
-            if (hasDef &&
-                (node.HasLoweringFlag(GenTreeLinearFlags.RequiresRegisterOperands) ||
-                 node.LinearMemoryAccess.HasAddressOperand(operandIndex) ||
-                 node.LinearMemoryAccess.HasValueOperand(operandIndex)))
-            {
+            if (hasDef && UseRequiresDelayedFree(node, operandIndex))
                 end = defPosition + 1;
-            }
 
             return end;
         }
+
+        private static bool UseRequiresDelayedFree(GenTree node, int operandIndex)
+            => node.LinearMemoryAccess.HasAddressOperand(operandIndex);
 
         private static void RecordUse(
             Dictionary<GenTree, SortedSet<int>> allUsePositions,

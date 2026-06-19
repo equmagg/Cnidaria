@@ -3094,8 +3094,48 @@ namespace System
         {
             return UInt64ToHexString((ulong)value, precision, upperCase);
         }
+        internal const int FloatFormatBufferCharCount = 32;
+        internal const int DoubleFormatBufferCharCount = 32;
+        private static unsafe string StringFromCharBuffer(char* source, int length)
+        {
+            string s = String.FastAllocateString(length);
+            ref char dst = ref s.GetRawStringData();
+            for (int i = 0; i < length; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = source[i];
+            return s;
+        }
 
-        internal static string FormatFloat(float value, string? format, NumberFormatInfo? info)
+        private static unsafe int FormatUnsignedIntegerToBuffer(ulong value, bool negative, char* destination, int destinationLength)
+        {
+            char* buffer = stackalloc char[20];
+            char* p = buffer + 20;
+
+            do
+            {
+                ulong digit = value % 10UL;
+                value /= 10UL;
+                *--p = (char)('0' + digit);
+            } while (value != 0UL);
+
+            int digitCount = (int)((buffer + 20) - p);
+            int length = digitCount + (negative ? 1 : 0);
+
+            int pos = 0;
+            if (negative)
+                destination[pos++] = '-';
+
+            for (int i = 0; i < digitCount; i++)
+                destination[pos++] = p[i];
+
+            return length;
+        }
+        internal static unsafe string FormatFloat(float value, string? format, NumberFormatInfo? info)
+        {
+            char* buffer = stackalloc char[FloatFormatBufferCharCount];
+            int length = FormatFloatToBuffer(value, format, info, buffer, FloatFormatBufferCharCount);
+            return StringFromCharBuffer(buffer, length);
+        }
+        internal static unsafe int FormatFloatToBuffer(float value, string? format, NumberFormatInfo? info, char* destination, int destinationLength)
         {
             uint bits = BitConverter.SingleToUInt32Bits(value);
             bool negative = (bits & 0x8000_0000U) != 0;
@@ -3104,22 +3144,72 @@ namespace System
             if ((absBits & 0x7F80_0000U) == 0x7F80_0000U)
             {
                 if ((absBits & 0x007F_FFFFU) != 0)
-                    return "NaN";
+                {
+                    destination[0] = 'N';
+                    destination[1] = 'a';
+                    destination[2] = 'N';
+                    return 3;
+                }
 
-                return negative ? "-Infinity" : "Infinity";
+                if (negative) //-Infinity
+                {
+                    destination[0] = '-';
+                    destination[1] = 'I';
+                    destination[2] = 'n';
+                    destination[3] = 'f';
+                    destination[4] = 'i';
+                    destination[5] = 'n';
+                    destination[6] = 'i';
+                    destination[7] = 't';
+                    destination[8] = 'y';
+                    return 9;
+                }
+                else //Infinity
+                {
+                    destination[0] = 'I';
+                    destination[1] = 'n';
+                    destination[2] = 'f';
+                    destination[3] = 'i';
+                    destination[4] = 'n';
+                    destination[5] = 'i';
+                    destination[6] = 't';
+                    destination[7] = 'y';
+                    return 8;
+                }
             }
 
             if (absBits == 0)
-                return "0";
+            {
+                destination[0] = '0';
+                return 1;
+            }
 
             if (value > -2147483648.0f && value < 2147483648.0f)
             {
                 int integerValue = (int)value;
                 if ((float)integerValue == value)
-                    return Int32ToString(integerValue);
+                {
+                    if (value == unchecked((int)0x80000000))
+                    {
+                        destination[0] = '-';
+                        destination[1] = '2';
+                        destination[2] = '1';
+                        destination[3] = '4';
+                        destination[4] = '7';
+                        destination[5] = '4';
+                        destination[6] = '8';
+                        destination[7] = '3';
+                        destination[8] = '6';
+                        destination[9] = '4';
+                        destination[10] = '8';
+                        return 11;
+                    }
+                    uint magnitude = (uint)(value < 0 ? -value : value);
+                    return FormatUnsignedIntegerToBuffer(magnitude, value < 0, destination, destinationLength);
+                }
             }
 
-            return FormatDouble((double)value, format, info);
+            return FormatDoubleToBuffer((double)value, format, info, destination, destinationLength);
         }
 
         private const int DoubleFormatBigUIntMaxWords = 48;
@@ -3131,6 +3221,12 @@ namespace System
             public int Capacity;
         }
         internal static unsafe string FormatDouble(double value, string? format, NumberFormatInfo? info)
+        {
+            char* buffer = stackalloc char[DoubleFormatBufferCharCount];
+            int length = FormatDoubleToBuffer(value, format, info, buffer, DoubleFormatBufferCharCount);
+            return StringFromCharBuffer(buffer, length);
+        }
+        internal static unsafe int FormatDoubleToBuffer(double value, string? format, NumberFormatInfo? info, char* destination, int destinationLength)
         {
             const ulong SignMask = 0x8000_0000_0000_0000UL;
             const ulong MantissaMask = 0x000F_FFFF_FFFF_FFFFUL;
@@ -3145,19 +3241,78 @@ namespace System
             if ((absBits & ExponentMask) == ExponentMask)
             {
                 if ((absBits & MantissaMask) != 0)
-                    return "NaN";
+                {
+                    destination[0] = 'N';
+                    destination[1] = 'a';
+                    destination[2] = 'N';
+                    return 3;
+                }
 
-                return negative ? "-Infinity" : "Infinity";
+                if (negative) //-Infinity
+                {
+                    destination[0] = '-';
+                    destination[1] = 'I';
+                    destination[2] = 'n';
+                    destination[3] = 'f';
+                    destination[4] = 'i';
+                    destination[5] = 'n';
+                    destination[6] = 'i';
+                    destination[7] = 't';
+                    destination[8] = 'y';
+                    return 9;
+                }
+                else //Infinity
+                {
+                    destination[0] = 'I';
+                    destination[1] = 'n';
+                    destination[2] = 'f';
+                    destination[3] = 'i';
+                    destination[4] = 'n';
+                    destination[5] = 'i';
+                    destination[6] = 't';
+                    destination[7] = 'y';
+                    return 8;
+                }
             }
 
             if (absBits == 0)
-                return "0";
+            {
+                destination[0] = '0';
+                return 1;
+            }
 
             if (value > -9223372036854775808.0 && value < 9223372036854775808.0)
             {
                 long integerValue = (long)value;
                 if ((double)integerValue == value)
-                    return Int64ToString(integerValue);
+                {
+                    if (value == unchecked((long)0x8000000000000000))
+                    {
+                        destination[0] = '-';
+                        destination[1] = '9';
+                        destination[2] = '2';
+                        destination[3] = '2';
+                        destination[4] = '3';
+                        destination[5] = '3';
+                        destination[6] = '7';
+                        destination[7] = '2';
+                        destination[8] = '0';
+                        destination[9] = '3';
+                        destination[10] = '6';
+                        destination[11] = '8';
+                        destination[12] = '5';
+                        destination[13] = '4';
+                        destination[14] = '7';
+                        destination[15] = '7';
+                        destination[16] = '5';
+                        destination[17] = '8';
+                        destination[18] = '0';
+                        destination[19] = '8';
+                        return 20;
+                    }
+                    ulong magnitude = (ulong)(value < 0 ? -value : value);
+                    return FormatUnsignedIntegerToBuffer(magnitude, value < 0, destination, destinationLength);
+                }
             }
 
             ulong ieeeMantissa = bits & MantissaMask;
@@ -3230,7 +3385,7 @@ namespace System
                 decimalScale = nextScale;
             }
 
-            return FormatShortestDouble(negative, digits, decimalScale);
+            return FormatShortestDoubleToBuffer(negative, digits, decimalScale, destination, destinationLength);
         }
         private static int ComputeDecimalExponent(ulong mantissa, int binaryExponent)
         {
@@ -3735,7 +3890,7 @@ namespace System
 
             return quotient;
         }
-        private static unsafe string FormatShortestDouble(bool negative, ulong digits, int decimalScale)
+        private static unsafe int FormatShortestDoubleToBuffer(bool negative, ulong digits, int decimalScale, char* destination, int destinationLength)
         {
             char* digitBuffer = stackalloc char[24];
             int digitCount = UInt64ToDecimalDigits(digits, digitBuffer + 24);
@@ -3743,9 +3898,9 @@ namespace System
 
             int scientificExponent = digitCount + decimalScale - 1;
             if (scientificExponent >= -4 && scientificExponent < digitCount)
-                return FormatFixedDecimal(negative, digitStart, digitCount, decimalScale);
+                return FormatFixedDecimalToBuffer(negative, digitStart, digitCount, decimalScale, destination, destinationLength);
 
-            return FormatScientificDecimal(negative, digitStart, digitCount, scientificExponent);
+            return FormatScientificDecimalToBuffer(negative, digitStart, digitCount, scientificExponent, destination, destinationLength);
         }
         private static unsafe int UInt64ToDecimalDigits(ulong value, char* end)
         {
@@ -3760,7 +3915,7 @@ namespace System
 
             return (int)(end - p);
         }
-        private static unsafe string FormatFixedDecimal(bool negative, char* digits, int digitCount, int decimalScale)
+        private static unsafe int FormatFixedDecimalToBuffer(bool negative, char* digits, int digitCount, int decimalScale, char* destination, int destinationLength)
         {
             int decimalPoint = digitCount + decimalScale;
             int signLength = negative ? 1 : 0;
@@ -3773,89 +3928,83 @@ namespace System
             else
                 length = signLength + digitCount + 1;
 
-            string result = String.FastAllocateString(length);
-            ref char dst = ref result.GetRawStringData();
             int pos = 0;
 
             if (negative)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '-';
+                destination[pos++] = '-';
 
             if (decimalPoint <= 0)
             {
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+                destination[pos++] = '0';
+                destination[pos++] = '.';
 
                 int zeroCount = -decimalPoint;
                 for (int i = 0; i < zeroCount; i++)
-                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+                    destination[pos++] = '0';
 
                 for (int i = 0; i < digitCount; i++)
-                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+                    destination[pos++] = digits[i];
 
-                return result;
+                return length;
             }
 
             if (decimalPoint >= digitCount)
             {
                 for (int i = 0; i < digitCount; i++)
-                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+                    destination[pos++] = digits[i];
 
                 for (int i = digitCount; i < decimalPoint; i++)
-                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+                    destination[pos++] = '0';
 
-                return result;
+                return length;
             }
 
             for (int i = 0; i < decimalPoint; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+                destination[pos++] = digits[i];
 
-            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+            destination[pos++] = '.';
 
             for (int i = decimalPoint; i < digitCount; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+                destination[pos++] = digits[i];
 
-            return result;
+            return length;
         }
-        private static unsafe string FormatScientificDecimal(bool negative, char* digits, int digitCount, int scientificExponent)
+        private static unsafe int FormatScientificDecimalToBuffer(bool negative, char* digits, int digitCount, int scientificExponent, char* destination, int destinationLength)
         {
             char* exponentBuffer = stackalloc char[8];
-            int exponentDigitCount = UInt32ToDecimalDigits(
-                scientificExponent < 0 ? (uint)(-scientificExponent) : (uint)scientificExponent, exponentBuffer + 8);
-            if (exponentDigitCount < 2)
-                exponentDigitCount = 2;
+            uint exponentMagnitude = scientificExponent < 0 ? (uint)(-scientificExponent) : (uint)scientificExponent;
+            int exponentMagnitudeDigitCount = UInt32ToDecimalDigits(exponentMagnitude, exponentBuffer + 8);
+            int exponentDigitCount = exponentMagnitudeDigitCount < 2 ? 2 : exponentMagnitudeDigitCount;
 
             int signLength = negative ? 1 : 0;
             int significandLength = digitCount == 1 ? 1 : digitCount + 1;
             int length = signLength + significandLength + 2 + exponentDigitCount;
 
-            string result = String.FastAllocateString(length);
-            ref char dst = ref result.GetRawStringData();
             int pos = 0;
 
             if (negative)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '-';
+                destination[pos++] = '-';
 
-            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[0];
+            destination[pos++] = digits[0];
             if (digitCount != 1)
             {
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '.';
+                destination[pos++] = '.';
                 for (int i = 1; i < digitCount; i++)
-                    System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = digits[i];
+                    destination[pos++] = digits[i];
             }
 
-            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = 'E';
-            System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = scientificExponent < 0 ? '-' : '+';
+            destination[pos++] = 'E';
+            destination[pos++] = scientificExponent < 0 ? '-' : '+';
 
-            int leadingZeroCount = exponentDigitCount - UInt32ToDecimalDigits(
-                scientificExponent < 0 ? (uint)(-scientificExponent) : (uint)scientificExponent, exponentBuffer + 8);
+            int leadingZeroCount = exponentDigitCount - exponentMagnitudeDigitCount;
             for (int i = 0; i < leadingZeroCount; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = '0';
+                destination[pos++] = '0';
 
-            char* exponentStart = exponentBuffer + 8 - (exponentDigitCount - leadingZeroCount);
-            for (int i = 0; i < exponentDigitCount - leadingZeroCount; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos++) = exponentStart[i];
+            char* exponentStart = exponentBuffer + 8 - exponentMagnitudeDigitCount;
+            for (int i = 0; i < exponentMagnitudeDigitCount; i++)
+                destination[pos++] = exponentStart[i];
 
-            return result;
+            return length;
         }
         private static unsafe int UInt32ToDecimalDigits(uint value, char* end)
         {
@@ -9968,10 +10117,19 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
             _Write(p);
         }
-        public static void Write(float value) { _Write(System.Number.FormatFloat(value, null, null)); }
+        public static unsafe void Write(float value)
+        {
+            char* buffer = stackalloc char[System.Number.FloatFormatBufferCharCount + 1];
+            int length = System.Number.FormatFloatToBuffer(value, null, null, buffer, System.Number.FloatFormatBufferCharCount);
+            buffer[length] = '\0';
+            _Write(buffer);
+        }
         public static unsafe void Write(double value)
         {
-            _Write(System.Number.FormatDouble(value, null, null));
+            char* buffer = stackalloc char[System.Number.DoubleFormatBufferCharCount + 1];
+            int length = System.Number.FormatDoubleToBuffer(value, null, null, buffer, System.Number.DoubleFormatBufferCharCount);
+            buffer[length] = '\0';
+            _Write(buffer);
         }
         public static unsafe void Write(char value) { uint terminated = value; _Write((char*)&terminated); }
         public static unsafe void Write(bool value)

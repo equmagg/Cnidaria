@@ -23,7 +23,9 @@ namespace Cnidaria.Cs
         public bool OptimizeSsa { get; set; } = true;
         public bool ValidateHir { get; set; } = true;
         public bool ValidateSsa { get; set; } = true;
+        public bool EnablePhysicalPromotion { get; set; } = true;
 
+        public PhysicalPromotionOptions PhysicalPromotionOptions { get; set; } = PhysicalPromotionOptions.Default;
         public SsaOptimizationOptions SsaOptimizationOptions { get; set; } = SsaOptimizationOptions.DefaultWithoutValidation;
         public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
         public RegisterAllocatorOptions RegisterAllocatorOptions { get; set; } = RegisterAllocatorOptions.Default;
@@ -233,6 +235,14 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (options.EnablePhysicalPromotion)
+            {
+                var promotion = GenTreePhysicalPromoter.PromoteMethod(method, options.PhysicalPromotionOptions);
+                method = promotion.Method;
+                if (promotion.Changed)
+                    method = GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir);
+            }
+
             var cfg = ControlFlowGraph.Build(method);
             method.AttachFlowGraph(cfg);
 
@@ -276,7 +286,7 @@ namespace Cnidaria.Cs
     }
     internal static class GenTreeMorpher
     {
-        public static GenTreeMethod MorphMethod(GenTreeMethod method)
+        public static GenTreeMethod MorphMethod(GenTreeMethod method, GenTreeMethodPhase phase = GenTreeMethodPhase.MorphedHir)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
@@ -288,7 +298,7 @@ namespace Cnidaria.Cs
                     NormalizeFlags(statements[s]);
             }
 
-            method.SetPhase(GenTreeMethodPhase.MorphedHir);
+            method.SetPhase(phase);
             return method;
         }
 
@@ -424,8 +434,6 @@ namespace Cnidaria.Cs
                 for (int s = 0; s < statements.Length; s++)
                     MarkAddressExposed(statements[s]);
             }
-
-            method.EnsurePromotedStructFieldLocals();
 
             SealDescriptors(method.ArgDescriptors);
             SealDescriptors(method.LocalDescriptors);

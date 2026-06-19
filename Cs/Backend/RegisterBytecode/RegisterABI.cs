@@ -220,6 +220,21 @@ namespace Cnidaria.Cs
         public static int GeneralRegisterSlotSize => TargetArchitecture.GeneralRegisterSize;
         public static int StackArgumentSlotSize => TargetArchitecture.StackSlotSize;
 
+        public static int StackSlotsForArgumentSize(int size)
+        {
+            int actualSize = size <= 0 ? StackArgumentSlotSize : size;
+            return Math.Max(1, checked((actualSize + StackArgumentSlotSize - 1) / StackArgumentSlotSize));
+        }
+
+        public static int LastStackSlotIndex(AbiArgumentLocation location)
+        {
+            if (!location.IsStack)
+                return -1;
+
+            int coveredSize = checked(location.StackOffset + Math.Max(1, location.Size));
+            return checked(location.StackSlotIndex + StackSlotsForArgumentSize(coveredSize) - 1);
+        }
+
         public static AbiValueInfo AddressValue()
             => Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
 
@@ -577,7 +592,9 @@ namespace Cnidaria.Cs
 
                 var stackClass = info.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : info.RegisterClass;
                 int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
-                var stackLocation = AbiArgumentLocation.ForStack(stackClass, outgoingArg++, 0, stackSize);
+                int stackSlot = outgoingArg;
+                outgoingArg = checked(outgoingArg + StackSlotsForArgumentSize(stackSize));
+                var stackLocation = AbiArgumentLocation.ForStack(stackClass, stackSlot, 0, stackSize);
                 segments.Add(new AbiCallSegment(
                     operandIndex++,
                     i,
@@ -658,14 +675,20 @@ namespace Cnidaria.Cs
 
             if (aggregateStackSlot < 0)
             {
-                aggregateStackSlot = outgoingIndex++;
+                aggregateStackSlot = outgoingIndex;
                 aggregateStackBaseOffset = segment.Offset;
             }
+
+            int stackOffset = checked(segment.Offset - aggregateStackBaseOffset);
+            int requiredSlots = StackSlotsForArgumentSize(checked(stackOffset + Math.Max(1, segment.Size)));
+            int requiredOutgoingIndex = checked(aggregateStackSlot + requiredSlots);
+            if (outgoingIndex < requiredOutgoingIndex)
+                outgoingIndex = requiredOutgoingIndex;
 
             return AbiArgumentLocation.ForStack(
                 segment.RegisterClass,
                 aggregateStackSlot,
-                checked(segment.Offset - aggregateStackBaseOffset),
+                stackOffset,
                 segment.Size);
         }
 

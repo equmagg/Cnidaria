@@ -163,6 +163,8 @@ namespace Cnidaria.Cs
         ImportedHir,
         MorphedHir,
         LocalRewrittenHir,
+        PhysicalPromotedHir,
+        GlobalMorphedHir,
         FlowgraphBuilt,
         HirLiveness,
         Ssa,
@@ -180,6 +182,7 @@ namespace Cnidaria.Cs
         InlineLocal,
         InlineReturn,
         StructMaterialization,
+        CommonSubexpression,
     }
     internal readonly struct GenTemp
     {
@@ -452,6 +455,7 @@ namespace Cnidaria.Cs
 
         internal void ResetPreSsaClassification()
         {
+            bool wasPromotedParent = Category == GenLocalCategory.PromotedStruct && HasPromotedStructFields;
             bool wasPromotedField = IsStructField && ParentLclNum >= 0 && PromotedField is not null;
             bool wasStructMaterializationTemp = IsStructMaterializationTemp;
             int oldParentLclNum = ParentLclNum;
@@ -482,10 +486,14 @@ namespace Cnidaria.Cs
                     oldFieldSize,
                     oldPromotedField);
             }
-
-            if (Kind == GenLocalKind.Temporary && !wasPromotedField)
+            else if (wasPromotedParent)
             {
-                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type))
+                MarkPromotedStructParent();
+            }
+
+            if (Kind == GenLocalKind.Temporary && !wasPromotedField && !wasPromotedParent)
+            {
+                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type) && !IsRefLikeStorageType(Type))
                 {
                     MarkPromotedStructParent();
                 }
@@ -670,6 +678,12 @@ namespace Cnidaria.Cs
                    type.IsValueType &&
                    type.Kind == RuntimeTypeKind.Struct &&
                    type.InstanceFields.Length != 0;
+        }
+
+        internal static bool IsRefLikeStorageType(RuntimeType? type)
+        {
+            return type is not null &&
+                   (type.Kind == RuntimeTypeKind.ByRef || IsKnownRefLike(type));
         }
 
         private static bool IsKnownRefLike(RuntimeType? type)
@@ -888,7 +902,12 @@ namespace Cnidaria.Cs
         public GenTreeValueKey ValueKey { get; internal set; }
         public SsaValueName? SsaValueName { get; internal set; }
         public SsaValueName? SsaStoreTargetName { get; internal set; }
+        public SsaValueName? SsaLocalFieldBaseValue { get; internal set; }
+        public RuntimeField? SsaLocalField { get; internal set; }
+        public ImmutableArray<SsaMemoryValueName> SsaMemoryUses { get; internal set; } = ImmutableArray<SsaMemoryValueName>.Empty;
+        public ImmutableArray<SsaMemoryValueName> SsaMemoryDefinitions { get; internal set; } = ImmutableArray<SsaMemoryValueName>.Empty;
         public GenTreeLsraInfo LsraInfo { get; private set; } = GenTreeLsraInfo.Empty;
+        public int CseNumber { get; internal set; }
         public ImmutableArray<GenTreeInternalRegister> InternalRegisters => LsraInfo.InternalRegisters;
         public GenTreeLsraFlags LsraFlags => LsraInfo.Flags;
 
@@ -908,6 +927,8 @@ namespace Cnidaria.Cs
         public GenTreeValueKey LinearValueKey => ValueKey;
         public bool HasSsaUse => SsaValueName.HasValue;
         public bool HasSsaDefinition => SsaStoreTargetName.HasValue;
+        public bool HasSsaLocalFieldBaseUse => SsaLocalFieldBaseValue.HasValue;
+        public bool HasSsaMemoryEffects => !SsaMemoryUses.IsDefaultOrEmpty || !SsaMemoryDefinitions.IsDefaultOrEmpty;
 
         public MoveKind MoveKind
         {
@@ -1011,6 +1032,9 @@ namespace Cnidaria.Cs
                 Operands[i].Parent = this;
         }
 
+        internal void SetParent(GenTree? parent)
+            => Parent = parent;
+
         internal void AttachSsaUse(SsaValueName value)
         {
             SsaValueName = value;
@@ -1027,10 +1051,31 @@ namespace Cnidaria.Cs
             StackKind = stackKind;
         }
 
+        internal void AttachSsaLocalFieldBaseUse(SsaValueName value, RuntimeField? field)
+        {
+            SsaLocalFieldBaseValue = value;
+            SsaLocalField = field;
+        }
+
+        internal void AttachSsaLocalField(RuntimeField? field)
+        {
+            SsaLocalField = field;
+        }
+
+        internal void AttachSsaMemory(ImmutableArray<SsaMemoryValueName> uses, ImmutableArray<SsaMemoryValueName> definitions)
+        {
+            SsaMemoryUses = uses.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : uses;
+            SsaMemoryDefinitions = definitions.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : definitions;
+        }
+
         internal void ClearSsaAnnotation()
         {
             SsaValueName = null;
             SsaStoreTargetName = null;
+            SsaLocalFieldBaseValue = null;
+            SsaLocalField = null;
+            SsaMemoryUses = ImmutableArray<SsaMemoryValueName>.Empty;
+            SsaMemoryDefinitions = ImmutableArray<SsaMemoryValueName>.Empty;
             ValueKey = GenTreeValueKey.ForTree(this);
         }
 
@@ -1309,8 +1354,7 @@ namespace Cnidaria.Cs
 
             var builder = ImmutableArray.CreateBuilder<GenTree>();
             var seen = new HashSet<GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
-            CollectUnique(root, seen, builder);
-            builder.Sort(static (left, right) => left.Id.CompareTo(right.Id));
+            CollectPostOrder(root, seen, builder);
 
             var result = builder.ToImmutable();
             ValidateStatementTreeList(root, result);
@@ -1346,14 +1390,14 @@ namespace Cnidaria.Cs
         public static ImmutableArray<GenTree> BuildBlock(ImmutableArray<GenTree> statements)
             => Flatten(BuildStatements(statements));
 
-        private static void CollectUnique(GenTree node, HashSet<GenTree> seen, ImmutableArray<GenTree>.Builder builder)
+        private static void CollectPostOrder(GenTree node, HashSet<GenTree> seen, ImmutableArray<GenTree>.Builder builder)
         {
             if (!seen.Add(node))
                 return;
 
-            builder.Add(node);
             for (int i = 0; i < node.Operands.Length; i++)
-                CollectUnique(node.Operands[i], seen, builder);
+                CollectPostOrder(node.Operands[i], seen, builder);
+            builder.Add(node);
         }
 
         private static void ValidateStatementTreeList(GenTree root, ImmutableArray<GenTree> treeList)
@@ -1420,10 +1464,32 @@ namespace Cnidaria.Cs
             JumpKind = jumpKind;
             Flags = flags;
             Statements = statements.IsDefault ? ImmutableArray<GenTree>.Empty : statements;
+            NormalizeParents(Statements);
             StatementTreeLists = GenTreeTreeOrder.BuildStatements(Statements);
             SetLinearNodes(GenTreeTreeOrder.Flatten(StatementTreeLists));
             SuccessorBlockIds = successorBlockIds.IsDefault ? ImmutableArray<int>.Empty : successorBlockIds;
             SuccessorPcs = successorPcs.IsDefault ? ImmutableArray<int>.Empty : successorPcs;
+        }
+
+
+        private static void NormalizeParents(ImmutableArray<GenTree> statements)
+        {
+            if (statements.IsDefaultOrEmpty)
+                return;
+
+            var seen = new HashSet<GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
+            for (int i = 0; i < statements.Length; i++)
+                NormalizeParent(statements[i], null, seen);
+        }
+
+        private static void NormalizeParent(GenTree node, GenTree? parent, HashSet<GenTree> seen)
+        {
+            if (!seen.Add(node))
+                throw new InvalidOperationException($"GenTree node {node.Id} is shared between statement trees.");
+
+            node.SetParent(parent);
+            for (int i = 0; i < node.Operands.Length; i++)
+                NormalizeParent(node.Operands[i], node, seen);
         }
 
         internal void SetLinearNodes(ImmutableArray<GenTree> nodes)
@@ -1449,12 +1515,12 @@ namespace Cnidaria.Cs
         public BytecodeFunction Function { get; }
         public ImmutableArray<RuntimeType> ArgTypes { get; }
         public ImmutableArray<RuntimeType> LocalTypes { get; }
-        public ImmutableArray<GenTemp> Temps { get; }
+        public ImmutableArray<GenTemp> Temps { get; private set; }
         public ImmutableArray<GenLocalDescriptor> ArgDescriptors { get; private set; }
         public ImmutableArray<GenLocalDescriptor> LocalDescriptors { get; private set; }
         public ImmutableArray<GenLocalDescriptor> TempDescriptors { get; private set; }
         public ImmutableArray<GenLocalDescriptor> AllLocalDescriptors { get; private set; }
-        public ImmutableArray<GenTreeBlock> Blocks { get; }
+        public ImmutableArray<GenTreeBlock> Blocks { get; private set; }
         public ImmutableArray<RuntimeMethod> DirectDependencies { get; }
         public ImmutableArray<RuntimeMethod> VirtualDependencies { get; }
 
@@ -1542,6 +1608,41 @@ namespace Cnidaria.Cs
             return clone;
         }
 
+        internal void ReplaceBlocksPreservingFlow(ImmutableArray<GenTreeBlock> blocks)
+        {
+            Blocks = blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks;
+            AttachLocalDescriptorsToTrees(Blocks);
+        }
+
+        internal GenLocalDescriptor AppendCompilerTemp(GenTempKind kind, RuntimeType? type, GenStackKind stackKind)
+        {
+            if (kind == GenTempKind.StructMaterialization)
+                throw new ArgumentException("Struct materialization temps must be created before local classification.", nameof(kind));
+
+            int tempIndex = NextTempIndex();
+            int lclNum = AllLocalDescriptors.Length;
+            var temp = new GenTemp(tempIndex, kind, type, stackKind);
+            var descriptor = new GenLocalDescriptor(lclNum, GenLocalKind.Temporary, tempIndex, type, stackKind, GenLocalCategory.CompilerTemp);
+            descriptor.IsCompilerTemp = true;
+            descriptor.DoNotEnregister = kind != GenTempKind.CommonSubexpression;
+
+            Temps = Temps.Add(temp);
+            TempDescriptors = TempDescriptors.Add(descriptor);
+            AllLocalDescriptors = AllLocalDescriptors.Add(descriptor);
+            return descriptor;
+
+            int NextTempIndex()
+            {
+                int max = -1;
+                for (int i = 0; i < Temps.Length; i++)
+                {
+                    if (Temps[i].Index > max)
+                        max = Temps[i].Index;
+                }
+                return max + 1;
+            }
+        }
+
         private static void MarkAddressExposedFromBytecode(
             BytecodeFunction function,
             ImmutableArray<GenLocalDescriptor> args,
@@ -1600,8 +1701,11 @@ namespace Cnidaria.Cs
             {
                 var temp = temps[i];
                 bool isStructMaterialization = temp.Kind == GenTempKind.StructMaterialization;
+                bool isCommonSubexpression = temp.Kind == GenTempKind.CommonSubexpression;
                 bool canPromoteTemp = temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineArg or GenTempKind.InlineLocal or GenTempKind.InlineReturn;
-                bool promoteParent = canPromoteTemp && LclVarDsc.IsPromotableStructMaterializationType(temp.Type);
+                bool promoteParent = canPromoteTemp &&
+                    LclVarDsc.IsPromotableStructMaterializationType(temp.Type) &&
+                    !LclVarDsc.IsRefLikeStorageType(temp.Type);
                 var category = promoteParent ? GenLocalCategory.PromotedStruct : GenLocalCategory.CompilerTemp;
                 var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, category);
 
@@ -1616,7 +1720,7 @@ namespace Cnidaria.Cs
                 else
                 {
                     descriptor.IsCompilerTemp = true;
-                    descriptor.DoNotEnregister = true;
+                    descriptor.DoNotEnregister = !isCommonSubexpression;
                 }
 
                 builder.Add(descriptor);
@@ -1698,6 +1802,8 @@ namespace Cnidaria.Cs
                         continue;
                     if (parent.AddressExposed || parent.MemoryAliased)
                         continue;
+                    if (parent.IsRefLike || parent.IsImplicitByRef)
+                        continue;
                     if (parent.HasPromotedStructFields)
                         continue;
                     if (!CanPromoteStruct(parent.Type))
@@ -1772,6 +1878,8 @@ namespace Cnidaria.Cs
             {
                 if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct)
                     return false;
+                if (LclVarDsc.IsRefLikeStorageType(type))
+                    return false;
                 if (type.InstanceFields.Length == 0)
                     return false;
                 return true;
@@ -1782,6 +1890,8 @@ namespace Cnidaria.Cs
                 if (field.IsStatic)
                     return false;
                 var stackKind = StackKindForDescriptor(field.FieldType);
+                if (field.FieldType.Kind == RuntimeTypeKind.ByRef || stackKind is GenStackKind.ByRef)
+                    return false;
                 if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                     return false;
                 if (field.FieldType.IsValueType && field.FieldType.ContainsGcPointers)
@@ -1855,8 +1965,43 @@ namespace Cnidaria.Cs
 
             static void AttachDescriptor(GenTree node, GenLocalDescriptor descriptor)
             {
+                if (node.SsaValueName.HasValue)
+                {
+                    if (SsaSlotMatchesDescriptor(node.SsaValueName.Value.Slot, descriptor))
+                        node.LocalDescriptor = descriptor;
+                    return;
+                }
+
+                if (node.SsaStoreTargetName.HasValue)
+                {
+                    if (SsaSlotMatchesDescriptor(node.SsaStoreTargetName.Value.Slot, descriptor))
+                        node.LocalDescriptor = descriptor;
+                    return;
+                }
+
+                if (node.SsaLocalFieldBaseValue.HasValue)
+                {
+                    if (SsaSlotMatchesDescriptor(node.SsaLocalFieldBaseValue.Value.Slot, descriptor))
+                        node.LocalDescriptor = descriptor;
+                    return;
+                }
+
                 node.LocalDescriptor = descriptor;
                 node.ValueKey = GenTreeValueKey.ForTree(node);
+            }
+
+            static bool SsaSlotMatchesDescriptor(SsaSlot slot, GenLocalDescriptor descriptor)
+            {
+                if (slot.HasLclNum)
+                    return slot.LclNum == descriptor.LclNum;
+
+                return descriptor.Kind switch
+                {
+                    GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg && slot.Index == descriptor.Index,
+                    GenLocalKind.Local => slot.Kind == SsaSlotKind.Local && slot.Index == descriptor.Index,
+                    GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp && slot.Index == descriptor.Index,
+                    _ => false,
+                };
             }
 
             static GenLocalDescriptor?[] BuildTempDescriptorIndex(ImmutableArray<GenLocalDescriptor> descriptors)

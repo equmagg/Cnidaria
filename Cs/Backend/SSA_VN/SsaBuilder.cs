@@ -1394,13 +1394,13 @@ namespace Cnidaria.Cs
                     {
                         if (fieldAccess.IsPromotedFieldAccess && _slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
+                            var operands = GetRenamedOperands(node, renamedByNode);
                             return AttachMemory(node, operands, blockId, pushedMemory, value: Top(fieldAccess.Slot));
                         }
 
                         if (!fieldAccess.IsPromotedFieldAccess && fieldAccess.Field is not null && _slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
+                            var operands = GetRenamedOperands(node, renamedByNode);
                             return AttachMemory(node, operands, blockId, pushedMemory, localFieldBaseValue: Top(fieldAccess.BaseSlot), localField: fieldAccess.Field);
                         }
                     }
@@ -1408,7 +1408,7 @@ namespace Cnidaria.Cs
                     {
                         if (_slots.IsPromotable(fieldAccess.Slot))
                         {
-                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
+                            var operands = GetRenamedOperands(node, renamedByNode);
                             var target = NewVersion(fieldAccess.Slot);
                             Push(fieldAccess.Slot, target);
                             pushed.Add(fieldAccess.Slot);
@@ -1420,7 +1420,7 @@ namespace Cnidaria.Cs
                     {
                         if (_slots.IsPromotable(fieldAccess.BaseSlot))
                         {
-                            var operands = GetRenamedNonReceiverOperands(node, fieldAccess, renamedByNode);
+                            var operands = GetRenamedOperands(node, renamedByNode);
                             var previous = Top(fieldAccess.BaseSlot);
                             var target = NewVersion(fieldAccess.BaseSlot);
                             SetUseDefSsaNum(target, previous);
@@ -1482,15 +1482,25 @@ namespace Cnidaria.Cs
                     AddMemoryDefToEHSuccessorPhis(blockId, kind, def);
                 }
 
-                return new SsaTree(
-                    node,
-                    operands,
-                    value,
-                    storeTarget,
-                    localFieldBaseValue,
-                    localField,
-                    memoryUses.ToImmutable(),
-                    memoryDefs.ToImmutable());
+                var memoryUseArray = memoryUses.ToImmutable();
+                var memoryDefArray = memoryDefs.ToImmutable();
+
+                if (value.HasValue)
+                    node.AttachSsaUse(value.Value);
+
+                if (storeTarget.HasValue)
+                {
+                    var info = _slots.GetInfo(storeTarget.Value.Slot);
+                    node.AttachSsaDefinition(storeTarget.Value, info.Type, info.StackKind);
+                }
+
+                if (localFieldBaseValue.HasValue)
+                    node.AttachSsaLocalFieldBaseUse(localFieldBaseValue.Value, localField);
+                else if (localField is not null)
+                    node.AttachSsaLocalField(localField);
+
+                node.AttachSsaMemory(memoryUseArray, memoryDefArray);
+                return new SsaTree(node, operands);
             }
 
             private static ImmutableArray<SsaTree> GetRenamedOperands(GenTree node, Dictionary<GenTree, SsaTree> renamedByNode)
@@ -1501,18 +1511,6 @@ namespace Cnidaria.Cs
                 var operands = ImmutableArray.CreateBuilder<SsaTree>(node.Operands.Length);
                 for (int i = 0; i < node.Operands.Length; i++)
                     operands.Add(GetRenamedOperand(node, i, renamedByNode));
-                return operands.ToImmutable();
-            }
-
-            private static ImmutableArray<SsaTree> GetRenamedNonReceiverOperands(GenTree node, SsaLocalAccess fieldAccess, Dictionary<GenTree, SsaTree> renamedByNode)
-            {
-                var operands = ImmutableArray.CreateBuilder<SsaTree>(Math.Max(0, node.Operands.Length - 1));
-                for (int i = 0; i < node.Operands.Length; i++)
-                {
-                    if (i == fieldAccess.ReceiverOperandIndex)
-                        continue;
-                    operands.Add(GetRenamedOperand(node, i, renamedByNode));
-                }
                 return operands.ToImmutable();
             }
 

@@ -176,11 +176,9 @@ namespace Cnidaria.Cs
                             continue;
 
                         var translated = TranslateAllocationRange(segment.Start, segment.End);
-                        AddAllocationLiveRangeSlices(
-                            ranges,
-                            new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type),
-                            translated.Start,
-                            translated.End);
+                        if (translated.Start < translated.End)
+                            AddLiveRangeSlices(
+                                ranges, new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type), translated.Start, translated.End);
                     }
                 }
 
@@ -888,40 +886,6 @@ namespace Cnidaria.Cs
                 }
 
                 return _finalEndPosition;
-            }
-
-            private void AddAllocationLiveRangeSlices(
-                ImmutableArray<RegisterGcLiveRange>.Builder ranges,
-                RegisterGcLiveRoot root,
-                int start,
-                int end)
-            {
-                if (start >= end)
-                    return;
-
-                if (!root.Location.IsRegister || !MachineRegisters.IsCallerSaved(root.Location.Register))
-                {
-                    AddLiveRangeSlices(ranges, root, start, end);
-                    return;
-                }
-
-                for (int i = 0; i < _finalCallerSavedKillPositions.Length; i++)
-                {
-                    int kill = _finalCallerSavedKillPositions[i];
-                    if (kill < start)
-                        continue;
-                    if (kill >= end)
-                        break;
-
-                    int killEnd = IsCallerFrameSuspendingCallPosition(kill)
-                        ? kill
-                        : Math.Min(end, kill + 1);
-                    if (start < killEnd)
-                        AddLiveRangeSlices(ranges, root, start, killEnd);
-                    return;
-                }
-
-                AddLiveRangeSlices(ranges, root, start, end);
             }
 
             private void AddLiveRangeSlices(

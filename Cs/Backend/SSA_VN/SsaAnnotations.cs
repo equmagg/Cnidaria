@@ -54,8 +54,6 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
-            Clear(method.GenTreeMethod);
-
             var context = new AttachContext(method);
 
             for (int b = 0; b < method.Blocks.Length; b++)
@@ -82,6 +80,14 @@ namespace Cnidaria.Cs
                 AttachDescriptor(context, tree.Source, tree.Value.Value.Slot);
             }
 
+            if (tree.LocalFieldBaseValue.HasValue)
+            {
+                tree.Source.AttachSsaLocalFieldBaseUse(tree.LocalFieldBaseValue.Value, tree.LocalField);
+                AttachDescriptor(context, tree.Source, tree.LocalFieldBaseValue.Value.Slot);
+            }
+
+            tree.Source.AttachSsaMemory(tree.MemoryUses, tree.MemoryDefinitions);
+
             for (int i = 0; i < tree.Operands.Length; i++)
                 AttachTree(context, tree.Operands[i]);
 
@@ -91,6 +97,10 @@ namespace Cnidaria.Cs
                 var info = GetSlotInfo(context, target.Slot);
                 tree.Source.AttachSsaDefinition(target, info.Type, info.StackKind);
                 AttachDescriptor(context, tree.Source, target.Slot);
+            }
+            else if (tree.LocalField is not null)
+            {
+                tree.Source.AttachSsaLocalField(tree.LocalField);
             }
         }
 
@@ -110,61 +120,34 @@ namespace Cnidaria.Cs
 
         private static void AttachDescriptor(AttachContext context, GenTree node, SsaSlot slot)
         {
-            if (node.LocalDescriptor is not null)
+            if (!context.DescriptorBySlot.TryGetValue(slot, out var descriptor))
                 return;
 
-            if (context.DescriptorBySlot.TryGetValue(slot, out var descriptor))
-                node.LocalDescriptor = descriptor;
+            if (node.LocalDescriptor is not null && SsaSlotMatchesDescriptor(slot, node.LocalDescriptor))
+                return;
+
+            if (node.SsaValueName.HasValue && !node.SsaValueName.Value.Slot.Equals(slot))
+                return;
+
+            if (node.SsaStoreTargetName.HasValue && !node.SsaStoreTargetName.Value.Slot.Equals(slot))
+                return;
+
+            node.LocalDescriptor = descriptor;
         }
 
-        private static bool TryGetDescriptor(GenTreeMethod method, SsaSlot slot, out GenLocalDescriptor descriptor)
+        private static bool SsaSlotMatchesDescriptor(SsaSlot slot, GenLocalDescriptor descriptor)
         {
             if (slot.HasLclNum)
-            {
-                var all = method.AllLocalDescriptors;
-                if ((uint)slot.LclNum < (uint)all.Length)
-                {
-                    descriptor = all[slot.LclNum];
-                    return descriptor.Kind switch
-                    {
-                        GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg,
-                        GenLocalKind.Local => slot.Kind == SsaSlotKind.Local,
-                        GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp,
-                        _ => false,
-                    };
-                }
-            }
+                return slot.LclNum == descriptor.LclNum;
 
-            switch (slot.Kind)
+            return descriptor.Kind switch
             {
-                case SsaSlotKind.Arg:
-                    if ((uint)slot.Index < (uint)method.ArgDescriptors.Length)
-                    {
-                        descriptor = method.ArgDescriptors[slot.Index];
-                        return true;
-                    }
-                    break;
-                case SsaSlotKind.Local:
-                    if ((uint)slot.Index < (uint)method.LocalDescriptors.Length)
-                    {
-                        descriptor = method.LocalDescriptors[slot.Index];
-                        return true;
-                    }
-                    break;
-                case SsaSlotKind.Temp:
-                    for (int i = 0; i < method.TempDescriptors.Length; i++)
-                    {
-                        if (method.TempDescriptors[i].Index == slot.Index)
-                        {
-                            descriptor = method.TempDescriptors[i];
-                            return true;
-                        }
-                    }
-                    break;
-            }
-
-            descriptor = null!;
-            return false;
+                GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg && slot.Index == descriptor.Index,
+                GenLocalKind.Local => slot.Kind == SsaSlotKind.Local && slot.Index == descriptor.Index,
+                GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp && slot.Index == descriptor.Index,
+                _ => false,
+            };
         }
+
     }
 }

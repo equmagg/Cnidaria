@@ -268,19 +268,21 @@ namespace Cnidaria.Cs
 
             private void ResetExistingLinearState()
             {
+                bool clearSsa = _ssa is null;
                 for (int b = 0; b < _method.Blocks.Length; b++)
                 {
                     var statements = _method.Blocks[b].Statements;
                     for (int s = 0; s < statements.Length; s++)
-                        Reset(statements[s]);
+                        Reset(statements[s], clearSsa);
                 }
 
-                static void Reset(GenTree node)
+                static void Reset(GenTree node, bool clearSsa)
                 {
                     node.ResetLinearState();
-                    node.ClearSsaAnnotation();
+                    if (clearSsa)
+                        node.ClearSsaAnnotation();
                     for (int i = 0; i < node.Operands.Length; i++)
-                        Reset(node.Operands[i]);
+                        Reset(node.Operands[i], clearSsa);
                 }
             }
 
@@ -446,8 +448,13 @@ namespace Cnidaria.Cs
             {
                 if (tree.Value.HasValue)
                 {
-                    tree.Source.AttachSsaUse(tree.Value.Value);
+                    var value = tree.Value.Value;
+                    tree.Source.AttachSsaUse(value);
+                    AttachSsaDescriptor(tree.Source, value.Slot);
                 }
+
+                if (tree.LocalFieldBaseValue.HasValue)
+                    AttachSsaDescriptor(tree.Source, tree.LocalFieldBaseValue.Value.Slot);
 
                 for (int i = 0; i < tree.Operands.Length; i++)
                     AttachSsaAnnotations(tree.Operands[i]);
@@ -530,8 +537,33 @@ namespace Cnidaria.Cs
 
             private void AttachSsaDescriptor(GenTree node, SsaSlot slot)
             {
-                if (node.LocalDescriptor is null && TryGetSsaDescriptor(slot, out var descriptor))
-                    node.LocalDescriptor = descriptor;
+                if (!TryGetSsaDescriptor(slot, out var descriptor))
+                    return;
+
+                if (node.LocalDescriptor is not null && SsaSlotMatchesDescriptor(slot, node.LocalDescriptor))
+                    return;
+
+                if (node.SsaValueName.HasValue && !node.SsaValueName.Value.Slot.Equals(slot))
+                    return;
+
+                if (node.SsaStoreTargetName.HasValue && !node.SsaStoreTargetName.Value.Slot.Equals(slot))
+                    return;
+
+                node.LocalDescriptor = descriptor;
+            }
+
+            private static bool SsaSlotMatchesDescriptor(SsaSlot slot, GenLocalDescriptor descriptor)
+            {
+                if (slot.HasLclNum)
+                    return slot.LclNum == descriptor.LclNum;
+
+                return descriptor.Kind switch
+                {
+                    GenLocalKind.Argument => slot.Kind == SsaSlotKind.Arg && slot.Index == descriptor.Index,
+                    GenLocalKind.Local => slot.Kind == SsaSlotKind.Local && slot.Index == descriptor.Index,
+                    GenLocalKind.Temporary => slot.Kind == SsaSlotKind.Temp && slot.Index == descriptor.Index,
+                    _ => false,
+                };
             }
 
             private GenTree CreateSsaInitialValueNode(SsaValueName value)
@@ -585,6 +617,7 @@ namespace Cnidaria.Cs
             {
                 if (_ssaValues.TryGetValue(value, out var existing))
                 {
+                    AttachSsaDescriptor(existing, value.Slot);
                     EnsureSsaValueInfo(value, existing);
                     return existing;
                 }
@@ -915,9 +948,6 @@ namespace Cnidaria.Cs
 
             private void LowerControlTransfer(GenTree tree)
             {
-                if (TryLowerContainedLocalLikeMultiRegisterReturn(tree))
-                    return;
-
                 if (TryLowerBooleanBranch(tree))
                     return;
 
@@ -932,35 +962,6 @@ namespace Cnidaria.Cs
 
                 EmitTree(tree, uses, result);
             }
-
-            private bool TryLowerContainedLocalLikeMultiRegisterReturn(GenTree tree)
-            {
-                if (tree.Kind != GenTreeKind.Return || tree.Operands.Length != 1)
-                    return false;
-
-                var value = tree.Operands[0];
-                if (!IsDirectReturnableLocalLike(value))
-                    return false;
-
-                RuntimeType? returnType = value.LocalDescriptor?.Type ?? value.RuntimeType ?? value.Type;
-                if (returnType is null || !returnType.IsValueType)
-                    return false;
-
-                if (MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod))
-                    return false;
-
-                var returnKind = value.LocalDescriptor?.StackKind ?? MachineAbi.StackKindForType(returnType);
-                var abi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true);
-                if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
-                    return false;
-
-                value.IsContainedInLinear = true;
-                EmitTree(tree, ImmutableArray.Create(LirOperandFlags.Contained), result: null);
-                return true;
-            }
-
-            private static bool IsDirectReturnableLocalLike(GenTree value)
-                => value.Kind is GenTreeKind.Local or GenTreeKind.Temp;
 
             private readonly struct LoweredBranchCondition
             {
@@ -1286,9 +1287,6 @@ namespace Cnidaria.Cs
 
             private void LowerControlTransfer(SsaTree tree)
             {
-                if (TryLowerContainedLocalLikeMultiRegisterReturn(tree.Source))
-                    return;
-
                 if (TryLowerBooleanBranch(tree))
                     return;
 
@@ -1330,8 +1328,11 @@ namespace Cnidaria.Cs
                 if (TryLowerCommutativeBinaryOperands(tree, out var binaryOperands))
                     return binaryOperands;
 
-                if (tree.LocalFieldBaseValue.HasValue && SsaSlotHelpers.TryGetLocalFieldAccess(tree.Source, out var localFieldAccess))
+                if ((tree.LocalFieldBaseValue.HasValue || tree.StoreTarget.HasValue) &&
+                    SsaSlotHelpers.TryGetLocalFieldAccess(tree.Source, out var localFieldAccess))
+                {
                     return LowerLocalFieldOperands(tree, localFieldAccess);
+                }
 
                 var flags = ImmutableArray.CreateBuilder<LirOperandFlags>(tree.Operands.Length);
                 var sources = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
@@ -1361,40 +1362,54 @@ namespace Cnidaria.Cs
                 var flags = ImmutableArray.CreateBuilder<LirOperandFlags>(originalOperands.Length);
                 var sources = ImmutableArray.CreateBuilder<GenTree>(originalOperands.Length);
 
-                for (int originalIndex = 0, ssaIndex = 0; originalIndex < originalOperands.Length; originalIndex++)
+                var ssaOperands = tree.Operands;
+                if (ssaOperands.Length != originalOperands.Length)
+                    throw new InvalidOperationException($"SSA local-field operand mapping is malformed for node {tree.Source.Id}.");
+
+                bool promotedFieldDefinition =
+                    tree.StoreTarget.HasValue &&
+                    localFieldAccess.Kind == SsaLocalAccessKind.FullDefinition &&
+                    localFieldAccess.IsPromotedFieldAccess;
+
+                for (int originalIndex = 0; originalIndex < originalOperands.Length; originalIndex++)
                 {
+                    var operandTree = ssaOperands[originalIndex];
+                    sources.Add(operandTree.Source);
+
                     if (originalIndex == localFieldAccess.ReceiverOperandIndex)
                     {
-                        var receiver = originalOperands[originalIndex];
-                        sources.Add(receiver);
-                        var value = LowerValueOrVoid(receiver);
+                        if (promotedFieldDefinition)
+                        {
+                            operandTree.Source.IsContainedInLinear = true;
+                            flags.Add(LirOperandFlags.Contained);
+                            continue;
+                        }
+
+                        var value = LowerValueOrVoid(operandTree.Source);
                         if (value is not null)
-                            receiver.RegisterResult = value;
+                            operandTree.Source.RegisterResult = value;
                         flags.Add(LirOperandFlags.None);
                         continue;
                     }
 
-                    if ((uint)ssaIndex >= (uint)tree.Operands.Length)
-                        throw new InvalidOperationException($"SSA local-field operand mapping is malformed for node {tree.Source.Id}.");
-
-                    var operandTree = tree.Operands[ssaIndex++];
-                    sources.Add(operandTree.Source);
                     if (TryCreateContainedOperand(tree.Source, originalIndex, operandTree.Source, out var containedFlags))
                     {
                         flags.Add(containedFlags);
                         continue;
                     }
+
+                    if (TryCreateContainedOperand(tree.Source, originalIndex, operandTree.Source, out var containedFlag))
                     {
-                        var value = LowerValueOrVoid(operandTree);
-                        if (value is not null)
-                            operandTree.Source.RegisterResult = value;
+                        flags.Add(containedFlag);
+                        continue;
                     }
+
+                    var loweredValue = LowerValueOrVoid(operandTree);
+                    if (loweredValue is not null)
+                        operandTree.Source.RegisterResult = loweredValue;
 
                     flags.Add(LirOperandFlags.None);
                 }
-
-                if (sources.Count - 1 > tree.Operands.Length)
-                    throw new InvalidOperationException($"SSA local-field operand mapping has too many source operands for node {tree.Source.Id}.");
 
                 tree.Source.SetOperands(sources.ToImmutable());
                 return flags.ToImmutable();
@@ -1728,6 +1743,7 @@ namespace Cnidaria.Cs
                     result = GetOrCreateSsaValue(targetName, finalNode);
                     var info = GetSsaSlotInfo(targetName.Slot);
                     finalNode.AttachSsaDefinition(targetName, info.Type, info.StackKind);
+                    AttachSsaDescriptor(finalNode, targetName.Slot);
                     finalNode.RegisterResult = result;
                 }
                 else
@@ -1804,6 +1820,7 @@ namespace Cnidaria.Cs
                     var target = GetOrCreateSsaValue(targetName, tree.Source);
                     var info = GetSsaSlotInfo(targetName.Slot);
                     tree.Source.AttachSsaDefinition(targetName, info.Type, info.StackKind);
+                    AttachSsaDescriptor(tree.Source, targetName.Slot);
                     tree.Source.RegisterResult = target;
                     EmitTree(tree.Source, uses, target);
                     return target;

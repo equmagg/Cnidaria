@@ -240,14 +240,11 @@ namespace Cnidaria.Cs
 
             private void CollectExplicitUserSlotFromLocalLikeNode(GenTree node)
             {
-                if (node.LocalDescriptor is { IsStructField: true })
-                    return;
-
                 switch (node.Kind)
                 {
                     case GenTreeKind.Local:
                     case GenTreeKind.StoreLocal:
-                        if ((uint)node.Int32 < (uint)_method.GenTreeMethod.LocalTypes.Length &&
+                        if (ContainsDescriptorIndex(_method.GenTreeMethod.LocalDescriptors, GenLocalKind.Local, node.Int32) &&
                             SurvivingLocalLikeNodeRequiresHome(node))
                         {
                             _explicitLocalSlots.Add(node.Int32);
@@ -255,13 +252,13 @@ namespace Cnidaria.Cs
                         return;
 
                     case GenTreeKind.LocalAddr:
-                        if ((uint)node.Int32 < (uint)_method.GenTreeMethod.LocalTypes.Length)
+                        if (ContainsDescriptorIndex(_method.GenTreeMethod.LocalDescriptors, GenLocalKind.Local, node.Int32))
                             _explicitLocalSlots.Add(node.Int32);
                         return;
 
                     case GenTreeKind.Temp:
                     case GenTreeKind.StoreTemp:
-                        if (ContainsTempIndex(_method.GenTreeMethod.Temps, node.Int32) &&
+                        if (ContainsDescriptorIndex(_method.GenTreeMethod.TempDescriptors, GenLocalKind.Temporary, node.Int32) &&
                             SurvivingLocalLikeNodeRequiresHome(node))
                         {
                             _explicitTempSlots.Add(node.Int32);
@@ -269,7 +266,7 @@ namespace Cnidaria.Cs
                         return;
 
                     case GenTreeKind.TempAddr:
-                        if (ContainsTempIndex(_method.GenTreeMethod.Temps, node.Int32))
+                        if (ContainsDescriptorIndex(_method.GenTreeMethod.TempDescriptors, GenLocalKind.Temporary, node.Int32))
                             _explicitTempSlots.Add(node.Int32);
                         return;
                 }
@@ -281,13 +278,6 @@ namespace Cnidaria.Cs
                 if (descriptor is null)
                     return true;
 
-                if (descriptor.IsStructField)
-                    return false;
-
-                // A promoted aggregate parent normally has no physical home. If a full-width
-                // Local/Temp or StoreLocal/StoreTemp survived promotion, CodeGen will materialize it
-                // through the parent frame slot, so the slot must exist even though field locals may
-                // also be promoted independently.
                 if (descriptor.Category == GenLocalCategory.PromotedStruct &&
                     descriptor.HasPromotedStructFields &&
                     !descriptor.AddressExposed &&
@@ -535,10 +525,10 @@ namespace Cnidaria.Cs
                 if (_method.GenTreeMethod.Cfg.ExceptionRegions.Length != 0)
                     return true;
 
-                if (!_options.SaveFramePointerWhenFrameIsUsed)
-                    return false;
+                if (UsesSpecificCalleeSavedRegister(MachineRegisters.FramePointer))
+                    return true;
 
-                return UsesSpecificCalleeSavedRegister(MachineRegisters.FramePointer);
+                return _options.SaveFramePointerWhenFrameIsUsed;
             }
 
             private bool MethodMayCall()
@@ -698,31 +688,31 @@ namespace Cnidaria.Cs
             private void AllocateLocalSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
                 var descriptors = _method.GenTreeMethod.LocalDescriptors;
-                var types = _method.GenTreeMethod.LocalTypes;
-                for (int i = 0; i < types.Length; i++)
+                var allocated = new HashSet<int>();
+                for (int i = 0; i < descriptors.Length; i++)
                 {
-                    if (!RequiresLocalOrTempHome(StackFrameSlotKind.Local, i, _explicitLocalSlots, descriptors))
+                    var descriptor = descriptors[i];
+                    if (descriptor.Kind != GenLocalKind.Local)
                         continue;
 
-                    var storage = StorageForType(types[i]);
+                    if (!allocated.Add(descriptor.Index))
+                        continue;
+
+                    if (!RequiresDescriptorHome(descriptor, _explicitLocalSlots))
+                        continue;
+
+                    var storage = StorageForDescriptor(descriptor);
                     cursor = AlignUp(cursor, storage.Alignment);
-                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Local, i, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, types[i]));
+                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Local, descriptor.Index, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, descriptor.Type));
                     cursor = checked(cursor + storage.Size);
                 }
 
-                ValidateExplicitUserSlots(StackFrameSlotKind.Local, _explicitLocalSlots, types.Length);
+                ValidateExplicitUserSlots(StackFrameSlotKind.Local, _explicitLocalSlots, descriptors);
             }
 
-            private bool RequiresLocalOrTempHome(
-                StackFrameSlotKind kind,
-                int index,
-                HashSet<int> explicitSlots,
-                ImmutableArray<GenLocalDescriptor> descriptors)
+            private static bool RequiresDescriptorHome(GenLocalDescriptor descriptor, HashSet<int> explicitSlots)
             {
-                if (explicitSlots.Contains(index))
-                    return true;
-
-                if (!TryGetTopLevelDescriptor(kind, index, descriptors, out var descriptor))
+                if (explicitSlots.Contains(descriptor.Index))
                     return true;
 
                 if (descriptor.Category == GenLocalCategory.PromotedStruct &&
@@ -746,11 +736,10 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool TryGetTopLevelDescriptor(
+            private static void ValidateExplicitUserSlots(
                 StackFrameSlotKind kind,
-                int index,
-                ImmutableArray<GenLocalDescriptor> descriptors,
-                out GenLocalDescriptor descriptor)
+                HashSet<int> explicitSlots,
+                ImmutableArray<GenLocalDescriptor> descriptors)
             {
                 GenLocalKind localKind = kind switch
                 {
@@ -759,32 +748,42 @@ namespace Cnidaria.Cs
                     _ => throw new ArgumentOutOfRangeException(nameof(kind)),
                 };
 
-                for (int i = 0; i < descriptors.Length; i++)
-                {
-                    var candidate = descriptors[i];
-                    if (candidate.Kind == localKind && !candidate.IsStructField && candidate.Index == index)
-                    {
-                        descriptor = candidate;
-                        return true;
-                    }
-                }
-
-                descriptor = null!;
-                return false;
-            }
-
-            private static void ValidateExplicitUserSlots(StackFrameSlotKind kind, HashSet<int> explicitSlots, int slotCount)
-            {
                 foreach (int index in explicitSlots)
                 {
-                    if ((uint)index >= (uint)slotCount)
+                    if (!ContainsDescriptorIndex(descriptors, localKind, index))
                         throw new InvalidOperationException(kind + " slot " + index.ToString() + " is referenced by LIR but no such slot exists in the method frame table.");
                 }
+            }
+
+            private static bool ContainsDescriptorIndex(ImmutableArray<GenLocalDescriptor> descriptors, GenLocalKind kind, int index)
+            {
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var descriptor = descriptors[i];
+                    if (descriptor.Kind == kind && descriptor.Index == index)
+                        return true;
+                }
+
+                return false;
             }
 
             private void AllocateArgumentSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
                 var argTypes = _method.GenTreeMethod.ArgTypes;
+                int hiddenReturnBufferHomeIndex = argTypes.Length;
+                if (MachineAbi.RequiresHiddenReturnBuffer(_method.GenTreeMethod.RuntimeMethod))
+                {
+                    cursor = AlignUp(cursor, TargetArchitecture.PointerSize);
+                    slots.Add(new StackFrameSlot(
+                        StackFrameSlotKind.Argument,
+                        hiddenReturnBufferHomeIndex,
+                        cursor,
+                        TargetArchitecture.PointerSize,
+                        TargetArchitecture.PointerSize,
+                        RegisterClass.General));
+                    cursor = checked(cursor + TargetArchitecture.PointerSize);
+                }
+
                 for (int i = 0; i < argTypes.Length; i++)
                 {
                     if (!RequiresIncomingArgumentHome(i))
@@ -799,6 +798,11 @@ namespace Cnidaria.Cs
 
             private bool RequiresIncomingArgumentHome(int index)
             {
+                RuntimeType argType = _method.GenTreeMethod.ArgTypes[index];
+                var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false);
+                if (argAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                    return true;
+
                 if (!TryGetTopLevelArgumentDescriptor(index, out var descriptor))
                     return true;
 
@@ -978,48 +982,35 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    incomingStackArgumentIndex++;
+                    int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                    incomingStackArgumentIndex = checked(incomingStackArgumentIndex + MachineAbi.StackSlotsForArgumentSize(stackSize));
                 }
 
                 return false;
             }
             private void AllocateTempSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
-                var temps = _method.GenTreeMethod.Temps;
                 var descriptors = _method.GenTreeMethod.TempDescriptors;
-                for (int i = 0; i < temps.Length; i++)
+                var allocated = new HashSet<int>();
+                for (int i = 0; i < descriptors.Length; i++)
                 {
-                    var temp = temps[i];
-                    if (!RequiresLocalOrTempHome(StackFrameSlotKind.Temp, temp.Index, _explicitTempSlots, descriptors))
+                    var descriptor = descriptors[i];
+                    if (descriptor.Kind != GenLocalKind.Temporary)
                         continue;
 
-                    var storage = temp.Type is null
-                        ? StorageForStackKind(temp.StackKind)
-                        : StorageForType(temp.Type);
+                    if (!allocated.Add(descriptor.Index))
+                        continue;
 
+                    if (!RequiresDescriptorHome(descriptor, _explicitTempSlots))
+                        continue;
+
+                    var storage = StorageForDescriptor(descriptor);
                     cursor = AlignUp(cursor, storage.Alignment);
-                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Temp, temp.Index, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, temp.Type));
+                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Temp, descriptor.Index, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, descriptor.Type));
                     cursor = checked(cursor + storage.Size);
                 }
 
-                ValidateExplicitTempSlots(_explicitTempSlots, temps);
-            }
-
-            private static void ValidateExplicitTempSlots(HashSet<int> explicitSlots, ImmutableArray<GenTemp> temps)
-            {
-                foreach (int index in explicitSlots)
-                {
-                    if (!ContainsTempIndex(temps, index))
-                        throw new InvalidOperationException("Temp slot " + index.ToString() + " is referenced by LIR but no such temp exists in the method frame table.");
-                }
-            }
-
-            private static bool ContainsTempIndex(ImmutableArray<GenTemp> temps, int index)
-            {
-                for (int i = 0; i < temps.Length; i++)
-                    if (temps[i].Index == index)
-                        return true;
-                return false;
+                ValidateExplicitUserSlots(StackFrameSlotKind.Temp, _explicitTempSlots, descriptors);
             }
 
             private void AllocateSpillSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
@@ -1060,6 +1051,9 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < specs.Count; i++)
                 {
                     var spec = specs[i];
+                    if (spec.Index < nextIndex)
+                        continue;
+
                     while (nextIndex < spec.Index)
                     {
                         var defaultStorage = StorageForOutgoingArgumentSlot(RegisterClass.General, StorageForRegisterClass(RegisterClass.General));
@@ -1087,7 +1081,7 @@ namespace Cnidaria.Cs
                         align,
                         registerClass));
                     cursor = checked(cursor + size);
-                    nextIndex = spec.Index + 1;
+                    nextIndex = checked(spec.Index + MachineAbi.StackSlotsForArgumentSize(size));
                 }
             }
 
@@ -1256,6 +1250,14 @@ namespace Cnidaria.Cs
 
             private RegisterFrameBase FrameBaseForUserSlot()
                 => _layout.UsesFramePointer ? RegisterFrameBase.FramePointer : RegisterFrameBase.StackPointer;
+        }
+
+        private static StorageInfo StorageForDescriptor(GenLocalDescriptor descriptor)
+        {
+            if (descriptor.Type is not null)
+                return StorageForType(descriptor.Type);
+
+            return StorageForStackKind(descriptor.StackKind);
         }
 
         private static StorageInfo StorageForValue(GenTreeValueInfo valueInfo)

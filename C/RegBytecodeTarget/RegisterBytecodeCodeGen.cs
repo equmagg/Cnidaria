@@ -413,6 +413,8 @@ namespace Cnidaria.C
         private static StackFrameLayout ToStackFrameLayout(StackFrameMap frame)
         {
             var empty = ImmutableArray<StackFrameSlot>.Empty;
+            var tempAreaOffset = frame.ParallelCopyTempOffset;
+            var tempAreaSize = checked(frame.FloatingImmediateTempOffset + frame.FloatingImmediateTempSize - tempAreaOffset);
             return new StackFrameLayout(
                 frameSize: frame.FrameSize,
                 frameAlignment: frame.FrameAlignment,
@@ -422,8 +424,8 @@ namespace Cnidaria.C
                 argumentHomeAreaSize: 0,
                 localAreaOffset: frame.StackSlotAreaOffset,
                 localAreaSize: frame.StackSlotAreaSize,
-                tempAreaOffset: frame.ParallelCopyTempOffset,
-                tempAreaSize: frame.ParallelCopyTempSize,
+                tempAreaOffset: tempAreaOffset,
+                tempAreaSize: tempAreaSize,
                 spillAreaOffset: frame.SpillAreaOffset,
                 spillAreaSize: frame.SpillAreaSize,
                 outgoingArgumentAreaOffset: frame.OutgoingArgumentAreaOffset,
@@ -729,7 +731,7 @@ namespace Cnidaria.C
                 }
 
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
-                LoadOperandInto(instruction.Operands[0], destination);
+                LoadOperandIntoAs(instruction.Operands[0], destination, instruction.Result.Type, instruction);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
 
@@ -815,7 +817,7 @@ namespace Cnidaria.C
                 var resultType = instruction.Result.Type;
                 var leftType = instruction.Operands[0].Type;
                 var rightType = instruction.Operands[1].Type;
-                var usesFloatingOperands = IsFloatType(leftType) || IsFloatType(rightType);
+                var usesFloatingOperands = IsFloatType(leftType) || IsFloatType(rightType) || IsFloatType(resultType);
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
                 if (!usesFloatingOperands && TryEmitBinaryImmediate(instruction, dst, op))
@@ -824,10 +826,56 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var left = LoadOperand(instruction.Operands[0], usesFloatingOperands ? FpScratch1 : GpScratch1);
-                var right = LoadOperand(instruction.Operands[1], usesFloatingOperands ? FpScratch2 : GpScratch2);
+                MachineRegister left;
+                MachineRegister right;
+                if (usesFloatingOperands)
+                {
+                    var floatType = FloatingBinaryComputationType(leftType, rightType, resultType);
+                    left = LoadOperandForFloatingBinary(instruction.Operands[0], floatType, FpScratch1, GpScratch1, instruction);
+                    right = LoadOperandForFloatingBinary(instruction.Operands[1], floatType, FpScratch2, GpScratch2, instruction);
+                }
+                else
+                {
+                    left = LoadOperand(instruction.Operands[0], GpScratch1);
+                    right = LoadOperand(instruction.Operands[1], GpScratch2);
+                }
+
                 EmitRaw(op, dst, left, right, MayThrow(op));
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
+            }
+
+            private QualifiedType FloatingBinaryComputationType(QualifiedType leftType, QualifiedType rightType, QualifiedType resultType)
+            {
+                if (IsFloat64(leftType) || IsFloat64(rightType) || IsFloat64(resultType) ||
+                    IsLongDouble(leftType) || IsLongDouble(rightType) || IsLongDouble(resultType))
+                    return TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+
+                return TypeCatalog.Instance.Builtin(BuiltinTypeKind.Float);
+            }
+
+            private MachineRegister LoadOperandForFloatingBinary(
+                LirOperand operand,
+                QualifiedType floatType,
+                MachineRegister floatScratch,
+                MachineRegister generalScratch,
+                LirInstruction instruction)
+            {
+                if (IsFloatType(operand.Type))
+                {
+                    var source = LoadOperand(operand, floatScratch);
+                    if ((IsFloat32(operand.Type) && IsFloat32(floatType)) || (IsFloat64(operand.Type) && IsFloat64(floatType)))
+                        return source;
+
+                    EmitFloatConversion(floatScratch, source, operand.Type, floatType, instruction);
+                    return floatScratch;
+                }
+
+                if (!IsIntegerLike(operand.Type))
+                    throw Unsupported(instruction, $"Unsupported floating binary operand type {operand.Type.ToDisplayString()}.");
+
+                var integerSource = LoadOperand(operand, generalScratch);
+                EmitFloatConversion(floatScratch, integerSource, operand.Type, floatType, instruction);
+                return floatScratch;
             }
 
             private bool TryEmitBinaryImmediate(LirInstruction instruction, MachineRegister destination, Op binaryOp)
@@ -1053,7 +1101,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var src = LoadOperand(instruction.Operands[0], IsFloatType(instruction.Operands[0].Type) ? FpScratch0 : GpScratch0);
+                var src = LoadOperandAs(instruction.Operands[0], storeType, GpScratch0, FpScratch0, instruction);
                 var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
                 EmitMem(StoreOpForType(storeType), src, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(storeType), parts.ScaleLog2);
             }
@@ -1353,15 +1401,16 @@ namespace Cnidaria.C
                     return;
                 }
 
-                if (RegisterClassOf(ClassifyValue(operand.Type)) == AbiRegisterClass.Floating)
+                var returnType = _function.Symbol?.FunctionType?.ReturnType ?? operand.Type;
+                if (RegisterClassOf(ClassifyValue(returnType)) == AbiRegisterClass.Floating)
                 {
-                    LoadOperandInto(operand, MachineRegister.F10);
+                    LoadOperandIntoAs(operand, MachineRegister.F10, returnType, instruction);
                     EmitEpilogue();
                     _asm.RetF(MachineRegister.F10);
                     return;
                 }
 
-                LoadOperandInto(operand, MachineRegister.X10);
+                LoadOperandIntoAs(operand, MachineRegister.X10, returnType, instruction);
                 EmitEpilogue();
                 _asm.RetI(MachineRegister.X10);
             }
@@ -1673,6 +1722,48 @@ namespace Cnidaria.C
             }
 
 
+            private void LoadOperandIntoAs(LirOperand operand, MachineRegister destination, QualifiedType targetType, LirInstruction instruction)
+            {
+                if (SameType(operand.Type, targetType))
+                {
+                    LoadOperandInto(operand, destination);
+                    return;
+                }
+
+                if (!CanCodegenConvert(operand.Type, targetType))
+                    throw Unsupported(instruction, $"Cannot convert operand from {operand.Type.ToDisplayString()} to {targetType.ToDisplayString()} while loading it into a target register.");
+
+                var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch1 : GpScratch1);
+                EmitConversion(destination, source, operand.Type, targetType, instruction);
+            }
+
+            private MachineRegister LoadOperandAs(LirOperand operand, QualifiedType targetType, MachineRegister generalScratch, MachineRegister floatScratch, LirInstruction instruction)
+            {
+                if (SameType(operand.Type, targetType))
+                    return LoadOperand(operand, IsFloatType(targetType) ? floatScratch : generalScratch);
+
+                if (!CanCodegenConvert(operand.Type, targetType))
+                    throw Unsupported(instruction, $"Cannot convert operand from {operand.Type.ToDisplayString()} to {targetType.ToDisplayString()} while loading it.");
+
+                var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch1 : GpScratch1);
+                var destination = IsFloatType(targetType) ? floatScratch : generalScratch;
+                EmitConversion(destination, source, operand.Type, targetType, instruction);
+                return destination;
+            }
+
+            private static bool CanCodegenConvert(QualifiedType from, QualifiedType to)
+            {
+                if (from.IsError || to.IsError)
+                    return true;
+
+                if (from.ToDisplayString() == to.ToDisplayString())
+                    return true;
+
+                var fromScalar = IsIntegerLike(from) || IsFloatType(from) || IsPointerLike(from);
+                var toScalar = IsIntegerLike(to) || IsFloatType(to) || IsPointerLike(to);
+                return fromScalar && toScalar;
+            }
+
             private void LoadOperandInto(LirOperand operand, MachineRegister destination)
             {
                 var actual = LoadOperand(operand, destination);
@@ -1742,8 +1833,8 @@ namespace Cnidaria.C
                 if (!alloc.IsSpilled)
                     return alloc.PhysicalRegister;
 
-                EmitMem(IsFloatType(register.Type) ? Op.LdF64 : Op.LdI8, preferred, MachineRegister.Invalid,
-                    alloc.StackOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                EmitMem(LoadOpForType(register.Type), preferred, MachineRegister.Invalid,
+                    alloc.StackOffset, MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(register.Type));
                 return preferred;
             }
 
@@ -1768,8 +1859,8 @@ namespace Cnidaria.C
                 if (!alloc.IsSpilled)
                     return;
 
-                EmitMem(IsFloatType(register.Type) ? Op.StF64 : Op.StI8, source, MachineRegister.Invalid,
-                    alloc.StackOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                EmitMem(StoreOpForType(register.Type), source, MachineRegister.Invalid,
+                    alloc.StackOffset, MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(register.Type));
             }
             private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
             {
@@ -2004,7 +2095,10 @@ namespace Cnidaria.C
             {
                 if (value is null)
                 {
-                    _asm.LiI64(destination, 0);
+                    if (IsFloatType(type))
+                        EmitLiFloat(destination, 0.0, type);
+                    else
+                        _asm.LiI64(destination, 0);
                     return;
                 }
 
@@ -2016,12 +2110,7 @@ namespace Cnidaria.C
 
                 if (IsFloatType(type))
                 {
-                    if (value is float f)
-                        _asm.LiF32Bits(destination, BitConverter.SingleToInt32Bits(f));
-                    else if (value is double d)
-                        _asm.LiF64Bits(destination, BitConverter.DoubleToInt64Bits(d));
-                    else
-                        EmitLiFloat(destination, Convert.ToDouble(value, CultureInfo.InvariantCulture), type);
+                    EmitLiFloat(destination, Convert.ToDouble(value, CultureInfo.InvariantCulture), type);
                     return;
                 }
 
@@ -2510,10 +2599,25 @@ namespace Cnidaria.C
 
             private void EmitLiFloat(MachineRegister destination, double value, QualifiedType type)
             {
+                if (!IsFloatRegister(destination))
+                    throw new InvalidOperationException("Floating-point immediate destination must be an FPR.");
+
+                var scratchOffset = _allocation.Frame.FloatingImmediateTempOffset;
+                if (scratchOffset < 0)
+                    throw new InvalidOperationException("Floating-point immediate scratch slot was not reserved.");
+
                 if (IsFloat32(type))
-                    _asm.LiF32Bits(destination, BitConverter.SingleToInt32Bits((float)value));
+                {
+                    _asm.LiI32(GpScratch2, BitConverter.SingleToInt32Bits((float)value));
+                    EmitMem(Op.StI4, GpScratch2, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 4);
+                    EmitMem(Op.LdF32, destination, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 4);
+                }
                 else
-                    _asm.LiF64Bits(destination, BitConverter.DoubleToInt64Bits(value));
+                {
+                    _asm.LiI64(GpScratch2, BitConverter.DoubleToInt64Bits(value));
+                    EmitMem(Op.StI8, GpScratch2, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                    EmitMem(Op.LdF64, destination, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
+                }
             }
 
             private bool IsFallthroughTarget(LirBlock? target)

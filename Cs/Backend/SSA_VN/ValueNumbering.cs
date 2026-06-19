@@ -2701,6 +2701,14 @@ namespace Cnidaria.Cs
                 }
 
                 ValueNumber receiver = OperandNormal(operands, 0, ValueNumberCategory.Liberal);
+                if (MayBeLocalStorageByRefAliasAddress(node.Operands[0]))
+                {
+                    ValueNumber address = FieldAddressValue(node.StackKind, node.Type, receiver, node.Field, ValueNumberFieldSequenceKind.Instance, extraOffset: 0);
+                    ValueNumber type = _store.VNForType(node.Type ?? node.RuntimeType ?? node.Field.FieldType);
+                    ValueNumber value = _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.ByrefExposedLoad, type, address, byrefExposed);
+                    return node.CanThrow ? WithException(node, value) : ValueNumberPair.Same(value);
+                }
+
                 if (TryDecodeFieldAddress(receiver, out var receiverAddress))
                 {
                     if (IsLocalAddress(receiverAddress.BaseAddress))
@@ -2754,7 +2762,9 @@ namespace Cnidaria.Cs
                 if (TryDecodeArrayElementAddress(addr, out var arrayAddress))
                     return LoadArrayElementBySelector(node, arrayAddress.ElementClass, arrayAddress.Array, arrayAddress.Index, arrayAddress.Offset, heap, blockId, statementIndex);
 
-                ValueNumber memory = IsLocalAddress(addr) || (TryDecodeFieldAddress(addr, out var localFieldAddress) && IsLocalAddress(localFieldAddress.BaseAddress))
+                ValueNumber memory = IsLocalAddress(addr) ||
+                    MayBeLocalStorageByRefAliasAddress(node.Operands.Length == 0 ? null : node.Operands[0]) ||
+                    (TryDecodeFieldAddress(addr, out var localFieldAddress) && IsLocalAddress(localFieldAddress.BaseAddress))
                     ? byrefExposed
                     : OpaqueMemory(blockId);
                 ValueNumber type = _store.VNForType(node.Type ?? node.RuntimeType);
@@ -2783,6 +2793,12 @@ namespace Cnidaria.Cs
 
                 ValueNumber receiver = OperandNormal(operands, 0, ValueNumberCategory.Liberal);
                 ValueNumber stored = OperandNormal(operands, 1, ValueNumberCategory.Liberal);
+                if (MayBeLocalStorageByRefAliasAddress(node.Operands[0]))
+                {
+                    byrefExposed = OpaqueMemory(blockId);
+                    return ValueNumberPair.Same(stored);
+                }
+
                 if (TryDecodeFieldAddress(receiver, out var receiverAddress))
                 {
                     if (IsLocalAddress(receiverAddress.BaseAddress))
@@ -2854,7 +2870,7 @@ namespace Cnidaria.Cs
                     return ValueNumberPair.Same(result);
                 }
 
-                if (IsLocalAddress(addr))
+                if (IsLocalAddress(addr) || MayBeLocalStorageByRefAliasAddress(node.Operands.Length == 0 ? null : node.Operands[0]))
                     byrefExposed = OpaqueMemory(blockId);
                 else
                 {
@@ -3024,6 +3040,38 @@ namespace Cnidaria.Cs
                 info = default;
                 return false;
             }
+            private ValueNumber FieldAddressValue(GenStackKind stackKind, RuntimeType? type, ValueNumber receiver, RuntimeField field, ValueNumberFieldSequenceKind kind, int extraOffset)
+            {
+                var sequence = ValueNumberFieldSequence.Create(field, kind);
+                return _store.VNForFunc(
+                    stackKind,
+                    type,
+                    kind == ValueNumberFieldSequenceKind.Static ? ValueNumberFunction.PtrToStatic : ValueNumberFunction.FieldAddr,
+                    receiver,
+                    _store.VNForFieldSequence(sequence),
+                    _store.VNForInt32(extraOffset));
+            }
+
+            private static bool MayBeLocalStorageByRefAliasAddress(GenTree? node)
+            {
+                if (node is null)
+                    return false;
+
+                if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
+                    return node.LocalDescriptor is { IsLocalStorageByRefAlias: true };
+
+                if (node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerToByRef or GenTreeKind.PointerElementAddr)
+                {
+                    for (int i = 0; i < node.Operands.Length; i++)
+                    {
+                        if (MayBeLocalStorageByRefAliasAddress(node.Operands[i]))
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
 
             private bool TryGetInt32(ValueNumber vn, out int value)
             {

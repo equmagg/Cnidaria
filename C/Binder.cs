@@ -191,6 +191,10 @@ namespace Cnidaria.C
                                 $"Cannot initialize object of type '{targetType.ToDisplayString()}' with expression of type '{expression.Type.ToDisplayString()}'.",
                                 SpanOf(expressionInitializer.Expression));
                         }
+                        else
+                        {
+                            expression = ConvertImplicitValue(expression, targetType);
+                        }
 
                         return new BoundExpressionInitializer(expressionInitializer, targetType, expression);
                     }
@@ -525,6 +529,10 @@ namespace Cnidaria.C
                         $"Cannot convert return expression of type '{expression.Type.ToDisplayString()}' to '{returnType.Value.ToDisplayString()}'.",
                         SpanOf(syntax.Expression!));
                 }
+                else if (!returnsVoid && expression is not null)
+                {
+                    expression = ConvertImplicitValue(expression, returnType.Value);
+                }
             }
 
             return new BoundReturnStatement(syntax, function, expression);
@@ -827,12 +835,68 @@ namespace Cnidaria.C
             var right = ApplyDefaultConversions(BindExpression(syntax.Right));
 
             var resultType = BindBinaryResultType(syntax.OperatorToken, left, right);
+            ApplyBinaryOperandConversions(syntax.OperatorToken, ref left, ref right, resultType);
             return new BoundBinaryExpression(
                 syntax,
                 left,
                 syntax.OperatorToken,
                 right,
                 resultType);
+        }
+
+        private void ApplyBinaryOperandConversions(SyntaxToken operatorToken, ref BoundExpression left, ref BoundExpression right, QualifiedType resultType)
+        {
+            if (resultType.IsError || left.Type.IsError || right.Type.IsError)
+                return;
+
+            switch (operatorToken.Kind)
+            {
+                case SyntaxKind.StarToken:
+                case SyntaxKind.SlashToken:
+                case SyntaxKind.PercentToken:
+                case SyntaxKind.AmpersandToken:
+                case SyntaxKind.PipeToken:
+                case SyntaxKind.HatToken:
+                    if (IsArithmeticType(left.Type) && IsArithmeticType(right.Type))
+                    {
+                        var commonType = UsualArithmeticConversion(left.Type, right.Type);
+                        left = ConvertImplicitValue(left, commonType);
+                        right = ConvertImplicitValue(right, commonType);
+                    }
+                    return;
+
+                case SyntaxKind.PlusToken:
+                case SyntaxKind.MinusToken:
+                    if (IsArithmeticType(left.Type) && IsArithmeticType(right.Type))
+                    {
+                        var commonType = UsualArithmeticConversion(left.Type, right.Type);
+                        left = ConvertImplicitValue(left, commonType);
+                        right = ConvertImplicitValue(right, commonType);
+                    }
+                    return;
+
+                case SyntaxKind.EqualsEqualsToken:
+                case SyntaxKind.BangEqualsToken:
+                case SyntaxKind.LessThanToken:
+                case SyntaxKind.LessThanEqualsToken:
+                case SyntaxKind.GreaterThanToken:
+                case SyntaxKind.GreaterThanEqualsToken:
+                    if (IsArithmeticType(left.Type) && IsArithmeticType(right.Type))
+                    {
+                        var commonType = UsualArithmeticConversion(left.Type, right.Type);
+                        left = ConvertImplicitValue(left, commonType);
+                        right = ConvertImplicitValue(right, commonType);
+                    }
+                    return;
+
+                case SyntaxKind.LessThanLessThanToken:
+                case SyntaxKind.GreaterThanGreaterThanToken:
+                    if (IsIntegerType(left.Type))
+                        left = ConvertImplicitValue(left, IntegerPromote(left.Type));
+                    if (IsIntegerType(right.Type))
+                        right = ConvertImplicitValue(right, IntegerPromote(right.Type));
+                    return;
+            }
         }
 
         private QualifiedType BindBinaryResultType(
@@ -928,6 +992,10 @@ namespace Cnidaria.C
                     $"Cannot assign expression of type '{right.Type.ToDisplayString()}' to object of type '{left.Type.ToDisplayString()}'.",
                     SpanOf(syntax.Right));
             }
+            else if (syntax.OperatorToken.Kind == SyntaxKind.EqualsToken)
+            {
+                right = ConvertImplicitValue(right, left.Type);
+            }
 
             return new BoundAssignmentExpression(
                 syntax,
@@ -947,6 +1015,11 @@ namespace Cnidaria.C
             var whenFalse = ApplyDefaultConversions(BindExpression(syntax.WhenFalse));
 
             var resultType = CommonConditionalType(whenTrue.Type, whenFalse.Type);
+            if (!resultType.IsError)
+            {
+                whenTrue = ConvertImplicitValue(whenTrue, resultType);
+                whenFalse = ConvertImplicitValue(whenFalse, resultType);
+            }
 
             return new BoundConditionalExpression(
                 syntax,
@@ -1153,18 +1226,21 @@ namespace Cnidaria.C
                 return ConvertCallArgument(argument, _types.Builtin(BuiltinTypeKind.Double));
             return ConvertCallArgument(argument, IntegerPromote(argument.Type));
         }
-        private BoundExpression ConvertCallArgument(BoundExpression argument, QualifiedType targetType)
+        private BoundExpression ConvertImplicitValue(BoundExpression expression, QualifiedType targetType)
         {
-            if (argument.Type.IsError || targetType.IsError || SameType(argument.Type, targetType))
-                return argument;
+            if (expression.Type.IsError || targetType.IsError || SameType(expression.Type, targetType))
+                return expression;
 
             return new BoundConversionExpression(
-                argument.Syntax as ExpressionSyntax,
-                argument,
+                expression.Syntax as ExpressionSyntax,
+                expression,
                 targetType,
                 BoundValueKind.RValue,
                 BoundConversionKind.Implicit);
         }
+
+        private BoundExpression ConvertCallArgument(BoundExpression argument, QualifiedType targetType)
+            => ConvertImplicitValue(argument, targetType);
         private BoundExpression BindElementAccessExpression(ElementAccessExpressionSyntax syntax)
         {
             var expression = ApplyDefaultConversions(BindExpression(syntax.Expression));

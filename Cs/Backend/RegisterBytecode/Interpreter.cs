@@ -303,7 +303,10 @@ namespace Cnidaria.Cs
                 {
                     AbiArgumentLocation loc = slices[s].Location;
                     if (loc.IsStack)
-                        max = Math.Max(max, checked((loc.StackSlotIndex + 1) * MachineAbi.StackArgumentSlotSize));
+                    {
+                        int end = checked(loc.StackSlotIndex * MachineAbi.StackArgumentSlotSize + loc.StackOffset + Math.Max(1, loc.Size));
+                        max = Math.Max(max, end);
+                    }
                 }
             }
             return max == 0 ? 0 : checked((int)AlignUp(max, MachineAbi.StackArgumentSlotSize));
@@ -3195,7 +3198,9 @@ namespace Cnidaria.Cs
                 case AbiValuePassingKind.Indirect:
                     {
                         int size = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
-                        AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stack++, 0, size);
+                        int stackSlot = stack;
+                        stack = checked(stack + MachineAbi.StackSlotsForArgumentSize(size));
+                        AbiArgumentLocation loc = AbiArgumentLocation.ForStack(RegisterClass.General, stackSlot, 0, size);
                         return ImmutableArray.Create(new AbiArgumentSlice(loc, RegisterClass.General, 0, size, abi.ContainsGcPointers));
                     }
 
@@ -3231,7 +3236,8 @@ namespace Cnidaria.Cs
                 }
                 return;
             }
-            stack++;
+            int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+            stack = checked(stack + MachineAbi.StackSlotsForArgumentSize(stackSize));
         }
 
         private long ReadAbiValueBits(RuntimeMethod method, int logicalIndex, RuntimeType type, int size)
@@ -3487,14 +3493,20 @@ namespace Cnidaria.Cs
 
             if (aggregateStackSlot < 0)
             {
-                aggregateStackSlot = stack++;
+                aggregateStackSlot = stack;
                 aggregateStackBaseOffset = segment.Offset;
             }
+
+            int stackOffset = checked(segment.Offset - aggregateStackBaseOffset);
+            int requiredSlots = MachineAbi.StackSlotsForArgumentSize(checked(stackOffset + Math.Max(1, segment.Size)));
+            int requiredStackIndex = checked(aggregateStackSlot + requiredSlots);
+            if (stack < requiredStackIndex)
+                stack = requiredStackIndex;
 
             return AbiArgumentLocation.ForStack(
                 segment.RegisterClass,
                 aggregateStackSlot,
-                checked(segment.Offset - aggregateStackBaseOffset),
+                stackOffset,
                 segment.Size);
         }
 
@@ -6200,12 +6212,12 @@ namespace Cnidaria.Cs
             if (objRef == 0) throw new NullReferenceException();
             if (objRef < int.MinValue || objRef > int.MaxValue)
                 throw new AccessViolationException("Array reference is outside VM address space.");
-            abs = (int)objRef;
+            abs = checked((int)objRef);
             if (!TryGetBlockFromObjectRef(abs, out _))
-                throw new AccessViolationException();
+                throw new AccessViolationException("Could not get block from object ref");
             int flags = ReadI32(abs + 4);
             if ((flags & GcFlagAllocated) == 0)
-                throw new AccessViolationException();
+                throw new AccessViolationException("No allocation flag found");
         }
 
         private RuntimeType ValidateArrayRef(long objRef)

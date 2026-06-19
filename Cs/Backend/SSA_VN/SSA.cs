@@ -160,9 +160,9 @@ namespace Cnidaria.Cs
         public SsaDefinitionKind DefinitionKind { get; }
         public int DefBlockId { get; }
         public CfgBlock? DefBlock { get; }
-        public int DefStatementIndex { get; }
-        public int DefTreeId { get; }
-        public GenTree? DefNode { get; }
+        public int DefStatementIndex { get; internal set; }
+        public int DefTreeId { get; internal set; }
+        public GenTree? DefNode { get; internal set; }
         public SsaPhi? Phi { get; }
         public RuntimeType? Type { get; }
         public GenStackKind StackKind { get; }
@@ -237,6 +237,13 @@ namespace Cnidaria.Cs
         {
             HasPhiUse = true;
             AddUse(useBlockId);
+        }
+
+        internal void ResetUseTracking()
+        {
+            UseCount = 0;
+            HasPhiUse = false;
+            HasGlobalUse = false;
         }
 
         internal void SetValueNumbers(ValueNumberPair valueNumbers)
@@ -547,9 +554,9 @@ namespace Cnidaria.Cs
         public SsaMemoryDefinitionKind DefinitionKind { get; }
         public int DefBlockId { get; }
         public CfgBlock? DefBlock { get; }
-        public int DefStatementIndex { get; }
-        public int DefTreeId { get; }
-        public GenTree? DefNode { get; }
+        public int DefStatementIndex { get; internal set; }
+        public int DefTreeId { get; internal set; }
+        public GenTree? DefNode { get; internal set; }
         public SsaMemoryPhi? Phi { get; }
         public int UseCount { get; private set; }
         public bool HasPhiUse { get; private set; }
@@ -595,6 +602,13 @@ namespace Cnidaria.Cs
             AddUse(useBlockId);
         }
 
+        internal void ResetUseTracking()
+        {
+            UseCount = 0;
+            HasPhiUse = false;
+            HasGlobalUse = false;
+        }
+
         internal void SetValueNumber(ValueNumber valueNumber)
         {
             ValueNumber = valueNumber;
@@ -630,18 +644,40 @@ namespace Cnidaria.Cs
     }
     internal sealed class SsaTree
     {
+        private ImmutableArray<SsaTree> _operands;
+
         public GenTree Source { get; }
         public GenTreeKind Kind => Source.Kind;
-        public ImmutableArray<SsaTree> Operands { get; }
-        public SsaValueName? Value { get; }
-        public SsaValueName? StoreTarget { get; }
-        public SsaValueName? LocalFieldBaseValue { get; }
-        public RuntimeField? LocalField { get; }
-        public ImmutableArray<SsaMemoryValueName> MemoryUses { get; }
-        public ImmutableArray<SsaMemoryValueName> MemoryDefinitions { get; }
+        public ImmutableArray<SsaTree> Operands
+        {
+            get
+            {
+                if (_operands.IsDefault)
+                    _operands = BuildOperandViews(Source.Operands);
+                return _operands;
+            }
+        }
+        public SsaValueName? Value => Source.SsaValueName;
+        public SsaValueName? StoreTarget => Source.SsaStoreTargetName;
+        public SsaValueName? LocalFieldBaseValue => Source.SsaLocalFieldBaseValue;
+        public RuntimeField? LocalField => Source.SsaLocalField;
+        public ImmutableArray<SsaMemoryValueName> MemoryUses => Source.SsaMemoryUses;
+        public ImmutableArray<SsaMemoryValueName> MemoryDefinitions => Source.SsaMemoryDefinitions;
         public bool IsPartialDefinition => StoreTarget.HasValue && LocalField is not null;
         public bool IsLocalFieldAccess => (LocalFieldBaseValue.HasValue || IsPartialDefinition) && LocalField is not null;
         public bool HasMemoryEffects => !MemoryUses.IsDefaultOrEmpty || !MemoryDefinitions.IsDefaultOrEmpty;
+
+        public SsaTree(GenTree source)
+        {
+            Source = source ?? throw new ArgumentNullException(nameof(source));
+            _operands = default;
+        }
+
+        public SsaTree(GenTree source, ImmutableArray<SsaTree> operands)
+        {
+            Source = source ?? throw new ArgumentNullException(nameof(source));
+            _operands = operands.IsDefault ? BuildOperandViews(source.Operands) : ValidateOperandViews(source, operands);
+        }
 
         public SsaTree(
             GenTree source,
@@ -654,13 +690,80 @@ namespace Cnidaria.Cs
             ImmutableArray<SsaMemoryValueName> memoryDefinitions = default)
         {
             Source = source ?? throw new ArgumentNullException(nameof(source));
-            Operands = operands.IsDefault ? ImmutableArray<SsaTree>.Empty : operands;
-            Value = value;
-            StoreTarget = storeTarget;
-            LocalFieldBaseValue = localFieldBaseValue;
-            LocalField = localField;
-            MemoryUses = memoryUses.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryUses;
-            MemoryDefinitions = memoryDefinitions.IsDefault ? ImmutableArray<SsaMemoryValueName>.Empty : memoryDefinitions;
+            _operands = operands.IsDefault ? BuildOperandViews(source.Operands) : RewriteOperandViews(source, operands);
+
+            if (value.HasValue)
+                source.AttachSsaUse(value.Value);
+            else if (storeTarget.HasValue)
+                source.AttachSsaDefinition(storeTarget.Value, source.Type, source.StackKind);
+            else
+            {
+                source.SsaValueName = null;
+                source.SsaStoreTargetName = null;
+            }
+
+            if (localFieldBaseValue.HasValue)
+                source.AttachSsaLocalFieldBaseUse(localFieldBaseValue.Value, localField);
+            else if (localField is not null)
+                source.AttachSsaLocalField(localField);
+            else
+            {
+                source.SsaLocalFieldBaseValue = null;
+                source.SsaLocalField = null;
+            }
+
+            source.AttachSsaMemory(memoryUses, memoryDefinitions);
+        }
+
+        private static ImmutableArray<SsaTree> ValidateOperandViews(GenTree source, ImmutableArray<SsaTree> operands)
+        {
+            if (source.Operands.Length != operands.Length)
+                throw new InvalidOperationException($"SSA operand view for node {source.Id} does not match GenTree operand count.");
+
+            for (int i = 0; i < operands.Length; i++)
+            {
+                if (!ReferenceEquals(source.Operands[i], operands[i].Source))
+                    throw new InvalidOperationException($"SSA operand view for node {source.Id} does not match GenTree operand {i}.");
+            }
+
+            return operands;
+        }
+
+        private static ImmutableArray<SsaTree> RewriteOperandViews(GenTree source, ImmutableArray<SsaTree> operands)
+        {
+            if (source.Operands.Length == operands.Length)
+            {
+                bool same = true;
+                for (int i = 0; i < operands.Length; i++)
+                {
+                    if (!ReferenceEquals(source.Operands[i], operands[i].Source))
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+
+                if (same)
+                    return operands;
+            }
+
+            var genOperands = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
+            for (int i = 0; i < operands.Length; i++)
+                genOperands.Add(operands[i].Source);
+
+            source.SetOperands(genOperands.ToImmutable());
+            return operands;
+        }
+
+        private static ImmutableArray<SsaTree> BuildOperandViews(ImmutableArray<GenTree> operands)
+        {
+            if (operands.IsDefaultOrEmpty)
+                return ImmutableArray<SsaTree>.Empty;
+
+            var builder = ImmutableArray.CreateBuilder<SsaTree>(operands.Length);
+            for (int i = 0; i < operands.Length; i++)
+                builder.Add(new SsaTree(operands[i]));
+            return builder.ToImmutable();
         }
 
         public bool TryGetMemoryUse(SsaMemoryKind kind, out SsaMemoryValueName value)
@@ -710,8 +813,7 @@ namespace Cnidaria.Cs
 
             var builder = ImmutableArray.CreateBuilder<SsaTree>();
             var seen = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-            CollectUnique(root, seen, builder);
-            builder.Sort(static (left, right) => CompareSourceOrder(left.Source, right.Source));
+            CollectPostOrder(root, seen, builder);
 
             var result = builder.ToImmutable();
             ValidateStatementTreeList(root, result);
@@ -749,25 +851,14 @@ namespace Cnidaria.Cs
             return builder.ToImmutable();
         }
 
-        private static void CollectUnique(SsaTree tree, HashSet<SsaTree> seen, ImmutableArray<SsaTree>.Builder builder)
+        private static void CollectPostOrder(SsaTree tree, HashSet<SsaTree> seen, ImmutableArray<SsaTree>.Builder builder)
         {
             if (!seen.Add(tree))
                 return;
 
-            builder.Add(tree);
             for (int i = 0; i < tree.Operands.Length; i++)
-                CollectUnique(tree.Operands[i], seen, builder);
-        }
-
-        private static int CompareSourceOrder(GenTree left, GenTree right)
-        {
-            int block = left.LinearBlockId.CompareTo(right.LinearBlockId);
-            if (block != 0) return block;
-
-            int ordinal = left.LinearOrdinal.CompareTo(right.LinearOrdinal);
-            if (ordinal != 0) return ordinal;
-
-            return left.Id.CompareTo(right.Id);
+                CollectPostOrder(tree.Operands[i], seen, builder);
+            builder.Add(tree);
         }
 
         private static void ValidateStatementTreeList(SsaTree root, ImmutableArray<SsaTree> treeList)
@@ -1160,7 +1251,7 @@ namespace Cnidaria.Cs
             if (parent is null)
                 return false;
 
-            return operandIndex == 0 && parent.Kind is GenTreeKind.Field or GenTreeKind.StoreField;
+            return operandIndex == 0 && parent.Kind is (GenTreeKind.Field or GenTreeKind.StoreField);
         }
 
         private static bool TryGetContainedLocalAddressSlot(GenTree node, out SsaSlot slot)
@@ -1592,6 +1683,9 @@ namespace Cnidaria.Cs
                 if (descriptor.Pinned || descriptor.IsRefLike)
                     return false;
 
+                if (descriptor.IsStructField && descriptor.IsImplicitByRef)
+                    return false;
+
                 if (descriptor.Category is GenLocalCategory.AddressExposedLocal or GenLocalCategory.MemoryAliasedLocal or GenLocalCategory.ImplicitByRefPinnedRefLikeLocal)
                     return false;
 
@@ -1610,6 +1704,9 @@ namespace Cnidaria.Cs
                     return false;
 
                 if (descriptor.IsImplicitByRef && descriptor.IsLocalStorageByRefAlias)
+                    return false;
+
+                if (descriptor.IsStructField && descriptor.IsImplicitByRef)
                     return false;
 
                 if (descriptor.Category == GenLocalCategory.PromotedStruct)
@@ -1707,8 +1804,26 @@ namespace Cnidaria.Cs
                         changed = true;
                 }
 
+                if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var fieldAccess) &&
+                    fieldAccess.IsDefinition &&
+                    fieldAccess.IsPromotedFieldAccess &&
+                    DescriptorForFieldAccess(fieldAccess, node) is { IsImplicitByRef: true } &&
+                    node.Operands.Length >= 2 &&
+                    MayBeLocalStorageByRefValue(node.Operands[1], aliases))
+                {
+                    if (aliases.Add(fieldAccess.Slot))
+                        changed = true;
+                }
+
                 for (int i = 0; i < node.Operands.Length; i++)
                     VisitStore(node.Operands[i]);
+            }
+
+            static GenLocalDescriptor? DescriptorForFieldAccess(SsaLocalAccess access, GenTree node)
+            {
+                if (access.Field is not null && access.Receiver?.LocalDescriptor is not null && access.Receiver.LocalDescriptor.TryGetPromotedField(access.Field, out var fieldDescriptor))
+                    return fieldDescriptor;
+                return node.LocalDescriptor ?? access.Receiver?.LocalDescriptor;
             }
         }
 

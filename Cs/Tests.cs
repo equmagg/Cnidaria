@@ -2497,7 +2497,503 @@ var buffer = new InlineArray10<int>();
 buffer[3] = 3;
 Console.Write(buffer[3]);
 ", "3");
+            // 209 jagged array indexing
+            RunTest(@"
+class Program
+{
+    public static void Main(string[] args)
+    {
+        byte[][] slots = new byte[8][];
 
+        for (int i = 0; i < 200; i++)
+        {
+            int index = i & 7;
+            slots[index] = new byte[512];
+            slots[index][0] = (byte)i;
+        }
+
+        int sum = 0;
+        for (int i = 0; i < slots.Length; i++)
+            sum += slots[i][0];
+
+        Console.WriteLine(sum);
+    }
+}
+", "1564");
+            // 210 multiregister struct return ABI
+            RunTest(@"
+namespace Ns;
+
+struct S
+{
+    public ulong A;
+    public ushort B;
+    public ushort C;
+    public ushort D;
+
+    public S(ulong a, ushort b, ushort c, ushort d)
+    {
+        A = a;
+        B = b;
+        C = c;
+        D = d;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static S Pick(S[] data, int index)
+    {
+        S temp = data[index];
+        return temp;
+    }
+
+    public static void Main(string[] args)
+    {
+        S marker = new S(100, 200, 300, 400);
+        S[] data = new S[] { new S(1, 2, 3, 4), new S(5, 6, 7, 8) };
+
+        S result = Pick(data, 1);
+
+        Console.Write(result.A);
+        Console.Write(',');
+        Console.Write(result.B);
+        Console.Write(',');
+        Console.Write(result.C);
+        Console.Write(',');
+        Console.Write(result.D);
+        Console.Write(',');
+        Console.Write(marker.B);
+    }
+}
+", "5,6,7,8,200");
+            // 211 multiregister struct generic promotion
+            RunTest(@"
+namespace Ns;
+struct User
+{
+    public ulong Id;
+    public ushort Score1;
+    public ushort Score2;
+    public ushort Score3;
+    public User(ulong id, ushort score1, ushort score2, ushort score3)
+    {
+        Id = id;
+        Score1 = score1;
+        Score2 = score2;
+        Score3 = score3;
+    }
+}
+internal class Program
+{
+    static T RemoveAtInPlace<T>(T[] data, ref int size, int idx)
+    {
+        T temp = data[idx];
+        for (int i = idx; i < size - 1; i++)
+            data[i] = data[i + 1];
+        size--;
+        return temp;
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InsertAtInPlace<T>(T[] data, ref int size, int idx, T value)
+    {
+        for (int i = size; i > idx; i--)
+            data[i] = data[i - 1];
+        data[idx] = value;
+        size++;
+    }
+
+    public static void Main(string[] args)
+    {
+        User[] data = new User[] { new User(1, 1, 2, 3), new User(2, 4, 5, 6), new User(3, 7, 8, 9) };
+        User newUser = new User(2, 10, 20, 30);
+        int size = data.Length;
+        User temp = RemoveAtInPlace<User>(data, ref size, 1);
+        newUser.Score1 += temp.Score1;
+        newUser.Score2 += temp.Score2;
+        newUser.Score3 += temp.Score3;
+        InsertAtInPlace<User>(data, ref size, 1, newUser);
+        Console.Write(data[1].Id);
+        Console.Write(',');
+        Console.Write(data[1].Score1);
+        Console.Write(',');
+        Console.Write(data[1].Score2);
+        Console.Write(',');
+        Console.Write(data[1].Score3);
+    }
+}
+", "2,14,25,36");
+            // 212 multiregister struct return from array after loop
+            RunTest(@"
+namespace Ns;
+
+struct Ret16
+{
+    public ulong A;
+    public ushort B;
+    public ushort C;
+    public ushort D;
+
+    public Ret16(ulong a, ushort b, ushort c, ushort d)
+    {
+        A = a;
+        B = b;
+        C = c;
+        D = d;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int MakeSeed()
+    {
+        int[] data = new int[1];
+        data[0] = 1;
+        return data[0];
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Ret16 PickAndAdjust(Ret16[] data, int seed)
+    {
+        int index = 0;
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            if (((int)data[i].B + seed) % 3 == 0)
+                index = i;
+
+            data[i].C = (ushort)(data[i].C + seed + i);
+        }
+
+        Ret16 result = data[index];
+        result.D = (ushort)(result.D + data[0].C);
+        return result;
+    }
+
+    public static void Main(string[] args)
+    {
+        int seed = MakeSeed();
+        Ret16 guard = new Ret16(100, 99, 98, 97);
+        Ret16[] data = new Ret16[]
+        {
+            new Ret16(10, 2, 3, 4),
+            new Ret16(20, 5, 6, 7),
+            new Ret16(30, 8, 9, 10),
+            new Ret16(40, 11, 12, 13)
+        };
+
+        Ret16 r = PickAndAdjust(data, seed);
+
+        Console.Write(r.A);
+        Console.Write(',');
+        Console.Write(r.B);
+        Console.Write(',');
+        Console.Write(r.C);
+        Console.Write(',');
+        Console.Write(r.D);
+        Console.Write(',');
+        Console.Write(guard.B);
+    }
+}
+", "40,11,16,17,99");
+            // 213 hidden buffer large struct return after field accumulation
+            RunTest(@"
+namespace Ns;
+
+struct Large213
+{
+    public long A;
+    public long B;
+    public int C;
+    public int D;
+    public ushort E;
+    public ushort F;
+
+    public Large213(long a, long b, int c, int d, ushort e, ushort f)
+    {
+        A = a;
+        B = b;
+        C = c;
+        D = d;
+        E = e;
+        F = f;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int MakeSeed()
+    {
+        int[] data = new int[1];
+        data[0] = 1;
+        return data[0];
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Large213 FoldLarge(Large213[] data, int seed)
+    {
+        Large213 result = data[0];
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            if (((i + seed) & 1) == 0)
+                result.A += data[i].B;
+            else
+                result.B += data[i].A;
+
+            result.C += data[i].C + seed;
+            result.D ^= data[i].D;
+            result.E = (ushort)(result.E + data[i].E);
+            result.F = (ushort)(result.F + i);
+        }
+
+        return result;
+    }
+
+    public static void Main(string[] args)
+    {
+        int seed = MakeSeed();
+        Large213[] data = new Large213[]
+        {
+            new Large213(1, 2, 3, 4, 5, 6),
+            new Large213(10, 20, 30, 40, 50, 60),
+            new Large213(100, 200, 300, 400, 500, 600)
+        };
+
+        Large213 r = FoldLarge(data, seed);
+
+        Console.Write(r.A);
+        Console.Write(',');
+        Console.Write(r.B);
+        Console.Write(',');
+        Console.Write(r.C);
+        Console.Write(',');
+        Console.Write(r.D);
+        Console.Write(',');
+        Console.Write(r.E);
+        Console.Write(',');
+        Console.Write(r.F);
+    }
+}
+", "21,103,339,440,560,9");
+            // 214 generic struct array rotation returns
+            RunTest(@"
+namespace Ns;
+
+struct Ret214
+{
+    public ulong Id;
+    public ushort A;
+    public ushort B;
+    public ushort C;
+
+    public Ret214(ulong id, ushort a, ushort b, ushort c)
+    {
+        Id = id;
+        A = a;
+        B = b;
+        C = c;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int MakeCount()
+    {
+        int[] data = new int[1];
+        data[0] = 2;
+        return data[0];
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static T RotateLeft<T>(T[] data, ref int size, int count)
+    {
+        for (int c = 0; c < count; c++)
+        {
+            T first = data[0];
+
+            for (int i = 0; i < size - 1; i++)
+                data[i] = data[i + 1];
+
+            data[size - 1] = first;
+        }
+
+        return data[count % size];
+    }
+
+    public static void Main(string[] args)
+    {
+        int size = 4;
+        int count = MakeCount();
+        Ret214[] data = new Ret214[]
+        {
+            new Ret214(1, 2, 3, 4),
+            new Ret214(2, 5, 6, 7),
+            new Ret214(3, 8, 9, 10),
+            new Ret214(4, 11, 12, 13)
+        };
+
+        Ret214 r = RotateLeft<Ret214>(data, ref size, count);
+
+        Console.Write(data[0].Id);
+        Console.Write(',');
+        Console.Write(data[1].Id);
+        Console.Write(',');
+        Console.Write(r.Id);
+        Console.Write(',');
+        Console.Write(r.A);
+        Console.Write(',');
+        Console.Write(r.B);
+        Console.Write(',');
+        Console.Write(r.C);
+        Console.Write(',');
+        Console.Write(size);
+    }
+}
+", "3,4,1,2,3,4,4");
+            // 215 promoted struct materialized through ref call and safepoints
+            RunTest(@"
+namespace Ns;
+
+struct Acc215
+{
+    public int A;
+    public int B;
+    public int C;
+    public int D;
+
+    public Acc215(int a, int b, int c, int d)
+    {
+        A = a;
+        B = b;
+        C = c;
+        D = d;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int MakeSeed()
+    {
+        int[] data = new int[1];
+        data[0] = 1;
+        return data[0];
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Mutate(ref Acc215 p, int[] noise)
+    {
+        for (int i = 0; i < noise.Length; i++)
+        {
+            p.A += noise[i];
+            p.B += p.A;
+            p.C ^= noise[i];
+            p.D += i;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Acc215 Work(int seed)
+    {
+        Acc215 p = new Acc215(seed, seed + 1, seed + 2, seed + 3);
+        int[] noise = new int[5];
+
+        for (int i = 0; i < noise.Length; i++)
+            noise[i] = i + seed;
+
+        Mutate(ref p, noise);
+
+        int[] forceSafepoint = new int[200];
+        for (int i = 0; i < forceSafepoint.Length; i++)
+            forceSafepoint[i] = i;
+
+        p.D += forceSafepoint[199] - 199;
+        return p;
+    }
+
+    public static void Main(string[] args)
+    {
+        Acc215 r = Work(MakeSeed());
+
+        Console.Write(r.A);
+        Console.Write(',');
+        Console.Write(r.B);
+        Console.Write(',');
+        Console.Write(r.C);
+        Console.Write(',');
+        Console.Write(r.D);
+    }
+}
+", "16,42,2,14");
+            // 216 nested struct hiddenbuffer return copy
+            RunTest(@"
+namespace Ns;
+
+struct Inner216
+{
+    public long A;
+    public int B;
+
+    public Inner216(long a, int b)
+    {
+        A = a;
+        B = b;
+    }
+}
+
+struct Outer216
+{
+    public Inner216 L;
+    public Inner216 R;
+    public int Tag;
+
+    public Outer216(Inner216 l, Inner216 r, int tag)
+    {
+        L = l;
+        R = r;
+        Tag = tag;
+    }
+}
+
+internal class Program
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Outer216 Transform(Outer216[] data, int seed)
+    {
+        Outer216 o = data[seed % data.Length];
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            o.L.A += data[i].R.A;
+            o.R.B += data[i].L.B;
+            o.Tag += data[i].Tag;
+        }
+
+        data[0].L.A = 999;
+        return o;
+    }
+
+    public static void Main(string[] args)
+    {
+        Outer216[] data = new Outer216[]
+        {
+            new Outer216(new Inner216(1, 2), new Inner216(3, 4), 5),
+            new Outer216(new Inner216(10, 20), new Inner216(30, 40), 50)
+        };
+
+        Outer216 r = Transform(data, 1);
+
+        Console.Write(r.L.A);
+        Console.Write(',');
+        Console.Write(r.R.B);
+        Console.Write(',');
+        Console.Write(r.Tag);
+        Console.Write(',');
+        Console.Write(data[0].L.A);
+    }
+}
+", "43,62,105,999");
 
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");

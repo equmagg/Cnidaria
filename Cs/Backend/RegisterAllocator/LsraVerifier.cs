@@ -869,7 +869,8 @@ namespace Cnidaria.Cs
                     if (node.Kind == GenTreeKind.Return)
                     {
                         sawReturn = true;
-                        if (!HasContiguousEpilogBefore(block.LinearNodes, i) &&
+                        if (!IsHiddenReturnBufferCopyReturn(method, node) &&
+                            !HasContiguousEpilogBefore(block.LinearNodes, i) &&
                             (IsFuncletBlock(method, block.Id) || !ReturnMustRunFinallyBeforeMethodExit(method, block.Id)))
                             throw new InvalidOperationException("Return node is missing an immediately preceding epilog sequence.");
                     }
@@ -879,6 +880,11 @@ namespace Cnidaria.Cs
             if (!sawReturn)
                 return;
         }
+
+        private static bool IsHiddenReturnBufferCopyReturn(RegisterAllocatedMethod method, GenTree node)
+            => node.Kind == GenTreeKind.Return &&
+               node.Uses.Length != 0 &&
+               MachineAbi.RequiresHiddenReturnBuffer(method.GenTreeMethod.RuntimeMethod);
 
         private static bool HasContiguousEpilogBefore(ImmutableArray<GenTree> nodes, int returnIndex)
         {
@@ -1448,6 +1454,9 @@ namespace Cnidaria.Cs
         private static bool RequiresRegisterOnlyTreeShape(GenTree node)
         {
             if (!GenTreeLirKinds.IsRealTree(node))
+                return false;
+
+            if (node.TreeKind == GenTreeKind.Return)
                 return false;
 
             var lowering = GenTreeLinearLoweringClassifier.Classify(
