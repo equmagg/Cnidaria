@@ -84,6 +84,7 @@ namespace Cnidaria.C
         private readonly LSRAOptions _options;
         private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
         private readonly List<int> _callPositions = new();
+        private readonly List<int> _inlineAssemblyPositions = new();
 
         private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options)
         {
@@ -98,6 +99,7 @@ namespace Cnidaria.C
         private AllocationResult Allocate()
         {
             _callPositions.Clear();
+            _inlineAssemblyPositions.Clear();
             var intervals = BuildIntervals();
             var allocations = new Dictionary<LirVirtualRegister, VirtualRegisterAllocation>();
 
@@ -107,9 +109,9 @@ namespace Cnidaria.C
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
             }
 
-            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _target, _callPositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _target, _callPositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _target, _callPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
 
             foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
             {
@@ -158,6 +160,8 @@ namespace Cnidaria.C
                     var pos = position++;
                     if (instruction.Kind == LirInstructionKind.Call)
                         _callPositions.Add(pos);
+                    else if (instruction.Kind == LirInstructionKind.InlineAssembly)
+                        _inlineAssemblyPositions.Add(pos);
                     RecordCopyPreferences(instruction);
                     VisitInstructionUses(
                         instruction,
@@ -259,6 +263,19 @@ namespace Cnidaria.C
             if (block.Instructions.Length == 0)
                 yield break;
 
+            var seenInlineAsmLabels = new HashSet<LirBlock>();
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction.Kind != LirInstructionKind.InlineAssembly)
+                    continue;
+
+                foreach (var operand in instruction.Operands)
+                {
+                    if (operand.Kind == LirOperandKind.Label && operand.Label is not null && seenInlineAsmLabels.Add(operand.Label))
+                        yield return operand.Label;
+                }
+            }
+
             var terminator = block.Instructions[block.Instructions.Length - 1];
             switch (terminator.Kind)
             {
@@ -283,6 +300,11 @@ namespace Cnidaria.C
                         if (seen.Add(@case.Target))
                             yield return @case.Target;
                     }
+                    break;
+
+                case LirInstructionKind.InlineAssembly:
+                    if (terminator.Target is not null)
+                        yield return terminator.Target;
                     break;
             }
         }
@@ -467,7 +489,8 @@ namespace Cnidaria.C
             Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
             IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
             TargetInfo target,
-            IReadOnlyList<int> callPositions)
+            IReadOnlyList<int> callPositions,
+            IReadOnlyList<int> inlineAssemblyPositions)
         {
             if (physicalRegisters.IsDefaultOrEmpty)
                 return;
@@ -485,7 +508,7 @@ namespace Cnidaria.C
             {
                 ExpireOldIntervals(interval, active, allocations);
 
-                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, target, callPositions);
+                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, target, callPositions, inlineAssemblyPositions);
                 if (allowedRegisters.IsDefaultOrEmpty)
                 {
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
@@ -511,9 +534,16 @@ namespace Cnidaria.C
             LiveInterval interval,
             ImmutableArray<MachineRegister> physicalRegisters,
             TargetInfo target,
-            IReadOnlyList<int> callPositions)
+            IReadOnlyList<int> callPositions,
+            IReadOnlyList<int> inlineAssemblyPositions)
         {
-            if (!IntervalSpansCall(interval, callPositions))
+            if (interval.Register.HasFixedRegister)
+                return ImmutableArray.Create(interval.Register.FixedRegister);
+
+            if (IntervalSpansPosition(interval, inlineAssemblyPositions))
+                return ImmutableArray<MachineRegister>.Empty;
+
+            if (!IntervalSpansPosition(interval, callPositions))
                 return physicalRegisters;
 
             var builder = ImmutableArray.CreateBuilder<MachineRegister>();
@@ -526,15 +556,15 @@ namespace Cnidaria.C
             return builder.ToImmutable();
         }
 
-        private static bool IntervalSpansCall(LiveInterval interval, IReadOnlyList<int> callPositions)
+        private static bool IntervalSpansPosition(LiveInterval interval, IReadOnlyList<int> positions)
         {
-            foreach (var call in callPositions)
+            foreach (var position in positions)
             {
-                if (call <= interval.Start)
+                if (position <= interval.Start)
                     continue;
-                if (call + 1 < interval.End)
+                if (position + 1 < interval.End)
                     return true;
-                if (call >= interval.End)
+                if (position >= interval.End)
                     return false;
             }
 
@@ -585,6 +615,9 @@ namespace Cnidaria.C
             IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
             IReadOnlyDictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters)
         {
+            if (interval.Register.HasFixedRegister && IsFreeRegister(interval.Register.FixedRegister, physicalRegisters, active))
+                return interval.Register.FixedRegister;
+
             if (copyPreferences.TryGetValue(interval.Register, out var preferredSources))
             {
                 for (var i = preferredSources.Count - 1; i >= 0; i--)
@@ -703,7 +736,8 @@ namespace Cnidaria.C
             }
 
             var currentNextUse = current.NextUseAtOrAfter(current.Start);
-            if (spillNextUse > currentNextUse ||
+            if (current.Register.HasFixedRegister ||
+                spillNextUse > currentNextUse ||
                 spillNextUse == currentNextUse && spill.End > current.End)
             {
                 current.PhysicalRegister = spill.PhysicalRegister;

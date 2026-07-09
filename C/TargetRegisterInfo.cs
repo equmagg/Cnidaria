@@ -9,6 +9,282 @@ namespace Cnidaria.C
         public static bool IsWindowsX64(TargetInfo target)
             => target.Architecture == TargetArchitectureKind.X64 && target.OperatingSystem == OperatingSystemKind.Windows;
 
+
+        public static bool TryParseExplicitRegister(TargetInfo target, string? text, LirRegisterClass registerClass, out MachineRegister register)
+        {
+            register = MachineRegister.Invalid;
+            if (target is null || string.IsNullOrWhiteSpace(text))
+                return false;
+
+            var name = NormalizeExplicitRegisterName(text);
+            if (target.IsX86)
+                return TryParseX86ExplicitRegister(target, name, registerClass, out register);
+            if (target.IsRiscV)
+                return TryParseRiscVExplicitRegister(name, registerClass, out register);
+            return false;
+        }
+
+        private static string NormalizeExplicitRegisterName(string text)
+        {
+            text = text.Trim();
+            if (text.Length >= 2 && text[0] == '{' && text[text.Length - 1] == '}')
+                text = text.Substring(1, text.Length - 2).Trim();
+            while (text.StartsWith("%", StringComparison.Ordinal))
+                text = text.Substring(1);
+            return text.ToLowerInvariant();
+        }
+
+        private static bool TryParseX86ExplicitRegister(TargetInfo target, string name, LirRegisterClass registerClass, out MachineRegister register)
+        {
+            register = MachineRegister.Invalid;
+            if (name.StartsWith("xmm", StringComparison.Ordinal) || name.StartsWith("ymm", StringComparison.Ordinal))
+            {
+                if (!int.TryParse(name.Substring(3), out var vectorIndex) || vectorIndex < 0 || vectorIndex > 15)
+                    return false;
+                if (target.Architecture == TargetArchitectureKind.X86 && vectorIndex >= 8)
+                    return false;
+                if (registerClass is not LirRegisterClass.Vector and not LirRegisterClass.Floating)
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.V0 + vectorIndex);
+                return true;
+            }
+
+            var canonical = CanonicalX86GeneralRegisterName(name);
+            if (canonical is null)
+                return false;
+            if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+                return false;
+
+            return TryMapX86GeneralRegister(target, canonical, out register);
+        }
+
+        private static string? CanonicalX86GeneralRegisterName(string name)
+        {
+            return name switch
+            {
+                "al" or "ah" or "ax" or "eax" or "rax" => "rax",
+                "cl" or "ch" or "cx" or "ecx" or "rcx" => "rcx",
+                "dl" or "dh" or "dx" or "edx" or "rdx" => "rdx",
+                "bl" or "bh" or "bx" or "ebx" or "rbx" => "rbx",
+                "sil" or "si" or "esi" or "rsi" => "rsi",
+                "dil" or "di" or "edi" or "rdi" => "rdi",
+                "bpl" or "bp" or "ebp" or "rbp" => "rbp",
+                "spl" or "sp" or "esp" or "rsp" => "rsp",
+                "r8b" or "r8w" or "r8d" or "r8" => "r8",
+                "r9b" or "r9w" or "r9d" or "r9" => "r9",
+                "r10b" or "r10w" or "r10d" or "r10" => "r10",
+                "r11b" or "r11w" or "r11d" or "r11" => "r11",
+                "r12b" or "r12w" or "r12d" or "r12" => "r12",
+                "r13b" or "r13w" or "r13d" or "r13" => "r13",
+                "r14b" or "r14w" or "r14d" or "r14" => "r14",
+                "r15b" or "r15w" or "r15d" or "r15" => "r15",
+                _ => null,
+            };
+        }
+
+        private static bool TryMapX86GeneralRegister(TargetInfo target, string canonical, out MachineRegister register)
+        {
+            register = MachineRegister.Invalid;
+            if (target.Architecture == TargetArchitectureKind.X86)
+            {
+                register = canonical switch
+                {
+                    "rax" => MachineRegister.X0,
+                    "rcx" => MachineRegister.X1,
+                    "rdx" => MachineRegister.X2,
+                    "rbx" => MachineRegister.X3,
+                    "rsi" => MachineRegister.X4,
+                    "rdi" => MachineRegister.X5,
+                    _ => MachineRegister.Invalid,
+                };
+                return register != MachineRegister.Invalid;
+            }
+
+            if (IsWindowsX64(target))
+            {
+                register = canonical switch
+                {
+                    "rax" => MachineRegister.X0,
+                    "rcx" => MachineRegister.X1,
+                    "rdx" => MachineRegister.X2,
+                    "r8" => MachineRegister.X3,
+                    "r9" => MachineRegister.X4,
+                    "r10" => MachineRegister.X5,
+                    "r11" => MachineRegister.X6,
+                    "rbx" => MachineRegister.X7,
+                    "rsi" => MachineRegister.X8,
+                    "rdi" => MachineRegister.X9,
+                    "r12" => MachineRegister.X11,
+                    "r13" => MachineRegister.X12,
+                    "r14" => MachineRegister.X13,
+                    "r15" => MachineRegister.X14,
+                    _ => MachineRegister.Invalid,
+                };
+                return register != MachineRegister.Invalid;
+            }
+
+            register = canonical switch
+            {
+                "rax" => MachineRegister.X0,
+                "rdi" => MachineRegister.X1,
+                "rsi" => MachineRegister.X2,
+                "rdx" => MachineRegister.X3,
+                "rcx" => MachineRegister.X4,
+                "r8" => MachineRegister.X5,
+                "r9" => MachineRegister.X6,
+                "r10" => MachineRegister.X7,
+                "r11" => MachineRegister.X8,
+                "rbx" => MachineRegister.X9,
+                "r12" => MachineRegister.X11,
+                "r13" => MachineRegister.X12,
+                "r14" => MachineRegister.X13,
+                "r15" => MachineRegister.X14,
+                _ => MachineRegister.Invalid,
+            };
+            return register != MachineRegister.Invalid;
+        }
+
+        private static bool TryParseRiscVExplicitRegister(string name, LirRegisterClass registerClass, out MachineRegister register)
+        {
+            register = MachineRegister.Invalid;
+            if (TryParseIndexedRegister(name, 'x', 0, out var index))
+            {
+                if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+                    return false;
+                if (IsReservedRiscVExplicitIntegerRegister(index))
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.X0 + index);
+                return true;
+            }
+            if (TryParseIndexedRegister(name, 'f', 0, out index))
+            {
+                if (registerClass != LirRegisterClass.Floating)
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.F0 + index);
+                return true;
+            }
+            if (TryParseIndexedRegister(name, 'v', 0, out index))
+            {
+                if (registerClass != LirRegisterClass.Vector)
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.V0 + index);
+                return true;
+            }
+
+            if (TryParseRiscVIntegerAbiRegister(name, out index))
+            {
+                if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+                    return false;
+                if (IsReservedRiscVExplicitIntegerRegister(index))
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.X0 + index);
+                return true;
+            }
+            if (TryParseRiscVFloatAbiRegister(name, out index))
+            {
+                if (registerClass != LirRegisterClass.Floating)
+                    return false;
+                register = (MachineRegister)((int)MachineRegister.F0 + index);
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryParseIndexedRegister(string name, char prefix, int first, out int index)
+        {
+            index = -1;
+            if (name.Length < 2 || name[0] != prefix)
+                return false;
+            if (!int.TryParse(name.Substring(1), out index))
+                return false;
+            return index >= first && index < 32;
+        }
+
+        private static bool IsReservedRiscVExplicitIntegerRegister(int index)
+            => index is 0 or 1 or 2 or 3 or 4 or 8;
+
+        private static bool TryParseRiscVIntegerAbiRegister(string name, out int index)
+        {
+            index = name switch
+            {
+                "zero" => 0,
+                "ra" => 1,
+                "sp" => 2,
+                "gp" => 3,
+                "tp" => 4,
+                "t0" => 5,
+                "t1" => 6,
+                "t2" => 7,
+                "s0" or "fp" => 8,
+                "s1" => 9,
+                "a0" => 10,
+                "a1" => 11,
+                "a2" => 12,
+                "a3" => 13,
+                "a4" => 14,
+                "a5" => 15,
+                "a6" => 16,
+                "a7" => 17,
+                "s2" => 18,
+                "s3" => 19,
+                "s4" => 20,
+                "s5" => 21,
+                "s6" => 22,
+                "s7" => 23,
+                "s8" => 24,
+                "s9" => 25,
+                "s10" => 26,
+                "s11" => 27,
+                "t3" => 28,
+                "t4" => 29,
+                "t5" => 30,
+                "t6" => 31,
+                _ => -1,
+            };
+            return index >= 0;
+        }
+
+        private static bool TryParseRiscVFloatAbiRegister(string name, out int index)
+        {
+            index = name switch
+            {
+                "ft0" => 0,
+                "ft1" => 1,
+                "ft2" => 2,
+                "ft3" => 3,
+                "ft4" => 4,
+                "ft5" => 5,
+                "ft6" => 6,
+                "ft7" => 7,
+                "fs0" => 8,
+                "fs1" => 9,
+                "fa0" => 10,
+                "fa1" => 11,
+                "fa2" => 12,
+                "fa3" => 13,
+                "fa4" => 14,
+                "fa5" => 15,
+                "fa6" => 16,
+                "fa7" => 17,
+                "fs2" => 18,
+                "fs3" => 19,
+                "fs4" => 20,
+                "fs5" => 21,
+                "fs6" => 22,
+                "fs7" => 23,
+                "fs8" => 24,
+                "fs9" => 25,
+                "fs10" => 26,
+                "fs11" => 27,
+                "ft8" => 28,
+                "ft9" => 29,
+                "ft10" => 30,
+                "ft11" => 31,
+                _ => -1,
+            };
+            return index >= 0;
+        }
+
         public static bool UsesUnifiedArgumentCursor(TargetInfo target)
             => IsWindowsX64(target);
 

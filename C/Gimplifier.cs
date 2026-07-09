@@ -251,6 +251,10 @@ namespace Cnidaria.C
                     LowerExpressionForSideEffects(expressionStatement.Expression);
                     break;
 
+                case BoundAsmStatement asmStatement:
+                    LowerAsmStatement(asmStatement);
+                    break;
+
                 case BoundEmptyStatement emptyStatement:
                     Emit(new GimpleNopStatement(emptyStatement.Syntax));
                     break;
@@ -263,6 +267,51 @@ namespace Cnidaria.C
                     Emit(new GimpleNopStatement(statement.Syntax));
                     break;
             }
+        }
+
+        private void LowerAsmStatement(BoundAsmStatement statement)
+        {
+            var outputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
+            foreach (var output in statement.Outputs)
+            {
+                var target = LowerPlace(output.Expression);
+                outputs.Add(new GimpleAsmOperand(
+                    output.Name,
+                    output.Constraint,
+                    target,
+                    output.IsReadWrite ? target : null,
+                    isOutput: true,
+                    output.IsReadWrite,
+                    output.Syntax));
+            }
+
+            var inputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
+            foreach (var input in statement.Inputs)
+            {
+                inputs.Add(new GimpleAsmOperand(
+                    input.Name,
+                    input.Constraint,
+                    target: null,
+                    LowerExpression(input.Expression),
+                    isOutput: false,
+                    isReadWrite: false,
+                    input.Syntax));
+            }
+
+            var labels = statement.GotoLabels.Select(label => GetLabel(label)).ToImmutableArray();
+            Emit(new GimpleAsmStatement(
+                statement.Text,
+                statement.IsVolatile,
+                statement.IsInline,
+                statement.IsGoto,
+                outputs.ToImmutable(),
+                inputs.ToImmutable(),
+                statement.Clobbers,
+                labels,
+                statement.Syntax));
+
+            if (statement.IsGoto)
+                StartBlock(CreateGeneratedLabel("asm_fallthrough"));
         }
 
         private void LowerCompoundStatement(BoundCompoundStatement statement)

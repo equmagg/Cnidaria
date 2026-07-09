@@ -79,6 +79,8 @@ namespace Cnidaria.C
         ZeroMemory,
         Call,
         VaStart,
+        VaArg,
+        InlineAssembly,
         Jump,
         Branch,
         Switch,
@@ -261,9 +263,11 @@ namespace Cnidaria.C
         public LirRegisterClass RegisterClass { get; }
         public SsaName? SourceName { get; }
         public ValueNumber? ValueNumber { get; }
+        public MachineRegister FixedRegister { get; }
+        public bool HasFixedRegister => FixedRegister != MachineRegister.Invalid;
         public bool IsCompilerTemporary => SourceName is null;
 
-        internal LirVirtualRegister(int ordinal, QualifiedType type, LirRegisterClass registerClass, SsaName? sourceName, ValueNumber? valueNumber)
+        internal LirVirtualRegister(int ordinal, QualifiedType type, LirRegisterClass registerClass, SsaName? sourceName, ValueNumber? valueNumber, MachineRegister fixedRegister)
         {
             if (ordinal < 0)
                 throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -273,6 +277,7 @@ namespace Cnidaria.C
             RegisterClass = registerClass;
             SourceName = sourceName;
             ValueNumber = valueNumber;
+            FixedRegister = fixedRegister;
             Name = "%v" + ordinal.ToString(CultureInfo.InvariantCulture);
         }
 
@@ -530,7 +535,8 @@ namespace Cnidaria.C
         public GimpleValue? SourceValue { get; }
         public SsaInstruction? SourceInstruction { get; }
         public ValueNumber? ValueNumber { get; }
-        public bool IsTerminator => Kind is LirInstructionKind.Jump or LirInstructionKind.Branch or LirInstructionKind.Switch or LirInstructionKind.Return or LirInstructionKind.Unreachable;
+        public bool IsTerminator => Kind is LirInstructionKind.Jump or LirInstructionKind.Branch or LirInstructionKind.Switch or LirInstructionKind.Return or LirInstructionKind.Unreachable ||
+            (Kind == LirInstructionKind.InlineAssembly && SourceStatement is GimpleAsmStatement { IsGoto: true });
 
         internal LirInstruction(
             int ordinal,
@@ -1043,6 +1049,10 @@ namespace Cnidaria.C
                     TranslateReturn(block, instruction, returnStatement);
                     break;
 
+                case GimpleAsmStatement asmStatement:
+                    TranslateAsm(block, instruction, asmStatement);
+                    break;
+
                 case GimpleNopStatement nop:
                     if (_options.KeepNops)
                         EmitNop(block, nop);
@@ -1159,6 +1169,161 @@ namespace Cnidaria.C
             }
 
             Emit(block, LirInstructionKind.Return, null, operands, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression, sourceInstruction: instruction, valueNumber: null);
+        }
+
+        private void TranslateAsm(LirBlock block, SsaInstruction instruction, GimpleAsmStatement asmStatement)
+        {
+            var operands = ImmutableArray.CreateBuilder<LirOperand>();
+            var copies = ImmutableArray.CreateBuilder<LirParallelCopy>();
+            var postStores = new List<(GimplePlace Target, LirVirtualRegister Register, SsaExpression? AddressExpression)>();
+            var definitions = instruction.Definitions
+                .Where(static definition => definition.Name.Variable.Kind != SsaVariableKind.Memory)
+                .ToArray();
+            var definitionIndex = 0;
+            var expressionIndex = 0;
+
+            foreach (var output in asmStatement.Outputs)
+            {
+                SsaExpression? initialExpression = null;
+                if (output.IsReadWrite && output.Value is not null)
+                {
+                    if (TryGetExpression(instruction, expressionIndex, out var expression))
+                        initialExpression = expression;
+                    expressionIndex++;
+                }
+
+                SsaExpression? addressExpression = null;
+                var storage = output.Target is null
+                    ? InlineAsmOperandStorage.Register
+                    : InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type);
+                var hasAddressExpression = output.Target is not null &&
+                    (storage == InlineAsmOperandStorage.Memory || !TryGetVariableDefinitionTarget(output.Target, definitions, definitionIndex));
+                if (hasAddressExpression)
+                {
+                    if (TryGetExpression(instruction, expressionIndex, out var expression))
+                        addressExpression = expression;
+                    expressionIndex++;
+                }
+
+                if (output.Target is null)
+                    continue;
+
+                if (storage == InlineAsmOperandStorage.Memory)
+                {
+                    operands.Add(LirOperand.ForAddress(addressExpression is null ? EmitAddress(block, output.Target) : EmitAddress(block, addressExpression)));
+                    continue;
+                }
+
+                LirVirtualRegister destination;
+                if (definitionIndex < definitions.Length && definitions[definitionIndex].Target is not null && ReferenceSamePlace(definitions[definitionIndex].Target!, output.Target))
+                {
+                    destination = GetRegister(definitions[definitionIndex].Name);
+                    definitionIndex++;
+                }
+                else
+                {
+                    destination = NewVirtualRegister(output.Target.Type, sourceName: null, valueNumber: null);
+                    if (!asmStatement.IsGoto)
+                        postStores.Add((output.Target, destination, addressExpression));
+                }
+
+                if (output.IsReadWrite && output.Value is not null)
+                {
+                    var source = initialExpression is null ? EmitValue(block, output.Value) : EmitValue(block, initialExpression);
+                    if (!source.ReferencesSameRegister(destination))
+                        Emit(block, LirInstructionKind.Copy, destination, ImmutableArray.Create(source), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: asmStatement, sourceValue: output.Value, sourceInstruction: instruction, valueNumber: null);
+                    copies.Add(new LirParallelCopy(destination, LirOperand.ForRegister(destination)));
+                }
+                else
+                {
+                    copies.Add(new LirParallelCopy(destination, LirOperand.Void));
+                }
+            }
+
+            foreach (var input in asmStatement.Inputs)
+            {
+                SsaExpression? expression = null;
+                if (TryGetExpression(instruction, expressionIndex, out var rewritten))
+                    expression = rewritten;
+                expressionIndex++;
+
+                if (input.Value is null)
+                {
+                    operands.Add(LirOperand.Void);
+                    continue;
+                }
+
+                var storage = InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type);
+                if (storage == InlineAsmOperandStorage.Memory && input.Value is GimplePlace place)
+                {
+                    operands.Add(LirOperand.ForAddress(expression is null ? EmitAddress(block, place) : EmitAddress(block, expression)));
+                    continue;
+                }
+
+                var value = expression is null ? EmitValue(block, input.Value) : EmitValue(block, expression);
+                if (storage == InlineAsmOperandStorage.Register)
+                    value = MaterializeAsmRegisterInput(block, asmStatement, input.Value, value, instruction);
+                operands.Add(value);
+            }
+
+            foreach (var label in asmStatement.GotoLabels)
+                operands.Add(LirOperand.ForLabel(ResolveTarget(instruction.Block, label, asmStatement)));
+
+            Emit(block, LirInstructionKind.InlineAssembly, null, operands.ToImmutable(), address: null, op: asmStatement.Text, conversionKind: null, callSignature: null, parallelCopies: copies.ToImmutable(), switchCases: default, target: asmStatement.IsGoto ? FindAsmGotoFallthrough(instruction.Block, asmStatement) : null, trueTarget: null, falseTarget: null, sourceStatement: asmStatement, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+
+            foreach (var store in postStores)
+            {
+                var address = store.AddressExpression is null ? EmitAddress(block, store.Target) : EmitAddress(block, store.AddressExpression);
+                Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(LirOperand.ForRegister(store.Register)), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: asmStatement, sourceValue: store.Target, sourceInstruction: instruction, valueNumber: null);
+            }
+        }
+
+        private LirBlock? FindAsmGotoFallthrough(ControlFlowBlock source, GimpleAsmStatement statement)
+        {
+            foreach (var edge in source.Successors)
+            {
+                if (edge.Kind == ControlFlowEdgeKind.FallThrough && !edge.Target.IsExit)
+                    return GetBaseBlock(edge.Target);
+            }
+
+            foreach (var edge in source.Successors)
+            {
+                if (!edge.Target.IsExit)
+                    return GetBaseBlock(edge.Target);
+            }
+
+            return null;
+        }
+
+        private LirOperand MaterializeAsmRegisterInput(LirBlock block, GimpleAsmStatement statement, GimpleValue sourceValue, LirOperand value, SsaInstruction instruction)
+        {
+            if (value.Kind == LirOperandKind.Register)
+                return value;
+
+            var register = NewVirtualRegister(value.Type, sourceName: null, valueNumber: null);
+            Emit(block, LirInstructionKind.Copy, register, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: sourceValue, sourceInstruction: instruction, valueNumber: null);
+            return LirOperand.ForRegister(register);
+        }
+
+        private static bool TryGetVariableDefinitionTarget(GimplePlace target, SsaDefinition[] definitions, int startIndex)
+        {
+            for (var i = startIndex; i < definitions.Length; i++)
+            {
+                if (definitions[i].Target is not null && ReferenceSamePlace(definitions[i].Target!, target))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool ReferenceSamePlace(GimplePlace left, GimplePlace right)
+        {
+            if (ReferenceEquals(left, right))
+                return true;
+            if (left is GimpleSymbolValue leftSymbol && right is GimpleSymbolValue rightSymbol)
+                return ReferenceEquals(leftSymbol.Symbol, rightSymbol.Symbol);
+            if (left is GimpleTemporaryValue leftTemporary && right is GimpleTemporaryValue rightTemporary)
+                return ReferenceEquals(leftTemporary, rightTemporary);
+            return false;
         }
 
         private LirOperand EmitValue(LirBlock block, SsaExpression expression)
@@ -1279,13 +1444,13 @@ namespace Cnidaria.C
                 operand.Kind == LirOperandKind.Symbol &&
                 operand.Symbol is FunctionSymbol function)
             {
-                if (function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart)
+                if (function.IntrinsicKind is RuntimeIntrinsicKind.BuiltinVaStart or RuntimeIntrinsicKind.BuiltinVaArg)
                 {
                     _problems.Add(new LirProblem(
                         LirProblemKind.UnsupportedNode,
                         _currentInstruction?.Block,
                         conversion,
-                        "Cannot take address of compiler intrinsic '__builtin_va_start'."));
+                        "Cannot take address of compiler intrinsic. "));
                     return LirOperand.Undefined(null, conversion.Type);
                 }
                 return LirOperand.ForSymbol(operand.Symbol, conversion.Type);
@@ -1347,6 +1512,8 @@ namespace Cnidaria.C
                 {
                     case RuntimeIntrinsicKind.BuiltinVaStart:
                         return EmitVaStart(block, call, expression);
+                    case RuntimeIntrinsicKind.BuiltinVaArg:
+                        return EmitVaArg(block, call, expression);
                 }
             }
             var operands = ImmutableArray.CreateBuilder<LirOperand>();
@@ -1369,17 +1536,49 @@ namespace Cnidaria.C
 
         private LirOperand EmitVaStart(LirBlock block, GimpleCallExpression call, SsaExpression? expression)
         {
-            if (call.Arguments.Length != 0)
+            if (call.Arguments.Length > 1)
             {
                 _problems.Add(new LirProblem(
                     LirProblemKind.UnsupportedNode,
                     _currentInstruction?.Block,
                     call,
-                    "__builtin_va_start expects no explicit arguments after macro expansion."));
+                    "__builtin_va_start expects zero or one explicit argument after macro expansion."));
+            }
+
+            var operands = ImmutableArray.CreateBuilder<LirOperand>();
+            if (call.Arguments.Length == 1)
+            {
+                var child = GetChild(expression, 1);
+                operands.Add(child is null ? EmitValue(block, call.Arguments[0]) : EmitValue(block, child));
             }
 
             LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.VaStart, result, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null,
+            Emit(block, LirInstructionKind.VaStart, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+            return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
+        }
+
+        private LirOperand EmitVaArg(LirBlock block, GimpleCallExpression call, SsaExpression? expression)
+        {
+            if (call.Arguments.Length != 4)
+            {
+                _problems.Add(new LirProblem(
+                    LirProblemKind.UnsupportedNode,
+                    _currentInstruction?.Block,
+                    call,
+                    "__builtin_va_arg expects a va_list pointer, kind, size, and alignment."));
+            }
+
+            var operands = ImmutableArray.CreateBuilder<LirOperand>();
+            for (var i = 0; i < call.Arguments.Length; i++)
+            {
+                var child = GetChild(expression, i + 1);
+                operands.Add(child is null ? EmitValue(block, call.Arguments[i]) : EmitValue(block, child));
+            }
+
+            LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
+            Emit(block, LirInstructionKind.VaArg, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
                 callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
@@ -1754,9 +1953,20 @@ namespace Cnidaria.C
 
         private LirVirtualRegister NewVirtualRegister(QualifiedType type, SsaName? sourceName, ValueNumber? valueNumber)
         {
-            var register = new LirVirtualRegister(_registers.Count, type, GetRegisterClass(type), sourceName, valueNumber);
+            var registerClass = GetRegisterClass(type);
+            var fixedRegister = TryGetFixedRegister(sourceName, registerClass);
+            var register = new LirVirtualRegister(_registers.Count, type, registerClass, sourceName, valueNumber, fixedRegister);
             _registers.Add(register);
             return register;
+        }
+
+        private MachineRegister TryGetFixedRegister(SsaName? sourceName, LirRegisterClass registerClass)
+        {
+            if (sourceName?.Variable.Symbol is not VariableSymbol variable || variable.ExplicitRegisterName is null)
+                return MachineRegister.Invalid;
+            return TargetRegisterInfo.TryParseExplicitRegister(_target, variable.ExplicitRegisterName, registerClass, out var register)
+                ? register
+                : MachineRegister.Invalid;
         }
 
         private LirVirtualRegister GetRegister(SsaName name)
@@ -2232,6 +2442,18 @@ namespace Cnidaria.C
                     if (instruction.Result is not null)
                         line += FormatResult(instruction) + " = ";
                     line += "vastart";
+                    if (instruction.Operands.Length != 0)
+                        line += " " + string.Join(", ", instruction.Operands.Select(FormatOperand));
+                    break;
+
+                case LirInstructionKind.VaArg:
+                    if (instruction.Result is not null)
+                        line += FormatResult(instruction) + " = ";
+                    line += "vaarg " + string.Join(", ", instruction.Operands.Select(FormatOperand));
+                    break;
+
+                case LirInstructionKind.InlineAssembly:
+                    line += "asm \"" + EscapeString(instruction.Operator) + "\"";
                     break;
 
                 case LirInstructionKind.Jump:
@@ -2326,6 +2548,25 @@ namespace Cnidaria.C
 
         private static string FormatBlock(LirBlock? block)
             => block?.Name ?? "<missing>";
+
+        private static string EscapeString(string text)
+        {
+            var builder = new StringBuilder(text.Length);
+            foreach (var ch in text)
+            {
+                switch (ch)
+                {
+                    case '\\': builder.Append("\\\\"); break;
+                    case '"': builder.Append("\\\""); break;
+                    case '\n': builder.Append("\\n"); break;
+                    case '\r': builder.Append("\\r"); break;
+                    case '\t': builder.Append("\\t"); break;
+                    default: builder.Append(ch); break;
+                }
+            }
+
+            return builder.ToString();
+        }
 
         private static string FormatImmediate(object? value)
         {

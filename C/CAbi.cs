@@ -550,7 +550,7 @@ namespace Cnidaria.C
                 }
             }
 
-            if (includeVariadicHomeArea && signature is not null && signature.IsVariadic)
+            if (includeVariadicHomeArea && target.IsRegisterBytecode && signature is not null && signature.IsVariadic)
             {
                 var fixedCount = signature.Parameters.Length;
                 var variadicCount = Math.Max(0, instruction.Operands.Length - 1 - fixedCount);

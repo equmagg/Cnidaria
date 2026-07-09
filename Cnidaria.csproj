@@ -11,15 +11,12 @@
   <ItemGroup>
 	<Compile Remove="Cs\BCL\**\*.cs" />
     <EmbeddedResource Include="Cs\BCL\**\*.cs" Pack="true" />
+	<EmbeddedResource Include="C\StandardHeaders\**\*.h" Pack="true" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Folder Include="C\" />
-  </ItemGroup>
-	
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>2.6.0</Version>
+    <Version>2.7.0</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe interpreter collection</Description>
 

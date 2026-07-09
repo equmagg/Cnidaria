@@ -434,6 +434,8 @@ namespace Cnidaria.C
                     flags |= SsaInstructionFlags.WritesMemory;
                 if ((instruction.Flags & SsaInstructionFlags.ContainsCall) != 0)
                     flags |= SsaInstructionFlags.ContainsCall;
+                if (newStatement is GimpleAsmStatement)
+                    flags |= SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall;
 
                 var uses = ImmutableArray.CreateBuilder<SsaUse>();
                 CollectUses(expressionArray, instruction.Block, newStatement, uses);
@@ -1167,7 +1169,7 @@ namespace Cnidaria.C
                         return true;
                     }
                 }
-                
+
 
                 return false;
             }

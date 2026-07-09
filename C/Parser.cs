@@ -210,8 +210,20 @@ namespace Cnidaria.C
         {
             DeclareDeclaratorName(declarator, isTypedefName);
 
+            SyntaxToken? asmKeyword = null;
+            SyntaxToken? asmOpenParen = null;
+            var asmRegisterName = ImmutableArray<SyntaxToken>.Empty;
+            SyntaxToken? asmCloseParen = null;
             SyntaxToken? equalsToken = null;
             InitializerSyntax? initializer = null;
+
+            if (IsAsmKeyword(Current.Kind))
+            {
+                asmKeyword = NextToken();
+                asmOpenParen = MatchToken(SyntaxKind.OpenParenToken);
+                asmRegisterName = ParseStringLiteralSequence("Expected explicit register name string literal.");
+                asmCloseParen = MatchToken(SyntaxKind.CloseParenToken);
+            }
 
             if (Current.Kind == SyntaxKind.EqualsToken)
             {
@@ -221,6 +233,10 @@ namespace Cnidaria.C
 
             return new InitDeclaratorSyntax(
                 declarator,
+                asmKeyword,
+                asmOpenParen,
+                asmRegisterName,
+                asmCloseParen,
                 equalsToken,
                 initializer);
         }
@@ -446,6 +462,7 @@ namespace Cnidaria.C
                 SyntaxKind.CaseKeyword => ParseCaseStatement(),
                 SyntaxKind.DefaultKeyword => ParseDefaultStatement(),
                 SyntaxKind.ReturnKeyword => ParseReturnStatement(),
+                var kind when IsAsmKeyword(kind) => ParseAsmStatement(),
                 SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken when Peek(1).Kind == SyntaxKind.ColonToken => ParseLabelStatement(),
                 _ => ParseExpressionStatement(),
             };
@@ -657,6 +674,161 @@ namespace Cnidaria.C
 
             var semicolon = MatchToken(SyntaxKind.SemicolonToken);
             return new ReturnStatementSyntax(returnKeyword, expression, semicolon);
+        }
+
+        private AsmStatementSyntax ParseAsmStatement()
+        {
+            var asmKeyword = NextToken();
+            var qualifiers = ImmutableArray.CreateBuilder<SyntaxToken>();
+
+            while (IsAsmQualifierKeyword(Current))
+                qualifiers.Add(NextToken());
+
+            var openParen = MatchToken(SyntaxKind.OpenParenToken);
+            var stringLiterals = ParseStringLiteralSequence("Expected inline assembly string literal.");
+            var outputs = ImmutableArray<AsmOperandSyntax>.Empty;
+            var inputs = ImmutableArray<AsmOperandSyntax>.Empty;
+            var clobbers = ImmutableArray<AsmClobberSyntax>.Empty;
+            var labels = ImmutableArray<SyntaxToken>.Empty;
+
+            if (Current.Kind == SyntaxKind.ColonToken)
+            {
+                NextToken();
+                outputs = ParseAsmOperandList();
+
+                if (Current.Kind == SyntaxKind.ColonToken)
+                {
+                    NextToken();
+                    inputs = ParseAsmOperandList();
+
+                    if (Current.Kind == SyntaxKind.ColonToken)
+                    {
+                        NextToken();
+                        clobbers = ParseAsmClobberList();
+
+                        if (Current.Kind == SyntaxKind.ColonToken)
+                        {
+                            NextToken();
+                            labels = ParseAsmGotoLabelList();
+                        }
+                    }
+                }
+            }
+
+            var closeParen = MatchToken(SyntaxKind.CloseParenToken);
+            var semicolon = MatchToken(SyntaxKind.SemicolonToken);
+
+            return new AsmStatementSyntax(
+                asmKeyword,
+                qualifiers.ToImmutable(),
+                openParen,
+                stringLiterals,
+                outputs,
+                inputs,
+                clobbers,
+                labels,
+                closeParen,
+                semicolon);
+        }
+
+        private ImmutableArray<SyntaxToken> ParseStringLiteralSequence(string diagnostic)
+        {
+            var literals = ImmutableArray.CreateBuilder<SyntaxToken>();
+            if (IsStringLiteral(Current.Kind))
+            {
+                do
+                {
+                    literals.Add(NextToken());
+                } while (IsStringLiteral(Current.Kind));
+            }
+            else
+            {
+                Report(Current, diagnostic);
+            }
+
+            return literals.ToImmutable();
+        }
+
+        private ImmutableArray<AsmOperandSyntax> ParseAsmOperandList()
+        {
+            var operands = ImmutableArray.CreateBuilder<AsmOperandSyntax>();
+            while (Current.Kind != SyntaxKind.CloseParenToken &&
+                   Current.Kind != SyntaxKind.ColonToken &&
+                   Current.Kind != SyntaxKind.EndOfFileToken)
+            {
+                operands.Add(ParseAsmOperand());
+                if (Current.Kind != SyntaxKind.CommaToken)
+                    break;
+
+                NextToken();
+                if (Current.Kind == SyntaxKind.CloseParenToken || Current.Kind == SyntaxKind.ColonToken)
+                    break;
+            }
+
+            return operands.ToImmutable();
+        }
+
+        private AsmOperandSyntax ParseAsmOperand()
+        {
+            SyntaxToken? openBracket = null;
+            SyntaxToken? name = null;
+            SyntaxToken? closeBracket = null;
+
+            if (Current.Kind == SyntaxKind.OpenBracketToken)
+            {
+                openBracket = NextToken();
+                name = Current.Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken
+                    ? NextToken()
+                    : MatchToken(SyntaxKind.IdentifierToken);
+                closeBracket = MatchToken(SyntaxKind.CloseBracketToken);
+            }
+
+            var constraint = ParseStringLiteralSequence("Expected inline assembly constraint string literal.");
+            var openParen = MatchToken(SyntaxKind.OpenParenToken);
+            var expression = Current.Kind == SyntaxKind.CloseParenToken || Current.Kind == SyntaxKind.EndOfFileToken
+                ? new InvalidExpressionSyntax(MissingTokenAt(Current.Position))
+                : ParseExpression();
+            var closeParen = MatchToken(SyntaxKind.CloseParenToken);
+
+            return new AsmOperandSyntax(openBracket, name, closeBracket, constraint, openParen, expression, closeParen);
+        }
+
+        private ImmutableArray<AsmClobberSyntax> ParseAsmClobberList()
+        {
+            var clobbers = ImmutableArray.CreateBuilder<AsmClobberSyntax>();
+            while (Current.Kind != SyntaxKind.CloseParenToken &&
+                   Current.Kind != SyntaxKind.ColonToken &&
+                   Current.Kind != SyntaxKind.EndOfFileToken)
+            {
+                clobbers.Add(new AsmClobberSyntax(ParseStringLiteralSequence("Expected inline assembly clobber string literal.")));
+                if (Current.Kind != SyntaxKind.CommaToken)
+                    break;
+
+                NextToken();
+                if (Current.Kind == SyntaxKind.CloseParenToken || Current.Kind == SyntaxKind.ColonToken)
+                    break;
+            }
+
+            return clobbers.ToImmutable();
+        }
+
+        private ImmutableArray<SyntaxToken> ParseAsmGotoLabelList()
+        {
+            var labels = ImmutableArray.CreateBuilder<SyntaxToken>();
+            while (Current.Kind != SyntaxKind.CloseParenToken && Current.Kind != SyntaxKind.EndOfFileToken)
+            {
+                labels.Add(Current.Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken
+                    ? NextToken()
+                    : MatchToken(SyntaxKind.IdentifierToken));
+                if (Current.Kind != SyntaxKind.CommaToken)
+                    break;
+
+                NextToken();
+                if (Current.Kind == SyntaxKind.CloseParenToken)
+                    break;
+            }
+
+            return labels.ToImmutable();
         }
 
         private ExpressionStatementSyntax ParseExpressionStatement()
@@ -1457,6 +1629,28 @@ namespace Cnidaria.C
             return kind is SyntaxKind.SizeofKeyword or
                 SyntaxKind.AlignofKeyword or
                 SyntaxKind.UnderscoreAlignofKeyword;
+        }
+
+        private static bool IsAsmKeyword(SyntaxKind kind)
+            => kind is SyntaxKind.AsmKeyword or SyntaxKind.AsmExtensionKeyword;
+
+        private static bool IsAsmQualifierKeyword(SyntaxToken token)
+        {
+            return (token.Kind is SyntaxKind.VolatileKeyword or
+                SyntaxKind.VolatileExtensionKeyword or
+                SyntaxKind.InlineKeyword or
+                SyntaxKind.InlineExtensionKeyword or
+                SyntaxKind.GotoKeyword) ||
+                string.Equals(token.Text, "__goto__", StringComparison.Ordinal);
+        }
+
+        private static bool IsStringLiteral(SyntaxKind kind)
+        {
+            return kind is SyntaxKind.StringLiteralToken or
+                SyntaxKind.WideStringLiteralToken or
+                SyntaxKind.Utf8StringLiteralToken or
+                SyntaxKind.Utf16StringLiteralToken or
+                SyntaxKind.Utf32StringLiteralToken;
         }
 
         private static bool IsTypeQualifier(SyntaxKind kind)

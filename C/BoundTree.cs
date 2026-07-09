@@ -33,6 +33,7 @@ namespace Cnidaria.C
         DefaultStatement,
         ReturnStatement,
         ExpressionStatement,
+        AsmStatement,
         EmptyStatement,
         ErrorStatement,
 
@@ -516,6 +517,60 @@ namespace Cnidaria.C
             : base(syntax)
         {
             Expression = expression ?? throw new ArgumentNullException(nameof(expression));
+        }
+    }
+
+    public sealed class BoundAsmOperand
+    {
+        public AsmOperandSyntax Syntax { get; }
+        public string? Name { get; }
+        public string Constraint { get; }
+        public BoundExpression Expression { get; }
+        public bool IsReadWrite { get; }
+
+        public BoundAsmOperand(AsmOperandSyntax syntax, string? name, string constraint, BoundExpression expression, bool isReadWrite)
+        {
+            Syntax = syntax ?? throw new ArgumentNullException(nameof(syntax));
+            Name = string.IsNullOrEmpty(name) ? null : name;
+            Constraint = constraint ?? string.Empty;
+            Expression = expression ?? throw new ArgumentNullException(nameof(expression));
+            IsReadWrite = isReadWrite;
+        }
+    }
+
+    public sealed class BoundAsmStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.AsmStatement;
+
+        public string Text { get; }
+        public bool IsVolatile { get; }
+        public bool IsInline { get; }
+        public bool IsGoto { get; }
+        public ImmutableArray<BoundAsmOperand> Outputs { get; }
+        public ImmutableArray<BoundAsmOperand> Inputs { get; }
+        public ImmutableArray<string> Clobbers { get; }
+        public ImmutableArray<LabelSymbol> GotoLabels { get; }
+
+        public BoundAsmStatement(
+            AsmStatementSyntax syntax,
+            string text,
+            bool isVolatile,
+            bool isInline,
+            bool isGoto,
+            ImmutableArray<BoundAsmOperand> outputs,
+            ImmutableArray<BoundAsmOperand> inputs,
+            ImmutableArray<string> clobbers,
+            ImmutableArray<LabelSymbol> gotoLabels)
+            : base(syntax)
+        {
+            Text = text ?? string.Empty;
+            IsVolatile = isVolatile;
+            IsInline = isInline;
+            IsGoto = isGoto;
+            Outputs = outputs.IsDefault ? ImmutableArray<BoundAsmOperand>.Empty : outputs;
+            Inputs = inputs.IsDefault ? ImmutableArray<BoundAsmOperand>.Empty : inputs;
+            Clobbers = clobbers.IsDefault ? ImmutableArray<string>.Empty : clobbers;
+            GotoLabels = gotoLabels.IsDefault ? ImmutableArray<LabelSymbol>.Empty : gotoLabels;
         }
     }
 

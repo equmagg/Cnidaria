@@ -249,6 +249,9 @@
         DefaultStatement,
         ReturnStatement,
         ExpressionStatement,
+        AsmStatement,
+        AsmOperand,
+        AsmClobber,
         SkippedExternalDeclaration,
         SkippedStatement,
 

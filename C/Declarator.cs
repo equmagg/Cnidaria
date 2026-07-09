@@ -179,6 +179,9 @@ namespace Cnidaria.C
             if (string.Equals(name, StandardHeaders.BuiltinVaStartName, StringComparison.Ordinal))
                 return RuntimeIntrinsicKind.BuiltinVaStart;
 
+            if (string.Equals(name, StandardHeaders.BuiltinVaArgName, StringComparison.Ordinal))
+                return RuntimeIntrinsicKind.BuiltinVaArg;
+
             return RuntimeIntrinsicKind.None;
         }
         private void CollectDeclaration(DeclarationSyntax declaration, Scope scope)
@@ -238,7 +241,8 @@ namespace Cnidaria.C
                     name,
                     declaredType,
                     specifiers.StorageClass,
-                    initDeclarator);
+                    initDeclarator,
+                    initDeclarator.ExplicitRegisterName);
             }
 
             DeclareOrdinary(scope, symbol);
@@ -338,7 +342,29 @@ namespace Cnidaria.C
                     if (expressionStatement.Expression is not null)
                         VisitExpression(expressionStatement.Expression, scope);
                     break;
+
+                case AsmStatementSyntax asmStatement:
+                    CollectAsmStatement(asmStatement, scope);
+                    break;
             }
+        }
+
+        private void CollectAsmStatement(AsmStatementSyntax statement, Scope scope)
+        {
+            foreach (var operand in statement.OutputOperands)
+            {
+                _scopes[operand] = scope;
+                VisitExpression(operand.Expression, scope);
+            }
+
+            foreach (var operand in statement.InputOperands)
+            {
+                _scopes[operand] = scope;
+                VisitExpression(operand.Expression, scope);
+            }
+
+            foreach (var clobber in statement.Clobbers)
+                _scopes[clobber] = scope;
         }
 
         private void CollectForStatement(ForStatementSyntax forStatement, Scope parentScope)

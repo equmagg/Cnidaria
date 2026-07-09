@@ -120,18 +120,36 @@ namespace Cnidaria.C
         public override SyntaxKind Kind => SyntaxKind.InitDeclarator;
 
         public DeclaratorSyntax Declarator { get; }
+        public SyntaxToken? AsmKeyword { get; }
+        public SyntaxToken? AsmOpenParenToken { get; }
+        public ImmutableArray<SyntaxToken> AsmRegisterNameTokens { get; }
+        public SyntaxToken? AsmCloseParenToken { get; }
         public SyntaxToken? EqualsToken { get; }
         public InitializerSyntax? Initializer { get; }
 
         public InitDeclaratorSyntax(
             DeclaratorSyntax declarator,
+            SyntaxToken? asmKeyword,
+            SyntaxToken? asmOpenParenToken,
+            ImmutableArray<SyntaxToken> asmRegisterNameTokens,
+            SyntaxToken? asmCloseParenToken,
             SyntaxToken? equalsToken,
             InitializerSyntax? initializer)
         {
             Declarator = declarator;
+            AsmKeyword = asmKeyword;
+            AsmOpenParenToken = asmOpenParenToken;
+            AsmRegisterNameTokens = asmRegisterNameTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : asmRegisterNameTokens;
+            AsmCloseParenToken = asmCloseParenToken;
             EqualsToken = equalsToken;
             Initializer = initializer;
         }
+
+        public string? ExplicitRegisterName => AsmRegisterNameTokens.Length == 0
+            ? null
+            : AsmSyntaxHelpers.ConcatenateStringLiterals(AsmRegisterNameTokens);
     }
 
     public sealed class DeclaratorSyntax : SyntaxNode
@@ -559,6 +577,136 @@ namespace Cnidaria.C
         {
             Expression = expression;
             SemicolonToken = semicolonToken;
+        }
+    }
+
+    public sealed class AsmOperandSyntax : SyntaxNode
+    {
+        public override SyntaxKind Kind => SyntaxKind.AsmOperand;
+
+        public SyntaxToken? OpenBracketToken { get; }
+        public SyntaxToken? NameToken { get; }
+        public SyntaxToken? CloseBracketToken { get; }
+        public ImmutableArray<SyntaxToken> ConstraintLiteralTokens { get; }
+        public SyntaxToken OpenParenToken { get; }
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken CloseParenToken { get; }
+
+        public AsmOperandSyntax(
+            SyntaxToken? openBracketToken,
+            SyntaxToken? nameToken,
+            SyntaxToken? closeBracketToken,
+            ImmutableArray<SyntaxToken> constraintLiteralTokens,
+            SyntaxToken openParenToken,
+            ExpressionSyntax expression,
+            SyntaxToken closeParenToken)
+        {
+            OpenBracketToken = openBracketToken;
+            NameToken = nameToken;
+            CloseBracketToken = closeBracketToken;
+            ConstraintLiteralTokens = constraintLiteralTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : constraintLiteralTokens;
+            OpenParenToken = openParenToken;
+            Expression = expression ?? throw new ArgumentNullException(nameof(expression));
+            CloseParenToken = closeParenToken;
+        }
+
+        public string? Name => NameToken?.Text;
+        public string Constraint => AsmSyntaxHelpers.ConcatenateStringLiterals(ConstraintLiteralTokens);
+    }
+
+    public sealed class AsmClobberSyntax : SyntaxNode
+    {
+        public override SyntaxKind Kind => SyntaxKind.AsmClobber;
+
+        public ImmutableArray<SyntaxToken> StringLiteralTokens { get; }
+
+        public AsmClobberSyntax(ImmutableArray<SyntaxToken> stringLiteralTokens)
+        {
+            StringLiteralTokens = stringLiteralTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : stringLiteralTokens;
+        }
+
+        public string Text => AsmSyntaxHelpers.ConcatenateStringLiterals(StringLiteralTokens);
+    }
+
+    public sealed class AsmStatementSyntax : StatementSyntax
+    {
+        public override SyntaxKind Kind => SyntaxKind.AsmStatement;
+
+        public SyntaxToken AsmKeyword { get; }
+        public ImmutableArray<SyntaxToken> QualifierTokens { get; }
+        public SyntaxToken OpenParenToken { get; }
+        public ImmutableArray<SyntaxToken> StringLiteralTokens { get; }
+        public ImmutableArray<AsmOperandSyntax> OutputOperands { get; }
+        public ImmutableArray<AsmOperandSyntax> InputOperands { get; }
+        public ImmutableArray<AsmClobberSyntax> Clobbers { get; }
+        public ImmutableArray<SyntaxToken> GotoLabelTokens { get; }
+        public SyntaxToken CloseParenToken { get; }
+        public SyntaxToken SemicolonToken { get; }
+
+        public AsmStatementSyntax(
+            SyntaxToken asmKeyword,
+            ImmutableArray<SyntaxToken> qualifierTokens,
+            SyntaxToken openParenToken,
+            ImmutableArray<SyntaxToken> stringLiteralTokens,
+            ImmutableArray<AsmOperandSyntax> outputOperands,
+            ImmutableArray<AsmOperandSyntax> inputOperands,
+            ImmutableArray<AsmClobberSyntax> clobbers,
+            ImmutableArray<SyntaxToken> gotoLabelTokens,
+            SyntaxToken closeParenToken,
+            SyntaxToken semicolonToken)
+        {
+            AsmKeyword = asmKeyword;
+            QualifierTokens = qualifierTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : qualifierTokens;
+            OpenParenToken = openParenToken;
+            StringLiteralTokens = stringLiteralTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : stringLiteralTokens;
+            OutputOperands = outputOperands.IsDefault
+                ? ImmutableArray<AsmOperandSyntax>.Empty
+                : outputOperands;
+            InputOperands = inputOperands.IsDefault
+                ? ImmutableArray<AsmOperandSyntax>.Empty
+                : inputOperands;
+            Clobbers = clobbers.IsDefault
+                ? ImmutableArray<AsmClobberSyntax>.Empty
+                : clobbers;
+            GotoLabelTokens = gotoLabelTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : gotoLabelTokens;
+            CloseParenToken = closeParenToken;
+            SemicolonToken = semicolonToken;
+        }
+
+        public string Text => AsmSyntaxHelpers.ConcatenateStringLiterals(StringLiteralTokens);
+
+        public bool IsVolatile => QualifierTokens.Any(static token => IsVolatileQualifier(token));
+        public bool IsInline => QualifierTokens.Any(static token => IsInlineQualifier(token));
+        public bool IsGoto => GotoLabelTokens.Length != 0 || QualifierTokens.Any(static token => IsGotoQualifier(token));
+
+        private static bool IsVolatileQualifier(SyntaxToken token)
+            => token.Kind is SyntaxKind.VolatileKeyword or SyntaxKind.VolatileExtensionKeyword;
+
+        private static bool IsInlineQualifier(SyntaxToken token)
+            => token.Kind is SyntaxKind.InlineKeyword or SyntaxKind.InlineExtensionKeyword;
+
+        private static bool IsGotoQualifier(SyntaxToken token)
+            => token.Kind == SyntaxKind.GotoKeyword || string.Equals(token.Text, "__goto__", StringComparison.Ordinal);
+    }
+
+    internal static class AsmSyntaxHelpers
+    {
+        public static string ConcatenateStringLiterals(ImmutableArray<SyntaxToken> tokens)
+        {
+            var builder = new StringBuilder();
+            foreach (var token in tokens)
+                builder.Append(token.Value as string ?? string.Empty);
+            return builder.ToString();
         }
     }
 

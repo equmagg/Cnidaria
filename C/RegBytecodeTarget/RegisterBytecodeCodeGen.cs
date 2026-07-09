@@ -627,6 +627,13 @@ namespace Cnidaria.C
                         EmitVaStart(instruction);
                         break;
 
+                    case LirInstructionKind.VaArg:
+                        EmitVaArg(instruction);
+                        break;
+
+                    case LirInstructionKind.InlineAssembly:
+                        throw Unsupported(instruction, "Inline assembly is not supported by the register bytecode backend.");
+
                     case LirInstructionKind.Jump:
                         if (!IsFallthroughTarget(instruction.Target))
                             _asm.J(LabelOf(instruction.Target));
@@ -1197,14 +1204,23 @@ namespace Cnidaria.C
             }
             private void EmitVaStart(LirInstruction instruction)
             {
-                if (instruction.Operands.Length != 0)
-                    throw Unsupported(instruction, "VaStart instruction must not have explicit operands.");
+                var frame = _allocation.Frame;
+                if (instruction.Operands.Length == 1)
+                {
+                    var ap = LoadOperand(instruction.Operands[0], GpScratch0);
+                    if (frame.HasVarArgsPointer)
+                        EmitMem(Op.LdPtr, GpScratch1, MachineRegister.Invalid,
+                            frame.VarArgsPointerOffset, MachineRegister.Invalid, MemoryBase.StackPointer, _owner._target.PointerAlignment);
+                    else
+                        _asm.LiI64(GpScratch1, 0);
+                    EmitMem(Op.StPtr, GpScratch1, ap, 0, MachineRegister.Invalid, MemoryBase.Register, _owner._target.PointerAlignment);
+                    return;
+                }
 
                 if (instruction.Result is null)
                     return;
 
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
-                var frame = _allocation.Frame;
 
                 if (frame.HasVarArgsPointer)
                     EmitMem(LoadOpForType(instruction.Result.Type), destination, MachineRegister.Invalid,
@@ -1213,6 +1229,33 @@ namespace Cnidaria.C
                     _asm.LiI64(destination, 0);
 
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void EmitVaArg(LirInstruction instruction)
+            {
+                if (instruction.Operands.Length != 4)
+                    throw Unsupported(instruction, "VaArg expects a va_list pointer, kind, size, and alignment.");
+                if (instruction.Result is null)
+                    return;
+
+                var size = Math.Max(1, ImmediateToInt32(instruction.Operands[2]));
+                var align = Math.Max(1, ImmediateToInt32(instruction.Operands[3]));
+                var ap = LoadOperand(instruction.Operands[0], GpScratch0);
+                EmitMem(Op.LdPtr, GpScratch1, ap, 0, MachineRegister.Invalid, MemoryBase.Register, _owner._target.PointerAlignment);
+                AlignPointerRegister(GpScratch1, align);
+                var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+                MoveRegister(destination, GpScratch1);
+                EmitI64Imm(Op.I64AddImm, GpScratch1, GpScratch1, CAbi.AlignUp(size, _owner._target.PointerSize));
+                EmitMem(Op.StPtr, GpScratch1, ap, 0, MachineRegister.Invalid, MemoryBase.Register, _owner._target.PointerAlignment);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void AlignPointerRegister(MachineRegister register, int alignment)
+            {
+                if (alignment <= 1)
+                    return;
+                EmitI64Imm(Op.I64AddImm, register, register, alignment - 1);
+                EmitI64Imm(Op.I64AndImm, register, register, -alignment);
             }
             private void PrepareVariadicCall(LirInstruction instruction)
             {

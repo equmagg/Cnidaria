@@ -199,8 +199,8 @@ namespace Cnidaria.C
                 _ => target.PointerSize == 8 ? "unknown64" : "unknown32",
             };
 
-            var operatingSystem = target.OperatingSystem switch 
-            { 
+            var operatingSystem = target.OperatingSystem switch
+            {
                 OperatingSystemKind.None => "unknown",
                 OperatingSystemKind.Windows => "windows",
                 OperatingSystemKind.Linux => "linux",
@@ -945,7 +945,6 @@ namespace Cnidaria.C
             ["__attribute__"] = SyntaxKind.AttributeKeyword,
             ["__declspec"] = SyntaxKind.DeclspecKeyword,
 
-            ["__builtin_va_arg"] = SyntaxKind.BuiltinVaArgKeyword,
             ["__builtin_offsetof"] = SyntaxKind.BuiltinOffsetofKeyword,
             ["__builtin_types_compatible_p"] = SyntaxKind.BuiltinTypesCompatiblePKeyword,
             ["__builtin_choose_expr"] = SyntaxKind.BuiltinChooseExprKeyword,
@@ -2105,7 +2104,9 @@ namespace Cnidaria.C
 
             return text.IndexOf('.') >= 0 ||
                    text.IndexOf('e') >= 0 ||
-                   text.IndexOf('E') >= 0;
+                   text.IndexOf('E') >= 0 ||
+                   text.EndsWith("F", StringComparison.OrdinalIgnoreCase) ||
+                   text.EndsWith("D", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string StripIntegerSuffix(string text, out string suffix)

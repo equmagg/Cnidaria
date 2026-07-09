@@ -237,6 +237,15 @@ namespace Cnidaria.C
                             AddEdge(block, _exit!, ControlFlowEdgeKind.Return, @return, switchValue: null);
                             break;
 
+                        case GimpleAsmStatement asm when asm.IsGoto:
+                            foreach (var label in asm.GotoLabels)
+                                AddLabelEdge(block, label, ControlFlowEdgeKind.Goto, asm, switchValue: null);
+                            if (next is not null)
+                                AddEdge(block, next, ControlFlowEdgeKind.FallThrough, asm, switchValue: null);
+                            else
+                                AddEdge(block, _exit!, ControlFlowEdgeKind.ImplicitExit, asm, switchValue: null);
+                            break;
+
                         default:
                             if (terminator.IsTerminator)
                             {

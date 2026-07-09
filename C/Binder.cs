@@ -164,6 +164,8 @@ namespace Cnidaria.C
                     ? BindInitializer(declarator.Initializer, type)
                     : null;
 
+                ValidateExplicitRegisterDeclarator(declarator, symbol, specifiers.StorageClass, type, scope);
+
                 declarators.Add(new BoundDeclarator(
                     declarator,
                     symbol,
@@ -175,6 +177,33 @@ namespace Cnidaria.C
                 syntax,
                 specifiers.StorageClass,
                 declarators.ToImmutable());
+        }
+
+
+        private void ValidateExplicitRegisterDeclarator(InitDeclaratorSyntax declarator, Symbol? symbol, StorageClass storageClass, QualifiedType type, Scope scope)
+        {
+            if (declarator.ExplicitRegisterName is null)
+                return;
+
+            var span = declarator.AsmKeyword?.Span ?? (declarator.Declarator.Identifier?.Span ?? SpanOf(declarator));
+            if (symbol is not VariableSymbol)
+            {
+                Report("Explicit register names are only supported on object declarations.", span);
+                return;
+            }
+
+            if (storageClass != StorageClass.Register)
+                Report("Explicit register variables must use the 'register' storage class.", span);
+
+            if (scope.Parent is null)
+                Report("Global explicit register variables are not supported.", span);
+
+            if (CAbi.IsAggregate(type) || type.Type.Kind == TypeKind.Array)
+                Report("Explicit register variables require scalar object type.", span);
+
+            var registerClass = CAbi.PreferredLirRegisterClass(_compilation.Options.Target, type);
+            if (!TargetRegisterInfo.TryParseExplicitRegister(_compilation.Options.Target, declarator.ExplicitRegisterName, registerClass, out _))
+                Report("Invalid or unsupported explicit register name '" + declarator.ExplicitRegisterName + "'.", span);
         }
 
         private BoundInitializer BindInitializer(InitializerSyntax syntax, QualifiedType targetType)
@@ -279,6 +308,9 @@ namespace Cnidaria.C
 
                 case ExpressionStatementSyntax expressionStatement:
                     return BindExpressionStatement(expressionStatement);
+
+                case AsmStatementSyntax asmStatement:
+                    return BindAsmStatement(asmStatement);
 
                 default:
                     Report($"Unsupported statement syntax '{syntax.Kind}'.", SpanOf(syntax));
@@ -546,6 +578,140 @@ namespace Cnidaria.C
             return new BoundExpressionStatement(
                 syntax,
                 ApplyDefaultConversions(BindExpression(syntax.Expression)));
+        }
+
+        private BoundAsmStatement BindAsmStatement(AsmStatementSyntax syntax)
+        {
+            if (syntax.StringLiteralTokens.Length == 0)
+                Report("Inline assembly requires a string literal.", syntax.AsmKeyword.Span);
+
+            foreach (var token in syntax.StringLiteralTokens)
+            {
+                if (token.Kind != SyntaxKind.StringLiteralToken)
+                    Report("Inline assembly requires ordinary string literals.", token.Span);
+            }
+
+            var outputs = ImmutableArray.CreateBuilder<BoundAsmOperand>();
+            foreach (var operand in syntax.OutputOperands)
+            {
+                var constraint = operand.Constraint;
+                if (!IsOutputConstraint(constraint))
+                    Report("Inline assembly output constraints must start with '=' or '+'.", AsmOperandConstraintSpan(operand));
+
+                var expression = BindExpression(operand.Expression);
+                if (!IsModifiableLValue(expression))
+                    Report("Inline assembly output operand must be a modifiable lvalue.", SpanOf(operand.Expression));
+                ValidateInlineAsmExplicitRegisterConstraint(constraint, expression.Type, AsmOperandConstraintSpan(operand));
+
+                outputs.Add(new BoundAsmOperand(operand, operand.Name, constraint, expression, IsReadWriteAsmConstraint(constraint)));
+            }
+
+            var inputs = ImmutableArray.CreateBuilder<BoundAsmOperand>();
+            foreach (var operand in syntax.InputOperands)
+            {
+                var constraint = operand.Constraint;
+                if (IsOutputConstraint(constraint))
+                    Report("Inline assembly input constraints cannot start with '=' or '+'.", AsmOperandConstraintSpan(operand));
+
+                var expression = ApplyDefaultConversions(BindExpression(operand.Expression));
+                ValidateInlineAsmExplicitRegisterConstraint(constraint, expression.Type, AsmOperandConstraintSpan(operand));
+
+                inputs.Add(new BoundAsmOperand(
+                    operand,
+                    operand.Name,
+                    constraint,
+                    expression,
+                    isReadWrite: false));
+            }
+
+            var clobbers = ImmutableArray.CreateBuilder<string>();
+            foreach (var clobber in syntax.Clobbers)
+            {
+                if (clobber.StringLiteralTokens.Length == 0)
+                    Report("Inline assembly clobber requires a string literal.", syntax.AsmKeyword.Span);
+
+                foreach (var token in clobber.StringLiteralTokens)
+                {
+                    if (token.Kind != SyntaxKind.StringLiteralToken)
+                        Report("Inline assembly clobbers require ordinary string literals.", token.Span);
+                }
+
+                clobbers.Add(clobber.Text);
+            }
+
+            var labels = ImmutableArray.CreateBuilder<LabelSymbol>();
+            foreach (var labelToken in syntax.GotoLabelTokens)
+            {
+                LabelSymbol? label = null;
+                if (_currentLabels is not null)
+                    _currentLabels.TryGetValue(labelToken.Text, out label);
+
+                if (label is null)
+                {
+                    Report($"Unknown label '{labelToken.Text}'.", labelToken.Span);
+                    continue;
+                }
+
+                labels.Add(label);
+            }
+
+            if (syntax.IsGoto && labels.Count == 0)
+                Report("Inline assembly 'goto' requires a label list.", syntax.AsmKeyword.Span);
+
+            if (!syntax.IsGoto && labels.Count != 0)
+                Report("Inline assembly label lists require the 'goto' qualifier.", syntax.AsmKeyword.Span);
+
+            return new BoundAsmStatement(
+                syntax,
+                syntax.Text,
+                syntax.IsVolatile || outputs.Count == 0,
+                syntax.IsInline,
+                syntax.IsGoto,
+                outputs.ToImmutable(),
+                inputs.ToImmutable(),
+                clobbers.ToImmutable(),
+                labels.ToImmutable());
+        }
+
+        private void ValidateInlineAsmExplicitRegisterConstraint(string constraint, QualifiedType type, TextSpan span)
+        {
+            var registerName = InlineAsmConstraints.ExplicitRegisterName(constraint);
+            if (registerName is null)
+                return;
+
+            var registerClass = CAbi.PreferredLirRegisterClass(_compilation.Options.Target, type);
+            if (!TargetRegisterInfo.TryParseExplicitRegister(_compilation.Options.Target, registerName, registerClass, out _))
+                Report("Invalid or unsupported inline assembly explicit register constraint '" + constraint + "'.", span);
+        }
+
+        private static bool IsOutputConstraint(string constraint)
+        {
+            constraint = StripAsmConstraintPrefixes(constraint);
+            return constraint.Length != 0 && (constraint[0] == '=' || constraint[0] == '+');
+        }
+
+        private static bool IsReadWriteAsmConstraint(string constraint)
+        {
+            constraint = StripAsmConstraintPrefixes(constraint);
+            return constraint.Length != 0 && constraint[0] == '+';
+        }
+
+        private static string StripAsmConstraintPrefixes(string constraint)
+        {
+            if (string.IsNullOrEmpty(constraint))
+                return string.Empty;
+
+            var index = 0;
+            while (index < constraint.Length && (constraint[index] == '&' || constraint[index] == '%' || constraint[index] == '!'))
+                index++;
+            return constraint.Substring(index);
+        }
+
+        private static TextSpan AsmOperandConstraintSpan(AsmOperandSyntax operand)
+        {
+            if (operand.ConstraintLiteralTokens.Length != 0)
+                return operand.ConstraintLiteralTokens[0].Span;
+            return operand.OpenParenToken.Span;
         }
 
         private BoundExpression BindScalarCondition(ExpressionSyntax syntax, string constructName)
@@ -1060,11 +1226,13 @@ namespace Cnidaria.C
             {
                 try
                 {
-                    constantValue = _compilation.Options.Target.SizeOf(operandType);
+                    constantValue = syntax.Keyword.Kind is SyntaxKind.AlignofKeyword or SyntaxKind.UnderscoreAlignofKeyword
+                        ? _compilation.Options.Target.AlignOf(operandType)
+                        : _compilation.Options.Target.SizeOf(operandType);
                 }
                 catch (OverflowException)
                 {
-                    Report("The size of the operand cannot be represented by the target size type.", SpanOf(syntax));
+                    Report("The size or alignment of the operand cannot be represented by the target size type.", SpanOf(syntax));
                 }
             }
 
@@ -2607,7 +2775,7 @@ namespace Cnidaria.C
             if (string.IsNullOrWhiteSpace(text))
                 return null;
 
-            var trimmed = text.TrimEnd('f', 'F', 'l', 'L').Replace("'", string.Empty);
+            var trimmed = text.TrimEnd('f', 'F', 'd', 'D', 'l', 'L').Replace("'", string.Empty);
             return double.TryParse(
                 trimmed,
                 NumberStyles.Float,
@@ -2698,6 +2866,9 @@ namespace Cnidaria.C
                     return expressionStatement.Expression is null
                         ? expressionStatement.SemicolonToken.Span
                         : SpanOf(expressionStatement.Expression);
+
+                case AsmStatementSyntax asmStatement:
+                    return asmStatement.AsmKeyword.Span;
 
                 case LiteralExpressionSyntax literal:
                     return literal.LiteralToken.Span;

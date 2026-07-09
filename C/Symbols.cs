@@ -19,6 +19,7 @@ namespace Cnidaria.C
     {
         None,
         BuiltinVaStart,
+        BuiltinVaArg,
         CStringWrite,
         Malloc,
         Free,
@@ -62,16 +63,19 @@ namespace Cnidaria.C
         public override SymbolKind Kind => SymbolKind.Variable;
         public override string Name { get; }
         public StorageClass StorageClass { get; }
+        public string? ExplicitRegisterName { get; }
 
         public VariableSymbol(
             string name,
             QualifiedType type,
             StorageClass storageClass,
-            SyntaxNode? declaringSyntax)
+            SyntaxNode? declaringSyntax,
+            string? explicitRegisterName = null)
             : base(type, declaringSyntax)
         {
             Name = name ?? string.Empty;
             StorageClass = storageClass;
+            ExplicitRegisterName = string.IsNullOrWhiteSpace(explicitRegisterName) ? null : explicitRegisterName.Trim();
         }
     }
 

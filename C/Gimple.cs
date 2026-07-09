@@ -24,6 +24,7 @@ namespace Cnidaria.C
         ConditionalGotoStatement,
         SwitchStatement,
         ReturnStatement,
+        AsmStatement,
         NopStatement,
 
         SymbolValue,
@@ -506,6 +507,73 @@ namespace Cnidaria.C
         {
             Function = function;
             Expression = expression;
+        }
+    }
+
+    public sealed class GimpleAsmOperand
+    {
+        public string? Name { get; }
+        public string Constraint { get; }
+        public GimplePlace? Target { get; }
+        public GimpleValue? Value { get; }
+        public bool IsOutput { get; }
+        public bool IsReadWrite { get; }
+        public SyntaxNode? Syntax { get; }
+
+        public GimpleAsmOperand(
+            string? name,
+            string constraint,
+            GimplePlace? target,
+            GimpleValue? value,
+            bool isOutput,
+            bool isReadWrite,
+            SyntaxNode? syntax)
+        {
+            Name = string.IsNullOrEmpty(name) ? null : name;
+            Constraint = constraint ?? string.Empty;
+            Target = target;
+            Value = value;
+            IsOutput = isOutput;
+            IsReadWrite = isReadWrite;
+            Syntax = syntax;
+        }
+    }
+
+    public sealed class GimpleAsmStatement : GimpleStatement
+    {
+        public override GimpleNodeKind Kind => GimpleNodeKind.AsmStatement;
+        public override bool IsTerminator => IsGoto;
+
+        public string Text { get; }
+        public bool IsVolatile { get; }
+        public bool IsInline { get; }
+        public bool IsGoto { get; }
+        public ImmutableArray<GimpleAsmOperand> Outputs { get; }
+        public ImmutableArray<GimpleAsmOperand> Inputs { get; }
+        public ImmutableArray<string> Clobbers { get; }
+        public ImmutableArray<GimpleLabel> GotoLabels { get; }
+        public bool HasMemoryClobber => InlineAsmConstraints.HasMemoryClobber(Clobbers);
+
+        public GimpleAsmStatement(
+            string text,
+            bool isVolatile,
+            bool isInline,
+            bool isGoto,
+            ImmutableArray<GimpleAsmOperand> outputs,
+            ImmutableArray<GimpleAsmOperand> inputs,
+            ImmutableArray<string> clobbers,
+            ImmutableArray<GimpleLabel> gotoLabels,
+            SyntaxNode? syntax = null)
+            : base(syntax)
+        {
+            Text = text ?? string.Empty;
+            IsVolatile = isVolatile;
+            IsInline = isInline;
+            IsGoto = isGoto;
+            Outputs = outputs.IsDefault ? ImmutableArray<GimpleAsmOperand>.Empty : outputs;
+            Inputs = inputs.IsDefault ? ImmutableArray<GimpleAsmOperand>.Empty : inputs;
+            Clobbers = clobbers.IsDefault ? ImmutableArray<string>.Empty : clobbers;
+            GotoLabels = gotoLabels.IsDefault ? ImmutableArray<GimpleLabel>.Empty : gotoLabels;
         }
     }
 

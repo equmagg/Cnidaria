@@ -25,7 +25,6 @@ namespace Cnidaria.C
         private static readonly MachineRegister FpScratch0 = MachineRegister.F0;
         private static readonly MachineRegister FpScratch1 = MachineRegister.F1;
         private static readonly MachineRegister FpScratch2 = MachineRegister.F2;
-        private static readonly MachineRegister VarArgsRegister = MachineRegister.X9;
 
         private readonly LirModule _module;
         private readonly TargetInfo _target;
@@ -414,6 +413,8 @@ namespace Cnidaria.C
             private readonly IReadOnlyDictionary<LirBlock, string> _labels;
             private readonly bool _hasCalls;
             private readonly int _raSaveOffset;
+            private readonly int _riscVVarArgsSaveAreaOffset;
+            private readonly int _riscVVarArgsSaveAreaSize;
             private readonly int _totalFrameSize;
             private AbiCursor _parameters;
 
@@ -429,9 +430,14 @@ namespace Cnidaria.C
                 _allocation = allocation ?? throw new ArgumentNullException(nameof(allocation));
                 _functionLabel = functionLabel ?? string.Empty;
                 _labels = labels ?? throw new ArgumentNullException(nameof(labels));
-                _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i => i.Kind == LirInstructionKind.Call);
+                _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i => i.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly);
                 _raSaveOffset = _hasCalls ? AlignUp(_allocation.Frame.FrameSize, _owner._target.PointerAlignment) : -1;
-                _totalFrameSize = AlignUp(_allocation.Frame.FrameSize + (_hasCalls ? _owner._target.PointerSize : 0), _allocation.Frame.FrameAlignment);
+                _riscVVarArgsSaveAreaSize = ComputeRiscVVarArgsSaveAreaSize();
+                var baseFrameSize = _allocation.Frame.FrameSize;
+                if (_hasCalls)
+                    baseFrameSize = Math.Max(baseFrameSize, checked(_raSaveOffset + _owner._target.PointerSize));
+                _totalFrameSize = AlignUp(checked(baseFrameSize + _riscVVarArgsSaveAreaSize), _allocation.Frame.FrameAlignment);
+                _riscVVarArgsSaveAreaOffset = _riscVVarArgsSaveAreaSize == 0 ? -1 : checked(_totalFrameSize - _riscVVarArgsSaveAreaSize);
             }
 
             public void EmitPrologue()
@@ -458,11 +464,52 @@ namespace Cnidaria.C
             public void EmitTrap()
                 => Emit(new RVInstruction(RVInstrKind.Ebreak));
 
+            private int ComputeRiscVVarArgsSaveAreaSize()
+            {
+                if (!_allocation.Frame.HasVarArgsPointer || !_owner._target.IsRiscV || _function.Symbol?.FunctionType?.IsVariadic != true)
+                    return 0;
+
+                var cursor = ComputeNamedArgumentCursor();
+                var integerRegisters = TargetRegisterInfo.IntegerArgumentRegisters(_owner._target);
+                var remainingRegisters = Math.Max(0, integerRegisters.Length - cursor.Integer);
+                return checked(remainingRegisters * _owner._allocationOptions.StackArgumentSlotSize);
+            }
+
+            private AbiCursor ComputeNamedArgumentCursor()
+            {
+                var cursor = new AbiCursor();
+                if (_allocation.Frame.HasHiddenReturnBuffer)
+                    _ = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var functionType = _function.Symbol?.FunctionType;
+                if (functionType is not null)
+                {
+                    foreach (var parameter in functionType.Parameters)
+                    {
+                        var value = CAbi.ClassifyValue(_owner._target, parameter.Type, isReturn: false, isVariadicUnnamedArgument: false);
+                        _ = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    }
+                }
+                return cursor;
+            }
+
             private void SaveIncomingVarArgsPointer()
             {
                 if (!_allocation.Frame.HasVarArgsPointer)
                     return;
-                StoreRegister(VarArgsRegister, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize);
+
+                var cursor = ComputeNamedArgumentCursor();
+                if (_riscVVarArgsSaveAreaOffset >= 0)
+                {
+                    var integerRegisters = TargetRegisterInfo.IntegerArgumentRegisters(_owner._target);
+                    for (var register = cursor.Integer; register < integerRegisters.Length; register++)
+                        StoreRegister(integerRegisters[register], Sp, checked(_riscVVarArgsSaveAreaOffset + (register - cursor.Integer) * _owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                    AddImmediate(GpScratch0, Sp, _riscVVarArgsSaveAreaOffset);
+                }
+                else
+                {
+                    AddImmediate(GpScratch0, Sp, IncomingStackOffset(cursor.Stack * _owner._allocationOptions.StackArgumentSlotSize));
+                }
+                StoreRegister(GpScratch0, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize);
             }
 
             private void SaveIncomingHiddenReturnBuffer()
@@ -539,6 +586,12 @@ namespace Cnidaria.C
                     case LirInstructionKind.VaStart:
                         EmitVaStart(instruction);
                         break;
+                    case LirInstructionKind.VaArg:
+                        EmitVaArg(instruction);
+                        break;
+                    case LirInstructionKind.InlineAssembly:
+                        EmitInlineAssembly(instruction);
+                        break;
                     case LirInstructionKind.Jump:
                         if (!IsFallthroughTarget(instruction.Target))
                             EmitJump(LabelOf(instruction.Target));
@@ -556,7 +609,195 @@ namespace Cnidaria.C
                         EmitTrap();
                         break;
                     default:
-                        throw Unsupported(instruction, "Unsupported LIR instruction kind: " + instruction.Kind + ".");
+                        throw Unsupported(instruction, $"Unsupported LIR instruction kind: {instruction.Kind}.");
+                }
+            }
+
+            private void EmitInlineAssembly(LirInstruction instruction)
+            {
+                if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
+                {
+                    EmitInlineAssemblyText(instruction, instruction.Operator);
+                    return;
+                }
+
+                var operands = new List<InlineAsmFormattedOperand>();
+                var namedOperands = new Dictionary<string, int>(StringComparer.Ordinal);
+                var labels = new List<string>();
+                var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
+                var outputFinalizers = new List<Action>();
+                var operandIndex = 0;
+                var copyIndex = 0;
+
+                foreach (var output in asmStatement.Outputs)
+                {
+                    InlineAsmFormattedOperand formatted;
+                    var storage = output.Target is null
+                        ? InlineAsmOperandStorage.Register
+                        : InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type);
+                    if (storage == InlineAsmOperandStorage.Memory)
+                    {
+                        if (operandIndex >= instruction.Operands.Length)
+                            throw Unsupported(instruction, "Inline assembly output operand is missing from LIR.");
+                        var operand = instruction.Operands[operandIndex++];
+                        formatted = new InlineAsmFormattedOperand(output.Name, modifier => FormatRiscVAsmMemoryOperand(operand));
+                    }
+                    else
+                    {
+                        if (copyIndex >= instruction.ParallelCopies.Length)
+                            throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
+                        var destination = instruction.ParallelCopies[copyIndex++].Destination;
+                        formatted = CreateRiscVAsmOutputOperand(output, destination, instruction, outputFinalizers);
+                    }
+
+                    AddAsmOperand(operands, namedOperands, formatted);
+                }
+
+                foreach (var input in asmStatement.Inputs)
+                {
+                    if (operandIndex >= instruction.Operands.Length)
+                        throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
+
+                    var operand = instruction.Operands[operandIndex++];
+                    var formatted = CreateRiscVAsmInputOperand(input, operand, instruction);
+                    AddAsmOperand(operands, namedOperands, formatted);
+                }
+
+                foreach (var label in asmStatement.GotoLabels)
+                {
+                    if (operandIndex >= instruction.Operands.Length 
+                        || instruction.Operands[operandIndex].Kind != LirOperandKind.Label 
+                        || instruction.Operands[operandIndex].Label is null)
+                        throw Unsupported(instruction, "Inline assembly goto label is missing from LIR.");
+
+                    var text = LabelOf(instruction.Operands[operandIndex++].Label!);
+                    if (label.Symbol is not null && !namedLabels.ContainsKey(label.Symbol.Name))
+                        namedLabels.Add(label.Symbol.Name, labels.Count);
+                    if (!namedLabels.ContainsKey(label.Name))
+                        namedLabels.Add(label.Name, labels.Count);
+                    labels.Add(text);
+                }
+
+                var expanded = InlineAsmTemplateExpander.Expand(
+                    asmStatement.Text,
+                    operands,
+                    namedOperands,
+                    labels,
+                    namedLabels,
+                    _owner.CreateLocalLabel(_functionLabel + "_asm_id"));
+                EmitInlineAssemblyText(instruction, expanded);
+
+                foreach (var finalize in outputFinalizers)
+                    finalize();
+
+                if (asmStatement.IsGoto && instruction.Target is not null && !IsFallthroughTarget(instruction.Target))
+                    EmitJump(LabelOf(instruction.Target));
+            }
+
+            private void AddAsmOperand(List<InlineAsmFormattedOperand> operands, Dictionary<string, int> namedOperands, InlineAsmFormattedOperand operand)
+            {
+                if (operand.Name is not null && !namedOperands.ContainsKey(operand.Name))
+                    namedOperands.Add(operand.Name, operands.Count);
+                operands.Add(operand);
+            }
+
+            private InlineAsmFormattedOperand CreateRiscVAsmOutputOperand(
+                GimpleAsmOperand operand, LirVirtualRegister destination, LirInstruction instruction, List<Action> finalizers)
+            {
+                var fixedRegister = TryGetRiscVConstraintRegister(operand.Constraint, destination.Type);
+                if (fixedRegister.HasValue)
+                {
+                    if (operand.IsReadWrite)
+                        LoadOperandIntoAs(LirOperand.ForRegister(destination), fixedRegister.Value, destination.Type, instruction);
+                    finalizers.Add(() => StoreRiscVAsmOutput(destination, fixedRegister.Value));
+                    return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(fixedRegister.Value)));
+                }
+
+                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
+                    throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
+
+                var register = GetWritableRegister(destination, UsesHardwareFloating(destination.Type) ? FpScratch0 : GpScratch0);
+                finalizers.Add(() => StoreWritableRegisterIfSpilled(destination, register));
+                return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(register)));
+            }
+
+            private InlineAsmFormattedOperand CreateRiscVAsmInputOperand(GimpleAsmOperand operand, LirOperand value, LirInstruction instruction)
+            {
+                var storage = InlineAsmConstraints.PreferredStorage(operand.Constraint, value.Type);
+                if (storage == InlineAsmOperandStorage.Memory)
+                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatRiscVAsmMemoryOperand(value));
+                if (storage == InlineAsmOperandStorage.Immediate)
+                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatRiscVAsmImmediate(value));
+
+                var fixedRegister = TryGetRiscVConstraintRegister(operand.Constraint, value.Type);
+                if (fixedRegister.HasValue)
+                {
+                    LoadOperandIntoAs(value, fixedRegister.Value, value.Type, instruction);
+                    return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(fixedRegister.Value)));
+                }
+
+                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
+                    throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
+
+                var preferred = UsesHardwareFloating(value.Type) ? FpScratch1 : GpScratch1;
+                return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(LoadOperand(value, preferred))));
+            }
+
+            private void StoreRiscVAsmOutput(LirVirtualRegister destination, MachineRegister source)
+            {
+                var writable = GetWritableRegister(destination, source);
+                if (writable != source)
+                    MoveRegister(writable, source);
+                StoreWritableRegisterIfSpilled(destination, writable);
+            }
+
+            private MachineRegister? TryGetRiscVConstraintRegister(string constraint, QualifiedType type)
+            {
+                var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(constraint);
+                if (explicitRegister is null)
+                    return null;
+
+                var registerClass = CAbi.PreferredLirRegisterClass(_owner._target, type);
+                if (TargetRegisterInfo.TryParseExplicitRegister(_owner._target, explicitRegister, registerClass, out var register))
+                    return register;
+                return null;
+            }
+
+            private string FormatRiscVAsmMemoryOperand(LirOperand operand)
+            {
+                if (operand.Kind == LirOperandKind.Address && operand.Address is not null)
+                {
+                    var address = BuildAddress(operand.Address, GpScratch0, GpScratch1);
+                    return $"{address.Offset}({RVRegisters.Format(ToRegister(address.BaseRegister))})";
+                }
+
+                var register = LoadOperand(operand, GpScratch0);
+                return "0(" + RVRegisters.Format(ToRegister(register)) + ")";
+            }
+
+            private string FormatRiscVAsmImmediate(LirOperand operand)
+            {
+                switch (operand.Kind)
+                {
+                    case LirOperandKind.Immediate:
+                        return ConvertIntegerConstant(operand.Immediate).ToString(CultureInfo.InvariantCulture);
+                    case LirOperandKind.Symbol when operand.Symbol is not null:
+                        return _owner.GetSymbolLabel(operand.Symbol);
+                    default:
+                        return RVRegisters.Format(ToAnyRegister(LoadOperand(operand, GpScratch1)));
+                }
+            }
+
+
+            private void EmitInlineAssemblyText(LirInstruction instruction, string text)
+            {
+                try
+                {
+                    _owner._text.EmitAssembly(text, _owner.CreateLocalLabel(_functionLabel + "_asm"), _owner._machineTarget);
+                }
+                catch (Exception ex) when (ex is FormatException or ArgumentException or InvalidOperationException)
+                {
+                    throw Unsupported(instruction, $"Invalid RISC-V inline assembly: {ex.Message}");
                 }
             }
 
@@ -578,7 +819,12 @@ namespace Cnidaria.C
                     }
                     else if (loc.Kind == AbiLocationKind.Stack)
                     {
-                        LoadFromMemory(GpScratch1, Sp, IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, signed: false);
+                        LoadFromMemory(
+                            GpScratch1, 
+                            Sp, 
+                            IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), 
+                            _owner._target.PointerSize, 
+                            signed: false);
                         CopyMemory(destinationAddress, GpScratch1, value.Size);
                     }
                     else
@@ -629,7 +875,8 @@ namespace Cnidaria.C
                 }
                 else if (scalarLocation.Kind == AbiLocationKind.Stack)
                 {
-                    LoadFromMemory(destination, Sp, IncomingStackOffset(scalarLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsSignedIntegerType(type));
+                    LoadFromMemory(destination, Sp, IncomingStackOffset(
+                        scalarLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsSignedIntegerType(type));
                     NormalizeScalarRegister(destination, type);
                 }
                 else
@@ -713,7 +960,8 @@ namespace Cnidaria.C
                     return;
 
                 if (RequiresSoftwareScalar(instruction.Result.Type) || RequiresSoftwareScalar(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), "Unary operation for scalar wider than one machine register is not implemented yet.");
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), 
+                        "Unary operation for scalar wider than one machine register is not implemented yet.");
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0);
                 var src = LoadOperand(instruction.Operands[0], GpScratch1);
@@ -747,7 +995,8 @@ namespace Cnidaria.C
                     return false;
 
                 if (!IsRv32WideInteger(instruction.Result.Type) || !IsRv32WideInteger(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type), "Unary operation requires an explicit wide integer conversion.");
+                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type), 
+                        "Unary operation requires an explicit wide integer conversion.");
 
                 LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
                 switch (instruction.Operator)
@@ -787,7 +1036,8 @@ namespace Cnidaria.C
                 }
 
                 if (!IsRv32WideInteger(instruction.Result.Type))
-                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), "Wide integer binary operation requires a wide integer result.");
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), 
+                        "Wide integer binary operation requires a wide integer result.");
 
                 switch (op)
                 {
@@ -1519,32 +1769,6 @@ namespace Cnidaria.C
 
             private void PrepareVariadicCall(LirInstruction instruction)
             {
-                var signature = instruction.CallSignature;
-                if (signature is null || !signature.IsVariadic)
-                    return;
-
-                var fixedCount = signature.Parameters.Length;
-                var firstVariadicOperand = 1 + fixedCount;
-                var variadicCount = instruction.Operands.Length - firstVariadicOperand;
-                if (variadicCount <= 0)
-                {
-                    MoveRegister(VarArgsRegister, MachineRegister.X0);
-                    return;
-                }
-
-                var normalArgumentBytes = CAbi.ComputeOutgoingArgumentAreaSize(
-                    instruction,
-                    startOperand: 1,
-                    _owner._target,
-                    _owner._allocationOptions.StackArgumentSlotSize,
-                    includeVariadicHomeArea: false);
-                var homeSlotSize = CAbi.VariadicHomeSlotSize(_owner._target, _owner._allocationOptions.StackArgumentSlotSize);
-                var baseOffset = checked(_allocation.Frame.OutgoingArgumentAreaOffset + AlignUp(normalArgumentBytes, homeSlotSize));
-
-                for (var i = 0; i < variadicCount; i++)
-                    StoreVariadicHomeValue(instruction, instruction.Operands[firstVariadicOperand + i], checked(baseOffset + i * homeSlotSize), homeSlotSize);
-
-                AddImmediate(VarArgsRegister, Sp, baseOffset);
             }
 
             private void StoreVariadicHomeValue(LirInstruction instruction, LirOperand operand, int offset, int homeSlotSize)
@@ -1680,7 +1904,8 @@ namespace Cnidaria.C
                     return GpScratch0;
                 }
 
-                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Floating-point argument bit move to an integer ABI register requires a runtime helper.");
+                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), 
+                    "Floating-point argument bit move to an integer ABI register requires a runtime helper.");
             }
 
             private void StoreArgumentValue(MachineRegister source, AbiLocation location, int size)
@@ -1758,6 +1983,17 @@ namespace Cnidaria.C
 
             private void EmitVaStart(LirInstruction instruction)
             {
+                if (instruction.Operands.Length == 1)
+                {
+                    var ap = LoadOperand(instruction.Operands[0], GpScratch0);
+                    if (_allocation.Frame.HasVarArgsPointer)
+                        LoadFromMemory(GpScratch1, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize, signed: false);
+                    else
+                        MoveRegister(GpScratch1, MachineRegister.X0);
+                    StoreRegister(GpScratch1, ap, 0, _owner._target.PointerSize);
+                    return;
+                }
+
                 if (instruction.Result is null)
                     return;
                 var destination = GetWritableRegister(instruction.Result, GpScratch0);
@@ -1766,6 +2002,34 @@ namespace Cnidaria.C
                 else
                     MoveRegister(destination, MachineRegister.X0);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void EmitVaArg(LirInstruction instruction)
+            {
+                if (instruction.Operands.Length != 4)
+                    throw Unsupported(instruction, "VaArg expects a va_list pointer, kind, size, and alignment.");
+                if (instruction.Result is null)
+                    return;
+
+                var size = Math.Max(1, ImmediateToInt32(instruction.Operands[2]));
+                var align = Math.Max(1, ImmediateToInt32(instruction.Operands[3]));
+                var ap = LoadOperand(instruction.Operands[0], GpScratch0);
+                LoadFromMemory(GpScratch1, ap, 0, _owner._target.PointerSize, signed: false);
+                AlignPointerRegister(GpScratch1, align);
+                var destination = GetWritableRegister(instruction.Result, GpScratch0);
+                MoveRegister(destination, GpScratch1);
+                AddImmediate(GpScratch1, GpScratch1, AlignUp(size, _owner._target.PointerSize));
+                StoreRegister(GpScratch1, ap, 0, _owner._target.PointerSize);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void AlignPointerRegister(MachineRegister register, int alignment)
+            {
+                if (alignment <= 1)
+                    return;
+                AddImmediate(register, register, alignment - 1);
+                LoadImmediate(GpScratch2, -alignment);
+                Emit(RVInstruction.R(RVInstrKind.And, ToRegister(register), ToRegister(register), ToRegister(GpScratch2)));
             }
 
             private void EmitBranch(LirInstruction instruction)
@@ -3027,6 +3291,8 @@ namespace Cnidaria.C
                     return (RVRegister)(int)register;
                 if (register >= MachineRegister.F0 && register <= MachineRegister.F31)
                     return (RVRegister)(int)register;
+                if (register >= MachineRegister.V0 && register <= MachineRegister.V31)
+                    return (RVRegister)(int)register;
                 throw new NotSupportedException("Unsupported machine register for instruction emission.");
             }
 
@@ -3124,6 +3390,54 @@ namespace Cnidaria.C
             {
                 _instructions.Add(instruction);
                 CurrentLabel = string.Empty;
+            }
+
+            public void EmitAssembly(string text, string labelPrefix, RVTarget target)
+            {
+                var program = RiscVAssembler.Assemble(text ?? string.Empty, target);
+                var renamedLabels = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var label in program.Text.Labels.Keys)
+                    renamedLabels[label] = labelPrefix + "_" + SanitizeSymbolName(label);
+
+                var labelsByOffset = new Dictionary<int, List<string>>();
+                foreach (var pair in program.Text.Labels)
+                {
+                    if (!labelsByOffset.TryGetValue(pair.Value, out var labels))
+                    {
+                        labels = new List<string>();
+                        labelsByOffset.Add(pair.Value, labels);
+                    }
+
+                    labels.Add(renamedLabels[pair.Key]);
+                }
+
+                var offset = 0;
+                foreach (var instruction in program.Text.Instructions)
+                {
+                    DefineInlineLabels(labelsByOffset, offset);
+                    Emit(RewriteInlineLabelReference(instruction, renamedLabels));
+                    offset = checked(offset + 4);
+                }
+
+                DefineInlineLabels(labelsByOffset, offset);
+            }
+
+            private void DefineInlineLabels(Dictionary<int, List<string>> labelsByOffset, int offset)
+            {
+                if (!labelsByOffset.TryGetValue(offset, out var labels))
+                    return;
+
+                foreach (var label in labels)
+                    DefineLabel(label);
+            }
+
+            private static RVInstruction RewriteInlineLabelReference(
+                RVInstruction instruction,
+                IReadOnlyDictionary<string, string> renamedLabels)
+            {
+                return instruction.Symbol is not null && renamedLabels.TryGetValue(instruction.Symbol, out var replacement)
+                    ? instruction.WithSymbol(replacement, instruction.RelocationKind)
+                    : instruction;
             }
 
             public void AddRelocation(int offset, string symbol, int addend, RVObjectRelocationKind kind)

@@ -895,6 +895,19 @@ namespace Cnidaria.C
                         AddMemoryDefinitionBlock(block);
                     break;
 
+                case GimpleAsmStatement asmStatement:
+                    foreach (var output in asmStatement.Outputs)
+                    {
+                        if (output.Target is not null &&
+                            InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Memory &&
+                            TryGetVariable(output.Target, out var outputVariable))
+                            _definitionBlocks[outputVariable].Add(block);
+                        else
+                            AddMemoryDefinitionBlock(block);
+                    }
+                    AddMemoryDefinitionBlock(block);
+                    break;
+
                 case GimpleConditionalGotoStatement conditional:
                     if (ExpressionWritesMemory(conditional.Condition))
                         AddMemoryDefinitionBlock(block);
@@ -1040,6 +1053,38 @@ namespace Cnidaria.C
                     CollectValueLiveUses(expressionStatement.Expression, uses, defs);
                     if (_memoryVariable is not null && ExpressionWritesMemory(expressionStatement.Expression))
                         defs.Add(_memoryVariable);
+                    break;
+
+                case GimpleAsmStatement asmStatement:
+                    foreach (var output in asmStatement.Outputs)
+                    {
+                        if (output.IsReadWrite && output.Value is not null)
+                            CollectValueLiveUses(output.Value, uses, defs);
+
+                        if (output.Target is null)
+                            continue;
+
+                        if (InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Memory &&
+                            TryGetVariable(output.Target, out var outputVariable))
+                            defs.Add(outputVariable);
+                        else
+                            CollectPlaceAddressLiveUses(output.Target, uses, defs);
+                    }
+
+                    foreach (var input in asmStatement.Inputs)
+                    {
+                        if (input.Value is GimplePlace inputPlace &&
+                            InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) == InlineAsmOperandStorage.Memory)
+                            CollectPlaceAddressLiveUses(inputPlace, uses, defs);
+                        else if (input.Value is not null)
+                            CollectValueLiveUses(input.Value, uses, defs);
+                    }
+
+                    if (_memoryVariable is not null)
+                    {
+                        uses.Add(_memoryVariable);
+                        defs.Add(_memoryVariable);
+                    }
                     break;
 
                 case GimpleConditionalGotoStatement conditional:
@@ -1342,6 +1387,32 @@ namespace Cnidaria.C
                     expressions.Add(RewriteValue(expressionStatement.Expression, uses));
                     break;
 
+                case GimpleAsmStatement asmStatement:
+                    foreach (var output in asmStatement.Outputs)
+                    {
+                        if (output.IsReadWrite && output.Value is not null)
+                            expressions.Add(RewriteValue(output.Value, uses));
+                        if (output.Target is not null &&
+                            (InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) == InlineAsmOperandStorage.Memory ||
+                             !TryGetVariable(output.Target, out _)))
+                        {
+                            expressions.Add(RewritePlaceAddress(output.Target, uses));
+                            explicitMemoryWrite = true;
+                        }
+                    }
+
+                    foreach (var input in asmStatement.Inputs)
+                    {
+                        if (input.Value is GimplePlace inputPlace &&
+                            InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) == InlineAsmOperandStorage.Memory)
+                            expressions.Add(RewritePlaceAddress(inputPlace, uses));
+                        else if (input.Value is not null)
+                            expressions.Add(RewriteValue(input.Value, uses));
+                    }
+
+                    flags |= SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall;
+                    break;
+
                 case GimpleConditionalGotoStatement conditional:
                     expressions.Add(RewriteValue(conditional.Condition, uses));
                     break;
@@ -1392,6 +1463,20 @@ namespace Cnidaria.C
                         var definition = PushDefinition(targetVariable, SsaDefinitionKind.Statement, block, statement, zeroInitialize.Target, parameter: null);
                         definitions.Add(definition);
                         pushed.Add(targetVariable);
+                    }
+                    break;
+
+                case GimpleAsmStatement asmStatement:
+                    foreach (var output in asmStatement.Outputs)
+                    {
+                        if (output.Target is not null &&
+                            InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Memory &&
+                            TryGetVariable(output.Target, out var outputVariable))
+                        {
+                            var definition = PushDefinition(outputVariable, SsaDefinitionKind.Statement, block, statement, output.Target, parameter: null);
+                            definitions.Add(definition);
+                            pushed.Add(outputVariable);
+                        }
                     }
                     break;
             }
