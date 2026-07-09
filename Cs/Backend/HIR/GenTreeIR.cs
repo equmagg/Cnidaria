@@ -957,9 +957,7 @@ namespace Cnidaria.Cs
             {
                 if (Kind is GenTreeKind.GcPoll or GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill or GenTreeKind.StackFrameOp)
                     return false;
-                return GenTreeLinearLoweringClassifier
-                    .Classify(this, RegisterResult, RegisterUses)
-                    .HasFlag(GenTreeLinearFlags.CallerSavedKill);
+                return HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill);
             }
         }
 
@@ -1202,7 +1200,7 @@ namespace Cnidaria.Cs
     }
     internal static class GenTreeArithmeticSemantics
     {
-        public static bool BinaryOperationCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands)
+        public static bool BinaryOperationCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
         {
             if (sourceOp is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
                 or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
@@ -1210,19 +1208,19 @@ namespace Cnidaria.Cs
                 return true;
 
             if (sourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
-                return DivRemCanThrow(sourceOp, type, stackKind, operands);
+                return DivRemCanThrow(sourceOp, type, stackKind, operands, target);
 
             return false;
         }
 
-        public static bool DivRemCanThrow(GenTree node)
+        public static bool DivRemCanThrow(GenTree node, TargetInfo target)
         {
             if (node.Kind != GenTreeKind.Binary)
                 return false;
-            return DivRemCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands);
+            return DivRemCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
         }
 
-        public static bool DivRemCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands)
+        public static bool DivRemCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
         {
             if (sourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
                 return false;
@@ -1233,7 +1231,7 @@ namespace Cnidaria.Cs
             if (operands.Length < 2)
                 return true;
 
-            int bits = IntegralBits(type, stackKind);
+            int bits = IntegralBits(type, stackKind, target);
             if (!TryGetIntegralConstant(operands[1], bits, out long signedDivisor, out ulong unsignedDivisor))
                 return true;
 
@@ -1274,22 +1272,22 @@ namespace Cnidaria.Cs
             return stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt;
         }
 
-        public static bool Is64BitIntegral(RuntimeType? type, GenStackKind stackKind)
-            => IntegralBits(type, stackKind) == 64;
-
-        public static int IntegralBits(RuntimeType? type, GenStackKind stackKind)
+        public static int IntegralBits(RuntimeType? type, GenStackKind stackKind, TargetInfo target)
         {
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
+
             if (stackKind == GenStackKind.I8)
                 return 64;
             if (stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt)
-                return TargetArchitecture.PointerSize == 8 ? 64 : 32;
+                return target.PointerSize == 8 ? 64 : 32;
 
             if (type is not null)
             {
                 if (type.PrimitiveKind is RuntimePrimitiveKind.Int64 or RuntimePrimitiveKind.UInt64)
                     return 64;
                 if (type.PrimitiveKind is RuntimePrimitiveKind.IntPtr or RuntimePrimitiveKind.UIntPtr)
-                    return TargetArchitecture.PointerSize == 8 ? 64 : 32;
+                    return target.PointerSize == 8 ? 64 : 32;
             }
 
             return 32;
@@ -1512,6 +1510,7 @@ namespace Cnidaria.Cs
     {
         public RuntimeModule Module { get; }
         public RuntimeMethod RuntimeMethod { get; }
+        public TargetInfo Target { get; }
         public BytecodeFunction Function { get; }
         public ImmutableArray<RuntimeType> ArgTypes { get; }
         public ImmutableArray<RuntimeType> LocalTypes { get; }
@@ -1559,6 +1558,7 @@ namespace Cnidaria.Cs
         public GenTreeMethod(
             RuntimeModule module,
             RuntimeMethod runtimeMethod,
+            TargetInfo target,
             BytecodeFunction function,
             ImmutableArray<RuntimeType> argTypes,
             ImmutableArray<RuntimeType> localTypes,
@@ -1569,6 +1569,7 @@ namespace Cnidaria.Cs
         {
             Module = module;
             RuntimeMethod = runtimeMethod;
+            Target = target ?? throw new ArgumentNullException(nameof(target));
             Function = function;
             ArgTypes = argTypes.IsDefault ? ImmutableArray<RuntimeType>.Empty : argTypes;
             LocalTypes = localTypes.IsDefault ? ImmutableArray<RuntimeType>.Empty : localTypes;
@@ -1592,6 +1593,7 @@ namespace Cnidaria.Cs
             var clone = new GenTreeMethod(
                 Module,
                 RuntimeMethod,
+                Target,
                 Function,
                 ArgTypes,
                 LocalTypes,
@@ -1779,6 +1781,7 @@ namespace Cnidaria.Cs
             var temps = TempDescriptors.ToBuilder();
             int nextLclNum = AllLocalDescriptors.Length;
             bool changed = false;
+            var target = Target;
 
             PromoteFrom(args, GenLocalKind.Argument, ref nextLclNum, ref changed);
             PromoteFrom(locals, GenLocalKind.Local, ref nextLclNum, ref changed);
@@ -1792,7 +1795,7 @@ namespace Cnidaria.Cs
             TempDescriptors = temps.ToImmutable();
             AllLocalDescriptors = BuildAllLocalDescriptors(ArgDescriptors, LocalDescriptors, TempDescriptors);
 
-            static void PromoteFrom(ImmutableArray<GenLocalDescriptor>.Builder descriptors, GenLocalKind kind, ref int nextLclNum, ref bool changed)
+            void PromoteFrom(ImmutableArray<GenLocalDescriptor>.Builder descriptors, GenLocalKind kind, ref int nextLclNum, ref bool changed)
             {
                 int originalCount = descriptors.Count;
                 for (int i = 0; i < originalCount; i++)
@@ -1885,7 +1888,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            static bool CanPromoteField(RuntimeField field)
+            bool CanPromoteField(RuntimeField field)
             {
                 if (field.IsStatic)
                     return false;
@@ -1896,7 +1899,7 @@ namespace Cnidaria.Cs
                     return false;
                 if (field.FieldType.IsValueType && field.FieldType.ContainsGcPointers)
                     return false;
-                return MachineAbi.IsPhysicallyPromotableStorage(field.FieldType, stackKind) ||
+                return MachineAbi.IsPhysicallyPromotableStorage(field.FieldType, stackKind, target) ||
                        stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Ptr or GenStackKind.NativeInt or GenStackKind.NativeUInt;
             }
 

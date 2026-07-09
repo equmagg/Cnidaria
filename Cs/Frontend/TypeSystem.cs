@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace Cnidaria.Cs
@@ -699,14 +698,119 @@ namespace Cnidaria.Cs
         }
     }
 
-    public static class TargetArchitecture
+    
+    
+    public sealed class TargetInfo
     {
-        public const int PointerSize = 4;
-        public const int GeneralRegisterSize = 8;
-        public const int FloatingRegisterSize = 8;
-        public const int StackSlotSize = 8;
-        public const int StackAlignment = 8;
-        public const int CallFrameAlignment = 16;
+        public static TargetInfo RegisterBytecode32Bit { get; } = CreateRegisterBytecode(pointerSize: 4);
+        public static TargetInfo RegisterBytecode64Bit { get; } = CreateRegisterBytecode(pointerSize: 8);
+        public static TargetInfo CreateRegisterBytecode(int pointerSize) => new TargetInfo(
+            architecture: TargetArchitectureKind.RegisterBytecode,
+            pointerSize: pointerSize,
+            generalRegisterSize: TargetArchitecture.GeneralRegisterSize,
+            floatingRegisterSize: TargetArchitecture.FloatingRegisterSize,
+            stackSlotSize: TargetArchitecture.StackSlotSize,
+            stackAlignment: TargetArchitecture.StackAlignment,
+            callFrameAlignment: TargetArchitecture.CallFrameAlignment);
+        public static TargetInfo RiscV32 { get; } = ForArchitecture(TargetArchitectureKind.RiscV32);
+        public static TargetInfo RiscV64 { get; } = ForArchitecture(TargetArchitectureKind.RiscV64);
+        public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.X86);
+        public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
+        public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
+        public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
+
+        public static TargetInfo Default => TargetArchitecture.PointerSize == 4 ? RegisterBytecode32Bit : RegisterBytecode64Bit;
+        public static TargetInfo Default32Bit => RegisterBytecode32Bit;
+        public static TargetInfo Default64Bit => RegisterBytecode64Bit;
+        public static TargetInfo ForArchitecture(TargetArchitectureKind architecture, TargetArchitectureFeatures features = TargetArchitectureFeatures.None)
+        {
+            return architecture switch
+            {
+                TargetArchitectureKind.RegisterBytecode => RegisterBytecode32Bit.WithFeatures(features),
+                TargetArchitectureKind.RegisterBytecode64 => RegisterBytecode64Bit.WithFeatures(features),
+                TargetArchitectureKind.X86 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 4, 16, architectureFeatures: features
+                | TargetArchitectureFeatures.X86Sse2),
+                TargetArchitectureKind.X64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
+                | TargetArchitectureFeatures.X86Sse2),
+                TargetArchitectureKind.RiscV32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 16, 16, architectureFeatures: features
+                | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF),
+                TargetArchitectureKind.RiscV64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
+                | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVD),
+                TargetArchitectureKind.Arm32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 8, 8, architectureFeatures: features),
+                TargetArchitectureKind.Arm64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
+                 | TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat),
+                _ => throw new ArgumentOutOfRangeException(nameof(architecture))
+            };
+        }
+        public TargetArchitectureKind Architecture { get; }
+        public TargetArchitectureFeatures ArchitectureFeatures { get; }
+        public TargetEndianness Endianness { get; }
+        public OperatingSystemKind OperatingSystem { get; }
+        public int PointerSize { get; }
+        public int GeneralRegisterSize { get; }
+        public int FloatingRegisterSize { get; }
+        public int StackSlotSize { get; }
+        public int StackAlignment { get; }
+        public int CallFrameAlignment { get; }
+        public int ObjectHeaderSize => PointerSize * 2;
+        public bool Is32Bit => PointerSize == 4;
+        public bool Is64Bit => PointerSize == 8;
+        public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
+        public bool IsRiscV => Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;
+        public bool IsX86 => Architecture is TargetArchitectureKind.X86 or TargetArchitectureKind.X64;
+        public bool IsArm => Architecture is TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
+        public TargetInfo(
+            TargetArchitectureKind architecture,
+            int pointerSize,
+            int generalRegisterSize,
+            int floatingRegisterSize,
+            int stackSlotSize,
+            int stackAlignment,
+            int callFrameAlignment,
+            TargetEndianness endianness = TargetEndianness.Little,
+            OperatingSystemKind operatingSystem = OperatingSystemKind.None,
+            TargetArchitectureFeatures architectureFeatures = TargetArchitectureFeatures.None)
+        {
+            if (pointerSize is not 4 and not 8)
+                throw new ArgumentOutOfRangeException(nameof(pointerSize));
+            if (generalRegisterSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(generalRegisterSize));
+            if (floatingRegisterSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(floatingRegisterSize));
+            if (stackSlotSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(stackSlotSize));
+            if (stackAlignment <= 0)
+                throw new ArgumentOutOfRangeException(nameof(stackAlignment));
+            if (callFrameAlignment <= 0)
+                throw new ArgumentOutOfRangeException(nameof(callFrameAlignment));
+
+            Architecture = architecture;
+            ArchitectureFeatures = architectureFeatures;
+            Endianness = endianness;
+            OperatingSystem = operatingSystem;
+            PointerSize = pointerSize;
+            GeneralRegisterSize = generalRegisterSize;
+            FloatingRegisterSize = floatingRegisterSize;
+            StackSlotSize = stackSlotSize;
+            StackAlignment = stackAlignment;
+            CallFrameAlignment = callFrameAlignment;
+        }
+
+        public TargetInfo WithFeatures(TargetArchitectureFeatures features)
+            => new TargetInfo(
+                Architecture,
+                PointerSize,
+                GeneralRegisterSize,
+                FloatingRegisterSize,
+                StackSlotSize,
+                StackAlignment,
+                CallFrameAlignment,
+                Endianness,
+                OperatingSystem,
+                features);
+
+        public override string ToString()
+            => Architecture.ToString();
     }
     public sealed class RuntimeTypeSystem
     {
@@ -732,7 +836,8 @@ namespace Cnidaria.Cs
 
 
 
-        private const int ObjectHeaderSize = TargetArchitecture.PointerSize * 2;
+        public TargetInfo Target { get; }
+        private readonly int ObjectHeaderSize;
         private readonly HashSet<int> _layoutDone = new();
         internal RuntimeType SystemObject { get; private set; } = null!;
         internal RuntimeType SystemString { get; private set; } = null!;
@@ -741,9 +846,11 @@ namespace Cnidaria.Cs
         internal RuntimeType SystemEnum { get; private set; } = null!;
         private readonly Dictionary<string, RuntimeType> _constructedTypes = new(StringComparer.Ordinal);
         private readonly Dictionary<string, RuntimeMethod> _constructedMethods = new(StringComparer.Ordinal);
-        public RuntimeTypeSystem(IReadOnlyDictionary<string, RuntimeModule> modules)
+        public RuntimeTypeSystem(IReadOnlyDictionary<string, RuntimeModule> modules, TargetInfo? target = null)
         {
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
+            Target = target ?? TargetInfo.Default;
+            ObjectHeaderSize = Target.ObjectHeaderSize;
 
             PrecreateAllTypeDefs();
             IndexWellKnownCoreTypes();
@@ -1429,9 +1536,9 @@ namespace Cnidaria.Cs
             var t = new RuntimeType(_nextTypeId++, kind, asm, ns, name);
             if (kind == RuntimeTypeKind.Class && SystemObject is not null && !(ns == "System" && name == "Object"))
                 t.BaseType = SystemObject;
-            t.SizeOf = TargetArchitecture.PointerSize;
-            t.AlignOf = TargetArchitecture.PointerSize;
-            t.InstanceSize = kind == RuntimeTypeKind.Class ? TargetArchitecture.PointerSize : 0;
+            t.SizeOf = Target.PointerSize;
+            t.AlignOf = Target.PointerSize;
+            t.InstanceSize = kind == RuntimeTypeKind.Class ? Target.PointerSize : 0;
             t.StaticSize = 0;
             t.StaticAlign = 1;
 
@@ -1528,7 +1635,7 @@ namespace Cnidaria.Cs
                 t.PrimitiveKind = primitiveKind;
                 t.SizeOf = primSize;
                 t.AlignOf = primAlign;
-                t.InstanceSize = t.IsReferenceType ? TargetArchitecture.PointerSize : primSize;
+                t.InstanceSize = t.IsReferenceType ? Target.PointerSize : primSize;
                 t.ContainsGcPointers = false;
                 t.GcPointerOffsets = Array.Empty<int>();
                 LayoutStaticFields(t);
@@ -1541,25 +1648,25 @@ namespace Cnidaria.Cs
             switch (t.Kind)
             {
                 case RuntimeTypeKind.TypeParam:
-                    t.SizeOf = TargetArchitecture.PointerSize;
-                    t.AlignOf = TargetArchitecture.PointerSize;
-                    t.InstanceSize = TargetArchitecture.PointerSize;
+                    t.SizeOf = Target.PointerSize;
+                    t.AlignOf = Target.PointerSize;
+                    t.InstanceSize = Target.PointerSize;
                     t.ContainsGcPointers = true;
                     t.GcPointerOffsets = new[] { 0 };
                     LayoutStaticFields(t);
                     return;
                 case RuntimeTypeKind.Pointer:
-                    t.SizeOf = TargetArchitecture.PointerSize;
-                    t.AlignOf = TargetArchitecture.PointerSize;
-                    t.InstanceSize = TargetArchitecture.PointerSize;
+                    t.SizeOf = Target.PointerSize;
+                    t.AlignOf = Target.PointerSize;
+                    t.InstanceSize = Target.PointerSize;
                     t.ContainsGcPointers = false;
                     t.GcPointerOffsets = Array.Empty<int>();
                     LayoutStaticFields(t);
                     return;
                 case RuntimeTypeKind.ByRef:
-                    t.SizeOf = TargetArchitecture.PointerSize;
-                    t.AlignOf = TargetArchitecture.PointerSize;
-                    t.InstanceSize = TargetArchitecture.PointerSize;
+                    t.SizeOf = Target.PointerSize;
+                    t.AlignOf = Target.PointerSize;
+                    t.InstanceSize = Target.PointerSize;
                     t.ContainsGcPointers = true;
                     t.GcPointerOffsets = new[] { 0 };
                     LayoutStaticFields(t);
@@ -1569,8 +1676,8 @@ namespace Cnidaria.Cs
                 case RuntimeTypeKind.Interface:
                 case RuntimeTypeKind.Class:
                     {
-                        t.SizeOf = TargetArchitecture.PointerSize;
-                        t.AlignOf = TargetArchitecture.PointerSize;
+                        t.SizeOf = Target.PointerSize;
+                        t.AlignOf = Target.PointerSize;
                         t.ContainsGcPointers = true;
                         t.GcPointerOffsets = new[] { 0 };
 
@@ -1580,7 +1687,7 @@ namespace Cnidaria.Cs
                             ? t.BaseType.InstanceSize
                             : ObjectHeaderSize;
 
-                        int maxAlign = TargetArchitecture.PointerSize;
+                        int maxAlign = Target.PointerSize;
 
                         for (int i = 0; i < t.InstanceFields.Length; i++)
                         {
@@ -1850,18 +1957,18 @@ namespace Cnidaria.Cs
             EnsureLayout(fieldType);
 
             if (fieldType.Kind == RuntimeTypeKind.TypeParam)
-                return (TargetArchitecture.PointerSize, TargetArchitecture.PointerSize);
+                return (Target.PointerSize, Target.PointerSize);
 
             // reference types stored as pointers
             if (fieldType.IsReferenceType)
-                return (TargetArchitecture.PointerSize, TargetArchitecture.PointerSize);
+                return (Target.PointerSize, Target.PointerSize);
 
             if (fieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
-                return (TargetArchitecture.PointerSize, TargetArchitecture.PointerSize);
+                return (Target.PointerSize, Target.PointerSize);
 
             return (fieldType.SizeOf, fieldType.AlignOf);
         }
-        private static bool TryGetPrimitiveLayout(RuntimeType t, out int size, out int align, out RuntimePrimitiveKind primitiveKind)
+        private bool TryGetPrimitiveLayout(RuntimeType t, out int size, out int align, out RuntimePrimitiveKind primitiveKind)
         {
             size = 0;
             align = 0;
@@ -1884,8 +1991,8 @@ namespace Cnidaria.Cs
                 case "UInt64": primitiveKind = RuntimePrimitiveKind.UInt64; size = 8; align = 8; return true;
                 case "Double": primitiveKind = RuntimePrimitiveKind.Double; size = 8; align = 8; return true;
                 case "Decimal": primitiveKind = RuntimePrimitiveKind.Decimal; size = 16; align = 8; return true;
-                case "IntPtr": primitiveKind = RuntimePrimitiveKind.IntPtr; size = TargetArchitecture.PointerSize; align = TargetArchitecture.PointerSize; return true;
-                case "UIntPtr": primitiveKind = RuntimePrimitiveKind.UIntPtr; size = TargetArchitecture.PointerSize; align = TargetArchitecture.PointerSize; return true;
+                case "IntPtr": primitiveKind = RuntimePrimitiveKind.IntPtr; size = Target.PointerSize; align = Target.PointerSize; return true;
+                case "UIntPtr": primitiveKind = RuntimePrimitiveKind.UIntPtr; size = Target.PointerSize; align = Target.PointerSize; return true;
                 default:
                     return false;
             }

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -177,7 +178,96 @@ namespace Cnidaria.C
                     ? new Dictionary<string, string>(StringComparer.Ordinal)
                     : new Dictionary<string, string>(extraPredefinedMacros, StringComparer.Ordinal));
         }
+        public static PreprocessorEnvironment ForTarget(
+            TargetInfo target, IReadOnlyDictionary<string, string>? extraPredefinedMacros = null)
+        {
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
 
+            var macros = extraPredefinedMacros is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(extraPredefinedMacros, StringComparer.Ordinal);
+
+            var architecture = target.Architecture switch
+            {
+                TargetArchitectureKind.RiscV32 => "riscv32",
+                TargetArchitectureKind.RiscV64 => "riscv64",
+                TargetArchitectureKind.X86 => "x86",
+                TargetArchitectureKind.X64 => "x64",
+                TargetArchitectureKind.Arm32 => "arm",
+                TargetArchitectureKind.Arm64 => "arm64",
+                _ => target.PointerSize == 8 ? "unknown64" : "unknown32",
+            };
+
+            var operatingSystem = target.OperatingSystem switch 
+            { 
+                OperatingSystemKind.None => "unknown",
+                OperatingSystemKind.Windows => "windows",
+                OperatingSystemKind.Linux => "linux",
+                OperatingSystemKind.MacOs => "macos",
+                OperatingSystemKind.FreeBsd => "freebsd",
+                OperatingSystemKind.Unix => "unix",
+                _ => "unknown"
+            };
+
+            if (target.IsRiscV)
+            {
+                macros["__riscv"] = "1";
+                macros["__riscv_xlen"] = (target.PointerSize * 8).ToString();
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVM) != 0)
+                    macros["__riscv_mul"] = "1";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVA) != 0)
+                    macros["__riscv_atomic"] = "1";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)
+                    macros["__riscv_flen"] = "32";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)
+                    macros["__riscv_flen"] = "64";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVC) != 0)
+                    macros["__riscv_compressed"] = "1";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVV) != 0)
+                    macros["__riscv_vector"] = "1";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)
+                    macros["__riscv_float_abi_double"] = "1";
+                else if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)
+                    macros["__riscv_float_abi_single"] = "1";
+                else
+                    macros["__riscv_float_abi_soft"] = "1";
+            }
+
+            if (target.Architecture == TargetArchitectureKind.Arm32)
+            {
+                macros["__ARM_ARCH"] = "7";
+                macros["__ARM_32BIT_STATE"] = "1";
+                if (target.HasFeature(TargetArchitectureFeatures.ArmVfp))
+                    macros["__VFP_FP__"] = "1";
+                if (target.HasFeature(TargetArchitectureFeatures.ArmNeon))
+                    macros["__ARM_NEON"] = "1";
+                if (target.HasFeature(TargetArchitectureFeatures.ArmVfpD32))
+                    macros["__ARM_VFPV3_D32__"] = "1";
+                if (target.HasFeature(TargetArchitectureFeatures.ArmHardFloat))
+                    macros["__ARM_PCS_VFP"] = "1";
+                else
+                    macros["__SOFTFP__"] = "1";
+            }
+
+            if (target.Architecture == TargetArchitectureKind.Arm64)
+            {
+                macros["__ARM_ARCH"] = "8";
+                macros["__ARM_ARCH_ISA_A64"] = "1";
+                macros["__ARM_FEATURE_FMA"] = "1";
+                macros["__ARM_NEON"] = "1";
+            }
+
+            if (target.IsX86 &&
+                (target.ArchitectureFeatures & TargetArchitectureFeatures.X86Sse2) != 0)
+            {
+                macros["__SSE__"] = "1";
+                macros["__SSE__"] = "1";
+                macros["_M_IX86_FP"] = "2";
+            }
+
+            return new PreprocessorEnvironment(operatingSystem, architecture, macros);
+        }
 
         internal IReadOnlyDictionary<string, string> CreatePredefinedMacros()
         {
@@ -235,18 +325,34 @@ namespace Cnidaria.C
                 case "arm":
                     macros["__arm__"] = "1";
                     macros["_M_ARM"] = "7";
+                    macros["__ARM_ARCH"] = "7";
+                    macros["__ARM_32BIT_STATE"] = "1";
                     break;
 
                 case "arm64":
                 case "aarch64":
                     macros["__aarch64__"] = "1";
                     macros["_M_ARM64"] = "1";
+                    macros["__ARM_ARCH"] = "8";
+                    macros["__ARM_ARCH_ISA_A64"] = "1";
                     break;
 
                 case "wasm":
                 case "wasm32":
                     macros["__wasm__"] = "1";
                     macros["__wasm32__"] = "1";
+                    break;
+
+                case "riscv32":
+                case "rv32":
+                    macros["__riscv"] = "1";
+                    macros["__riscv_xlen"] = "32";
+                    break;
+
+                case "riscv64":
+                case "rv64":
+                    macros["__riscv"] = "1";
+                    macros["__riscv_xlen"] = "64";
                     break;
             }
 
@@ -619,7 +725,28 @@ namespace Cnidaria.C
 
         public static PreprocessorOptions CreateDefault(string? filePath = null)
             => new PreprocessorOptions(filePath: filePath);
+        public static PreprocessorOptions CreateForTarget(
+            TargetInfo target,
+            string? filePath = null,
+            IEnumerable<IncludeFile>? includeFiles = null,
+            IEnumerable<string>? includeSearchPaths = null,
+            IIncludeResolver? includeResolver = null,
+            IReadOnlyDictionary<string, string>? predefinedMacros = null,
+            bool includeStandardHeaders = true)
+        {
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
 
+            var environment = PreprocessorEnvironment.ForTarget(target);
+            return new PreprocessorOptions(
+                filePath,
+                environment,
+                predefinedMacros,
+                includeSearchPaths,
+                includeResolver,
+                includeFiles,
+                includeStandardHeaders: includeStandardHeaders);
+        }
         public static PreprocessorOptions CreateForInMemoryFiles(
             string? filePath = null,
             IEnumerable<IncludeFile>? includeFiles = null,

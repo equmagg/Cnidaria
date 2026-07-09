@@ -1,11 +1,49 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
-using System.Xml.Linq;
 
-namespace Cnidaria.Cs
+namespace Cnidaria
 {
+    public enum TargetEndianness : byte { Little, Big }
+    public enum OperatingSystemKind : byte { None, Windows, Linux, MacOs, Unix, FreeBsd }
+    public enum TargetArchitectureKind : byte
+    {
+        RegisterBytecode,
+        RegisterBytecode64,
+        RiscV32,
+        RiscV64,
+        X86,
+        X64,
+        Arm32,
+        Arm64
+    }
+    [Flags]
+    public enum TargetArchitectureFeatures : ulong
+    {
+        None = 0,
+        RiscVM = 1UL << 0,
+        RiscVA = 1UL << 1,
+        RiscVF = 1UL << 2,
+        RiscVD = 1UL << 3,
+        RiscVC = 1UL << 4,
+        RiscVV = 1UL << 5,
+        RiscVPrivileged = 1UL << 6,
+        X86Sse2 = 1UL << 16,
+        X86Avx = 1UL << 17,
+        X86Avx2 = 1UL << 18,
+        ArmVfp = 1UL << 32,
+        ArmVfpD32 = 1UL << 33,
+        ArmNeon = 1UL << 34,
+        ArmHardFloat = 1UL << 35,
+    }
+
+    internal enum RegisterClass : byte
+    {
+        Invalid,
+        General,
+        Float,
+        Vector
+    }
     public enum MachineRegister : byte
     {
         X0 = 0,
@@ -74,7 +112,51 @@ namespace Cnidaria.Cs
         F30 = 62,
         F31 = 63,
 
-        Invalid = 255,
+        V0 = 64,
+        V1 = 65,
+        V2 = 66,
+        V3 = 67,
+        V4 = 68,
+        V5 = 69,
+        V6 = 70,
+        V7 = 71,
+        V8 = 72,
+        V9 = 73,
+        V10 = 74,
+        V11 = 75,
+        V12 = 76,
+        V13 = 77,
+        V14 = 78,
+        V15 = 79,
+        V16 = 80,
+        V17 = 81,
+        V18 = 82,
+        V19 = 83,
+        V20 = 84,
+        V21 = 85,
+        V22 = 86,
+        V23 = 87,
+        V24 = 88,
+        V25 = 89,
+        V26 = 90,
+        V27 = 91,
+        V28 = 92,
+        V29 = 93,
+        V30 = 94,
+        V31 = 95,
+
+        Invalid = 255
+    }
+
+    public static class TargetArchitecture
+    {
+        public const int PointerSize = 4;
+        public const int GeneralRegisterSize = 8;
+        public const int FloatingRegisterSize = 8;
+        public const int VectorRegisterSize = 16;
+        public const int StackSlotSize = 8;
+        public const int StackAlignment = 8;
+        public const int CallFrameAlignment = 16;
     }
     internal static class MachineRegisters
     {
@@ -100,6 +182,10 @@ namespace Cnidaria.Cs
         public const MachineRegister FloatParallelCopyScratch1 = MachineRegister.F31;
         public const MachineRegister FloatBackendScratch = MachineRegister.F29;
         public const MachineRegister FloatTreeScratch3 = MachineRegister.F28;
+        public const MachineRegister VectorParallelCopyScratch0 = MachineRegister.V30;
+        public const MachineRegister VectorParallelCopyScratch1 = MachineRegister.V31;
+        public const MachineRegister VectorBackendScratch = MachineRegister.V29;
+        public const MachineRegister VectorTreeScratch3 = MachineRegister.V28;
 
         public static ImmutableArray<MachineRegister> TreeScratchGprs { get; } = ImmutableArray.Create(
             BackendScratch,
@@ -112,6 +198,12 @@ namespace Cnidaria.Cs
             FloatParallelCopyScratch0,
             FloatParallelCopyScratch1,
             FloatTreeScratch3);
+
+        public static ImmutableArray<MachineRegister> TreeScratchVprs { get; } = ImmutableArray.Create(
+            VectorBackendScratch,
+            VectorParallelCopyScratch0,
+            VectorParallelCopyScratch1,
+            VectorTreeScratch3);
 
         public static ImmutableArray<MachineRegister> DefaultAllocatableGprs { get; } = ImmutableArray.Create(
             MachineRegister.X5,
@@ -167,6 +259,36 @@ namespace Cnidaria.Cs
             MachineRegister.F26,
             MachineRegister.F27);
 
+        public static ImmutableArray<MachineRegister> DefaultAllocatableVprs { get; } = ImmutableArray.Create(
+            MachineRegister.V0,
+            MachineRegister.V1,
+            MachineRegister.V2,
+            MachineRegister.V3,
+            MachineRegister.V4,
+            MachineRegister.V5,
+            MachineRegister.V6,
+            MachineRegister.V7,
+            MachineRegister.V8,
+            MachineRegister.V9,
+            MachineRegister.V10,
+            MachineRegister.V11,
+            MachineRegister.V12,
+            MachineRegister.V13,
+            MachineRegister.V14,
+            MachineRegister.V15,
+            MachineRegister.V16,
+            MachineRegister.V17,
+            MachineRegister.V18,
+            MachineRegister.V19,
+            MachineRegister.V20,
+            MachineRegister.V21,
+            MachineRegister.V22,
+            MachineRegister.V23,
+            MachineRegister.V24,
+            MachineRegister.V25,
+            MachineRegister.V26,
+            MachineRegister.V27);
+
         public static ImmutableArray<MachineRegister> DefaultReservedGprs { get; } = ImmutableArray.Create(
             MachineRegister.X0,
             MachineRegister.X1,
@@ -184,6 +306,12 @@ namespace Cnidaria.Cs
             MachineRegister.F29,
             MachineRegister.F30,
             MachineRegister.F31);
+
+        public static ImmutableArray<MachineRegister> DefaultReservedVprs { get; } = ImmutableArray.Create(
+            MachineRegister.V28,
+            MachineRegister.V29,
+            MachineRegister.V30,
+            MachineRegister.V31);
 
         public static ImmutableArray<MachineRegister> CalleeSavedGprs { get; } = ImmutableArray.Create(
             MachineRegister.X8,
@@ -212,6 +340,8 @@ namespace Cnidaria.Cs
             MachineRegister.F25,
             MachineRegister.F26,
             MachineRegister.F27);
+
+        public static ImmutableArray<MachineRegister> CalleeSavedVprs { get; } = ImmutableArray<MachineRegister>.Empty;
 
         public static ImmutableArray<MachineRegister> CallerSavedGprs { get; } = ImmutableArray.Create(
             MachineRegister.X1,
@@ -253,12 +383,53 @@ namespace Cnidaria.Cs
             MachineRegister.F30,
             MachineRegister.F31);
 
-        public static ImmutableArray<MachineRegister> CallerSavedRegisters { get; } =
+        public static ImmutableArray<MachineRegister> CallerSavedVprs { get; } = ImmutableArray.Create(
+            MachineRegister.V0,
+            MachineRegister.V1,
+            MachineRegister.V2,
+            MachineRegister.V3,
+            MachineRegister.V4,
+            MachineRegister.V5,
+            MachineRegister.V6,
+            MachineRegister.V7,
+            MachineRegister.V8,
+            MachineRegister.V9,
+            MachineRegister.V10,
+            MachineRegister.V11,
+            MachineRegister.V12,
+            MachineRegister.V13,
+            MachineRegister.V14,
+            MachineRegister.V15,
+            MachineRegister.V16,
+            MachineRegister.V17,
+            MachineRegister.V18,
+            MachineRegister.V19,
+            MachineRegister.V20,
+            MachineRegister.V21,
+            MachineRegister.V22,
+            MachineRegister.V23,
+            MachineRegister.V24,
+            MachineRegister.V25,
+            MachineRegister.V26,
+            MachineRegister.V27,
+            MachineRegister.V28,
+            MachineRegister.V29,
+            MachineRegister.V30,
+            MachineRegister.V31);
+
+        public static ImmutableArray<MachineRegister> CallerSavedScalarRegisters { get; } =
             CallerSavedGprs.AddRange(CallerSavedFprs);
+        public static ImmutableArray<MachineRegister> CallerSavedRegisters { get; } =
+            CallerSavedScalarRegisters.AddRange(CallerSavedVprs);
 
         public static bool IsCalleeSaved(MachineRegister register)
         {
-            var regs = GetClass(register) == RegisterClass.Float ? CalleeSavedFprs : CalleeSavedGprs;
+            var regs = GetClass(register) switch
+            {
+                RegisterClass.Float => CalleeSavedFprs,
+                RegisterClass.Vector => CalleeSavedVprs,
+                _ => CalleeSavedGprs,
+            };
             for (int i = 0; i < regs.Length; i++)
             {
                 if (regs[i] == register)
@@ -272,7 +443,12 @@ namespace Cnidaria.Cs
 
         public static bool IsReserved(MachineRegister register)
         {
-            var regs = GetClass(register) == RegisterClass.Float ? DefaultReservedFprs : DefaultReservedGprs;
+            var regs = GetClass(register) switch
+            {
+                RegisterClass.Float => DefaultReservedFprs,
+                RegisterClass.Vector => DefaultReservedVprs,
+                _ => DefaultReservedGprs,
+            };
             for (int i = 0; i < regs.Length; i++)
             {
                 if (regs[i] == register)
@@ -311,6 +487,7 @@ namespace Cnidaria.Cs
             {
                 RegisterClass.General => MaskOf(DefaultAllocatableGprs),
                 RegisterClass.Float => MaskOf(DefaultAllocatableFprs),
+                RegisterClass.Vector => 0,
                 _ => 0,
             };
         }
@@ -343,15 +520,26 @@ namespace Cnidaria.Cs
             {
                 RegisterClass.General => ParallelCopyScratch0,
                 RegisterClass.Float => FloatParallelCopyScratch0,
+                RegisterClass.Vector => VectorParallelCopyScratch0,
                 _ => MachineRegister.Invalid,
             };
         }
 
         public static int RegisterSaveSize(MachineRegister register)
-            => GetClass(register) == RegisterClass.Float ? TargetArchitecture.FloatingRegisterSize : TargetArchitecture.GeneralRegisterSize;
+            => GetClass(register) switch
+            {
+                RegisterClass.Float => TargetArchitecture.FloatingRegisterSize,
+                RegisterClass.Vector => TargetArchitecture.VectorRegisterSize,
+                _ => TargetArchitecture.GeneralRegisterSize,
+            };
 
         public static int RegisterSaveAlignment(MachineRegister register)
-            => GetClass(register) == RegisterClass.Float ? TargetArchitecture.FloatingRegisterSize : TargetArchitecture.GeneralRegisterSize;
+            => GetClass(register) switch
+            {
+                RegisterClass.Float => TargetArchitecture.FloatingRegisterSize,
+                RegisterClass.Vector => TargetArchitecture.VectorRegisterSize,
+                _ => TargetArchitecture.GeneralRegisterSize,
+            };
 
         public static RegisterClass GetClass(MachineRegister register)
         {
@@ -359,6 +547,8 @@ namespace Cnidaria.Cs
                 return RegisterClass.General;
             if (register >= MachineRegister.F0 && register <= MachineRegister.F31)
                 return RegisterClass.Float;
+            if (register >= MachineRegister.V0 && register <= MachineRegister.V31)
+                return RegisterClass.Vector;
             return RegisterClass.Invalid;
         }
 
@@ -406,6 +596,7 @@ namespace Cnidaria.Cs
             {
                 RegisterClass.General => "g",
                 RegisterClass.Float => "f",
+                RegisterClass.Vector => "v",
                 _ => "?",
             };
         }
@@ -479,6 +670,39 @@ namespace Cnidaria.Cs
                 MachineRegister.F29 => "f29/ft9",
                 MachineRegister.F30 => "f30/ft10",
                 MachineRegister.F31 => "f31/ft11",
+
+                MachineRegister.V0 => "v0",
+                MachineRegister.V1 => "v1",
+                MachineRegister.V2 => "v2",
+                MachineRegister.V3 => "v3",
+                MachineRegister.V4 => "v4",
+                MachineRegister.V5 => "v5",
+                MachineRegister.V6 => "v6",
+                MachineRegister.V7 => "v7",
+                MachineRegister.V8 => "v8",
+                MachineRegister.V9 => "v9",
+                MachineRegister.V10 => "v10",
+                MachineRegister.V11 => "v11",
+                MachineRegister.V12 => "v12",
+                MachineRegister.V13 => "v13",
+                MachineRegister.V14 => "v14",
+                MachineRegister.V15 => "v15",
+                MachineRegister.V16 => "v16",
+                MachineRegister.V17 => "v17",
+                MachineRegister.V18 => "v18",
+                MachineRegister.V19 => "v19",
+                MachineRegister.V20 => "v20",
+                MachineRegister.V21 => "v21",
+                MachineRegister.V22 => "v22",
+                MachineRegister.V23 => "v23",
+                MachineRegister.V24 => "v24",
+                MachineRegister.V25 => "v25",
+                MachineRegister.V26 => "v26",
+                MachineRegister.V27 => "v27",
+                MachineRegister.V28 => "v28",
+                MachineRegister.V29 => "v29",
+                MachineRegister.V30 => "v30",
+                MachineRegister.V31 => "v31",
                 _ => "<invalid-reg>",
             };
         }

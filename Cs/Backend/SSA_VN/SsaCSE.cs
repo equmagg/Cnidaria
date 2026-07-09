@@ -104,6 +104,7 @@ namespace Cnidaria.Cs
         private sealed class Optimizer
         {
             private readonly SsaMethod _method;
+            private readonly TargetInfo _target;
             private readonly SsaValueNumberingResult _vn;
             private readonly Dictionary<CseKey, Candidate> _candidateByKey = new Dictionary<CseKey, Candidate>();
             private readonly List<Candidate> _candidates = new List<Candidate>();
@@ -113,6 +114,7 @@ namespace Cnidaria.Cs
             public Optimizer(SsaMethod method, int nextSyntheticTreeId)
             {
                 _method = method;
+                _target = method.GenTreeMethod.Target;
                 _vn = method.ValueNumbers!;
                 _nextSyntheticTreeId = Math.Max(nextSyntheticTreeId, MaxTreeId(method) + 1);
             }
@@ -538,13 +540,13 @@ namespace Cnidaria.Cs
                 };
             }
 
-            private static bool CanEnregisterCse(GenTree node)
+            private bool CanEnregisterCse(GenTree node)
             {
                 if (node.StackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value or GenStackKind.Null or GenStackKind.ByRef)
                     return false;
 
                 if (node.Type is not null)
-                    return MachineAbi.IsPhysicallyPromotableStorage(node.Type, node.StackKind);
+                    return MachineAbi.IsPhysicallyPromotableStorage(node.Type, node.StackKind, _target);
 
                 return node.StackKind is
                     GenStackKind.I4 or

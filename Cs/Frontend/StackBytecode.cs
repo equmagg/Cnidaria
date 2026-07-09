@@ -431,24 +431,26 @@ namespace Cnidaria.Cs
     }
     internal static class BytecodeEmitter
     {
-        public static BytecodeEmitResult Emit(BoundMethodBody loweredBody, ITokenProvider tokens)
+        public static BytecodeEmitResult Emit(BoundMethodBody loweredBody, ITokenProvider tokens, TargetInfo? target = null)
         {
             if (loweredBody is null) throw new ArgumentNullException(nameof(loweredBody));
             if (tokens is null) throw new ArgumentNullException(nameof(tokens));
 
-            var module = new EmitterModule(tokens);
+            var module = new EmitterModule(tokens, target ?? TargetInfo.Default);
             var entry = module.EmitRoot(loweredBody);
             return new BytecodeEmitResult(entry, module.BakeAdditionalMethods());
         }
         private sealed class EmitterModule
         {
             private readonly ITokenProvider _tokens;
+            private readonly TargetInfo _target;
             private readonly Dictionary<MethodSymbol, BytecodeFunction> _compiled;
             private readonly List<BytecodeFunction> _additional;
 
-            public EmitterModule(ITokenProvider tokens)
+            public EmitterModule(ITokenProvider tokens, TargetInfo target)
             {
                 _tokens = tokens;
+                _target = target ?? throw new ArgumentNullException(nameof(target));
                 _compiled = new Dictionary<MethodSymbol, BytecodeFunction>(ReferenceEqualityComparer<MethodSymbol>.Instance);
                 _additional = new List<BytecodeFunction>();
             }
@@ -461,7 +463,7 @@ namespace Cnidaria.Cs
                 if (_compiled.TryGetValue(body.Method, out var existing))
                     return existing;
 
-                var emitter = new Emitter(_tokens, this, body.Method);
+                var emitter = new Emitter(_tokens, this, body.Method, _target);
                 var fn = emitter.Emit(body);
 
                 _compiled.Add(body.Method, fn);
@@ -499,6 +501,7 @@ namespace Cnidaria.Cs
             private readonly ITokenProvider _tokens;
             private readonly EmitterModule _module;
             private readonly MethodSymbol _method;
+            private readonly TargetInfo _target;
             private readonly BytecodeBuilder _il = new();
 
             private readonly Dictionary<LocalSymbol, int> _localsBySymbol;
@@ -548,11 +551,12 @@ namespace Cnidaria.Cs
                 }
             }
 
-            public Emitter(ITokenProvider tokens, EmitterModule module, MethodSymbol method)
+            public Emitter(ITokenProvider tokens, EmitterModule module, MethodSymbol method, TargetInfo target)
             {
                 _tokens = tokens;
                 _module = module;
                 _method = method;
+                _target = target ?? throw new ArgumentNullException(nameof(target));
 
                 _localsBySymbol = new Dictionary<LocalSymbol, int>(ReferenceEqualityComparer<LocalSymbol>.Instance);
                 _localTypes = new List<TypeSymbol>();
@@ -704,7 +708,7 @@ namespace Cnidaria.Cs
 
             private static bool IsBool(TypeSymbol type) => type.SpecialType == SpecialType.System_Boolean;
 
-            private static int GetElementSizeOrThrow(TypeSymbol type)
+            private int GetElementSizeOrThrow(TypeSymbol type)
             {
                 return type.SpecialType switch
                 {
@@ -723,7 +727,7 @@ namespace Cnidaria.Cs
                     SpecialType.System_Double => 8,
                     SpecialType.System_Decimal => 16,
                     _ => (type.IsReferenceType || type is PointerTypeSymbol || type is ByRefTypeSymbol)
-                        ? TargetArchitecture.PointerSize
+                        ? _target.PointerSize
                         : throw new NotSupportedException($"No known size for '{type.Name}'.")
                 };
             }

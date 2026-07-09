@@ -217,26 +217,32 @@ namespace Cnidaria.Cs
         private const int MaxRegisterAggregateBytes = 16;
 
 
-        public static int GeneralRegisterSlotSize => TargetArchitecture.GeneralRegisterSize;
-        public static int StackArgumentSlotSize => TargetArchitecture.StackSlotSize;
+        public static int GeneralRegisterSlotSize => TargetInfo.Default.GeneralRegisterSize;
+        public static int StackArgumentSlotSize => TargetInfo.Default.StackSlotSize;
 
-        public static int StackSlotsForArgumentSize(int size)
+        private static TargetInfo EffectiveTarget(TargetInfo? target) => target ?? TargetInfo.Default;
+        private static int PointerSizeFor(TargetInfo? target) => EffectiveTarget(target).PointerSize;
+        private static int GeneralRegisterSlotSizeFor(TargetInfo? target) => EffectiveTarget(target).GeneralRegisterSize;
+        private static int StackArgumentSlotSizeFor(TargetInfo? target) => EffectiveTarget(target).StackSlotSize;
+
+        public static int StackSlotsForArgumentSize(int size, TargetInfo? target = null)
         {
-            int actualSize = size <= 0 ? StackArgumentSlotSize : size;
-            return Math.Max(1, checked((actualSize + StackArgumentSlotSize - 1) / StackArgumentSlotSize));
+            int slotSize = StackArgumentSlotSizeFor(target);
+            int actualSize = size <= 0 ? slotSize : size;
+            return Math.Max(1, checked((actualSize + slotSize - 1) / slotSize));
         }
 
-        public static int LastStackSlotIndex(AbiArgumentLocation location)
+        public static int LastStackSlotIndex(AbiArgumentLocation location, TargetInfo? target = null)
         {
             if (!location.IsStack)
                 return -1;
 
             int coveredSize = checked(location.StackOffset + Math.Max(1, location.Size));
-            return checked(location.StackSlotIndex + StackSlotsForArgumentSize(coveredSize) - 1);
+            return checked(location.StackSlotIndex + StackSlotsForArgumentSize(coveredSize, target) - 1);
         }
 
-        public static AbiValueInfo AddressValue()
-            => Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
+        public static AbiValueInfo AddressValue(TargetInfo? target = null)
+            => Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: false);
 
         public static GenStackKind StackKindForType(RuntimeType? type)
         {
@@ -283,25 +289,25 @@ namespace Cnidaria.Cs
             return GenStackKind.Value;
         }
 
-        public static bool RequiresHiddenReturnBuffer(RuntimeMethod? method)
+        public static bool RequiresHiddenReturnBuffer(RuntimeMethod? method, TargetInfo? target = null)
         {
             if (method is null)
                 return false;
 
             var returnStackKind = StackKindForType(method.ReturnType);
-            return ClassifyValue(method.ReturnType, returnStackKind, isReturn: true).PassingKind == AbiValuePassingKind.Indirect;
+            return ClassifyValue(method.ReturnType, returnStackKind, isReturn: true, target: target).PassingKind == AbiValuePassingKind.Indirect;
         }
 
-        public static AbiValueInfo ClassifyStorageValue(RuntimeType? type, GenStackKind stackKind)
+        public static AbiValueInfo ClassifyStorageValue(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
-            var abi = ClassifyValue(type, stackKind, isReturn: false);
+            var abi = ClassifyValue(type, stackKind, isReturn: false, target: target);
             if (abi.PassingKind == AbiValuePassingKind.Void)
                 return abi;
 
             if (abi.PassingKind == AbiValuePassingKind.Indirect)
             {
-                int size = type is null ? TargetArchitecture.PointerSize : Math.Max(1, type.SizeOf);
-                int align = type is null ? TargetArchitecture.PointerSize : Math.Max(1, type.AlignOf);
+                int size = type is null ? PointerSizeFor(target) : Math.Max(1, type.SizeOf);
+                int align = type is null ? PointerSizeFor(target) : Math.Max(1, type.AlignOf);
                 return new AbiValueInfo(AbiValuePassingKind.Stack, RegisterClass.General, size, align, abi.ContainsGcPointers);
             }
 
@@ -317,7 +323,7 @@ namespace Cnidaria.Cs
             if (IsScalarStorageValue(type))
                 return abi;
 
-            if (IsPhysicallyPromotableStruct(type, abi))
+            if (IsPhysicallyPromotableStruct(type, abi, target))
                 return abi;
 
             return new AbiValueInfo(
@@ -328,39 +334,39 @@ namespace Cnidaria.Cs
                 type.ContainsGcPointers);
         }
 
-        public static bool RequiresAggregateHome(RuntimeType? type, GenStackKind stackKind)
-            => ClassifyStorageValue(type, stackKind).PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
+        public static bool RequiresAggregateHome(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
+            => ClassifyStorageValue(type, stackKind, target).PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
 
-        public static AbiValueInfo ClassifyValue(RuntimeType? type, GenStackKind stackKind, bool isReturn)
+        public static AbiValueInfo ClassifyValue(RuntimeType? type, GenStackKind stackKind, bool isReturn, TargetInfo? target = null)
         {
             if (stackKind == GenStackKind.Void || (type is not null && IsVoid(type)))
                 return new AbiValueInfo(AbiValuePassingKind.Void, RegisterClass.Invalid, 0, 1, containsGcPointers: false);
 
             if (stackKind is GenStackKind.Ref or GenStackKind.Null)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+                return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
 
             if (stackKind == GenStackKind.ByRef)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+                return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
 
             if (stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
+                return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: false);
 
             if (type is not null)
             {
                 if (type.Kind is RuntimeTypeKind.Pointer)
-                    return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: false);
+                    return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: false);
 
                 if (type.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam || type.IsReferenceType)
-                    return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+                    return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
 
                 if (type.IsValueType)
                 {
                     int exactSize = Math.Max(1, type.SizeOf);
                     int exactAlign = Math.Max(1, type.AlignOf);
-                    if (TryClassifyPrimitiveWrapper(type, exactSize, exactAlign, out var primitiveWrapper))
+                    if (TryClassifyPrimitiveWrapper(type, exactSize, exactAlign, target, out var primitiveWrapper))
                         return primitiveWrapper;
 
-                    if (TryClassifyEnum(type, exactSize, exactAlign, out var enumAbi))
+                    if (TryClassifyEnum(type, exactSize, exactAlign, target, out var enumAbi))
                         return enumAbi;
                 }
             }
@@ -375,17 +381,17 @@ namespace Cnidaria.Cs
             }
 
             if (stackKind is GenStackKind.I4)
-                return IntegerScalar(4, 4, containsGcPointers: false);
+                return IntegerScalar(4, 4, containsGcPointers: false, target: target);
 
             if (stackKind is GenStackKind.I8)
-                return IntegerScalar(8, 8, containsGcPointers: false);
+                return IntegerScalar(8, 8, containsGcPointers: false, target: target);
 
             if (type is null)
                 return new AbiValueInfo(AbiValuePassingKind.Indirect, RegisterClass.General,
-                    TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+                    PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
 
             if (!type.IsValueType)
-                return Scalar(RegisterClass.General, TargetArchitecture.PointerSize, TargetArchitecture.PointerSize, containsGcPointers: true);
+                return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
 
             int size = Math.Max(1, type.SizeOf);
             int align = Math.Max(1, type.AlignOf);
@@ -393,42 +399,42 @@ namespace Cnidaria.Cs
             if (size > MaxRegisterAggregateBytes)
                 return new AbiValueInfo(isReturn ? AbiValuePassingKind.Indirect : AbiValuePassingKind.Stack, RegisterClass.General, size, align, type.ContainsGcPointers);
 
-            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, out var hfaStruct))
+            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, target: target, out var hfaStruct))
                 return hfaStruct;
 
-            if (TryClassifySingleRegisterStruct(type, size, align, out var singleRegisterStruct))
+            if (TryClassifySingleRegisterStruct(type, size, align, target, out var singleRegisterStruct))
                 return singleRegisterStruct;
 
-            if (TryClassifyMultiRegisterStruct(type, size, align, out var registerStruct))
+            if (TryClassifyMultiRegisterStruct(type, size, align, target, out var registerStruct))
                 return registerStruct;
 
             return new AbiValueInfo(isReturn ? AbiValuePassingKind.Indirect : AbiValuePassingKind.Stack, RegisterClass.General, size, align, type.ContainsGcPointers);
         }
 
-        public static bool RequiresStackHome(RuntimeType? type, GenStackKind stackKind)
+        public static bool RequiresStackHome(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
-            var abi = ClassifyStorageValue(type, stackKind);
+            var abi = ClassifyStorageValue(type, stackKind, target);
             return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
         }
 
-        public static bool IsBlockCopyValue(RuntimeType? type, GenStackKind stackKind)
+        public static bool IsBlockCopyValue(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
-            var abi = ClassifyStorageValue(type, stackKind);
+            var abi = ClassifyStorageValue(type, stackKind, target);
             return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
         }
 
-        public static bool IsRegisterPassedStruct(RuntimeType? type, GenStackKind stackKind)
+        public static bool IsRegisterPassedStruct(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
-            var abi = ClassifyValue(type, stackKind, isReturn: false);
+            var abi = ClassifyValue(type, stackKind, isReturn: false, target: target);
             return type is not null && type.IsValueType && abi.IsRegisterPassed;
         }
 
-        public static bool IsPhysicallyPromotableStorage(RuntimeType? type, GenStackKind stackKind)
+        public static bool IsPhysicallyPromotableStorage(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
             if (stackKind is GenStackKind.Void or GenStackKind.Unknown)
                 return false;
 
-            var abi = ClassifyStorageValue(type, stackKind);
+            var abi = ClassifyStorageValue(type, stackKind, target);
             if (!abi.IsRegisterPassed)
                 return false;
 
@@ -441,26 +447,26 @@ namespace Cnidaria.Cs
             if (IsScalarStorageValue(type))
                 return true;
 
-            return IsPhysicallyPromotableStruct(type, abi);
+            return IsPhysicallyPromotableStruct(type, abi, target);
         }
 
-        public static ImmutableArray<AbiRegisterSegment> GetRegisterSegments(AbiValueInfo abi)
+        public static ImmutableArray<AbiRegisterSegment> GetRegisterSegments(AbiValueInfo abi, TargetInfo? target = null)
         {
             if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
             {
                 return ImmutableArray.Create(new AbiRegisterSegment(
                     abi.RegisterClass,
                     offset: 0,
-                    size: abi.Size <= 0 ? GeneralRegisterSlotSize : abi.Size,
+                    size: abi.Size <= 0 ? GeneralRegisterSlotSizeFor(target) : abi.Size,
                     abi.ContainsGcPointers));
             }
 
             return abi.RegisterSegments;
         }
 
-        public static int HiddenReturnBufferInsertionIndex(RuntimeMethod? method, int explicitArgumentCount)
+        public static int HiddenReturnBufferInsertionIndex(RuntimeMethod? method, int explicitArgumentCount, TargetInfo? target = null)
         {
-            if (method is null || !RequiresHiddenReturnBuffer(method))
+            if (method is null || !RequiresHiddenReturnBuffer(method, target))
                 return -1;
 
             return method.HasThis && explicitArgumentCount > 0 ? 1 : 0;
@@ -471,7 +477,8 @@ namespace Cnidaria.Cs
             Func<GenTree, GenTreeValueInfo> getValueInfo,
             GenTree? resultValue = null,
             RuntimeMethod? callee = null,
-            bool isNewObject = false)
+            bool isNewObject = false,
+            TargetInfo? target = null)
         {
             if (getValueInfo is null)
                 throw new ArgumentNullException(nameof(getValueInfo));
@@ -495,16 +502,17 @@ namespace Cnidaria.Cs
             {
                 _ = AssignScalarArgumentLocation(
                     RegisterClass.General,
-                    TargetArchitecture.PointerSize,
+                    PointerSizeFor(target),
                     ref generalArg,
                     ref floatArg,
-                    ref outgoingArg);
+                    ref outgoingArg,
+                    target);
             }
 
             if (resultValue is not null)
             {
                 var resultInfo = getValueInfo(resultValue);
-                returnAbi = ClassifyValue(resultInfo.Type, resultInfo.StackKind, isReturn: true);
+                returnAbi = ClassifyValue(resultInfo.Type, resultInfo.StackKind, isReturn: true, target: target);
                 if (returnAbi.PassingKind == AbiValuePassingKind.Indirect)
                 {
                     needsHiddenReturnBuffer = true;
@@ -513,7 +521,7 @@ namespace Cnidaria.Cs
             }
 
             int hiddenReturnBufferInsertionIndex = needsHiddenReturnBuffer
-                ? (callee is null ? 0 : HiddenReturnBufferInsertionIndex(callee, arguments.Length))
+                ? (callee is null ? 0 : HiddenReturnBufferInsertionIndex(callee, arguments.Length, target))
                 : -1;
 
             if (hiddenReturnBufferInsertionIndex == 0)
@@ -526,7 +534,7 @@ namespace Cnidaria.Cs
 
                 var value = arguments[i];
                 var info = getValueInfo(value);
-                var abi = ClassifyValue(info.Type, info.StackKind, isReturn: false);
+                var abi = ClassifyValue(info.Type, info.StackKind, isReturn: false, target: target);
                 if (abi.PassingKind == AbiValuePassingKind.Void)
                     continue;
 
@@ -537,10 +545,11 @@ namespace Cnidaria.Cs
                         : abi.RegisterClass;
                     var location = AssignScalarArgumentLocation(
                         registerClass,
-                        abi.Size <= 0 ? GeneralRegisterSlotSize : abi.Size,
+                        abi.Size <= 0 ? GeneralRegisterSlotSizeFor(target) : abi.Size,
                         ref generalArg,
                         ref floatArg,
-                        ref outgoingArg);
+                        ref outgoingArg,
+                        target);
 
                     segments.Add(new AbiCallSegment(
                         operandIndex++,
@@ -551,7 +560,7 @@ namespace Cnidaria.Cs
                         abi,
                         registerClass,
                         0,
-                        abi.Size <= 0 ? GeneralRegisterSlotSize : abi.Size,
+                        abi.Size <= 0 ? GeneralRegisterSlotSizeFor(target) : abi.Size,
                         abi.ContainsGcPointers,
                         location));
                     continue;
@@ -559,7 +568,7 @@ namespace Cnidaria.Cs
 
                 if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                 {
-                    var abiSegments = GetRegisterSegments(abi);
+                    var abiSegments = GetRegisterSegments(abi, target);
                     int aggregateStackSlot = -1;
                     int aggregateStackBaseOffset = 0;
 
@@ -572,7 +581,8 @@ namespace Cnidaria.Cs
                             ref floatArg,
                             ref outgoingArg,
                             ref aggregateStackSlot,
-                            ref aggregateStackBaseOffset);
+                            ref aggregateStackBaseOffset,
+                            target);
 
                         segments.Add(new AbiCallSegment(
                             operandIndex++,
@@ -591,9 +601,9 @@ namespace Cnidaria.Cs
                 }
 
                 var stackClass = info.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : info.RegisterClass;
-                int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
+                int stackSize = abi.Size <= 0 ? PointerSizeFor(target) : abi.Size;
                 int stackSlot = outgoingArg;
-                outgoingArg = checked(outgoingArg + StackSlotsForArgumentSize(stackSize));
+                outgoingArg = checked(outgoingArg + StackSlotsForArgumentSize(stackSize, target));
                 var stackLocation = AbiArgumentLocation.ForStack(stackClass, stackSlot, 0, stackSize);
                 segments.Add(new AbiCallSegment(
                     operandIndex++,
@@ -619,13 +629,14 @@ namespace Cnidaria.Cs
                 if (!needsHiddenReturnBuffer || hiddenReturnBufferInserted)
                     return;
 
-                var addressAbi = AddressValue();
+                var addressAbi = AddressValue(target);
                 var location = AssignScalarArgumentLocation(
                     addressAbi.RegisterClass,
                     addressAbi.Size,
                     ref generalArg,
                     ref floatArg,
-                    ref outgoingArg);
+                    ref outgoingArg,
+                    target);
 
                 if (hiddenReturnBufferValue is null)
                     throw new InvalidOperationException("Hidden return buffer argument requested without a result value.");
@@ -639,7 +650,7 @@ namespace Cnidaria.Cs
                     addressAbi,
                     RegisterClass.General,
                     0,
-                    TargetArchitecture.PointerSize,
+                    PointerSizeFor(target),
                     false,
                     location));
                 hiddenReturnBufferInserted = true;
@@ -653,7 +664,8 @@ namespace Cnidaria.Cs
             ref int floatIndex,
             ref int outgoingIndex,
             ref int aggregateStackSlot,
-            ref int aggregateStackBaseOffset)
+            ref int aggregateStackBaseOffset,
+            TargetInfo? target = null)
         {
             MachineRegister register;
             if (segment.RegisterClass == RegisterClass.Float)
@@ -680,7 +692,7 @@ namespace Cnidaria.Cs
             }
 
             int stackOffset = checked(segment.Offset - aggregateStackBaseOffset);
-            int requiredSlots = StackSlotsForArgumentSize(checked(stackOffset + Math.Max(1, segment.Size)));
+            int requiredSlots = StackSlotsForArgumentSize(checked(stackOffset + Math.Max(1, segment.Size)), target);
             int requiredOutgoingIndex = checked(aggregateStackSlot + requiredSlots);
             if (outgoingIndex < requiredOutgoingIndex)
                 outgoingIndex = requiredOutgoingIndex;
@@ -697,7 +709,8 @@ namespace Cnidaria.Cs
             int size,
             ref int generalIndex,
             ref int floatIndex,
-            ref int outgoingIndex)
+            ref int outgoingIndex,
+            TargetInfo? target = null)
         {
             if (registerClass == RegisterClass.Float)
             {
@@ -711,8 +724,8 @@ namespace Cnidaria.Cs
             {
                 var reg = MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
                 if (reg != MachineRegister.Invalid)
-                    return AbiArgumentLocation.ForRegister(RegisterClass.General, reg, size <= 0 ? GeneralRegisterSlotSize : size);
-                return AbiArgumentLocation.ForStack(RegisterClass.General, outgoingIndex++, 0, size <= 0 ? GeneralRegisterSlotSize : size);
+                    return AbiArgumentLocation.ForRegister(RegisterClass.General, reg, size <= 0 ? GeneralRegisterSlotSizeFor(target) : size);
+                return AbiArgumentLocation.ForStack(RegisterClass.General, outgoingIndex++, 0, size <= 0 ? GeneralRegisterSlotSizeFor(target) : size);
             }
 
             throw new InvalidOperationException("Invalid ABI argument register class " + registerClass + ".");
@@ -721,13 +734,13 @@ namespace Cnidaria.Cs
         private static AbiValueInfo Scalar(RegisterClass registerClass, int size, int alignment, bool containsGcPointers)
             => new AbiValueInfo(AbiValuePassingKind.ScalarRegister, registerClass, Math.Max(1, size), Math.Max(1, alignment), containsGcPointers);
 
-        private static AbiValueInfo IntegerScalar(int size, int alignment, bool containsGcPointers)
+        private static AbiValueInfo IntegerScalar(int size, int alignment, bool containsGcPointers, TargetInfo? target = null)
         {
-            int slotSize = GeneralRegisterSlotSize;
+            int slotSize = GeneralRegisterSlotSizeFor(target);
             if (size <= slotSize)
                 return Scalar(RegisterClass.General, Math.Max(1, size), Math.Max(1, alignment), containsGcPointers);
 
-            return MultiRegisterInteger(size, alignment, containsGcPointers, MaxIntegerRegisterSlots, null);
+            return MultiRegisterInteger(size, alignment, containsGcPointers, MaxIntegerRegisterSlots, null, target);
         }
 
         private static AbiValueInfo MultiRegisterInteger(
@@ -735,9 +748,10 @@ namespace Cnidaria.Cs
             int alignment,
             bool containsGcPointers,
             int maxRegisterSlots,
-            Func<int, int, bool>? gcPointerProvider)
+            Func<int, int, bool>? gcPointerProvider,
+            TargetInfo? target = null)
         {
-            int slotSize = GeneralRegisterSlotSize;
+            int slotSize = GeneralRegisterSlotSizeFor(target);
             int segmentCount = checked((size + slotSize - 1) / slotSize);
             if (segmentCount <= 0)
                 return Scalar(RegisterClass.General, slotSize, alignment, containsGcPointers);
@@ -765,7 +779,7 @@ namespace Cnidaria.Cs
                 segments.ToImmutable());
         }
 
-        private static bool TryClassifyPrimitiveWrapper(RuntimeType type, int size, int align, out AbiValueInfo abi)
+        private static bool TryClassifyPrimitiveWrapper(RuntimeType type, int size, int align, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
             if (!IsPrimitiveWrapper(type))
@@ -774,28 +788,28 @@ namespace Cnidaria.Cs
             if (type.Name is "Single" or "Double")
                 abi = Scalar(RegisterClass.Float, size, align, containsGcPointers: false);
             else
-                abi = IntegerScalar(size, align, containsGcPointers: false);
+                abi = IntegerScalar(size, align, containsGcPointers: false, target: target);
             return true;
         }
 
-        private static bool TryClassifyEnum(RuntimeType type, int size, int align, out AbiValueInfo abi)
+        private static bool TryClassifyEnum(RuntimeType type, int size, int align, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
             if (type.Kind != RuntimeTypeKind.Enum)
                 return false;
 
-            abi = IntegerScalar(Math.Max(1, size), Math.Max(1, align), containsGcPointers: false);
+            abi = IntegerScalar(Math.Max(1, size), Math.Max(1, align), containsGcPointers: false, target: target);
             return true;
         }
 
-        private static bool TryClassifySingleRegisterStruct(RuntimeType type, int size, int align, out AbiValueInfo abi)
+        private static bool TryClassifySingleRegisterStruct(RuntimeType type, int size, int align, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
-            if (size > GeneralRegisterSlotSize)
+            if (size > GeneralRegisterSlotSizeFor(target))
                 return false;
 
 
-            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: 1, out var hfa))
+            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: 1, target: target, out var hfa))
             {
                 abi = hfa;
                 return true;
@@ -805,17 +819,17 @@ namespace Cnidaria.Cs
             return true;
         }
 
-        private static bool TryClassifyMultiRegisterStruct(RuntimeType type, int size, int align, out AbiValueInfo abi)
+        private static bool TryClassifyMultiRegisterStruct(RuntimeType type, int size, int align, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
 
-            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, out abi))
+            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, target: target, out abi))
                 return true;
 
-            if (TryClassifyMixedFieldRegisterStruct(type, size, align, out abi))
+            if (TryClassifyMixedFieldRegisterStruct(type, size, align, target, out abi))
                 return true;
 
-            int registerSlotSize = GeneralRegisterSlotSize;
+            int registerSlotSize = GeneralRegisterSlotSizeFor(target);
             if (size > registerSlotSize * MaxIntegerRegisterSlots)
                 return false;
 
@@ -824,7 +838,8 @@ namespace Cnidaria.Cs
                 align,
                 type.ContainsGcPointers,
                 MaxIntegerRegisterSlots,
-                (offset, segmentSize) => SegmentContainsGcPointer(type, offset, segmentSize));
+                (offset, segmentSize) => SegmentContainsGcPointer(type, offset, segmentSize),
+                target);
             return abi.PassingKind == AbiValuePassingKind.MultiRegister;
         }
 
@@ -844,7 +859,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static bool TryClassifyMixedFieldRegisterStruct(RuntimeType type, int size, int align, out AbiValueInfo abi)
+        private static bool TryClassifyMixedFieldRegisterStruct(RuntimeType type, int size, int align, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
             if (type.InstanceFields.Length == 0)
@@ -852,7 +867,7 @@ namespace Cnidaria.Cs
 
             var flattenedFields = new List<FlattenedAbiField>(MaxIntegerRegisterSlots);
             var visitingTypes = new HashSet<int>();
-            if (!TryFlattenRegisterFields(type, 0, flattenedFields, MaxIntegerRegisterSlots, visitingTypes))
+            if (!TryFlattenRegisterFields(type, 0, flattenedFields, MaxIntegerRegisterSlots, visitingTypes, target))
                 return false;
             if (flattenedFields.Count != 2)
                 return false;
@@ -887,7 +902,8 @@ namespace Cnidaria.Cs
             int baseOffset,
             List<FlattenedAbiField> flattenedFields,
             int maxSegments,
-            HashSet<int> visitingTypes)
+            HashSet<int> visitingTypes,
+            TargetInfo? target)
         {
             if (type.InstanceFields.Length == 0)
                 return false;
@@ -910,7 +926,7 @@ namespace Cnidaria.Cs
 
                     var fieldType = field.FieldType;
                     int fieldSize;
-                    if (TryClassifyFieldAsRegisterSegment(fieldType, out var registerClass, out fieldSize, out bool containsGcPointers))
+                    if (TryClassifyFieldAsRegisterSegment(fieldType, target, out var registerClass, out fieldSize, out bool containsGcPointers))
                     {
                         if (fieldSize <= 0 || field.Offset + fieldSize > typeSize)
                             return false;
@@ -924,7 +940,7 @@ namespace Cnidaria.Cs
                             return false;
 
                         int beforeCount = flattenedFields.Count;
-                        if (!TryFlattenRegisterFields(fieldType, baseOffset + field.Offset, flattenedFields, maxSegments, visitingTypes))
+                        if (!TryFlattenRegisterFields(fieldType, baseOffset + field.Offset, flattenedFields, maxSegments, visitingTypes, target))
                             return false;
 
                         if (flattenedFields.Count == beforeCount)
@@ -949,7 +965,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static bool TryClassifyFieldAsRegisterSegment(RuntimeType fieldType, out RegisterClass registerClass, out int size, out bool containsGcPointers)
+        private static bool TryClassifyFieldAsRegisterSegment(RuntimeType fieldType, TargetInfo? target, out RegisterClass registerClass, out int size, out bool containsGcPointers)
         {
             registerClass = RegisterClass.Invalid;
             size = 0;
@@ -964,14 +980,14 @@ namespace Cnidaria.Cs
             if (fieldType.Kind is RuntimeTypeKind.Pointer)
             {
                 registerClass = RegisterClass.General;
-                size = TargetArchitecture.PointerSize;
+                size = PointerSizeFor(target);
                 return true;
             }
 
             if (fieldType.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam || fieldType.IsReferenceType)
             {
                 registerClass = RegisterClass.General;
-                size = TargetArchitecture.PointerSize;
+                size = PointerSizeFor(target);
                 containsGcPointers = true;
                 return true;
             }
@@ -981,13 +997,13 @@ namespace Cnidaria.Cs
                 registerClass = RegisterClass.General;
                 size = Math.Max(1, fieldType.SizeOf);
                 containsGcPointers = fieldType.ContainsGcPointers;
-                return size <= GeneralRegisterSlotSize;
+                return size <= GeneralRegisterSlotSizeFor(target);
             }
 
             return false;
         }
 
-        private static bool TryClassifyHomogeneousFloatAggregate(RuntimeType type, int size, int maxFields, out AbiValueInfo abi)
+        private static bool TryClassifyHomogeneousFloatAggregate(RuntimeType type, int size, int maxFields, TargetInfo? target, out AbiValueInfo abi)
         {
             abi = default;
             if (type.ContainsGcPointers || size <= 0 || maxFields <= 0)
@@ -995,7 +1011,7 @@ namespace Cnidaria.Cs
 
             var flattenedFields = new List<FlattenedAbiField>(maxFields);
             var visitingTypes = new HashSet<int>();
-            if (!TryFlattenRegisterFields(type, 0, flattenedFields, maxFields, visitingTypes))
+            if (!TryFlattenRegisterFields(type, 0, flattenedFields, maxFields, visitingTypes, target))
                 return false;
             if (flattenedFields.Count == 0 || flattenedFields.Count > maxFields)
                 return false;
@@ -1047,7 +1063,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static bool IsPhysicallyPromotableStruct(RuntimeType type, AbiValueInfo abi)
+        private static bool IsPhysicallyPromotableStruct(RuntimeType type, AbiValueInfo abi, TargetInfo? target)
         {
             if (!abi.IsRegisterPassed || type.InstanceFields.Length == 0)
                 return false;
@@ -1056,13 +1072,13 @@ namespace Cnidaria.Cs
             if (abi.Size > 0 && abi.Size != structSize)
                 return false;
 
-            var segments = GetRegisterSegments(abi);
+            var segments = GetRegisterSegments(abi, target);
             if (segments.IsDefaultOrEmpty)
                 return false;
 
             var flattenedFields = new List<FlattenedAbiField>(segments.Length);
             var visitingTypes = new HashSet<int>();
-            if (!TryFlattenRegisterFields(type, 0, flattenedFields, segments.Length, visitingTypes))
+            if (!TryFlattenRegisterFields(type, 0, flattenedFields, segments.Length, visitingTypes, target))
                 return false;
 
             int previousEnd = 0;

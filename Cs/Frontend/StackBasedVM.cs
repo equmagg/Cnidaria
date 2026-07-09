@@ -290,16 +290,16 @@ namespace Cnidaria.Cs
         private const int FinallyCatchTypeToken = -1;
 
         private const int SlotSize = 16;
-        private const int ObjectHeaderSize = 8;
+        private int ObjectHeaderSize => _rts.Target.ObjectHeaderSize;
 
         private const int GcFlagMark = 1 << 0;
         private const int GcFlagAllocated = 1 << 1;
 
-        private const int ArrayLengthOffset = ObjectHeaderSize + 0;   // +8
-        private const int ArrayDataOffset = ObjectHeaderSize + 8;   // +16 aligned
+        private int ArrayLengthOffset => ObjectHeaderSize;    // +8
+        private int ArrayDataOffset => ObjectHeaderSize + 8;  // +16 aligned
 
-        private const int StringLengthOffset = ObjectHeaderSize + 0;  // +8
-        private const int StringCharsOffset = ObjectHeaderSize + 4;  // +12
+        private int StringLengthOffset => ObjectHeaderSize;   // +8
+        private int StringCharsOffset => ObjectHeaderSize + 4;// +12
 
         private readonly int _heapBase;
         private readonly int _heapEnd;
@@ -384,13 +384,14 @@ namespace Cnidaria.Cs
             TextWriter textWriter)
         {
             _mem = memory ?? throw new ArgumentNullException(nameof(memory));
+            _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _staticEnd = staticEnd;
             _stackBase = staticEnd;
             _stackEnd = stackEnd;
             _sp = staticEnd;
             _frameBase = -1;
             _stackPeakAbs = _sp;
-            _staticAllocPtr = Math.Min(AlignUp(TargetArchitecture.PointerSize, 8), staticEnd);
+            _staticAllocPtr = Math.Min(AlignUp(_rts.Target.PointerSize, 8), staticEnd);
 
             _heapBase = AlignUp(_stackEnd, 8);
             _heapEnd = _mem.Length;
@@ -401,7 +402,6 @@ namespace Cnidaria.Cs
                 throw new ArgumentOutOfRangeException("Heap region is empty or invalid.");
 
             _domain = domain ?? throw new ArgumentNullException(nameof(domain));
-            _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
 
             var list = new List<RuntimeModule>(_modules.Count);
@@ -1130,7 +1130,7 @@ namespace Cnidaria.Cs
             }
             void VisitRefCell(int cellAbs)
             {
-                CheckRange(cellAbs, TargetArchitecture.PointerSize);
+                CheckRange(cellAbs, _rts.Target.PointerSize);
 
                 long raw = ReadNativeInt(cellAbs);
                 if (raw == 0)
@@ -3160,7 +3160,7 @@ namespace Cnidaria.Cs
             long diffBytes = (long)aAbs - (long)bAbs;
             long diffElems = diffBytes / elemSize;
 
-            int PointerSize = TargetArchitecture.PointerSize;
+            int PointerSize = _rts.Target.PointerSize;
             if (PointerSize == 8)
                 PushSlot(new Slot(SlotKind.I8, diffElems));
             else
@@ -4374,7 +4374,7 @@ namespace Cnidaria.Cs
         }
         private long ReadNativeInt(int abs)
         {
-            return TargetArchitecture.PointerSize switch
+            return _rts.Target.PointerSize switch
             {
                 4 => BinaryPrimitives.ReadInt32LittleEndian(_mem.AsSpan(abs, 4)),
                 8 => BinaryPrimitives.ReadInt64LittleEndian(_mem.AsSpan(abs, 8)),
@@ -4383,7 +4383,7 @@ namespace Cnidaria.Cs
         }
         private void WriteNativeInt(int abs, long value)
         {
-            int ptrSize = TargetArchitecture.PointerSize;
+            int ptrSize = _rts.Target.PointerSize;
             switch (ptrSize)
             {
                 case 4:
@@ -5286,7 +5286,7 @@ namespace Cnidaria.Cs
             throw new InvalidOperationException($"Cannot convert {v.Kind} to bool");
         }
 
-        private static Slot DoConv(Slot v, NumericConvKind kind, NumericConvFlags flags)
+        private Slot DoConv(Slot v, NumericConvKind kind, NumericConvFlags flags)
         {
             bool @checked = (flags & NumericConvFlags.Checked) != 0;
             bool srcUnsigned = (flags & NumericConvFlags.SourceUnsigned) != 0;
@@ -5486,8 +5486,7 @@ namespace Cnidaria.Cs
 
                     case NumericConvKind.NativeInt:
                         {
-                            int PointerSize = TargetArchitecture.PointerSize;
-                            if (PointerSize == 8)
+                            if (_rts.Target.PointerSize == 8)
                             {
                                 long r = srcUnsigned
                                     ? (@checked ? checked((long)u64) : unchecked((long)u64))
@@ -5503,8 +5502,7 @@ namespace Cnidaria.Cs
 
                     case NumericConvKind.NativeUInt:
                         {
-                            int PointerSize = TargetArchitecture.PointerSize;
-                            if (PointerSize == 8)
+                            if (_rts.Target.PointerSize == 8)
                             {
                                 ulong r = srcUnsigned
                                     ? u64
@@ -5853,7 +5851,7 @@ namespace Cnidaria.Cs
             _methodLayouts.Add(rm.MethodId, layout);
             return layout;
         }
-        private static FastCellKind ClassifyFastCell(RuntimeType t)
+        private FastCellKind ClassifyFastCell(RuntimeType t)
         {
             if (t.IsReferenceType || t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
                 return FastCellKind.None;
@@ -5874,7 +5872,7 @@ namespace Cnidaria.Cs
                 "Int64" or "UInt64" => FastCellKind.I8,
                 "Single" => FastCellKind.R4,
                 "Double" => FastCellKind.R8,
-                "IntPtr" or "UIntPtr" => TargetArchitecture.PointerSize == 8
+                "IntPtr" or "UIntPtr" => _rts.Target.PointerSize == 8
                                             ? FastCellKind.I8 : FastCellKind.I4,
                 _ => FastCellKind.None
             };
@@ -6048,7 +6046,7 @@ namespace Cnidaria.Cs
 
                     case "IntPtr":
                     case "UIntPtr":
-                        return TargetArchitecture.PointerSize == 8
+                        return _rts.Target.PointerSize == 8
                             ? new Slot(SlotKind.I8, v.AsInt64())
                             : new Slot(SlotKind.I4, v.AsInt32());
                 }
@@ -6354,7 +6352,7 @@ namespace Cnidaria.Cs
                         // srcElem assignable to dstElem
                         if (IsAssignableTo(srcElem, dstElem))
                         {
-                            int ptrSize = TargetArchitecture.PointerSize;
+                            int ptrSize = _rts.Target.PointerSize;
                             int bytes = checked(length * ptrSize);
 
                             int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
@@ -6370,7 +6368,7 @@ namespace Cnidaria.Cs
                         // dstElem more derived
                         else if (IsAssignableTo(dstElem, srcElem))
                         {
-                            int ptrSize = TargetArchitecture.PointerSize;
+                            int ptrSize = _rts.Target.PointerSize;
                             int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
 
                             for (int i = 0; i < length; i++)
@@ -6412,7 +6410,7 @@ namespace Cnidaria.Cs
                     else if (srcElem.IsValueType && dstElem.IsReferenceType && IsAssignableTo(srcElem, dstElem))
                     {
                         var (srcElemSize, _) = GetStorageSizeAlign(srcElem);
-                        int ptrSize = TargetArchitecture.PointerSize;
+                        int ptrSize = _rts.Target.PointerSize;
 
                         int srcBase = checked(srcAbs + ArrayDataOffset + checked(srcIndex * srcElemSize));
                         int dstBase = checked(dstAbs + ArrayDataOffset + checked(dstIndex * ptrSize));

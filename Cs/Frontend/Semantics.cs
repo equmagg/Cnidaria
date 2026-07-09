@@ -690,15 +690,35 @@ namespace Cnidaria.Cs
             return current;
         }
     }
+    public sealed class CompilationOptions
+    {
+        public TargetInfo Target { get; }
+        public CompilationOptions(TargetInfo? target = null)
+        {
+            Target = target ?? TargetInfo.Default;
+        }
+    }
     public static class CompilationFactory
     {
         public static Compilation Create(ImmutableArray<SyntaxTree> trees, out ImmutableArray<Diagnostic> diagnostics)
-            => Create(trees, coreLib: null, out diagnostics);
+            => Create(trees, coreLib: null, options: null, out diagnostics);
+        public static Compilation Create(
+            ImmutableArray<SyntaxTree> trees,
+            CompilationOptions? options,
+            out ImmutableArray<Diagnostic> diagnostics)
+            => Create(trees, coreLib: null, options: options, out diagnostics);
         public static Compilation Create(
             ImmutableArray<SyntaxTree> trees,
             ICoreLibraryProvider? coreLib,
             out ImmutableArray<Diagnostic> diagnostics)
+            => Create(trees, coreLib, options: null, out diagnostics);
+        public static Compilation Create(
+            ImmutableArray<SyntaxTree> trees,
+            ICoreLibraryProvider? coreLib,
+             CompilationOptions? options,
+            out ImmutableArray<Diagnostic> diagnostics)
         {
+            options ??= new CompilationOptions();
             var bag = new DiagnosticBag();
             var types = new TypeManager(coreLib);
 
@@ -710,7 +730,8 @@ namespace Cnidaria.Cs
                 sourceGlobalNamespace: declResult.GlobalNamespace,
                 entryPoint: decl.SynthesizedEntryPoint,
                 declaredSymbolsByTree: declResult.DeclaredSymbolsByTree,
-                types: types);
+                types: types,
+                options: options);
 
             GenericConstraintBinder.BindAll(compilation, trees, bag);
             MemberSignatureBinder.BindAll(compilation, trees, bag);
@@ -722,8 +743,9 @@ namespace Cnidaria.Cs
             diagnostics = bag.ToImmutable();
             return compilation;
         }
-        public static Compilation CreateCoreLibrary(ImmutableArray<SyntaxTree> trees, out ImmutableArray<Diagnostic> diagnostics)
+        public static Compilation CreateCoreLibrary(ImmutableArray<SyntaxTree> trees, CompilationOptions? options, out ImmutableArray<Diagnostic> diagnostics)
         {
+            options ??= new CompilationOptions();
             var bag = new DiagnosticBag();
             var types = new TypeManager(provider: null);
             var decl = new DeclarationBuilder(bag, types, isCoreLibrary: true);
@@ -734,7 +756,8 @@ namespace Cnidaria.Cs
                 declResult.GlobalNamespace,
                 entryPoint: decl.SynthesizedEntryPoint,
                 declResult.DeclaredSymbolsByTree,
-                types);
+                types,
+                options);
 
             GenericConstraintBinder.BindAll(compilation, trees, bag);
             MemberSignatureBinder.BindAll(compilation, trees, bag);
@@ -754,6 +777,8 @@ namespace Cnidaria.Cs
         public NamespaceSymbol SourceGlobalNamespace { get; }
         public NamespaceSymbol GlobalNamespace { get; }
         public ImmutableArray<SyntaxTree> SyntaxTrees => _syntaxTrees;
+        public CompilationOptions Options { get; }
+        public TargetInfo Target => Options.Target;
         internal TypeManager TypeManager => _types;
         internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
             = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
@@ -765,10 +790,12 @@ namespace Cnidaria.Cs
             NamespaceSymbol sourceGlobalNamespace,
             MethodSymbol? entryPoint,
             ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> declaredSymbolsByTree,
-            TypeManager types)
+            TypeManager types,
+            CompilationOptions? options = null)
         {
             _syntaxTrees = syntaxTrees;
             _types = types;
+            Options = options ?? new CompilationOptions();
             SourceGlobalNamespace = sourceGlobalNamespace;
             EntryPoint = entryPoint;
             DeclaredSymbolsByTree = declaredSymbolsByTree;
@@ -934,7 +961,7 @@ namespace Cnidaria.Cs
                     }
 
                     var lowered = IRLowering.Rewrite(compilation, body);
-                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens);
+                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens, compilation.Target);
 
                     AddFn(emit.Entry);
                     foreach (var lf in emit.AdditionalMethods)

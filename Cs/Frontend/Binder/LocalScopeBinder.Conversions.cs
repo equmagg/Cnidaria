@@ -39,7 +39,7 @@ namespace Cnidaria.Cs
             {
                 return new Conversion(ConversionKind.ImplicitStackAlloc);
             }
-            var standard = ClassifyConversion(expr, target);
+            var standard = ClassifyConversion(expr, target, context.Compilation.Target);
             if (standard.Exists)
                 return standard;
             return ClassifyUserDefinedConversion(expr, target, context);
@@ -221,8 +221,9 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
-        internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target)
+        internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, TargetInfo? targetInfo = null)
         {
+            targetInfo ??= TargetInfo.Default;
             if (expr is BoundOutVarPendingExpression)
                 return ClassifyOutVarPendingConversion(target);
 
@@ -487,7 +488,8 @@ namespace Cnidaria.Cs
 
                 return TryToDecimal(expr.ConstantValueOpt.Value, out var d) && d == 0m;
             }
-            static (decimal min, decimal max, bool ok) GetIntegralRange(SpecialType t) => t switch
+            
+            (decimal min, decimal max, bool ok) GetIntegralRange(SpecialType t) => t switch
             {
                 SpecialType.System_Int8 => (sbyte.MinValue, sbyte.MaxValue, true),
                 SpecialType.System_UInt8 => (byte.MinValue, byte.MaxValue, true),
@@ -499,15 +501,15 @@ namespace Cnidaria.Cs
                 SpecialType.System_Int64 => (long.MinValue, long.MaxValue, true),
                 SpecialType.System_UInt64 => (0m, (decimal)ulong.MaxValue, true),
                 SpecialType.System_IntPtr =>
-                    (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? int.MinValue : long.MinValue,
-                    Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? int.MaxValue : long.MaxValue, true),
+                    (targetInfo.PointerSize == 4 ? int.MinValue : long.MinValue,
+                    targetInfo.PointerSize == 4 ? int.MaxValue : long.MaxValue, true),
                 SpecialType.System_UIntPtr =>
-                    (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? uint.MinValue : ulong.MinValue,
-                    Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? uint.MaxValue : ulong.MaxValue, true),
+                    (targetInfo.PointerSize == 4 ? uint.MinValue : ulong.MinValue,
+                    targetInfo.PointerSize == 4 ? uint.MaxValue : ulong.MaxValue, true),
                 _ => (0m, 0m, false)
             };
 
-            static bool TryImplicitConstantNumericConversion(BoundExpression expr, TypeSymbol target)
+            bool TryImplicitConstantNumericConversion(BoundExpression expr, TypeSymbol target)
             {
                 if (!expr.ConstantValueOpt.HasValue)
                     return false;

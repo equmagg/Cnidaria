@@ -13,6 +13,7 @@ namespace Cnidaria.C
 
         public ImmutableArray<MachineRegister> GeneralRegisters { get; }
         public ImmutableArray<MachineRegister> FloatingRegisters { get; }
+        public ImmutableArray<MachineRegister> VectorRegisters { get; }
 
         public int StackAlignment { get; }
         public int SpillSlotSize { get; }
@@ -22,27 +23,57 @@ namespace Cnidaria.C
         public LSRAOptions(
             ImmutableArray<MachineRegister> generalRegisters = default,
             ImmutableArray<MachineRegister> floatingRegisters = default,
+            ImmutableArray<MachineRegister> vectorRegisters = default,
             int stackAlignment = 16,
             int spillSlotSize = 8,
             int spillSlotAlignment = 8,
             int stackArgumentSlotSize = 8)
         {
-            GeneralRegisters = generalRegisters.IsDefaultOrEmpty
+            GeneralRegisters = generalRegisters.IsDefault
                 ? ImmutableArray.Create(
                     MachineRegister.X18, MachineRegister.X19, MachineRegister.X20, MachineRegister.X21, MachineRegister.X22,
                     MachineRegister.X23, MachineRegister.X24, MachineRegister.X25, MachineRegister.X26, MachineRegister.X27)
                 : generalRegisters;
 
-            FloatingRegisters = floatingRegisters.IsDefaultOrEmpty
-                ? ImmutableArray.Create(
+            FloatingRegisters = floatingRegisters.IsDefault
+                 ? ImmutableArray.Create(
                     MachineRegister.F18, MachineRegister.F19, MachineRegister.F20, MachineRegister.F21, MachineRegister.F22,
                     MachineRegister.F23, MachineRegister.F24, MachineRegister.F25, MachineRegister.F26, MachineRegister.F27)
                 : floatingRegisters;
+
+            VectorRegisters = vectorRegisters.IsDefault
+                ? ImmutableArray<MachineRegister>.Empty
+                : vectorRegisters;
 
             StackAlignment = stackAlignment <= 0 ? 16 : stackAlignment;
             SpillSlotSize = spillSlotSize <= 0 ? 8 : spillSlotSize;
             SpillSlotAlignment = spillSlotAlignment <= 0 ? 8 : spillSlotAlignment;
             StackArgumentSlotSize = stackArgumentSlotSize <= 0 ? 8 : stackArgumentSlotSize;
+        }
+
+        public static LSRAOptions ForTarget(TargetInfo? target)
+        {
+            target ??= TargetInfo.Default;
+            return target.Architecture switch
+            {
+                TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => CreateTargetOptions(target),
+                TargetArchitectureKind.X86 or TargetArchitectureKind.X64 => CreateTargetOptions(target),
+                TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64 => CreateTargetOptions(target),
+                _ => Default
+            };
+        }
+
+        private static LSRAOptions CreateTargetOptions(TargetInfo target)
+        {
+            var registerSize = Math.Max(1, target.RegisterSize);
+            return new LSRAOptions(
+                generalRegisters: TargetRegisterInfo.AllocatableGeneralRegisters(target),
+                floatingRegisters: TargetRegisterInfo.AllocatableFloatingRegisters(target),
+                vectorRegisters: TargetRegisterInfo.AllocatableVectorRegisters(target),
+                stackAlignment: target.Architecture == TargetArchitectureKind.Arm32 ? 8 : 16,
+                spillSlotSize: registerSize,
+                spillSlotAlignment: registerSize,
+                stackArgumentSlotSize: registerSize);
         }
     }
 
@@ -52,24 +83,33 @@ namespace Cnidaria.C
         private readonly TargetInfo _target;
         private readonly LSRAOptions _options;
         private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
+        private readonly List<int> _callPositions = new();
 
-        private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions options)
+        private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options)
         {
             _function = function ?? throw new ArgumentNullException(nameof(function));
             _target = target ?? TargetInfo.Default;
-            _options = options ?? LSRAOptions.Default;
+            _options = options ?? LSRAOptions.ForTarget(_target);
         }
 
         public static AllocationResult Allocate(LirFunction function, TargetInfo? target = null, LSRAOptions? options = null)
-            => new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options ?? LSRAOptions.Default).Allocate();
+             => new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options).Allocate();
 
         private AllocationResult Allocate()
         {
+            _callPositions.Clear();
             var intervals = BuildIntervals();
             var allocations = new Dictionary<LirVirtualRegister, VirtualRegisterAllocation>();
 
-            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences);
+            foreach (var interval in intervals.Values)
+            {
+                if (RequiresStackBackedScalar(interval.Register))
+                    allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
+            }
+
+            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _target, _callPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _target, _callPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _target, _callPositions);
 
             foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
             {
@@ -116,6 +156,8 @@ namespace Cnidaria.C
                 foreach (var instruction in block.Instructions)
                 {
                     var pos = position++;
+                    if (instruction.Kind == LirInstructionKind.Call)
+                        _callPositions.Add(pos);
                     RecordCopyPreferences(instruction);
                     VisitInstructionUses(
                         instruction,
@@ -403,18 +445,35 @@ namespace Cnidaria.C
         private static bool ShouldTrack(LirVirtualRegister register)
             => register.RegisterClass is not (LirRegisterClass.Void or LirRegisterClass.Memory);
 
+        private bool RequiresStackBackedScalar(LirVirtualRegister register)
+        {
+            if (_target.IsRegisterBytecode)
+                return false;
+            if (register.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory or LirRegisterClass.Aggregate)
+                return false;
+            if (CAbi.IsAggregate(register.Type))
+                return false;
+            if (register.Type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function)
+                return false;
+            if (CAbi.UsesHardwareFloatingRegister(_target, register.Type, isVariadicUnnamedArgument: false))
+                return false;
+            return Math.Max(1, _target.SizeOf(register.Type)) > Math.Max(1, _target.RegisterSize);
+        }
+
         private static void AllocateClasses(
             Dictionary<LirVirtualRegister, LiveInterval> allIntervals,
             IReadOnlyCollection<LirRegisterClass> registerClasses,
             ImmutableArray<MachineRegister> physicalRegisters,
             Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
-            IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences)
+            IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
+            TargetInfo target,
+            IReadOnlyList<int> callPositions)
         {
             if (physicalRegisters.IsDefaultOrEmpty)
                 return;
 
             var intervals = allIntervals.Values
-                .Where(i => registerClasses.Contains(i.Register.RegisterClass))
+                .Where(i => !allocations.ContainsKey(i.Register) && registerClasses.Contains(i.Register.RegisterClass))
                 .OrderBy(static i => i.Start)
                 .ThenBy(static i => i.End)
                 .ToList();
@@ -426,19 +485,83 @@ namespace Cnidaria.C
             {
                 ExpireOldIntervals(interval, active, allocations);
 
-                if (active.Count == physicalRegisters.Length)
+                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, target, callPositions);
+                if (allowedRegisters.IsDefaultOrEmpty)
                 {
-                    SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters);
+                    allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
+                    continue;
+                }
+
+                if (ActiveRegisterCount(active, allowedRegisters) == allowedRegisters.Length)
+                {
+                    SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters);
                 }
                 else
                 {
-                    var reg = PreferredFreeRegister(interval, physicalRegisters, active, allocations, copyPreferences, valueNumberPreferredRegisters);
+                    var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, valueNumberPreferredRegisters);
                     interval.PhysicalRegister = reg;
                     allocations[interval.Register] = VirtualRegisterAllocation.InRegister(interval.Register, reg);
                     RememberValueNumberRegister(interval, reg, valueNumberPreferredRegisters);
                     InsertActive(active, interval);
                 }
             }
+        }
+
+        private static ImmutableArray<MachineRegister> AllowedRegistersForInterval(
+            LiveInterval interval,
+            ImmutableArray<MachineRegister> physicalRegisters,
+            TargetInfo target,
+            IReadOnlyList<int> callPositions)
+        {
+            if (!IntervalSpansCall(interval, callPositions))
+                return physicalRegisters;
+
+            var builder = ImmutableArray.CreateBuilder<MachineRegister>();
+            foreach (var register in physicalRegisters)
+            {
+                if (TargetRegisterInfo.IsCalleeSaved(target, register))
+                    builder.Add(register);
+            }
+
+            return builder.ToImmutable();
+        }
+
+        private static bool IntervalSpansCall(LiveInterval interval, IReadOnlyList<int> callPositions)
+        {
+            foreach (var call in callPositions)
+            {
+                if (call <= interval.Start)
+                    continue;
+                if (call + 1 < interval.End)
+                    return true;
+                if (call >= interval.End)
+                    return false;
+            }
+
+            return false;
+        }
+
+        private static int ActiveRegisterCount(List<LiveInterval> active, ImmutableArray<MachineRegister> registers)
+        {
+            var count = 0;
+            foreach (var interval in active)
+            {
+                if (ContainsRegister(registers, interval.PhysicalRegister))
+                    count++;
+            }
+
+            return count;
+        }
+
+        private static bool ContainsRegister(ImmutableArray<MachineRegister> registers, MachineRegister register)
+        {
+            foreach (var candidate in registers)
+            {
+                if (candidate == register)
+                    return true;
+            }
+
+            return false;
         }
 
         private static void ExpireOldIntervals(LiveInterval current, List<LiveInterval> active, Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
@@ -553,20 +676,30 @@ namespace Cnidaria.C
             LiveInterval current,
             List<LiveInterval> active,
             Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
-            Dictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters)
+            Dictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters,
+            ImmutableArray<MachineRegister> allowedRegisters)
         {
-            var spill = active[0];
-            var spillNextUse = spill.NextUseAtOrAfter(current.Start);
-            for (var i = 1; i < active.Count; i++)
+            LiveInterval? spill = null;
+            var spillNextUse = -1;
+            foreach (var candidate in active)
             {
-                var candidate = active[i];
+                if (!ContainsRegister(allowedRegisters, candidate.PhysicalRegister))
+                    continue;
+
                 var candidateNextUse = candidate.NextUseAtOrAfter(current.Start);
-                if (candidateNextUse > spillNextUse ||
+                if (spill is null ||
+                    candidateNextUse > spillNextUse ||
                     candidateNextUse == spillNextUse && candidate.End > spill.End)
                 {
                     spill = candidate;
                     spillNextUse = candidateNextUse;
                 }
+            }
+
+            if (spill is null)
+            {
+                allocations[current.Register] = VirtualRegisterAllocation.Spilled(current.Register, current.Register.RegisterClass);
+                return;
             }
 
             var currentNextUse = current.NextUseAtOrAfter(current.Start);
@@ -644,11 +777,6 @@ namespace Cnidaria.C
             offset = AlignUp(offset, _options.SpillSlotAlignment);
             var parallelCopyTempOffset = offset;
             offset = checked(offset + parallelCopyTempSize);
-
-            // Floating-point immediates are materialized by storing their raw bits through
-            // an integer register and then loading them into an FPR. Keep this scratch
-            // slot separate from the parallel-copy temporary area because an immediate
-            // can be used while parallel-copy temporaries already contain live data.
             offset = AlignUp(offset, _options.SpillSlotAlignment);
             var floatingImmediateTempOffset = offset;
             var floatingImmediateTempSize = AlignUp(Math.Max(8, _options.SpillSlotSize), _options.SpillSlotAlignment);
@@ -665,9 +793,10 @@ namespace Cnidaria.C
             var savedRegisterAreaOffset = offset;
             foreach (var register in usedRegisters)
             {
-                offset = AlignUp(offset, 8);
+                var saveAlignment = Math.Max(1, Math.Min(RegisterSaveSize(register), _options.StackAlignment));
+                offset = AlignUp(offset, saveAlignment);
                 savedRegisterOffsets.Add(register, offset);
-                offset = checked(offset + 8);
+                offset = checked(offset + RegisterSaveSize(register));
             }
             var savedRegisterAreaSize = checked(offset - savedRegisterAreaOffset);
 
@@ -743,7 +872,7 @@ namespace Cnidaria.C
                     continue;
 
                 var copies = physicalCopies.ToImmutable();
-                if (!HasAggregateParallelCopy(copies) && !HasPhysicalStorageClobber(copies, allocations, spillOffsets))
+                if (!HasBlockCopyParallelCopy(copies) && !HasPhysicalStorageClobber(copies, allocations, spillOffsets))
                     continue;
 
                 var size = 0;
@@ -775,11 +904,11 @@ namespace Cnidaria.C
             return !ReferencesSamePhysicalStorage(copy.Source, copy.Destination, allocations, spillOffsets);
         }
 
-        private static bool HasAggregateParallelCopy(ImmutableArray<LirParallelCopy> copies)
+        private bool HasBlockCopyParallelCopy(ImmutableArray<LirParallelCopy> copies)
         {
             foreach (var copy in copies)
             {
-                if (copy.Destination.RegisterClass == LirRegisterClass.Aggregate)
+                if (copy.Destination.RegisterClass == LirRegisterClass.Aggregate || RequiresStackBackedScalar(copy.Destination))
                     return true;
             }
 
@@ -919,6 +1048,9 @@ namespace Cnidaria.C
 
         private int SizeOfStorage(QualifiedType type)
             => Math.Max(1, _target.SizeOf(type));
+
+        private int RegisterSaveSize(MachineRegister register)
+            => TargetRegisterInfo.RegisterSaveSize(_target, register, _options.SpillSlotSize);
 
         private static int AlignUp(int value, int alignment)
         {

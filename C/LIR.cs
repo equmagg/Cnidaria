@@ -32,6 +32,7 @@ namespace Cnidaria.C
         Void,
         General,
         Floating,
+        Vector,
         Address,
         Aggregate,
         Memory,
@@ -1238,7 +1239,7 @@ namespace Cnidaria.C
                 ? EmitValue(block, child)
                 : EmitValue(block, unary.Operand);
             var result = NewVirtualRegister(unary.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: TokenText(unary.OperatorToken), 
+            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: TokenText(unary.OperatorToken),
                 conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: unary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
@@ -1253,8 +1254,8 @@ namespace Cnidaria.C
                 ? EmitValue(block, rightExpression)
                 : EmitValue(block, binary.Right);
             var result = NewVirtualRegister(binary.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, op: TokenText(binary.OperatorToken), 
-                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, op: TokenText(binary.OperatorToken),
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: binary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
@@ -1291,9 +1292,9 @@ namespace Cnidaria.C
             }
 
             var result = NewVirtualRegister(conversion.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null, op: conversion.ConversionKind.ToString(), 
-                conversionKind: conversion.ConversionKind, callSignature: null, parallelCopies: default, switchCases: default, target: null, 
-                trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: conversion, 
+            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null, op: conversion.ConversionKind.ToString(),
+                conversionKind: conversion.ConversionKind, callSignature: null, parallelCopies: default, switchCases: default, target: null,
+                trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: conversion,
                 sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
@@ -1332,8 +1333,8 @@ namespace Cnidaria.C
             if (IsVoid(cast.Type))
                 return LirOperand.Void;
             var result = NewVirtualRegister(cast.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Cast, result, ImmutableArray.Create(operand), address: null, op: "cast", conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.Cast, result, ImmutableArray.Create(operand), address: null, op: "cast", conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: cast, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
@@ -1360,8 +1361,8 @@ namespace Cnidaria.C
             }
 
             LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null, 
-                callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
+                callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
         }
@@ -1378,8 +1379,8 @@ namespace Cnidaria.C
             }
 
             LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.VaStart, result, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.VaStart, result, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
         }
@@ -1389,7 +1390,7 @@ namespace Cnidaria.C
             {
                 switch (value)
                 {
-                    case GimpleConversionExpression conversion 
+                    case GimpleConversionExpression conversion
                     when conversion.ConversionKind is GimpleConversionKind.FunctionToPointer or GimpleConversionKind.Identity:
                         value = conversion.Operand;
                         continue;
@@ -1409,8 +1410,8 @@ namespace Cnidaria.C
         private LirOperand EmitLoad(LirBlock block, LirAddress address, QualifiedType type, GimpleValue sourceValue, SsaExpression? expression)
         {
             var result = NewVirtualRegister(type, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
@@ -1420,8 +1421,8 @@ namespace Cnidaria.C
         private LirOperand EmitAddressValue(LirBlock block, LirAddress address, QualifiedType resultType, GimpleValue sourceValue, SsaExpression? expression)
         {
             var result = NewVirtualRegister(resultType, sourceName: null, GetValueNumber(expression));
-            Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
@@ -1566,8 +1567,8 @@ namespace Cnidaria.C
             else
                 slot = GetOrCreateAnonymousStackSlot(name.Type, name.Variable.Name);
 
-            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(GetOperand(name)), LirAddress.ForStackSlot(slot), op: string.Empty, conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, 
+            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(GetOperand(name)), LirAddress.ForStackSlot(slot), op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement,
                 sourceValue: expression.Original, sourceInstruction: _currentInstruction, valueNumber: null);
             return LirAddress.ForStackSlot(slot);
         }
@@ -1579,8 +1580,8 @@ namespace Cnidaria.C
 
             if (source.Successors.Length == 0)
             {
-                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
-                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null,
                     sourceInstruction: null, valueNumber: null);
                 return;
             }
@@ -1588,8 +1589,8 @@ namespace Cnidaria.C
             var nonExitSuccessors = source.Successors.Where(static edge => !edge.Target.IsExit).ToArray();
             if (nonExitSuccessors.Length == 0)
             {
-                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, 
-                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, 
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                    parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null,
                     sourceInstruction: null, valueNumber: null);
                 return;
             }
@@ -1733,8 +1734,8 @@ namespace Cnidaria.C
         }
 
         private void EmitNop(LirBlock block, GimpleStatement statement)
-            => Emit(block, LirInstructionKind.Nop, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, 
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, 
+            => Emit(block, LirInstructionKind.Nop, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: statement, sourceValue: null, sourceInstruction: _currentInstruction, valueNumber: null);
 
         private bool HasTerminator(LirBlock block)
@@ -2003,27 +2004,7 @@ namespace Cnidaria.C
         private static bool IsVoid(QualifiedType type)
             => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
 
-        private static LirRegisterClass GetRegisterClass(QualifiedType type)
-        {
-            if (type.Type is BuiltinType builtin)
-            {
-                return builtin.BuiltinKind switch
-                {
-                    BuiltinTypeKind.Void => LirRegisterClass.Void,
-                    BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble => LirRegisterClass.Floating,
-                    _ => LirRegisterClass.General,
-                };
-            }
-
-            return type.Type.Kind switch
-            {
-                TypeKind.Pointer or TypeKind.Function => LirRegisterClass.Address,
-                TypeKind.Array or TypeKind.Struct or TypeKind.Union => LirRegisterClass.Aggregate,
-                TypeKind.Enum => LirRegisterClass.General,
-                TypeKind.Error => LirRegisterClass.Unknown,
-                _ => LirRegisterClass.Unknown,
-            };
-        }
+        private LirRegisterClass GetRegisterClass(QualifiedType type) => CAbi.PreferredLirRegisterClass(_target, type);
 
         internal readonly struct LoweredLirFunction
         {

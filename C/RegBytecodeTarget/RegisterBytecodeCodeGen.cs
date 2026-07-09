@@ -32,7 +32,7 @@ namespace Cnidaria.C
             PrintfMethodId = printfMethodId;
             MethodIds = methodIds ?? throw new ArgumentNullException(nameof(methodIds));
             SignaturesByMethodId = signaturesByMethodId ?? throw new ArgumentNullException(nameof(signaturesByMethodId));
-            Target = target ?? TargetInfo.RegisterBytecode;
+            Target = target ?? TargetInfo.Default;
         }
         public RegisterBytecodeSyntheticRuntime CreateSyntheticRuntime()
             => CreateSyntheticRuntime(MethodIds, SignaturesByMethodId, EntryPc, PrintfMethodId, Target);
@@ -56,7 +56,7 @@ namespace Cnidaria.C
             modules.Add(stdModule.Name, stdModule);
 
             var runtimeTypes = new RuntimeTypeSystem(modules);
-            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId, target ?? TargetInfo.RegisterBytecode);
+            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId, target ?? TargetInfo.Default);
             return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryPc);
         }
 
@@ -73,7 +73,7 @@ namespace Cnidaria.C
                 throw new ArgumentNullException(nameof(methodIds));
             if (signaturesByMethodId is null)
                 throw new ArgumentNullException(nameof(signaturesByMethodId));
-            target ??= TargetInfo.RegisterBytecode;
+            target ??= TargetInfo.Default;
 
             var cProgramType = runtimeTypes.RegisterSyntheticType("c", "__c", "Program", RuntimeTypeKind.Class);
             foreach (var pair in signaturesByMethodId.OrderBy(static p => p.Key))
@@ -659,7 +659,7 @@ namespace Cnidaria.C
                     return;
 
                 var type = instruction.Result.Type;
-                var value = CAbi.ClassifyValue(_owner._target, type);
+                var value = CAbi.ClassifyValue(_owner._target, type, isReturn: false, isVariadicUnnamedArgument: false);
                 var cursor = ToAbiCursor(_parameters);
 
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
@@ -1155,7 +1155,7 @@ namespace Cnidaria.C
                 if (instruction.Result is null)
                     return;
 
-                var value = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, isReturn: true);
+                var value = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, isReturn: true, isVariadicUnnamedArgument: false);
                 if (IsAggregateType(instruction.Result.Type))
                 {
                     if (value.PassingKind == AbiPassingKind.Indirect)
@@ -1383,7 +1383,7 @@ namespace Cnidaria.C
                 var operand = instruction.Operands[0];
                 if (IsAggregateType(operand.Type))
                 {
-                    var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: true);
+                    var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: true, isVariadicUnnamedArgument: false);
                     MaterializeOperandStorageAddress(operand, GpScratch0, instruction);
                     var sourceAddress = GpScratch0;
 
@@ -2029,7 +2029,7 @@ namespace Cnidaria.C
 
             private void MarshalCallArgument(LirInstruction instruction, LirOperand operand, ref AbiCursor cursor)
             {
-                var value = CAbi.ClassifyValue(_owner._target, operand.Type);
+                var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: false, isVariadicUnnamedArgument: false);
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
                     MaterializeOperandStorageAddress(operand, GpScratch1, instruction);
@@ -2502,7 +2502,7 @@ namespace Cnidaria.C
             {
                 if (IsAggregateType(returnType))
                 {
-                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true);
+                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
                     if (abi.PassingKind == AbiPassingKind.Indirect)
                         return isInternal ? Op.CallInternalVoid : Op.CallVoid;
                     return isInternal ? Op.CallInternalValue : Op.CallValue;
@@ -2521,7 +2521,7 @@ namespace Cnidaria.C
             {
                 if (IsAggregateType(returnType))
                 {
-                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true);
+                    var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
                     return abi.PassingKind == AbiPassingKind.Indirect ? Op.CallIndirectVoid : Op.CallIndirectValue;
                 }
 

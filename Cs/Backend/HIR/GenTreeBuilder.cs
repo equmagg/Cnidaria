@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Cnidaria.C;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
@@ -12,7 +13,7 @@ namespace Cnidaria.Cs
         public ImmutableArray<GenTreeMethod> Methods { get; }
         public IReadOnlyDictionary<int, GenTreeMethod> MethodsByRuntimeMethodId { get; }
         public RuntimeTypeSystem? TypeSystem { get; }
-
+        public TargetInfo Target => TypeSystem?.Target ?? (Methods.IsDefaultOrEmpty ? TargetInfo.Default : Methods[0].Target);
         public GenTreeProgram(ImmutableArray<GenTreeMethod> methods)
             : this(null, methods)
         {
@@ -27,6 +28,7 @@ namespace Cnidaria.Cs
                 map[m.RuntimeMethod.MethodId] = m;
             MethodsByRuntimeMethodId = map;
         }
+
     }
     internal sealed class GenTreeBuildException : Exception
     {
@@ -630,6 +632,7 @@ namespace Cnidaria.Cs
             return new GenTreeMethod(
                 _module,
                 _method,
+                _rts.Target,
                 _body,
                 _argTypes.ToImmutableArray(),
                 _localTypes.ToImmutableArray(),
@@ -5086,7 +5089,7 @@ namespace Cnidaria.Cs
                 targetBlockId);
         }
 
-        private static GenTreeFlags ComputeFlags(GenTreeKind kind, BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, NumericConvFlags convFlags)
+        private GenTreeFlags ComputeFlags(GenTreeKind kind, BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, NumericConvFlags convFlags)
         {
             GenTreeFlags flags = GenTreeFlags.None;
             for (int i = 0; i < operands.Length; i++)
@@ -5181,7 +5184,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.Binary:
-                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(sourceOp, type, stackKind, operands))
+                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(sourceOp, type, stackKind, operands, _rts.Target))
                         flags |= GenTreeFlags.CanThrow;
                     break;
 

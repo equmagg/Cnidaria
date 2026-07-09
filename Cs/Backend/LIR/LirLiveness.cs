@@ -29,6 +29,7 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
+            var target = method.Target;
             var result = ImmutableArray.CreateBuilder<LinearRefPosition>();
 
             for (int i = 0; i < method.LinearNodes.Length; i++)
@@ -65,11 +66,11 @@ namespace Cnidaria.Cs
                 }
                 else if (node.HasLoweringFlag(GenTreeLinearFlags.AbiCall))
                 {
-                    AddCallRefPositions(result, method, intervals, node, usePosition, defPosition);
+                    AddCallRefPositions(result, method, intervals, node, usePosition, defPosition, target);
                 }
                 else if (node.Kind == GenTreeKind.Return)
                 {
-                    AddReturnRefPositions(result, method, intervals, node, usePosition);
+                    AddReturnRefPositions(result, method, intervals, node, usePosition, target);
                 }
                 else
                 {
@@ -77,10 +78,10 @@ namespace Cnidaria.Cs
                 }
 
                 if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                    AddRegisterKills(result, node, usePosition, MachineRegisters.CallerSavedRegisters);
+                    AddRegisterKills(result, node, usePosition, MachineRegisters.CallerSavedScalarRegisters);
             }
 
-            AddInitialArgumentFixedRefPositions(result, method, layout);
+            AddInitialArgumentFixedRefPositions(result, method, layout, target);
 
             result.Sort(static (a, b) =>
             {
@@ -115,7 +116,8 @@ namespace Cnidaria.Cs
         private static void AddInitialArgumentFixedRefPositions(
             ImmutableArray<LinearRefPosition>.Builder result,
             GenTreeMethod method,
-            PositionLayout layout)
+            PositionLayout layout,
+            TargetInfo target)
         {
             if (method.Values.IsDefaultOrEmpty || method.ArgTypes.IsDefaultOrEmpty)
                 return;
@@ -129,7 +131,7 @@ namespace Cnidaria.Cs
                 if ((uint)info.Value.SsaSlot.Index >= (uint)method.ArgTypes.Length)
                     continue;
 
-                AddInitialArgumentFixedRefPositions(result, method, layout, info, info.Value.SsaSlot.Index);
+                AddInitialArgumentFixedRefPositions(result, method, layout, info, info.Value.SsaSlot.Index, target);
             }
         }
 
@@ -144,13 +146,15 @@ namespace Cnidaria.Cs
             GenTreeMethod method,
             PositionLayout layout,
             GenTreeValueInfo info,
-            int argumentIndex)
+            int argumentIndex,
+            TargetInfo target)
         {
             int general = 0;
             int floating = 0;
             int hiddenReturnBufferInsertionIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                 method.RuntimeMethod,
-                method.ArgTypes.Length);
+                method.ArgTypes.Length,
+                target);
             int position = ComputeInitialDefinitionPosition(layout, info);
 
             for (int i = 0; i <= argumentIndex; i++)
@@ -161,8 +165,8 @@ namespace Cnidaria.Cs
                 RuntimeType currentType = method.ArgTypes[i];
                 GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : StackKindForAbi(currentType);
                 var abi = i == argumentIndex
-                    ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false)
-                    : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
+                    ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false, target: target)
+                    : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: target);
 
                 if (abi.PassingKind == AbiValuePassingKind.Void)
                     continue;
@@ -187,7 +191,7 @@ namespace Cnidaria.Cs
 
                 if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                 {
-                    var segments = MachineAbi.GetRegisterSegments(abi);
+                    var segments = MachineAbi.GetRegisterSegments(abi, target);
                     for (int s = 0; s < segments.Length; s++)
                     {
                         var segment = segments[s];
@@ -249,8 +253,8 @@ namespace Cnidaria.Cs
             if (IsLastUse(intervals, sourceValue, usePosition))
                 sourceFlags |= LinearRefPositionFlags.LastUse;
 
-            var sourceAbi = MachineAbi.ClassifyStorageValue(sourceInfo.Type, sourceInfo.StackKind);
-            var destinationAbi = MachineAbi.ClassifyStorageValue(destinationInfo.Type, destinationInfo.StackKind);
+            var sourceAbi = MachineAbi.ClassifyStorageValue(sourceInfo.Type, sourceInfo.StackKind, sourceInfo.Target);
+            var destinationAbi = MachineAbi.ClassifyStorageValue(destinationInfo.Type, destinationInfo.StackKind, destinationInfo.Target);
             if (sourceAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
                 sourceFlags |= LinearRefPositionFlags.StackOnly | LinearRefPositionFlags.ExposedMemory;
             if (destinationAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
@@ -267,8 +271,8 @@ namespace Cnidaria.Cs
                         "Cannot build linear IR ref-positions for a scalar/aggregate copy: " + sourceValue + " -> " + destinationValue + ".");
                 }
 
-                var sourceSegments = MachineAbi.GetRegisterSegments(sourceAbi);
-                var destinationSegments = MachineAbi.GetRegisterSegments(destinationAbi);
+                var sourceSegments = MachineAbi.GetRegisterSegments(sourceAbi, sourceInfo.Target);
+                var destinationSegments = MachineAbi.GetRegisterSegments(destinationAbi, destinationInfo.Target);
                 if (sourceSegments.Length != destinationSegments.Length)
                 {
                     throw new InvalidOperationException(
@@ -335,7 +339,7 @@ namespace Cnidaria.Cs
             {
                 var value = node.RegisterUses[u];
                 var info = method.GetValueInfo(value);
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, info.Target);
                 var flags = GetValueRefFlags(info);
                 int operandIndex = GetOperandIndexForRegisterUse(node, u);
                 ApplyMemoryUseFlags(node.LinearMemoryAccess, operandIndex, ref flags);
@@ -361,7 +365,7 @@ namespace Cnidaria.Cs
                         u,
                         LinearRefPositionKind.Use,
                         value,
-                        MachineAbi.GetRegisterSegments(abi),
+                        MachineAbi.GetRegisterSegments(abi, info.Target),
                         flags,
                         fixedRegisters: default);
                     continue;
@@ -383,7 +387,7 @@ namespace Cnidaria.Cs
                 var value = node.RegisterResult;
                 var info = method.GetValueInfo(value);
                 var flags = GetValueRefFlags(info);
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, info.Target);
                 if (RequiresRegisterForDefinition(node, abi, registerOnly))
                     flags |= LinearRefPositionFlags.RequiresRegister;
 
@@ -398,7 +402,7 @@ namespace Cnidaria.Cs
                         -1,
                         LinearRefPositionKind.Def,
                         value,
-                        MachineAbi.GetRegisterSegments(abi),
+                        MachineAbi.GetRegisterSegments(abi, info.Target),
                         flags,
                         fixedRegisters: default);
                     return;
@@ -581,14 +585,16 @@ namespace Cnidaria.Cs
             IReadOnlyDictionary<GenTree, LinearLiveInterval> intervals,
             GenTree node,
             int usePosition,
-            int defPosition)
+            int defPosition,
+            TargetInfo target)
         {
             var descriptor = MachineAbi.BuildCallDescriptor(
                 node.RegisterUses,
                 method.GetValueInfo,
                 node.RegisterResult,
                 node.Method,
-                node.Kind == GenTreeKind.NewObject);
+                node.Kind == GenTreeKind.NewObject,
+                target);
 
             for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
             {
@@ -637,7 +643,8 @@ namespace Cnidaria.Cs
             GenTreeMethod method,
             IReadOnlyDictionary<GenTree, LinearLiveInterval> intervals,
             GenTree node,
-            int usePosition)
+            int usePosition,
+            TargetInfo target)
         {
             if (node.RegisterUses.Length == 0)
                 return;
@@ -647,7 +654,7 @@ namespace Cnidaria.Cs
 
             var value = node.RegisterUses[0];
             var info = method.GetValueInfo(value);
-            var abi = MachineAbi.ClassifyValue(info.Type, info.StackKind, isReturn: true);
+            var abi = MachineAbi.ClassifyValue(info.Type, info.StackKind, isReturn: true, target: target);
             var flags = GetValueRefFlags(info);
             if (IsLastUse(intervals, value, usePosition))
                 flags |= LinearRefPositionFlags.LastUse;
@@ -671,7 +678,7 @@ namespace Cnidaria.Cs
 
             if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
             {
-                var segments = MachineAbi.GetRegisterSegments(abi);
+                var segments = MachineAbi.GetRegisterSegments(abi, target);
                 int generalRet = 0;
                 int floatRet = 0;
                 for (int i = 0; i < segments.Length; i++)
@@ -737,7 +744,7 @@ namespace Cnidaria.Cs
 
             if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
             {
-                var segments = MachineAbi.GetRegisterSegments(abi);
+                var segments = MachineAbi.GetRegisterSegments(abi, info.Target);
                 int generalRet = 0;
                 int floatRet = 0;
                 for (int i = 0; i < segments.Length; i++)

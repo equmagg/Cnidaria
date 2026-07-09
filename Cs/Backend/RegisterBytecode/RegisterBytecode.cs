@@ -2121,11 +2121,13 @@ namespace Cnidaria.Cs
                 delegateInvocationCountOffset = FindInstanceFieldOffsetInHierarchy(type, "_invocationCount");
             }
 
-            int size = StorageSizeOfForLayout(type);
-            int align = StorageAlignOfForLayout(type);
+            int pointerSize = (_rts?.Target ?? TargetInfo.Default).PointerSize;
+            int size = StorageSizeOfForLayout(type, pointerSize);
+            int align = StorageAlignOfForLayout(type, pointerSize);
             int instanceSize = InstanceSizeOfForLayout(
                 type,
                 isDelegateLike,
+                pointerSize,
                 delegateTargetOffset,
                 delegateMethodPtrOffset,
                 delegateInvocationListOffset,
@@ -2570,23 +2572,24 @@ namespace Cnidaria.Cs
             throw new MissingFieldException(type.Name, name);
         }
 
-        private static int StorageSizeOfForLayout(RuntimeType type)
+        private static int StorageSizeOfForLayout(RuntimeType type, int pointerSize)
         {
             if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
-                return TargetArchitecture.PointerSize;
+                return pointerSize;
             return Math.Max(1, type.SizeOf);
         }
 
-        private static int StorageAlignOfForLayout(RuntimeType type)
+        private static int StorageAlignOfForLayout(RuntimeType type, int pointerSize)
         {
             if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
-                return TargetArchitecture.PointerSize;
+                return pointerSize;
             return Math.Max(1, type.AlignOf);
         }
 
         private static int InstanceSizeOfForLayout(
             RuntimeType type,
             bool isDelegateLike,
+            int pointerSize,
             int delegateTargetOffset,
             int delegateMethodPtrOffset,
             int delegateInvocationListOffset,
@@ -2597,26 +2600,28 @@ namespace Cnidaria.Cs
             if (!isDelegateLike)
                 return instanceSize;
 
-            int required = TargetArchitecture.PointerSize * 2;
-            IncludeDelegateSlot(delegateTargetOffset, ref required);
-            IncludeDelegateSlot(delegateMethodPtrOffset, ref required);
-            IncludeDelegateSlot(delegateInvocationListOffset, ref required);
-            IncludeDelegateSlot(delegateInvocationCountOffset, ref required);
-            return Math.Max(instanceSize, AlignUpForDelegateLayout(required, TargetArchitecture.PointerSize));
-        }
-        private static int AlignUpForDelegateLayout(int value, int alignment)
-        {
-            if (alignment <= 1)
-                return value;
+            int required = pointerSize * 2;
+            IncludeDelegateSlot(delegateTargetOffset, pointerSize, ref required);
+            IncludeDelegateSlot(delegateMethodPtrOffset, pointerSize, ref required);
+            IncludeDelegateSlot(delegateInvocationListOffset, pointerSize, ref required);
+            IncludeDelegateSlot(delegateInvocationCountOffset, pointerSize, ref required);
+            return Math.Max(instanceSize, AlignUpForDelegateLayout(required, pointerSize));
 
-            int mask = alignment - 1;
-            return checked((value + mask) & ~mask);
-        }
-        private static void IncludeDelegateSlot(int offset, ref int required)
-        {
-            if (offset < 0)
-                return;
-            required = Math.Max(required, checked(offset + TargetArchitecture.PointerSize));
+            static void IncludeDelegateSlot(int offset, int pointerSize, ref int required)
+            {
+                if (offset < 0)
+                    return;
+                required = Math.Max(required, checked(offset + pointerSize));
+            }
+
+            static int AlignUpForDelegateLayout(int value, int alignment)
+            {
+                if (alignment <= 1)
+                    return value;
+
+                int mask = alignment - 1;
+                return checked((value + mask) & ~mask);
+            }
         }
 
         public int AddBlob(ReadOnlySpan<byte> bytes)

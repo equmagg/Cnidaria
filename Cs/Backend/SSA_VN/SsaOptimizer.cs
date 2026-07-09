@@ -126,6 +126,7 @@ namespace Cnidaria.Cs
         {
             private readonly SsaMethod _original;
             private readonly SsaOptimizationOptions _options;
+            private readonly TargetInfo _target;
             private readonly Dictionary<SsaSlot, SsaSlotInfo> _slotInfos = new();
             private int _nextSyntheticTreeId;
 
@@ -133,6 +134,7 @@ namespace Cnidaria.Cs
             {
                 _original = method;
                 _options = options;
+                _target = method.GenTreeMethod.Target;
                 for (int i = 0; i < method.Slots.Length; i++)
                     _slotInfos[method.Slots[i].Slot] = method.Slots[i];
                 _nextSyntheticTreeId = MaxTreeId(method) + 1;
@@ -3640,7 +3642,7 @@ namespace Cnidaria.Cs
                 if (IsGcOrManagedPointerKind(info.StackKind))
                     return true;
 
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, _target);
                 return abi.ContainsGcPointers;
             }
 
@@ -3891,8 +3893,8 @@ namespace Cnidaria.Cs
                 if (!IsSemanticallyNoOpConversion(tree.Source.ConvKind, tree.Source.ConvFlags, operandInfo.StackKind))
                     return false;
 
-                var sourceAbi = MachineAbi.ClassifyStorageValue(operandInfo.Type, operandInfo.StackKind);
-                var destinationAbi = MachineAbi.ClassifyStorageValue(tree.Source.Type, tree.Source.StackKind);
+                var sourceAbi = MachineAbi.ClassifyStorageValue(operandInfo.Type, operandInfo.StackKind, _target);
+                var destinationAbi = MachineAbi.ClassifyStorageValue(tree.Source.Type, tree.Source.StackKind, _target);
                 if (sourceAbi.PassingKind == destinationAbi.PassingKind &&
                     sourceAbi.RegisterClass == destinationAbi.RegisterClass &&
                     sourceAbi.Size == destinationAbi.Size &&
@@ -3905,7 +3907,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool IsSemanticallyNoOpConversion(NumericConvKind targetKind, NumericConvFlags flags, GenStackKind sourceStackKind)
+            private bool IsSemanticallyNoOpConversion(NumericConvKind targetKind, NumericConvFlags flags, GenStackKind sourceStackKind)
             {
                 if ((flags & NumericConvFlags.Checked) != 0)
                     return false;
@@ -3931,12 +3933,12 @@ namespace Cnidaria.Cs
 
                 if (targetKind == NumericConvKind.NativeInt)
                     return sourceStackKind == GenStackKind.NativeInt ||
-                           (TargetArchitecture.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
+                           (_target.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
 
                 if (targetKind == NumericConvKind.NativeUInt)
                     return sourceStackKind == GenStackKind.NativeUInt ||
                            sourceStackKind == GenStackKind.Ptr ||
-                           (TargetArchitecture.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
+                           (_target.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
 
                 return false;
             }
@@ -4090,12 +4092,12 @@ namespace Cnidaria.Cs
                    (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == -1 ||
                     fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == -1);
 
-            private static bool UsesEightByteInteger(GenStackKind stackKind)
+            private bool UsesEightByteInteger(GenStackKind stackKind)
                 => stackKind == GenStackKind.I8 ||
                    ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) &&
-                    TargetArchitecture.PointerSize == 8);
+                    _target.PointerSize == 8);
 
-            private static bool IsEffectiveZeroShift(ValueFact fact, GenStackKind stackKind)
+            private bool IsEffectiveZeroShift(ValueFact fact, GenStackKind stackKind)
             {
                 if (fact.Kind != ValueFactKind.Constant || fact.Constant.Kind == ConstKind.Null)
                     return false;

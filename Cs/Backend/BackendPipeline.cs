@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Cnidaria.C;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -30,6 +31,7 @@ namespace Cnidaria.Cs
         public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
         public RegisterAllocatorOptions RegisterAllocatorOptions { get; set; } = RegisterAllocatorOptions.Default;
         public CodeGeneratorOptions CodeGeneratorOptions { get; set; } = CodeGeneratorOptions.Default;
+        public TargetInfo? Target { get; set; }
     }
     internal sealed class BackendResult
     {
@@ -88,7 +90,7 @@ namespace Cnidaria.Cs
             options ??= BackendOptions.Default;
             var swCompile = Stopwatch.StartNew();
             var lowered = GenTreeBackendPipeline.RunProgram(program, options);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions);
+            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, program.Target);
             swCompile.Stop();
             return new BackendResult(
                 lowered.HirProgram,
@@ -106,7 +108,7 @@ namespace Cnidaria.Cs
 
             options ??= BackendOptions.Default;
             var lowered = GenTreeBackendPipeline.RunMethod(method, options);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions);
+            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, method.Target);
             return new BackendResult(
                 lowered.HirProgram,
                 lowered.SsaProgram,
@@ -291,23 +293,24 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
+            var target = method.Target;
             for (int b = 0; b < method.Blocks.Length; b++)
             {
                 var statements = method.Blocks[b].Statements;
                 for (int s = 0; s < statements.Length; s++)
-                    NormalizeFlags(statements[s]);
+                    NormalizeFlags(statements[s], target);
             }
 
             method.SetPhase(phase);
             return method;
         }
 
-        private static GenTreeFlags NormalizeFlags(GenTree node)
+        private static GenTreeFlags NormalizeFlags(GenTree node, TargetInfo target)
         {
             var flags = node.Flags;
             for (int i = 0; i < node.Operands.Length; i++)
             {
-                var childFlags = NormalizeFlags(node.Operands[i]);
+                var childFlags = NormalizeFlags(node.Operands[i], target);
                 if ((childFlags & GenTreeFlags.ContainsCall) != 0)
                     flags |= GenTreeFlags.ContainsCall;
                 if ((childFlags & GenTreeFlags.CanThrow) != 0)
@@ -382,7 +385,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.Binary:
-                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands))
+                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands, target))
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
@@ -399,7 +402,7 @@ namespace Cnidaria.Cs
 
             if (node.Kind == GenTreeKind.Binary &&
                 (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) &&
-                !GenTreeArithmeticSemantics.DivRemCanThrow(node))
+                !GenTreeArithmeticSemantics.DivRemCanThrow(node, target))
                 flags = ClearNodeOwnedCanThrow(flags, node.Operands);
 
             node.Flags = flags;

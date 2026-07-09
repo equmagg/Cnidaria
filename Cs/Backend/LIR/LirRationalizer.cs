@@ -179,6 +179,8 @@ namespace Cnidaria.Cs
             private readonly GenTreeMethod _method;
             private readonly ControlFlowGraph _cfg;
             private readonly SsaMethod? _ssa;
+            private readonly TargetInfo _target;
+            private readonly GenTreeLinearLoweringClassifier _classifier;
             private readonly Dictionary<GenTreeValueKey, GenTreeValueInfo> _valueInfos = new();
             private readonly Dictionary<SsaSlot, SsaSlotInfo> _ssaSlotInfos = new();
             private readonly Dictionary<SsaValueName, SsaValueDefinition> _ssaDefinitions = new();
@@ -191,11 +193,13 @@ namespace Cnidaria.Cs
             private int _currentBlockId;
             private int _currentBlockOrdinal;
 
-            public MethodBuilder(GenTreeMethod method, ControlFlowGraph cfg, SsaMethod? ssa = null)
+            public MethodBuilder(GenTreeMethod method, ControlFlowGraph cfg, SsaMethod? ssa)
             {
                 _method = method;
                 _cfg = cfg;
                 _ssa = ssa;
+                _target = method.Target;
+                _classifier = new GenTreeLinearLoweringClassifier(_target);
                 _nodesByBlock = new List<GenTree>[method.Blocks.Length];
                 for (int i = 0; i < _nodesByBlock.Length; i++)
                     _nodesByBlock[i] = new List<GenTree>();
@@ -672,19 +676,20 @@ namespace Cnidaria.Cs
                     slotInfo.Type,
                     slotInfo.StackKind,
                     ResolveRegisterClass(slotInfo.Type, slotInfo.StackKind),
+                    _target,
                     defBlock,
                     defNode));
             }
 
-            private static RegisterClass ResolveRegisterClass(RuntimeType? type, GenStackKind stackKind)
+            private RegisterClass ResolveRegisterClass(RuntimeType? type, GenStackKind stackKind)
             {
-                AbiValueInfo abi = MachineAbi.ClassifyStorageValue(type, stackKind);
+                AbiValueInfo abi = MachineAbi.ClassifyStorageValue(type, stackKind, _target);
                 if (abi.PassingKind == AbiValuePassingKind.ScalarRegister && abi.RegisterClass != RegisterClass.Invalid)
                     return abi.RegisterClass;
 
                 if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                 {
-                    var segments = MachineAbi.GetRegisterSegments(abi);
+                    var segments = MachineAbi.GetRegisterSegments(abi, _target);
                     if (segments.Length != 0)
                     {
                         RegisterClass cls = segments[0].RegisterClass;
@@ -898,7 +903,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.StoreArrayElement);
             }
 
-            private static bool RequiresCodegenResultForDeadDefinition(GenTree tree)
+            private bool RequiresCodegenResultForDeadDefinition(GenTree tree)
             {
                 if (!ProducesValue(tree))
                     return false;
@@ -910,7 +915,7 @@ namespace Cnidaria.Cs
                         return true;
 
                     var returnKind = MachineAbi.StackKindForType(method.ReturnType);
-                    var returnAbi = MachineAbi.ClassifyValue(method.ReturnType, returnKind, isReturn: true);
+                    var returnAbi = MachineAbi.ClassifyValue(method.ReturnType, returnKind, isReturn: true, target: _target);
                     return returnAbi.PassingKind is AbiValuePassingKind.Indirect or AbiValuePassingKind.Stack;
                 }
 
@@ -1632,7 +1637,7 @@ namespace Cnidaria.Cs
                 if (template.SourceOp != BytecodeOp.Mul)
                     return false;
 
-                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind);
+                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
                 bool rightConst = GenTreeArithmeticSemantics.TryGetIntegralConstant(rightSource, bits, out long rightSigned, out ulong rightUnsigned);
                 bool leftConst = GenTreeArithmeticSemantics.TryGetIntegralConstant(leftSource, bits, out long leftSigned, out ulong leftUnsigned);
 
@@ -1679,7 +1684,7 @@ namespace Cnidaria.Cs
                 if (template.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
                     return false;
 
-                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind);
+                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
                 if (!GenTreeArithmeticSemantics.TryGetIntegralConstant(divisorSource, bits, out _, out ulong unsignedDivisor))
                     return false;
 
@@ -1757,7 +1762,7 @@ namespace Cnidaria.Cs
 
             private GenTree CreateContainedIntegerConstant(GenTree template, ulong value)
             {
-                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind);
+                int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
                 GenTree node = bits <= 32
                     ? new GenTree(
                         _nextSyntheticTreeId++,
@@ -1849,6 +1854,7 @@ namespace Cnidaria.Cs
                     source.Type,
                     source.StackKind,
                     ResolveRegisterClass(source.Type, source.StackKind),
+                    _target,
                     _currentBlockId,
                     definitionNodeId: key.IsTreeNode ? -1 : source.LinearId));
 
@@ -1864,8 +1870,8 @@ namespace Cnidaria.Cs
                 int ordinal = _currentBlockOrdinal++;
                 operands = operands.IsDefault ? ImmutableArray<LirOperandFlags>.Empty : operands;
                 var uses = BuildUses(tree, operands);
-                var memoryAccess = GenTreeLinearLoweringClassifier.ClassifyMemoryAccess(tree);
-                var lowering = GenTreeLinearLoweringClassifier.Classify(tree, result, uses, _currentBlockId, memoryAccess);
+                var memoryAccess = _classifier.ClassifyMemoryAccess(tree);
+                var lowering = _classifier.Classify(tree, result, uses, _currentBlockId, memoryAccess);
                 tree.SetLinearState(id, _currentBlockId, ordinal, GenTreeLinearKind.Tree, result, operands, uses, lowering, memoryAccess);
                 RecordNode(tree);
                 return tree;

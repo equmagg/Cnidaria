@@ -34,73 +34,92 @@ namespace Cnidaria.Cs
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
-            for (int i = 0; i < method.LinearNodes.Length; i++)
+            new Pass(method).Run();
+        }
+
+        private sealed class Pass
+        {
+            private readonly GenTreeMethod _method;
+            private readonly TargetInfo _target;
+            private readonly GenTreeLinearLoweringClassifier _classifier;
+
+            public Pass(GenTreeMethod method)
             {
-                var node = method.LinearNodes[i];
-                if (node.LinearKind == GenTreeLinearKind.Tree)
-                    RefineTreeNode(node);
+                _method = method;
+                _target = method.Target;
+                _classifier = new GenTreeLinearLoweringClassifier(_target);
             }
-        }
 
-        private static void RefineTreeNode(GenTree node)
-        {
-            var memoryAccess = GenTreeLinearLoweringClassifier.ClassifyMemoryAccess(node);
-            var operands = RefineOperandFlags(node, memoryAccess);
-            var uses = BuildUses(node, operands);
-            var lowering = GenTreeLinearLoweringClassifier.Classify(node, node.RegisterResult, uses, node.LinearBlockId, memoryAccess);
-
-            node.SetLinearState(
-                node.LinearId,
-                node.LinearBlockId,
-                node.LinearOrdinal,
-                node.LinearKind,
-                node.RegisterResults,
-                operands,
-                uses,
-                lowering,
-                memoryAccess,
-                node.LinearPhiCopyFromBlockId,
-                node.LinearPhiCopyToBlockId);
-        }
-
-        private static ImmutableArray<LirOperandFlags> RefineOperandFlags(GenTree node, LinearMemoryAccess memoryAccess)
-        {
-            if (node.Operands.IsDefaultOrEmpty)
-                return ImmutableArray<LirOperandFlags>.Empty;
-
-            var builder = ImmutableArray.CreateBuilder<LirOperandFlags>(node.Operands.Length);
-            int existingCount = node.OperandFlags.IsDefaultOrEmpty ? 0 : node.OperandFlags.Length;
-            for (int i = 0; i < node.Operands.Length; i++)
+            public void Run()
             {
-                var flags = i < existingCount ? node.OperandFlags[i] : LirOperandFlags.None;
-
-                if ((flags & LirOperandFlags.Contained) == 0 &&
-                    memoryAccess.HasValueOperand(i) &&
-                    CanUseValueOperandFromHome(node, i, memoryAccess))
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
-                    flags |= LirOperandFlags.RegOptional;
+                    var node = _method.LinearNodes[i];
+                    if (node.LinearKind == GenTreeLinearKind.Tree)
+                        RefineTreeNode(node);
+                }
+            }
+
+            private void RefineTreeNode(GenTree node)
+            {
+                var memoryAccess = _classifier.ClassifyMemoryAccess(node);
+                var operands = RefineOperandFlags(node, memoryAccess);
+                var uses = BuildUses(node, operands);
+                var lowering = _classifier.Classify(node, node.RegisterResult, uses, node.LinearBlockId, memoryAccess);
+
+                node.SetLinearState(
+                    node.LinearId,
+                    node.LinearBlockId,
+                    node.LinearOrdinal,
+                    node.LinearKind,
+                    node.RegisterResults,
+                    operands,
+                    uses,
+                    lowering,
+                    memoryAccess,
+                    node.LinearPhiCopyFromBlockId,
+                    node.LinearPhiCopyToBlockId);
+            }
+
+            private ImmutableArray<LirOperandFlags> RefineOperandFlags(GenTree node, LinearMemoryAccess memoryAccess)
+            {
+                if (node.Operands.IsDefaultOrEmpty)
+                    return ImmutableArray<LirOperandFlags>.Empty;
+
+                var builder = ImmutableArray.CreateBuilder<LirOperandFlags>(node.Operands.Length);
+                int existingCount = node.OperandFlags.IsDefaultOrEmpty ? 0 : node.OperandFlags.Length;
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    var flags = i < existingCount ? node.OperandFlags[i] : LirOperandFlags.None;
+
+                    if ((flags & LirOperandFlags.Contained) == 0 &&
+                        memoryAccess.HasValueOperand(i) &&
+                        CanUseValueOperandFromHome(node, i, memoryAccess))
+                    {
+                        flags |= LirOperandFlags.RegOptional;
+                    }
+
+                    builder.Add(flags);
                 }
 
-                builder.Add(flags);
+                return builder.ToImmutable();
             }
 
-            return builder.ToImmutable();
-        }
+            private bool CanUseValueOperandFromHome(GenTree node, int operandIndex, LinearMemoryAccess memoryAccess)
+            {
+                if (node.HasLoweringFlag(GenTreeLinearFlags.RequiresRegisterOperands))
+                    return false;
 
-        private static bool CanUseValueOperandFromHome(GenTree node, int operandIndex, LinearMemoryAccess memoryAccess)
-        {
-            if (node.HasLoweringFlag(GenTreeLinearFlags.RequiresRegisterOperands))
-                return false;
+                if (memoryAccess.HasAddressOperand(operandIndex))
+                    return false;
 
-            if (memoryAccess.HasAddressOperand(operandIndex))
-                return false;
+                if (memoryAccess.IsBlockCopy)
+                    return true;
 
-            if (memoryAccess.IsBlockCopy)
-                return true;
-
-            var operand = node.Operands[operandIndex];
-            var abi = MachineAbi.ClassifyStorageValue(operand.Type, operand.StackKind);
-            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister;
+                var operand = node.Operands[operandIndex];
+                var abi = MachineAbi.ClassifyStorageValue(operand.Type, operand.StackKind, _target);
+                return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister;
+            }
         }
 
         private static ImmutableArray<GenTree> BuildUses(GenTree tree, ImmutableArray<LirOperandFlags> operandFlags)

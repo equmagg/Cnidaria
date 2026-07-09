@@ -924,7 +924,7 @@ namespace Cnidaria.Cs
     }
     internal static class LinearScanRegisterAllocator
     {
-        public static GenTreeProgram AllocateProgram(GenTreeProgram program, RegisterAllocatorOptions? options = null)
+        public static GenTreeProgram AllocateProgram(GenTreeProgram program, RegisterAllocatorOptions? options = null, TargetInfo? target = null)
         {
             if (program is null)
                 throw new ArgumentNullException(nameof(program));

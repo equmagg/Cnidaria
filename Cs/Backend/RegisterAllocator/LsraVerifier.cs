@@ -1420,7 +1420,7 @@ namespace Cnidaria.Cs
                 else if (node.TreeKind == GenTreeKind.Return)
                     VerifyReturnAbiShape(method, node);
 
-                if (RequiresRegisterOnlyTreeShape(node))
+                if (RequiresRegisterOnlyTreeShape(node, method.GenTreeMethod.Target))
                     VerifyRegisterOnlyTreeShape(node);
             }
         }
@@ -1451,7 +1451,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
 
-        private static bool RequiresRegisterOnlyTreeShape(GenTree node)
+        private static bool RequiresRegisterOnlyTreeShape(GenTree node, TargetInfo target)
         {
             if (!GenTreeLirKinds.IsRealTree(node))
                 return false;
@@ -1459,10 +1459,10 @@ namespace Cnidaria.Cs
             if (node.TreeKind == GenTreeKind.Return)
                 return false;
 
-            var lowering = GenTreeLinearLoweringClassifier.Classify(
-                node.Source,
-                node.RegisterResults.Length == 1 ? node.RegisterResults[0] : null,
-                node.RegisterUses);
+            var lowering = (new GenTreeLinearLoweringClassifier(target)).Classify(
+                node.Source, 
+                node.RegisterResults.Length == 1 ? node.RegisterResults[0] : null, node.RegisterUses, -1, 
+                GenTreeLinearLoweringClassifier.ClassifyMemoryAccess(node.Source, target));
 
             return lowering.HasFlag(GenTreeLinearFlags.RequiresRegisterOperands) &&
                    !lowering.HasFlag(GenTreeLinearFlags.AbiCall);

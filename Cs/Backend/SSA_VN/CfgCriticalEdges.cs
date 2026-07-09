@@ -60,6 +60,7 @@ namespace Cnidaria.Cs
             return new GenTreeMethod(
                 method.Module,
                 method.RuntimeMethod,
+                method.Target,
                 method.Function,
                 method.ArgTypes,
                 method.LocalTypes,

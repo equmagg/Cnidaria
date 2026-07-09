@@ -1,11 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
@@ -1326,14 +1321,15 @@ namespace Cnidaria.Cs
 
             if (left.HasErrors || right.HasErrors) return new BoundBadExpression(bin);
 
-            var constValue = FoldShiftConstant(op, leftPromoted, left, right);
+            var constValue = FoldShiftConstant(op, leftPromoted, left, right, ctx.Compilation.Target);
             return new BoundBinaryExpression(bin, op, leftPromoted, left, right, constValue);
         }
         private static Optional<object> FoldShiftConstant(
             BoundBinaryOperatorKind op,
             TypeSymbol leftType,
             BoundExpression left,
-            BoundExpression right)
+            BoundExpression right,
+            TargetInfo target)
         {
             if (!left.ConstantValueOpt.HasValue || !right.ConstantValueOpt.HasValue)
                 return Optional<object>.None;
@@ -1345,7 +1341,7 @@ namespace Cnidaria.Cs
             {
                 SpecialType.System_Int32 or SpecialType.System_UInt32 => 0x1F,
                 SpecialType.System_Int64 or SpecialType.System_UInt64 => 0x3F,
-                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => Cnidaria.Cs.TargetArchitecture.PointerSize == 4 ? 0x1F : 0x3F,
+                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => target.PointerSize == 4 ? 0x1F : 0x3F,
                 _ => 0x1F
             };
             shift &= mask;
@@ -1396,7 +1392,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case SpecialType.System_IntPtr:
-                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 && lv is int ni32)
+                    if (target.PointerSize == 4 && lv is int ni32)
                         return new Optional<object>(op switch
                         {
                             BoundBinaryOperatorKind.LeftShift => unchecked(ni32 << shift),
@@ -1404,7 +1400,7 @@ namespace Cnidaria.Cs
                             BoundBinaryOperatorKind.UnsignedRightShift => (int)((uint)ni32 >> shift),
                             _ => 0
                         });
-                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 8 && (lv is long or int))
+                    if (target.PointerSize == 8 && (lv is long or int))
                     {
                         long ni64 = lv is long l ? l : (int)lv;
                         return new Optional<object>(op switch
@@ -1418,14 +1414,14 @@ namespace Cnidaria.Cs
                     break;
 
                 case SpecialType.System_UIntPtr:
-                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 4 && lv is uint nu32)
+                    if (target.PointerSize == 4 && lv is uint nu32)
                         return new Optional<object>(op switch
                         {
                             BoundBinaryOperatorKind.LeftShift => unchecked(nu32 << shift),
                             BoundBinaryOperatorKind.RightShift or BoundBinaryOperatorKind.UnsignedRightShift => nu32 >> shift,
                             _ => 0u
                         });
-                    if (Cnidaria.Cs.TargetArchitecture.PointerSize == 8 && (lv is ulong or uint))
+                    if (target.PointerSize == 8 && (lv is ulong or uint))
                     {
                         ulong nu64 = lv is ulong ul ? ul : (uint)lv;
                         return new Optional<object>(op switch

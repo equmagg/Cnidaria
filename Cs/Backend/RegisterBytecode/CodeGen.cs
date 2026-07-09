@@ -7,17 +7,17 @@ namespace Cnidaria.Cs
 {
     internal static class CodeGenerator
     {
-        public static CodeImage Build(GenTreeProgram program, CodeGeneratorOptions? options = null)
+        public static CodeImage Build(GenTreeProgram program, CodeGeneratorOptions? options = null, TargetInfo? target = null)
         {
             if (program is null) throw new ArgumentNullException(nameof(program));
             options ??= CodeGeneratorOptions.Default;
-
+            target ??= program.Target;
             var asm = new Assembler(program.TypeSystem);
             var state = BuildState.Create(asm, program);
             InternMethodSignatureLayouts(asm, program); // intern signatures in case method is used as entry point
 
             ImageFlags flags = ImageFlags.LittleEndian;
-            if (TargetArchitecture.PointerSize == 4)
+            if (target.PointerSize == 4)
                 flags |= ImageFlags.Target32;
 
             var methodEntryLabels = new Dictionary<int, Label>(program.Methods.Length);
@@ -39,7 +39,7 @@ namespace Cnidaria.Cs
                 method.SetPhase(GenTreeMethodPhase.CodeGenerated);
             }
 
-            new DelegateStubEmitter(asm, state, methodEntryLabels).EmitAll();
+            new DelegateStubEmitter(asm, state, methodEntryLabels, target).EmitAll();
 
             return asm.Build(flags, validate: options.VerifyImage);
         }
@@ -212,17 +212,18 @@ namespace Cnidaria.Cs
             private readonly BuildState _state;
             private readonly IReadOnlyDictionary<int, Label> _methodEntryLabels;
 
-            private const int PtrSize = TargetArchitecture.PointerSize;
+            private readonly int PtrSize;
             private static readonly MachineRegister Scratch0 = MachineRegisters.BackendScratch;
             private static readonly MachineRegister Scratch1 = MachineRegisters.ParallelCopyScratch0;
             private static readonly MachineRegister Scratch2 = MachineRegisters.ParallelCopyScratch1;
             private static readonly MachineRegister Scratch3 = MachineRegisters.TreeScratch3;
 
-            public DelegateStubEmitter(Assembler asm, BuildState state, IReadOnlyDictionary<int, Label> methodEntryLabels)
+            public DelegateStubEmitter(Assembler asm, BuildState state, IReadOnlyDictionary<int, Label> methodEntryLabels, TargetInfo target)
             {
                 _asm = asm ?? throw new ArgumentNullException(nameof(asm));
                 _state = state ?? throw new ArgumentNullException(nameof(state));
                 _methodEntryLabels = methodEntryLabels ?? throw new ArgumentNullException(nameof(methodEntryLabels));
+                PtrSize = (target ?? throw new ArgumentNullException(nameof(target))).PointerSize;
             }
 
             public void EmitAll()
@@ -539,7 +540,7 @@ namespace Cnidaria.Cs
                 return new AbiBundle(method, callFlags, hidden, args.ToImmutableArray(), saveCursor, outgoingStackSize);
             }
 
-            private static ImmutableArray<AbiSlice> BuildArgumentSlices(RuntimeType type, ref int general, ref int floating, ref int stack, int saveBase, ref int maxStackSlot)
+            private ImmutableArray<AbiSlice> BuildArgumentSlices(RuntimeType type, ref int general, ref int floating, ref int stack, int saveBase, ref int maxStackSlot)
             {
                 var abi = MachineAbi.ClassifyValue(type, MachineAbi.StackKindForType(type), isReturn: false);
                 var builder = ImmutableArray.CreateBuilder<AbiSlice>();
@@ -3904,7 +3905,7 @@ namespace Cnidaria.Cs
                 return Aux.Instruction(flags);
             }
 
-            private static bool OperationMayThrow(GenTree source, Op op)
+            private bool OperationMayThrow(GenTree source, Op op)
             {
                 if (op is Op.I32Div or Op.I32Rem or Op.U32Div or Op.U32Rem or
                     Op.I64Div or Op.I64Rem or Op.U64Div or Op.U64Rem)
@@ -3926,7 +3927,7 @@ namespace Cnidaria.Cs
                     && source.CanThrow;
             }
 
-            private static bool DivRemInstructionMayThrow(GenTree source)
+            private bool DivRemInstructionMayThrow(GenTree source)
             {
                 if (source.Kind != GenTreeKind.Binary)
                     return true;
@@ -3934,7 +3935,7 @@ namespace Cnidaria.Cs
                 if (source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
                     return true;
 
-                return GenTreeArithmeticSemantics.DivRemCanThrow(source);
+                return GenTreeArithmeticSemantics.DivRemCanThrow(source, _method.Target);
             }
 
             private Label LabelForTarget(GenTree source)

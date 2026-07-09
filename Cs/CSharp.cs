@@ -8,7 +8,6 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
-using static System.Net.Mime.MediaTypeNames;
 
 namespace Cnidaria.Cs
 {
@@ -33,9 +32,18 @@ namespace Cnidaria.Cs
             }
         }
         public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            StandartLibrary = CompileCoreLibrary(GetCoreBCLSource());
+            StandartLibrary32Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default32Bit);
+        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
+            StandartLibrary64Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default64Bit);
+
+        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
+            StandartLibrary = TargetInfo.Default.PointerSize == 4 ? StandartLibrary32Bit : StandartLibrary64Bit;
         public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
-            ExtendedLibrary = CompileLibrary(GetExtendedBCLSource(), "extendedStd");
+            ExtendedLibrary32Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default32Bit);
+        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+            ExtendedLibrary64Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default64Bit);
+        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+            ExtendedLibrary = TargetInfo.Default.PointerSize == 4 ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
         public readonly struct ExecutionContext
         {
             public readonly long InstructionsCount;
@@ -63,13 +71,14 @@ namespace Cnidaria.Cs
         }
         public static (byte[]? image, List<IDiagnostic> diagnostics) CompileStackApplicationToRunnableBytes(
             string source,
-            byte[]? externalLibImage = null)
+            byte[]? externalLibImage = null,
+            int? pointerSize = null)
         {
             var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
 
             try
             {
-                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var options = new LexerOptions { TargetPointerSize = pointerSize ?? TargetArchitecture.PointerSize };
                 var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
@@ -90,7 +99,7 @@ namespace Cnidaria.Cs
                     ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, externalMeta })
                     : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
 
-                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
                 if (HasErrors(diagnostics))
                     return (null, diagnostics);
@@ -739,7 +748,8 @@ namespace Cnidaria.Cs
             Action<string>? streamAction = null,
             string? entryAttributeTypeName = null,
             string[]? entryAttributeArgs = null,
-            string[]? entryMethodArgs = null)
+            string[]? entryMethodArgs = null,
+            TargetInfo? target = null)
         {
             execLimits ??= new ExecutionLimits();
             var output = new StringBuilder();
@@ -750,14 +760,14 @@ namespace Cnidaria.Cs
                 (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
                 if (externalLibSource != null)
                 {
-                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external");
+                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
                     AddDiagnostics(diagnostics, extDiags);
                     if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
                         return (string.Empty, diagnostics, ExecutionContext.Empty);
                     external = (extMeta, extFuncs);
                 }
                 var swBuild = Stopwatch.StartNew();
-                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
                 var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
@@ -771,7 +781,7 @@ namespace Cnidaria.Cs
                     ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
                     : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
 
-                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
                 if (HasErrors(diagnostics))
                     return (string.Empty, diagnostics, ExecutionContext.Empty);
@@ -829,12 +839,12 @@ namespace Cnidaria.Cs
                         return (output.ToString(), diagnostics, ExecutionContext.Empty);
                     }
                 }
-                var rts = new RuntimeTypeSystem(modules);
+                var rts = new RuntimeTypeSystem(modules, target);
                 swBuild.Stop();
                 var swCompile = Stopwatch.StartNew();
                 var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
                 var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
-                var backend = BackendPipeline.CompileProgram(genTreeProgram);
+                var backend = BackendPipeline.CompileProgram(genTreeProgram, new BackendOptions { Target = target });
                 swCompile.Stop();
                 byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + metaSize);
                 int staticEnd = metaSize;
@@ -898,7 +908,8 @@ namespace Cnidaria.Cs
             Action<string>? streamAction = null,
             string? entryAttributeTypeName = null,
             string[]? entryAttributeArgs = null,
-            string[]? entryMethodArgs = null)
+            string[]? entryMethodArgs = null,
+            TargetInfo? target = null)
         {
             execLimits ??= new ExecutionLimits();
             var output = new StringBuilder();
@@ -909,13 +920,13 @@ namespace Cnidaria.Cs
                 (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
                 if (externalLibSource != null)
                 {
-                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external");
+                    var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
                     AddDiagnostics(diagnostics, extDiags);
                     if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
                         return (string.Empty, diagnostics, ExecutionContext.Empty);
                     external = (extMeta, extFuncs);
                 }
-                var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+                var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
                 var parser = new Parser(source, options);
                 var root = parser.Parse();
                 AddDiagnostics(diagnostics, parser.LexerDiagnostics);
@@ -929,7 +940,7 @@ namespace Cnidaria.Cs
                     ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
                     : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
 
-                var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+                var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
                 if (HasErrors(diagnostics))
                     return (string.Empty, diagnostics, ExecutionContext.Empty);
@@ -989,7 +1000,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                var rts = new RuntimeTypeSystem(modules);
+                var rts = new RuntimeTypeSystem(modules, target);
                 byte[] mem = new byte[stackSize + heapSize + metaSize];
                 int staticEnd = metaSize;
                 int stackEnd = staticEnd + stackSize;
@@ -1044,10 +1055,10 @@ namespace Cnidaria.Cs
             }
         }
 
-        internal static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs) CompileCoreLibrary(string source)
+        internal static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs) CompileCoreLibrary(string source, TargetInfo? target = null)
         {
             if (string.IsNullOrWhiteSpace(source)) throw new ArgumentException("standart library source code is empty");
-            var stdParser = new Cnidaria.Cs.Parser(source);
+            var stdParser = new Cnidaria.Cs.Parser(source, new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize });
             var stdRoot = stdParser.Parse();
             foreach (var diag in stdParser.LexerDiagnostics)
                 throw new InvalidOperationException($"std lexer error: {diag.GetMessage(source)}");
@@ -1055,7 +1066,7 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"std parser error: {diag.GetMessage(source)}");
             var stdSyntaxTree = new SyntaxTree(stdRoot, "std");
             var stdTrees = ImmutableArray.Create(new SyntaxTree[] { stdSyntaxTree });
-            var stdCompilation = CompilationFactory.CreateCoreLibrary(stdTrees, out var stdDiagnostics);
+            var stdCompilation = CompilationFactory.CreateCoreLibrary(stdTrees, options: new CompilationOptions(target ?? TargetInfo.Default), out var stdDiagnostics);
             foreach (var diag in stdDiagnostics)
                 throw new InvalidOperationException($"std declaration error: {diag.GetMessage(source)}");
             var (stdMd, stdFuncs, stdDiags, stdEx) = stdCompilation.BuildModule(
@@ -1075,10 +1086,11 @@ namespace Cnidaria.Cs
             IMetadataView stdViewFlat = new FlatMetadataView(stdFlatMd);
             return (stdViewFlat, stdFuncs);
         }
-        public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileLibrary(string source, string modulename)
+        public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileLibrary(
+            string source, string modulename, TargetInfo? target = null)
         {
             var diagnostics = new List<IDiagnostic>();
-            var parser = new Cnidaria.Cs.Parser(source);
+            var parser = new Cnidaria.Cs.Parser(source, new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize });
             var root = parser.Parse();
             foreach (var diag in parser.LexerDiagnostics)
             {
@@ -1095,7 +1107,7 @@ namespace Cnidaria.Cs
             var tree = new SyntaxTree(root, modulename);
             var trees = ImmutableArray.Create(new[] { tree });
             var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandartLibrary.meta });
-            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+            var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
             foreach (var diag in declDiag)
             {
@@ -1130,10 +1142,10 @@ namespace Cnidaria.Cs
             return (viewFlat, builtFuncs, diagnostics);
         }
         internal static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction>? funcs, List<IDiagnostic> diags)
-            CompileLibraryCore(string source, string moduleName)
+            CompileLibraryCore(string source, string moduleName, TargetInfo? target = null)
         {
             var diagnostics = new List<IDiagnostic>();
-            var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+            var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
             var parser = new Parser(source, options);
             var root = parser.Parse();
 
@@ -1147,7 +1159,7 @@ namespace Cnidaria.Cs
             var tree = new SyntaxTree(root, moduleName);
             var trees = ImmutableArray.Create(tree);
             var refs = new MetadataReferenceSet(new[] { StandartLibrary.meta });
-            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+            var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
             foreach (var diag in declDiag)
                 diagnostics.Add(diag);
@@ -1177,9 +1189,10 @@ namespace Cnidaria.Cs
         }
         public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
             string source,
-            string moduleName = "external")
+            string moduleName = "external",
+            TargetInfo? target = null)
         {
-            var (flatMd, _, extFuncs, diags) = CompileLibraryCore(source, moduleName);
+            var (flatMd, _, extFuncs, diags) = CompileLibraryCore(source, moduleName, target);
             if (HasErrors(diags) || flatMd == null || extFuncs == null)
                 return (null, diags);
 

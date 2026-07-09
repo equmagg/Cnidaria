@@ -635,8 +635,12 @@ namespace Cnidaria.Cs
         private readonly Dictionary<(int blockId, int memoryKind, ValueNumberFunction function), ValueNumber> _stableMemoryPhis = new();
         private readonly Dictionary<int, ValueNumberEntry> _entries = new();
         private readonly Dictionary<ValueNumberFuncKey, MapSelectWorkCacheEntry> _mapSelectCache = new();
+        private readonly TargetInfo _target;
         private int _nextId = 1;
-
+        public ValueNumberStore(TargetInfo target)
+        {
+            _target = target ?? throw new ArgumentNullException(nameof(target));
+        }
         public ValueNumber InitialHeap(RuntimeMethod method)
             => VNForConstant(ValueNumberConstantKey.Heap(method));
 
@@ -1549,8 +1553,8 @@ namespace Cnidaria.Cs
                 "UInt32" => VNForInt32(unchecked((int)(uint)v)),
                 "Int64" => VNForInt64(v),
                 "UInt64" => VNForInt64(v),
-                "IntPtr" => TargetArchitecture.PointerSize == 4 ? VNForInt32(unchecked((int)v)) : VNForInt64(v),
-                "UIntPtr" => TargetArchitecture.PointerSize == 4 ? VNForInt32(unchecked((int)(uint)v)) : VNForInt64(v),
+                "IntPtr" => _target.PointerSize == 4 ? VNForInt32(unchecked((int)v)) : VNForInt64(v),
+                "UIntPtr" => _target.PointerSize == 4 ? VNForInt32(unchecked((int)(uint)v)) : VNForInt64(v),
                 _ => targetStackKind == GenStackKind.I8 ? VNForInt64(v) : targetStackKind == GenStackKind.I4 ? VNForInt32(unchecked((int)v)) : NoVN,
             };
         }
@@ -1558,9 +1562,9 @@ namespace Cnidaria.Cs
         private ValueNumber ZeroForStackKind(GenStackKind stackKind)
             => Is64BitStackKind(stackKind) ? VNForInt64(0) : VNForInt32(0);
 
-        private static bool Is64BitStackKind(GenStackKind stackKind)
+        private bool Is64BitStackKind(GenStackKind stackKind)
             => stackKind == GenStackKind.I8 ||
-               ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) && TargetArchitecture.PointerSize == 8);
+               ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) && _target.PointerSize == 8);
 
         private static bool IsIntegerLikeStackKind(GenStackKind stackKind)
             => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
@@ -1650,10 +1654,10 @@ namespace Cnidaria.Cs
             return true;
         }
 
-        private static bool UsesEightByteInteger(GenStackKind stackKind)
+        private bool UsesEightByteInteger(GenStackKind stackKind)
             => stackKind == GenStackKind.I8 ||
                ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) &&
-                TargetArchitecture.PointerSize == 8);
+                _target.PointerSize == 8);
 
         private bool IsEffectiveZeroShift(ValueNumber vn, GenStackKind stackKind)
         {
@@ -1959,7 +1963,8 @@ namespace Cnidaria.Cs
         private sealed class Builder
         {
             private readonly SsaMethod _method;
-            private readonly ValueNumberStore _store = new();
+            private readonly TargetInfo _target;
+            private readonly ValueNumberStore _store;
             private readonly Dictionary<SsaValueName, ValueNumberPair> _ssaValues = new();
             private readonly Dictionary<SsaMemoryValueName, ValueNumber> _memoryValues = new();
             private readonly Dictionary<GenTree, ValueNumberPair> _treeValues = new(ReferenceEqualityComparer<GenTree>.Instance);
@@ -1979,6 +1984,8 @@ namespace Cnidaria.Cs
             public Builder(SsaMethod method)
             {
                 _method = method;
+                _target = method.GenTreeMethod.Target;
+                _store = new ValueNumberStore(_target);
                 for (int i = 0; i < method.Slots.Length; i++)
                     _slotInfos[method.Slots[i].Slot] = method.Slots[i];
                 for (int i = 0; i < method.ValueDefinitions.Length; i++)
@@ -3085,7 +3092,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static int AccessSize(GenTree node, RuntimeType? fallbackType)
+            private int AccessSize(GenTree node, RuntimeType? fallbackType)
                 => Math.Max(1, StorageSize(AccessRuntimeType(node, fallbackType), AccessStackKind(node, fallbackType)));
 
             private static RuntimeType? AccessRuntimeType(GenTree node, RuntimeType? fallbackType)
@@ -3394,7 +3401,7 @@ namespace Cnidaria.Cs
 
             private bool DivRemMayThrowDivideByZero(GenTree node, ValueNumber divisor)
             {
-                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind);
+                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind, _target);
                 return !TryGetIntegralConstant(divisor, bits, out _, out ulong unsignedDivisor) || unsignedDivisor == 0;
             }
 
@@ -3403,7 +3410,7 @@ namespace Cnidaria.Cs
                 if (node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Rem))
                     return false;
 
-                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind);
+                int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind, _target);
                 if (TryGetIntegralConstant(divisor, bits, out long signedDivisor, out ulong unsignedDivisor))
                 {
                     if (unsignedDivisor == 0 || signedDivisor != -1)
@@ -3813,7 +3820,7 @@ namespace Cnidaria.Cs
                 return GenStackKind.Value;
             }
 
-            private static int StorageSize(RuntimeType? type, GenStackKind stackKind)
+            private int StorageSize(RuntimeType? type, GenStackKind stackKind)
             {
                 if (type is not null && type.SizeOf > 0)
                     return type.SizeOf;
@@ -3829,9 +3836,9 @@ namespace Cnidaria.Cs
                     case GenStackKind.Ptr:
                     case GenStackKind.Ref:
                     case GenStackKind.ByRef:
-                        return TargetArchitecture.PointerSize;
+                        return _target.PointerSize;
                     case GenStackKind.Value:
-                        return Math.Max(1, type?.SizeOf ?? TargetArchitecture.PointerSize);
+                        return Math.Max(1, type?.SizeOf ?? _target.PointerSize);
                     default:
                         return 4;
                 }
@@ -3871,7 +3878,7 @@ namespace Cnidaria.Cs
                 return _store.VNForArrayElementClass(aliasClass.EquivalenceClass, aliasClass.Size, aliasClass.ExactTypeId);
             }
 
-            private static ArrayElementAliasClass GetArrayElementAliasClass(RuntimeType? type, GenStackKind fallbackKind)
+            private ArrayElementAliasClass GetArrayElementAliasClass(RuntimeType? type, GenStackKind fallbackKind)
             {
                 if (type is null)
                     return new ArrayElementAliasClass(ArrayAliasUnknown, StorageSize(null, fallbackKind), 0);
@@ -3880,9 +3887,9 @@ namespace Cnidaria.Cs
                 GenStackKind kind = fallbackKind;
 
                 if (elementType.IsReferenceType)
-                    return new ArrayElementAliasClass(ArrayAliasReference, TargetArchitecture.PointerSize, RuntimeArrayElementTypeEquivalenceId(elementType));
+                    return new ArrayElementAliasClass(ArrayAliasReference, _target.PointerSize, RuntimeArrayElementTypeEquivalenceId(elementType));
                 if (kind is GenStackKind.Ref or GenStackKind.Null)
-                    return new ArrayElementAliasClass(ArrayAliasReference, TargetArchitecture.PointerSize, 0);
+                    return new ArrayElementAliasClass(ArrayAliasReference, _target.PointerSize, 0);
 
                 int size = Math.Max(1, StorageSize(elementType, kind));
 
@@ -3905,7 +3912,7 @@ namespace Cnidaria.Cs
                         return new ArrayElementAliasClass(ArrayAliasInt64, 8, 0);
                     case RuntimePrimitiveKind.NativeInt:
                     case RuntimePrimitiveKind.NativeUInt:
-                        return new ArrayElementAliasClass(ArrayAliasNativeInt, TargetArchitecture.PointerSize, 0);
+                        return new ArrayElementAliasClass(ArrayAliasNativeInt, _target.PointerSize, 0);
                     case RuntimePrimitiveKind.Single:
                         return new ArrayElementAliasClass(ArrayAliasFloat32, 4, 0);
                     case RuntimePrimitiveKind.Double:
@@ -3920,7 +3927,7 @@ namespace Cnidaria.Cs
                 if (kind == GenStackKind.R8)
                     return new ArrayElementAliasClass(ArrayAliasFloat64, 8, 0);
                 if (kind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr)
-                    return new ArrayElementAliasClass(ArrayAliasNativeInt, TargetArchitecture.PointerSize, 0);
+                    return new ArrayElementAliasClass(ArrayAliasNativeInt, _target.PointerSize, 0);
                 if (kind is GenStackKind.I4 or GenStackKind.I8)
                     return IntegralArrayAliasClassForSize(size);
 

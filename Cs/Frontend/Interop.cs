@@ -293,8 +293,8 @@ namespace Cnidaria.Cs
             if (clr == typeof(ulong)) return unchecked((ulong)v.AsInt64());
             if (clr == typeof(double)) return v.AsDouble();
             if (clr == typeof(float)) return (float)v.AsDouble();
-            if (clr == typeof(IntPtr)) return TargetArchitecture.PointerSize == 8 ? new IntPtr(v.AsInt64()) : new IntPtr(v.AsInt32());
-            if (clr == typeof(UIntPtr)) return TargetArchitecture.PointerSize == 8 ? new UIntPtr(unchecked((ulong)v.AsInt64())) : new UIntPtr(unchecked((uint)v.AsInt32()));
+            if (clr == typeof(IntPtr)) return _rts.Target.PointerSize == 8 ? new IntPtr(v.AsInt64()) : new IntPtr(v.AsInt32());
+            if (clr == typeof(UIntPtr)) return _rts.Target.PointerSize == 8 ? new UIntPtr(unchecked((ulong)v.AsInt64())) : new UIntPtr(unchecked((uint)v.AsInt32()));
             throw new NotSupportedException($"Host arg type not supported: {clr.FullName}");
         }
 
@@ -326,7 +326,7 @@ namespace Cnidaria.Cs
             return ConvertScalarRet(ctx, retObj, clr);
         }
 
-        private static VmValue ConvertScalarRet(VmCallContext ctx, object? retObj, Type clr)
+        private VmValue ConvertScalarRet(VmCallContext ctx, object? retObj, Type clr)
         {
             if (clr == typeof(void)) return VmValue.Null;
             if (clr == typeof(string)) return ctx.NewString((string?)retObj);
@@ -345,14 +345,14 @@ namespace Cnidaria.Cs
             if (clr == typeof(IntPtr))
             {
                 var ip = (IntPtr)(retObj ?? IntPtr.Zero);
-                long raw = TargetArchitecture.PointerSize == 8 ? ip.ToInt64() : ip.ToInt32();
-                return TargetArchitecture.PointerSize == 8 ? VmValue.FromInt64(raw) : VmValue.FromInt32((int)raw);
+                long raw = _rts.Target.PointerSize == 8 ? ip.ToInt64() : ip.ToInt32();
+                return _rts.Target.PointerSize == 8 ? VmValue.FromInt64(raw) : VmValue.FromInt32((int)raw);
             }
             if (clr == typeof(UIntPtr))
             {
                 var up = (UIntPtr)(retObj ?? UIntPtr.Zero);
                 ulong raw = up.ToUInt64();
-                return TargetArchitecture.PointerSize == 8 ? VmValue.FromInt64(unchecked((long)raw)) : VmValue.FromInt32(unchecked((int)(uint)raw));
+                return _rts.Target.PointerSize == 8 ? VmValue.FromInt64(unchecked((long)raw)) : VmValue.FromInt32(unchecked((int)(uint)raw));
             }
             throw new NotSupportedException($"Host return type not supported: {clr.FullName}");
         }

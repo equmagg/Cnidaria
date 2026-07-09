@@ -5,12 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    internal enum RegisterClass : byte
-    {
-        Invalid,
-        General,
-        Float,
-    }
+    
     internal enum GenTreeValueOrigin : byte
     {
         TreeNode,
@@ -26,6 +21,7 @@ namespace Cnidaria.Cs
         public readonly RuntimeType? Type;
         public readonly GenStackKind StackKind;
         public readonly RegisterClass RegisterClass;
+        public readonly TargetInfo Target;
         public readonly int DefinitionBlockId;
         public readonly int DefinitionNodeId;
 
@@ -35,6 +31,7 @@ namespace Cnidaria.Cs
             RuntimeType? type,
             GenStackKind stackKind,
             RegisterClass registerClass,
+            TargetInfo target,
             int definitionBlockId,
             int definitionNodeId)
         {
@@ -44,18 +41,19 @@ namespace Cnidaria.Cs
             Type = type;
             StackKind = stackKind;
             RegisterClass = registerClass;
+            Target = target ?? throw new ArgumentNullException(nameof(target));
             DefinitionBlockId = definitionBlockId;
             DefinitionNodeId = definitionNodeId;
         }
 
         public GenTreeValueInfo WithDefinitionNode(GenTree representativeNode, int blockId, int nodeId)
-            => new GenTreeValueInfo(Value, representativeNode, Type, StackKind, RegisterClass, blockId, nodeId);
+            => new GenTreeValueInfo(Value, representativeNode, Type, StackKind, RegisterClass, Target, blockId, nodeId);
 
-        public AbiValueInfo StorageAbi => MachineAbi.ClassifyStorageValue(Type, StackKind);
-        public AbiValueInfo ArgumentAbi => MachineAbi.ClassifyValue(Type, StackKind, isReturn: false);
-        public AbiValueInfo ReturnAbi => MachineAbi.ClassifyValue(Type, StackKind, isReturn: true);
+        public AbiValueInfo StorageAbi => MachineAbi.ClassifyStorageValue(Type, StackKind, Target);
+        public AbiValueInfo ArgumentAbi => MachineAbi.ClassifyValue(Type, StackKind, isReturn: false, target: Target);
+        public AbiValueInfo ReturnAbi => MachineAbi.ClassifyValue(Type, StackKind, isReturn: true, target: Target);
         public bool IsMultiRegisterStorage => StorageAbi.PassingKind == AbiValuePassingKind.MultiRegister;
-        public bool RequiresStackHome => MachineAbi.RequiresStackHome(Type, StackKind);
+        public bool RequiresStackHome => MachineAbi.RequiresStackHome(Type, StackKind, Target);
     }
     internal enum GenTreeLinearKind : byte
     {
@@ -234,12 +232,16 @@ namespace Cnidaria.Cs
             return sb.ToString();
         }
     }
-    internal static class GenTreeLinearLoweringClassifier
+    internal sealed class GenTreeLinearLoweringClassifier
     {
-        public static GenTreeLinearLoweringInfo Classify(GenTree source, GenTree? result, ImmutableArray<GenTree> uses, int blockId = -1)
-            => Classify(source, result, uses, blockId, ClassifyMemoryAccess(source));
+        private readonly TargetInfo _target;
 
-        public static GenTreeLinearLoweringInfo Classify(GenTree source, GenTree? result, ImmutableArray<GenTree> uses, int blockId, LinearMemoryAccess memoryAccess)
+        public GenTreeLinearLoweringClassifier(TargetInfo target)
+        {
+            _target = target ?? throw new ArgumentNullException(nameof(target));
+        }
+
+        public GenTreeLinearLoweringInfo Classify(GenTree source, GenTree? result, ImmutableArray<GenTree> uses, int blockId, LinearMemoryAccess memoryAccess)
         {
             if (source is null)
                 throw new ArgumentNullException(nameof(source));
@@ -270,13 +272,15 @@ namespace Cnidaria.Cs
 
             return new GenTreeLinearLoweringInfo(flags, internalGeneral, internalFloat);
         }
-
-        public static LinearMemoryAccess ClassifyMemoryAccess(GenTree source)
+        public LinearMemoryAccess ClassifyMemoryAccess(GenTree source) => ClassifyMemoryAccess(source, _target);
+        internal static LinearMemoryAccess ClassifyMemoryAccess(GenTree source, TargetInfo target)
         {
             if (source is null)
                 throw new ArgumentNullException(nameof(source));
 
-            static LinearMemoryAccessFlags TypeFlags(RuntimeType? type, GenStackKind stackKind)
+            int pointerSize = target.PointerSize;
+
+            LinearMemoryAccessFlags TypeFlags(RuntimeType? type, GenStackKind stackKind)
             {
                 LinearMemoryAccessFlags flags = LinearMemoryAccessFlags.None;
                 if (type is not null)
@@ -284,7 +288,7 @@ namespace Cnidaria.Cs
                     if (type.ContainsGcPointers || type.IsReferenceType || type.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
                         flags |= LinearMemoryAccessFlags.ContainsGcPointers;
 
-                    if (MachineAbi.IsBlockCopyValue(type, stackKind))
+                    if (MachineAbi.IsBlockCopyValue(type, stackKind, target))
                         flags |= LinearMemoryAccessFlags.BlockCopy;
                 }
                 if (stackKind is GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef)
@@ -294,7 +298,7 @@ namespace Cnidaria.Cs
                 return flags;
             }
 
-            static LinearMemoryAccessFlags StoreTypeFlags(RuntimeType? type, GenStackKind stackKind)
+            LinearMemoryAccessFlags StoreTypeFlags(RuntimeType? type, GenStackKind stackKind)
             {
                 var flags = TypeFlags(type, stackKind);
                 if ((flags & LinearMemoryAccessFlags.ContainsGcPointers) != 0)
@@ -302,7 +306,7 @@ namespace Cnidaria.Cs
                 return flags;
             }
 
-            static int SizeOf(RuntimeType? type, GenStackKind stackKind)
+            int SizeOf(RuntimeType? type, GenStackKind stackKind)
             {
                 if (type is not null)
                     return Math.Max(1, type.SizeOf);
@@ -313,18 +317,18 @@ namespace Cnidaria.Cs
                     GenStackKind.I8 => 8,
                     GenStackKind.R4 => 4,
                     GenStackKind.R8 => 8,
-                    GenStackKind.NativeInt => TargetArchitecture.PointerSize,
-                    GenStackKind.NativeUInt => TargetArchitecture.PointerSize,
-                    GenStackKind.Ref => TargetArchitecture.PointerSize,
-                    GenStackKind.Ptr => TargetArchitecture.PointerSize,
-                    GenStackKind.ByRef => TargetArchitecture.PointerSize,
-                    GenStackKind.Null => TargetArchitecture.PointerSize,
+                    GenStackKind.NativeInt => pointerSize,
+                    GenStackKind.NativeUInt => pointerSize,
+                    GenStackKind.Ref => pointerSize,
+                    GenStackKind.Ptr => pointerSize,
+                    GenStackKind.ByRef => pointerSize,
+                    GenStackKind.Null => pointerSize,
                     GenStackKind.Void => 0,
-                    _ => TargetArchitecture.PointerSize,
+                    _ => pointerSize,
                 };
             }
 
-            static int AlignOf(RuntimeType? type, GenStackKind stackKind)
+            int AlignOf(RuntimeType? type, GenStackKind stackKind)
             {
                 if (type is not null)
                     return Math.Max(1, type.AlignOf);
@@ -335,14 +339,14 @@ namespace Cnidaria.Cs
                     GenStackKind.I8 => 8,
                     GenStackKind.R4 => 4,
                     GenStackKind.R8 => 8,
-                    GenStackKind.NativeInt => TargetArchitecture.PointerSize,
-                    GenStackKind.NativeUInt => TargetArchitecture.PointerSize,
-                    GenStackKind.Ref => TargetArchitecture.PointerSize,
-                    GenStackKind.Ptr => TargetArchitecture.PointerSize,
-                    GenStackKind.ByRef => TargetArchitecture.PointerSize,
-                    GenStackKind.Null => TargetArchitecture.PointerSize,
+                    GenStackKind.NativeInt => pointerSize,
+                    GenStackKind.NativeUInt => pointerSize,
+                    GenStackKind.Ref => pointerSize,
+                    GenStackKind.Ptr => pointerSize,
+                    GenStackKind.ByRef => pointerSize,
+                    GenStackKind.Null => pointerSize,
                     GenStackKind.Void => 1,
-                    _ => TargetArchitecture.PointerSize,
+                    _ => pointerSize,
                 };
             }
 
@@ -411,15 +415,15 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.LocalAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Local, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        | LinearMemoryAccessFlags.ByRefAddress, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.ArgAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Argument, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        | LinearMemoryAccessFlags.ByRefAddress, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.TempAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Temporary, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        | LinearMemoryAccessFlags.ByRefAddress, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.Field:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Read
@@ -430,7 +434,7 @@ namespace Cnidaria.Cs
                 case GenTreeKind.FieldAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck, addressOperandIndex: 0,
-                        field: source.Field, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        field: source.Field, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.StaticField:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.StaticField, LinearMemoryAccessFlags.Read
@@ -440,7 +444,7 @@ namespace Cnidaria.Cs
                 case GenTreeKind.StaticFieldAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.StaticField, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress, field: source.Field,
-                        size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.StoreField:
                     {
@@ -487,7 +491,7 @@ namespace Cnidaria.Cs
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayElement, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck | LinearMemoryAccessFlags.BoundsCheck,
                         addressOperandIndex: 0, indexOperandIndex: 1, elementType: source.RuntimeType,
-                        size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.StoreArrayElement:
                     {
@@ -502,17 +506,17 @@ namespace Cnidaria.Cs
                 case GenTreeKind.ArrayDataRef:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayData, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck,
-                        addressOperandIndex: 0, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        addressOperandIndex: 0, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.PointerElementAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.PointerElement, LinearMemoryAccessFlags.Address
                         | LinearMemoryAccessFlags.ByRefAddress, addressOperandIndex: 0, indexOperandIndex: 1,
-                        elementType: source.RuntimeType, size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        elementType: source.RuntimeType, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.PointerDiff:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.PointerDiff, LinearMemoryAccessFlags.Address,
                         addressOperandIndex: 0, indexOperandIndex: 1, elementType: source.RuntimeType,
-                        size: TargetArchitecture.PointerSize, alignment: TargetArchitecture.PointerSize);
+                        size: pointerSize, alignment: pointerSize);
 
                 default:
                     return LinearMemoryAccess.None;
@@ -561,7 +565,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static bool RequiresRegisterOperands(GenTree source, LinearMemoryAccess memoryAccess)
+        private bool RequiresRegisterOperands(GenTree source, LinearMemoryAccess memoryAccess)
         {
             if (source.StackKind == GenStackKind.Value)
                 return false;
@@ -597,7 +601,7 @@ namespace Cnidaria.Cs
             };
         }
 
-        private static byte InternalGeneralRegisterCount(GenTree source, GenTree? result, LinearMemoryAccess memoryAccess)
+        private byte InternalGeneralRegisterCount(GenTree source, GenTree? result, LinearMemoryAccess memoryAccess)
         {
             int count = source.Kind == GenTreeKind.Box && IsStackHomeBoxSource(source) ? 1 : source.Kind switch
             {
@@ -628,7 +632,7 @@ namespace Cnidaria.Cs
             return (byte)count;
         }
 
-        private static byte InternalFloatRegisterCount(GenTree source, GenTree? result)
+        private byte InternalFloatRegisterCount(GenTree source, GenTree? result)
         {
             int count = source.Kind switch
             {
@@ -651,16 +655,16 @@ namespace Cnidaria.Cs
             return (byte)count;
         }
 
-        private static bool IsStackHomeBoxSource(GenTree node)
+        private bool IsStackHomeBoxSource(GenTree node)
         {
             if (node.Operands.IsDefaultOrEmpty)
                 return false;
 
             var operand = node.Operands[0].RegisterResult ?? node.Operands[0];
-            return MachineAbi.IsBlockCopyValue(operand.RuntimeType ?? operand.Type, operand.StackKind);
+            return MachineAbi.IsBlockCopyValue(operand.RuntimeType ?? operand.Type, operand.StackKind, _target);
         }
 
-        private static GenTree? MultiRegisterOperandValue(GenTree node, int operandIndex)
+        private GenTree? MultiRegisterOperandValue(GenTree node, int operandIndex)
         {
             if ((uint)operandIndex >= (uint)node.Operands.Length)
                 return null;
@@ -670,25 +674,25 @@ namespace Cnidaria.Cs
             return IsMultiRegisterValue(value) ? value : null;
         }
 
-        private static bool IsMultiRegisterValue(GenTree? value)
+        private bool IsMultiRegisterValue(GenTree? value)
         {
             if (value is null)
                 return false;
 
-            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
             return abi.PassingKind == AbiValuePassingKind.MultiRegister;
         }
 
-        private static bool MultiRegisterValueHasRegisterClass(GenTree? value, RegisterClass registerClass)
+        private bool MultiRegisterValueHasRegisterClass(GenTree? value, RegisterClass registerClass)
         {
             if (value is null)
                 return false;
 
-            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
             if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
                 return false;
 
-            var segments = MachineAbi.GetRegisterSegments(abi);
+            var segments = MachineAbi.GetRegisterSegments(abi, _target);
             for (int i = 0; i < segments.Length; i++)
             {
                 if (segments[i].RegisterClass == registerClass)
@@ -699,7 +703,7 @@ namespace Cnidaria.Cs
         }
 
 
-        private static int ArrayElementLoadGeneralScratchCount(GenTree? result)
+        private int ArrayElementLoadGeneralScratchCount(GenTree? result)
         {
             int count = MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true);
             if (count != 0)
@@ -708,11 +712,11 @@ namespace Cnidaria.Cs
             if (result is null)
                 return 0;
 
-            var abi = MachineAbi.ClassifyStorageValue(result.Type, result.StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(result.Type, result.StackKind, _target);
             return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
         }
 
-        private static int MultiRegisterLoadGeneralScratchCount(GenTree? result, bool needsAddressScratch)
+        private int MultiRegisterLoadGeneralScratchCount(GenTree? result, bool needsAddressScratch)
         {
             if (!IsMultiRegisterValue(result))
                 return 0;
@@ -723,9 +727,9 @@ namespace Cnidaria.Cs
             return count;
         }
 
-        private static int MultiRegisterLoadFloatScratchCount(GenTree? result)
+        private int MultiRegisterLoadFloatScratchCount(GenTree? result)
             => MultiRegisterValueHasRegisterClass(result, RegisterClass.Float) ? 1 : 0;
-        private static int StoreArrayElementGeneralScratchCount(GenTree source)
+        private int StoreArrayElementGeneralScratchCount(GenTree source)
         {
             var value = StoreArrayElementOperandValue(source);
 
@@ -735,7 +739,7 @@ namespace Cnidaria.Cs
             if (value is null)
                 return 0;
 
-            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
             return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
         }
         private static GenTree? StoreArrayElementOperandValue(GenTree node)
@@ -746,7 +750,7 @@ namespace Cnidaria.Cs
             var operand = node.Operands[2];
             return operand.RegisterResult ?? operand;
         }
-        private static int MultiRegisterStoreGeneralScratchCount(GenTree? value, bool needsAddressScratch)
+        private int MultiRegisterStoreGeneralScratchCount(GenTree? value, bool needsAddressScratch)
         {
             if (!IsMultiRegisterValue(value))
                 return 0;
@@ -757,7 +761,7 @@ namespace Cnidaria.Cs
             return count;
         }
 
-        private static int MultiRegisterStoreFloatScratchCount(GenTree? value)
+        private int MultiRegisterStoreFloatScratchCount(GenTree? value)
             => MultiRegisterValueHasRegisterClass(value, RegisterClass.Float) ? 1 : 0;
     }
     internal readonly struct LinearLiveRange

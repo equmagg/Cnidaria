@@ -73,18 +73,19 @@ namespace Cnidaria.Cs
 
             var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
 
-            if (TryGetCompileTimeSizeOf(operandType, out int size))
+            if (TryGetCompileTimeSizeOf(operandType, context.Compilation.Target, out int size))
                 return new BoundLiteralExpression(node, intType, size);
 
             return new BoundSizeOfExpression(node, intType, operandType);
         }
-        private static bool TryGetCompileTimeSizeOf(TypeSymbol type, out int size)
+        private static bool TryGetCompileTimeSizeOf(TypeSymbol type, TargetInfo target, out int size)
         {
             var visiting = new HashSet<TypeSymbol>();
-            return TryGetStorageSizeAlign(type, visiting, out size, out _);
+            return TryGetStorageSizeAlign(type, target, visiting, out size, out _);
         }
         private static bool TryGetStorageSizeAlign(
             TypeSymbol type,
+            TargetInfo target,
             HashSet<TypeSymbol> visiting,
             out int size,
             out int align)
@@ -97,15 +98,15 @@ namespace Cnidaria.Cs
 
             if (type.IsReferenceType || type is ArrayTypeSymbol || type is PointerTypeSymbol || type is ByRefTypeSymbol)
             {
-                size = Cnidaria.Cs.TargetArchitecture.PointerSize;
-                align = Cnidaria.Cs.TargetArchitecture.PointerSize;
+                size = target.PointerSize;
+                align = target.PointerSize;
                 return true;
             }
 
             if (type is TypeParameterSymbol)
                 return false;
 
-            if (TryGetKnownPrimitiveOrBuiltinSizeAlign(type, out size, out align))
+            if (TryGetKnownPrimitiveOrBuiltinSizeAlign(type, target.PointerSize, out size, out align))
                 return true;
 
             if (type is NamedTypeSymbol nt)
@@ -116,7 +117,7 @@ namespace Cnidaria.Cs
                     if (ut is null)
                         return false;
 
-                    return TryGetStorageSizeAlign(ut, visiting, out size, out align);
+                    return TryGetStorageSizeAlign(ut, target, visiting, out size, out align);
                 }
 
                 if (nt.TypeKind == TypeKind.Struct)
@@ -128,7 +129,7 @@ namespace Cnidaria.Cs
                     {
                         if (InlineArrayFacts.TryGetInfo(nt, out var inlineArray))
                         {
-                            if (!TryGetStorageSizeAlign(inlineArray.ElementType, visiting, out int es, out int ea))
+                            if (!TryGetStorageSizeAlign(inlineArray.ElementType, target, visiting, out int es, out int ea))
                                 return false;
 
                             int inlineSize = checked(es * inlineArray.Length);
@@ -149,7 +150,7 @@ namespace Cnidaria.Cs
                             if (members[i] is not FieldSymbol f || f.IsStatic)
                                 continue;
 
-                            if (!TryGetStorageSizeAlign(f.Type, visiting, out int fs, out int fa))
+                            if (!TryGetStorageSizeAlign(f.Type, target, visiting, out int fs, out int fa))
                                 return false;
 
                             offset = AlignUp(offset, fa);
@@ -173,7 +174,7 @@ namespace Cnidaria.Cs
             }
             return false;
         }
-        private static bool TryGetKnownPrimitiveOrBuiltinSizeAlign(TypeSymbol type, out int size, out int align)
+        private static bool TryGetKnownPrimitiveOrBuiltinSizeAlign(TypeSymbol type, int pointerSize, out int size, out int align)
         {
             size = 0;
             align = 1;
@@ -207,8 +208,8 @@ namespace Cnidaria.Cs
                     size = 16; align = 8; return true;
                 case SpecialType.System_IntPtr:
                 case SpecialType.System_UIntPtr:
-                    size = Cnidaria.Cs.TargetArchitecture.PointerSize;
-                    align = Cnidaria.Cs.TargetArchitecture.PointerSize;
+                    size = pointerSize;
+                    align = pointerSize;
                     return true;
             }
 

@@ -599,6 +599,7 @@ namespace Cnidaria.Cs
                 if (!ReferenceEquals(hirLiveness.Cfg, cfg))
                     throw new InvalidOperationException("SSA slot table requires HIR liveness for the same CFG.");
 
+                var target = method.Target;
                 var slots = new List<SsaSlotInfo>();
                 var promotable = new List<SsaSlot>();
                 var descriptorBySlot = new Dictionary<SsaSlot, GenLocalDescriptor>();
@@ -649,7 +650,7 @@ namespace Cnidaria.Cs
                     if (!descriptor.CanBeSsaRenamedAsScalar)
                         throw new InvalidOperationException("LclVarDsc marked non-scalar or memory-aliased local as SSA-renamable: " + descriptor + ".");
 
-                    if (!IsPromotableStorageSlot(type, stackKind))
+                    if (!IsPromotableStorageSlot(type, stackKind, target))
                         throw new InvalidOperationException("tracked SSA local has non-promotable storage kind: " + slot + ".");
 
                     promotable.Add(slot);
@@ -669,7 +670,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind)
+                static bool IsPromotableStorageSlot(RuntimeType? type, GenStackKind stackKind, TargetInfo target)
                 {
                     if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                         return false;
@@ -696,7 +697,7 @@ namespace Cnidaria.Cs
                             GenStackKind.NativeUInt or
                             GenStackKind.Ptr;
 
-                    return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind);
+                    return MachineAbi.IsPhysicallyPromotableStorage(type, stackKind, target);
                 }
             }
             private static int LoopDepth(ControlFlowGraph cfg, int blockId)
