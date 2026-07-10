@@ -7,7 +7,7 @@ using System.Text;
 
 namespace Cnidaria.X86
 {
-    internal sealed class X86AssemblyWriterOptions
+    public sealed class X86AssemblyWriterOptions
     {
         public static X86AssemblyWriterOptions Default { get; } = new X86AssemblyWriterOptions();
 
@@ -16,7 +16,7 @@ namespace Cnidaria.X86
         public bool IncludeMemorySize { get; set; } = true;
     }
 
-    internal static class X86Assembler
+    public static class X86Assembler
     {
         public static X86Program Assemble(string text, X86Target target)
             => X86AssemblyParser.Parse(text, target);
@@ -25,7 +25,7 @@ namespace Cnidaria.X86
             => Assemble(text, target);
     }
 
-    internal static class X86Disassembler
+    public static class X86Disassembler
     {
         public static string Disassemble(X86Program obj, X86AssemblyWriterOptions? options = null)
             => X86AssemblyWriter.Write(obj, options);

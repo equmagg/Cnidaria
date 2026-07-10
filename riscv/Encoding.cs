@@ -421,19 +421,27 @@ namespace Cnidaria.RiscV
             ValidateVectorRegister(instruction.Rs2, nameof(instruction.Rs2));
             uint vm = instruction.VectorUnmasked ? 1U : 0U;
             uint source1;
-            if (metadata.Funct3 == 0)
+            if (metadata.Funct3 is 0 or 1 or 2)
             {
                 ValidateVectorRegister(instruction.Rs1, nameof(instruction.Rs1));
                 source1 = (uint)RVRegisters.VectorIndex(instruction.Rs1);
             }
-            else if (metadata.Funct3 == 4)
+            else if (metadata.Funct3 is 4 or 6)
             {
                 ValidateIntegerRegister(instruction.Rs1, nameof(instruction.Rs1));
                 source1 = (uint)RVRegisters.IntegerIndex(instruction.Rs1);
             }
+            else if (metadata.Funct3 == 5)
+            {
+                ValidateFloatRegister(instruction.Rs1, nameof(instruction.Rs1));
+                source1 = (uint)RVRegisters.FloatIndex(instruction.Rs1);
+            }
             else if (metadata.Funct3 == 3)
             {
-                ValidateSignedImmediate(instruction.Immediate, 5, nameof(instruction.Immediate));
+                if (IsUnsignedVectorImmediate(instruction.Opcode))
+                    ValidateUnsignedImmediate(instruction.Immediate, 5, nameof(instruction.Immediate));
+                else
+                    ValidateSignedImmediate(instruction.Immediate, 5, nameof(instruction.Immediate));
                 source1 = (uint)instruction.Immediate & 0x1FU;
             }
             else
@@ -487,6 +495,10 @@ namespace Cnidaria.RiscV
             if (value < 0 || value > ((1 << bits) - 1))
                 throw new ArgumentOutOfRangeException(name, value, "Unsigned immediate does not fit " + bits.ToString(System.Globalization.CultureInfo.InvariantCulture) + " bits");
         }
+
+        internal static bool IsUnsignedVectorImmediate(RVInstrKind opcode)
+            => opcode is RVInstrKind.VsllVi or RVInstrKind.VsrlVi or RVInstrKind.VsraVi
+                or RVInstrKind.VnsrlWi or RVInstrKind.VnsraWi or RVInstrKind.VrgatherVi;
 
         private static void ValidateBranchImmediate(int immediate)
         {
@@ -876,6 +888,14 @@ namespace Cnidaria.RiscV
                 (2, 4) => RVInstrKind.VsubVx,
                 (3, 4) => RVInstrKind.VrsubVx,
                 (3, 3) => RVInstrKind.VrsubVi,
+                (4, 0) => RVInstrKind.VminuVv,
+                (4, 4) => RVInstrKind.VminuVx,
+                (5, 0) => RVInstrKind.VminVv,
+                (5, 4) => RVInstrKind.VminVx,
+                (6, 0) => RVInstrKind.VmaxuVv,
+                (6, 4) => RVInstrKind.VmaxuVx,
+                (7, 0) => RVInstrKind.VmaxVv,
+                (7, 4) => RVInstrKind.VmaxVx,
                 (9, 0) => RVInstrKind.VandVv,
                 (9, 4) => RVInstrKind.VandVx,
                 (9, 3) => RVInstrKind.VandVi,
@@ -885,15 +905,112 @@ namespace Cnidaria.RiscV
                 (11, 0) => RVInstrKind.VxorVv,
                 (11, 4) => RVInstrKind.VxorVx,
                 (11, 3) => RVInstrKind.VxorVi,
+                (24, 0) => RVInstrKind.VmseqVv,
+                (24, 4) => RVInstrKind.VmseqVx,
+                (24, 3) => RVInstrKind.VmseqVi,
+                (25, 0) => RVInstrKind.VmsneVv,
+                (25, 4) => RVInstrKind.VmsneVx,
+                (25, 3) => RVInstrKind.VmsneVi,
+                (26, 0) => RVInstrKind.VmsltuVv,
+                (26, 4) => RVInstrKind.VmsltuVx,
+                (27, 0) => RVInstrKind.VmsltVv,
+                (27, 4) => RVInstrKind.VmsltVx,
+                (28, 0) => RVInstrKind.VmsleuVv,
+                (28, 4) => RVInstrKind.VmsleuVx,
+                (28, 3) => RVInstrKind.VmsleuVi,
+                (29, 0) => RVInstrKind.VmsleVv,
+                (29, 4) => RVInstrKind.VmsleVx,
+                (29, 3) => RVInstrKind.VmsleVi,
+                (30, 4) => RVInstrKind.VmsgtuVx,
+                (30, 3) => RVInstrKind.VmsgtuVi,
+                (31, 4) => RVInstrKind.VmsgtVx,
+                (31, 3) => RVInstrKind.VmsgtVi,
+                (32, 2) => RVInstrKind.VdivuVv,
+                (32, 6) => RVInstrKind.VdivuVx,
+                (33, 2) => RVInstrKind.VdivVv,
+                (33, 6) => RVInstrKind.VdivVx,
+                (34, 2) => RVInstrKind.VremuVv,
+                (34, 6) => RVInstrKind.VremuVx,
+                (35, 2) => RVInstrKind.VremVv,
+                (35, 6) => RVInstrKind.VremVx,
+                (36, 2) => RVInstrKind.VmulhuVv,
+                (36, 6) => RVInstrKind.VmulhuVx,
+                (37, 0) => RVInstrKind.VsllVv,
+                (37, 4) => RVInstrKind.VsllVx,
+                (37, 3) => RVInstrKind.VsllVi,
+                (37, 2) => RVInstrKind.VmulVv,
+                (37, 6) => RVInstrKind.VmulVx,
+                (38, 2) => RVInstrKind.VmulhsuVv,
+                (38, 6) => RVInstrKind.VmulhsuVx,
+                (39, 2) => RVInstrKind.VmulhVv,
+                (39, 6) => RVInstrKind.VmulhVx,
+                (40, 0) => RVInstrKind.VsrlVv,
+                (40, 4) => RVInstrKind.VsrlVx,
+                (40, 3) => RVInstrKind.VsrlVi,
+                (41, 0) => RVInstrKind.VsraVv,
+                (41, 4) => RVInstrKind.VsraVx,
+                (41, 3) => RVInstrKind.VsraVi,
+                (41, 2) => RVInstrKind.VmaddVv,
+                (41, 6) => RVInstrKind.VmaddVx,
+                (43, 2) => RVInstrKind.VnmsubVv,
+                (43, 6) => RVInstrKind.VnmsubVx,
+                (44, 0) => RVInstrKind.VnsrlWv,
+                (44, 4) => RVInstrKind.VnsrlWx,
+                (44, 3) => RVInstrKind.VnsrlWi,
+                (45, 0) => RVInstrKind.VnsraWv,
+                (45, 4) => RVInstrKind.VnsraWx,
+                (45, 3) => RVInstrKind.VnsraWi,
+                (45, 2) => RVInstrKind.VmaccVv,
+                (45, 6) => RVInstrKind.VmaccVx,
+                (47, 2) => RVInstrKind.VnmsacVv,
+                (47, 6) => RVInstrKind.VnmsacVx,
+                (48, 0) => RVInstrKind.VrgatherVv,
+                (48, 4) => RVInstrKind.VrgatherVx,
+                (48, 3) => RVInstrKind.VrgatherVi,
+                (0, 1) => RVInstrKind.VfaddVv,
+                (0, 5) => RVInstrKind.VfaddVf,
+                (2, 1) => RVInstrKind.VfsubVv,
+                (2, 5) => RVInstrKind.VfsubVf,
+                (4, 1) => RVInstrKind.VfminVv,
+                (4, 5) => RVInstrKind.VfminVf,
+                (6, 1) => RVInstrKind.VfmaxVv,
+                (6, 5) => RVInstrKind.VfmaxVf,
+                (8, 1) => RVInstrKind.VfsgnjVv,
+                (8, 5) => RVInstrKind.VfsgnjVf,
+                (9, 1) => RVInstrKind.VfsgnjnVv,
+                (9, 5) => RVInstrKind.VfsgnjnVf,
+                (10, 1) => RVInstrKind.VfsgnjxVv,
+                (10, 5) => RVInstrKind.VfsgnjxVf,
+                (24, 1) => RVInstrKind.VmfeqVv,
+                (24, 5) => RVInstrKind.VmfeqVf,
+                (25, 1) => RVInstrKind.VmfleVv,
+                (25, 5) => RVInstrKind.VmfleVf,
+                (27, 1) => RVInstrKind.VmfltVv,
+                (27, 5) => RVInstrKind.VmfltVf,
+                (28, 1) => RVInstrKind.VmfneVv,
+                (28, 5) => RVInstrKind.VmfneVf,
+                (29, 5) => RVInstrKind.VmfgtVf,
+                (31, 5) => RVInstrKind.VmfgeVf,
+                (32, 1) => RVInstrKind.VfdivVv,
+                (32, 5) => RVInstrKind.VfdivVf,
+                (33, 5) => RVInstrKind.VfrdivVf,
+                (36, 1) => RVInstrKind.VfmulVv,
+                (36, 5) => RVInstrKind.VfmulVf,
+                (39, 5) => RVInstrKind.VfrsubVf,
                 _ => RVInstrKind.Invalid,
             };
             if (opcode == RVInstrKind.Invalid)
                 throw new InvalidDataException("Invalid RISC-V vector instruction");
-            if (funct3 == 0)
+            if (funct3 is 0 or 1 or 2)
                 return RVInstruction.Vv(opcode, rd, vs2, vs1, vm);
-            if (funct3 == 4)
+            if (funct3 is 4 or 6)
                 return RVInstruction.Vx(opcode, rd, vs2, rs1, vm);
-            return RVInstruction.Vi(opcode, rd, vs2, SignExtend((int)((word >> 15) & 0x1F), 5), vm);
+            if (funct3 == 5)
+                return RVInstruction.Vx(opcode, rd, vs2, (RVRegister)(32 + (int)((word >> 15) & 0x1F)), vm);
+            int immediate = (int)((word >> 15) & 0x1F);
+            if (!RiscVCodeEncoder.IsUnsignedVectorImmediate(opcode))
+                immediate = SignExtend(immediate, 5);
+            return RVInstruction.Vi(opcode, rd, vs2, immediate, vm);
         }
 
         private static RVInstruction DecodeVectorLoad(uint word, byte width, RVRegister rd, RVRegister rs1)

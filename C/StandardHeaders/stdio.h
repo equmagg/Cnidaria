@@ -105,6 +105,22 @@ static void __printf(const char* text)
     : [text] "{ecx}"(text), [length] "{edx}"(length)
         : "eax", "ecx", "edx", "memory");
 }
+#elif defined(__linux__) && defined(__riscv)
+static void __printf(const char* text)
+{
+    unsigned long length = 0;
+
+    while (text[length] != 0)
+        length = length + 1;
+
+    __asm__ volatile(
+        "addi a7, zero, 64\n"
+        "addi a0, zero, 1\n"
+        "ecall"
+        :
+    : [text] "{a1}"(text), [length] "{a2}"(length)
+        : "a0", "a7", "memory");
+}
 #else
 void __printf(const char* text);
 #endif

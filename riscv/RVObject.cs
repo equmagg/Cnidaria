@@ -154,7 +154,7 @@ namespace Cnidaria.RiscV
                 case RVRelocationKind.AbsoluteUpper20:
                     return instruction.WithImmediate(PcrelHi20((long)value, (long)pc));
                 case RVRelocationKind.AbsoluteLow12:
-                    return instruction.WithImmediate(PcrelLo12((long)value, (long)pc));
+                    return instruction.WithImmediate(PcrelLo12((long)value, checked((long)pc - 4)));
                 default:
                     throw new NotSupportedException("Unsupported symbolic instruction relocation: " + instruction.RelocationKind);
             }
@@ -231,13 +231,13 @@ namespace Cnidaria.RiscV
         private static int PcrelHi20(long value, long pc)
         {
             var delta = checked(value - pc);
-            return checked((int)((delta + 0x800L) & ~0xFFFL));
+            return checked((int)((delta + 0x800L) >> 12));
         }
 
         private static int PcrelLo12(long value, long pc)
         {
             var hi = PcrelHi20(value, pc);
-            return checked((int)(value - pc - hi));
+            return checked((int)(value - pc - ((long)hi << 12)));
         }
 
         private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)

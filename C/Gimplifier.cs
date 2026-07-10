@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 
 namespace Cnidaria.C
 {
@@ -339,6 +340,11 @@ namespace Cnidaria.C
         {
             switch (initializer)
             {
+                case BoundExpressionInitializer expressionInitializer
+                    when target.Type.Type is ArrayType arrayType && expressionInitializer.Expression.ConstantValue is string text:
+                    LowerStringArrayInitializer(target, arrayType, text, expressionInitializer.Syntax);
+                    break;
+
                 case BoundExpressionInitializer expressionInitializer:
                     Emit(new GimpleAssignmentStatement(
                         target,
@@ -353,6 +359,25 @@ namespace Cnidaria.C
                 default:
                     EmitZeroInitialize(target, initializer.Syntax);
                     break;
+            }
+        }
+
+        private void LowerStringArrayInitializer(GimplePlace target, ArrayType arrayType, string text, SyntaxNode? syntax)
+        {
+            EmitZeroInitialize(target, syntax);
+            if (!arrayType.Length.HasValue)
+                return;
+
+            var bytes = Encoding.UTF8.GetBytes(text);
+            var count = Math.Min(arrayType.Length.Value, (long)bytes.Length + 1L);
+            for (long index = 0; index < count; index++)
+            {
+                var value = index < bytes.Length ? bytes[index] : (byte)0;
+                var element = CreateElementAccess(target, index, arrayType.ElementType, syntax);
+                Emit(new GimpleAssignmentStatement(
+                    element,
+                    new GimpleConstantValue(value, arrayType.ElementType, syntax),
+                    syntax));
             }
         }
 

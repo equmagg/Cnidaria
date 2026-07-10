@@ -17,6 +17,7 @@ namespace Cnidaria.C
         internal static string StddefH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stddef.h");
         internal static string StdargH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdarg.h");
         internal static string StdioH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdio.h");
+        internal static string RiscVVectorH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.riscv_vector.h");
         private static string ReadEmbeddedText(string resourceName)
         {
             var asm = typeof(Cnidaria.C.StandardHeaders).Assembly;
@@ -31,7 +32,8 @@ namespace Cnidaria.C
             return ImmutableArray.Create(
                 new IncludeFile("stddef.h", StddefH),
                 new IncludeFile("stdio.h", StdioH),
-                new IncludeFile("stdarg.h", StdargH));
+                new IncludeFile("stdarg.h", StdargH),
+                new IncludeFile("riscv_vector.h", RiscVVectorH));
         }
 
         public static IIncludeResolver CreateResolver()

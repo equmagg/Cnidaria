@@ -60,6 +60,7 @@ Redundant Branch Optimization
 Common Subexpression Elimination
 Dead Code Elimination
 Strength reduction
+
 ---
 
 # С
@@ -78,6 +79,7 @@ Declarator + Gimplifier > GIMPLE (Lowering)
 ```
 
 ### C Hello World
+Targeting internal vitual mashine
 
 ```cs
 var code = """
@@ -108,5 +110,55 @@ var limits = new Cnidaria.Cs.ExecutionLimits
     TokenCheckPeriod = 256,
 };
 cVm.Execute(cRuntime.EntryPc, cts.Token, limits, ReadOnlySpan<VmValue>.Empty);
+```
 
+Targeting x86-64 Windows .exe
+
+```cs
+var code = """
+#include <stdio.h>
+int main()
+{
+    printf("Hello World!\n");
+    return 0;
+}
+""";
+var comp = Cnidaria.C.Compilation.Create(code, Cnidaria.C.TargetInfo.X64Windows);
+foreach(var diag in comp.GetDiagnostics())
+{
+    Console.WriteLine(diag.Message);
+}
+var cfg = Cnidaria.C.ControlFlowGraph.Build(comp.GetSemanticModel(comp.SyntaxTrees[0]));
+var ssa = Cnidaria.C.SsaGraph.Build(cfg);
+var lir = Cnidaria.C.LirModule.Lower(ssa);
+Cnidaria.X86.X86Program xProgram = Cnidaria.C.X86CodeGenerator.Generate(lir);
+File.WriteAllBytes(Path.Combine(AppContext.BaseDirectory, "CExecutable.exe"), xProgram.ToWindowsExecutableBytes());
+```
+
+Targeting RISC-V emulator
+
+```cs
+var code = """
+#include <stdio.h>
+int main()
+{
+    printf("Hello World!\n");
+    return 0;
+}
+""";
+var layout = new Cnidaria.RiscV.RiscVZBootLayout();
+var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfig
+{
+    RamBase = 0x80000000UL,
+    RamSize = 128 * 1024 * 1024,
+    ResetVector = layout.Zs2LoadAddress,
+    BlockDeviceBase = layout.BlockDeviceBase,
+    BlockDeviceSize = layout.RequiredBootChainStorageSize
+});
+
+Cnidaria.RiscV.RiscVZBoot.LoadDefaultBootChain(machine, layout, autorunSource: code);
+var result = machine.Run(10_000_000);
+while (machine.Uart.TryReadOutput(out byte b))
+    Console.Write((char)b);
+Console.WriteLine($"\nstop={result.StopReason} pc=0x{machine.ProgramCounter:x16} mode={machine.PrivilegeMode} steps={result.Steps}");
 ```

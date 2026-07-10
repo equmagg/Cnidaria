@@ -7,7 +7,7 @@ using System.Linq;
 namespace Cnidaria.RiscV
 {
 
-    internal sealed class RiscVProgram
+    public sealed class RiscVProgram
     {
         public RVTarget Target { get; }
         public RVTextSection Text { get; }
@@ -50,10 +50,17 @@ namespace Cnidaria.RiscV
             => RVObjectLinker.LinkFlat(this, imageBase, externalSymbols);
 
         public byte[] ToExecutableBytes(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
-            => LinkFlat(imageBase, externalSymbols).Bytes.ToArray();
+            => Target.OperatingSystem switch
+            {
+                OperatingSystemKind.Linux => RiscVElfExecutableWriter.WriteExecutable(this, imageBase == 0 ? RiscVElfExecutableWriter.DefaultImageBase(Target) : imageBase, externalSymbols),
+                _ => LinkFlat(imageBase, externalSymbols).Bytes.ToArray(),
+            };
+
+        public byte[] ToLinuxExecutableBytes(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
+            => RiscVElfExecutableWriter.WriteExecutable(this, imageBase == 0 ? RiscVElfExecutableWriter.DefaultImageBase(Target) : imageBase, externalSymbols);
     }
 
-    internal sealed class RVTextSection
+    public sealed class RVTextSection
     {
         public ImmutableArray<RVInstruction> Instructions { get; }
         public ImmutableDictionary<string, int> Labels { get; }
@@ -81,7 +88,7 @@ namespace Cnidaria.RiscV
             => RiscVDisassembler.Disassemble(this, options);
     }
 
-    internal sealed class RVDataSection
+    public sealed class RVDataSection
     {
         public string Name { get; }
         public RVObjectSectionKind Kind { get; }
@@ -107,7 +114,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal sealed class RVObjectSymbol
+    public sealed class RVObjectSymbol
     {
         public string Name { get; }
         public string SectionName { get; }
@@ -133,7 +140,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal sealed class RVObjectRelocation
+    public sealed class RVObjectRelocation
     {
         public string SectionName { get; }
         public int Offset { get; }
@@ -151,7 +158,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal sealed class RVLinkedImage
+    public sealed class RVLinkedImage
     {
         public RiscVProgram Source { get; }
         public ulong ImageBase { get; }
@@ -183,7 +190,7 @@ namespace Cnidaria.RiscV
             => Bytes.ToArray();
     }
 
-    internal sealed class RVLinkedSection
+    public sealed class RVLinkedSection
     {
         public string Name { get; }
         public RVObjectSectionKind Kind { get; }
@@ -203,7 +210,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal enum RVObjectSectionKind : byte
+    public enum RVObjectSectionKind : byte
     {
         Text,
         Rodata,
@@ -211,14 +218,14 @@ namespace Cnidaria.RiscV
         Bss,
     }
 
-    internal enum RVObjectSymbolBinding : byte
+    public enum RVObjectSymbolBinding : byte
     {
         Local,
         Global,
         External,
     }
 
-    internal enum RVObjectSymbolKind : byte
+    public enum RVObjectSymbolKind : byte
     {
         None,
         Function,
@@ -226,7 +233,7 @@ namespace Cnidaria.RiscV
         Section,
     }
 
-    internal enum RVObjectRelocationKind : byte
+    public enum RVObjectRelocationKind : byte
     {
         None,
         Branch12,
@@ -240,7 +247,7 @@ namespace Cnidaria.RiscV
     }
 
     [Flags]
-    internal enum RVIsaFlags : ulong
+    public enum RVIsaFlags : ulong
     {
         None = 0,
         I = 1UL << 0,
@@ -255,7 +262,7 @@ namespace Cnidaria.RiscV
         Privileged = 1UL << 32,
     }
 
-    internal enum RVAbiKind : byte
+    public enum RVAbiKind : byte
     {
         Ilp32,
         Ilp32F,
@@ -265,7 +272,7 @@ namespace Cnidaria.RiscV
         Lp64D,
     }
 
-    internal enum RVInstructionFormat : byte
+    public enum RVInstructionFormat : byte
     {
         None,
         Raw,
@@ -297,7 +304,7 @@ namespace Cnidaria.RiscV
         PrivilegedFence,
     }
 
-    internal enum RVRelocationKind : byte
+    public enum RVRelocationKind : byte
     {
         None,
         RelativeBranch,
@@ -307,14 +314,14 @@ namespace Cnidaria.RiscV
         AbsoluteUpper20
     }
     [Flags]
-    internal enum RVInstructionFlags : byte
+    public enum RVInstructionFlags : byte
     {
         None = 0,
         VectorUnmasked = 1 << 0,
         AtomicAcquire = 1 << 1,
         AtomicRelease = 1 << 2,
     }
-    internal enum RVInstrKind : ushort
+    public enum RVInstrKind : ushort
     {
         Invalid = 0,
         Raw32,
@@ -495,9 +502,109 @@ namespace Cnidaria.RiscV
         VxorVv,
         VxorVx,
         VxorVi,
+        VminuVv,
+        VminuVx,
+        VminVv,
+        VminVx,
+        VmaxuVv,
+        VmaxuVx,
+        VmaxVv,
+        VmaxVx,
+        VmseqVv,
+        VmseqVx,
+        VmseqVi,
+        VmsneVv,
+        VmsneVx,
+        VmsneVi,
+        VmsltuVv,
+        VmsltuVx,
+        VmsltVv,
+        VmsltVx,
+        VmsleuVv,
+        VmsleuVx,
+        VmsleuVi,
+        VmsleVv,
+        VmsleVx,
+        VmsleVi,
+        VmsgtuVx,
+        VmsgtuVi,
+        VmsgtVx,
+        VmsgtVi,
+        VsllVv,
+        VsllVx,
+        VsllVi,
+        VsrlVv,
+        VsrlVx,
+        VsrlVi,
+        VsraVv,
+        VsraVx,
+        VsraVi,
+        VdivuVv,
+        VdivuVx,
+        VdivVv,
+        VdivVx,
+        VremuVv,
+        VremuVx,
+        VremVv,
+        VremVx,
+        VmulhuVv,
+        VmulhuVx,
+        VmulVv,
+        VmulVx,
+        VmulhsuVv,
+        VmulhsuVx,
+        VmulhVv,
+        VmulhVx,
+        VmaddVv,
+        VmaddVx,
+        VnmsubVv,
+        VnmsubVx,
+        VmaccVv,
+        VmaccVx,
+        VnmsacVv,
+        VnmsacVx,
+        VnsrlWv,
+        VnsrlWx,
+        VnsrlWi,
+        VnsraWv,
+        VnsraWx,
+        VnsraWi,
+        VrgatherVv,
+        VrgatherVx,
+        VrgatherVi,
+        VfaddVv,
+        VfaddVf,
+        VfsubVv,
+        VfsubVf,
+        VfrsubVf,
+        VfminVv,
+        VfminVf,
+        VfmaxVv,
+        VfmaxVf,
+        VfsgnjVv,
+        VfsgnjVf,
+        VfsgnjnVv,
+        VfsgnjnVf,
+        VfsgnjxVv,
+        VfsgnjxVf,
+        VmfeqVv,
+        VmfeqVf,
+        VmfleVv,
+        VmfleVf,
+        VmfltVv,
+        VmfltVf,
+        VmfneVv,
+        VmfneVf,
+        VmfgtVf,
+        VmfgeVf,
+        VfdivVv,
+        VfdivVf,
+        VfrdivVf,
+        VfmulVv,
+        VfmulVf,
     }
 
-    internal enum RVRegister : byte
+    public enum RVRegister : byte
     {
         X0 = 0,
         X1 = 1,
@@ -685,17 +792,23 @@ namespace Cnidaria.RiscV
         CycleH = 0xC80,
         TimeH = 0xC81,
         InstRetH = 0xC82,
+        VL = 0xC20,
+        VType = 0xC21,
+        VLenB = 0xC22,
         Dcsr = 0x7B0,
         Dpc = 0x7B1,
         DScratch0 = 0x7B2,
         DScratch1 = 0x7B3,
-        VLenB = 0xC22,
     }
 
-    internal sealed class RVTarget
+    public sealed class RVTarget
     {
         public static RVTarget Rv32I { get; } = new RVTarget(32, RVAbiKind.Ilp32, RVIsaFlags.I | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei, TargetEndianness.Little);
         public static RVTarget Rv64I { get; } = new RVTarget(64, RVAbiKind.Lp64, RVIsaFlags.I | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei, TargetEndianness.Little);
+        public static RVTarget Rv64G { get; } = new RVTarget(64, RVAbiKind.Lp64D, RVIsaFlags.I | RVIsaFlags.M | RVIsaFlags.A | RVIsaFlags.F | RVIsaFlags.D
+            | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei, TargetEndianness.Little);
+        public static RVTarget Rv64GPrivileged { get; } = new RVTarget(64, RVAbiKind.Lp64D, RVIsaFlags.I | RVIsaFlags.M | RVIsaFlags.A | RVIsaFlags.F | RVIsaFlags.D
+            | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei | RVIsaFlags.Privileged, TargetEndianness.Little);
         public static RVTarget FromTargetInfo(Cnidaria.C.TargetInfo target)
         {
             if (target is null)
@@ -724,7 +837,7 @@ namespace Cnidaria.RiscV
                 ? ((flags & RVIsaFlags.D) != 0 ? RVAbiKind.Lp64D : (flags & RVIsaFlags.F) != 0 ? RVAbiKind.Lp64F : RVAbiKind.Lp64)
                 : ((flags & RVIsaFlags.D) != 0 ? RVAbiKind.Ilp32D : (flags & RVIsaFlags.F) != 0 ? RVAbiKind.Ilp32F : RVAbiKind.Ilp32);
 
-            return new RVTarget(target.PointerSize * 8, abi, flags, target.Endianness);
+            return new RVTarget(target.PointerSize * 8, abi, flags, target.Endianness, target.OperatingSystem);
         }
         public static RVTarget FromTargetInfo(Cnidaria.Cs.TargetInfo target)
         {
@@ -754,13 +867,14 @@ namespace Cnidaria.RiscV
                 ? ((flags & RVIsaFlags.D) != 0 ? RVAbiKind.Lp64D : (flags & RVIsaFlags.F) != 0 ? RVAbiKind.Lp64F : RVAbiKind.Lp64)
                 : ((flags & RVIsaFlags.D) != 0 ? RVAbiKind.Ilp32D : (flags & RVIsaFlags.F) != 0 ? RVAbiKind.Ilp32F : RVAbiKind.Ilp32);
 
-            return new RVTarget(target.PointerSize * 8, abi, flags, target.Endianness);
+            return new RVTarget(target.PointerSize * 8, abi, flags, target.Endianness, target.OperatingSystem);
         }
 
         public int XLen { get; }
         public RVAbiKind Abi { get; }
         public RVIsaFlags Isa { get; }
         public TargetEndianness Endianness { get; }
+        public OperatingSystemKind OperatingSystem { get; }
         public bool Is32Bit => XLen == 32;
         public bool Is64Bit => XLen == 64;
         public bool HasM => Has(RVIsaFlags.M);
@@ -773,7 +887,7 @@ namespace Cnidaria.RiscV
         public bool HasZifencei => Has(RVIsaFlags.Zifencei);
         public bool HasPrivileged => Has(RVIsaFlags.Privileged);
 
-        public RVTarget(int xlen, RVAbiKind abi, RVIsaFlags isa, TargetEndianness endianness = TargetEndianness.Little)
+        public RVTarget(int xlen, RVAbiKind abi, RVIsaFlags isa, TargetEndianness endianness = TargetEndianness.Little, OperatingSystemKind operatingSystem = OperatingSystemKind.None)
         {
             if (xlen is not 32 and not 64)
                 throw new ArgumentOutOfRangeException(nameof(xlen));
@@ -788,6 +902,7 @@ namespace Cnidaria.RiscV
             Abi = abi;
             Isa = isa;
             Endianness = endianness;
+            OperatingSystem = operatingSystem;
         }
 
         public bool Has(RVIsaFlags flags)
@@ -1092,6 +1207,8 @@ namespace Cnidaria.RiscV
                 ["cycleh"] = 0xC80,
                 ["timeh"] = 0xC81,
                 ["instreth"] = 0xC82,
+                ["vl"] = 0xC20,
+                ["vtype"] = 0xC21,
                 ["vlenb"] = 0xC22,
                 ["sstatus"] = 0x100,
                 ["sie"] = 0x104,
@@ -1233,7 +1350,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal readonly struct RVInstruction
+    public readonly struct RVInstruction
     {
         public RVInstrKind Opcode { get; }
         public RVRegister Rd { get; }
@@ -1384,191 +1501,288 @@ namespace Cnidaria.RiscV
             throw new ArgumentOutOfRangeException(nameof(opcode));
         }
 
-        public static string GetMnemonic(RVInstrKind opcode)
+        public static string GetMnemonic(RVInstrKind opcode) => opcode switch
         {
-            return opcode switch
-            {
-                RVInstrKind.Raw32 => ".word",
-                RVInstrKind.Lui => "lui",
-                RVInstrKind.Auipc => "auipc",
-                RVInstrKind.Jal => "jal",
-                RVInstrKind.Jalr => "jalr",
-                RVInstrKind.Beq => "beq",
-                RVInstrKind.Bne => "bne",
-                RVInstrKind.Blt => "blt",
-                RVInstrKind.Bge => "bge",
-                RVInstrKind.Bltu => "bltu",
-                RVInstrKind.Bgeu => "bgeu",
-                RVInstrKind.Lb => "lb",
-                RVInstrKind.Lh => "lh",
-                RVInstrKind.Lw => "lw",
-                RVInstrKind.Lbu => "lbu",
-                RVInstrKind.Lhu => "lhu",
-                RVInstrKind.Lwu => "lwu",
-                RVInstrKind.Ld => "ld",
-                RVInstrKind.Sb => "sb",
-                RVInstrKind.Sh => "sh",
-                RVInstrKind.Sw => "sw",
-                RVInstrKind.Sd => "sd",
-                RVInstrKind.Flw => "flw",
-                RVInstrKind.Fld => "fld",
-                RVInstrKind.Fsw => "fsw",
-                RVInstrKind.Fsd => "fsd",
-                RVInstrKind.FaddS => "fadd.s",
-                RVInstrKind.FsubS => "fsub.s",
-                RVInstrKind.FmulS => "fmul.s",
-                RVInstrKind.FdivS => "fdiv.s",
-                RVInstrKind.FaddD => "fadd.d",
-                RVInstrKind.FsubD => "fsub.d",
-                RVInstrKind.FmulD => "fmul.d",
-                RVInstrKind.FdivD => "fdiv.d",
-                RVInstrKind.FsgnjS => "fsgnj.s",
-                RVInstrKind.FsgnjnS => "fsgnjn.s",
-                RVInstrKind.FsgnjxS => "fsgnjx.s",
-                RVInstrKind.FsgnjD => "fsgnj.d",
-                RVInstrKind.FsgnjnD => "fsgnjn.d",
-                RVInstrKind.FsgnjxD => "fsgnjx.d",
-                RVInstrKind.FeqS => "feq.s",
-                RVInstrKind.FltS => "flt.s",
-                RVInstrKind.FleS => "fle.s",
-                RVInstrKind.FeqD => "feq.d",
-                RVInstrKind.FltD => "flt.d",
-                RVInstrKind.FleD => "fle.d",
-                RVInstrKind.FcvtSW => "fcvt.s.w",
-                RVInstrKind.FcvtSWu => "fcvt.s.wu",
-                RVInstrKind.FcvtSL => "fcvt.s.l",
-                RVInstrKind.FcvtSLu => "fcvt.s.lu",
-                RVInstrKind.FcvtDW => "fcvt.d.w",
-                RVInstrKind.FcvtDWu => "fcvt.d.wu",
-                RVInstrKind.FcvtDL => "fcvt.d.l",
-                RVInstrKind.FcvtDLu => "fcvt.d.lu",
-                RVInstrKind.FcvtWS => "fcvt.w.s",
-                RVInstrKind.FcvtWuS => "fcvt.wu.s",
-                RVInstrKind.FcvtLS => "fcvt.l.s",
-                RVInstrKind.FcvtLuS => "fcvt.lu.s",
-                RVInstrKind.FcvtWD => "fcvt.w.d",
-                RVInstrKind.FcvtWuD => "fcvt.wu.d",
-                RVInstrKind.FcvtLD => "fcvt.l.d",
-                RVInstrKind.FcvtLuD => "fcvt.lu.d",
-                RVInstrKind.FcvtSD => "fcvt.s.d",
-                RVInstrKind.FcvtDS => "fcvt.d.s",
-                RVInstrKind.FmvXW => "fmv.x.w",
-                RVInstrKind.FmvWX => "fmv.w.x",
-                RVInstrKind.FmvXD => "fmv.x.d",
-                RVInstrKind.FmvDX => "fmv.d.x",
-                RVInstrKind.Addi => "addi",
-                RVInstrKind.Slti => "slti",
-                RVInstrKind.Sltiu => "sltiu",
-                RVInstrKind.Xori => "xori",
-                RVInstrKind.Ori => "ori",
-                RVInstrKind.Andi => "andi",
-                RVInstrKind.Slli => "slli",
-                RVInstrKind.Srli => "srli",
-                RVInstrKind.Srai => "srai",
-                RVInstrKind.Add => "add",
-                RVInstrKind.Sub => "sub",
-                RVInstrKind.Sll => "sll",
-                RVInstrKind.Slt => "slt",
-                RVInstrKind.Sltu => "sltu",
-                RVInstrKind.Xor => "xor",
-                RVInstrKind.Srl => "srl",
-                RVInstrKind.Sra => "sra",
-                RVInstrKind.Or => "or",
-                RVInstrKind.And => "and",
-                RVInstrKind.Addiw => "addiw",
-                RVInstrKind.Slliw => "slliw",
-                RVInstrKind.Srliw => "srliw",
-                RVInstrKind.Sraiw => "sraiw",
-                RVInstrKind.Addw => "addw",
-                RVInstrKind.Subw => "subw",
-                RVInstrKind.Sllw => "sllw",
-                RVInstrKind.Srlw => "srlw",
-                RVInstrKind.Sraw => "sraw",
-                RVInstrKind.Mul => "mul",
-                RVInstrKind.Mulh => "mulh",
-                RVInstrKind.Mulhsu => "mulhsu",
-                RVInstrKind.Mulhu => "mulhu",
-                RVInstrKind.Div => "div",
-                RVInstrKind.Divu => "divu",
-                RVInstrKind.Rem => "rem",
-                RVInstrKind.Remu => "remu",
-                RVInstrKind.Mulw => "mulw",
-                RVInstrKind.Divw => "divw",
-                RVInstrKind.Divuw => "divuw",
-                RVInstrKind.Remw => "remw",
-                RVInstrKind.Remuw => "remuw",
-                RVInstrKind.LrW => "lr.w",
-                RVInstrKind.ScW => "sc.w",
-                RVInstrKind.AmoSwapW => "amoswap.w",
-                RVInstrKind.AmoAddW => "amoadd.w",
-                RVInstrKind.AmoXorW => "amoxor.w",
-                RVInstrKind.AmoAndW => "amoand.w",
-                RVInstrKind.AmoOrW => "amoor.w",
-                RVInstrKind.AmoMinW => "amomin.w",
-                RVInstrKind.AmoMaxW => "amomax.w",
-                RVInstrKind.AmoMinuW => "amominu.w",
-                RVInstrKind.AmoMaxuW => "amomaxu.w",
-                RVInstrKind.LrD => "lr.d",
-                RVInstrKind.ScD => "sc.d",
-                RVInstrKind.AmoSwapD => "amoswap.d",
-                RVInstrKind.AmoAddD => "amoadd.d",
-                RVInstrKind.AmoXorD => "amoxor.d",
-                RVInstrKind.AmoAndD => "amoand.d",
-                RVInstrKind.AmoOrD => "amoor.d",
-                RVInstrKind.AmoMinD => "amomin.d",
-                RVInstrKind.AmoMaxD => "amomax.d",
-                RVInstrKind.AmoMinuD => "amominu.d",
-                RVInstrKind.AmoMaxuD => "amomaxu.d",
-                RVInstrKind.Fence => "fence",
-                RVInstrKind.FenceI => "fence.i",
-                RVInstrKind.Ecall => "ecall",
-                RVInstrKind.Ebreak => "ebreak",
-                RVInstrKind.Uret => "uret",
-                RVInstrKind.Sret => "sret",
-                RVInstrKind.Mret => "mret",
-                RVInstrKind.Wfi => "wfi",
-                RVInstrKind.SfenceVma => "sfence.vma",
-                RVInstrKind.SinvalVma => "sinval.vma",
-                RVInstrKind.SfenceWInval => "sfence.w.inval",
-                RVInstrKind.SfenceInvalIr => "sfence.inval.ir",
-                RVInstrKind.HfenceVvma => "hfence.vvma",
-                RVInstrKind.HfenceGvma => "hfence.gvma",
-                RVInstrKind.Csrrw => "csrrw",
-                RVInstrKind.Csrrs => "csrrs",
-                RVInstrKind.Csrrc => "csrrc",
-                RVInstrKind.Csrrwi => "csrrwi",
-                RVInstrKind.Csrrsi => "csrrsi",
-                RVInstrKind.Csrrci => "csrrci",
-                RVInstrKind.Vsetvli => "vsetvli",
-                RVInstrKind.Vsetivli => "vsetivli",
-                RVInstrKind.Vsetvl => "vsetvl",
-                RVInstrKind.Vle8V => "vle8.v",
-                RVInstrKind.Vle16V => "vle16.v",
-                RVInstrKind.Vle32V => "vle32.v",
-                RVInstrKind.Vle64V => "vle64.v",
-                RVInstrKind.Vse8V => "vse8.v",
-                RVInstrKind.Vse16V => "vse16.v",
-                RVInstrKind.Vse32V => "vse32.v",
-                RVInstrKind.Vse64V => "vse64.v",
-                RVInstrKind.VaddVv => "vadd.vv",
-                RVInstrKind.VaddVx => "vadd.vx",
-                RVInstrKind.VaddVi => "vadd.vi",
-                RVInstrKind.VsubVv => "vsub.vv",
-                RVInstrKind.VsubVx => "vsub.vx",
-                RVInstrKind.VrsubVx => "vrsub.vx",
-                RVInstrKind.VrsubVi => "vrsub.vi",
-                RVInstrKind.VandVv => "vand.vv",
-                RVInstrKind.VandVx => "vand.vx",
-                RVInstrKind.VandVi => "vand.vi",
-                RVInstrKind.VorVv => "vor.vv",
-                RVInstrKind.VorVx => "vor.vx",
-                RVInstrKind.VorVi => "vor.vi",
-                RVInstrKind.VxorVv => "vxor.vv",
-                RVInstrKind.VxorVx => "vxor.vx",
-                RVInstrKind.VxorVi => "vxor.vi",
-                _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
-            };
-        }
+            RVInstrKind.Raw32 => ".word",
+            RVInstrKind.Lui => "lui",
+            RVInstrKind.Auipc => "auipc",
+            RVInstrKind.Jal => "jal",
+            RVInstrKind.Jalr => "jalr",
+            RVInstrKind.Beq => "beq",
+            RVInstrKind.Bne => "bne",
+            RVInstrKind.Blt => "blt",
+            RVInstrKind.Bge => "bge",
+            RVInstrKind.Bltu => "bltu",
+            RVInstrKind.Bgeu => "bgeu",
+            RVInstrKind.Lb => "lb",
+            RVInstrKind.Lh => "lh",
+            RVInstrKind.Lw => "lw",
+            RVInstrKind.Lbu => "lbu",
+            RVInstrKind.Lhu => "lhu",
+            RVInstrKind.Lwu => "lwu",
+            RVInstrKind.Ld => "ld",
+            RVInstrKind.Sb => "sb",
+            RVInstrKind.Sh => "sh",
+            RVInstrKind.Sw => "sw",
+            RVInstrKind.Sd => "sd",
+            RVInstrKind.Flw => "flw",
+            RVInstrKind.Fld => "fld",
+            RVInstrKind.Fsw => "fsw",
+            RVInstrKind.Fsd => "fsd",
+            RVInstrKind.FaddS => "fadd.s",
+            RVInstrKind.FsubS => "fsub.s",
+            RVInstrKind.FmulS => "fmul.s",
+            RVInstrKind.FdivS => "fdiv.s",
+            RVInstrKind.FaddD => "fadd.d",
+            RVInstrKind.FsubD => "fsub.d",
+            RVInstrKind.FmulD => "fmul.d",
+            RVInstrKind.FdivD => "fdiv.d",
+            RVInstrKind.FsgnjS => "fsgnj.s",
+            RVInstrKind.FsgnjnS => "fsgnjn.s",
+            RVInstrKind.FsgnjxS => "fsgnjx.s",
+            RVInstrKind.FsgnjD => "fsgnj.d",
+            RVInstrKind.FsgnjnD => "fsgnjn.d",
+            RVInstrKind.FsgnjxD => "fsgnjx.d",
+            RVInstrKind.FeqS => "feq.s",
+            RVInstrKind.FltS => "flt.s",
+            RVInstrKind.FleS => "fle.s",
+            RVInstrKind.FeqD => "feq.d",
+            RVInstrKind.FltD => "flt.d",
+            RVInstrKind.FleD => "fle.d",
+            RVInstrKind.FcvtSW => "fcvt.s.w",
+            RVInstrKind.FcvtSWu => "fcvt.s.wu",
+            RVInstrKind.FcvtSL => "fcvt.s.l",
+            RVInstrKind.FcvtSLu => "fcvt.s.lu",
+            RVInstrKind.FcvtDW => "fcvt.d.w",
+            RVInstrKind.FcvtDWu => "fcvt.d.wu",
+            RVInstrKind.FcvtDL => "fcvt.d.l",
+            RVInstrKind.FcvtDLu => "fcvt.d.lu",
+            RVInstrKind.FcvtWS => "fcvt.w.s",
+            RVInstrKind.FcvtWuS => "fcvt.wu.s",
+            RVInstrKind.FcvtLS => "fcvt.l.s",
+            RVInstrKind.FcvtLuS => "fcvt.lu.s",
+            RVInstrKind.FcvtWD => "fcvt.w.d",
+            RVInstrKind.FcvtWuD => "fcvt.wu.d",
+            RVInstrKind.FcvtLD => "fcvt.l.d",
+            RVInstrKind.FcvtLuD => "fcvt.lu.d",
+            RVInstrKind.FcvtSD => "fcvt.s.d",
+            RVInstrKind.FcvtDS => "fcvt.d.s",
+            RVInstrKind.FmvXW => "fmv.x.w",
+            RVInstrKind.FmvWX => "fmv.w.x",
+            RVInstrKind.FmvXD => "fmv.x.d",
+            RVInstrKind.FmvDX => "fmv.d.x",
+            RVInstrKind.Addi => "addi",
+            RVInstrKind.Slti => "slti",
+            RVInstrKind.Sltiu => "sltiu",
+            RVInstrKind.Xori => "xori",
+            RVInstrKind.Ori => "ori",
+            RVInstrKind.Andi => "andi",
+            RVInstrKind.Slli => "slli",
+            RVInstrKind.Srli => "srli",
+            RVInstrKind.Srai => "srai",
+            RVInstrKind.Add => "add",
+            RVInstrKind.Sub => "sub",
+            RVInstrKind.Sll => "sll",
+            RVInstrKind.Slt => "slt",
+            RVInstrKind.Sltu => "sltu",
+            RVInstrKind.Xor => "xor",
+            RVInstrKind.Srl => "srl",
+            RVInstrKind.Sra => "sra",
+            RVInstrKind.Or => "or",
+            RVInstrKind.And => "and",
+            RVInstrKind.Addiw => "addiw",
+            RVInstrKind.Slliw => "slliw",
+            RVInstrKind.Srliw => "srliw",
+            RVInstrKind.Sraiw => "sraiw",
+            RVInstrKind.Addw => "addw",
+            RVInstrKind.Subw => "subw",
+            RVInstrKind.Sllw => "sllw",
+            RVInstrKind.Srlw => "srlw",
+            RVInstrKind.Sraw => "sraw",
+            RVInstrKind.Mul => "mul",
+            RVInstrKind.Mulh => "mulh",
+            RVInstrKind.Mulhsu => "mulhsu",
+            RVInstrKind.Mulhu => "mulhu",
+            RVInstrKind.Div => "div",
+            RVInstrKind.Divu => "divu",
+            RVInstrKind.Rem => "rem",
+            RVInstrKind.Remu => "remu",
+            RVInstrKind.Mulw => "mulw",
+            RVInstrKind.Divw => "divw",
+            RVInstrKind.Divuw => "divuw",
+            RVInstrKind.Remw => "remw",
+            RVInstrKind.Remuw => "remuw",
+            RVInstrKind.LrW => "lr.w",
+            RVInstrKind.ScW => "sc.w",
+            RVInstrKind.AmoSwapW => "amoswap.w",
+            RVInstrKind.AmoAddW => "amoadd.w",
+            RVInstrKind.AmoXorW => "amoxor.w",
+            RVInstrKind.AmoAndW => "amoand.w",
+            RVInstrKind.AmoOrW => "amoor.w",
+            RVInstrKind.AmoMinW => "amomin.w",
+            RVInstrKind.AmoMaxW => "amomax.w",
+            RVInstrKind.AmoMinuW => "amominu.w",
+            RVInstrKind.AmoMaxuW => "amomaxu.w",
+            RVInstrKind.LrD => "lr.d",
+            RVInstrKind.ScD => "sc.d",
+            RVInstrKind.AmoSwapD => "amoswap.d",
+            RVInstrKind.AmoAddD => "amoadd.d",
+            RVInstrKind.AmoXorD => "amoxor.d",
+            RVInstrKind.AmoAndD => "amoand.d",
+            RVInstrKind.AmoOrD => "amoor.d",
+            RVInstrKind.AmoMinD => "amomin.d",
+            RVInstrKind.AmoMaxD => "amomax.d",
+            RVInstrKind.AmoMinuD => "amominu.d",
+            RVInstrKind.AmoMaxuD => "amomaxu.d",
+            RVInstrKind.Fence => "fence",
+            RVInstrKind.FenceI => "fence.i",
+            RVInstrKind.Ecall => "ecall",
+            RVInstrKind.Ebreak => "ebreak",
+            RVInstrKind.Uret => "uret",
+            RVInstrKind.Sret => "sret",
+            RVInstrKind.Mret => "mret",
+            RVInstrKind.Wfi => "wfi",
+            RVInstrKind.SfenceVma => "sfence.vma",
+            RVInstrKind.SinvalVma => "sinval.vma",
+            RVInstrKind.SfenceWInval => "sfence.w.inval",
+            RVInstrKind.SfenceInvalIr => "sfence.inval.ir",
+            RVInstrKind.HfenceVvma => "hfence.vvma",
+            RVInstrKind.HfenceGvma => "hfence.gvma",
+            RVInstrKind.Csrrw => "csrrw",
+            RVInstrKind.Csrrs => "csrrs",
+            RVInstrKind.Csrrc => "csrrc",
+            RVInstrKind.Csrrwi => "csrrwi",
+            RVInstrKind.Csrrsi => "csrrsi",
+            RVInstrKind.Csrrci => "csrrci",
+            RVInstrKind.Vsetvli => "vsetvli",
+            RVInstrKind.Vsetivli => "vsetivli",
+            RVInstrKind.Vsetvl => "vsetvl",
+            RVInstrKind.Vle8V => "vle8.v",
+            RVInstrKind.Vle16V => "vle16.v",
+            RVInstrKind.Vle32V => "vle32.v",
+            RVInstrKind.Vle64V => "vle64.v",
+            RVInstrKind.Vse8V => "vse8.v",
+            RVInstrKind.Vse16V => "vse16.v",
+            RVInstrKind.Vse32V => "vse32.v",
+            RVInstrKind.Vse64V => "vse64.v",
+            RVInstrKind.VaddVv => "vadd.vv",
+            RVInstrKind.VaddVx => "vadd.vx",
+            RVInstrKind.VaddVi => "vadd.vi",
+            RVInstrKind.VsubVv => "vsub.vv",
+            RVInstrKind.VsubVx => "vsub.vx",
+            RVInstrKind.VrsubVx => "vrsub.vx",
+            RVInstrKind.VrsubVi => "vrsub.vi",
+            RVInstrKind.VandVv => "vand.vv",
+            RVInstrKind.VandVx => "vand.vx",
+            RVInstrKind.VandVi => "vand.vi",
+            RVInstrKind.VorVv => "vor.vv",
+            RVInstrKind.VorVx => "vor.vx",
+            RVInstrKind.VorVi => "vor.vi",
+            RVInstrKind.VxorVv => "vxor.vv",
+            RVInstrKind.VxorVx => "vxor.vx",
+            RVInstrKind.VxorVi => "vxor.vi",
+            RVInstrKind.VminuVv => "vminu.vv",
+            RVInstrKind.VminuVx => "vminu.vx",
+            RVInstrKind.VminVv => "vmin.vv",
+            RVInstrKind.VminVx => "vmin.vx",
+            RVInstrKind.VmaxuVv => "vmaxu.vv",
+            RVInstrKind.VmaxuVx => "vmaxu.vx",
+            RVInstrKind.VmaxVv => "vmax.vv",
+            RVInstrKind.VmaxVx => "vmax.vx",
+            RVInstrKind.VmseqVv => "vmseq.vv",
+            RVInstrKind.VmseqVx => "vmseq.vx",
+            RVInstrKind.VmseqVi => "vmseq.vi",
+            RVInstrKind.VmsneVv => "vmsne.vv",
+            RVInstrKind.VmsneVx => "vmsne.vx",
+            RVInstrKind.VmsneVi => "vmsne.vi",
+            RVInstrKind.VmsltuVv => "vmsltu.vv",
+            RVInstrKind.VmsltuVx => "vmsltu.vx",
+            RVInstrKind.VmsltVv => "vmslt.vv",
+            RVInstrKind.VmsltVx => "vmslt.vx",
+            RVInstrKind.VmsleuVv => "vmsleu.vv",
+            RVInstrKind.VmsleuVx => "vmsleu.vx",
+            RVInstrKind.VmsleuVi => "vmsleu.vi",
+            RVInstrKind.VmsleVv => "vmsle.vv",
+            RVInstrKind.VmsleVx => "vmsle.vx",
+            RVInstrKind.VmsleVi => "vmsle.vi",
+            RVInstrKind.VmsgtuVx => "vmsgtu.vx",
+            RVInstrKind.VmsgtuVi => "vmsgtu.vi",
+            RVInstrKind.VmsgtVx => "vmsgt.vx",
+            RVInstrKind.VmsgtVi => "vmsgt.vi",
+            RVInstrKind.VsllVv => "vsll.vv",
+            RVInstrKind.VsllVx => "vsll.vx",
+            RVInstrKind.VsllVi => "vsll.vi",
+            RVInstrKind.VsrlVv => "vsrl.vv",
+            RVInstrKind.VsrlVx => "vsrl.vx",
+            RVInstrKind.VsrlVi => "vsrl.vi",
+            RVInstrKind.VsraVv => "vsra.vv",
+            RVInstrKind.VsraVx => "vsra.vx",
+            RVInstrKind.VsraVi => "vsra.vi",
+            RVInstrKind.VdivuVv => "vdivu.vv",
+            RVInstrKind.VdivuVx => "vdivu.vx",
+            RVInstrKind.VdivVv => "vdiv.vv",
+            RVInstrKind.VdivVx => "vdiv.vx",
+            RVInstrKind.VremuVv => "vremu.vv",
+            RVInstrKind.VremuVx => "vremu.vx",
+            RVInstrKind.VremVv => "vrem.vv",
+            RVInstrKind.VremVx => "vrem.vx",
+            RVInstrKind.VmulhuVv => "vmulhu.vv",
+            RVInstrKind.VmulhuVx => "vmulhu.vx",
+            RVInstrKind.VmulVv => "vmul.vv",
+            RVInstrKind.VmulVx => "vmul.vx",
+            RVInstrKind.VmulhsuVv => "vmulhsu.vv",
+            RVInstrKind.VmulhsuVx => "vmulhsu.vx",
+            RVInstrKind.VmulhVv => "vmulh.vv",
+            RVInstrKind.VmulhVx => "vmulh.vx",
+            RVInstrKind.VmaddVv => "vmadd.vv",
+            RVInstrKind.VmaddVx => "vmadd.vx",
+            RVInstrKind.VnmsubVv => "vnmsub.vv",
+            RVInstrKind.VnmsubVx => "vnmsub.vx",
+            RVInstrKind.VmaccVv => "vmacc.vv",
+            RVInstrKind.VmaccVx => "vmacc.vx",
+            RVInstrKind.VnmsacVv => "vnmsac.vv",
+            RVInstrKind.VnmsacVx => "vnmsac.vx",
+            RVInstrKind.VnsrlWv => "vnsrl.wv",
+            RVInstrKind.VnsrlWx => "vnsrl.wx",
+            RVInstrKind.VnsrlWi => "vnsrl.wi",
+            RVInstrKind.VnsraWv => "vnsra.wv",
+            RVInstrKind.VnsraWx => "vnsra.wx",
+            RVInstrKind.VnsraWi => "vnsra.wi",
+            RVInstrKind.VrgatherVv => "vrgather.vv",
+            RVInstrKind.VrgatherVx => "vrgather.vx",
+            RVInstrKind.VrgatherVi => "vrgather.vi",
+            RVInstrKind.VfaddVv => "vfadd.vv",
+            RVInstrKind.VfaddVf => "vfadd.vf",
+            RVInstrKind.VfsubVv => "vfsub.vv",
+            RVInstrKind.VfsubVf => "vfsub.vf",
+            RVInstrKind.VfrsubVf => "vfrsub.vf",
+            RVInstrKind.VfminVv => "vfmin.vv",
+            RVInstrKind.VfminVf => "vfmin.vf",
+            RVInstrKind.VfmaxVv => "vfmax.vv",
+            RVInstrKind.VfmaxVf => "vfmax.vf",
+            RVInstrKind.VfsgnjVv => "vfsgnj.vv",
+            RVInstrKind.VfsgnjVf => "vfsgnj.vf",
+            RVInstrKind.VfsgnjnVv => "vfsgnjn.vv",
+            RVInstrKind.VfsgnjnVf => "vfsgnjn.vf",
+            RVInstrKind.VfsgnjxVv => "vfsgnjx.vv",
+            RVInstrKind.VfsgnjxVf => "vfsgnjx.vf",
+            RVInstrKind.VmfeqVv => "vmfeq.vv",
+            RVInstrKind.VmfeqVf => "vmfeq.vf",
+            RVInstrKind.VmfleVv => "vmfle.vv",
+            RVInstrKind.VmfleVf => "vmfle.vf",
+            RVInstrKind.VmfltVv => "vmflt.vv",
+            RVInstrKind.VmfltVf => "vmflt.vf",
+            RVInstrKind.VmfneVv => "vmfne.vv",
+            RVInstrKind.VmfneVf => "vmfne.vf",
+            RVInstrKind.VmfgtVf => "vmfgt.vf",
+            RVInstrKind.VmfgeVf => "vmfge.vf",
+            RVInstrKind.VfdivVv => "vfdiv.vv",
+            RVInstrKind.VfdivVf => "vfdiv.vf",
+            RVInstrKind.VfrdivVf => "vfrdiv.vf",
+            RVInstrKind.VfmulVv => "vfmul.vv",
+            RVInstrKind.VfmulVf => "vfmul.vf",
+            _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
+        };
 
         public static bool TryGetOpcode(string mnemonic, out RVInstrKind opcode)
         {
@@ -1806,6 +2020,106 @@ namespace Cnidaria.RiscV
             AddVectorOp(map, RVInstrKind.VxorVv, 0, 11);
             AddVectorOp(map, RVInstrKind.VxorVx, 4, 11);
             AddVectorOp(map, RVInstrKind.VxorVi, 3, 11);
+            AddVectorOp(map, RVInstrKind.VminuVv, 0, 4);
+            AddVectorOp(map, RVInstrKind.VminuVx, 4, 4);
+            AddVectorOp(map, RVInstrKind.VminVv, 0, 5);
+            AddVectorOp(map, RVInstrKind.VminVx, 4, 5);
+            AddVectorOp(map, RVInstrKind.VmaxuVv, 0, 6);
+            AddVectorOp(map, RVInstrKind.VmaxuVx, 4, 6);
+            AddVectorOp(map, RVInstrKind.VmaxVv, 0, 7);
+            AddVectorOp(map, RVInstrKind.VmaxVx, 4, 7);
+            AddVectorOp(map, RVInstrKind.VmseqVv, 0, 24);
+            AddVectorOp(map, RVInstrKind.VmseqVx, 4, 24);
+            AddVectorOp(map, RVInstrKind.VmseqVi, 3, 24);
+            AddVectorOp(map, RVInstrKind.VmsneVv, 0, 25);
+            AddVectorOp(map, RVInstrKind.VmsneVx, 4, 25);
+            AddVectorOp(map, RVInstrKind.VmsneVi, 3, 25);
+            AddVectorOp(map, RVInstrKind.VmsltuVv, 0, 26);
+            AddVectorOp(map, RVInstrKind.VmsltuVx, 4, 26);
+            AddVectorOp(map, RVInstrKind.VmsltVv, 0, 27);
+            AddVectorOp(map, RVInstrKind.VmsltVx, 4, 27);
+            AddVectorOp(map, RVInstrKind.VmsleuVv, 0, 28);
+            AddVectorOp(map, RVInstrKind.VmsleuVx, 4, 28);
+            AddVectorOp(map, RVInstrKind.VmsleuVi, 3, 28);
+            AddVectorOp(map, RVInstrKind.VmsleVv, 0, 29);
+            AddVectorOp(map, RVInstrKind.VmsleVx, 4, 29);
+            AddVectorOp(map, RVInstrKind.VmsleVi, 3, 29);
+            AddVectorOp(map, RVInstrKind.VmsgtuVx, 4, 30);
+            AddVectorOp(map, RVInstrKind.VmsgtuVi, 3, 30);
+            AddVectorOp(map, RVInstrKind.VmsgtVx, 4, 31);
+            AddVectorOp(map, RVInstrKind.VmsgtVi, 3, 31);
+            AddVectorOp(map, RVInstrKind.VsllVv, 0, 37);
+            AddVectorOp(map, RVInstrKind.VsllVx, 4, 37);
+            AddVectorOp(map, RVInstrKind.VsllVi, 3, 37);
+            AddVectorOp(map, RVInstrKind.VsrlVv, 0, 40);
+            AddVectorOp(map, RVInstrKind.VsrlVx, 4, 40);
+            AddVectorOp(map, RVInstrKind.VsrlVi, 3, 40);
+            AddVectorOp(map, RVInstrKind.VsraVv, 0, 41);
+            AddVectorOp(map, RVInstrKind.VsraVx, 4, 41);
+            AddVectorOp(map, RVInstrKind.VsraVi, 3, 41);
+            AddVectorOp(map, RVInstrKind.VdivuVv, 2, 32);
+            AddVectorOp(map, RVInstrKind.VdivuVx, 6, 32);
+            AddVectorOp(map, RVInstrKind.VdivVv, 2, 33);
+            AddVectorOp(map, RVInstrKind.VdivVx, 6, 33);
+            AddVectorOp(map, RVInstrKind.VremuVv, 2, 34);
+            AddVectorOp(map, RVInstrKind.VremuVx, 6, 34);
+            AddVectorOp(map, RVInstrKind.VremVv, 2, 35);
+            AddVectorOp(map, RVInstrKind.VremVx, 6, 35);
+            AddVectorOp(map, RVInstrKind.VmulhuVv, 2, 36);
+            AddVectorOp(map, RVInstrKind.VmulhuVx, 6, 36);
+            AddVectorOp(map, RVInstrKind.VmulVv, 2, 37);
+            AddVectorOp(map, RVInstrKind.VmulVx, 6, 37);
+            AddVectorOp(map, RVInstrKind.VmulhsuVv, 2, 38);
+            AddVectorOp(map, RVInstrKind.VmulhsuVx, 6, 38);
+            AddVectorOp(map, RVInstrKind.VmulhVv, 2, 39);
+            AddVectorOp(map, RVInstrKind.VmulhVx, 6, 39);
+            AddVectorOp(map, RVInstrKind.VmaddVv, 2, 41);
+            AddVectorOp(map, RVInstrKind.VmaddVx, 6, 41);
+            AddVectorOp(map, RVInstrKind.VnmsubVv, 2, 43);
+            AddVectorOp(map, RVInstrKind.VnmsubVx, 6, 43);
+            AddVectorOp(map, RVInstrKind.VmaccVv, 2, 45);
+            AddVectorOp(map, RVInstrKind.VmaccVx, 6, 45);
+            AddVectorOp(map, RVInstrKind.VnmsacVv, 2, 47);
+            AddVectorOp(map, RVInstrKind.VnmsacVx, 6, 47);
+            AddVectorOp(map, RVInstrKind.VnsrlWv, 0, 44);
+            AddVectorOp(map, RVInstrKind.VnsrlWx, 4, 44);
+            AddVectorOp(map, RVInstrKind.VnsrlWi, 3, 44);
+            AddVectorOp(map, RVInstrKind.VnsraWv, 0, 45);
+            AddVectorOp(map, RVInstrKind.VnsraWx, 4, 45);
+            AddVectorOp(map, RVInstrKind.VnsraWi, 3, 45);
+            AddVectorOp(map, RVInstrKind.VrgatherVv, 0, 48);
+            AddVectorOp(map, RVInstrKind.VrgatherVx, 4, 48);
+            AddVectorOp(map, RVInstrKind.VrgatherVi, 3, 48);
+            AddVectorOp(map, RVInstrKind.VfaddVv, 1, 0);
+            AddVectorOp(map, RVInstrKind.VfaddVf, 5, 0);
+            AddVectorOp(map, RVInstrKind.VfsubVv, 1, 2);
+            AddVectorOp(map, RVInstrKind.VfsubVf, 5, 2);
+            AddVectorOp(map, RVInstrKind.VfrsubVf, 5, 39);
+            AddVectorOp(map, RVInstrKind.VfminVv, 1, 4);
+            AddVectorOp(map, RVInstrKind.VfminVf, 5, 4);
+            AddVectorOp(map, RVInstrKind.VfmaxVv, 1, 6);
+            AddVectorOp(map, RVInstrKind.VfmaxVf, 5, 6);
+            AddVectorOp(map, RVInstrKind.VfsgnjVv, 1, 8);
+            AddVectorOp(map, RVInstrKind.VfsgnjVf, 5, 8);
+            AddVectorOp(map, RVInstrKind.VfsgnjnVv, 1, 9);
+            AddVectorOp(map, RVInstrKind.VfsgnjnVf, 5, 9);
+            AddVectorOp(map, RVInstrKind.VfsgnjxVv, 1, 10);
+            AddVectorOp(map, RVInstrKind.VfsgnjxVf, 5, 10);
+            AddVectorOp(map, RVInstrKind.VmfeqVv, 1, 24);
+            AddVectorOp(map, RVInstrKind.VmfeqVf, 5, 24);
+            AddVectorOp(map, RVInstrKind.VmfleVv, 1, 25);
+            AddVectorOp(map, RVInstrKind.VmfleVf, 5, 25);
+            AddVectorOp(map, RVInstrKind.VmfltVv, 1, 27);
+            AddVectorOp(map, RVInstrKind.VmfltVf, 5, 27);
+            AddVectorOp(map, RVInstrKind.VmfneVv, 1, 28);
+            AddVectorOp(map, RVInstrKind.VmfneVf, 5, 28);
+            AddVectorOp(map, RVInstrKind.VmfgtVf, 5, 29);
+            AddVectorOp(map, RVInstrKind.VmfgeVf, 5, 31);
+            AddVectorOp(map, RVInstrKind.VfdivVv, 1, 32);
+            AddVectorOp(map, RVInstrKind.VfdivVf, 5, 32);
+            AddVectorOp(map, RVInstrKind.VfrdivVf, 5, 33);
+            AddVectorOp(map, RVInstrKind.VfmulVv, 1, 36);
+            AddVectorOp(map, RVInstrKind.VfmulVf, 5, 36);
             return map;
         }
 

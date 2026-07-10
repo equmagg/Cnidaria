@@ -5,18 +5,20 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
-	<LangVersion>10.0</LangVersion>
+	<LangVersion>12.0</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
 	<Compile Remove="Cs\BCL\**\*.cs" />
     <EmbeddedResource Include="Cs\BCL\**\*.cs" Pack="true" />
 	<EmbeddedResource Include="C\StandardHeaders\**\*.h" Pack="true" />
+	<EmbeddedResource Include="riscv\boot\**\*.s" Pack="true" />
+	<EmbeddedResource Include="riscv\os\**\*.c" Pack="true" />
   </ItemGroup>
 
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>2.7.0</Version>
+    <Version>2.8.0</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe interpreter collection</Description>
 

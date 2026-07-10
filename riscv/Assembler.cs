@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Cnidaria.RiscV
 {
-    internal sealed class RiscVAssemblyWriterOptions
+    public sealed class RiscVAssemblyWriterOptions
     {
         public static RiscVAssemblyWriterOptions Default { get; } = new RiscVAssemblyWriterOptions();
 
@@ -16,13 +16,89 @@ namespace Cnidaria.RiscV
         public bool FormatVectorTypeNames { get; set; } = true;
     }
 
+    public sealed class RiscVAssemblySettings
+    {
+        private readonly Dictionary<string, string> _values = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        public IReadOnlyDictionary<string, string> Values => _values;
+
+        public RiscVAssemblySettings Define(string name, string value)
+        {
+            ValidateName(name);
+            if (value is null)
+                throw new ArgumentNullException(nameof(value));
+            _values[name] = value;
+            return this;
+        }
+
+        public RiscVAssemblySettings Define(string name, ulong value)
+            => Define(name, "0x" + value.ToString("x", CultureInfo.InvariantCulture));
+
+        public RiscVAssemblySettings Define(string name, long value)
+            => Define(name, value.ToString(CultureInfo.InvariantCulture));
+
+        public RiscVAssemblySettings Define(string name, int value)
+            => Define(name, value.ToString(CultureInfo.InvariantCulture));
+
+        public string Expand(string text)
+        {
+            if (text is null)
+                throw new ArgumentNullException(nameof(text));
+            if (text.IndexOf("${", StringComparison.Ordinal) < 0)
+                return text;
+
+            var sb = new StringBuilder(text.Length);
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] != '$' || i + 1 >= text.Length || text[i + 1] != '{')
+                {
+                    sb.Append(text[i]);
+                    continue;
+                }
+
+                int close = text.IndexOf('}', i + 2);
+                if (close < 0)
+                    throw new FormatException("Unterminated RISC-V assembly setting reference");
+
+                string name = text.Substring(i + 2, close - i - 2);
+                ValidateName(name);
+                if (!_values.TryGetValue(name, out var value))
+                    throw new KeyNotFoundException($"RISC-V assembly setting '{name}' is not defined");
+
+                sb.Append(value);
+                i = close;
+            }
+            return sb.ToString();
+        }
+
+        private static void ValidateName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("RISC-V assembly setting name is empty", nameof(name));
+            if (!(char.IsLetter(name[0]) || name[0] == '_'))
+                throw new ArgumentException($"Invalid RISC-V assembly setting name: {name}", nameof(name));
+            for (int i = 1; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (!(char.IsLetterOrDigit(c) || c == '_' || c == '.'))
+                    throw new ArgumentException($"Invalid RISC-V assembly setting name: {name}", nameof(name));
+            }
+        }
+    }
+
     internal static class RiscVAssembler
     {
         public static RiscVProgram Assemble(string text, RVTarget target)
-            => RiscVAssemblyParser.Parse(text, target);
+            => RiscVAssemblyParser.Parse(text, target, null);
+
+        public static RiscVProgram Assemble(string text, RVTarget target, RiscVAssemblySettings? settings)
+            => RiscVAssemblyParser.Parse(text, target, settings);
 
         public static RiscVProgram Parse(string text, RVTarget target)
             => Assemble(text, target);
+
+        public static RiscVProgram Parse(string text, RVTarget target, RiscVAssemblySettings? settings)
+            => Assemble(text, target, settings);
     }
 
     internal static class RiscVDisassembler
@@ -40,11 +116,16 @@ namespace Cnidaria.RiscV
     internal static class RiscVAssemblyParser
     {
         public static RiscVProgram Parse(string text, RVTarget target)
+            => Parse(text, target, null);
+
+        public static RiscVProgram Parse(string text, RVTarget target, RiscVAssemblySettings? settings)
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
             if (text is null)
                 throw new ArgumentNullException(nameof(text));
+            if (text.IndexOf("${", StringComparison.Ordinal) >= 0)
+                text = (settings ?? new RiscVAssemblySettings()).Expand(text);
 
             var instructions = ImmutableArray.CreateBuilder<RVInstruction>();
             var labels = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -78,7 +159,7 @@ namespace Cnidaria.RiscV
                     instructions.Add(instruction);
             }
 
-            return new RiscVProgram(target, instructions.MoveToImmutable(), labels);
+            return new RiscVProgram(target, instructions.ToImmutable(), labels);
         }
 
         private static IEnumerable<RVInstruction> ParseInstruction(string line, int lineNumber)
@@ -223,7 +304,11 @@ namespace Cnidaria.RiscV
                     return true;
                 case "li":
                     ValidateOperandCount(mnemonic, operands, 2, lineNumber);
-                    instructions = ParseLoadImmediate(ParseGpr(operands[0]), ParseImmediate(operands[1]));
+                    instructions = ParseLoadImmediate(ParseGpr(operands[0]), ParseImmediate64(operands[1]));
+                    return true;
+                case "la":
+                    ValidateOperandCount(mnemonic, operands, 2, lineNumber);
+                    instructions = ParseLoadAddress(ParseGpr(operands[0]), operands[1]);
                     return true;
                 case "beqz":
                     ValidateOperandCount(mnemonic, operands, 2, lineNumber);
@@ -255,18 +340,44 @@ namespace Cnidaria.RiscV
             return false;
         }
 
-        private static IEnumerable<RVInstruction> ParseLoadImmediate(RVRegister rd, int immediate)
+        private static IEnumerable<RVInstruction> ParseLoadAddress(RVRegister rd, string symbol)
         {
-            if (immediate >= -2048 && immediate <= 2047)
-                return One(RVInstruction.I(RVInstrKind.Addi, rd, RVRegister.X0, immediate));
-
-            int upper = (int)(((long)immediate + 0x800L) >> 12);
-            int lower = (int)((long)immediate - ((long)upper << 12));
             return new[]
             {
-                RVInstruction.U(RVInstrKind.Lui, rd, upper),
-                RVInstruction.I(RVInstrKind.Addi, rd, rd, lower),
+                RVInstruction.U(RVInstrKind.Auipc, rd, 0).WithSymbol(symbol, RVRelocationKind.AbsoluteUpper20),
+                RVInstruction.I(RVInstrKind.Addi, rd, rd, 0).WithSymbol(symbol, RVRelocationKind.AbsoluteLow12),
             };
+        }
+
+        private static IEnumerable<RVInstruction> ParseLoadImmediate(RVRegister rd, ulong immediate)
+        {
+            var signed = unchecked((long)immediate);
+            if (signed >= -2048 && signed <= 2047)
+                return One(RVInstruction.I(RVInstrKind.Addi, rd, RVRegister.X0, checked((int)signed)));
+
+            var chunks = ImmutableArray.CreateBuilder<int>();
+            var value = immediate;
+            while (value != 0)
+            {
+                var chunk = (int)(value & 0xFFFUL);
+                if (chunk >= 0x800)
+                {
+                    chunk -= 0x1000;
+                    value += 0x1000UL;
+                }
+                chunks.Add(chunk);
+                value >>= 12;
+            }
+
+            var result = ImmutableArray.CreateBuilder<RVInstruction>();
+            result.Add(RVInstruction.I(RVInstrKind.Addi, rd, RVRegister.X0, chunks[chunks.Count - 1]));
+            for (var i = chunks.Count - 2; i >= 0; i--)
+            {
+                result.Add(RVInstruction.I(RVInstrKind.Slli, rd, rd, 12));
+                if (chunks[i] != 0)
+                    result.Add(RVInstruction.I(RVInstrKind.Addi, rd, rd, chunks[i]));
+            }
+            return result.ToImmutable();
         }
 
         private static RVInstruction ParseI(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
@@ -404,10 +515,12 @@ namespace Cnidaria.RiscV
         {
             bool unmasked = ParseOptionalVectorMask(ref operands);
             ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 3, lineNumber);
-            if (metadata.Funct3 == 0)
+            if (metadata.Funct3 is 0 or 1 or 2)
                 return RVInstruction.Vv(opcode, ParseVreg(operands[0]), ParseVreg(operands[1]), ParseVreg(operands[2]), unmasked);
-            if (metadata.Funct3 == 4)
+            if (metadata.Funct3 is 4 or 6)
                 return RVInstruction.Vx(opcode, ParseVreg(operands[0]), ParseVreg(operands[1]), ParseGpr(operands[2]), unmasked);
+            if (metadata.Funct3 == 5)
+                return RVInstruction.Vx(opcode, ParseVreg(operands[0]), ParseVreg(operands[1]), ParseFpr(operands[2]), unmasked);
             if (metadata.Funct3 == 3)
                 return RVInstruction.Vi(opcode, ParseVreg(operands[0]), ParseVreg(operands[1]), ParseImmediate(operands[2]), unmasked);
             throw new FormatException($"Unsupported vector operand form on line {lineNumber}");
@@ -605,6 +718,111 @@ namespace Cnidaria.RiscV
             return value;
         }
 
+        private static ulong ParseImmediate64(string text)
+        {
+            if (TryParseImmediate64(text, out var immediate))
+                return immediate;
+            throw new FormatException($"Invalid RISC-V immediate: {text}");
+        }
+
+        private static bool TryParseImmediate64(string text, out ulong immediate)
+        {
+            text = text.Trim().Replace("_", string.Empty);
+            if (text.Length == 0)
+            {
+                immediate = 0;
+                return false;
+            }
+
+            var negative = false;
+            if (text[0] == '+')
+                text = text.Substring(1);
+            else if (text[0] == '-')
+            {
+                negative = true;
+                text = text.Substring(1);
+            }
+
+            if (text.Length == 0)
+            {
+                immediate = 0;
+                return false;
+            }
+
+            var radix = 10;
+            var style = NumberStyles.None;
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                text = text.Substring(2);
+                radix = 16;
+                style = NumberStyles.HexNumber;
+            }
+            else if (text.StartsWith("0b", StringComparison.OrdinalIgnoreCase))
+            {
+                text = text.Substring(2);
+                radix = 2;
+            }
+
+            if (text.Length == 0)
+            {
+                immediate = 0;
+                return false;
+            }
+
+            try
+            {
+                ulong value;
+                if (radix == 2)
+                {
+                    value = 0;
+                    foreach (var c in text)
+                    {
+                        if (c is not '0' and not '1')
+                        {
+                            immediate = 0;
+                            return false;
+                        }
+                        value = checked((value << 1) | (c == '1' ? 1UL : 0UL));
+                    }
+                }
+                else if (radix == 16)
+                {
+                    if (!ulong.TryParse(text, style, CultureInfo.InvariantCulture, out value))
+                    {
+                        immediate = 0;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (negative)
+                    {
+                        if (!long.TryParse("-" + text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var signedValue))
+                        {
+                            immediate = 0;
+                            return false;
+                        }
+                        immediate = unchecked((ulong)signedValue);
+                        return true;
+                    }
+
+                    if (!ulong.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+                    {
+                        immediate = 0;
+                        return false;
+                    }
+                }
+
+                immediate = negative ? unchecked(0UL - value) : value;
+                return true;
+            }
+            catch (OverflowException)
+            {
+                immediate = 0;
+                return false;
+            }
+        }
+
         private static int ParseImmediate(string text)
         {
             if (TryParseImmediate(text, out int immediate))
@@ -689,7 +907,7 @@ namespace Cnidaria.RiscV
         {
             var builder = ImmutableArray.CreateBuilder<string>();
             if (string.IsNullOrWhiteSpace(operandText))
-                return builder.MoveToImmutable();
+                return builder.ToImmutable();
 
             int start = 0;
             int parenDepth = 0;
@@ -713,7 +931,7 @@ namespace Cnidaria.RiscV
                     start = i + 1;
                 }
             }
-            return builder.MoveToImmutable();
+            return builder.ToImmutable();
         }
 
         private static string StripComment(string line)
@@ -777,7 +995,17 @@ namespace Cnidaria.RiscV
         {
             if (obj is null)
                 throw new ArgumentNullException(nameof(obj));
-            return Write(obj.Text, options);
+            options ??= RiscVAssemblyWriterOptions.Default;
+            var sb = new StringBuilder();
+            WriteSymbolDeclarations(sb, obj.Symbols, options);
+            sb.AppendLine(".section .text");
+            WriteTextSection(sb, obj.Text, obj.Symbols, options);
+            foreach (var section in obj.DataSections)
+            {
+                sb.AppendLine();
+                WriteDataSection(sb, obj, section, options);
+            }
+            return sb.ToString();
         }
 
         public static string Write(RVTextSection text, RiscVAssemblyWriterOptions? options = null)
@@ -824,6 +1052,233 @@ namespace Cnidaria.RiscV
             foreach (var instruction in instructions)
                 sb.AppendLine(WriteInstruction(instruction, options));
             return sb.ToString();
+        }
+        private static void WriteSymbolDeclarations(StringBuilder sb, ImmutableArray<RVObjectSymbol> symbols, RiscVAssemblyWriterOptions options)
+        {
+            if (!options.IncludeLabels)
+                return;
+
+            var emitted = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var symbol in symbols)
+            {
+                if (symbol.Binding is not RVObjectSymbolBinding.Global and not RVObjectSymbolBinding.External ||
+                    symbol.Kind == RVObjectSymbolKind.Section ||
+                    string.IsNullOrEmpty(symbol.Name) ||
+                    !emitted.Add(symbol.Name))
+                {
+                    continue;
+                }
+
+                sb.Append(symbol.Binding == RVObjectSymbolBinding.Global ? ".globl " : ".extern ")
+                    .AppendLine(symbol.Name);
+            }
+
+            if (emitted.Count != 0)
+                sb.AppendLine();
+        }
+
+        private static void WriteTextSection(
+            StringBuilder sb,
+            RVTextSection text,
+            ImmutableArray<RVObjectSymbol> symbols,
+            RiscVAssemblyWriterOptions options)
+        {
+            Dictionary<int, List<string>>? labelsByPc = null;
+            if (options.IncludeLabels)
+            {
+                labelsByPc = new Dictionary<int, List<string>>();
+                foreach (var label in text.Labels)
+                    AddLabel(labelsByPc, label.Value, label.Key);
+                foreach (var symbol in symbols)
+                {
+                    if (symbol.Binding != RVObjectSymbolBinding.External &&
+                        symbol.Kind != RVObjectSymbolKind.Section &&
+                        string.Equals(symbol.SectionName, ".text", StringComparison.Ordinal))
+                    {
+                        AddLabel(labelsByPc, symbol.Offset, symbol.Name);
+                    }
+                }
+            }
+
+            for (var i = 0; i < text.Instructions.Length; i++)
+            {
+                var pc = checked(i * 4);
+                WriteLabels(sb, labelsByPc, pc);
+                sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options));
+            }
+
+            WriteLabels(sb, labelsByPc, checked(text.Instructions.Length * 4));
+        }
+        private static void WriteDataSection(
+            StringBuilder sb,
+            RiscVProgram obj,
+            RVDataSection section,
+            RiscVAssemblyWriterOptions options)
+        {
+            sb.Append(".section ").AppendLine(section.Name);
+            if (section.Alignment > 1)
+                sb.Append(".balign ").AppendLine(section.Alignment.ToString(CultureInfo.InvariantCulture));
+
+            Dictionary<int, List<string>>? labelsByOffset = null;
+            if (options.IncludeLabels)
+            {
+                labelsByOffset = new Dictionary<int, List<string>>();
+                foreach (var symbol in obj.Symbols)
+                {
+                    if (symbol.Binding != RVObjectSymbolBinding.External &&
+                        symbol.Kind != RVObjectSymbolKind.Section &&
+                        string.Equals(symbol.SectionName, section.Name, StringComparison.Ordinal))
+                    {
+                        AddLabel(labelsByOffset, symbol.Offset, symbol.Name);
+                    }
+                }
+            }
+
+            var relocationsByOffset = new Dictionary<int, RVObjectRelocation>();
+            foreach (var relocation in section.Relocations)
+            {
+                if (!relocationsByOffset.TryAdd(relocation.Offset, relocation))
+                    throw new InvalidOperationException($"Multiple RISC-V data relocations at {section.Name}+0x{relocation.Offset:x}");
+            }
+
+            if (section.Kind == RVObjectSectionKind.Bss)
+                WriteZeroSection(sb, section.BssSize, labelsByOffset);
+            else
+                WriteInitializedData(sb, obj.Target, section, labelsByOffset, relocationsByOffset);
+        }
+        private static void WriteInitializedData(
+            StringBuilder sb,
+            RVTarget target,
+            RVDataSection section,
+            Dictionary<int, List<string>>? labelsByOffset,
+            Dictionary<int, RVObjectRelocation> relocationsByOffset)
+        {
+            var offset = 0;
+            while (offset < section.Data.Length)
+            {
+                WriteLabels(sb, labelsByOffset, offset);
+
+                if (relocationsByOffset.TryGetValue(offset, out var relocation))
+                {
+                    var width = GetDataRelocationWidth(target, relocation.Kind);
+                    if (checked(offset + width) > section.Data.Length)
+                        throw new InvalidOperationException($"RISC-V data relocation exceeds section bounds at {section.Name}+0x{offset:x}");
+                    WriteDataRelocation(sb, relocation, width);
+                    offset += width;
+                    continue;
+                }
+
+                if (section.Data[offset] == 0)
+                {
+                    var count = 1;
+                    while (offset + count < section.Data.Length &&
+                           section.Data[offset + count] == 0 &&
+                           !HasBoundary(labelsByOffset, relocationsByOffset, offset + count))
+                    {
+                        count++;
+                    }
+                    sb.Append("    .zero ").AppendLine(count.ToString(CultureInfo.InvariantCulture));
+                    offset += count;
+                    continue;
+                }
+
+                var byteCount = 1;
+                while (byteCount < 16 &&
+                       offset + byteCount < section.Data.Length &&
+                       section.Data[offset + byteCount] != 0 &&
+                       !HasBoundary(labelsByOffset, relocationsByOffset, offset + byteCount))
+                {
+                    byteCount++;
+                }
+
+                sb.Append("    .byte ");
+                for (var i = 0; i < byteCount; i++)
+                {
+                    if (i != 0)
+                        sb.Append(", ");
+                    sb.Append("0x").Append(section.Data[offset + i].ToString("x2", CultureInfo.InvariantCulture));
+                }
+                sb.AppendLine();
+                offset += byteCount;
+            }
+
+            WriteLabels(sb, labelsByOffset, section.Data.Length);
+        }
+        private static void WriteZeroSection(StringBuilder sb, int size, Dictionary<int, List<string>>? labelsByOffset)
+        {
+            var offset = 0;
+            while (offset < size)
+            {
+                WriteLabels(sb, labelsByOffset, offset);
+                var next = FindNextLabelOffset(labelsByOffset, offset, size);
+                var count = next - offset;
+                sb.Append("    .zero ").AppendLine(count.ToString(CultureInfo.InvariantCulture));
+                offset = next;
+            }
+
+            WriteLabels(sb, labelsByOffset, size);
+        }
+
+        private static void WriteDataRelocation(StringBuilder sb, RVObjectRelocation relocation, int width)
+        {
+            sb.Append(width == 8 ? "    .8byte " : "    .4byte ");
+            sb.Append(relocation.SymbolName);
+            if (relocation.Addend > 0)
+                sb.Append(" + ").Append(relocation.Addend.ToString(CultureInfo.InvariantCulture));
+            else if (relocation.Addend < 0)
+                sb.Append(" - ").Append((-(long)relocation.Addend).ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine();
+        }
+
+        private static int GetDataRelocationWidth(RVTarget target, RVObjectRelocationKind kind)
+            => kind switch
+            {
+                RVObjectRelocationKind.AbsolutePointer => target.XLen / 8,
+                RVObjectRelocationKind.Absolute32 => 4,
+                RVObjectRelocationKind.Absolute64 => 8,
+                _ => throw new NotSupportedException($"Unsupported RISC-V data relocation kind: {kind}"),
+            };
+
+        private static bool HasBoundary(
+            Dictionary<int, List<string>>? labelsByOffset,
+            Dictionary<int, RVObjectRelocation> relocationsByOffset,
+            int offset)
+            => (labelsByOffset is not null && labelsByOffset.ContainsKey(offset)) || relocationsByOffset.ContainsKey(offset);
+        private static int FindNextLabelOffset(Dictionary<int, List<string>>? labelsByOffset, int offset, int limit)
+        {
+            if (labelsByOffset is null)
+                return limit;
+
+            var next = limit;
+            foreach (var pair in labelsByOffset)
+            {
+                if (pair.Key > offset && pair.Key < next)
+                    next = pair.Key;
+            }
+            return next;
+        }
+
+        private static void AddLabel(Dictionary<int, List<string>> labelsByOffset, int offset, string label)
+        {
+            if (string.IsNullOrEmpty(label))
+                return;
+            if (!labelsByOffset.TryGetValue(offset, out var labels))
+            {
+                labels = new List<string>();
+                labelsByOffset.Add(offset, labels);
+            }
+            if (!labels.Contains(label))
+                labels.Add(label);
+        }
+
+        private static void WriteLabels(StringBuilder sb, Dictionary<int, List<string>>? labelsByOffset, int offset)
+        {
+            if (labelsByOffset is null || !labelsByOffset.TryGetValue(offset, out var labels))
+                return;
+
+            labels.Sort(StringComparer.Ordinal);
+            foreach (var label in labels)
+                sb.Append(label).AppendLine(":");
         }
 
         public static string WriteInstruction(RVInstruction instruction, RiscVAssemblyWriterOptions? options = null)
@@ -946,12 +1401,9 @@ namespace Cnidaria.RiscV
 
         private static string WriteVectorOp(string mnemonic, RVInstructionMetadata metadata, RVInstruction instruction, RiscVAssemblyWriterOptions options)
         {
-            if (metadata.Funct3 == 0)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + Reg(instruction.Rs1, options) + MaskSuffix(instruction);
-            if (metadata.Funct3 == 4)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + Reg(instruction.Rs1, options) + MaskSuffix(instruction);
-            return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + instruction.Immediate
-                + MaskSuffix(instruction);
+            if (metadata.Funct3 == 3)
+                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + instruction.Immediate + MaskSuffix(instruction);
+            return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + Reg(instruction.Rs1, options) + MaskSuffix(instruction);
         }
 
         private static string Reg(RVRegister register, RiscVAssemblyWriterOptions options)

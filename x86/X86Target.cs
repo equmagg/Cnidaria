@@ -7,7 +7,7 @@ using System.Text;
 
 namespace Cnidaria.X86
 {
-    internal sealed class X86Program
+    public sealed class X86Program
     {
         public X86Target Target { get; }
         public X86TextSection Text { get; }
@@ -64,7 +64,7 @@ namespace Cnidaria.X86
             => X86ElfExecutableWriter.WriteExecutable(this, imageBase == 0 ? X86ElfExecutableWriter.DefaultImageBase(Target) : imageBase, externalSymbols);
     }
 
-    internal sealed class X86TextSection
+    public sealed class X86TextSection
     {
         public ImmutableArray<X86Instruction> Instructions { get; }
         public ImmutableDictionary<string, int> Labels { get; }
@@ -92,7 +92,7 @@ namespace Cnidaria.X86
             => X86Disassembler.Disassemble(this, options);
     }
 
-    internal sealed class X86DataSection
+    public sealed class X86DataSection
     {
         public string Name { get; }
         public X86ObjectSectionKind Kind { get; }
@@ -118,7 +118,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal sealed class X86ObjectSymbol
+    public sealed class X86ObjectSymbol
     {
         public string Name { get; }
         public string SectionName { get; }
@@ -144,7 +144,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal sealed class X86ObjectRelocation
+    public sealed class X86ObjectRelocation
     {
         public string SectionName { get; }
         public int Offset { get; }
@@ -162,7 +162,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal sealed class X86LinkedImage
+    public sealed class X86LinkedImage
     {
         public X86Program Source { get; }
         public ulong ImageBase { get; }
@@ -194,7 +194,7 @@ namespace Cnidaria.X86
             => Bytes.ToArray();
     }
 
-    internal sealed class X86LinkedSection
+    public sealed class X86LinkedSection
     {
         public string Name { get; }
         public X86ObjectSectionKind Kind { get; }
@@ -214,7 +214,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal enum X86ObjectSectionKind : byte
+    public enum X86ObjectSectionKind : byte
     {
         Text,
         Rodata,
@@ -222,14 +222,14 @@ namespace Cnidaria.X86
         Bss,
     }
 
-    internal enum X86ObjectSymbolBinding : byte
+    public enum X86ObjectSymbolBinding : byte
     {
         Local,
         Global,
         External,
     }
 
-    internal enum X86ObjectSymbolKind : byte
+    public enum X86ObjectSymbolKind : byte
     {
         None,
         Function,
@@ -237,7 +237,7 @@ namespace Cnidaria.X86
         Section,
     }
 
-    internal enum X86ObjectRelocationKind : byte
+    public enum X86ObjectRelocationKind : byte
     {
         None,
         Relative8,
@@ -249,7 +249,7 @@ namespace Cnidaria.X86
     }
 
     [Flags]
-    internal enum X86IsaFlags : ulong
+    public enum X86IsaFlags : ulong
     {
         None = 0,
         Sse = 1UL << 0,
@@ -258,7 +258,7 @@ namespace Cnidaria.X86
         Avx2 = 1UL << 3,
     }
 
-    internal enum X86AbiKind : byte
+    public enum X86AbiKind : byte
     {
         Cdecl,
         SysV64,
@@ -278,7 +278,7 @@ namespace Cnidaria.X86
         ConditionBinary,
     }
 
-    internal enum X86OperandKind : byte
+    public enum X86OperandKind : byte
     {
         None,
         Register,
@@ -294,7 +294,7 @@ namespace Cnidaria.X86
         Vector,
     }
 
-    internal enum X86Condition : byte
+    public enum X86Condition : byte
     {
         O = 0,
         No = 1,
@@ -328,7 +328,7 @@ namespace Cnidaria.X86
         Nle = 15,
     }
 
-    internal enum X86InstrKind : ushort
+    public enum X86InstrKind : ushort
     {
         Invalid = 0,
         Raw,
@@ -487,7 +487,7 @@ namespace Cnidaria.X86
         Vpsrad,
     }
 
-    internal enum X86Register : byte
+    public enum X86Register : byte
     {
         Rax = 0,
         Rcx = 1,
@@ -541,7 +541,7 @@ namespace Cnidaria.X86
         Invalid = 255,
     }
 
-    internal readonly struct X86Operand
+    public readonly struct X86Operand
     {
         public X86OperandKind Kind { get; }
         public int Size { get; }
@@ -638,7 +638,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal readonly struct X86Instruction
+    public readonly struct X86Instruction
     {
         public X86InstrKind Opcode { get; }
         public X86Operand Operand0 { get; }
@@ -753,7 +753,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal sealed class X86Target
+    public sealed class X86Target
     {
         public static X86Target I386 { get; } = new X86Target(32, X86AbiKind.Cdecl, X86IsaFlags.Sse | X86IsaFlags.Sse2, TargetEndianness.Little);
         public static X86Target I386Windows { get; } = new X86Target(32, X86AbiKind.Cdecl, X86IsaFlags.Sse | X86IsaFlags.Sse2, TargetEndianness.Little, OperatingSystemKind.Windows);

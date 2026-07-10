@@ -212,7 +212,11 @@ namespace Cnidaria.C
             {
                 case ExpressionInitializerSyntax expressionInitializer:
                     {
-                        var expression = ApplyDefaultConversions(BindExpression(expressionInitializer.Expression));
+                        var expression = BindExpression(expressionInitializer.Expression);
+                        if (IsNarrowStringArrayInitializer(targetType, expression))
+                            return new BoundExpressionInitializer(expressionInitializer, targetType, expression);
+
+                        expression = ApplyDefaultConversions(expression);
 
                         if (!targetType.IsError && !expression.Type.IsError && !CanConvert(expression.Type, targetType))
                         {
@@ -245,6 +249,24 @@ namespace Cnidaria.C
                     throw new InvalidOperationException($"Unexpected initializer syntax: {syntax.GetType().Name}");
             }
         }
+
+        private static bool IsNarrowStringArrayInitializer(QualifiedType targetType, BoundExpression expression)
+        {
+            if (expression.ConstantValue is not string ||
+                targetType.Type is not ArrayType targetArray ||
+                expression.Type.Type is not ArrayType sourceArray)
+            {
+                return false;
+            }
+
+            return IsNarrowCharacterType(targetArray.ElementType) && IsNarrowCharacterType(sourceArray.ElementType);
+        }
+
+        private static bool IsNarrowCharacterType(QualifiedType type)
+            => type.Type is BuiltinType
+            {
+                BuiltinKind: BuiltinTypeKind.Char or BuiltinTypeKind.SignedChar or BuiltinTypeKind.UnsignedChar
+            };
 
         private BoundStaticAssertDeclaration BindStaticAssertDeclaration(StaticAssertDeclarationSyntax syntax)
         {

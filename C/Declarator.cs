@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Text;
 
 namespace Cnidaria.C
 {
@@ -218,6 +219,7 @@ namespace Cnidaria.C
 
             var name = identifier.Value.Text;
             var declaredType = DeclaratorTypeBuilder.Build(initDeclarator.Declarator, specifiers.BaseType, _types, scope);
+            declaredType = CompleteArrayTypeFromInitializer(declaredType, initDeclarator.Initializer);
 
             Symbol symbol;
             if (specifiers.IsTypedef)
@@ -252,6 +254,38 @@ namespace Cnidaria.C
             if (initDeclarator.Initializer is not null)
                 VisitInitializer(initDeclarator.Initializer, scope);
         }
+
+        private QualifiedType CompleteArrayTypeFromInitializer(QualifiedType type, InitializerSyntax? initializer)
+        {
+            if (initializer is null || type.Type is not ArrayType { Length: null } array)
+                return type;
+            if (!TryGetStringInitializerLength(array.ElementType, initializer, out var length))
+                return type;
+
+            return new QualifiedType(_types.ArrayOf(array.ElementType, length), type.Qualifiers);
+        }
+
+        private static bool TryGetStringInitializerLength(QualifiedType elementType, InitializerSyntax initializer, out long length)
+        {
+            if (!IsNarrowCharacterType(elementType) ||
+                initializer is not ExpressionInitializerSyntax expressionInitializer ||
+                expressionInitializer.Expression is not LiteralExpressionSyntax literal ||
+                literal.LiteralToken.Kind is not SyntaxKind.StringLiteralToken and not SyntaxKind.Utf8StringLiteralToken ||
+                literal.LiteralToken.Value is not string text)
+            {
+                length = 0;
+                return false;
+            }
+
+            length = checked((long)Encoding.UTF8.GetByteCount(text) + 1L);
+            return true;
+        }
+
+        private static bool IsNarrowCharacterType(QualifiedType type)
+            => type.Type is BuiltinType
+            {
+                BuiltinKind: BuiltinTypeKind.Char or BuiltinTypeKind.SignedChar or BuiltinTypeKind.UnsignedChar
+            };
 
         private void CollectCompoundStatement(CompoundStatementSyntax statement, Scope scope)
         {
@@ -1358,33 +1392,279 @@ namespace Cnidaria.C
 
         private long? TryReadArrayLength(ImmutableArray<SyntaxToken> tokens)
         {
-            if (tokens.Length != 1)
+            if (tokens.IsDefaultOrEmpty)
                 return null;
 
-            var token = tokens[0];
-            if (token.Kind != SyntaxKind.IntegerLiteralToken)
-                return null;
+            var evaluator = new ArrayLengthExpressionEvaluator(tokens);
+            return evaluator.TryEvaluate(out var value) && value >= 0 ? value : null;
+        }
 
-            var text = token.Text.Replace("'", string.Empty);
-            var suffixStart = text.Length;
-            while (suffixStart > 0 && text[suffixStart - 1] is 'u' or 'U' or 'l' or 'L')
-                suffixStart--;
+        private sealed class ArrayLengthExpressionEvaluator
+        {
+            private readonly ImmutableArray<SyntaxToken> _tokens;
+            private int _position;
 
-            text = text[..suffixStart];
-
-            try
+            public ArrayLengthExpressionEvaluator(ImmutableArray<SyntaxToken> tokens)
             {
-                if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                    return Convert.ToInt64(text[2..], 16);
-
-                if (text.Length > 1 && text[0] == '0')
-                    return Convert.ToInt64(text[1..], 8);
-
-                return Convert.ToInt64(text, 10);
+                _tokens = tokens;
             }
-            catch
+
+            public bool TryEvaluate(out long value)
             {
-                return null;
+                value = 0;
+                try
+                {
+                    return TryParseConditional(out value) && _position == _tokens.Length;
+                }
+                catch (OverflowException)
+                {
+                    value = 0;
+                    return false;
+                }
+            }
+
+            private bool TryParseConditional(out long value)
+            {
+                if (!TryParseBinary(1, out value))
+                    return false;
+
+                if (!Match(SyntaxKind.QuestionToken))
+                    return true;
+
+                var condition = value;
+                if (!TryParseConditional(out var whenTrue) ||
+                    !Match(SyntaxKind.ColonToken) ||
+                    !TryParseConditional(out var whenFalse))
+                {
+                    value = 0;
+                    return false;
+                }
+
+                value = condition != 0 ? whenTrue : whenFalse;
+                return true;
+            }
+
+            private bool TryParseBinary(int minimumPrecedence, out long value)
+            {
+                if (!TryParseUnary(out value))
+                    return false;
+
+                while (_position < _tokens.Length &&
+                       TryGetBinaryPrecedence(_tokens[_position].Kind, out var precedence) &&
+                       precedence >= minimumPrecedence)
+                {
+                    var operatorKind = _tokens[_position].Kind;
+                    _position++;
+                    if (!TryParseBinary(precedence + 1, out var right) ||
+                        !TryApplyBinary(operatorKind, value, right, out value))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            private bool TryParseUnary(out long value)
+            {
+                if (Match(SyntaxKind.PlusToken))
+                    return TryParseUnary(out value);
+
+                if (Match(SyntaxKind.MinusToken))
+                {
+                    if (!TryParseUnary(out value))
+                        return false;
+                    value = checked(-value);
+                    return true;
+                }
+
+                if (Match(SyntaxKind.TildeToken))
+                {
+                    if (!TryParseUnary(out value))
+                        return false;
+                    value = ~value;
+                    return true;
+                }
+
+                if (Match(SyntaxKind.BangToken))
+                {
+                    if (!TryParseUnary(out value))
+                        return false;
+                    value = value == 0 ? 1 : 0;
+                    return true;
+                }
+
+                return TryParsePrimary(out value);
+            }
+
+            private bool TryParsePrimary(out long value)
+            {
+                value = 0;
+
+                if (Match(SyntaxKind.OpenParenToken))
+                    return TryParseConditional(out value) && Match(SyntaxKind.CloseParenToken);
+
+                if (_position >= _tokens.Length)
+                    return false;
+
+                var token = _tokens[_position];
+                if (token.Kind == SyntaxKind.IntegerLiteralToken && TryParseIntegerLiteral(token.Text, out value))
+                {
+                    _position++;
+                    return true;
+                }
+
+                if (token.Kind is SyntaxKind.TrueKeyword or SyntaxKind.FalseKeyword)
+                {
+                    _position++;
+                    value = token.Kind == SyntaxKind.TrueKeyword ? 1 : 0;
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool Match(SyntaxKind kind)
+            {
+                if (_position >= _tokens.Length || _tokens[_position].Kind != kind)
+                    return false;
+
+                _position++;
+                return true;
+            }
+
+            private static bool TryGetBinaryPrecedence(SyntaxKind kind, out int precedence)
+            {
+                precedence = kind switch
+                {
+                    SyntaxKind.PipePipeToken => 1,
+                    SyntaxKind.AmpersandAmpersandToken => 2,
+                    SyntaxKind.PipeToken => 3,
+                    SyntaxKind.HatToken => 4,
+                    SyntaxKind.AmpersandToken => 5,
+                    SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken => 6,
+                    SyntaxKind.LessThanToken or SyntaxKind.LessThanEqualsToken or
+                    SyntaxKind.GreaterThanToken or SyntaxKind.GreaterThanEqualsToken => 7,
+                    SyntaxKind.LessThanLessThanToken or SyntaxKind.GreaterThanGreaterThanToken => 8,
+                    SyntaxKind.PlusToken or SyntaxKind.MinusToken => 9,
+                    SyntaxKind.StarToken or SyntaxKind.SlashToken or SyntaxKind.PercentToken => 10,
+                    _ => 0,
+                };
+                return precedence != 0;
+            }
+
+            private static bool TryApplyBinary(
+                SyntaxKind kind,
+                long left,
+                long right,
+                out long value)
+            {
+                value = 0;
+                switch (kind)
+                {
+                    case SyntaxKind.StarToken:
+                        value = checked(left * right);
+                        return true;
+                    case SyntaxKind.SlashToken:
+                        if (right == 0)
+                            return false;
+                        value = left / right;
+                        return true;
+                    case SyntaxKind.PercentToken:
+                        if (right == 0)
+                            return false;
+                        value = left % right;
+                        return true;
+                    case SyntaxKind.PlusToken:
+                        value = checked(left + right);
+                        return true;
+                    case SyntaxKind.MinusToken:
+                        value = checked(left - right);
+                        return true;
+                    case SyntaxKind.LessThanLessThanToken:
+                        if (right < 0 || right >= 64)
+                            return false;
+                        value = left << (int)right;
+                        return true;
+                    case SyntaxKind.GreaterThanGreaterThanToken:
+                        if (right < 0 || right >= 64)
+                            return false;
+                        value = left >> (int)right;
+                        return true;
+                    case SyntaxKind.LessThanToken:
+                        value = left < right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.LessThanEqualsToken:
+                        value = left <= right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.GreaterThanToken:
+                        value = left > right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.GreaterThanEqualsToken:
+                        value = left >= right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.EqualsEqualsToken:
+                        value = left == right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.BangEqualsToken:
+                        value = left != right ? 1 : 0;
+                        return true;
+                    case SyntaxKind.AmpersandToken:
+                        value = left & right;
+                        return true;
+                    case SyntaxKind.HatToken:
+                        value = left ^ right;
+                        return true;
+                    case SyntaxKind.PipeToken:
+                        value = left | right;
+                        return true;
+                    case SyntaxKind.AmpersandAmpersandToken:
+                        value = left != 0 && right != 0 ? 1 : 0;
+                        return true;
+                    case SyntaxKind.PipePipeToken:
+                        value = left != 0 || right != 0 ? 1 : 0;
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
+            private static bool TryParseIntegerLiteral(string text, out long value)
+            {
+                value = 0;
+                if (string.IsNullOrWhiteSpace(text))
+                    return false;
+
+                var trimmed = text.Replace("'", string.Empty);
+                var end = trimmed.Length;
+                while (end > 0 && trimmed[end - 1] is 'u' or 'U' or 'l' or 'L')
+                    end--;
+                trimmed = trimmed[..end];
+
+                try
+                {
+                    if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (trimmed.Length == 2)
+                            return false;
+                        value = Convert.ToInt64(trimmed[2..], 16);
+                        return true;
+                    }
+
+                    if (trimmed.Length > 1 && trimmed[0] == '0')
+                    {
+                        value = Convert.ToInt64(trimmed[1..], 8);
+                        return true;
+                    }
+
+                    value = Convert.ToInt64(trimmed, 10);
+                    return true;
+                }
+                catch
+                {
+                    value = 0;
+                    return false;
+                }
             }
         }
 

@@ -8,7 +8,7 @@ using Cnidaria.X86;
 
 namespace Cnidaria.C
 {
-    internal sealed class X86CodeGenerator
+    public sealed class X86CodeGenerator
     {
         private const string TextSectionName = ".text";
         private const string RodataSectionName = ".rodata";

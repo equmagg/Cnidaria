@@ -9,7 +9,7 @@ using Cnidaria.RiscV;
 
 namespace Cnidaria.C
 {
-    internal sealed class RiscVCodeGenerator
+    public sealed class RiscVCodeGenerator
     {
         private const string TextSectionName = ".text";
         private const string RodataSectionName = ".rodata";
@@ -63,9 +63,12 @@ namespace Cnidaria.C
             foreach (var function in _module.Functions)
                 EmitFunction(function);
 
-            var entry = _functionLabelsByName.TryGetValue("main", out var mainLabel)
+            var selectedEntry = _functionLabelsByName.TryGetValue("main", out var mainLabel)
                 ? mainLabel
                 : (_functionLabels.Values.FirstOrDefault() ?? string.Empty);
+            var entry = IsLinuxExecutableTarget
+                ? EmitLinuxRuntime(selectedEntry)
+                : selectedEntry;
 
             AddSectionSymbols();
             var dataSections = ImmutableArray.CreateBuilder<RVDataSection>();
@@ -80,6 +83,46 @@ namespace Cnidaria.C
                 _symbols.ToImmutableArray(),
                 entry);
         }
+
+        private bool IsLinuxExecutableTarget
+            => _target.OperatingSystem == OperatingSystemKind.Linux && _target.IsRiscV;
+
+        private string EmitLinuxRuntime(string userEntryLabel)
+            => EmitLinuxStart(userEntryLabel);
+
+        private string EmitLinuxStart(string userEntryLabel)
+        {
+            var label = CreateUniqueGlobalLabel("_start");
+            var startOffset = _text.ByteLength;
+            _text.DefineLabel(label);
+
+            Emit(RVInstruction.I(_machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw, RVRegister.X10, RVRegister.X2, 0));
+            Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X11, RVRegister.X2, _target.PointerSize));
+            Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X12, RVRegister.X10, 1));
+            Emit(RVInstruction.I(RVInstrKind.Slli, RVRegister.X12, RVRegister.X12, _target.PointerSize == 8 ? 3 : 2));
+            Emit(RVInstruction.R(RVInstrKind.Add, RVRegister.X12, RVRegister.X12, RVRegister.X11));
+            Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X2, RVRegister.X2, -16));
+            if (!string.IsNullOrEmpty(userEntryLabel))
+                EmitCall(userEntryLabel);
+            else
+                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X10, RVRegister.X0, 0));
+            Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X17, RVRegister.X0, 93));
+            Emit(new RVInstruction(RVInstrKind.Ecall));
+            Emit(new RVInstruction(RVInstrKind.Ebreak));
+
+            _symbols.Add(new RVObjectSymbol(label, TextSectionName, startOffset, _text.ByteLength - startOffset, RVObjectSymbolBinding.Global, RVObjectSymbolKind.Function));
+            return label;
+        }
+
+        private void EmitCall(string label)
+        {
+            var offset = _text.ByteLength;
+            Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X1, label));
+            _text.AddRelocation(offset, label, 0, RVObjectRelocationKind.Jal20);
+        }
+
+        private void Emit(RVInstruction instruction)
+            => _text.Emit(instruction);
 
         private void IndexFunctions()
         {
@@ -665,8 +708,8 @@ namespace Cnidaria.C
 
                 foreach (var label in asmStatement.GotoLabels)
                 {
-                    if (operandIndex >= instruction.Operands.Length 
-                        || instruction.Operands[operandIndex].Kind != LirOperandKind.Label 
+                    if (operandIndex >= instruction.Operands.Length
+                        || instruction.Operands[operandIndex].Kind != LirOperandKind.Label
                         || instruction.Operands[operandIndex].Label is null)
                         throw Unsupported(instruction, "Inline assembly goto label is missing from LIR.");
 
@@ -820,10 +863,10 @@ namespace Cnidaria.C
                     else if (loc.Kind == AbiLocationKind.Stack)
                     {
                         LoadFromMemory(
-                            GpScratch1, 
-                            Sp, 
-                            IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), 
-                            _owner._target.PointerSize, 
+                            GpScratch1,
+                            Sp,
+                            IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                            _owner._target.PointerSize,
                             signed: false);
                         CopyMemory(destinationAddress, GpScratch1, value.Size);
                     }
@@ -960,7 +1003,7 @@ namespace Cnidaria.C
                     return;
 
                 if (RequiresSoftwareScalar(instruction.Result.Type) || RequiresSoftwareScalar(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), 
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type),
                         "Unary operation for scalar wider than one machine register is not implemented yet.");
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0);
@@ -995,7 +1038,7 @@ namespace Cnidaria.C
                     return false;
 
                 if (!IsRv32WideInteger(instruction.Result.Type) || !IsRv32WideInteger(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type), 
+                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type),
                         "Unary operation requires an explicit wide integer conversion.");
 
                 LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
@@ -1036,7 +1079,7 @@ namespace Cnidaria.C
                 }
 
                 if (!IsRv32WideInteger(instruction.Result.Type))
-                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), 
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type),
                         "Wide integer binary operation requires a wide integer result.");
 
                 switch (op)
@@ -1904,7 +1947,7 @@ namespace Cnidaria.C
                     return GpScratch0;
                 }
 
-                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), 
+                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type),
                     "Floating-point argument bit move to an integer ABI register requires a runtime helper.");
             }
 

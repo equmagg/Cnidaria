@@ -225,7 +225,10 @@ namespace Cnidaria.C
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVC) != 0)
                     macros["__riscv_compressed"] = "1";
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVV) != 0)
+                {
                     macros["__riscv_vector"] = "1";
+                    macros["__riscv_v"] = "1000000";
+                }
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)
                     macros["__riscv_float_abi_double"] = "1";
                 else if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)

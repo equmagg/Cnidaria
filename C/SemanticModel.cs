@@ -347,6 +347,7 @@ namespace Cnidaria.C
         public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
         public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
+        public static TargetInfo RiscV64Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux);
         public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Windows);
         public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Linux);
         public static TargetInfo Default => RegisterBytecode32;
@@ -362,6 +363,8 @@ namespace Cnidaria.C
                 features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF;
+            if (architecture == TargetArchitectureKind.RiscV64)
+                features |= TargetArchitectureFeatures.RiscVD;
             return architecture switch
             {
                 TargetArchitectureKind.RegisterBytecode => RegisterBytecode32.WithFeatures(features),

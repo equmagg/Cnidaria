@@ -1,4 +1,4 @@
-#ifndef __STDARG_H
+﻿#ifndef __STDARG_H
 #define __STDARG_H
 
 #define __VA_KIND_GP 0u
