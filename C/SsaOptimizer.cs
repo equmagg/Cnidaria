@@ -1440,10 +1440,18 @@ namespace Cnidaria.C
             private bool TryCastIntegerConstant(GimpleConstantValue constant, QualifiedType targetType, SyntaxNode? syntax, out GimpleConstantValue casted)
             {
                 casted = null!;
-                if (!TryGetIntegerConstant(constant, out var value, out _))
+                if (!TryGetIntegerConstant(constant, out var value, out var sourceInfo))
                     return false;
 
-                return TryCastInteger(value, targetType, syntax, out casted);
+                if (!TryGetIntegerInfo(targetType, out _))
+                    return false;
+
+                var targetValue = sourceInfo.IsSigned
+                    ? unchecked((ulong)ToSigned(value, sourceInfo.Bits))
+                    : value;
+
+                casted = CreateIntegerConstant(targetValue, targetType, syntax);
+                return true;
             }
 
             private bool TryCastInteger(ulong value, QualifiedType targetType, SyntaxNode? syntax, out GimpleConstantValue casted)

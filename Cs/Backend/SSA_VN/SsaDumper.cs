@@ -275,6 +275,9 @@ namespace Cnidaria.Cs
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
+                case GenTreeKind.ClassInit:
+                    sb.Append("classinit ").Append(TypeName(tree.Source.RuntimeType));
+                    return;
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:

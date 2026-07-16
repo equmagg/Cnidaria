@@ -9666,6 +9666,30 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             : base(message, innerException)
         { }
     }
+    public sealed class TypeInitializationException : SystemException
+    {
+        private readonly string? _typeName;
+
+        private TypeInitializationException() 
+            : base()
+        { }
+
+
+        public TypeInitializationException(string? fullTypeName, Exception? innerException)
+            : this(fullTypeName, string.Empty, innerException)
+        { }
+
+        internal TypeInitializationException(string? message) : base(message ?? string.Empty)
+        { }
+
+        internal TypeInitializationException(string? fullTypeName, string? message, Exception? innerException)
+            : base(message ?? string.Empty, innerException)
+        {
+            _typeName = fullTypeName; 
+        }
+
+        public string TypeName => _typeName ?? string.Empty;
+    }
     public class SerializationException : SystemException
     {
         private static string _nullMessage = "Arg_SerializationException";

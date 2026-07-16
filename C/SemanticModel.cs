@@ -9,15 +9,18 @@ namespace Cnidaria.C
     public readonly struct SemanticDiagnostic : IDiagnostic
     {
         public DiagnosticSeverity Severity { get; }
-        public string Message { get; }
+        public string Message => _message;
         public TextSpan Position { get; }
+        private readonly string _message;
 
         public SemanticDiagnostic(DiagnosticSeverity severity, string? message, TextSpan position)
         {
             Severity = severity;
-            Message = message ?? string.Empty;
+            _message = message ?? string.Empty;
             Position = position;
         }
+
+        public string GetMessage(string source) => _message + $" {Position.ToString(source)}";
 
         public static SemanticDiagnostic Error(string message, TextSpan position)
             => new SemanticDiagnostic(DiagnosticSeverity.Error, message, position);
@@ -127,7 +130,7 @@ namespace Cnidaria.C
         {
             options ??= new CompilationOptions();
             return Create(
-                new[] { SyntaxTree.ParseText(text, preprocessorOptions 
+                new[] { SyntaxTree.ParseText(text, preprocessorOptions
                 ?? new PreprocessorOptions(environment: PreprocessorEnvironment.ForTarget(options.Target))) },
                 assemblyName,
                 options);
@@ -209,8 +212,16 @@ namespace Cnidaria.C
                     builder.Add(diagnostic);
             }
 
-            foreach (var diagnostic in SemanticDiagnostics)
+            var semanticDiagnostics = SemanticDiagnostics;
+            foreach (var diagnostic in semanticDiagnostics)
                 builder.Add(diagnostic);
+
+            foreach (var tree in SyntaxTrees)
+            {
+                var boundDiagnostics = GetSemanticModel(tree).GetBoundTree().Diagnostics;
+                for (var i = semanticDiagnostics.Length; i < boundDiagnostics.Length; i++)
+                    builder.Add(boundDiagnostics[i]);
+            }
 
             return builder.ToImmutable();
         }
@@ -319,7 +330,7 @@ namespace Cnidaria.C
 
     public enum CharSignedness : byte { Signed, Unsigned, ImplementationDefined }
 
-   
+
     public readonly struct PrimitiveLayout
     {
         public int Size { get; }
@@ -347,7 +358,7 @@ namespace Cnidaria.C
         public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
         public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
-        public static TargetInfo RiscV64Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux);
+        public static TargetInfo RV64GLinux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RiscVG);
         public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Windows);
         public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Linux);
         public static TargetInfo Default => RegisterBytecode32;
@@ -362,7 +373,7 @@ namespace Cnidaria.C
             if (architecture == TargetArchitectureKind.Arm64)
                 features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
-                features |= TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF;
+                features |= TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVA;
             if (architecture == TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVD;
             return architecture switch
@@ -373,8 +384,8 @@ namespace Cnidaria.C
                 TargetArchitectureKind.X86 => CreateILP32(TargetArchitectureKind.X86, features, operatingSystem),
                 TargetArchitectureKind.Arm32 => CreateArm32(features, operatingSystem),
                 TargetArchitectureKind.RiscV64 => CreateLP64(TargetArchitectureKind.RiscV64, features, operatingSystem),
-                TargetArchitectureKind.X64 => operatingSystem == OperatingSystemKind.Windows 
-                    ? CreateWindowsX64(features) 
+                TargetArchitectureKind.X64 => operatingSystem == OperatingSystemKind.Windows
+                    ? CreateWindowsX64(features)
                     : CreateLP64(TargetArchitectureKind.X64, features, operatingSystem),
                 TargetArchitectureKind.Arm64 => CreateArm64(features, operatingSystem),
                 _ => throw new ArgumentOutOfRangeException(nameof(architecture)),
@@ -626,6 +637,9 @@ namespace Cnidaria.C
                 case BuiltinType builtin:
                     return GetPrimitiveLayout(builtin.BuiltinKind).Size;
 
+                case RVVectorType:
+                    return Math.Max(1, TargetRegisterInfo.VectorRegisterSize(this));
+
                 case PointerType:
                     return PointerSize;
 
@@ -661,6 +675,9 @@ namespace Cnidaria.C
             {
                 case BuiltinType builtin:
                     return GetPrimitiveLayout(builtin.BuiltinKind).Alignment;
+
+                case RVVectorType:
+                    return Math.Max(1, TargetRegisterInfo.VectorRegisterSize(this));
 
                 case PointerType:
                     return PointerAlignment;
@@ -794,7 +811,8 @@ namespace Cnidaria.C
         Function,
         Struct,
         Union,
-        Enum
+        Enum,
+        Vector
     }
 
     public enum BuiltinTypeKind : byte
@@ -915,6 +933,89 @@ namespace Cnidaria.C
                 default:
                     return "<builtin>";
             }
+        }
+    }
+
+    public enum RVVectorTypeKind : byte
+    {
+        Bool64,
+        Bool32,
+        Bool16,
+        Bool8,
+        Int8M1,
+        UInt8M1,
+        Int16M1,
+        UInt16M1,
+        Int32M1,
+        UInt32M1,
+        Int64M1,
+        UInt64M1,
+        Float32M1,
+        Float64M1
+    }
+
+    public sealed class RVVectorType : CType
+    {
+        public RVVectorTypeKind VectorKind { get; }
+        public int ElementWidth { get; }
+        public bool IsMask { get; }
+        public bool IsFloating { get; }
+        public bool IsUnsigned { get; }
+        public string BuiltinName { get; }
+
+        public override TypeKind Kind => TypeKind.Vector;
+
+        public RVVectorType(RVVectorTypeKind kind)
+        {
+            VectorKind = kind;
+            (ElementWidth, IsMask, IsFloating, IsUnsigned, BuiltinName) = kind switch
+            {
+                RVVectorTypeKind.Bool64 => (1, true, false, false, "__rvv_bool64_t"),
+                RVVectorTypeKind.Bool32 => (1, true, false, false, "__rvv_bool32_t"),
+                RVVectorTypeKind.Bool16 => (1, true, false, false, "__rvv_bool16_t"),
+                RVVectorTypeKind.Bool8 => (1, true, false, false, "__rvv_bool8_t"),
+                RVVectorTypeKind.Int8M1 => (8, false, false, false, "__rvv_int8m1_t"),
+                RVVectorTypeKind.UInt8M1 => (8, false, false, true, "__rvv_uint8m1_t"),
+                RVVectorTypeKind.Int16M1 => (16, false, false, false, "__rvv_int16m1_t"),
+                RVVectorTypeKind.UInt16M1 => (16, false, false, true, "__rvv_uint16m1_t"),
+                RVVectorTypeKind.Int32M1 => (32, false, false, false, "__rvv_int32m1_t"),
+                RVVectorTypeKind.UInt32M1 => (32, false, false, true, "__rvv_uint32m1_t"),
+                RVVectorTypeKind.Int64M1 => (64, false, false, false, "__rvv_int64m1_t"),
+                RVVectorTypeKind.UInt64M1 => (64, false, false, true, "__rvv_uint64m1_t"),
+                RVVectorTypeKind.Float32M1 => (32, false, true, false, "__rvv_float32m1_t"),
+                RVVectorTypeKind.Float64M1 => (64, false, true, false, "__rvv_float64m1_t"),
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+        }
+
+        public override string ToDisplayString()
+            => BuiltinName;
+
+        public static bool TryParseBuiltinName(string name, out RVVectorTypeKind kind)
+        {
+            kind = name switch
+            {
+                "__rvv_bool64_t" => RVVectorTypeKind.Bool64,
+                "__rvv_bool32_t" => RVVectorTypeKind.Bool32,
+                "__rvv_bool16_t" => RVVectorTypeKind.Bool16,
+                "__rvv_bool8_t" => RVVectorTypeKind.Bool8,
+                "__rvv_int8m1_t" => RVVectorTypeKind.Int8M1,
+                "__rvv_uint8m1_t" => RVVectorTypeKind.UInt8M1,
+                "__rvv_int16m1_t" => RVVectorTypeKind.Int16M1,
+                "__rvv_uint16m1_t" => RVVectorTypeKind.UInt16M1,
+                "__rvv_int32m1_t" => RVVectorTypeKind.Int32M1,
+                "__rvv_uint32m1_t" => RVVectorTypeKind.UInt32M1,
+                "__rvv_int64m1_t" => RVVectorTypeKind.Int64M1,
+                "__rvv_uint64m1_t" => RVVectorTypeKind.UInt64M1,
+                "__rvv_float32m1_t" => RVVectorTypeKind.Float32M1,
+                "__rvv_float64m1_t" => RVVectorTypeKind.Float64M1,
+                _ => default,
+            };
+
+            return name is "__rvv_bool64_t" or "__rvv_bool32_t" or "__rvv_bool16_t" or "__rvv_bool8_t"
+                or "__rvv_int8m1_t" or "__rvv_uint8m1_t" or "__rvv_int16m1_t" or "__rvv_uint16m1_t"
+                or "__rvv_int32m1_t" or "__rvv_uint32m1_t" or "__rvv_int64m1_t" or "__rvv_uint64m1_t"
+                or "__rvv_float32m1_t" or "__rvv_float64m1_t";
         }
     }
 
@@ -1051,6 +1152,21 @@ namespace Cnidaria.C
         public BuiltinType Double { get; } = new BuiltinType(BuiltinTypeKind.Double);
         public BuiltinType LongDouble { get; } = new BuiltinType(BuiltinTypeKind.LongDouble);
 
+        public RVVectorType RiscVBool64 { get; } = new RVVectorType(RVVectorTypeKind.Bool64);
+        public RVVectorType RiscVBool32 { get; } = new RVVectorType(RVVectorTypeKind.Bool32);
+        public RVVectorType RiscVBool16 { get; } = new RVVectorType(RVVectorTypeKind.Bool16);
+        public RVVectorType RiscVBool8 { get; } = new RVVectorType(RVVectorTypeKind.Bool8);
+        public RVVectorType RiscVInt8M1 { get; } = new RVVectorType(RVVectorTypeKind.Int8M1);
+        public RVVectorType RiscVUInt8M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt8M1);
+        public RVVectorType RiscVInt16M1 { get; } = new RVVectorType(RVVectorTypeKind.Int16M1);
+        public RVVectorType RiscVUInt16M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt16M1);
+        public RVVectorType RiscVInt32M1 { get; } = new RVVectorType(RVVectorTypeKind.Int32M1);
+        public RVVectorType RiscVUInt32M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt32M1);
+        public RVVectorType RiscVInt64M1 { get; } = new RVVectorType(RVVectorTypeKind.Int64M1);
+        public RVVectorType RiscVUInt64M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt64M1);
+        public RVVectorType RiscVFloat32M1 { get; } = new RVVectorType(RVVectorTypeKind.Float32M1);
+        public RVVectorType RiscVFloat64M1 { get; } = new RVVectorType(RVVectorTypeKind.Float64M1);
+
         private TypeCatalog() { }
 
         public PointerType PointerTo(QualifiedType pointee)
@@ -1107,6 +1223,29 @@ namespace Cnidaria.C
                 default:
                     return new QualifiedType(CErrorType.Instance, qualifiers);
             }
+        }
+
+        public QualifiedType RiscVVector(RVVectorTypeKind kind, TypeQualifiers qualifiers = TypeQualifiers.None)
+        {
+            var type = kind switch
+            {
+                RVVectorTypeKind.Bool64 => RiscVBool64,
+                RVVectorTypeKind.Bool32 => RiscVBool32,
+                RVVectorTypeKind.Bool16 => RiscVBool16,
+                RVVectorTypeKind.Bool8 => RiscVBool8,
+                RVVectorTypeKind.Int8M1 => RiscVInt8M1,
+                RVVectorTypeKind.UInt8M1 => RiscVUInt8M1,
+                RVVectorTypeKind.Int16M1 => RiscVInt16M1,
+                RVVectorTypeKind.UInt16M1 => RiscVUInt16M1,
+                RVVectorTypeKind.Int32M1 => RiscVInt32M1,
+                RVVectorTypeKind.UInt32M1 => RiscVUInt32M1,
+                RVVectorTypeKind.Int64M1 => RiscVInt64M1,
+                RVVectorTypeKind.UInt64M1 => RiscVUInt64M1,
+                RVVectorTypeKind.Float32M1 => RiscVFloat32M1,
+                RVVectorTypeKind.Float64M1 => RiscVFloat64M1,
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+            return new QualifiedType(type, qualifiers);
         }
     }
 

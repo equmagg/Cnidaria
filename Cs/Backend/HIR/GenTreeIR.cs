@@ -30,6 +30,7 @@ namespace Cnidaria.Cs
         Reload,
         Spill,
         GcPoll,
+        ClassInit,
         StackFrameOp,
 
         ConstI4,
@@ -112,6 +113,14 @@ namespace Cnidaria.Cs
 
         public static bool IsRealTree(GenTree node)
             => node is not null && !IsSynthetic(node.Kind);
+
+        public static int PrologPrefixLength(ImmutableArray<GenTree> nodes)
+        {
+            int length = 0;
+            while (length < nodes.Length && nodes[length].IsProlog)
+                length++;
+            return length;
+        }
     }
     internal enum GenTreeFlags : uint
     {
@@ -135,6 +144,7 @@ namespace Cnidaria.Cs
         VarDef = 1u << 14,
         VarUseAsg = 1u << 15,
         VarDeath = 1u << 16,
+        Prolog = 1u << 17,
     }
     internal enum GenTreeBlockJumpKind : byte
     {
@@ -955,7 +965,7 @@ namespace Cnidaria.Cs
         {
             get
             {
-                if (Kind is GenTreeKind.GcPoll or GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill or GenTreeKind.StackFrameOp)
+                if (Kind is GenTreeKind.Copy or GenTreeKind.Reload or GenTreeKind.Spill or GenTreeKind.StackFrameOp)
                     return false;
                 return HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill);
             }
@@ -970,6 +980,7 @@ namespace Cnidaria.Cs
         public bool HasSideEffect => (Flags & GenTreeFlags.SideEffect) != 0;
         public bool ReadsMemory => (Flags & GenTreeFlags.MemoryRead) != 0;
         public bool WritesMemory => (Flags & GenTreeFlags.MemoryWrite) != 0;
+        public bool IsProlog => (Flags & GenTreeFlags.Prolog) != 0;
 
         public int Int32 { get; }
         public long Int64 { get; }
@@ -1155,16 +1166,18 @@ namespace Cnidaria.Cs
             LinearPhiCopyFromBlockId = phiCopyFromBlockId;
             LinearPhiCopyToBlockId = phiCopyToBlockId;
         }
-        internal void AttachRegisterAllocation(RegisterAllocationInfo allocation)
+        internal void AttachRegisterAllocation(RegisterAllocationInfo allocation, TargetInfo target)
         {
             if (allocation is null)
                 throw new ArgumentNullException(nameof(allocation));
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
             if (!allocation.ValueKey.Equals(LinearValueKey))
                 throw new InvalidOperationException("Cannot attach allocation for a different GenTree value.");
 
             RegisterAllocation = allocation;
             RegisterHome = allocation.Home;
-            var abi = MachineAbi.ClassifyStorageValue(Type, StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(Type, StackKind, target);
             RegisterLocationAtDefinition = allocation.ValueLocationAtDefinition(abi);
 
             var info = new GenTreeLsraInfo
@@ -1182,12 +1195,14 @@ namespace Cnidaria.Cs
             LsraInfo = info ?? GenTreeLsraInfo.Empty;
         }
 
-        public RegisterValueLocation GetRegisterLocation(int position, bool isReturn = false)
+        public RegisterValueLocation GetRegisterLocation(int position, TargetInfo target, bool isReturn = false)
         {
             if (RegisterAllocation is null)
                 throw new InvalidOperationException($"GenTree node has no register allocation: {this}.");
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
 
-            var abi = MachineAbi.ClassifyValue(Type, StackKind, isReturn);
+            var abi = MachineAbi.ClassifyValue(Type, StackKind, isReturn, target);
             return RegisterAllocation.ValueLocationAt(position, abi);
         }
 
@@ -2138,12 +2153,12 @@ namespace Cnidaria.Cs
         }
 
         public RegisterValueLocation GetValueLocation(GenTree value, int position, bool isReturn = false)
-            => value.GetRegisterLocation(position, isReturn);
+            => value.GetRegisterLocation(position, Target, isReturn);
 
         public RegisterValueLocation GetValueLocationAtDefinition(GenTree value, bool isReturn = false)
         {
             if (isReturn)
-                return value.GetRegisterLocation(value.RegisterAllocation?.DefinitionPosition ?? 0, isReturn: true);
+                return value.GetRegisterLocation(value.RegisterAllocation?.DefinitionPosition ?? 0, Target, isReturn: true);
             if (value.RegisterAllocation is null)
                 throw new InvalidOperationException($"No LSRA home is attached to GenTree value {value}.");
             return value.RegisterLocationAtDefinition;

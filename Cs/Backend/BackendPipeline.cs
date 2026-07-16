@@ -1,8 +1,10 @@
 ﻿using Cnidaria.C;
+using Cnidaria.RiscV;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Linq;
 
 namespace Cnidaria.Cs
 {
@@ -29,7 +31,7 @@ namespace Cnidaria.Cs
         public PhysicalPromotionOptions PhysicalPromotionOptions { get; set; } = PhysicalPromotionOptions.Default;
         public SsaOptimizationOptions SsaOptimizationOptions { get; set; } = SsaOptimizationOptions.DefaultWithoutValidation;
         public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
-        public RegisterAllocatorOptions RegisterAllocatorOptions { get; set; } = RegisterAllocatorOptions.Default;
+        public RegisterAllocatorOptions? RegisterAllocatorOptions { get; set; }
         public CodeGeneratorOptions CodeGeneratorOptions { get; set; } = CodeGeneratorOptions.Default;
         public TargetInfo? Target { get; set; }
     }
@@ -89,7 +91,10 @@ namespace Cnidaria.Cs
 
             options ??= BackendOptions.Default;
             var swCompile = Stopwatch.StartNew();
-            var lowered = GenTreeBackendPipeline.RunProgram(program, options);
+            var lowered = GenTreeBackendPipeline.RunProgram(
+                program,
+                options,
+                nonCallOperationsClobberCallerSavedRegisters: false);
             var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, program.Target);
             swCompile.Stop();
             return new BackendResult(
@@ -107,7 +112,10 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(method));
 
             options ??= BackendOptions.Default;
-            var lowered = GenTreeBackendPipeline.RunMethod(method, options);
+            var lowered = GenTreeBackendPipeline.RunMethod(
+                method,
+                options,
+                nonCallOperationsClobberCallerSavedRegisters: false);
             var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, method.Target);
             return new BackendResult(
                 lowered.HirProgram,
@@ -117,10 +125,51 @@ namespace Cnidaria.Cs
                 lowered.RegisterAllocatedProgram,
                 image);
         }
+
+        public static RiscVProgram CompileRiscVProgram(
+            GenTreeProgram program,
+            BackendOptions? options = null,
+            RiscVCodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (program is null)
+                throw new ArgumentNullException(nameof(program));
+
+            options ??= BackendOptions.Default;
+            var lowered = GenTreeBackendPipeline.RunProgram(
+                program,
+                options,
+                nonCallOperationsClobberCallerSavedRegisters: true);
+            return RiscVCodeGenerator.Build(
+                lowered.RegisterAllocatedProgram,
+                codeGeneratorOptions,
+                lowered.RegisterAllocatedProgram.Target);
+        }
+
+        public static RiscVProgram CompileRiscVMethod(
+            GenTreeMethod method,
+            BackendOptions? options = null,
+            RiscVCodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            options ??= BackendOptions.Default;
+            var lowered = GenTreeBackendPipeline.RunMethod(
+                method,
+                options,
+                nonCallOperationsClobberCallerSavedRegisters: true);
+            return RiscVCodeGenerator.Build(
+                lowered.RegisterAllocatedProgram,
+                codeGeneratorOptions,
+                lowered.RegisterAllocatedProgram.Target);
+        }
     }
     internal static class GenTreeBackendPipeline
     {
-        public static GenTreeBackendPipelineResult RunProgram(GenTreeProgram program, BackendOptions options)
+        public static GenTreeBackendPipelineResult RunProgram(
+            GenTreeProgram program,
+            BackendOptions options,
+            bool nonCallOperationsClobberCallerSavedRegisters)
         {
             if (program is null)
                 throw new ArgumentNullException(nameof(program));
@@ -135,7 +184,14 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < program.Methods.Length; i++)
             {
-                var method = CompileMethodThroughLsra(program.Methods[i], options, out var hir, out var ssa, out var rationalized, out var lowered);
+                var method = CompileMethodThroughLsra(
+                    program.Methods[i],
+                    options,
+                    nonCallOperationsClobberCallerSavedRegisters,
+                    out var hir,
+                    out var ssa,
+                    out var rationalized,
+                    out var lowered);
                 hirMethods.Add(hir);
                 if (ssa is not null)
                     ssaMethods!.Add(ssa);
@@ -152,14 +208,24 @@ namespace Cnidaria.Cs
                 new GenTreeProgram(program.TypeSystem, allocatedMethods.ToImmutable()));
         }
 
-        public static GenTreeBackendPipelineResult RunMethod(GenTreeMethod method, BackendOptions options)
+        public static GenTreeBackendPipelineResult RunMethod(
+            GenTreeMethod method,
+            BackendOptions options,
+            bool nonCallOperationsClobberCallerSavedRegisters)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
             if (options is null)
                 throw new ArgumentNullException(nameof(options));
 
-            var allocated = CompileMethodThroughLsra(method, options, out var hir, out var ssa, out var rationalized, out var lowered);
+            var allocated = CompileMethodThroughLsra(
+                method,
+                options,
+                nonCallOperationsClobberCallerSavedRegisters,
+                out var hir,
+                out var ssa,
+                out var rationalized,
+                out var lowered);
             return new GenTreeBackendPipelineResult(
                 new GenTreeProgram(ImmutableArray.Create(hir)),
                 ssa is null ? null : new SsaProgram(ImmutableArray.Create(ssa)),
@@ -171,6 +237,7 @@ namespace Cnidaria.Cs
         private static GenTreeMethod CompileMethodThroughLsra(
             GenTreeMethod importedMethod,
             BackendOptions options,
+            bool nonCallOperationsClobberCallerSavedRegisters,
             out GenTreeMethod hirMethod,
             out SsaMethod? ssaMethod,
             out GenTreeMethod rationalizedMethod,
@@ -204,7 +271,7 @@ namespace Cnidaria.Cs
                     SsaVerifier.Verify(ssaMethod);
             }
 
-            var lirOptions = CreateLirOptions(options);
+            var lirOptions = CreateLirOptions(options, nonCallOperationsClobberCallerSavedRegisters);
             rationalizedMethod = GenTreeLinearIrRationalizer.RationalizeMethod(hirMethod, ssaMethod, lirOptions);
             loweredMethod = GenTreeLinearLowerer.LowerMethod(rationalizedMethod, lirOptions);
             return LinearScanRegisterAllocator.AllocateMethod(loweredMethod, options.RegisterAllocatorOptions);
@@ -212,6 +279,9 @@ namespace Cnidaria.Cs
 
         private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
         {
+            if (method.Target.IsRiscV)
+                method = GenTreeClassInitializationEntryInserter.Insert(method);
+
             method = GenTreeMorpher.MorphMethod(method);
             method = GenTreeLocalRewriter.RewriteMethod(method);
 
@@ -244,6 +314,9 @@ namespace Cnidaria.Cs
                 if (promotion.Changed)
                     method = GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir);
             }
+
+            if (method.Target.IsRiscV)
+                method = GenTreeClassInitializationOptimizer.OptimizeMethod(method);
 
             var cfg = ControlFlowGraph.Build(method);
             method.AttachFlowGraph(cfg);
@@ -278,14 +351,167 @@ namespace Cnidaria.Cs
             return true;
         }
 
-        private static LinearRationalizationOptions CreateLirOptions(BackendOptions options)
+        private static LinearRationalizationOptions CreateLirOptions(
+            BackendOptions options,
+            bool nonCallOperationsClobberCallerSavedRegisters)
         {
             return new LinearRationalizationOptions
             {
                 Validate = options.RationalizationOptions.Validate,
+                NonCallOperationsClobberCallerSavedRegisters = nonCallOperationsClobberCallerSavedRegisters,
             };
         }
     }
+
+    internal static class GenTreeClassInitializationEntryInserter
+    {
+        public static GenTreeMethod Insert(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (!method.RuntimeMethod.RequiresClassInitializationEntryCheck || method.Blocks.IsDefaultOrEmpty)
+                return method;
+
+            RuntimeType type = method.RuntimeMethod.DeclaringType;
+            if (type.IsBeforeFieldInit || StringComparer.Ordinal.Equals(method.RuntimeMethod.Name, ".cctor"))
+                return method;
+
+            GenTreeBlock entry = method.Blocks[0];
+            if (!entry.Statements.IsDefaultOrEmpty &&
+                entry.Statements[0].Kind == GenTreeKind.ClassInit &&
+                ReferenceEquals(entry.Statements[0].RuntimeType, type))
+            {
+                return method;
+            }
+
+            int nextId = 0;
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var nodes = method.Blocks[b].LinearNodes;
+                for (int n = 0; n < nodes.Length; n++)
+                    nextId = Math.Max(nextId, checked(nodes[n].Id + 1));
+            }
+
+            var classInit = new GenTree(
+                nextId,
+                GenTreeKind.ClassInit,
+                entry.StartPc,
+                BytecodeOp.Nop,
+                type: null,
+                stackKind: GenStackKind.Void,
+                flags: GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered,
+                operands: ImmutableArray<GenTree>.Empty,
+                runtimeType: type);
+
+            var statements = ImmutableArray.CreateBuilder<GenTree>(entry.Statements.Length + 1);
+            statements.Add(classInit);
+            statements.AddRange(entry.Statements);
+
+            var blocks = method.Blocks.ToArray();
+            blocks[0] = new GenTreeBlock(
+                entry.Id,
+                entry.StartPc,
+                entry.EndPcExclusive,
+                entry.EntryStackDepth,
+                entry.ExitStackDepth,
+                entry.JumpKind,
+                entry.Flags,
+                statements.ToImmutable(),
+                entry.SuccessorBlockIds,
+                entry.SuccessorPcs);
+            return method.CloneWithBlocks(blocks.ToImmutableArray());
+        }
+    }
+
+    internal static class GenTreeClassInitializationOptimizer
+    {
+        public static GenTreeMethod OptimizeMethod(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (method.Function.ExceptionHandlers.Length != 0)
+                return method;
+
+            bool hasClassInit = false;
+            for (int b = 0; b < method.Blocks.Length && !hasClassInit; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                {
+                    if (statements[s].Kind == GenTreeKind.ClassInit)
+                    {
+                        hasClassInit = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasClassInit)
+                return method;
+
+            ControlFlowGraph cfg = ControlFlowGraph.Build(method);
+            var blocks = method.Blocks.ToArray();
+            bool changed = false;
+            var initial = new HashSet<int>();
+            RuntimeMethod runtimeMethod = method.RuntimeMethod;
+            RuntimeType declaringType = runtimeMethod.DeclaringType;
+            if (StringComparer.Ordinal.Equals(runtimeMethod.Name, ".cctor") ||
+                (!runtimeMethod.RequiresClassInitializationEntryCheck &&
+                 !declaringType.IsBeforeFieldInit &&
+                 (runtimeMethod.IsStatic || declaringType.IsValueType || StringComparer.Ordinal.Equals(runtimeMethod.Name, ".ctor"))))
+            {
+                initial.Add(declaringType.TypeId);
+            }
+
+            Visit(0, initial);
+            if (!changed)
+                return method;
+            return method.CloneWithBlocks(blocks.ToImmutableArray());
+
+            void Visit(int blockId, HashSet<int> inherited)
+            {
+                var current = new HashSet<int>(inherited);
+                GenTreeBlock block = method.Blocks[blockId];
+                var statements = block.Statements;
+                var rewritten = ImmutableArray.CreateBuilder<GenTree>(statements.Length);
+                bool blockChanged = false;
+
+                for (int i = 0; i < statements.Length; i++)
+                {
+                    GenTree statement = statements[i];
+                    if (statement.Kind == GenTreeKind.ClassInit && statement.RuntimeType is RuntimeType type)
+                    {
+                        if (!current.Add(type.TypeId))
+                        {
+                            blockChanged = true;
+                            continue;
+                        }
+                    }
+                    rewritten.Add(statement);
+                }
+
+                if (blockChanged)
+                {
+                    changed = true;
+                    blocks[blockId] = new GenTreeBlock(
+                        block.Id,
+                        block.StartPc,
+                        block.EndPcExclusive,
+                        block.EntryStackDepth,
+                        block.ExitStackDepth,
+                        block.JumpKind,
+                        block.Flags,
+                        rewritten.ToImmutable(),
+                        block.SuccessorBlockIds,
+                        block.SuccessorPcs);
+                }
+
+                var children = cfg.DominatorTreeChildren[blockId];
+                for (int i = 0; i < children.Length; i++)
+                    Visit(children[i], current);
+            }
+        }
+    }
+
     internal static class GenTreeMorpher
     {
         public static GenTreeMethod MorphMethod(GenTreeMethod method, GenTreeMethodPhase phase = GenTreeMethodPhase.MorphedHir)
@@ -325,6 +551,7 @@ namespace Cnidaria.Cs
 
             switch (node.Kind)
             {
+                case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:

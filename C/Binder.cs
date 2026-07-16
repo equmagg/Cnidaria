@@ -1631,7 +1631,7 @@ namespace Cnidaria.C
             if (tokens.IsDefaultOrEmpty)
                 return ErrorType;
 
-            SplitTypeNameTokens(tokens, out var specifierTokens, out var declaratorTokens);
+            SplitTypeNameTokens(tokens, scope, out var specifierTokens, out var declaratorTokens);
 
             if (specifierTokens.Length == 0)
                 return ErrorType;
@@ -1649,6 +1649,7 @@ namespace Cnidaria.C
 
         private static void SplitTypeNameTokens(
             ImmutableArray<SyntaxToken> tokens,
+            Scope scope,
             out ImmutableArray<SyntaxToken> specifierTokens,
             out ImmutableArray<SyntaxToken> declaratorTokens)
         {
@@ -1659,7 +1660,7 @@ namespace Cnidaria.C
             {
                 var token = tokens[index];
 
-                if (!IsTypeNameSpecifierToken(token.Kind))
+                if (!IsTypeNameSpecifierToken(token.Kind) && !IsTypedefNameToken(token, scope))
                     break;
 
                 specifiers.Add(token);
@@ -1742,7 +1743,11 @@ namespace Cnidaria.C
                 or SyntaxKind.TypeofUnqualKeyword
                 or SyntaxKind.TypeofExtensionKeyword;
         }
-
+        private static bool IsTypedefNameToken(SyntaxToken token, Scope scope)
+        {
+            return token.Kind == SyntaxKind.IdentifierToken &&
+                scope.LookupOrdinary(token.Text) is TypeAliasSymbol;
+        }
         private static bool IsTypeNameSpecifierToken(SyntaxKind kind)
         {
             switch (kind)
@@ -1924,15 +1929,54 @@ namespace Cnidaria.C
 
         private bool IsModifiableLValue(BoundExpression expression)
         {
-            if (expression.ValueKind != BoundValueKind.LValue)
+            expression = StripLValueTransparency(expression);
+            if (!IsLValueExpression(expression))
                 return false;
 
-            if (expression.Type.Qualifiers.HasFlag(TypeQualifiers.Const))
+            if (expression.Type.IsError)
                 return false;
 
-            return !expression.Type.IsError;
+            if (expression.Type.Type is ArrayType or FunctionType)
+                return false;
+
+            return !expression.Type.Qualifiers.HasFlag(TypeQualifiers.Const);
         }
 
+        private static BoundExpression StripLValueTransparency(BoundExpression expression)
+        {
+            while (true)
+            {
+                switch (expression)
+                {
+                    case BoundParenthesizedExpression parenthesized:
+                        expression = parenthesized.Expression;
+                        continue;
+                    case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
+                        expression = conversion.Expression;
+                        continue;
+                    default:
+                        return expression;
+                }
+            }
+        }
+
+        private static bool IsLValueExpression(BoundExpression expression)
+        {
+            if (expression.ValueKind == BoundValueKind.LValue)
+                return true;
+
+            switch (expression)
+            {
+                case BoundNameExpression ne when ne.Symbol is VariableSymbol or ParameterSymbol:
+                case BoundUnaryExpression ue when ue.OperatorToken.Kind == SyntaxKind.StarToken:
+                case BoundMemberAccessExpression ma when ma.Field != null:
+                case BoundElementAccessExpression:
+                case BoundCompoundLiteralExpression:
+                    return true;
+                default:
+                    return false;
+            }
+        }
         private bool IsScalarType(QualifiedType type)
             => IsArithmeticType(type) || IsPointerType(type);
         private static bool IsAggregateType(QualifiedType type)

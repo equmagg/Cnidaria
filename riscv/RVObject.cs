@@ -34,7 +34,7 @@ namespace Cnidaria.RiscV
         {
             var result = new Dictionary<string, RVLinkedSection>(StringComparer.Ordinal);
             var offset = 0;
-            AddSection(result, obj.Text.Instructions.Length * 4, ".text", RVObjectSectionKind.Text, 4, imageBase, ref offset);
+            AddSection(result, obj.Text.SizeInBytes, ".text", RVObjectSectionKind.Text, 4, imageBase, ref offset);
             foreach (var section in obj.DataSections)
             {
                 var size = section.Kind == RVObjectSectionKind.Bss ? section.BssSize : section.Data.Length;
@@ -75,7 +75,7 @@ namespace Cnidaria.RiscV
                 if (string.IsNullOrEmpty(symbol.SectionName))
                     continue;
                 if (!sections.TryGetValue(symbol.SectionName, out var section))
-                    throw new InvalidOperationException("Symbol section does not exist: " + symbol.SectionName);
+                    throw new InvalidOperationException($"Symbol section does not exist: {symbol.SectionName}");
                 result[symbol.Name] = checked(section.Address + (ulong)symbol.Offset);
             }
 
@@ -96,9 +96,9 @@ namespace Cnidaria.RiscV
         {
             var text = sections[".text"];
             var relocations = obj.Text.Relocations.ToDictionary(r => r.Offset, r => r);
+            var sectionOffset = 0;
             for (var i = 0; i < obj.Text.Instructions.Length; i++)
             {
-                var sectionOffset = checked(i * 4);
                 var instruction = obj.Text.Instructions[i];
                 if (relocations.TryGetValue(sectionOffset, out var relocation))
                     instruction = ResolveRelocatedInstruction(obj, instruction, relocation, sectionOffset, relocations, text.Address, symbols);
@@ -106,7 +106,9 @@ namespace Cnidaria.RiscV
                     instruction = ResolveSymbolicInstruction(instruction, checked(text.Address + (ulong)sectionOffset), symbols);
 
                 var encoded = RiscVCodeEncoder.Encode(instruction, obj.Target);
-                WriteUInt32(image, checked(text.Offset + sectionOffset), encoded, obj.Target.Endianness);
+                var size = RVInstructionTable.GetEncodedSize(instruction.Opcode);
+                RiscVCodeEncoder.WriteInstruction(image, checked(text.Offset + sectionOffset), encoded, size, obj.Target.Endianness);
+                sectionOffset = checked(sectionOffset + size);
             }
         }
 
@@ -134,7 +136,7 @@ namespace Cnidaria.RiscV
                 case RVObjectRelocationKind.PcrelLo12S:
                     return instruction.WithImmediate(PcrelLo12(value, FindPcrelHiPc(relocation, instructionOffset, textRelocations, textAddress)));
                 default:
-                    throw new NotSupportedException("Unsupported text relocation: " + relocation.Kind);
+                    throw new NotSupportedException($"Unsupported text relocation: {relocation.Kind}");
             }
         }
 
@@ -156,7 +158,7 @@ namespace Cnidaria.RiscV
                 case RVRelocationKind.AbsoluteLow12:
                     return instruction.WithImmediate(PcrelLo12((long)value, checked((long)pc - 4)));
                 default:
-                    throw new NotSupportedException("Unsupported symbolic instruction relocation: " + instruction.RelocationKind);
+                    throw new NotSupportedException($"Unsupported symbolic instruction relocation: {instruction.RelocationKind}");
             }
         }
 
@@ -222,7 +224,7 @@ namespace Cnidaria.RiscV
                             WriteAbsolute(image, offset, value, 8, obj.Target.Endianness);
                             break;
                         default:
-                            throw new NotSupportedException("Unsupported data relocation: " + relocation.Kind);
+                            throw new NotSupportedException($"Unsupported data relocation: {relocation.Kind}");
                     }
                 }
             }
@@ -244,7 +246,7 @@ namespace Cnidaria.RiscV
         {
             if (symbols.TryGetValue(symbol, out var address))
                 return address;
-            throw new InvalidOperationException("Unresolved RISC-V symbol: " + symbol);
+            throw new InvalidOperationException($"Unresolved symbol: {symbol}");
         }
 
         private static void WriteAbsolute(byte[] image, int offset, ulong value, int size, TargetEndianness endianness)
@@ -290,4 +292,334 @@ namespace Cnidaria.RiscV
             return remainder == 0 ? value : checked(value + alignment - remainder);
         }
     }
+
+    internal static class RiscVObjectComposer
+    {
+        public static RiscVProgram Compose(RiscVProgram primary, params RiscVProgram[] libraries)
+        {
+            if (primary is null)
+                throw new ArgumentNullException(nameof(primary));
+
+            libraries ??= Array.Empty<RiscVProgram>();
+            var inputs = new RiscVProgram[libraries.Length + 1];
+            inputs[0] = primary;
+            for (int i = 0; i < libraries.Length; i++)
+            {
+                inputs[i + 1] = libraries[i] ?? throw new ArgumentNullException(nameof(libraries));
+                ValidateTargetCompatibility(primary.Target, inputs[i + 1].Target);
+            }
+
+            var globalDefinitions = CollectGlobalDefinitions(inputs);
+            var renames = BuildLocalRenameMaps(inputs);
+            var textBases = new int[inputs.Length];
+            var instructions = ImmutableArray.CreateBuilder<RVInstruction>();
+            var labels = new Dictionary<string, int>(StringComparer.Ordinal);
+            var textRelocations = ImmutableArray.CreateBuilder<RVObjectRelocation>();
+
+            int textOffset = 0;
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                var input = inputs[i];
+                textBases[i] = textOffset;
+                for (int instructionIndex = 0; instructionIndex < input.Text.Instructions.Length; instructionIndex++)
+                {
+                    var instruction = input.Text.Instructions[instructionIndex];
+                    if (instruction.HasSymbol)
+                    {
+                        string symbol = Rename(renames[i], instruction.Symbol!);
+                        if (!StringComparer.Ordinal.Equals(symbol, instruction.Symbol))
+                            instruction = instruction.WithSymbol(symbol, instruction.RelocationKind);
+                    }
+                    instructions.Add(instruction);
+                }
+
+                foreach (var pair in input.Text.Labels)
+                {
+                    string name = Rename(renames[i], pair.Key);
+                    if (!labels.TryAdd(name, checked(textOffset + pair.Value)))
+                        throw new InvalidOperationException($"Duplicate composed text label: {name}");
+                }
+
+                for (int r = 0; r < input.Text.Relocations.Length; r++)
+                {
+                    var relocation = input.Text.Relocations[r];
+                    textRelocations.Add(new RVObjectRelocation(
+                        ".text",
+                        checked(textOffset + relocation.Offset),
+                        Rename(renames[i], relocation.SymbolName),
+                        relocation.Addend,
+                        relocation.Kind));
+                }
+
+                textOffset = checked(textOffset + input.Text.SizeInBytes);
+            }
+
+            var sectionBuilders = new Dictionary<string, ComposedSectionBuilder>(StringComparer.Ordinal);
+            var sectionOrder = new List<string>();
+            var sectionBases = new Dictionary<(int InputIndex, string SectionName), int>();
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                var input = inputs[i];
+                for (int s = 0; s < input.DataSections.Length; s++)
+                {
+                    var section = input.DataSections[s];
+                    if (!sectionBuilders.TryGetValue(section.Name, out var builder))
+                    {
+                        builder = new ComposedSectionBuilder(section.Name, section.Kind);
+                        sectionBuilders.Add(section.Name, builder);
+                        sectionOrder.Add(section.Name);
+                    }
+                    else if (builder.Kind != section.Kind)
+                    {
+                        throw new InvalidOperationException($"RISC-V sections with the same name have different kinds: {section.Name}");
+                    }
+
+                    int sectionBase = builder.Append(section, renames[i]);
+                    sectionBases.Add((i, section.Name), sectionBase);
+                }
+            }
+
+            var symbols = ImmutableArray.CreateBuilder<RVObjectSymbol>();
+            var emittedExternalSymbols = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < inputs.Length; i++)
+            {
+                var input = inputs[i];
+                for (int s = 0; s < input.Symbols.Length; s++)
+                {
+                    var symbol = input.Symbols[s];
+                    if (symbol.Kind == RVObjectSymbolKind.Section)
+                        continue;
+
+                    string name = Rename(renames[i], symbol.Name);
+                    if (symbol.Binding == RVObjectSymbolBinding.External)
+                    {
+                        if (!globalDefinitions.Contains(name) && emittedExternalSymbols.Add(name))
+                        {
+                            symbols.Add(new RVObjectSymbol(
+                                name,
+                                string.Empty,
+                                0,
+                                0,
+                                RVObjectSymbolBinding.External,
+                                symbol.Kind));
+                        }
+                        continue;
+                    }
+
+                    int offset;
+                    if (StringComparer.Ordinal.Equals(symbol.SectionName, ".text"))
+                    {
+                        offset = checked(textBases[i] + symbol.Offset);
+                    }
+                    else
+                    {
+                        if (!sectionBases.TryGetValue((i, symbol.SectionName), out int sectionBase))
+                            throw new InvalidOperationException($"Symbol section is missing from composed RISC-V object: {symbol.SectionName}");
+                        offset = checked(sectionBase + symbol.Offset);
+                    }
+
+                    symbols.Add(new RVObjectSymbol(
+                        name,
+                        symbol.SectionName,
+                        offset,
+                        symbol.Size,
+                        symbol.Binding,
+                        symbol.Kind));
+                }
+            }
+
+            symbols.Add(new RVObjectSymbol(
+                ".text",
+                ".text",
+                0,
+                textOffset,
+                RVObjectSymbolBinding.Local,
+                RVObjectSymbolKind.Section));
+
+            var dataSections = ImmutableArray.CreateBuilder<RVDataSection>(sectionOrder.Count);
+            for (int i = 0; i < sectionOrder.Count; i++)
+            {
+                var builder = sectionBuilders[sectionOrder[i]];
+                var section = builder.ToSection();
+                dataSections.Add(section);
+                symbols.Add(new RVObjectSymbol(
+                    section.Name,
+                    section.Name,
+                    0,
+                    section.Kind == RVObjectSectionKind.Bss ? section.BssSize : section.Data.Length,
+                    RVObjectSymbolBinding.Local,
+                    RVObjectSymbolKind.Section));
+            }
+
+            return new RiscVProgram(
+                primary.Target,
+                new RVTextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
+                dataSections.ToImmutable(),
+                symbols.ToImmutable(),
+                Rename(renames[0], primary.EntrySymbol));
+        }
+
+        private static HashSet<string> CollectGlobalDefinitions(IReadOnlyList<RiscVProgram> inputs)
+        {
+            var definitions = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                var symbols = inputs[i].Symbols;
+                for (int s = 0; s < symbols.Length; s++)
+                {
+                    var symbol = symbols[s];
+                    if (symbol.Binding != RVObjectSymbolBinding.Global ||
+                        symbol.Kind == RVObjectSymbolKind.Section ||
+                        string.IsNullOrEmpty(symbol.Name))
+                    {
+                        continue;
+                    }
+
+                    if (!definitions.Add(symbol.Name))
+                        throw new InvalidOperationException($"Duplicate global symbol: {symbol.Name}");
+                }
+            }
+            return definitions;
+        }
+
+        private static Dictionary<string, string>[] BuildLocalRenameMaps(IReadOnlyList<RiscVProgram> inputs)
+        {
+            var result = new Dictionary<string, string>[inputs.Count];
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                var input = inputs[i];
+                var globalNames = new HashSet<string>(
+                    input.Symbols
+                        .Where(static symbol => symbol.Binding == RVObjectSymbolBinding.Global && symbol.Kind != RVObjectSymbolKind.Section)
+                        .Select(static symbol => symbol.Name),
+                    StringComparer.Ordinal);
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                var usedNames = new HashSet<string>(StringComparer.Ordinal);
+                string prefix = $".Lobj{i}_";
+
+                void AddLocal(string name)
+                {
+                    if (map.ContainsKey(name))
+                        return;
+
+                    string baseName = prefix + SanitizeLocalName(name);
+                    string candidate = baseName;
+                    int suffix = 0;
+                    while (!usedNames.Add(candidate))
+                        candidate = baseName + "_" + (++suffix).ToString();
+                    map.Add(name, candidate);
+                }
+
+                foreach (var pair in input.Text.Labels)
+                {
+                    if (!globalNames.Contains(pair.Key))
+                        AddLocal(pair.Key);
+                }
+
+                for (int s = 0; s < input.Symbols.Length; s++)
+                {
+                    var symbol = input.Symbols[s];
+                    if (symbol.Binding == RVObjectSymbolBinding.Local && symbol.Kind != RVObjectSymbolKind.Section)
+                        AddLocal(symbol.Name);
+                }
+
+                result[i] = map;
+            }
+            return result;
+        }
+
+        private static string Rename(IReadOnlyDictionary<string, string> renames, string name)
+            => renames.TryGetValue(name, out var renamed) ? renamed : name;
+
+        private static string SanitizeLocalName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "symbol";
+
+            var chars = name.ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+            {
+                char c = chars[i];
+                if (!char.IsLetterOrDigit(c) && c is not '_' and not '$')
+                    chars[i] = '_';
+            }
+            return new string(chars);
+        }
+
+        private static void ValidateTargetCompatibility(RVTarget primary, RVTarget other)
+        {
+            if (primary.XLen != other.XLen ||
+                primary.Abi != other.Abi ||
+                primary.Isa != other.Isa ||
+                primary.Endianness != other.Endianness ||
+                primary.OperatingSystem != other.OperatingSystem)
+            {
+                throw new InvalidOperationException("Cannot compose ABI-incompatible RISC-V objects.");
+            }
+        }
+
+        private sealed class ComposedSectionBuilder
+        {
+            private readonly List<byte> _data = new List<byte>();
+            private readonly ImmutableArray<RVObjectRelocation>.Builder _relocations = ImmutableArray.CreateBuilder<RVObjectRelocation>();
+            private int _bssSize;
+
+            public string Name { get; }
+            public RVObjectSectionKind Kind { get; }
+            public int Alignment { get; private set; } = 1;
+
+            public ComposedSectionBuilder(string name, RVObjectSectionKind kind)
+            {
+                Name = name;
+                Kind = kind;
+            }
+
+            public int Append(RVDataSection section, IReadOnlyDictionary<string, string> renames)
+            {
+                Alignment = Math.Max(Alignment, section.Alignment);
+                int offset;
+                if (Kind == RVObjectSectionKind.Bss)
+                {
+                    offset = AlignUp(_bssSize, section.Alignment);
+                    _bssSize = checked(offset + section.BssSize);
+                }
+                else
+                {
+                    offset = AlignUp(_data.Count, section.Alignment);
+                    while (_data.Count < offset)
+                        _data.Add(0);
+                    _data.AddRange(section.Data);
+                }
+
+                for (int i = 0; i < section.Relocations.Length; i++)
+                {
+                    var relocation = section.Relocations[i];
+                    _relocations.Add(new RVObjectRelocation(
+                        Name,
+                        checked(offset + relocation.Offset),
+                        Rename(renames, relocation.SymbolName),
+                        relocation.Addend,
+                        relocation.Kind));
+                }
+
+                return offset;
+            }
+            private static int AlignUp(int value, int alignment)
+            {
+                if (alignment <= 1)
+                    return value;
+                var remainder = value % alignment;
+                return remainder == 0 ? value : checked(value + alignment - remainder);
+            }
+            public RVDataSection ToSection()
+                => new RVDataSection(
+                    Name,
+                    Kind,
+                    Alignment,
+                    _data.ToImmutableArray(),
+                    _bssSize,
+                    _relocations.ToImmutable());
+        }
+    }
+
 }

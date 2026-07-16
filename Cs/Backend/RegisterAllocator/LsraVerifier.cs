@@ -60,7 +60,7 @@ namespace Cnidaria.Cs
                     continue;
 
                 var info = method.GenTreeMethod.GetValueInfo(allocation.ValueKey);
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, method.GenTreeMethod.Target);
                 var location = allocation.ValueLocationAt(position, abi);
                 if (!location.IsEmpty)
                     state[allocation.ValueKey] = location;
@@ -82,7 +82,7 @@ namespace Cnidaria.Cs
                     continue;
 
                 var info = method.GenTreeMethod.GetValueInfo(allocation.ValueKey);
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, method.GenTreeMethod.Target);
                 var expected = allocation.ValueLocationAt(toStart, abi);
                 if (expected.IsEmpty)
                     continue;
@@ -142,7 +142,8 @@ namespace Cnidaria.Cs
             GenTreeBlock block,
             Dictionary<GenTreeValueKey, RegisterValueLocation> state)
         {
-            for (int i = 0; i < block.LinearNodes.Length; i++)
+            int firstBodyNode = GenTreeLirKinds.PrologPrefixLength(block.LinearNodes);
+            for (int i = firstBodyNode; i < block.LinearNodes.Length; i++)
             {
                 var node = block.LinearNodes[i];
                 if (IsMatchingEntryPhiCopy(edge, node))
@@ -184,7 +185,7 @@ namespace Cnidaria.Cs
                     continue;
 
                 var destinationInfo = method.GenTreeMethod.GetValueInfo(destinationKey);
-                var destinationAbi = MachineAbi.ClassifyStorageValue(destinationInfo.Type, destinationInfo.StackKind);
+                var destinationAbi = MachineAbi.ClassifyStorageValue(destinationInfo.Type, destinationInfo.StackKind, method.GenTreeMethod.Target);
                 state[destinationKey] = RetargetLocation(destination, destinationAbi, sourceLocation);
             }
         }
@@ -204,7 +205,7 @@ namespace Cnidaria.Cs
             if (TryGetAllocation(method, sourceKey, out var allocation))
             {
                 var info = method.GenTreeMethod.GetValueInfo(sourceKey);
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, method.GenTreeMethod.Target);
                 int position = layout.BlockEndPositions[edge.FromBlockId];
                 if (IsAllocationLiveAt(allocation, position))
                 {
@@ -324,14 +325,14 @@ namespace Cnidaria.Cs
                 return;
 
             var info = method.GenTreeMethod.GetValueInfo(value.LinearValueKey);
-            var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind);
+            var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, method.GenTreeMethod.Target);
             if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
             {
                 state[value.LinearValueKey] = new RegisterValueLocation(value, abi.PassingKind, operands[0]);
                 return;
             }
 
-            var segments = MachineAbi.GetRegisterSegments(abi);
+            var segments = MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target);
             if (operands.Length >= segments.Length)
             {
                 state[value.LinearValueKey] = new RegisterValueLocation(
@@ -374,7 +375,7 @@ namespace Cnidaria.Cs
             IReadOnlyDictionary<GenTreeValueKey, RegisterValueLocation> state)
         {
             var key = value.LinearValueKey;
-            var segments = MachineAbi.GetRegisterSegments(abi);
+            var segments = MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target);
             if (state.TryGetValue(key, out var current) && current.Count == segments.Length)
             {
                 var result = new List<RegisterOperand>(segments.Length);
@@ -826,16 +827,13 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Frame-code generated method has no blocks.");
 
             var entry = method.Blocks[0].LinearNodes;
-            int firstNonProlog = 0;
-            while (firstNonProlog < entry.Length && IsPrologFrameNode(entry[firstNonProlog]))
-                firstNonProlog++;
-
+            int firstNonProlog = GenTreeLirKinds.PrologPrefixLength(entry);
             if (firstNonProlog == 0)
                 throw new InvalidOperationException("Non-empty-frame method is missing an entry prolog.");
 
             for (int i = firstNonProlog; i < entry.Length; i++)
             {
-                if (IsPrologFrameNode(entry[i]))
+                if (entry[i].IsProlog)
                     throw new InvalidOperationException("Prolog nodes must be a contiguous prefix of the entry block.");
             }
 
@@ -884,7 +882,7 @@ namespace Cnidaria.Cs
         private static bool IsHiddenReturnBufferCopyReturn(RegisterAllocatedMethod method, GenTree node)
             => node.Kind == GenTreeKind.Return &&
                node.Uses.Length != 0 &&
-               MachineAbi.RequiresHiddenReturnBuffer(method.GenTreeMethod.RuntimeMethod);
+               MachineAbi.RequiresHiddenReturnBuffer(method.GenTreeMethod.RuntimeMethod, method.GenTreeMethod.Target);
 
         private static bool HasContiguousEpilogBefore(ImmutableArray<GenTree> nodes, int returnIndex)
         {
@@ -1013,7 +1011,7 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException("Callee-save prolog node must write a callee-saved frame slot.");
                     if (result.FrameBase != RegisterFrameBase.StackPointer)
                         throw new InvalidOperationException("Callee-save prolog node must write a stack-pointer-relative frame slot.");
-                    if (node.Uses.Length != 1 || !node.Uses[0].IsRegister || !MachineRegisters.IsCalleeSaved(node.Uses[0].Register))
+                    if (node.Uses.Length != 1 || !node.Uses[0].IsRegister || !RegisterInfo.IsCalleeSaved(method.GenTreeMethod.Target, node.Uses[0].Register))
                         throw new InvalidOperationException("Callee-save prolog node must read one callee-saved register.");
                     RequireImmediate(node, 0, "callee-save prolog immediate");
                     return;
@@ -1050,7 +1048,7 @@ namespace Cnidaria.Cs
 
                 case FrameOperation.RestoreCalleeSavedRegister:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    if (!result.IsRegister || !MachineRegisters.IsCalleeSaved(result.Register))
+                    if (!result.IsRegister || !RegisterInfo.IsCalleeSaved(method.GenTreeMethod.Target, result.Register))
                         throw new InvalidOperationException("Callee-save epilog node must write one callee-saved register.");
                     if (node.Uses.Length != 1
                         || !node.Uses[0].IsFrameSlot
@@ -1235,7 +1233,7 @@ namespace Cnidaria.Cs
                 var located = segments[i];
                 var segment = located.Segment;
                 var allocation = located.Allocation;
-                if (!MachineRegisters.IsCallerSaved(segment.Location.Register))
+                if (!RegisterInfo.IsCallerSaved(method.GenTreeMethod.Target, segment.Location.Register))
                     continue;
 
                 for (int c = 0; c < callPositions.Length; c++)
@@ -1381,7 +1379,7 @@ namespace Cnidaria.Cs
 
                 VerifyOperandStorage(method, operand, isUse: false);
 
-                if (i < node.RegisterResults.Length)
+                if (i < node.RegisterResults.Length && !IsAbiRepresentationMove(node))
                     VerifyOperandClass(method, operand, node.RegisterResults[i], "result");
             }
 
@@ -1393,15 +1391,21 @@ namespace Cnidaria.Cs
 
                 VerifyOperandStorage(method, operand, isUse: true);
 
-                if (i < node.RegisterUses.Length && node.UseRoles[i] != OperandRole.HiddenReturnBuffer)
+                if (i < node.RegisterUses.Length &&
+                    node.UseRoles[i] != OperandRole.HiddenReturnBuffer &&
+                    !IsAbiRepresentationMove(node) &&
+                    !(GenTreeLirKinds.IsRealTree(node) && IsCallLike(node.TreeKind)))
+                {
                     VerifyOperandClass(method, operand, node.RegisterUses[i], "use");
+                }
             }
 
 
             if (GenTreeLirKinds.IsCopyKind(node.Kind) &&
                 node.Results.Length == 1 && node.Uses.Length == 1 &&
                 node.Results[0].RegisterClass != node.Uses[0].RegisterClass &&
-                node.MoveKind != MoveKind.Register)
+                node.MoveKind != MoveKind.Register &&
+                !IsAbiRepresentationMove(node))
             {
                 throw new InvalidOperationException($"Move crosses register classes: {node.Uses[0]} -> {node.Results[0]}.");
             }
@@ -1441,7 +1445,7 @@ namespace Cnidaria.Cs
         private static bool IsBlockCopyValue(RegisterAllocatedMethod method, GenTree value)
         {
             var valueInfo = method.GenTreeMethod.GetValueInfo(value);
-            return MachineAbi.IsBlockCopyValue(valueInfo.Type, valueInfo.StackKind);
+            return MachineAbi.IsBlockCopyValue(valueInfo.Type, valueInfo.StackKind, method.GenTreeMethod.Target);
         }
 
         private static bool IsCallLike(GenTreeKind kind)
@@ -1460,8 +1464,8 @@ namespace Cnidaria.Cs
                 return false;
 
             var lowering = (new GenTreeLinearLoweringClassifier(target)).Classify(
-                node.Source, 
-                node.RegisterResults.Length == 1 ? node.RegisterResults[0] : null, node.RegisterUses, -1, 
+                node.Source,
+                node.RegisterResults.Length == 1 ? node.RegisterResults[0] : null, node.RegisterUses, -1,
                 GenTreeLinearLoweringClassifier.ClassifyMemoryAccess(node.Source, target));
 
             return lowering.HasFlag(GenTreeLinearFlags.RequiresRegisterOperands) &&
@@ -1488,6 +1492,9 @@ namespace Cnidaria.Cs
                 }
             }
         }
+
+        private static bool IsAbiRepresentationMove(GenTree node)
+            => GenTreeLirKinds.IsCopyKind(node.Kind) && (node.MoveFlags & MoveFlags.AbiArgument) != 0;
 
         private static void VerifyCallLikeAbiShape(RegisterAllocatedMethod method, GenTree node)
         {
@@ -1551,8 +1558,8 @@ namespace Cnidaria.Cs
                         {
                             var expectedReturn = RegisterOperand.ForRegister(
                                 abi.RegisterClass == RegisterClass.Float
-                                    ? MachineRegisters.FloatReturnValue0
-                                    : MachineRegisters.ReturnValue0);
+                                    ? RegisterInfo.GetFloatReturnRegister(method.GenTreeMethod.Target, 0)
+                                    : RegisterInfo.GetIntegerReturnRegister(method.GenTreeMethod.Target, 0));
 
                             if (!node.Results[0].Equals(expectedReturn))
                             {
@@ -1597,6 +1604,8 @@ namespace Cnidaria.Cs
             var explicitArguments = ImmutableArray.CreateBuilder<GenTree>();
             GenTree? hiddenReturnBufferValue = null;
 
+            int generalArgumentIndex = node.Kind == GenTreeKind.NewObject && node.Method?.HasThis == true ? 1 : 0;
+            int floatArgumentIndex = 0;
             int index = 0;
             while (index < node.RegisterUses.Length)
             {
@@ -1609,6 +1618,7 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException("Hidden return-buffer call-like node must not also expose a result value on the call node.");
 
                     hiddenReturnBufferValue = node.RegisterUses[index];
+                    generalArgumentIndex++;
                     index++;
                     continue;
                 }
@@ -1616,7 +1626,13 @@ namespace Cnidaria.Cs
                 if (role != OperandRole.Normal)
                     throw new InvalidOperationException("Call-like node has an unknown ABI operand role: " + role + ".");
 
-                AddCompressedExpandedCallArgument(method, node, explicitArguments, ref index);
+                AddCompressedExpandedCallArgument(
+                    method,
+                    node,
+                    explicitArguments,
+                    ref index,
+                    ref generalArgumentIndex,
+                    ref floatArgumentIndex);
             }
 
             return MachineAbi.BuildCallDescriptor(
@@ -1624,23 +1640,31 @@ namespace Cnidaria.Cs
                 method.GenTreeMethod.GetValueInfo,
                 hiddenReturnBufferValue ?? node.RegisterResult,
                 node.Method,
-                node.Kind == GenTreeKind.NewObject);
+                node.Kind == GenTreeKind.NewObject,
+                method.GenTreeMethod.Target);
         }
 
         private static void AddCompressedExpandedCallArgument(
             RegisterAllocatedMethod method,
             GenTree node,
             ImmutableArray<GenTree>.Builder explicitArguments,
-            ref int index)
+            ref int index,
+            ref int generalArgumentIndex,
+            ref int floatArgumentIndex)
         {
             if ((uint)index >= (uint)node.RegisterUses.Length)
                 throw new ArgumentOutOfRangeException(nameof(index));
 
             var value = node.RegisterUses[index];
             var info = method.GenTreeMethod.GetValueInfo(value);
-            var abi = MachineAbi.ClassifyValue(info.Type, info.StackKind, isReturn: false);
+            var abi = MachineAbi.ClassifyValue(info.Type, info.StackKind, isReturn: false, target: method.GenTreeMethod.Target);
+            abi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
+                abi,
+                generalArgumentIndex,
+                floatArgumentIndex,
+                method.GenTreeMethod.Target);
             int operandCount = abi.PassingKind == AbiValuePassingKind.MultiRegister
-                ? MachineAbi.GetRegisterSegments(abi).Length
+                ? MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target).Length
                 : 1;
 
             if (operandCount <= 0)
@@ -1667,6 +1691,25 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException(
                         $"Expanded ABI argument fragment {i} has wrong GenTree value metadata. " +
                         $"Actual: {node.RegisterUses[operandIndex]}, expected: {value}.");
+                }
+            }
+
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                if (abi.RegisterClass == RegisterClass.Float)
+                    floatArgumentIndex++;
+                else if (abi.RegisterClass == RegisterClass.General)
+                    generalArgumentIndex++;
+            }
+            else if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+            {
+                var segments = MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target);
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    if (segments[i].RegisterClass == RegisterClass.Float)
+                        floatArgumentIndex++;
+                    else if (segments[i].RegisterClass == RegisterClass.General)
+                        generalArgumentIndex++;
                 }
             }
 
@@ -1702,7 +1745,7 @@ namespace Cnidaria.Cs
             }
 
             var valueInfo = method.GenTreeMethod.GetValueInfo(value);
-            var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true);
+            var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true, target: method.GenTreeMethod.Target);
 
             if (abi.PassingKind is not (AbiValuePassingKind.ScalarRegister or AbiValuePassingKind.MultiRegister))
             {
@@ -1713,7 +1756,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            var expected = ExpectedReturnOperands(abi);
+            var expected = ExpectedReturnOperands(abi, method.GenTreeMethod.Target);
             if (node.Uses.Length != expected.Length)
                 throw new InvalidOperationException($"Return node ABI operand count mismatch. Actual: {node.Uses.Length}, expected: {expected.Length}.");
 
@@ -1728,47 +1771,39 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static ImmutableArray<RegisterOperand> ExpectedReturnOperands(AbiValueInfo abi)
+        private static ImmutableArray<RegisterOperand> ExpectedReturnOperands(AbiValueInfo abi, TargetInfo target)
         {
             if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 return ImmutableArray.Create(RegisterOperand.ForRegister(
-                    abi.RegisterClass == RegisterClass.Float ? MachineRegisters.FloatReturnValue0 : MachineRegisters.ReturnValue0));
+                    abi.RegisterClass == RegisterClass.Float
+                        ? RegisterInfo.GetFloatReturnRegister(target, 0)
+                        : RegisterInfo.GetIntegerReturnRegister(target, 0)));
 
             if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
             {
-                var segments = MachineAbi.GetRegisterSegments(abi);
+                var segments = MachineAbi.GetRegisterSegments(abi, target);
                 var result = ImmutableArray.CreateBuilder<RegisterOperand>(segments.Length);
                 int general = 0;
                 int floating = 0;
                 for (int i = 0; i < segments.Length; i++)
-                    result.Add(RegisterOperand.ForRegister(GetReturnRegisterForVerifier(segments[i].RegisterClass, ref general, ref floating)));
+                    result.Add(RegisterOperand.ForRegister(GetReturnRegisterForVerifier(target, segments[i].RegisterClass, ref general, ref floating)));
                 return result.ToImmutable();
             }
 
             return ImmutableArray<RegisterOperand>.Empty;
         }
 
-        private static MachineRegister GetReturnRegisterForVerifier(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+        private static MachineRegister GetReturnRegisterForVerifier(TargetInfo target, RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
         {
             if (registerClass == RegisterClass.Float)
             {
                 int index = floatIndex++;
-                return index switch
-                {
-                    0 => MachineRegisters.FloatReturnValue0,
-                    1 => MachineRegisters.FloatReturnValue1,
-                    _ => MachineRegister.Invalid,
-                };
+                return RegisterInfo.GetFloatReturnRegister(target, index);
             }
             if (registerClass == RegisterClass.General)
             {
                 int index = generalIndex++;
-                return index switch
-                {
-                    0 => MachineRegisters.ReturnValue0,
-                    1 => MachineRegisters.ReturnValue1,
-                    _ => MachineRegister.Invalid,
-                };
+                return RegisterInfo.GetIntegerReturnRegister(target, index);
             }
             return MachineRegister.Invalid;
         }
@@ -1850,10 +1885,10 @@ namespace Cnidaria.Cs
             if (operand.RegisterClass == expected)
                 return;
 
-            var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: false);
+            var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: false, target: method.GenTreeMethod.Target);
             if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
             {
-                var segments = MachineAbi.GetRegisterSegments(abi);
+                var segments = MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target);
                 for (int i = 0; i < segments.Length; i++)
                 {
                     if (segments[i].RegisterClass == operand.RegisterClass)
@@ -1861,10 +1896,10 @@ namespace Cnidaria.Cs
                 }
             }
 
-            var returnAbi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true);
+            var returnAbi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true, target: method.GenTreeMethod.Target);
             if (returnAbi.PassingKind == AbiValuePassingKind.MultiRegister)
             {
-                var segments = MachineAbi.GetRegisterSegments(returnAbi);
+                var segments = MachineAbi.GetRegisterSegments(returnAbi, method.GenTreeMethod.Target);
                 for (int i = 0; i < segments.Length; i++)
                 {
                     if (segments[i].RegisterClass == operand.RegisterClass)

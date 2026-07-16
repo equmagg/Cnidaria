@@ -46,7 +46,7 @@ namespace Cnidaria.Cs
             if (_refs.Length > 0)
             {
                 string stdName = _refs[0].ModuleName;
-                foreach (SpecialType st in Enum.GetValues(typeof(SpecialType)))
+                foreach (SpecialType st in Enum.GetValues<SpecialType>())
                 {
                     if (st == SpecialType.None) continue;
                     var t = core.GetSpecialType(st);
@@ -134,6 +134,8 @@ namespace Cnidaria.Cs
             => _types.GetByRefType(elementType);
         public ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank)
             => _types.GetArrayType(elementType, rank);
+        public ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank, bool isSZArray)
+            => _types.GetArrayType(elementType, rank, isSZArray);
         public NamedTypeSymbol ConstructNamedType(NamedTypeSymbol type, ImmutableArray<TypeSymbol> typeArguments)
             => _types.ConstructNamedType(type, typeArguments);
         public FieldSymbol AddExternalField(
@@ -407,7 +409,7 @@ namespace Cnidaria.Cs
         private readonly IMetadataView _md;
         internal MetadataCoreLibProvider(MetadataImage md)
         : this(new MetadataImageView(md))
-        {  }
+        { }
         internal MetadataCoreLibProvider(IMetadataView md)
             => _md = md ?? throw new ArgumentNullException(nameof(md));
         public void Populate(CoreLibraryBuilder core)
@@ -471,7 +473,7 @@ namespace Cnidaria.Cs
                         kind,
                         arity: arity,
                         declaredAccessibility: DecodeTypeAccessibility(td.Flags),
-                        isFromMetadata: true, 
+                        isFromMetadata: true,
                         isSealed: isSealed);
                 }
 
@@ -916,7 +918,7 @@ namespace Cnidaria.Cs
                 return a.SpecialType == b.SpecialType;
 
             if (a is ArrayTypeSymbol aa && b is ArrayTypeSymbol ab)
-                return aa.Rank == ab.Rank && AreEquivalentSignatureType(aa.ElementType, ab.ElementType);
+                return aa.Rank == ab.Rank && aa.IsSZArray == ab.IsSZArray && AreEquivalentSignatureType(aa.ElementType, ab.ElementType);
 
             if (a is PointerTypeSymbol pa && b is PointerTypeSymbol pb)
                 return AreEquivalentSignatureType(pa.PointedAtType, pb.PointedAtType);
@@ -1198,7 +1200,7 @@ namespace Cnidaria.Cs
                 return a.SpecialType == b.SpecialType;
 
             if (a is ArrayTypeSymbol aa && b is ArrayTypeSymbol ab)
-                return aa.Rank == ab.Rank && AreSameType(aa.ElementType, ab.ElementType);
+                return aa.Rank == ab.Rank && aa.IsSZArray == ab.IsSZArray && AreSameType(aa.ElementType, ab.ElementType);
 
             if (a is PointerTypeSymbol pa && b is PointerTypeSymbol pb)
                 return AreSameType(pa.PointedAtType, pb.PointedAtType);
@@ -1341,7 +1343,7 @@ namespace Cnidaria.Cs
             var fieldByRid = new Dictionary<int, FieldSymbol>();
             var constByParent = new Dictionary<int, ConstantRow>();
             for (int i = 0; i < _md.GetRowCount(MetadataTableKind.Constant); i++)
-                constByParent[_md.GetConstant(i+1).ParentToken] = _md.GetConstant(i+1);
+                constByParent[_md.GetConstant(i + 1).ParentToken] = _md.GetConstant(i + 1);
             for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.TypeDef); rid++)
             {
                 var declaringType = typeByRid[rid];
@@ -1381,12 +1383,12 @@ namespace Cnidaria.Cs
                             cval = DecodeConstant(ftype, crow);
                     }
                     var field = core.AddExternalField(
-                        declaringType, 
-                        fname, 
-                        ftype, 
-                        isStatic, 
+                        declaringType,
+                        fname,
+                        ftype,
+                        isStatic,
                         isConst,
-                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags), 
+                        declaredAccessibility: DecodeFieldAccessibility(frow.Flags),
                         cval);
 
                     fieldByRid[frid] = field;
@@ -1776,7 +1778,7 @@ namespace Cnidaria.Cs
                     => core.CreateByRefType(ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters)),
 
                 SigElementType.SZARRAY
-                    => core.CreateArrayType(ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters), rank: 1),
+                    => core.CreateArrayType(ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters), rank: 1, isSZArray: true),
 
                 SigElementType.ARRAY
                 => ReadMdArray(core, typeByRid, ref reader, declaringType, methodTypeParameters),
@@ -1853,20 +1855,20 @@ namespace Cnidaria.Cs
             var elem = ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
 
             uint rank = reader.ReadCompressedUInt();
-            uint numSizes = reader.ReadCompressedUInt(); 
-            for (int i = 0; i < numSizes; i++) 
+            uint numSizes = reader.ReadCompressedUInt();
+            for (int i = 0; i < numSizes; i++)
                 _ = reader.ReadCompressedUInt();
 
             uint numLoBounds = reader.ReadCompressedUInt();
-            for (int i = 0; i < numLoBounds; i++) 
+            for (int i = 0; i < numLoBounds; i++)
                 _ = reader.ReadCompressedUInt();
             if (rank == 0)
                 return new ErrorTypeSymbol("array-rank-0", containing: null, locations: ImmutableArray<Location>.Empty);
-            return core.CreateArrayType(elem, checked((int)rank));
+            return core.CreateArrayType(elem, checked((int)rank), isSZArray: false);
         }
         private TypeSymbol ResolveTypeDefOrRef(
-            uint encoded, 
-            NamedTypeSymbol[] typeByRid, 
+            uint encoded,
+            NamedTypeSymbol[] typeByRid,
             CoreLibraryBuilder core,
             NamedTypeSymbol? declaringType,
             ImmutableArray<TypeParameterSymbol> methodTypeParameters)

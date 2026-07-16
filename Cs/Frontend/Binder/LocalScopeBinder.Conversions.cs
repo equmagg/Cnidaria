@@ -164,6 +164,7 @@ namespace Cnidaria.Cs
             {
                 case (ArrayTypeSymbol aa, ArrayTypeSymbol bb):
                     return aa.Rank == bb.Rank &&
+                           aa.IsSZArray == bb.IsSZArray &&
                            AreSameType(aa.ElementType, bb.ElementType);
 
                 case (PointerTypeSymbol aa, PointerTypeSymbol bb):
@@ -488,7 +489,7 @@ namespace Cnidaria.Cs
 
                 return TryToDecimal(expr.ConstantValueOpt.Value, out var d) && d == 0m;
             }
-            
+
             (decimal min, decimal max, bool ok) GetIntegralRange(SpecialType t) => t switch
             {
                 SpecialType.System_Int8 => (sbyte.MinValue, sbyte.MaxValue, true),
@@ -705,7 +706,7 @@ namespace Cnidaria.Cs
             // Array covariance
             if (source is ArrayTypeSymbol srcArr && destination is ArrayTypeSymbol dstArr)
             {
-                if (srcArr.Rank != dstArr.Rank)
+                if (srcArr.Rank != dstArr.Rank || srcArr.IsSZArray != dstArr.IsSZArray)
                     return false;
 
                 if (!srcArr.ElementType.IsReferenceType || !dstArr.ElementType.IsReferenceType)
@@ -753,7 +754,7 @@ namespace Cnidaria.Cs
             // Array covariance
             if (source is ArrayTypeSymbol srcArr && destination is ArrayTypeSymbol dstArr)
             {
-                if (srcArr.Rank != dstArr.Rank)
+                if (srcArr.Rank != dstArr.Rank || srcArr.IsSZArray != dstArr.IsSZArray)
                     return false;
 
                 if (!srcArr.ElementType.IsReferenceType || !dstArr.ElementType.IsReferenceType)

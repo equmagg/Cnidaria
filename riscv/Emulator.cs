@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -118,7 +119,7 @@ namespace Cnidaria.RiscV
     [InlineArray(32)]
     internal struct VectorRegisterArray
     {
-        private Vector256<ulong> _element;
+        private Vector512<ulong> _element;
     }
     public sealed class RiscVEmulator
     {
@@ -151,8 +152,8 @@ namespace Cnidaria.RiscV
         private const ulong MstatusSxlMask = 3UL << 34;
         private const ulong SstatusMask = MstatusSie | MstatusSpie | MstatusSpp | MstatusVsMask | MstatusFsMask | MstatusXsMask | MstatusSum | MstatusMxr | MstatusUxlMask;
         private const int VectorRegisterCount = 32;
-        private const int VectorRegisterBytes = 32;
-        private const int VectorLengthBits = 256;
+        private const int VectorRegisterBytes = 64;
+        private const int VectorLengthBits = 512;
         private const int VectorLengthBytes = VectorLengthBits / 8;
         private const int VectorElementLengthBits = 64;
         private const ulong VectorTypeIllegal = 1UL << 63;
@@ -165,6 +166,10 @@ namespace Cnidaria.RiscV
         private const ulong SupervisorSoftwareInterrupt = 1;
         private const ulong MachineExternalInterrupt = 11;
         private const ulong SupervisorExternalInterrupt = 9;
+        private const uint OpcodeMask = 0b0000000_00000_00000_000_00000_1111111U;
+        private const uint Funct3Mask = 0b0000000_00000_00000_111_00000_0000000U;
+        private const uint Funct6Mask = 0b1111110_00000_00000_000_00000_0000000U;
+        private const uint Funct7Mask = 0b1111111_00000_00000_000_00000_0000000U;
 
         private RegisterArray _x;
         private RegisterArray _f;
@@ -200,6 +205,10 @@ namespace Cnidaria.RiscV
         private ulong _vxrm;
         private ulong _vl;
         private ulong _vtype;
+        private int _vsewBytes;
+        private int _vgroupBytes;
+        private int _vgroupRegisters;
+        private int _vvlmax;
         private ulong _mstatus;
         private ulong _medeleg;
         private ulong _mideleg;
@@ -242,7 +251,7 @@ namespace Cnidaria.RiscV
         public ulong HartId => _hartId;
         public ReadOnlySpan<ulong> IntegerRegisters => _x;
         public ReadOnlySpan<ulong> FloatingPointRegisters => _f;
-        public ReadOnlySpan<Vector256<ulong>> VectorRegisters => _v;
+        public ReadOnlySpan<Vector512<ulong>> VectorRegisters => _v;
         public ulong VectorLength => _vl;
         public ulong VectorType => _vtype;
 
@@ -291,7 +300,7 @@ namespace Cnidaria.RiscV
             spanX.Clear();
             Span<ulong> spanF = _f;
             spanF.Clear();
-            Span<Vector256<ulong>> spanV = _v;
+            Span<Vector512<ulong>> spanV = _v;
             spanV.Clear();
             Array.Clear(_ram, 0, _ram.Length);
             _pc = _resetVector;
@@ -429,17 +438,17 @@ namespace Cnidaria.RiscV
                 trapCause = (ulong)RVTrapCause.IllegalInstruction;
                 trapValue = instruction;
 
-                switch (instruction & 0x7F)
+                switch (instruction & OpcodeMask)
                 {
-                    case 0x37:
+                    case 0x37: // LUI
                         if (rd != 0) _x[rd] = (ulong)(long)ImmU(instruction);
                         break;
 
-                    case 0x17:
+                    case 0x17: // AUIPC
                         if (rd != 0) _x[rd] = pc + (ulong)(long)ImmU(instruction);
                         break;
 
-                    case 0x6F:
+                    case 0x6F: // JAL
                         {
                             ulong target = pc + (ulong)ImmJ(instruction);
                             if ((target & 3) != 0)
@@ -454,7 +463,7 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x67:
+                    case 0x67: // JALR
                         {
                             if ((int)((instruction >> 12) & 7) != 0)
                             {
@@ -474,19 +483,19 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x63:
+                    case 0x63: // BRANCH
                         {
                             bool take;
                             ulong a = _x[(int)((instruction >> 15) & 31)];
                             ulong b = _x[(int)((instruction >> 20) & 31)];
-                            switch ((int)((instruction >> 12) & 7))
+                            switch (instruction & Funct3Mask)
                             {
-                                case 0: take = a == b; break;
-                                case 1: take = a != b; break;
-                                case 4: take = (long)a < (long)b; break;
-                                case 5: take = (long)a >= (long)b; break;
-                                case 6: take = a < b; break;
-                                case 7: take = a >= b; break;
+                                case 0x0000U: take = a == b; break;
+                                case 0x1000U: take = a != b; break;
+                                case 0x4000U: take = (long)a < (long)b; break;
+                                case 0x5000U: take = (long)a >= (long)b; break;
+                                case 0x6000U: take = a < b; break;
+                                case 0x7000U: take = a >= b; break;
                                 default: trapped = true; take = false; break;
                             }
                             if (trapped || !take)
@@ -503,19 +512,19 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x03:
+                    case 0x03: // LOAD
                         {
                             int size;
                             bool unsignedLoad = false;
-                            switch ((int)((instruction >> 12) & 7))
+                            switch (instruction & Funct3Mask)
                             {
-                                case 0: size = 1; break;
-                                case 1: size = 2; break;
-                                case 2: size = 4; break;
-                                case 3: size = 8; break;
-                                case 4: size = 1; unsignedLoad = true; break;
-                                case 5: size = 2; unsignedLoad = true; break;
-                                case 6: size = 4; unsignedLoad = true; break;
+                                case 0x0000U: size = 1; break;
+                                case 0x1000U: size = 2; break;
+                                case 0x2000U: size = 4; break;
+                                case 0x3000U: size = 8; break;
+                                case 0x4000U: size = 1; unsignedLoad = true; break;
+                                case 0x5000U: size = 2; unsignedLoad = true; break;
+                                case 0x6000U: size = 4; unsignedLoad = true; break;
                                 default: trapped = true; size = 0; break;
                             }
                             if (trapped)
@@ -543,15 +552,15 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x23:
+                    case 0x23: // STORE
                         {
                             int size;
-                            switch ((int)((instruction >> 12) & 7))
+                            switch (instruction & Funct3Mask)
                             {
-                                case 0: size = 1; break;
-                                case 1: size = 2; break;
-                                case 2: size = 4; break;
-                                case 3: size = 8; break;
+                                case 0x0000U: size = 1; break;
+                                case 0x1000U: size = 2; break;
+                                case 0x2000U: size = 4; break;
+                                case 0x3000U: size = 8; break;
                                 default: trapped = true; size = 0; break;
                             }
                             if (trapped)
@@ -569,23 +578,28 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x13:
+                    case 0x13: // IMM
                         {
-                            long imm = ImmI(instruction);
                             ulong a = _x[(int)((instruction >> 15) & 31)];
-                            switch ((int)((instruction >> 12) & 7))
+                            if (TryExecuteBitmanipImmediate(instruction, a, out ulong bitmanipValue))
                             {
-                                case 0: if (rd != 0) _x[rd] = a + (ulong)imm; break;
-                                case 2: if (rd != 0) _x[rd] = (long)a < imm ? 1UL : 0UL; break;
-                                case 3: if (rd != 0) _x[rd] = a < (ulong)imm ? 1UL : 0UL; break;
-                                case 4: if (rd != 0) _x[rd] = a ^ (ulong)imm; break;
-                                case 6: if (rd != 0) _x[rd] = a | (ulong)imm; break;
-                                case 7: if (rd != 0) _x[rd] = a & (ulong)imm; break;
-                                case 1:
+                                _x[rd] = bitmanipValue;
+                                break;
+                            }
+
+                            long imm = ImmI(instruction);
+                            switch (instruction & Funct3Mask)
+                            {
+                                case 0x0000U: _x[rd] = a + (ulong)imm; break;
+                                case 0x2000U: _x[rd] = (long)a < imm ? 1UL : 0UL; break;
+                                case 0x3000U: _x[rd] = a < (ulong)imm ? 1UL : 0UL; break;
+                                case 0x4000U: _x[rd] = a ^ (ulong)imm; break;
+                                case 0x6000U: _x[rd] = a | (ulong)imm; break;
+                                case 0x7000U: _x[rd] = a & (ulong)imm; break;
+                                case 0x1000U:
                                     {
-                                        int funct6 = (int)((instruction >> 26) & 0x3F);
                                         int shamt = (int)((instruction >> 20) & 0x3F);
-                                        if (funct6 != 0)
+                                        if ((instruction & Funct6Mask) != 0)
                                         {
                                             trapped = true;
                                             break;
@@ -595,17 +609,17 @@ namespace Cnidaria.RiscV
                                             _x[rd] = a << shamt;
                                         break;
                                     }
-                                case 5:
+                                case 0x5000U:
                                     {
-                                        int funct6 = (int)((instruction >> 26) & 0x3F);
+                                        uint funct6 = instruction & Funct6Mask;
                                         int shamt = (int)((instruction >> 20) & 0x3F);
 
-                                        if (funct6 == 0x00)
+                                        if (funct6 == 0x00000000U)
                                         {
                                             if (rd != 0)
                                                 _x[rd] = a >> shamt;
                                         }
-                                        else if (funct6 == 0x10)
+                                        else if (funct6 == 0x40000000U)
                                         {
                                             if (rd != 0)
                                                 _x[rd] = (ulong)((long)a >> shamt);
@@ -624,21 +638,51 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x1B:
+                    case 0x1B: //IMM32
                         {
-                            int shamt = (int)((instruction >> 20) & 31);
-                            int funct7 = (int)((instruction >> 25) & 127);
                             int rs1 = (int)((instruction >> 15) & 31);
-                            switch ((int)((instruction >> 12) & 7))
+                            uint funct3 = instruction & Funct3Mask;
+
+                            if (funct3 == 0x1000U)
                             {
-                                case 0: if (rd != 0) _x[rd] = SignExtend32((uint)((int)_x[rs1] + (int)ImmI(instruction))); break;
-                                case 1:
-                                    if (funct7 != 0) { trapped = true; break; }
-                                    if (rd != 0) _x[rd] = SignExtend32((uint)_x[rs1] << shamt);
+                                int immediate = (int)((instruction >> 20) & 0xFFFU);
+                                if (immediate == 0x600)
+                                {
+                                    _x[rd] = (ulong)System.Numerics.BitOperations.LeadingZeroCount((uint)_x[rs1]); break;
+                                }
+                                else if (immediate == 0x601)
+                                {
+                                    _x[rd] = (ulong)System.Numerics.BitOperations.TrailingZeroCount((uint)_x[rs1]); break;
+                                }
+                                else if (immediate == 0x602)
+                                {
+                                    _x[rd] = (ulong)System.Numerics.BitOperations.PopCount((uint)_x[rs1]); break;
+                                }
+                                else if ((instruction & Funct6Mask) == 0x08000000U)
+                                {
+                                    _x[rd] = (ulong)(uint)_x[rs1] << (int)((instruction >> 20) & 63);
                                     break;
-                                case 5:
-                                    if (funct7 == 0) { if (rd != 0) _x[rd] = SignExtend32((uint)_x[rs1] >> shamt); }
-                                    else if (funct7 == 0x20) { if (rd != 0) _x[rd] = SignExtend32((uint)((int)_x[rs1] >> shamt)); }
+                                }
+                            }
+                            else if (funct3 == 0x5000U && (instruction & Funct7Mask) == 0x60000000U)
+                            {
+                                uint value = System.Numerics.BitOperations.RotateRight((uint)_x[rs1], (int)((instruction >> 20) & 31));
+                                _x[rd] = SignExtend32(value);
+                                break;
+                            }
+
+                            int shamt = (int)((instruction >> 20) & 31);
+                            uint funct7 = instruction & Funct7Mask;
+                            switch (instruction & Funct3Mask)
+                            {
+                                case 0x0000U: _x[rd] = SignExtend32((uint)((int)_x[rs1] + (int)ImmI(instruction))); break;
+                                case 0x1000U:
+                                    if (funct7 != 0) { trapped = true; break; }
+                                    _x[rd] = SignExtend32((uint)_x[rs1] << shamt);
+                                    break;
+                                case 0x5000U:
+                                    if (funct7 == 0) { _x[rd] = SignExtend32((uint)_x[rs1] >> shamt); }
+                                    else if (funct7 == 0x40000000U) { _x[rd] = SignExtend32((uint)((int)_x[rs1] >> shamt)); }
                                     else trapped = true;
                                     break;
                                 default:
@@ -648,48 +692,145 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x33:
+                    case 0x33: // OP
                         {
                             ulong a = _x[(int)((instruction >> 15) & 31)];
                             ulong b = _x[(int)((instruction >> 20) & 31)];
+                            if (TryExecuteBitmanipRegister(instruction, a, b, out ulong bitmanipValue))
+                            {
+                                _x[rd] = bitmanipValue;
+                                break;
+                            }
+
                             ulong value;
-                            int funct7 = (int)((instruction >> 25) & 127);
-                            if (funct7 == 0x00)
+                            uint funct7 = instruction & Funct7Mask;
+                            if (funct7 == 0x00000000U)
                             {
-                                switch ((int)((instruction >> 12) & 7))
+                                switch (instruction & Funct3Mask)
                                 {
-                                    case 0: value = a + b; break;
-                                    case 1: value = a << (int)(b & 63); break;
-                                    case 2: value = (long)a < (long)b ? 1UL : 0UL; break;
-                                    case 3: value = a < b ? 1UL : 0UL; break;
-                                    case 4: value = a ^ b; break;
-                                    case 5: value = a >> (int)(b & 63); break;
-                                    case 6: value = a | b; break;
-                                    case 7: value = a & b; break;
+                                    case 0x0000U: value = a + b; break;
+                                    case 0x1000U: value = a << (int)(b & 63); break;
+                                    case 0x2000U: value = (long)a < (long)b ? 1UL : 0UL; break;
+                                    case 0x3000U: value = a < b ? 1UL : 0UL; break;
+                                    case 0x4000U: value = a ^ b; break;
+                                    case 0x5000U: value = a >> (int)(b & 63); break;
+                                    case 0x6000U: value = a | b; break;
+                                    case 0x7000U: value = a & b; break;
                                     default: trapped = true; value = 0; break;
                                 }
                             }
-                            else if (funct7 == 0x20)
+                            else if (funct7 == 0x40000000U)
                             {
-                                switch ((int)((instruction >> 12) & 7))
+                                switch (instruction & Funct3Mask)
                                 {
-                                    case 0: value = a - b; break;
-                                    case 5: value = (ulong)((long)a >> (int)(b & 63)); break;
+                                    case 0x0000U: value = a - b; break;
+                                    case 0x5000U: value = (ulong)((long)a >> (int)(b & 63)); break;
                                     default: trapped = true; value = 0; break;
                                 }
                             }
-                            else if (funct7 == 0x01)
+                            else if (funct7 == 0x02000000U)
                             {
-                                switch ((int)((instruction >> 12) & 7))
+                                switch (instruction & Funct3Mask)
                                 {
-                                    case 0: value = a * b; break;
-                                    case 1: value = Mulh((long)a, (long)b); break;
-                                    case 2: value = Mulhsu((long)a, b); break;
-                                    case 3: value = Mulhu(a, b); break;
-                                    case 4: value = Div(a, b); break;
-                                    case 5: value = b == 0 ? ulong.MaxValue : a / b; break;
-                                    case 6: value = Rem(a, b); break;
-                                    case 7: value = b == 0 ? a : a % b; break;
+                                    case 0x0000U: value = a * b; break;
+                                    case 0x1000U: value = Mulh((long)a, (long)b); break;
+                                    case 0x2000U: value = Mulhsu((long)a, b); break;
+                                    case 0x3000U: value = Mulhu(a, b); break;
+                                    case 0x4000U: value = Div(a, b); break;
+                                    case 0x5000U: value = b == 0 ? ulong.MaxValue : a / b; break;
+                                    case 0x6000U: value = Rem(a, b); break;
+                                    case 0x7000U: value = b == 0 ? a : a % b; break;
+                                    default: trapped = true; value = 0; break;
+                                }
+                            }
+                            else
+                            {
+                                trapped = true;
+                                value = 0;
+                            }
+                            if (!trapped) _x[rd] = value;
+                            break;
+                        }
+
+                    case 0x3B: // OP32
+                        {
+                            ulong a = _x[(int)((instruction >> 15) & 31)];
+                            ulong b = _x[(int)((instruction >> 20) & 31)];
+
+                            uint funct7 = instruction & Funct7Mask;
+
+                            if (funct7 == 0x08000000U)
+                            {
+                                uint funct3 = instruction & Funct3Mask;
+                                if (funct3 == 0x0000U)
+                                {
+                                    _x[rd] = (uint)a + b;
+                                    break;
+                                }
+                                if (funct3 == 0x4000U && ((instruction >> 20) & 31) == 0)
+                                {
+                                    _x[rd] = (ushort)a;
+                                    break;
+                                }
+                            }
+                            else if (funct7 == 0x20000000U)
+                            {
+                                uint funct3 = instruction & Funct3Mask;
+                                if (funct3 == 0x2000U)
+                                {
+                                    _x[rd] = ((uint)a << 1) + b; break;
+                                }
+                                else if (funct3 == 0x4000U)
+                                {
+                                    _x[rd] = ((uint)a << 2) + b; break;
+                                }
+                                else if (funct3 == 0x6000U)
+                                {
+                                    _x[rd] = ((uint)a << 3) + b; break;
+                                }
+                            }
+                            else if (funct7 == 0x60000000U)
+                            {
+                                uint funct3 = instruction & Funct3Mask;
+                                if (funct3 == 0x1000U)
+                                {
+                                    _x[rd] = SignExtend32(System.Numerics.BitOperations.RotateLeft((uint)a, (int)(b & 31))); break;
+                                }
+                                else if (funct3 == 0x5000U)
+                                {
+                                    _x[rd] = SignExtend32(System.Numerics.BitOperations.RotateRight((uint)a, (int)(b & 31))); break;
+                                }
+                            }
+
+                            ulong value;
+                            if (funct7 == 0x00000000U)
+                            {
+                                switch (instruction & Funct3Mask)
+                                {
+                                    case 0x0000U: value = SignExtend32((uint)((int)a + (int)b)); break;
+                                    case 0x1000U: value = SignExtend32((uint)a << (int)(b & 31)); break;
+                                    case 0x5000U: value = SignExtend32((uint)a >> (int)(b & 31)); break;
+                                    default: trapped = true; value = 0; break;
+                                }
+                            }
+                            else if (funct7 == 0x40000000U)
+                            {
+                                switch (instruction & Funct3Mask)
+                                {
+                                    case 0x0000U: value = SignExtend32((uint)((int)a - (int)b)); break;
+                                    case 0x5000U: value = SignExtend32((uint)((int)a >> (int)(b & 31))); break;
+                                    default: trapped = true; value = 0; break;
+                                }
+                            }
+                            else if (funct7 == 0x02000000U)
+                            {
+                                switch (instruction & Funct3Mask)
+                                {
+                                    case 0x0000U: value = SignExtend32((uint)((int)a * (int)b)); break;
+                                    case 0x4000U: value = SignExtend32((uint)DivW((int)a, (int)b)); break;
+                                    case 0x5000U: value = SignExtend32((uint)b == 0 ? uint.MaxValue : (uint)a / (uint)b); break;
+                                    case 0x6000U: value = SignExtend32((uint)RemW((int)a, (int)b)); break;
+                                    case 0x7000U: value = SignExtend32((uint)b == 0 ? (uint)a : (uint)a % (uint)b); break;
                                     default: trapped = true; value = 0; break;
                                 }
                             }
@@ -702,73 +843,23 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x3B:
+                    case 0x0F: // MISC
                         {
-                            ulong a = _x[(int)((instruction >> 15) & 31)];
-                            ulong b = _x[(int)((instruction >> 20) & 31)];
-                            ulong value;
-                            int funct7 = (int)((instruction >> 25) & 127);
-                            if (funct7 == 0x00)
-                            {
-                                switch ((int)((instruction >> 12) & 7))
-                                {
-                                    case 0: value = SignExtend32((uint)((int)a + (int)b)); break;
-                                    case 1: value = SignExtend32((uint)a << (int)(b & 31)); break;
-                                    case 5: value = SignExtend32((uint)a >> (int)(b & 31)); break;
-                                    default: trapped = true; value = 0; break;
-                                }
-                            }
-                            else if (funct7 == 0x20)
-                            {
-                                switch ((int)((instruction >> 12) & 7))
-                                {
-                                    case 0: value = SignExtend32((uint)((int)a - (int)b)); break;
-                                    case 5: value = SignExtend32((uint)((int)a >> (int)(b & 31))); break;
-                                    default: trapped = true; value = 0; break;
-                                }
-                            }
-                            else if (funct7 == 0x01)
-                            {
-                                int ai = (int)a;
-                                int bi = (int)b;
-                                uint au = (uint)a;
-                                uint bu = (uint)b;
-                                switch ((int)((instruction >> 12) & 7))
-                                {
-                                    case 0: value = SignExtend32((uint)(ai * bi)); break;
-                                    case 4: value = SignExtend32((uint)DivW(ai, bi)); break;
-                                    case 5: value = SignExtend32(bu == 0 ? uint.MaxValue : au / bu); break;
-                                    case 6: value = SignExtend32((uint)RemW(ai, bi)); break;
-                                    case 7: value = SignExtend32(bu == 0 ? au : au % bu); break;
-                                    default: trapped = true; value = 0; break;
-                                }
-                            }
-                            else
-                            {
-                                trapped = true;
-                                value = 0;
-                            }
-                            if (!trapped && rd != 0) _x[rd] = value;
-                            break;
-                        }
-
-                    case 0x0F:
-                        {
-                            int funct3 = (int)((instruction >> 12) & 7);
-                            if (funct3 != 0 && funct3 != 1)
+                            uint funct3 = instruction & Funct3Mask;
+                            if (funct3 != 0x0000U && funct3 != 0x1000U)
                                 trapped = true;
                         }
                         break;
 
-                    case 0x73:
+                    case 0x73: // SYSTEM
                         {
-                            int funct3 = (int)((instruction >> 12) & 7);
+                            uint funct3 = instruction & Funct3Mask;
 
-                            if (funct3 == 0)
+                            if (funct3 == 0x0000U)
                             {
                                 switch (instruction)
                                 {
-                                    case 0x00000073:
+                                    case 0x00000073: // ECALL
                                         trapCause = _mode == RVPrivilegeMode.User
                                             ? (ulong)RVTrapCause.EnvironmentCallFromUMode
                                             : _mode == RVPrivilegeMode.Supervisor
@@ -777,12 +868,12 @@ namespace Cnidaria.RiscV
                                         trapValue = 0;
                                         trapped = true;
                                         goto outer_break;
-                                    case 0x00100073:
+                                    case 0x00100073: // EBREAK
                                         trapCause = (ulong)RVTrapCause.Breakpoint;
                                         trapValue = pc;
                                         trapped = true;
                                         goto outer_break;
-                                    case 0x10200073:
+                                    case 0x10200073: // SRET
                                         if (_mode < RVPrivilegeMode.Supervisor || (_mode == RVPrivilegeMode.Supervisor && (_mstatus & MstatusTsr) != 0))
                                         {
                                             trapped = true;
@@ -790,7 +881,7 @@ namespace Cnidaria.RiscV
                                         }
                                         ReturnFromSupervisorTrap(ref nextPc);
                                         goto outer_break;
-                                    case 0x30200073:
+                                    case 0x30200073: // MRET
                                         if (_mode != RVPrivilegeMode.Machine)
                                         {
                                             trapped = true;
@@ -798,7 +889,7 @@ namespace Cnidaria.RiscV
                                         }
                                         ReturnFromMachineTrap(ref nextPc);
                                         goto outer_break;
-                                    case 0x10500073:
+                                    case 0x10500073: // WFI
                                         if (_mode < RVPrivilegeMode.Machine && (_mstatus & MstatusTw) != 0)
                                         {
                                             trapped = true;
@@ -820,9 +911,10 @@ namespace Cnidaria.RiscV
 
                             int rs1 = (int)((instruction >> 15) & 31);
                             int csr = (int)(instruction >> 20);
-                            bool write = funct3 == 1 || funct3 == 5 || ((funct3 == 2 || funct3 == 3 || funct3 == 6 || funct3 == 7) && rs1 != 0);
+                            bool write = funct3 == 0x1000U || funct3 == 0x5000U ||
+                                ((funct3 == 0x2000U || funct3 == 0x3000U || funct3 == 0x6000U || funct3 == 0x7000U) && rs1 != 0);
                             ulong old;
-                            if ((funct3 == 1 || funct3 == 5) && rd == 0)
+                            if ((funct3 == 0x1000U || funct3 == 0x5000U) && rd == 0)
                             {
                                 old = 0;
                                 if (!CheckCsrAccess(csr, write))
@@ -845,27 +937,27 @@ namespace Cnidaria.RiscV
                                 }
                             }
 
-                            ulong src = funct3 >= 5 ? (ulong)rs1 : _x[rs1];
+                            ulong src = funct3 >= 0x5000U ? (ulong)rs1 : _x[rs1];
                             switch (funct3)
                             {
-                                case 1:
-                                case 5:
+                                case 0x1000U:
+                                case 0x5000U:
                                     if (!TryWriteCsr(csr, src, false))
                                     {
                                         trapped = true;
                                         goto outer_break;
                                     }
                                     break;
-                                case 2:
-                                case 6:
+                                case 0x2000U:
+                                case 0x6000U:
                                     if (rs1 != 0 && !TryWriteCsr(csr, old | src, false))
                                     {
                                         trapped = true;
                                         goto outer_break;
                                     }
                                     break;
-                                case 3:
-                                case 7:
+                                case 0x3000U:
+                                case 0x7000U:
                                     if (rs1 != 0 && !TryWriteCsr(csr, old & ~src, false))
                                     {
                                         trapped = true;
@@ -882,9 +974,9 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x57:
+                    case 0x57: // VECTOR
                         {
-                            int funct3 = (int)((instruction >> 12) & 7);
+                            int funct3 = (int)((instruction & Funct3Mask) >> 12);
                             if (funct3 == 7)
                             {
                                 int rs1 = (int)((instruction >> 15) & 31);
@@ -896,7 +988,7 @@ namespace Cnidaria.RiscV
                                     avl = (ulong)rs1;
                                     type = (instruction >> 20) & 0x3FFUL;
                                 }
-                                else if (((instruction >> 26) & 0x3FU) == 0x20)
+                                else if ((instruction & Funct6Mask) == 0x80000000U)
                                 {
                                     int rs2 = (int)((instruction >> 20) & 31);
                                     avl = rs1 == 0 && rd == 0 ? _vl : rs1 == 0 ? ulong.MaxValue : _x[rs1];
@@ -913,9 +1005,14 @@ namespace Cnidaria.RiscV
                                     break;
                                 }
 
-                                if (!TryDecodeVectorType(type, out _, out _, out _, out int vlmax))
+                                if (!TryDecodeVectorType(type, out int vsetSewBytes, out int vsetGroupBytes, out int vsetGroupRegisters, out int vsetVlmax))
                                 {
                                     _vtype = VectorTypeIllegal;
+                                    _vsewBytes = 0;
+                                    _vgroupBytes = 0;
+                                    _vgroupRegisters = 0;
+                                    _vvlmax = 0;
+
                                     _vl = 0;
                                     _vstart = 0;
                                     _x[rd] = _vl;
@@ -923,12 +1020,16 @@ namespace Cnidaria.RiscV
                                     break;
                                 }
                                 _vtype = type & 0xFFUL;
+                                _vsewBytes = vsetSewBytes;
+                                _vgroupBytes = vsetGroupBytes;
+                                _vgroupRegisters = vsetGroupRegisters;
+                                _vvlmax = vsetVlmax;
                                 if (avl == 0)
                                     _vl = 0;
-                                else if (avl <= (ulong)vlmax)
+                                else if (avl <= (ulong)vsetVlmax)
                                     _vl = avl;
                                 else
-                                    _vl = (ulong)vlmax;
+                                    _vl = (ulong)vsetVlmax;
                                 _vstart = 0;
                                 _x[rd] = _vl;
                                 _mstatus |= MstatusVsMask;
@@ -941,93 +1042,172 @@ namespace Cnidaria.RiscV
                                 break;
                             }
 
-                            if (funct3 == 1 || funct3 == 5)
+                            int sewBytes = _vsewBytes;
+                            int groupBytes = _vgroupBytes;
+                            int groupRegisters = _vgroupRegisters;
+                            int vlmax = _vvlmax;
+
+                            bool floatOperation = funct3 == 1 || funct3 == 5;
+                            if (floatOperation && sewBytes != 4 && sewBytes != 8)
                             {
                                 trapped = true;
                                 break;
                             }
 
-                            if (!TryDecodeVectorType(_vtype, out int sewBytes, out _, out int groupRegisters, out _))
+                            int funct6 = (int)((instruction >> 26) & 0x3F);
+                            bool narrowingShift = (funct6 == 44 || funct6 == 45) && (funct3 == 0 || funct3 == 4 || funct3 == 3);
+
+                            int source2Registers = groupRegisters;
+
+                            if (narrowingShift)
                             {
-                                trapped = true;
-                                break;
+                                if (sewBytes == 8 || !TryGetVectorGroupRegisters(groupBytes << 1, out source2Registers))
+                                {
+                                    trapped = true;
+                                    break;
+                                }
                             }
 
                             int vs2 = (int)((instruction >> 20) & 31);
+                            if (!CheckVectorGroup(vs2, source2Registers))
+                            {
+                                trapped = true;
+                                break;
+                            }
 
-                            if (!CheckVectorGroup(vs2, groupRegisters))
-                            {
-                                trapped = true;
-                                break;
-                            }
                             int source1 = (int)((instruction >> 15) & 31);
-                            if ((funct3 == 0 || funct3 == 2) && !CheckVectorGroup(source1, groupRegisters))
+                            bool vectorSource1 = funct3 == 0 || funct3 == 1 || funct3 == 2;
+
+                            if (vectorSource1 && !CheckVectorGroup(source1, groupRegisters))
                             {
                                 trapped = true;
                                 break;
                             }
+
+                            bool maskDestination = floatOperation
+                                ? (funct3 switch { 1 => 0x1B00_0000UL, 5 => 0xBB00_0000UL, _ => 0 } & (1UL << funct6)) != 0
+                                : (funct3 switch { 0 => 0x3F00_0000UL, 3 => 0xF300_0000UL, 4 => 0xFF00_0000UL, _ => 0 } & (1UL << funct6)) != 0;
                             int vd = (int)((instruction >> 7) & 31);
-                            int funct6 = (int)((instruction >> 26) & 0x3F);
-                            bool maskDestination = IsVectorMaskOperation(funct6, funct3);
+
                             if (!CheckVectorGroup(vd, maskDestination ? 1 : groupRegisters))
                             {
                                 trapped = true;
                                 break;
                             }
-                            bool unmasked = ((instruction >> 25) & 1) != 0;
 
-                            if (funct6 == 11 && funct3 == 0 && unmasked && vd == vs2 && source1 == vs2 && _vstart == 0 && !maskDestination)
-                            {
-                                GetVectorBytes().Slice(vd * VectorRegisterBytes, checked((int)_vl * sewBytes)).Clear();
-                                _mstatus |= MstatusVsMask;
-                                break;
-                            }
+                            bool unmasked = ((instruction >> 25) & 1) != 0;
 
                             int vl = (int)_vl;
                             int start = (int)_vstart;
                             int sewBits = sewBytes * 8;
                             ulong mask = ElementMask(sewBits);
                             ulong scalar = 0;
-                            long signedImmediate = SignExtendImmediate5(source1);
-                            bool vectorSource1 = funct3 == 0 || funct3 == 2;
-                            bool scalarSource1 = funct3 == 4 || funct3 == 6;
-                            bool immediateSource1 = funct3 == 3;
+                            long signedImmediate = (source1 & 16) != 0 ? source1 - 32 : source1;
 
-                            if (scalarSource1)
-                                scalar = _x[source1] & mask;
-                            else if (immediateSource1)
-                                scalar = (ulong)signedImmediate & mask;
+                            if (funct3 == 4 || funct3 == 5 || funct3 == 6)
+                                scalar = floatOperation ? _f[source1] : _x[source1] & mask;
+                            else if (funct3 == 3)
+                                scalar = (ulong)((funct6 == 37 || funct6 == 40 || funct6 == 41 || funct6 == 44 || funct6 == 45 || funct6 == 48)
+                                        ? source1 : signedImmediate) & mask;
                             else if (!vectorSource1)
                             {
                                 trapped = true;
                                 break;
                             }
 
+                            int source2Bytes = narrowingShift ? sewBytes << 1 : sewBytes;
+                            ref byte vectorBytes = ref Unsafe.As<VectorRegisterArray, byte>(ref _v);
+                            int source1Offset = source1 * VectorRegisterBytes + start * sewBytes;
+                            int source2Offset = vs2 * VectorRegisterBytes + start * source2Bytes;
+                            int destinationOffset = vd * VectorRegisterBytes + start * sewBytes;
+                            int gatherBaseOffset = vs2 * VectorRegisterBytes;
+                            bool vectorFailed = false;
                             for (int i = start; i < vl; i++)
                             {
-                                if (!unmasked && !ReadVectorMaskBit(i))
+                                int currentSource1Offset = source1Offset;
+                                int currentSource2Offset = source2Offset;
+                                int currentDestinationOffset = destinationOffset;
+                                source1Offset += sewBytes;
+                                source2Offset += source2Bytes;
+                                destinationOffset += sewBytes;
+
+                                if (!unmasked && !ReadVectorMaskBit(ref vectorBytes, i))
                                     continue;
 
-                                ulong a = vectorSource1 ? ReadVectorElement(source1, i, sewBytes) : scalar;
-                                ulong b = ReadVectorElement(vs2, i, sewBytes);
+                                ulong a = vectorSource1 ? ReadVectorElement(ref vectorBytes, currentSource1Offset, sewBytes) : scalar;
+                                ulong b = ReadVectorElement(ref vectorBytes, currentSource2Offset, source2Bytes);
+
+                                if (floatOperation)
+                                {
+                                    if (maskDestination)
+                                    {
+                                        if (!TryEvaluateVectorFloatMaskOperation(funct6, funct3, a, b, sewBytes, out bool condition))
+                                        {
+                                            vectorFailed = true;
+                                            break;
+                                        }
+                                        WriteVectorMaskBit(ref vectorBytes, vd, i, condition);
+                                        continue;
+                                    }
+
+                                    if (!TryEvaluateVectorFloatOperation(funct6, funct3, a, b, sewBytes, out ulong floatResult))
+                                    {
+                                        vectorFailed = true;
+                                        break;
+                                    }
+                                    WriteVectorElement(ref vectorBytes, currentDestinationOffset, sewBytes, floatResult);
+                                    continue;
+                                }
 
                                 if (maskDestination)
                                 {
                                     if (!TryEvaluateVectorMaskOperation(funct6, funct3, a, b, sewBits, out bool condition))
                                     {
-                                        trapped = true;
+                                        vectorFailed = true;
                                         break;
                                     }
-                                    WriteVectorMaskBit(vd, i, condition);
+                                    WriteVectorMaskBit(ref vectorBytes, vd, i, condition);
                                     continue;
                                 }
 
-                                if (!TryEvaluateVectorIntegerOperation(funct6, funct3, a, b, sewBits, out ulong result))
+                                ulong result;
+                                if (narrowingShift)
                                 {
-                                    trapped = true;
+                                    int sourceBits = sewBits << 1;
+                                    int shift = (int)(a & (ulong)(sourceBits - 1));
+                                    result = funct6 == 44 ? b >> shift : (ulong)(SignExtendElement(b, sourceBits) >> shift);
+                                }
+                                else if (funct6 == 48)
+                                {
+                                    if (funct3 != 0 && funct3 != 4 && funct3 != 3)
+                                    {
+                                        vectorFailed = true;
+                                        break;
+                                    }
+                                    result = a < (ulong)vlmax ? ReadVectorElement(ref vectorBytes, gatherBaseOffset + (int)a * sewBytes, sewBytes) : 0;
+                                }
+                                else if (funct6 == 41 || funct6 == 43 || funct6 == 45 || funct6 == 47)
+                                {
+                                    if (!TryEvaluateVectorMultiplyAddOperation(
+                                        funct6, funct3, a, b, ReadVectorElement(ref vectorBytes, currentDestinationOffset, sewBytes), out result))
+                                    {
+                                        vectorFailed = true;
+                                        break;
+                                    }
+                                }
+                                else if (!TryEvaluateVectorIntegerOperation(funct6, funct3, a, b, sewBits, mask, out result))
+                                {
+                                    vectorFailed = true;
                                     break;
                                 }
-                                WriteVectorElement(vd, i, sewBytes, result & mask);
+
+                                WriteVectorElement(ref vectorBytes, currentDestinationOffset, sewBytes, result & mask);
+                            }
+
+                            if (vectorFailed)
+                            {
+                                trapped = true;
+                                break;
                             }
 
                             _vstart = 0;
@@ -1035,10 +1215,10 @@ namespace Cnidaria.RiscV
                         }
                         break;
 
-                    case 0x2F:
+                    case 0x2F: // AMO
                         {
-                            int funct3 = (int)((instruction >> 12) & 7);
-                            int size = funct3 == 2 ? 4 : funct3 == 3 ? 8 : 0;
+                            uint funct3 = instruction & Funct3Mask;
+                            int size = funct3 == 0x2000U ? 4 : funct3 == 0x3000U ? 8 : 0;
                             if (size == 0)
                             {
                                 trapped = true;
@@ -1058,8 +1238,8 @@ namespace Cnidaria.RiscV
                                 break;
                             }
 
-                            int op = (int)((instruction >> 27) & 31);
-                            if (op == 2)
+                            uint op = instruction & 0xF8000000U;
+                            if (op == 0x10000000U)
                             {
                                 if (rd != 0)
                                     _x[rd] = size == 4 ? SignExtend32((uint)old) : old;
@@ -1070,7 +1250,7 @@ namespace Cnidaria.RiscV
 
                             int rs2 = (int)((instruction >> 20) & 31);
                             ulong result;
-                            if (op == 3)
+                            if (op == 0x18000000U)
                             {
                                 result = _hasReservation && _reservationAddress == address ? 0UL : 1UL;
                                 if (result == 0 && !TryWriteMemory(address, size, _x[rs2], out trapCause, out trapValue))
@@ -1087,15 +1267,15 @@ namespace Cnidaria.RiscV
                             ulong write;
                             switch (op)
                             {
-                                case 1: write = src; break;
-                                case 0: write = old + src; break;
-                                case 4: write = old ^ src; break;
-                                case 8: write = old | src; break;
-                                case 12: write = old & src; break;
-                                case 16: write = size == 4 ? (ulong)(uint)Math.Min((int)old, (int)src) : (ulong)Math.Min((long)old, (long)src); break;
-                                case 20: write = size == 4 ? (ulong)(uint)Math.Max((int)old, (int)src) : (ulong)Math.Max((long)old, (long)src); break;
-                                case 24: write = size == 4 ? Math.Min((uint)old, (uint)src) : Math.Min(old, src); break;
-                                case 28: write = size == 4 ? Math.Max((uint)old, (uint)src) : Math.Max(old, src); break;
+                                case 0x08000000U: write = src; break;
+                                case 0x00000000U: write = old + src; break;
+                                case 0x20000000U: write = old ^ src; break;
+                                case 0x40000000U: write = old | src; break;
+                                case 0x60000000U: write = old & src; break;
+                                case 0x80000000U: write = size == 4 ? (ulong)(uint)Math.Min((int)old, (int)src) : (ulong)Math.Min((long)old, (long)src); break;
+                                case 0xA0000000U: write = size == 4 ? (ulong)(uint)Math.Max((int)old, (int)src) : (ulong)Math.Max((long)old, (long)src); break;
+                                case 0xC0000000U: write = size == 4 ? Math.Min((uint)old, (uint)src) : Math.Min(old, src); break;
+                                case 0xE0000000U: write = size == 4 ? Math.Max((uint)old, (uint)src) : Math.Max(old, src); break;
                                 default: trapped = true; goto outer_break;
                             }
                             if (!TryWriteMemory(address, size, write, out trapCause, out trapValue))
@@ -1108,18 +1288,18 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x07:
+                    case 0x07: // LOAD FP
                         {
-                            int funct3 = (int)((instruction >> 12) & 7);
-                            if (funct3 == 0 || funct3 == 5 || funct3 == 6 || funct3 == 7)
+                            uint funct3 = instruction & Funct3Mask;
+                            if (funct3 == 0x0000U || funct3 == 0x5000U || funct3 == 0x6000U || funct3 == 0x7000U)
                             {
                                 if (!ExecuteVectorLoad(instruction, out trapCause, out trapValue))
                                     trapped = true;
                                 break;
                             }
                             int size;
-                            if (funct3 == 2) size = 4;
-                            else if (funct3 == 3) size = 8;
+                            if (funct3 == 0x2000U) size = 4;
+                            else if (funct3 == 0x3000U) size = 8;
                             else { trapped = true; break; }
                             ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmI(instruction);
                             if ((address & (ulong)(size - 1)) != 0)
@@ -1138,18 +1318,18 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x27:
+                    case 0x27: // STORE FP
                         {
-                            int funct3 = (int)((instruction >> 12) & 7);
-                            if (funct3 == 0 || funct3 == 5 || funct3 == 6 || funct3 == 7)
+                            uint funct3 = instruction & Funct3Mask;
+                            if (funct3 == 0x0000U || funct3 == 0x5000U || funct3 == 0x6000U || funct3 == 0x7000U)
                             {
                                 if (!ExecuteVectorStore(instruction, out trapCause, out trapValue))
                                     trapped = true;
                                 break;
                             }
                             int size;
-                            if (funct3 == 2) size = 4;
-                            else if (funct3 == 3) size = 8;
+                            if (funct3 == 0x2000U) size = 4;
+                            else if (funct3 == 0x3000U) size = 8;
                             else { trapped = true; break; }
                             ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmS(instruction);
                             if ((address & (ulong)(size - 1)) != 0)
@@ -1164,17 +1344,17 @@ namespace Cnidaria.RiscV
                             break;
                         }
 
-                    case 0x43:
-                    case 0x47:
-                    case 0x4B:
-                    case 0x4F:
-                    case 0x53:
+                    case 0x43: // MADD
+                    case 0x47: // MSUB
+                    case 0x4B: // NMSUB
+                    case 0x4F: // NMADD
+                    case 0x53: // FP
                         {
-                            int opcode = (int)(instruction & 0x7F);
+                            uint opcode = instruction & OpcodeMask;
                             int rs1 = (int)((instruction >> 15) & 31);
                             int rs2 = (int)((instruction >> 20) & 31);
 
-                            if (opcode != 0x53)
+                            if (opcode != 0x53U)
                             {
                                 int rs3 = (int)((instruction >> 27) & 31);
                                 if ((instruction & (1U << 25)) == 0)
@@ -1269,23 +1449,23 @@ namespace Cnidaria.RiscV
                                     WriteFloat64(rd, Math.Sqrt(ReadFloat64(rs1)));
                                     goto outer_break;
                                 case 0x50:
-                                    if (!ExecuteFloatCompare(false, (int)((instruction >> 12) & 7), rd, rs1, rs2)) 
+                                    if (!ExecuteFloatCompare(false, (int)((instruction >> 12) & 7), rd, rs1, rs2))
                                         trapped = true;
                                     goto outer_break;
                                 case 0x51:
-                                    if (!ExecuteFloatCompare(true, (int)((instruction >> 12) & 7), rd, rs1, rs2)) 
+                                    if (!ExecuteFloatCompare(true, (int)((instruction >> 12) & 7), rd, rs1, rs2))
                                         trapped = true;
                                     goto outer_break;
                                 case 0x60:
-                                    if (!ExecuteFloatToInt(false, rs2, rd, rs1)) 
+                                    if (!ExecuteFloatToInt(false, rs2, rd, rs1))
                                         trapped = true;
                                     goto outer_break;
                                 case 0x61:
-                                    if (!ExecuteFloatToInt(true, rs2, rd, rs1)) 
+                                    if (!ExecuteFloatToInt(true, rs2, rd, rs1))
                                         trapped = true;
                                     goto outer_break;
                                 case 0x68:
-                                    if (!ExecuteIntToFloat(false, rs2, rd, rs1)) 
+                                    if (!ExecuteIntToFloat(false, rs2, rd, rs1))
                                         trapped = true;
                                     goto outer_break;
                                 case 0x69:
@@ -1341,7 +1521,7 @@ namespace Cnidaria.RiscV
                         outer_break:
                             break;
                         }
-                        
+
 
                     default:
                         trapped = true;
@@ -1376,11 +1556,11 @@ namespace Cnidaria.RiscV
 
         private void UpdatePendingInterrupts()
         {
-            ulong generated = (1UL << (int)MachineTimerInterrupt)
+            const ulong GeneratedInterruptMask = (1UL << (int)MachineTimerInterrupt)
                 | (1UL << (int)MachineSoftwareInterrupt)
                 | (1UL << (int)MachineExternalInterrupt)
                 | (1UL << (int)SupervisorExternalInterrupt);
-            ulong mip = _mip & ~generated;
+            ulong mip = _mip & ~GeneratedInterruptMask;
 
             if (_clint.MsIp != 0)
                 mip |= 1UL << (int)MachineSoftwareInterrupt;
@@ -2031,9 +2211,9 @@ namespace Cnidaria.RiscV
 
             ulong baseAddress = _x[(int)((instruction >> 15) & 31)];
             bool unmasked = ((instruction >> 25) & 1) != 0;
-            if (unmasked && elementBytes == 1 && _vstart == 0)
+            if (unmasked && _vstart == 0)
             {
-                if (TryVectorByteLoadStoreFast(baseAddress, vd, true, out bool trapped, out trapCause, out trapValue))
+                if (TryVectorLoadStore(baseAddress, vd, elementBytes, true, out bool trapped, out trapCause, out trapValue))
                     return true;
                 if (trapped)
                     return false;
@@ -2041,24 +2221,30 @@ namespace Cnidaria.RiscV
 
             int vl = (int)_vl;
             int start = (int)_vstart;
+            ref byte vectorBytes = ref Unsafe.As<VectorRegisterArray, byte>(ref _v);
+            int destinationOffset = vd * VectorRegisterBytes + start * elementBytes;
+            ulong address = baseAddress + (ulong)start * (ulong)elementBytes;
             for (int i = start; i < vl; i++)
             {
-                if (!unmasked && !ReadVectorMaskBit(i))
+                int currentDestinationOffset = destinationOffset;
+                ulong currentAddress = address;
+                destinationOffset += elementBytes;
+                address += (ulong)elementBytes;
+                if (!unmasked && !ReadVectorMaskBit(ref vectorBytes, i))
                     continue;
-                ulong address = baseAddress + (ulong)i * (ulong)elementBytes;
-                if ((address & (ulong)(elementBytes - 1)) != 0)
+                if ((currentAddress & (ulong)(elementBytes - 1)) != 0)
                 {
                     _vstart = (ulong)i;
                     trapCause = (ulong)RVTrapCause.LoadAddressMisaligned;
-                    trapValue = address;
+                    trapValue = currentAddress;
                     return false;
                 }
-                if (!TryReadMemory(address, elementBytes, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
+                if (!TryReadMemory(currentAddress, elementBytes, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
                 {
                     _vstart = (ulong)i;
                     return false;
                 }
-                WriteVectorElement(vd, i, elementBytes, value);
+                WriteVectorElement(ref vectorBytes, currentDestinationOffset, elementBytes, value);
             }
 
             _vstart = 0;
@@ -2086,9 +2272,9 @@ namespace Cnidaria.RiscV
 
             ulong baseAddress = _x[(int)((instruction >> 15) & 31)];
             bool unmasked = ((instruction >> 25) & 1) != 0;
-            if (unmasked && elementBytes == 1 && _vstart == 0)
+            if (unmasked && _vstart == 0)
             {
-                if (TryVectorByteLoadStoreFast(baseAddress, vs3, false, out bool trapped, out trapCause, out trapValue))
+                if (TryVectorLoadStore(baseAddress, vs3, elementBytes, false, out bool trapped, out trapCause, out trapValue))
                     return true;
                 if (trapped)
                     return false;
@@ -2096,20 +2282,26 @@ namespace Cnidaria.RiscV
 
             int vl = (int)_vl;
             int start = (int)_vstart;
+            ref byte vectorBytes = ref Unsafe.As<VectorRegisterArray, byte>(ref _v);
+            int sourceOffset = vs3 * VectorRegisterBytes + start * elementBytes;
+            ulong address = baseAddress + (ulong)start * (ulong)elementBytes;
             for (int i = start; i < vl; i++)
             {
-                if (!unmasked && !ReadVectorMaskBit(i))
+                int currentSourceOffset = sourceOffset;
+                ulong currentAddress = address;
+                sourceOffset += elementBytes;
+                address += (ulong)elementBytes;
+                if (!unmasked && !ReadVectorMaskBit(ref vectorBytes, i))
                     continue;
-                ulong address = baseAddress + (ulong)i * (ulong)elementBytes;
-                if ((address & (ulong)(elementBytes - 1)) != 0)
+                if ((currentAddress & (ulong)(elementBytes - 1)) != 0)
                 {
                     _vstart = (ulong)i;
                     trapCause = (ulong)RVTrapCause.StoreAddressMisaligned;
-                    trapValue = address;
+                    trapValue = currentAddress;
                     return false;
                 }
-                ulong value = ReadVectorElement(vs3, i, elementBytes);
-                if (!TryWriteMemory(address, elementBytes, value, out trapCause, out trapValue))
+                ulong value = ReadVectorElement(ref vectorBytes, currentSourceOffset, elementBytes);
+                if (!TryWriteMemory(currentAddress, elementBytes, value, out trapCause, out trapValue))
                 {
                     _vstart = (ulong)i;
                     return false;
@@ -2121,47 +2313,59 @@ namespace Cnidaria.RiscV
             return true;
         }
 
-        private bool TryVectorByteLoadStoreFast(ulong baseAddress, int register, bool load, out bool trapped, out ulong trapCause, out ulong trapValue)
+        private bool TryVectorLoadStore(ulong baseAddress, int register, int elementBytes, bool load, out bool trapped, out ulong trapCause, out ulong trapValue)
         {
             trapped = false;
             trapCause = 0;
             trapValue = 0;
-            int count = (int)_vl;
-            if (count == 0)
+            int elementCount = (int)_vl;
+            if (elementCount == 0)
             {
                 _vstart = 0;
                 _mstatus |= MstatusVsMask;
                 return true;
             }
 
-            int firstLength = (int)Math.Min((ulong)count, PageSize - (baseAddress & PageMask));
-            if (!TryGetTranslatedRamOffset(baseAddress, firstLength, load ? RVMemoryAccess.Load : RVMemoryAccess.Store, out int firstOffset, out bool firstTrap, out trapCause, out trapValue))
+            if ((baseAddress & (ulong)(elementBytes - 1)) != 0)
+            {
+                trapped = true;
+                trapCause = load ? (ulong)RVTrapCause.LoadAddressMisaligned : (ulong)RVTrapCause.StoreAddressMisaligned;
+                trapValue = baseAddress;
+                return false;
+            }
+
+            int byteCount = elementCount * elementBytes;
+            RVMemoryAccess access = load ? RVMemoryAccess.Load : RVMemoryAccess.Store;
+            int firstLength = (int)Math.Min((ulong)byteCount, PageSize - (baseAddress & PageMask));
+            if (!TryGetTranslatedRamOffset(baseAddress, firstLength, access, out int firstOffset, out bool firstTrap, out trapCause, out trapValue))
             {
                 trapped = firstTrap;
                 return false;
             }
 
-            int secondLength = count - firstLength;
-            int secondOffset = 0;
-            if (secondLength != 0 && !TryGetTranslatedRamOffset(baseAddress + (ulong)firstLength, secondLength, load ? RVMemoryAccess.Load : RVMemoryAccess.Store, out secondOffset, out bool secondTrap, out trapCause, out trapValue))
-            {
-                trapped = secondTrap;
-                return false;
-            }
-
-            Span<byte> vector = GetVectorBytes().Slice(register * VectorRegisterBytes, count);
+            int secondLength = byteCount - firstLength;
+            Span<byte> vector = GetVectorBytes().Slice(register * VectorRegisterBytes, byteCount);
             if (load)
-            {
                 _ram.AsSpan(firstOffset, firstLength).CopyTo(vector);
-                if (secondLength != 0)
-                    _ram.AsSpan(secondOffset, secondLength).CopyTo(vector.Slice(firstLength));
-            }
             else
             {
                 vector.Slice(0, firstLength).CopyTo(_ram.AsSpan(firstOffset, firstLength));
-                if (secondLength != 0)
-                    vector.Slice(firstLength, secondLength).CopyTo(_ram.AsSpan(secondOffset, secondLength));
                 _hasReservation = false;
+            }
+
+            if (secondLength != 0)
+            {
+                if (!TryGetTranslatedRamOffset(baseAddress + (ulong)firstLength, secondLength, access, out int secondOffset, out bool secondTrap, out trapCause, out trapValue))
+                {
+                    _vstart = (ulong)(firstLength / elementBytes);
+                    trapped = secondTrap;
+                    return false;
+                }
+
+                if (load)
+                    _ram.AsSpan(secondOffset, secondLength).CopyTo(vector.Slice(firstLength));
+                else
+                    vector.Slice(firstLength, secondLength).CopyTo(_ram.AsSpan(secondOffset, secondLength));
             }
 
             _vstart = 0;
@@ -2219,7 +2423,8 @@ namespace Cnidaria.RiscV
             groupBytes = VectorLengthBytes * numerator / denominator;
             if (groupBytes < sewBytes || groupBytes > VectorLengthBytes * 8 || groupBytes % sewBytes != 0)
                 return false;
-            groupRegisters = Math.Max(1, (groupBytes + VectorRegisterBytes - 1) / VectorRegisterBytes);
+            if (!TryGetVectorGroupRegisters(groupBytes, out groupRegisters))
+                return false;
             vlmax = groupBytes / sewBytes;
             return vlmax != 0;
         }
@@ -2228,7 +2433,9 @@ namespace Cnidaria.RiscV
         {
             groupBytes = 0;
             groupRegisters = 0;
-            if (!TryDecodeVectorType(_vtype, out int sewBytes, out int currentGroupBytes, out _, out _))
+            int sewBytes = _vsewBytes;
+            int currentGroupBytes = _vgroupBytes;
+            if (sewBytes == 0 || currentGroupBytes == 0)
                 return false;
             long bytes = (long)currentGroupBytes * elementBytes;
             if (bytes % sewBytes != 0)
@@ -2237,8 +2444,7 @@ namespace Cnidaria.RiscV
             if (bytes <= 0 || bytes > VectorLengthBytes * 8)
                 return false;
             groupBytes = (int)bytes;
-            groupRegisters = Math.Max(1, (groupBytes + VectorRegisterBytes - 1) / VectorRegisterBytes);
-            return true;
+            return TryGetVectorGroupRegisters(groupBytes, out groupRegisters);
         }
 
         private static int VectorMemoryElementBytes(int width)
@@ -2252,6 +2458,15 @@ namespace Cnidaria.RiscV
                 default: return 0;
             }
         }
+        private static bool TryGetVectorGroupRegisters(int groupBytes, out int groupRegisters)
+        {
+            groupRegisters = 0;
+            if (groupBytes <= 0 || groupBytes > VectorLengthBytes * 8)
+                return false;
+            groupRegisters = Math.Max(1, (groupBytes + VectorRegisterBytes - 1) / VectorRegisterBytes);
+            return groupRegisters <= VectorRegisterCount;
+        }
+
 
         private static bool CheckVectorGroup(int register, int groupRegisters)
         {
@@ -2260,91 +2475,242 @@ namespace Cnidaria.RiscV
             return groupRegisters == 1 || (register & (groupRegisters - 1)) == 0;
         }
 
-        private Span<byte> GetVectorBytes() => MemoryMarshal.AsBytes((Span<Vector256<ulong>>)_v);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Span<byte> GetVectorBytes() => MemoryMarshal.AsBytes((Span<Vector512<ulong>>)_v);
 
-        private ulong ReadVectorElement(int register, int element, int elementBytes)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong ReadVectorElement(ref byte vectorBytes, int offset, int elementBytes)
         {
-            Span<byte> bytes = GetVectorBytes();
-            int offset = register * VectorRegisterBytes + element * elementBytes;
+            ref byte address = ref Unsafe.Add(ref vectorBytes, offset);
             switch (elementBytes)
             {
                 case 1:
-                    return bytes[offset];
+                    return address;
                 case 2:
-                    return (ulong)(bytes[offset] | (bytes[offset + 1] << 8));
+                    {
+                        ushort value = Unsafe.ReadUnaligned<ushort>(ref address);
+                        return BitConverter.IsLittleEndian ? value : BinaryPrimitives.ReverseEndianness(value);
+                    }
                 case 4:
-                    return (ulong)(bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24));
+                    {
+                        uint value = Unsafe.ReadUnaligned<uint>(ref address);
+                        return BitConverter.IsLittleEndian ? value : BinaryPrimitives.ReverseEndianness(value);
+                    }
                 default:
-                    return (ulong)bytes[offset]
-                        | ((ulong)bytes[offset + 1] << 8)
-                        | ((ulong)bytes[offset + 2] << 16)
-                        | ((ulong)bytes[offset + 3] << 24)
-                        | ((ulong)bytes[offset + 4] << 32)
-                        | ((ulong)bytes[offset + 5] << 40)
-                        | ((ulong)bytes[offset + 6] << 48)
-                        | ((ulong)bytes[offset + 7] << 56);
+                    {
+                        ulong value = Unsafe.ReadUnaligned<ulong>(ref address);
+                        return BitConverter.IsLittleEndian ? value : BinaryPrimitives.ReverseEndianness(value);
+                    }
             }
         }
 
-        private void WriteVectorElement(int register, int element, int elementBytes, ulong value)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void WriteVectorElement(ref byte vectorBytes, int offset, int elementBytes, ulong value)
         {
-            Span<byte> bytes = GetVectorBytes();
-            int offset = register * VectorRegisterBytes + element * elementBytes;
-            bytes[offset] = (byte)value;
-            if (elementBytes >= 2)
-                bytes[offset + 1] = (byte)(value >> 8);
-            if (elementBytes >= 4)
+            ref byte address = ref Unsafe.Add(ref vectorBytes, offset);
+            switch (elementBytes)
             {
-                bytes[offset + 2] = (byte)(value >> 16);
-                bytes[offset + 3] = (byte)(value >> 24);
-            }
-            if (elementBytes == 8)
-            {
-                bytes[offset + 4] = (byte)(value >> 32);
-                bytes[offset + 5] = (byte)(value >> 40);
-                bytes[offset + 6] = (byte)(value >> 48);
-                bytes[offset + 7] = (byte)(value >> 56);
+                case 1:
+                    address = (byte)value;
+                    break;
+                case 2:
+                    {
+                        ushort element = (ushort)value;
+                        if (!BitConverter.IsLittleEndian)
+                            element = BinaryPrimitives.ReverseEndianness(element);
+                        Unsafe.WriteUnaligned(ref address, element);
+                        break;
+                    }
+                case 4:
+                    {
+                        uint element = (uint)value;
+                        if (!BitConverter.IsLittleEndian)
+                            element = BinaryPrimitives.ReverseEndianness(element);
+                        Unsafe.WriteUnaligned(ref address, element);
+                        break;
+                    }
+                default:
+                    if (!BitConverter.IsLittleEndian)
+                        value = BinaryPrimitives.ReverseEndianness(value);
+                    Unsafe.WriteUnaligned(ref address, value);
+                    break;
             }
         }
 
-        private bool ReadVectorMaskBit(int element)
-        {
-            Span<byte> bytes = GetVectorBytes();
-            return (bytes[element >> 3] & (1 << (element & 7))) != 0;
-        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool ReadVectorMaskBit(ref byte vectorBytes, int element)
+            => (Unsafe.Add(ref vectorBytes, element >> 3) & (1 << (element & 7))) != 0;
 
-        private void WriteVectorMaskBit(int register, int element, bool value)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void WriteVectorMaskBit(ref byte vectorBytes, int register, int element, bool value)
         {
-            Span<byte> bytes = GetVectorBytes();
-            int offset = register * VectorRegisterBytes + (element >> 3);
+            ref byte destination = ref Unsafe.Add(ref vectorBytes, register * VectorRegisterBytes + (element >> 3));
             byte mask = (byte)(1 << (element & 7));
             if (value)
-                bytes[offset] |= mask;
+                destination |= mask;
             else
-                bytes[offset] &= (byte)~mask;
+                destination &= (byte)~mask;
         }
 
-        private static bool IsVectorMaskOperation(int funct6, int funct3)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryEvaluateVectorMultiplyAddOperation(int funct6, int funct3, ulong a, ulong b, ulong vd, out ulong result)
         {
+            result = 0;
+            if (funct3 != 2 && funct3 != 6)
+                return false;
+
+            ulong product = a * b;
             switch (funct6)
             {
-                case 24:
-                case 25:
-                    return funct3 == 0 || funct3 == 4 || funct3 == 3;
-                case 26:
-                case 27:
-                    return funct3 == 0 || funct3 == 4;
-                case 28:
-                case 29:
-                    return funct3 == 0 || funct3 == 4 || funct3 == 3;
-                case 30:
-                case 31:
-                    return funct3 == 4 || funct3 == 3;
+                case 41:
+                    result = a * vd + b;
+                    return true;
+                case 43:
+                    result = b - a * vd;
+                    return true;
+                case 45:
+                    result = vd + product;
+                    return true;
+                case 47:
+                    result = vd - product;
+                    return true;
                 default:
                     return false;
             }
         }
 
+        private static bool TryEvaluateVectorFloatMaskOperation(int funct6, int funct3, ulong a, ulong b, int sewBytes, out bool result)
+        {
+            result = false;
+            if (funct3 != 1 && funct3 != 5)
+                return false;
+
+            if (sewBytes == 4)
+            {
+                float left = BitConverter.UInt32BitsToSingle((uint)b);
+                float right = BitConverter.UInt32BitsToSingle((uint)a);
+                switch (funct6)
+                {
+                    case 24: result = left == right; return true;
+                    case 25: result = left <= right; return true;
+                    case 27: result = left < right; return true;
+                    case 28: result = left != right; return true;
+                    case 29: result = left > right; return funct3 == 5;
+                    case 31: result = left >= right; return funct3 == 5;
+                    default: return false;
+                }
+            }
+
+            if (sewBytes == 8)
+            {
+                double left = BitConverter.Int64BitsToDouble((long)b);
+                double right = BitConverter.Int64BitsToDouble((long)a);
+                switch (funct6)
+                {
+                    case 24: result = left == right; return true;
+                    case 25: result = left <= right; return true;
+                    case 27: result = left < right; return true;
+                    case 28: result = left != right; return true;
+                    case 29: result = left > right; return funct3 == 5;
+                    case 31: result = left >= right; return funct3 == 5;
+                    default: return false;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryEvaluateVectorFloatOperation(int funct6, int funct3, ulong a, ulong b, int sewBytes, out ulong result)
+        {
+            result = 0;
+            if (funct3 != 1 && funct3 != 5)
+                return false;
+
+            if (sewBytes == 4)
+            {
+                uint leftBits = (uint)b;
+                uint rightBits = (uint)a;
+                float left = BitConverter.UInt32BitsToSingle(leftBits);
+                float right = BitConverter.UInt32BitsToSingle(rightBits);
+                switch (funct6)
+                {
+                    case 0: result = BitConverter.SingleToUInt32Bits(left + right); return true;
+                    case 2: result = BitConverter.SingleToUInt32Bits(left - right); return true;
+                    case 4: result = BitConverter.SingleToUInt32Bits(MathF.Min(left, right)); return true;
+                    case 6: result = BitConverter.SingleToUInt32Bits(MathF.Max(left, right)); return true;
+                    case 8: result = VectorFloatSign32(leftBits, rightBits, 0); return true;
+                    case 9: result = VectorFloatSign32(leftBits, rightBits, 1); return true;
+                    case 10: result = VectorFloatSign32(leftBits, rightBits, 2); return true;
+                    case 32: result = BitConverter.SingleToUInt32Bits(left / right); return true;
+                    case 33:
+                        if (funct3 != 5) return false;
+                        result = BitConverter.SingleToUInt32Bits(right / left);
+                        return true;
+                    case 36: result = BitConverter.SingleToUInt32Bits(left * right); return true;
+                    case 39:
+                        if (funct3 != 5) return false;
+                        result = BitConverter.SingleToUInt32Bits(right - left);
+                        return true;
+                    default: return false;
+                }
+            }
+
+            if (sewBytes == 8)
+            {
+                double left = BitConverter.Int64BitsToDouble((long)b);
+                double right = BitConverter.Int64BitsToDouble((long)a);
+                switch (funct6)
+                {
+                    case 0: result = (ulong)BitConverter.DoubleToInt64Bits(left + right); return true;
+                    case 2: result = (ulong)BitConverter.DoubleToInt64Bits(left - right); return true;
+                    case 4: result = (ulong)BitConverter.DoubleToInt64Bits(Math.Min(left, right)); return true;
+                    case 6: result = (ulong)BitConverter.DoubleToInt64Bits(Math.Max(left, right)); return true;
+                    case 8: result = VectorFloatSign64(b, a, 0); return true;
+                    case 9: result = VectorFloatSign64(b, a, 1); return true;
+                    case 10: result = VectorFloatSign64(b, a, 2); return true;
+                    case 32: result = (ulong)BitConverter.DoubleToInt64Bits(left / right); return true;
+                    case 33:
+                        if (funct3 != 5) return false;
+                        result = (ulong)BitConverter.DoubleToInt64Bits(right / left);
+                        return true;
+                    case 36: result = (ulong)BitConverter.DoubleToInt64Bits(left * right); return true;
+                    case 39:
+                        if (funct3 != 5) return false;
+                        result = (ulong)BitConverter.DoubleToInt64Bits(right - left);
+                        return true;
+                    default: return false;
+                }
+            }
+
+            return false;
+        }
+
+        private static uint VectorFloatSign32(uint magnitudeSource, uint signSource, int mode)
+        {
+            uint sign = signSource & 0x80000000U;
+            uint magnitude = magnitudeSource & 0x7FFFFFFFU;
+            switch (mode)
+            {
+                case 0: return magnitude | sign;
+                case 1: return magnitude | (~sign & 0x80000000U);
+                default: return magnitude | ((magnitudeSource ^ signSource) & 0x80000000U);
+            }
+        }
+
+        private static ulong VectorFloatSign64(ulong magnitudeSource, ulong signSource, int mode)
+        {
+            ulong sign = signSource & 0x8000000000000000UL;
+            ulong magnitude = magnitudeSource & 0x7FFFFFFFFFFFFFFFUL;
+            switch (mode)
+            {
+                case 0: return magnitude | sign;
+                case 1: return magnitude | (~sign & 0x8000000000000000UL);
+                default: return magnitude | ((magnitudeSource ^ signSource) & 0x8000000000000000UL);
+            }
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool TryEvaluateVectorMaskOperation(int funct6, int funct3, ulong a, ulong b, int sewBits, out bool result)
         {
             result = false;
@@ -2362,9 +2728,8 @@ namespace Cnidaria.RiscV
             }
         }
 
-        private static bool TryEvaluateVectorIntegerOperation(int funct6, int funct3, ulong a, ulong b, int sewBits, out ulong result)
+        private static bool TryEvaluateVectorIntegerOperation(int funct6, int funct3, ulong a, ulong b, int sewBits, ulong mask, out ulong result)
         {
-            ulong mask = ElementMask(sewBits);
             a &= mask;
             b &= mask;
             result = 0;
@@ -2444,11 +2809,15 @@ namespace Cnidaria.RiscV
                     return false;
                 case 38:
                     if (funct3 != 2 && funct3 != 6) return false;
-                    result = SignedUnsignedElementMulHigh(b, a, sewBits);
+                    result = sewBits == 64
+                        ? Mulhsu(SignExtendElement(b, sewBits), a)
+                        : (ulong)((SignExtendElement(b, sewBits) * (long)(a & ElementMask(sewBits))) >> sewBits) & ElementMask(sewBits);
                     return true;
                 case 39:
                     if (funct3 != 2 && funct3 != 6) return false;
-                    result = SignedElementMulHigh(b, a, sewBits);
+                    result = sewBits == 64
+                        ? Mulh(SignExtendElement(b, sewBits), SignExtendElement(a, sewBits))
+                        : (ulong)((SignExtendElement(b, sewBits) * SignExtendElement(a, sewBits)) >> sewBits) & ElementMask(sewBits);
                     return true;
                 case 40:
                     if (funct3 != 0 && funct3 != 4 && funct3 != 3) return false;
@@ -2463,17 +2832,16 @@ namespace Cnidaria.RiscV
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static ulong ElementMask(int bits)
             => bits == 64 ? ulong.MaxValue : (1UL << bits) - 1;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static long SignExtendElement(ulong value, int bits)
         {
             int shift = 64 - bits;
             return ((long)(value << shift)) >> shift;
         }
-
-        private static long SignExtendImmediate5(int value)
-            => (value & 16) != 0 ? value - 32 : value;
 
         private static ulong SignedElementDiv(ulong dividend, ulong divisor, int bits)
         {
@@ -2507,22 +2875,6 @@ namespace Cnidaria.RiscV
                 return Mulhu(left, right);
             ulong mask = ElementMask(bits);
             return ((left & mask) * (right & mask)) >> bits;
-        }
-
-        private static ulong SignedElementMulHigh(ulong left, ulong right, int bits)
-        {
-            if (bits == 64)
-                return Mulh(SignExtendElement(left, bits), SignExtendElement(right, bits));
-            long product = SignExtendElement(left, bits) * SignExtendElement(right, bits);
-            return (ulong)(product >> bits) & ElementMask(bits);
-        }
-
-        private static ulong SignedUnsignedElementMulHigh(ulong left, ulong right, int bits)
-        {
-            if (bits == 64)
-                return Mulhsu(SignExtendElement(left, bits), right);
-            long product = SignExtendElement(left, bits) * (long)(right & ElementMask(bits));
-            return (ulong)(product >> bits) & ElementMask(bits);
         }
 
 
@@ -2699,6 +3051,158 @@ namespace Cnidaria.RiscV
                 return sign ? 1UL << 2 : 1UL << 5;
             }
             return sign ? 1UL << 1 : 1UL << 6;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryExecuteBitmanipImmediate(uint instruction, ulong source, out ulong result)
+        {
+            uint funct3 = instruction & Funct3Mask;
+
+            if (funct3 == 0x1000U)
+            {
+                int immediate = (int)((instruction >> 20) & 0xFFFU);
+                uint funct6 = instruction & Funct6Mask;
+                switch (immediate)
+                {
+                    case 0x600: result = (ulong)System.Numerics.BitOperations.LeadingZeroCount(source); return true;
+                    case 0x601: result = (ulong)System.Numerics.BitOperations.TrailingZeroCount(source); return true;
+                    case 0x602: result = (ulong)System.Numerics.BitOperations.PopCount(source); return true;
+                    case 0x604: result = (ulong)(long)(sbyte)source; return true;
+                    case 0x605: result = (ulong)(long)(short)source; return true;
+                }
+
+                switch (funct6)
+                {
+                    case 0x48000000U: result = source & ~(1UL << immediate & 63); return true;
+                    case 0x68000000U: result = source ^ (1UL << immediate & 63); return true;
+                    case 0x28000000U: result = source | (1UL << immediate & 63); return true;
+                }
+            }
+            else if (funct3 == 0x5000U)
+            {
+                int immediate = (int)((instruction >> 20) & 0xFFFU);
+                if (immediate == 0x287)
+                {
+                    result = OrCombineBytes(source); return true;
+                }
+                if (immediate == 0x6B8)
+                {
+                    result = BinaryPrimitives.ReverseEndianness(source); return true;
+                }
+                uint funct6 = instruction & Funct6Mask;
+                if (funct6 == 0x60000000U)
+                {
+                    result = System.Numerics.BitOperations.RotateRight(source, immediate & 63); return true;
+                }
+                if(funct6 == 0x48000000U)
+                {
+                    result = (source >> immediate & 63) & 1UL; return true;
+                }
+            }
+
+            result = 0;
+            return false;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryExecuteBitmanipRegister(uint instruction, ulong left, ulong right, out ulong result)
+        {
+            uint funct3 = instruction & Funct3Mask;
+            uint funct7 = instruction & Funct7Mask;
+
+            switch (funct7)
+            {
+                case 0x40000000U:
+                    switch (funct3)
+                    {
+                        case 0x4000U: result = ~(left ^ right); return true;
+                        case 0x6000U: result = left | ~right; return true;
+                        case 0x7000U: result = left & ~right; return true;
+                    }
+                    break;
+                case 0x0A000000U:
+                    switch (funct3)
+                    {
+                        case 0x1000U:
+                            CarrylessMultiply(left, right, out result, out _);
+                            return true;
+                        case 0x2000U:
+                            CarrylessMultiply(left, right, out ulong low, out ulong high);
+                            result = (high << 1) | (low >> 63);
+                            return true;
+                        case 0x3000U:
+                            CarrylessMultiply(left, right, out _, out result);
+                            return true;
+                        case 0x4000U: result = (long)left < (long)right ? left : right; return true;
+                        case 0x5000U: result = left < right ? left : right; return true;
+                        case 0x6000U: result = (long)left > (long)right ? left : right; return true;
+                        case 0x7000U: result = left > right ? left : right; return true;
+                    }
+                    break;
+                case 0x60000000U:
+                    switch (funct3)
+                    {
+                        case 0x1000U: result = System.Numerics.BitOperations.RotateLeft(left, (int)(right & 63)); return true;
+                        case 0x5000U: result = System.Numerics.BitOperations.RotateRight(left, (int)(right & 63)); return true;
+                    }
+                    break;
+                case 0x20000000U:
+                    switch (funct3)
+                    {
+                        case 0x2000U: result = (left << 1) + right; return true;
+                        case 0x4000U: result = (left << 2) + right; return true;
+                        case 0x6000U: result = (left << 3) + right; return true;
+                    }
+                    break;
+                case 0x48000000U:
+                    switch (funct3)
+                    {
+                        case 0x1000U: result = left & ~(1UL << (int)(right & 63)); return true;
+                        case 0x5000U: result = (left >> (int)(right & 63)) & 1UL; return true;
+                    }
+                    break;
+                case 0x68000000U:
+                    if (funct3 == 0x1000U)
+                    {
+                        result = left ^ (1UL << (int)(right & 63));
+                        return true;
+                    }
+                    break;
+                case 0x28000000U:
+                    if (funct3 == 0x1000U)
+                    {
+                        result = left | (1UL << (int)(right & 63));
+                        return true;
+                    }
+                    break;
+            }
+
+            result = 0;
+            return false;
+        }
+        
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong OrCombineBytes(ulong value)
+        {
+            ulong result = 0;
+            for (int shift = 0; shift < 64; shift += 8)
+            {
+                if (((value >> shift) & 0xFFUL) != 0)
+                    result |= 0xFFUL << shift;
+            }
+            return result;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void CarrylessMultiply(ulong left, ulong right, out ulong low, out ulong high)
+        {
+            low = 0;
+            high = 0;
+            while (right != 0)
+            {
+                int shift = System.Numerics.BitOperations.TrailingZeroCount(right);
+                low ^= left << shift;
+                if (shift != 0)
+                    high ^= left >> (64 - shift);
+                right &= right - 1;
+            }
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static long ImmI(uint instruction)
@@ -3105,7 +3609,27 @@ namespace Cnidaria.RiscV
         }
 
         public bool HasPendingInterrupt(int context)
-            => FindClaim(context) != 0;
+        {
+            if ((uint)context >= ContextCount)
+                return false;
+
+            uint active = _pending & _enable[context];
+            if (active == 0)
+                return false;
+
+            uint threshold = _threshold[context];
+
+            while (active != 0)
+            {
+                int source = System.Numerics.BitOperations.TrailingZeroCount(active);
+                if (_priority[source] > threshold)
+                    return true;
+
+                active &= active - 1;
+            }
+
+            return false;
+        }
 
         public ulong Read(ulong address, int size)
         {
@@ -3135,7 +3659,29 @@ namespace Cnidaria.RiscV
                     value = _threshold[context];
                 else if (contextOffset == 4)
                 {
-                    value = FindClaim(context);
+                    if ((uint)context >= ContextCount)
+                        Slice(0, (int)(offset & 3), size);
+                    uint active = _pending & _enable[context];
+                    if (active == 0)
+                        Slice(0, (int)(offset & 3), size);
+                    uint threshold = _threshold[context];
+                    uint best = 0;
+                    uint bestPriority = 0;
+
+                    while (active != 0)
+                    {
+                        int source = System.Numerics.BitOperations.TrailingZeroCount(active);
+                        uint priority = _priority[source];
+
+                        if (priority > threshold && priority > bestPriority)
+                        {
+                            best = (uint)source;
+                            bestPriority = priority;
+                        }
+
+                        active &= active - 1;
+                    }
+                    value = best;
                     if (value != 0)
                     {
                         uint bit = 1U << (int)value;
@@ -3195,27 +3741,6 @@ namespace Cnidaria.RiscV
             }
         }
 
-        private uint FindClaim(int context)
-        {
-            if ((uint)context >= ContextCount)
-                return 0;
-
-            uint active = _pending & _enable[context];
-            uint best = 0;
-            uint bestPriority = 0;
-            for (int source = 1; source < SourceCount; source++)
-            {
-                uint bit = 1U << source;
-                if ((active & bit) == 0)
-                    continue;
-                uint priority = _priority[source];
-                if (priority <= _threshold[context] || priority <= bestPriority)
-                    continue;
-                best = (uint)source;
-                bestPriority = priority;
-            }
-            return best;
-        }
 
         private static ulong Slice(uint value, int byteOffset, int size)
         {

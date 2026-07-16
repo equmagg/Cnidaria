@@ -148,6 +148,11 @@ namespace Cnidaria.Cs
         DelegateRemove,  // stack: delegate?,delegate? -> delegate?
         DelegateInvoke, // operand0: delegate Invoke method token, operand1: argCount, stack: delegate,args -> return?
 
+        // MD Arrays
+        NewMdarr,   // operand0: array Type token, operand1: rank, stack: lengths... -> arrayref
+        LdelemMd,   // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> value
+        LdelemaMd,  // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> byref
+        StelemMd,   // operand0: array Type token, operand1: rank, stack: arrayref, indices..., value ->
     }
     internal enum NumericConvKind : byte
     {
@@ -272,7 +277,7 @@ namespace Cnidaria.Cs
                 if (!StringComparer.Ordinal.Equals(metadata.GetString(row.Name), "Main"))
                     continue;
 
-                if (!IsStaticMainStringArraySignature(metadata.GetBlob(row.Signature)))
+                if (!IsStaticMainSignature(metadata.GetBlob(row.Signature)))
                     continue;
 
                 methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
@@ -283,7 +288,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static bool IsStaticMainStringArraySignature(ReadOnlySpan<byte> sig)
+        private static bool IsStaticMainSignature(ReadOnlySpan<byte> sig)
         {
             var r = new SigReader(sig);
             byte cc = r.ReadByte();
@@ -300,11 +305,15 @@ namespace Cnidaria.Cs
             }
 
             uint paramCount = r.ReadCompressedUInt();
-            if (paramCount != 1)
-                return false;
 
             // ret: void
             if ((SigElementType)r.ReadByte() != SigElementType.VOID)
+                return false;
+
+            if (paramCount == 0)
+                return true;
+
+            if (paramCount != 1)
                 return false;
 
             // arg0: string[]
@@ -1703,25 +1712,30 @@ namespace Cnidaria.Cs
                 }
                 if (assignment.Left is BoundArrayElementAccessExpression aea)
                 {
-                    if (aea.Indices.Length != 1)
-                        throw new NotSupportedException("Only single dimensional arrays are supported.");
+                    if (aea.Expression.Type is not ArrayTypeSymbol arrayType)
+                        throw new InvalidOperationException("Array element access receiver is not an array type.");
 
                     EmitExpression(aea.Expression, EmitMode.Value);
-                    EmitExpression(aea.Indices[0], EmitMode.Value);
+                    for (int i = 0; i < aea.Indices.Length; i++)
+                        EmitExpression(aea.Indices[i], EmitMode.Value);
                     EmitExpression(assignment.Right, EmitMode.Value);
 
-                    int elemTok = _tokens.GetTypeToken(aea.Type);
+                    bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
+                    bool useSzAccess = arrayType.IsSZArray || useLinearAccess;
+                    BytecodeOp storeOp = useSzAccess ? BytecodeOp.Stelem : BytecodeOp.StelemMd;
+                    int token = useSzAccess ? _tokens.GetTypeToken(aea.Type) : _tokens.GetTypeToken(arrayType);
+                    short pop = checked((short)(aea.Indices.Length + 2));
 
                     if (mode == EmitMode.Discard)
                     {
-                        _il.Emit(BytecodeOp.Stelem, operand0: elemTok, pop: 3, push: 0);
+                        _il.Emit(storeOp, operand0: token, operand1: arrayType.Rank, pop: pop, push: 0);
                         return;
                     }
 
                     int spill = AllocateSpillLocal(assignment.Type);
-                    _il.Emit(BytecodeOp.Dup, pop: 1, push: 2); // arr, idx, val, val
-                    _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0); // arr, idx, val
-                    _il.Emit(BytecodeOp.Stelem, operand0: elemTok, pop: 3, push: 0);
+                    _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                    _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0);
+                    _il.Emit(storeOp, operand0: token, operand1: arrayType.Rank, pop: pop, push: 0);
                     _il.Emit(BytecodeOp.Ldloc, operand0: spill, pop: 0, push: 1);
                     return;
                 }
@@ -1896,45 +1910,107 @@ namespace Cnidaria.Cs
                 if (ac.Type is not ArrayTypeSymbol at)
                     throw new InvalidOperationException("BoundArrayCreationExpression.Type is not an array type.");
 
-                if (at.Rank != 1 || ac.DimensionSizes.Length > 1)
-                    throw new NotSupportedException("Only single dimensional arrays are supported.");
-
-                if (ac.DimensionSizes.Length == 0)
+                if (at.IsSZArray)
                 {
-                    int len = ac.InitializerOpt?.Elements.Length ?? 0;
-                    _il.Emit(BytecodeOp.Ldc_I4, operand0: len, pop: 0, push: 1);
+                    if (ac.DimensionSizes.Length == 0)
+                    {
+                        int len = ac.InitializerOpt?.Elements.Length ?? 0;
+                        _il.Emit(BytecodeOp.Ldc_I4, operand0: len, pop: 0, push: 1);
+                    }
+                    else
+                    {
+                        EmitExpression(ac.DimensionSizes[0], EmitMode.Value);
+                    }
+
+                    int elemTok = _tokens.GetTypeToken(ac.ElementType);
+                    _il.Emit(BytecodeOp.Newarr, operand0: elemTok, pop: 1, push: 1);
+
+                    if (ac.InitializerOpt is not null)
+                    {
+                        var elems = ac.InitializerOpt.Elements;
+                        for (int i = 0; i < elems.Length; i++)
+                        {
+                            _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                            _il.Emit(BytecodeOp.Ldc_I4, operand0: i, pop: 0, push: 1);
+                            EmitExpression(elems[i], EmitMode.Value);
+                            _il.Emit(BytecodeOp.Stelem, operand0: elemTok, pop: 3, push: 0);
+                        }
+                    }
                 }
                 else
                 {
-                    EmitExpression(ac.DimensionSizes[0], EmitMode.Value);
-                }
-                int elemTok = _tokens.GetTypeToken(ac.ElementType);
-                _il.Emit(BytecodeOp.Newarr, operand0: elemTok, pop: 1, push: 1);
+                    if (ac.DimensionSizes.Length != at.Rank)
+                        throw new InvalidOperationException("Multidimensional array dimension count does not match its rank.");
 
-                if (ac.InitializerOpt is not null)
-                {
-                    var elems = ac.InitializerOpt.Elements;
-                    for (int i = 0; i < elems.Length; i++)
-                    {
-                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);                 // arr, arr
-                        _il.Emit(BytecodeOp.Ldc_I4, operand0: i, pop: 0, push: 1); // arr, arr, i
-                        EmitExpression(elems[i], EmitMode.Value);                  // arr, arr, i, val
-                        _il.Emit(BytecodeOp.Stelem, operand0: elemTok, pop: 3, push: 0);
-                    }
+                    for (int i = 0; i < ac.DimensionSizes.Length; i++)
+                        EmitExpression(ac.DimensionSizes[i], EmitMode.Value);
+
+                    int arrayTok = _tokens.GetTypeToken(at);
+                    _il.Emit(BytecodeOp.NewMdarr, operand0: arrayTok, operand1: at.Rank, pop: checked((short)at.Rank), push: 1);
+
+                    if (ac.InitializerOpt is not null)
+                        EmitMdArrayInitializer(at, ac.InitializerOpt, arrayTok);
                 }
+
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            private void EmitMdArrayInitializer(ArrayTypeSymbol arrayType, BoundArrayInitializerExpression initializer, int arrayToken)
+            {
+                var indices = new int[arrayType.Rank];
+                EmitLevel(initializer, 0);
+
+                void EmitLevel(BoundArrayInitializerExpression current, int dimension)
+                {
+                    for (int i = 0; i < current.Elements.Length; i++)
+                    {
+                        indices[dimension] = i;
+                        if (dimension + 1 < arrayType.Rank)
+                        {
+                            if (current.Elements[i] is not BoundArrayInitializerExpression nested)
+                                throw new InvalidOperationException("Invalid multidimensional array initializer shape.");
+                            EmitLevel(nested, dimension + 1);
+                            continue;
+                        }
+
+                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                        for (int d = 0; d < indices.Length; d++)
+                            _il.Emit(BytecodeOp.Ldc_I4, operand0: indices[d], pop: 0, push: 1);
+                        EmitExpression(current.Elements[i], EmitMode.Value);
+                        _il.Emit(
+                            BytecodeOp.StelemMd,
+                            operand0: arrayToken,
+                            operand1: arrayType.Rank,
+                            pop: checked((short)(arrayType.Rank + 2)),
+                            push: 0);
+                    }
+                }
+            }
             private void EmitArrayElementAccess(BoundArrayElementAccessExpression aea, EmitMode mode)
             {
-                if (aea.Indices.Length != 1)
-                    throw new NotSupportedException("Only single dimensional arrays are supported.");
+                if (aea.Expression.Type is not ArrayTypeSymbol arrayType)
+                    throw new InvalidOperationException("Array element access receiver is not an array type.");
 
                 EmitExpression(aea.Expression, EmitMode.Value);
-                EmitExpression(aea.Indices[0], EmitMode.Value);
+                for (int i = 0; i < aea.Indices.Length; i++)
+                    EmitExpression(aea.Indices[i], EmitMode.Value);
 
-                int elemTok = _tokens.GetTypeToken(aea.Type);
-                _il.Emit(BytecodeOp.Ldelem, operand0: elemTok, pop: 2, push: 1);
+                bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
+                if (arrayType.IsSZArray || useLinearAccess)
+                {
+                    int elemTok = _tokens.GetTypeToken(aea.Type);
+                    _il.Emit(BytecodeOp.Ldelem, operand0: elemTok, pop: 2, push: 1);
+                }
+                else
+                {
+                    int arrayTok = _tokens.GetTypeToken(arrayType);
+                    _il.Emit(
+                        BytecodeOp.LdelemMd,
+                        operand0: arrayTok,
+                        operand1: arrayType.Rank,
+                        pop: checked((short)(arrayType.Rank + 1)),
+                        push: 1);
+                }
 
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
@@ -2962,14 +3038,29 @@ namespace Cnidaria.Cs
                         }
                     case BoundArrayElementAccessExpression aea:
                         {
-                            if (aea.Indices.Length != 1)
-                                throw new NotSupportedException("Only single dimensional arrays are supported.");
+                            if (aea.Expression.Type is not ArrayTypeSymbol arrayType)
+                                throw new InvalidOperationException("Array element access receiver is not an array type.");
 
                             EmitExpression(aea.Expression, EmitMode.Value);
-                            EmitExpression(aea.Indices[0], EmitMode.Value);
+                            for (int i = 0; i < aea.Indices.Length; i++)
+                                EmitExpression(aea.Indices[i], EmitMode.Value);
 
-                            int elemTok = _tokens.GetTypeToken(aea.Type);
-                            _il.Emit(BytecodeOp.Ldelema, operand0: elemTok, pop: 2, push: 1);
+                            bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
+                            if (arrayType.IsSZArray || useLinearAccess)
+                            {
+                                int elemTok = _tokens.GetTypeToken(aea.Type);
+                                _il.Emit(BytecodeOp.Ldelema, operand0: elemTok, pop: 2, push: 1);
+                            }
+                            else
+                            {
+                                int arrayTok = _tokens.GetTypeToken(arrayType);
+                                _il.Emit(
+                                    BytecodeOp.LdelemaMd,
+                                    operand0: arrayTok,
+                                    operand1: arrayType.Rank,
+                                    pop: checked((short)(arrayType.Rank + 1)),
+                                    push: 1);
+                            }
                         }
                         return;
                     case BoundParameterExpression par:

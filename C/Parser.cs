@@ -947,7 +947,7 @@ namespace Cnidaria.C
             var openParen = MatchToken(SyntaxKind.OpenParenToken);
             var typeNameTokens = ReadTypeNameTokens();
             var closeParen = MatchToken(SyntaxKind.CloseParenToken);
-            var expression = ParseUnaryExpression();
+            var expression = ParseCastOperandExpression();
 
             return new CastExpressionSyntax(
                 openParen,
@@ -956,11 +956,19 @@ namespace Cnidaria.C
                 expression);
         }
 
+        private ExpressionSyntax ParseCastOperandExpression()
+        {
+            if (IsCastExpressionStart())
+                return ParseCastExpression();
+
+            return ParseUnaryExpression();
+        }
+
         private SizeofExpressionSyntax ParseSizeofExpression()
         {
             var keyword = NextToken();
 
-            if (Current.Kind == SyntaxKind.OpenParenToken && IsTypeNameStart(Peek(1).Kind))
+            if (Current.Kind == SyntaxKind.OpenParenToken && IsTypeNameStart(Peek(1)))
             {
                 var openParen = MatchToken(SyntaxKind.OpenParenToken);
                 var typeNameTokens = ReadTypeNameTokens();
@@ -1537,10 +1545,9 @@ namespace Cnidaria.C
                 _ => false,
             };
         }
-
-        private static bool IsTypeNameStart(SyntaxKind kind)
+        private bool IsTypeNameStart(SyntaxToken token)
         {
-            return kind switch
+            return token.Kind switch
             {
                 SyntaxKind.VoidKeyword or
                 SyntaxKind.CharKeyword or
@@ -1591,13 +1598,13 @@ namespace Cnidaria.C
         private bool IsCastExpressionStart()
         {
             return Current.Kind == SyntaxKind.OpenParenToken &&
-                   IsTypeNameStart(Peek(1).Kind);
+                   IsTypeNameStart(Peek(1));
         }
 
         private bool IsCompoundLiteralExpressionStart()
         {
             if (Current.Kind != SyntaxKind.OpenParenToken ||
-                !IsTypeNameStart(Peek(1).Kind))
+                !IsTypeNameStart(Peek(1)))
                 return false;
 
             var depth = 0;

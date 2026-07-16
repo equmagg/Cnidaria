@@ -301,7 +301,7 @@ namespace Cnidaria.Cs
             }
         }
         private readonly NamedTypeSymbol[] _specialTypes;
-        private readonly Dictionary<(TypeSymbol elem, int rank), ArrayTypeSymbol> _arrayTypes = new();
+        private readonly Dictionary<(TypeSymbol elem, int rank, bool isSZArray), ArrayTypeSymbol> _arrayTypes = new();
         private readonly Dictionary<TypeSymbol, PointerTypeSymbol> _pointerTypes = new();
         private readonly Dictionary<TupleTypeKey, TupleTypeSymbol> _tupleTypes = new();
         private readonly Dictionary<TypeSymbol, ByRefTypeSymbol> _byRefTypes = new();
@@ -417,18 +417,23 @@ namespace Cnidaria.Cs
             return tt;
         }
         public ArrayTypeSymbol GetArrayType(TypeSymbol elementType, int rank)
+            => GetArrayType(elementType, rank, isSZArray: rank == 1);
+        public ArrayTypeSymbol GetArrayType(TypeSymbol elementType, int rank, bool isSZArray)
         {
-            if (rank <= 0) rank = 1;
+            if (rank <= 0)
+                rank = 1;
+            if (isSZArray && rank != 1)
+                throw new ArgumentException("SZ array rank must be one.", nameof(rank));
 
-            if (!_arrayTypes.TryGetValue((elementType, rank), out var at))
+            if (!_arrayTypes.TryGetValue((elementType, rank, isSZArray), out var at))
             {
                 var arrayBase = GetSpecialType(SpecialType.System_Array);
                 var ifaces = _arrayInterfacesBound
-                    ? BuildArrayInterfaces(elementType, rank)
+                    ? BuildArrayInterfaces(elementType, rank, isSZArray)
                     : ImmutableArray<TypeSymbol>.Empty;
 
-                _arrayTypes[(elementType, rank)] = at =
-                    new ArrayTypeSymbol(elementType, rank, arrayBase, ifaces);
+                _arrayTypes[(elementType, rank, isSZArray)] = at =
+                    new ArrayTypeSymbol(elementType, rank, isSZArray, arrayBase, ifaces);
             }
 
             return at;
@@ -589,9 +594,9 @@ namespace Cnidaria.Cs
             _arrayInterfacesBound = true;
 
             foreach (var arr in _arrayTypes.Values)
-                arr.SetInterfaces(BuildArrayInterfaces(arr.ElementType, arr.Rank));
+                arr.SetInterfaces(BuildArrayInterfaces(arr.ElementType, arr.Rank, arr.IsSZArray));
         }
-        private ImmutableArray<TypeSymbol> BuildArrayInterfaces(TypeSymbol elementType, int rank)
+        private ImmutableArray<TypeSymbol> BuildArrayInterfaces(TypeSymbol elementType, int rank, bool isSZArray)
         {
             var b = ImmutableArray.CreateBuilder<TypeSymbol>(8);
 
@@ -599,7 +604,7 @@ namespace Cnidaria.Cs
             AddIfPresent(_arrayICollection);
             AddIfPresent(_arrayIList);
 
-            if (rank == 1)
+            if (isSZArray)
             {
                 AddConstructedIfPresent(_arrayGenericIEnumerableDef, elementType);
                 AddConstructedIfPresent(_arrayGenericICollectionDef, elementType);
@@ -810,6 +815,8 @@ namespace Cnidaria.Cs
             => _types.GetPointerType(pointedAtType);
         public ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank)
             => _types.GetArrayType(elementType, rank);
+        internal ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank, bool isSZArray)
+            => _types.GetArrayType(elementType, rank, isSZArray);
         public TupleTypeSymbol CreateTupleType(ImmutableArray<TypeSymbol> elementTypes, ImmutableArray<string?> elementNames)
             => _types.GetTupleType(elementTypes, elementNames);
         public ByRefTypeSymbol CreateByRefType(TypeSymbol elementType)
@@ -975,6 +982,12 @@ namespace Cnidaria.Cs
                 foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
                 {
                     var body = (BoundMethodBody)model.GetBoundNode(owner);
+                    if (body.Method.IsStatic &&
+                        body.Method.Parameters.Length == 0 &&
+                        StringComparer.Ordinal.Equals(body.Method.Name, ".cctor"))
+                    {
+                        body = PrependTypeInitializerStatements(compilation, tree, model, body);
+                    }    
                     EmitBody(body);
                 }
                 foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
@@ -1018,6 +1031,40 @@ namespace Cnidaria.Cs
             SemanticModel model,
             MethodSymbol cctor)
         {
+            var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
+            stmts.AddRange(BuildTypeInitializerStatements(compilation, tree, model, cctor));
+            stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
+            var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
+            return new BoundMethodBody(tree.Root, cctor, block);
+        }
+
+        private static BoundMethodBody PrependTypeInitializerStatements(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            BoundMethodBody body)
+        {
+            var initializers = BuildTypeInitializerStatements(compilation, tree, model, body.Method);
+            if (initializers.IsDefaultOrEmpty)
+                return body;
+
+            int bodyStatementCount = body.Body is BoundBlockStatement block ? block.Statements.Length : 1;
+            var stmts = ImmutableArray.CreateBuilder<BoundStatement>(initializers.Length + bodyStatementCount);
+            stmts.AddRange(initializers);
+            if (body.Body is BoundBlockStatement bodyBlock)
+                stmts.AddRange(bodyBlock.Statements);
+            else
+                stmts.Add(body.Body);
+
+            return new BoundMethodBody(body.Syntax, body.Method, new BoundBlockStatement(body.Body.Syntax, stmts.ToImmutable()));
+        }
+
+        private static ImmutableArray<BoundStatement> BuildTypeInitializerStatements(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            MethodSymbol cctor)
+        {
             var bag = new DiagnosticBag();
 
             IBindingRecorder recorder =
@@ -1028,7 +1075,6 @@ namespace Cnidaria.Cs
             var exprBinder = new LocalScopeBinder(parent: typeBinder, flags: BinderFlags.InMethod, containing: cctor);
 
             var ctx = new BindingContext(compilation, model, cctor, recorder);
-
             var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
 
             var ownerType = (NamedTypeSymbol)cctor.ContainingSymbol!;
@@ -1070,9 +1116,7 @@ namespace Cnidaria.Cs
                 stmts.Add(new BoundExpressionStatement(vd, ass));
             }
 
-            stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
-            var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
-            return new BoundMethodBody(tree.Root, cctor, block);
+            return stmts.ToImmutable();
         }
         private static IEnumerable<SynthesizedConstructorSymbol> EnumerateSynthesizedInstanceCtorsInTree(
             Compilation compilation, SyntaxTree tree)

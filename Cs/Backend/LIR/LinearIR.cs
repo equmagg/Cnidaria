@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    
+
     internal enum GenTreeValueOrigin : byte
     {
         TreeNode,
@@ -90,6 +90,7 @@ namespace Cnidaria.Cs
         DefinesTrackedLocal = 1 << 7,
 
         UnusedValue = 1 << 8,
+        CallerSavedRegistersPreserved = 1 << 9,
     }
     internal enum LirOperandFlags : ushort
     {
@@ -235,10 +236,19 @@ namespace Cnidaria.Cs
     internal sealed class GenTreeLinearLoweringClassifier
     {
         private readonly TargetInfo _target;
+        private readonly bool _nonCallOperationsClobberCallerSavedRegisters;
 
         public GenTreeLinearLoweringClassifier(TargetInfo target)
+            : this(target, !target.IsRegisterBytecode)
+        {
+        }
+
+        public GenTreeLinearLoweringClassifier(
+            TargetInfo target,
+            bool nonCallOperationsClobberCallerSavedRegisters)
         {
             _target = target ?? throw new ArgumentNullException(nameof(target));
+            _nonCallOperationsClobberCallerSavedRegisters = nonCallOperationsClobberCallerSavedRegisters;
         }
 
         public GenTreeLinearLoweringInfo Classify(GenTree source, GenTree? result, ImmutableArray<GenTree> uses, int blockId, LinearMemoryAccess memoryAccess)
@@ -262,7 +272,9 @@ namespace Cnidaria.Cs
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
             else if (MayClobberCallerSaved(source))
-                flags |= GenTreeLinearFlags.CallerSavedKill;
+                flags |= _nonCallOperationsClobberCallerSavedRegisters
+                    ? GenTreeLinearFlags.CallerSavedKill
+                    : GenTreeLinearFlags.CallerSavedRegistersPreserved;
 
             if (IsGcSafePoint(source, blockId))
                 flags |= GenTreeLinearFlags.GcSafePoint;
@@ -526,6 +538,7 @@ namespace Cnidaria.Cs
         public static bool IsAbiCall(GenTree source)
         {
             return source.Kind is
+                GenTreeKind.ClassInit or
                 GenTreeKind.Call or
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
@@ -537,8 +550,42 @@ namespace Cnidaria.Cs
             if (IsAbiCall(source))
                 return true;
 
-            if (source.Kind is GenTreeKind.Throw or GenTreeKind.Rethrow)
+            if (source.Kind is
+                GenTreeKind.NewArray or
+                GenTreeKind.NewDelegate or
+                GenTreeKind.DelegateCombine or
+                GenTreeKind.DelegateRemove or
+                GenTreeKind.Box or
+                GenTreeKind.CastClass or
+                GenTreeKind.UnboxAny or
+                GenTreeKind.Throw or
+                GenTreeKind.Rethrow)
                 return true;
+
+            if (source.Kind == GenTreeKind.Branch && source.SourceOp == BytecodeOp.Leave)
+                return true;
+
+            if (source.Kind == GenTreeKind.Binary && source.SourceOp is
+                BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
+                BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
+                BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un or
+                BytecodeOp.Div or BytecodeOp.Div_Un or
+                BytecodeOp.Rem or BytecodeOp.Rem_Un)
+            {
+                return true;
+            }
+
+            if (source.Kind == GenTreeKind.Conv && (source.ConvFlags & NumericConvFlags.Checked) != 0)
+                return true;
+
+            if (source.Kind is
+                GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or
+                GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or
+                GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
+                GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
+            {
+                return true;
+            }
 
             return false;
         }
@@ -579,6 +626,7 @@ namespace Cnidaria.Cs
             return source.Kind switch
             {
                 GenTreeKind.Nop => false,
+                GenTreeKind.ClassInit => false,
                 GenTreeKind.ConstI4 => false,
                 GenTreeKind.ConstI8 => false,
                 GenTreeKind.ConstR4Bits => false,

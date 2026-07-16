@@ -2347,8 +2347,8 @@ namespace Cnidaria.Cs
                 BoundExpression collection,
                 BoundStatement body)
             {
-                if (collection.Type is not ArrayTypeSymbol arrayType || arrayType.Rank != 1)
-                    throw new NotSupportedException("foreach lowering for multidimensional arrays is not implemented.");
+                if (collection.Type is not ArrayTypeSymbol arrayType)
+                    throw new InvalidOperationException("Expected array expression in foreach lowering.");
 
                 var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
                 var boolType = _compilation.GetSpecialType(SpecialType.System_Boolean);

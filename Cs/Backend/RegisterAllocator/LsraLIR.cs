@@ -316,6 +316,13 @@ namespace Cnidaria.Cs
                 throw new ArgumentOutOfRangeException(nameof(linearId));
 
             var node = SyntheticNode(id, GenTreeKind.GcPoll);
+            var sourceLowering = source?.LinearLowering ?? default;
+            node.LinearLowering = new GenTreeLinearLoweringInfo(
+                sourceLowering.Flags |
+                GenTreeLinearFlags.IsStandaloneLoweredNode |
+                GenTreeLinearFlags.GcSafePoint,
+                sourceLowering.InternalGeneralRegisters,
+                sourceLowering.InternalFloatRegisters);
             return Attach(
                 node,
                 id,

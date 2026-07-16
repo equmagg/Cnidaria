@@ -1,4 +1,4 @@
-typedef unsigned char u8;
+﻿typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -30,6 +30,7 @@ typedef unsigned long usize;
 #define PTE_U 0x010ul
 #define PTE_A 0x040ul
 #define PTE_D 0x080ul
+#define PTE_SOFT_NOACCESS 0x100ul
 #define SATP_MODE_SV39 0x8000000000000000ul
 #define ELF_PF_X 1u
 #define ELF_PF_W 2u
@@ -115,6 +116,7 @@ typedef unsigned long usize;
 #define TCSETSW 0x5403ul
 #define TCSETSF 0x5404ul
 #define MAX_PROCESSES 16u
+#define MAX_VM_REGIONS 64u
 #define MAX_EXEC_ARGS 16u
 #define MAX_EXEC_ARG_BYTES 512u
 #define PROC_UNUSED 0u
@@ -122,6 +124,7 @@ typedef unsigned long usize;
 #define PROC_RUNNING 2u
 #define PROC_WAITING 3u
 #define PROC_ZOMBIE 4u
+#define PROC_VFORK 5u
 #define DEFAULT_TIME_SLICE 4u
 #define TIMER_INTERVAL 50000ul
 #define CLINT_MTIME_OFFSET 0xbff8ul
@@ -194,6 +197,22 @@ struct block_device
     int present;
 };
 
+struct virtq_descriptor
+{
+    u64 address;
+    u32 length;
+    u16 flags;
+    u16 next;
+};
+
+struct virtio_block_request
+{
+    u32 type;
+    u32 reserved;
+    u64 sector;
+    u8 status;
+};
+
 struct vfs_node
 {
     u32 type;
@@ -210,6 +229,15 @@ struct file_descriptor
     struct vfs_node node;
 };
 
+struct vm_region
+{
+    u64 start;
+    u64 end;
+    u64 prot;
+    u64 flags;
+    u32 used;
+};
+
 struct process
 {
     u32 used;
@@ -218,6 +246,7 @@ struct process
     u32 ppid;
     u32 exit_status;
     u32 time_slice;
+    u32 vfork_parent_pid;
     u64 root_page_table;
     u64 brk;
     u64 brk_min;
@@ -226,6 +255,7 @@ struct process
     u64 wait_status_pointer;
     struct trap_frame frame;
     struct file_descriptor files[MAX_OPEN_FILES];
+    struct vm_region vm_regions[MAX_VM_REGIONS];
 };
 
 extern void kernel_enter_user(u64 entry, u64 stack);
@@ -236,18 +266,22 @@ static u64 kernel_root_page_table;
 static u64 current_user_root_page_table;
 static u64 free_page_cursor;
 static u64 free_page_end;
+static u64 free_page_list;
 static u64 process_brk;
 static u64 process_brk_min;
 static u64 user_mmap_cursor;
-static u32 virtio_avail_index;
-static u32 virtio_used_index;
-static u64 virtq_desc[16];
+static u64 virtio_avail_index;
+static struct virtq_descriptor virtq_desc[VIRTIO_QUEUE_SIZE];
 static u16 virtq_avail[2 + VIRTIO_QUEUE_SIZE];
 static u16 virtq_used_raw[2 + VIRTIO_QUEUE_SIZE * 4];
-static u8 virtio_request[17];
+static struct virtio_block_request virtio_request;
 static u8 sector_buffer[SECTOR_SIZE];
 static u8 fat_buffer[SECTOR_SIZE];
 static u8 dir_buffer[SECTOR_SIZE];
+static u32 fat_buffer_lba;
+static u32 dir_buffer_lba;
+static u64 fat_buffer_valid;
+static u64 dir_buffer_valid;
 static struct block_device root_block_device;
 static struct process processes[MAX_PROCESSES];
 static struct process* current_task;
@@ -270,12 +304,25 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
 
 static u64 align_down(u64 value, u64 alignment)
 {
-    return value & ~(alignment - 1ul);
+    __asm__ volatile(
+        "addi %[alignment], %[alignment], -1\n"
+        "andn %[value], %[value], %[alignment]"
+        : [value] "+{a0}"(value), [alignment] "+{a1}"(alignment)
+        :
+        : );
+    return value;
 }
 
 static u64 align_up(u64 value, u64 alignment)
 {
-    return (value + alignment - 1ul) & ~(alignment - 1ul);
+    __asm__ volatile(
+        "addi %[alignment], %[alignment], -1\n"
+        "add %[value], %[value], %[alignment]\n"
+        "andn %[value], %[value], %[alignment]"
+        : [value] "+{a0}"(value), [alignment] "+{a1}"(alignment)
+        :
+        : );
+    return value;
 }
 
 static void fence_rw(void)
@@ -283,19 +330,23 @@ static void fence_rw(void)
     __asm__ volatile("fence rw, rw" : : : "memory");
 }
 
-static volatile u8* mmio8(u64 address)
-{
-    return (volatile u8*)address;
-}
-
 static u8 mmio_read8(u64 address)
 {
-    return *mmio8(address);
+    __asm__ volatile(
+        "lbu %[address], 0(%[address])"
+        : [address] "+{a0}"(address)
+        :
+        : "memory");
+    return (u8)address;
 }
 
 static void mmio_write8(u64 address, u8 value)
 {
-    *mmio8(address) = value;
+    __asm__ volatile(
+        "sb %[value], 0(%[address])"
+        :
+    : [address] "{a0}"(address), [value] "{a1}"((u64)value)
+        : "memory");
 }
 
 static void sbi_putchar(int ch)
@@ -314,30 +365,92 @@ static void sbi_system_reset(u64 reset_type, u64 reset_reason)
 
 static int uart_can_read(void)
 {
-    return (mmio_read8(boot_device.uart_base + 5ul) & 1u) != 0u;
+    u64 value = boot_device.uart_base;
+    __asm__ volatile(
+        "lbu a1, 5(%[value])\n"
+        "andi %[value], a1, 1"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (int)value;
 }
 
 static int uart_try_read(void)
 {
-    if (!uart_can_read())
-        return -1;
-    return (int)mmio_read8(boot_device.uart_base);
+    u64 value = boot_device.uart_base;
+    __asm__ volatile(
+        "lbu a1, 5(%[value])\n"
+        "andi a1, a1, 1\n"
+        "beq a1, zero, .Luart_try_read_empty_%=\n"
+        "lbu %[value], 0(%[value])\n"
+        "jal zero, .Luart_try_read_done_%=\n"
+        ".Luart_try_read_empty_%=:\n"
+        "addi %[value], zero, -1\n"
+        ".Luart_try_read_done_%=:"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (int)value;
 }
 
 static int uart_read_blocking(void)
 {
-    while (!uart_can_read())
-    {
-    }
-    return (int)mmio_read8(boot_device.uart_base);
+    u64 value = boot_device.uart_base;
+    __asm__ volatile(
+        ".Luart_read_wait_%=:\n"
+        "lbu a1, 5(%[value])\n"
+        "andi a1, a1, 1\n"
+        "beq a1, zero, .Luart_read_wait_%=\n"
+        "lbu %[value], 0(%[value])"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (int)value;
 }
 
 static void uart_putchar(int ch)
 {
-    while ((mmio_read8(boot_device.uart_base + 5ul) & 32u) == 0u)
-    {
-    }
-    mmio_write8(boot_device.uart_base, (u8)ch);
+    u64 base = boot_device.uart_base;
+    u64 value = (u64)(u8)ch;
+    __asm__ volatile(
+        ".Luart_putchar_wait_%=:\n"
+        "lbu a2, 5(%[base])\n"
+        "andi a2, a2, 32\n"
+        "beq a2, zero, .Luart_putchar_wait_%=\n"
+        "sb %[value], 0(%[base])"
+        :
+    : [base] "{a0}"(base), [value] "{a1}"(value)
+        : "memory");
+}
+
+static void uart_write_buffer(const u8* data, u64 count)
+{
+    u64 base = boot_device.uart_base;
+    __asm__ volatile(
+        "beq %[count], zero, .Luart_write_done_%=\n"
+        ".Luart_write_next_%=:\n"
+        "lbu a3, 0(%[data])\n"
+        "addi %[data], %[data], 1\n"
+        "addi %[count], %[count], -1\n"
+        "addi a4, zero, 10\n"
+        "bne a3, a4, .Luart_write_char_%=\n"
+        ".Luart_write_cr_wait_%=:\n"
+        "lbu a4, 5(%[base])\n"
+        "andi a4, a4, 32\n"
+        "beq a4, zero, .Luart_write_cr_wait_%=\n"
+        "addi a4, zero, 13\n"
+        "sb a4, 0(%[base])\n"
+        ".Luart_write_char_%=:\n"
+        ".Luart_write_char_wait_%=:\n"
+        "lbu a4, 5(%[base])\n"
+        "andi a4, a4, 32\n"
+        "beq a4, zero, .Luart_write_char_wait_%=\n"
+        "sb a3, 0(%[base])\n"
+        "bne %[count], zero, .Luart_write_next_%=\n"
+        ".Luart_write_done_%=:"
+        :
+    : [data] "{a0}"(data), [count] "{a1}"(count), [base] "{a2}"(base)
+        : "memory");
 }
 
 static void console_putchar_raw(int ch)
@@ -431,21 +544,22 @@ static void mem_copy(void* dst, const void* src, u64 count)
 {
     u8* d = (u8*)dst;
     const u8* s = (const u8*)src;
+
 #if __riscv_vector
-    while (count != 0ul)
-    {
-        u64 vl;
-        __asm__ volatile(
-            "vsetvli %[vl], %[count], e8, m8, ta, ma\n"
-            "vle8.v v8, (%[src])\n"
-            "vse8.v v8, (%[dst])"
-            : [vl] "={a3}"(vl)
-            : [count] "{a0}"(count), [src] "{a1}"(s), [dst] "{a2}"(d)
-            : "memory");
-        d = d + vl;
-        s = s + vl;
-        count = count - vl;
-    }
+    __asm__ volatile(
+        "beq %[count], zero, .Lmem_copy_done_%=\n"
+        ".Lmem_copy_loop_%=:\n"
+        "vsetvli a3, %[count], e8, m8, ta, ma\n"
+        "vle8.v v8, (%[src])\n"
+        "vse8.v v8, (%[dst])\n"
+        "add %[dst], %[dst], a3\n"
+        "add %[src], %[src], a3\n"
+        "sub %[count], %[count], a3\n"
+        "bne %[count], zero, .Lmem_copy_loop_%=\n"
+        ".Lmem_copy_done_%=:"
+        :
+    : [dst] "{a0}"(d), [src] "{a1}"(s), [count] "{a2}"(count)
+        : "memory");
 #else
     while (count != 0ul && ((((u64)d | (u64)s) & 7ul) != 0ul))
     {
@@ -455,33 +569,34 @@ static void mem_copy(void* dst, const void* src, u64 count)
         count = count - 1ul;
     }
 
+    u64* dwords = (u64*)d;
+    const u64* swords = (const u64*)s;
+
+    while (count >= 64ul)
     {
-        u64* dwords = (u64*)d;
-        const u64* swords = (const u64*)s;
-        while (count >= 64ul)
-        {
-            dwords[0] = swords[0];
-            dwords[1] = swords[1];
-            dwords[2] = swords[2];
-            dwords[3] = swords[3];
-            dwords[4] = swords[4];
-            dwords[5] = swords[5];
-            dwords[6] = swords[6];
-            dwords[7] = swords[7];
-            dwords = dwords + 8;
-            swords = swords + 8;
-            count = count - 64ul;
-        }
-        while (count >= 8ul)
-        {
-            *dwords = *swords;
-            dwords = dwords + 1;
-            swords = swords + 1;
-            count = count - 8ul;
-        }
-        d = (u8*)dwords;
-        s = (const u8*)swords;
+        dwords[0] = swords[0];
+        dwords[1] = swords[1];
+        dwords[2] = swords[2];
+        dwords[3] = swords[3];
+        dwords[4] = swords[4];
+        dwords[5] = swords[5];
+        dwords[6] = swords[6];
+        dwords[7] = swords[7];
+        dwords = dwords + 8;
+        swords = swords + 8;
+        count = count - 64ul;
     }
+
+    while (count >= 8ul)
+    {
+        *dwords = *swords;
+        dwords = dwords + 1;
+        swords = swords + 1;
+        count = count - 8ul;
+    }
+
+    d = (u8*)dwords;
+    s = (const u8*)swords;
 
     while (count != 0ul)
     {
@@ -498,21 +613,22 @@ static void mem_zero(void* dst, u64 count)
     u8* bytes = (u8*)dst;
 
 #if __riscv_vector
-    while (count != 0ul)
-    {
-        u64 vl;
-        __asm__ volatile(
-            "vsetvli %[vl], %[count], e8, m8, ta, ma\n"
-            "vxor.vv v8, v8, v8\n"
-            "vse8.v v8, (%[dst])"
-            : [vl] "={a2}"(vl)
-            : [count] "{a0}"(count), [dst] "{a1}"(bytes)
-            : "memory");
-        bytes = bytes + vl;
-        count = count - vl;
-    }
+    __asm__ volatile(
+        "beq %[count], zero, .Lmem_zero_done_%=\n"
+        "vsetvli a2, zero, e8, m8, ta, ma\n"
+        "vxor.vv v8, v8, v8\n"
+        ".Lmem_zero_loop_%=:\n"
+        "vsetvli a2, %[count], e8, m8, ta, ma\n"
+        "vse8.v v8, (%[dst])\n"
+        "add %[dst], %[dst], a2\n"
+        "sub %[count], %[count], a2\n"
+        "bne %[count], zero, .Lmem_zero_loop_%=\n"
+        ".Lmem_zero_done_%=:"
+        :
+    : [dst] "{a0}"(bytes), [count] "{a1}"(count)
+        : "memory");
 #else
-    while (count != 0ul && (((u64)bytes & 7ul) != 0ul)) 
+    while (count != 0ul && (((u64)bytes & 7ul) != 0ul))
     {
         *bytes = 0;
         bytes = bytes + 1;
@@ -539,59 +655,139 @@ static void mem_zero(void* dst, u64 count)
 #endif
 }
 
-static int mem_equal(const void* a, const void* b, u64 count)
-{
-    const u8* x = (const u8*)a;
-    const u8* y = (const u8*)b;
-    while (count != 0)
-    {
-        if (*x != *y)
-            return 0;
-        x = x + 1;
-        y = y + 1;
-        count = count - 1;
-    }
-    return 1;
-}
-
 static u16 le16(const u8* p)
 {
-    return (u16)((u16)p[0] | ((u16)p[1] << 8));
+    u64 value = (u64)p;
+    __asm__ volatile(
+        "lbu a1, 0(%[value])\n"
+        "lbu a2, 1(%[value])\n"
+        "slli a2, a2, 8\n"
+        "or %[value], a1, a2"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (u16)value;
 }
 
 static u32 le32(const u8* p)
 {
-    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    u64 value = (u64)p;
+    __asm__ volatile(
+        "lbu a1, 0(%[value])\n"
+        "lbu a2, 1(%[value])\n"
+        "lbu a3, 2(%[value])\n"
+        "lbu a4, 3(%[value])\n"
+        "slli a2, a2, 8\n"
+        "slli a3, a3, 16\n"
+        "slli a4, a4, 24\n"
+        "or a1, a1, a2\n"
+        "or a3, a3, a4\n"
+        "or %[value], a1, a3"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (u32)value;
 }
 
 static u64 le64(const u8* p)
 {
-    return (u64)le32(p) | ((u64)le32(p + 4) << 32);
+    u64 value = (u64)p;
+    __asm__ volatile(
+        "lbu a1, 0(%[value])\n"
+        "lbu a2, 1(%[value])\n"
+        "lbu a3, 2(%[value])\n"
+        "lbu a4, 3(%[value])\n"
+        "lbu a5, 4(%[value])\n"
+        "lbu a6, 5(%[value])\n"
+        "lbu t0, 6(%[value])\n"
+        "lbu t1, 7(%[value])\n"
+        "slli a2, a2, 8\n"
+        "slli a3, a3, 16\n"
+        "slli a4, a4, 24\n"
+        "slli a5, a5, 32\n"
+        "slli a6, a6, 40\n"
+        "slli t0, t0, 48\n"
+        "slli t1, t1, 56\n"
+        "or a1, a1, a2\n"
+        "or a3, a3, a4\n"
+        "or a5, a5, a6\n"
+        "or t0, t0, t1\n"
+        "or a1, a1, a3\n"
+        "or a5, a5, t0\n"
+        "or %[value], a1, a5"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return value;
 }
 
 static u32 be32(const u8* p)
 {
-    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+    u64 value = (u64)p;
+    __asm__ volatile(
+        "lbu a1, 0(%[value])\n"
+        "lbu a2, 1(%[value])\n"
+        "lbu a3, 2(%[value])\n"
+        "lbu a4, 3(%[value])\n"
+        "slli a1, a1, 24\n"
+        "slli a2, a2, 16\n"
+        "slli a3, a3, 8\n"
+        "or a1, a1, a2\n"
+        "or a3, a3, a4\n"
+        "or %[value], a1, a3"
+        : [value] "+{a0}"(value)
+        :
+        : "memory");
+    return (u32)value;
 }
 
 static void store_le16(u8* p, u16 value)
 {
-    p[0] = (u8)value;
-    p[1] = (u8)(value >> 8);
+    __asm__ volatile(
+        "sb %[value], 0(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 1(%[p])"
+        :
+    : [p] "{a0}"(p), [value] "{a1}"((u64)value)
+        : "memory");
 }
 
 static void store_le32(u8* p, u32 value)
 {
-    p[0] = (u8)value;
-    p[1] = (u8)(value >> 8);
-    p[2] = (u8)(value >> 16);
-    p[3] = (u8)(value >> 24);
+    __asm__ volatile(
+        "sb %[value], 0(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 1(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 2(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 3(%[p])"
+        :
+    : [p] "{a0}"(p), [value] "{a1}"((u64)value)
+        : "memory");
 }
 
 static void store_le64(u8* p, u64 value)
 {
-    store_le32(p, (u32)value);
-    store_le32(p + 4, (u32)(value >> 32));
+    __asm__ volatile(
+        "sb %[value], 0(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 1(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 2(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 3(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 4(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 5(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 6(%[p])\n"
+        "srli %[value], %[value], 8\n"
+        "sb %[value], 7(%[p])"
+        :
+    : [p] "{a0}"(p), [value] "{a1}"(value)
+        : "memory");
 }
 
 static u64 be_cell(const u8* p, u32 cells)
@@ -606,29 +802,35 @@ static u64 be_cell(const u8* p, u32 cells)
     return value;
 }
 
-static volatile u32* mmio32(u64 address)
-{
-    return (volatile u32*)address;
-}
-
 static u32 mmio_read32(u64 base, u32 offset)
 {
-    return *mmio32(base + (u64)offset);
+    u64 address = base + (u64)offset;
+    __asm__ volatile(
+        "lwu %[address], 0(%[address])"
+        : [address] "+{a0}"(address)
+        :
+        : "memory");
+    return (u32)address;
 }
 
 static void mmio_write32(u64 base, u32 offset, u32 value)
 {
-    *mmio32(base + (u64)offset) = value;
-}
-
-static volatile u64* mmio64(u64 address)
-{
-    return (volatile u64*)address;
+    u64 address = base + (u64)offset;
+    __asm__ volatile(
+        "sw %[value], 0(%[address])"
+        :
+    : [address] "{a0}"(address), [value] "{a1}"((u64)value)
+        : "memory");
 }
 
 static u64 mmio_read64(u64 address)
 {
-    return *mmio64(address);
+    __asm__ volatile(
+        "ld %[address], 0(%[address])"
+        : [address] "+{a0}"(address)
+        :
+        : "memory");
+    return address;
 }
 
 static u64 ram_end(void)
@@ -671,6 +873,7 @@ static void memory_manager_init(void)
 {
     free_page_cursor = align_up(KERNEL_RESERVED_END, PAGE_SIZE);
     free_page_end = align_down(ram_end(), PAGE_SIZE);
+    free_page_list = 0ul;
     if (free_page_cursor >= free_page_end)
         panic("no usable physical memory");
 }
@@ -679,6 +882,12 @@ static u64 alloc_page_raw(void)
 {
     u64 page;
     u64 reserved_limit;
+    if (free_page_list != 0ul)
+    {
+        page = free_page_list;
+        free_page_list = *((u64*)page);
+        return page;
+    }
     for (;;)
     {
         if (free_page_cursor + PAGE_SIZE < free_page_cursor || free_page_cursor + PAGE_SIZE > free_page_end)
@@ -695,7 +904,13 @@ static u64 alloc_page_raw(void)
     }
 }
 
-static u64 alloc_page(void) 
+static void free_page_raw(u64 page)
+{
+    *((u64*)page) = free_page_list;
+    free_page_list = page;
+}
+
+static u64 alloc_page(void)
 {
     u64 page = alloc_page_raw();
     mem_zero((void*)page, PAGE_SIZE);
@@ -704,17 +919,46 @@ static u64 alloc_page(void)
 
 static u64 pte_make(u64 physical, u64 flags)
 {
-    return ((physical >> 12) << 10) | flags | PTE_V;
+    __asm__ volatile(
+        "srli %[physical], %[physical], 12\n"
+        "slli %[physical], %[physical], 10\n"
+        "or %[physical], %[physical], %[flags]\n"
+        "ori %[physical], %[physical], 1"
+        : [physical] "+{a0}"(physical)
+        : [flags] "{a1}"(flags)
+        : );
+    return physical;
+}
+
+static u64 pte_make_noaccess(u64 physical)
+{
+    return pte_make(physical, PTE_SOFT_NOACCESS) & ~PTE_V;
 }
 
 static u64 pte_physical(u64 pte)
 {
-    return (pte >> 10) << 12;
+    __asm__ volatile(
+        "srli %[pte], %[pte], 10\n"
+        "slli %[pte], %[pte], 12"
+        : [pte] "+{a0}"(pte)
+        :
+        : );
+    return pte;
 }
 
 static u32 sv39_index(u64 virtual_address, int level)
 {
-    return (u32)((virtual_address >> (12ul + (u64)level * 9ul)) & 511ul);
+    u64 shift = (u64)level;
+    __asm__ volatile(
+        "slli a2, %[shift], 3\n"
+        "add %[shift], %[shift], a2\n"
+        "addi %[shift], %[shift], 12\n"
+        "srl %[address], %[address], %[shift]\n"
+        "andi %[address], %[address], 511"
+        : [address] "+{a0}"(virtual_address), [shift] "+{a1}"(shift)
+        :
+        : );
+    return (u32)virtual_address;
 }
 
 static void map_leaf(u64 root, u64 virtual_address, u64 physical_address, u64 flags, int leaf_level)
@@ -748,6 +992,32 @@ static void map_page(u64 root, u64 virtual_address, u64 physical_address, u64 fl
     map_leaf(root, virtual_address, physical_address, flags, 0);
 }
 
+static void map_noaccess_page(u64 root, u64 virtual_address, u64 physical_address)
+{
+    u64 table = root;
+    int level = 2;
+    while (level > 0)
+    {
+        u32 index = sv39_index(virtual_address, level);
+        u64* entries = (u64*)table;
+        u64 pte = entries[index];
+        if ((pte & PTE_V) == 0ul)
+        {
+            u64 next = alloc_page();
+            entries[index] = pte_make(next, 0ul);
+            table = next;
+        }
+        else
+        {
+            if ((pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+                panic("page table leaf collision");
+            table = pte_physical(pte);
+        }
+        level = level - 1;
+    }
+    ((u64*)table)[sv39_index(virtual_address, 0)] = pte_make_noaccess(physical_address);
+}
+
 static void map_range_2m(u64 root, u64 virtual_address, u64 physical_address, u64 size, u64 flags)
 {
     u64 offset = 0ul;
@@ -766,6 +1036,56 @@ static void map_range_4k(u64 root, u64 virtual_address, u64 physical_address, u6
         map_page(root, virtual_address + offset, physical_address + offset, flags);
         offset = offset + PAGE_SIZE;
     }
+}
+
+static int unmap_user_page(u64 root, u64 virtual_address)
+{
+    u64 table = root;
+    int level = 2;
+    while (level > 0)
+    {
+        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
+        if ((pte & PTE_V) == 0ul)
+            return 1;
+        if ((pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+            return 0;
+        table = pte_physical(pte);
+        level = level - 1;
+    }
+    {
+        u64* entries = (u64*)table;
+        u32 index = sv39_index(virtual_address, 0);
+        u64 pte = entries[index];
+        u64 physical;
+        if ((pte & PTE_V) == 0ul)
+        {
+            if ((pte & PTE_SOFT_NOACCESS) == 0ul)
+                return 1;
+            physical = pte_physical(pte);
+            entries[index] = 0ul;
+            free_page_raw(physical);
+            return 1;
+        }
+        if ((pte & PTE_U) == 0ul || (pte & (PTE_R | PTE_W | PTE_X)) == 0ul)
+            return 0;
+        physical = pte_physical(pte);
+        entries[index] = 0ul;
+        free_page_raw(physical);
+    }
+    return 1;
+}
+
+static int unmap_user_pages(u64 root, u64 start, u64 end)
+{
+    u64 page = start;
+    while (page < end)
+    {
+        if (!unmap_user_page(root, page))
+            return 0;
+        page = page + PAGE_SIZE;
+    }
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    return 1;
 }
 
 static void write_satp(u64 value)
@@ -792,8 +1112,6 @@ static int user_address_range_valid(u64 address, u64 size)
         return 0;
     if (ranges_overlap(address, size, UART_MMIO_BASE, 0x00010000ul))
         return 0;
-    if (ranges_overlap(address, size, CLINT_MMIO_BASE, 0x00010000ul))
-        return 0;
     if (ranges_overlap(address, size, PLIC_MMIO_BASE, 0x00400000ul))
         return 0;
     return 1;
@@ -808,69 +1126,76 @@ static int user_mapping_range_valid(u64 address, u64 size)
     return 1;
 }
 
-static int user_va_canonical(u64 address)
+static u64 user_translate(u64 root, u64 virtual_address, u64 required, u64* physical)
 {
-    return address < USER_VA_LIMIT;
-}
-
-static int user_translate(u64 root, u64 virtual_address, u64 required, u64* physical)
-{
-    u64 table = root;
-    int level = 2;
-    if (!user_va_canonical(virtual_address))
-        return 0;
-    for (;;)
-    {
-        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
-        if ((pte & PTE_V) == 0ul || ((pte & PTE_W) != 0ul && (pte & PTE_R) == 0ul))
-            return 0;
-        if ((pte & (PTE_R | PTE_X)) != 0ul)
-        {
-            u64 offset_mask;
-            if ((pte & PTE_U) == 0ul)
-                return 0;
-            if ((required & PTE_R) != 0ul && (pte & PTE_R) == 0ul)
-                return 0;
-            if ((required & PTE_W) != 0ul && (pte & PTE_W) == 0ul)
-                return 0;
-            if ((required & PTE_X) != 0ul && (pte & PTE_X) == 0ul)
-                return 0;
-            offset_mask = (1ul << (12ul + (u64)level * 9ul)) - 1ul;
-            *physical = (pte_physical(pte) & ~offset_mask) | (virtual_address & offset_mask);
-            return 1;
-        }
-        if (level == 0)
-            return 0;
-        table = pte_physical(pte);
-        level = level - 1;
-    }
-}
-
-static int user_physical(u64 root, u64 virtual_address, u64* physical)
-{
-    u64 table = root;
-    int level = 2;
-    if (!user_va_canonical(virtual_address))
-        return 0;
-    for (;;)
-    {
-        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
-        if ((pte & PTE_V) == 0ul || ((pte & PTE_W) != 0ul && (pte & PTE_R) == 0ul))
-            return 0;
-        if ((pte & (PTE_R | PTE_X)) != 0ul)
-        {
-            u64 offset_mask;
-            if ((pte & PTE_U) == 0ul)
-                return 0;
-            offset_mask = (1ul << (12ul + (u64)level * 9ul)) - 1ul;
-            *physical = (pte_physical(pte) & ~offset_mask) | (virtual_address & offset_mask);
-            return 1;
-        }
-        if (level == 0)
-            return 0;
-        table = pte_physical(pte);
-        level = level - 1;
-    }
+    __asm__ volatile(
+        "srli t0, a1, 38\n"
+        "bne t0, zero, .Luser_translate_fail_%=\n"
+        "srli t0, a1, 30\n"
+        "andi t0, t0, 511\n"
+        "sh3add t0, t0, a0\n"
+        "ld t0, 0(t0)\n"
+        "andi t1, t0, 1\n"
+        "beq t1, zero, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 6\n"
+        "addi t2, zero, 4\n"
+        "beq t1, t2, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 10\n"
+        "bne t1, zero, .Luser_translate_leaf2_%=\n"
+        "srli a0, t0, 10\n"
+        "slli a0, a0, 12\n"
+        "srli t0, a1, 21\n"
+        "andi t0, t0, 511\n"
+        "sh3add t0, t0, a0\n"
+        "ld t0, 0(t0)\n"
+        "andi t1, t0, 1\n"
+        "beq t1, zero, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 6\n"
+        "beq t1, t2, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 10\n"
+        "bne t1, zero, .Luser_translate_leaf1_%=\n"
+        "srli a0, t0, 10\n"
+        "slli a0, a0, 12\n"
+        "srli t0, a1, 12\n"
+        "andi t0, t0, 511\n"
+        "sh3add t0, t0, a0\n"
+        "ld t0, 0(t0)\n"
+        "andi t1, t0, 1\n"
+        "beq t1, zero, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 6\n"
+        "beq t1, t2, .Luser_translate_fail_%=\n"
+        "andi t1, t0, 10\n"
+        "beq t1, zero, .Luser_translate_fail_%=\n"
+        "addi t4, zero, 12\n"
+        "jal zero, .Luser_translate_leaf_%=\n"
+        ".Luser_translate_leaf1_%=:\n"
+        "addi t4, zero, 21\n"
+        "jal zero, .Luser_translate_leaf_%=\n"
+        ".Luser_translate_leaf2_%=:\n"
+        "addi t4, zero, 30\n"
+        ".Luser_translate_leaf_%=:\n"
+        "andi t1, t0, 16\n"
+        "beq t1, zero, .Luser_translate_fail_%=\n"
+        "andn t1, a2, t0\n"
+        "bne t1, zero, .Luser_translate_fail_%=\n"
+        "addi t1, t4, -2\n"
+        "srl t0, t0, t1\n"
+        "sll t0, t0, t4\n"
+        "addi t1, zero, 64\n"
+        "sub t1, t1, t4\n"
+        "sll t3, a1, t1\n"
+        "srl t3, t3, t1\n"
+        "or t0, t0, t3\n"
+        "sd t0, 0(a3)\n"
+        "addi a0, zero, 1\n"
+        "jal zero, .Luser_translate_done_%=\n"
+        ".Luser_translate_fail_%=:\n"
+        "addi a0, zero, 0\n"
+        ".Luser_translate_done_%=:"
+        : [root] "+{a0}"(root)
+        : [virtual_address] "{a1}"(virtual_address), [required] "{a2}"(required), [physical] "{a3}"(physical)
+        : "memory");
+    return root;
 }
 
 static int user_copy_to(u64 root, u64 destination, const void* source, u64 count)
@@ -882,7 +1207,7 @@ static int user_copy_to(u64 root, u64 destination, const void* source, u64 count
         u64 physical;
         u64 page_offset;
         u64 chunk;
-        if (!user_physical(root, destination + done, &physical))
+        if (!user_translate(root, destination + done, 0ul, &physical))
             return 0;
         page_offset = physical & PAGE_MASK;
         chunk = PAGE_SIZE - page_offset;
@@ -931,9 +1256,12 @@ static int map_user_range(u64 root, u64 start, u64 end, u64 flags)
     return 1;
 }
 
-static int map_user_stack(u64 root)
+static int map_user_stack(u64 root, u64 start)
 {
-    u64 page = USER_STACK_TOP - USER_STACK_SIZE;
+    u64 page = align_down(start, PAGE_SIZE);
+    u64 limit = USER_STACK_TOP - USER_STACK_SIZE;
+    if (page < limit || page >= USER_STACK_TOP)
+        return 0;
     while (page < USER_STACK_TOP)
     {
         u64 physical = alloc_page();
@@ -941,6 +1269,48 @@ static int map_user_stack(u64 root)
         page = page + PAGE_SIZE;
     }
     return 1;
+}
+
+static int map_user_stack_fault(u64 root, u64 address)
+{
+    u64 physical;
+    u64 existing;
+    u64 page;
+    if (address < USER_STACK_TOP - USER_STACK_SIZE || address >= USER_STACK_TOP)
+        return 0;
+    page = align_down(address, PAGE_SIZE);
+    if (user_translate(root, page, 0ul, &existing))
+        return 0;
+    physical = alloc_page();
+    map_page(root, page, physical, PTE_R | PTE_W | PTE_U | PTE_A | PTE_D);
+    __asm__ volatile("sfence.vma %[page], zero" : : [page] "{t0}"(page) : "memory");
+    return 1;
+}
+
+static int map_user_brk_fault(u64 root, u64 address)
+{
+    u64 existing;
+    u64 page;
+    if (address < process_brk_min || address >= process_brk)
+        return 0;
+    page = align_down(address, PAGE_SIZE);
+    if (user_translate(root, page, 0ul, &existing))
+        return 0;
+    if (!map_user_page(root, page, PTE_R | PTE_W))
+        return 0;
+    __asm__ volatile("sfence.vma %[page], zero" : : [page] "{t0}"(page) : "memory");
+    return 1;
+}
+
+static int user_translate_with_brk_fault(u64 root, u64 address, u64 required, u64* physical)
+{
+    if (user_translate(root, address, required, physical))
+        return 1;
+    if (root != current_user_root_page_table || (required & PTE_X) != 0ul)
+        return 0;
+    if (!map_user_brk_fault(root, address))
+        return 0;
+    return user_translate(root, address, required, physical);
 }
 
 static void map_kernel_address_space(u64 root)
@@ -953,10 +1323,47 @@ static void map_kernel_address_space(u64 root)
     map_range_4k(root, PLIC_MMIO_BASE, PLIC_MMIO_BASE, 0x00400000ul, PTE_R | PTE_W | PTE_A | PTE_D);
 }
 
+static void copy_4k_mapping_table(u64 destination_root, u64 source_root, u64 virtual_address)
+{
+    u32 root_index = sv39_index(virtual_address, 2);
+    u32 middle_index = sv39_index(virtual_address, 1);
+    u64 source_middle_pte = ((u64*)source_root)[root_index];
+    u64 source_middle;
+    u64 source_leaf_pte;
+    u64 destination_middle_pte = ((u64*)destination_root)[root_index];
+    u64 destination_middle;
+    u64 destination_leaf;
+    if ((source_middle_pte & PTE_V) == 0ul || (source_middle_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+        panic("invalid source mapping root");
+    source_middle = pte_physical(source_middle_pte);
+    source_leaf_pte = ((u64*)source_middle)[middle_index];
+    if ((source_leaf_pte & PTE_V) == 0ul || (source_leaf_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+        panic("invalid source mapping table");
+    if ((destination_middle_pte & PTE_V) == 0ul)
+    {
+        destination_middle = alloc_page();
+        ((u64*)destination_root)[root_index] = pte_make(destination_middle, 0ul);
+    }
+    else
+    {
+        if ((destination_middle_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+            panic("destination mapping root collision");
+        destination_middle = pte_physical(destination_middle_pte);
+    }
+    destination_leaf = alloc_page();
+    mem_copy((void*)destination_leaf, (const void*)pte_physical(source_leaf_pte), PAGE_SIZE);
+    ((u64*)destination_middle)[middle_index] = pte_make(destination_leaf, 0ul);
+}
+
 static u64 create_user_address_space(void)
 {
     u64 root = alloc_page();
-    map_kernel_address_space(root);
+    u64 ram_size = align_down(ram_end() - RAM_BASE, 0x200000ul);
+    map_range_2m(root, RAM_BASE, RAM_BASE, ram_size, PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+    map_range_4k(root, boot_device.uart_base, boot_device.uart_base, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    map_range_4k(root, boot_device.virtio_blk_base, boot_device.virtio_blk_base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE);
+    copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE + 0x00200000ul);
     return root;
 }
 
@@ -969,7 +1376,9 @@ static void kernel_mmu_init(void)
 
 static u64 timer_now(void)
 {
-    return mmio_read64(CLINT_MMIO_BASE + CLINT_MTIME_OFFSET);
+    u64 value;
+    __asm__ volatile("csrrs %[value], time, zero" : [value] "=r"(value) : : );
+    return value;
 }
 
 static void sbi_set_timer(u64 next_time)
@@ -1131,12 +1540,18 @@ static int copy_user_page_table_level(u64 dst_root, u64 src_table, int level, u6
     while (index < 512u)
     {
         u64 pte = ((u64*)src_table)[index];
-        if ((pte & PTE_V) != 0ul)
+        if ((pte & PTE_V) != 0ul || (level == 0 && (pte & PTE_SOFT_NOACCESS) != 0ul))
         {
             u64 virtual_address = virtual_prefix | ((u64)index << (12ul + (u64)level * 9ul));
             if (virtual_address < USER_VA_LIMIT)
             {
-                if ((pte & (PTE_R | PTE_X)) != 0ul)
+                if (level == 0 && (pte & PTE_SOFT_NOACCESS) != 0ul)
+                {
+                    u64 page = alloc_page_raw();
+                    mem_copy((void*)page, (const void*)pte_physical(pte), PAGE_SIZE);
+                    map_noaccess_page(dst_root, virtual_address, page);
+                }
+                else if ((pte & (PTE_R | PTE_X)) != 0ul)
                 {
                     if ((pte & PTE_U) != 0ul)
                     {
@@ -1169,7 +1584,7 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     int slot;
     struct process* child;
     u64 child_root;
-    u64 unsupported = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_VFORK | CLONE_THREAD | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
+    u64 unsupported = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
     if ((flags & unsupported) != 0ul)
         return -22;
     if ((flags & 255ul) != 0ul && (flags & 255ul) != SIGCHLD)
@@ -1177,7 +1592,10 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     slot = process_alloc_slot();
     if (slot < 0)
         return -11;
-    child_root = copy_user_address_space(current_user_root_page_table);
+    if ((flags & CLONE_VFORK) != 0ul)
+        child_root = current_user_root_page_table;
+    else
+        child_root = copy_user_address_space(current_user_root_page_table);
     if (child_root == 0ul)
         return -12;
     child = &processes[(u32)slot];
@@ -1191,7 +1609,10 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     child->brk_min = process_brk_min;
     child->mmap_cursor = user_mmap_cursor;
     child->time_slice = DEFAULT_TIME_SLICE;
+    if ((flags & CLONE_VFORK) != 0ul)
+        child->vfork_parent_pid = current_task->pid;
     mem_copy(child->files, open_files, sizeof(struct file_descriptor) * (u64)MAX_OPEN_FILES);
+    mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
     mem_copy(&child->frame, frame, sizeof(struct trap_frame));
     child->frame.x[10] = 0ul;
     if (child_stack != 0ul)
@@ -1281,6 +1702,26 @@ static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_poi
     scheduler_switch(frame);
 }
 
+static void process_wake_vfork_parent(struct process* child)
+{
+    u32 index = 0u;
+    u32 parent_pid = child->vfork_parent_pid;
+    if (parent_pid == 0u)
+        return;
+    while (index < MAX_PROCESSES)
+    {
+        struct process* parent = &processes[index];
+        if (parent->used != 0u && parent->pid == parent_pid && parent->state == PROC_VFORK)
+        {
+            parent->state = PROC_RUNNABLE;
+            child->vfork_parent_pid = 0u;
+            return;
+        }
+        index = index + 1u;
+    }
+    child->vfork_parent_pid = 0u;
+}
+
 static void process_wake_waiter(struct process* child)
 {
     u32 index = 0u;
@@ -1327,6 +1768,7 @@ static void process_exit_current(struct trap_frame* frame, u64 status)
     puts(" exited with status ");
     put_dec(code);
     puts("\n");
+    process_wake_vfork_parent(current_task);
     process_wake_waiter(current_task);
     scheduler_switch(frame);
 }
@@ -1386,6 +1828,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         return -12l;
     }
     current_user_root_page_table = new_root;
+    mem_zero(current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
     frame->sepc = image.entry;
     frame->sstatus = (frame->sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
     frame->x[2] = stack;
@@ -1394,6 +1837,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     current_task->brk = process_brk;
     current_task->brk_min = process_brk_min;
     current_task->mmap_cursor = user_mmap_cursor;
+    process_wake_vfork_parent(current_task);
     activate_page_table(current_user_root_page_table);
     return 0l;
 }
@@ -1587,16 +2031,6 @@ static void parse_fdt(void* fdt)
     }
 }
 
-static void virtq_set_desc(u32 index, u64 address, u32 length, u16 flags, u16 next)
-{
-    u8* p = (u8*)virtq_desc;
-    p = p + (u64)index * 16ul;
-    ((u64*)p)[0] = address;
-    ((u32*)(p + 8))[0] = length;
-    ((u16*)(p + 12))[0] = flags;
-    ((u16*)(p + 14))[0] = next;
-}
-
 static int virtio_blk_init(void)
 {
     u64 base = boot_device.virtio_blk_base;
@@ -1630,8 +2064,18 @@ static int virtio_blk_init(void)
     mem_zero(virtq_desc, sizeof(virtq_desc));
     mem_zero(virtq_avail, sizeof(virtq_avail));
     mem_zero(virtq_used_raw, sizeof(virtq_used_raw));
-    virtio_avail_index = 0;
-    virtio_used_index = 0;
+    mem_zero(&virtio_request, sizeof(virtio_request));
+    virtio_avail_index = 0ul;
+    virtq_avail[0] = 1u;
+    virtq_desc[0].address = (u64)&virtio_request;
+    virtq_desc[0].length = 16u;
+    virtq_desc[0].flags = 1u;
+    virtq_desc[0].next = 1u;
+    virtq_desc[1].next = 2u;
+    virtq_desc[2].address = (u64)&virtio_request.status;
+    virtq_desc[2].length = 1u;
+    virtq_desc[2].flags = 2u;
+    virtq_desc[2].next = 0u;
 
     mmio_write32(base, 0x080u, (u32)(u64)virtq_desc);
     mmio_write32(base, 0x084u, (u32)((u64)virtq_desc >> 32));
@@ -1647,35 +2091,42 @@ static int virtio_blk_init(void)
 static int virtio_blk_transfer(u64 sector, void* buffer, u32 bytes, u32 type)
 {
     u64 base = boot_device.virtio_blk_base;
-    u32 sectors = (bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
-    u32 transfer_bytes = sectors * SECTOR_SIZE;
-    u16 data_flags = 1u;
+    u32 sectors;
+    u32 transfer_bytes;
+    u64 index;
 
-    if (type == 0u)
-        data_flags = 3u;
+    if (bytes == 0u)
+        return 1;
 
-    mem_zero(virtio_request, sizeof(virtio_request));
-    store_le32(virtio_request + 0, type);
-    store_le32(virtio_request + 4, 0u);
-    store_le64(virtio_request + 8, sector);
-    virtio_request[16] = 255u;
+    sectors = (bytes + SECTOR_SIZE - 1u) / SECTOR_SIZE;
+    transfer_bytes = sectors * SECTOR_SIZE;
+    virtio_request.type = type;
+    virtio_request.sector = sector;
+    virtio_request.status = 255u;
+    virtq_desc[1].address = (u64)buffer;
+    virtq_desc[1].length = transfer_bytes;
+    virtq_desc[1].flags = type == 0u ? 3u : 1u;
 
-    virtq_set_desc(0, (u64)virtio_request, 16u, 1u, 1u);
-    virtq_set_desc(1, (u64)buffer, transfer_bytes, data_flags, 2u);
-    virtq_set_desc(2, (u64)(virtio_request + 16), 1u, 2u, 0u);
-    virtq_avail[0] = 1u;
-    virtq_avail[2 + (virtio_avail_index & (VIRTIO_QUEUE_SIZE - 1u))] = 0u;
-    virtio_avail_index = virtio_avail_index + 1u;
-    virtq_avail[1] = (u16)virtio_avail_index;
+    index = virtio_avail_index;
+    virtq_avail[2 + (index & (VIRTIO_QUEUE_SIZE - 1u))] = 0u;
+    index = index + 1ul;
+    virtio_avail_index = index;
+    virtq_avail[1] = (u16)index;
 
-    fence_rw();
-    mmio_write32(base, 0x050u, 0u);
-    while (virtio_request[16] == 255u)
-    {
-    }
-    mmio_write32(base, 0x064u, mmio_read32(base, 0x060u));
-    virtio_used_index = virtio_used_index + 1u;
-    return virtio_request[16] == 0u;
+    __asm__ volatile(
+        "fence rw, rw\n"
+        "sw zero, 80(a0)\n"
+        "addi t0, zero, 255\n"
+        ".Lvirtio_blk_wait_%=:\n"
+        "lbu t1, 0(a1)\n"
+        "beq t1, t0, .Lvirtio_blk_wait_%=\n"
+        "lwu t1, 96(a0)\n"
+        "sw t1, 100(a0)\n"
+        "lbu a0, 0(a1)"
+        : [base] "+{a0}"(base)
+        : [status] "{a1}"(&virtio_request.status)
+        : "memory");
+    return base == 0ul;
 }
 
 static int virtio_blk_read(u64 sector, void* buffer, u32 bytes)
@@ -1706,13 +2157,22 @@ static int block_subsystem_init(void)
     return 1;
 }
 
-static int block_read_sector(u64 lba, void* buffer)
+static int block_read(u64 lba, void* buffer, u32 bytes)
 {
+    u64 sectors;
+    if (bytes == 0u)
+        return 1;
     if (!root_block_device.present)
         return 0;
-    if (lba >= root_block_device.sector_count)
+    sectors = ((u64)bytes + (u64)SECTOR_SIZE - 1ul) / (u64)SECTOR_SIZE;
+    if (lba >= root_block_device.sector_count || sectors > root_block_device.sector_count - lba)
         return 0;
-    return virtio_blk_read(lba, buffer, SECTOR_SIZE);
+    return virtio_blk_read(lba, buffer, bytes);
+}
+
+static int block_read_sector(u64 lba, void* buffer)
+{
+    return block_read(lba, buffer, SECTOR_SIZE);
 }
 
 static int block_write_sector(u64 lba, void* buffer)
@@ -1734,6 +2194,8 @@ static int fat_mount(void)
     u8* mbr = sector_buffer;
     u8* bpb = sector_buffer;
     int part;
+    fat_buffer_valid = 0ul;
+    dir_buffer_valid = 0ul;
     if (!disk_read_sector(0u, mbr))
         return 0;
     if (le16(mbr + 510) != 0xaa55u)
@@ -1782,8 +2244,13 @@ static u32 fat_next_cluster(u32 cluster)
     u64 fat_offset = (u64)cluster << 2ul;
     u32 lba = boot_volume.fat_lba + (u32)(fat_offset >> 9ul);
     u32 sector_offset = (u32)(fat_offset & (u64)(SECTOR_SIZE - 1u));
-    if (!disk_read_sector(lba, fat_buffer))
-        return FAT_READ_ERROR;
+    if (fat_buffer_valid == 0ul || fat_buffer_lba != lba)
+    {
+        if (!disk_read_sector(lba, fat_buffer))
+            return FAT_READ_ERROR;
+        fat_buffer_lba = lba;
+        fat_buffer_valid = 1ul;
+    }
     return le32(fat_buffer + sector_offset) & 0x0fffffffu;
 }
 
@@ -1797,8 +2264,13 @@ static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
         {
             u32 lba = fat_cluster_lba(cluster) + sector_index;
             u32 offset = 0u;
-            if (!disk_read_sector(lba, dir_buffer))
-                return 0;
+            if (dir_buffer_valid == 0ul || dir_buffer_lba != lba)
+            {
+                if (!disk_read_sector(lba, dir_buffer))
+                    return 0;
+                dir_buffer_lba = lba;
+                dir_buffer_valid = 1ul;
+            }
             while (offset < SECTOR_SIZE)
             {
                 const u8* entry = dir_buffer + offset;
@@ -1841,7 +2313,7 @@ static int user_copy_to_writable(u64 root, u64 destination, const void* source, 
         u64 physical;
         u64 page_offset;
         u64 chunk;
-        if (!user_translate(root, destination + done, PTE_W, &physical))
+        if (!user_translate_with_brk_fault(root, destination + done, PTE_W, &physical))
             return 0;
         page_offset = physical & PAGE_MASK;
         chunk = PAGE_SIZE - page_offset;
@@ -1862,7 +2334,7 @@ static int user_copy_from_readable(u64 root, void* destination, u64 source, u64 
         u64 physical;
         u64 page_offset;
         u64 chunk;
-        if (!user_translate(root, source + done, PTE_R, &physical))
+        if (!user_translate_with_brk_fault(root, source + done, PTE_R, &physical))
             return 0;
         page_offset = physical & PAGE_MASK;
         chunk = PAGE_SIZE - page_offset;
@@ -1881,13 +2353,24 @@ static int copy_user_string(u64 source, char* destination, u32 capacity)
         return 0;
     while (index + 1u < capacity)
     {
-        u8 ch;
-        if (!user_load_u8(current_user_root_page_table, source + (u64)index, &ch))
+        u64 physical;
+        u64 chunk;
+        u64 remaining = (u64)capacity - 1ul - (u64)index;
+        u64 offset = 0ul;
+        if (!user_translate(current_user_root_page_table, source + (u64)index, PTE_R, &physical))
             return 0;
-        destination[index] = (char)ch;
-        if (ch == 0u)
-            return 1;
-        index = index + 1u;
+        chunk = PAGE_SIZE - (physical & PAGE_MASK);
+        if (chunk > remaining)
+            chunk = remaining;
+        while (offset < chunk)
+        {
+            u8 ch = ((const u8*)physical)[offset];
+            destination[index] = (char)ch;
+            if (ch == 0u)
+                return 1;
+            index = index + 1u;
+            offset = offset + 1ul;
+        }
     }
     destination[capacity - 1u] = 0;
     return 0;
@@ -2121,6 +2604,7 @@ static u32 fat_read_short_to_memory(const char* short_name, void* destination, u
     u32 cluster;
     u32 file_size;
     u32 remaining;
+    u32 cluster_bytes;
     u8* dst = (u8*)destination;
 
     *out_size = 0u;
@@ -2129,27 +2613,61 @@ static u32 fat_read_short_to_memory(const char* short_name, void* destination, u
     if (file_size > max_size)
         return 2u;
 
+    cluster_bytes = boot_volume.sectors_per_cluster * SECTOR_SIZE;
     remaining = file_size;
-    while (remaining != 0u)
+    while (remaining >= cluster_bytes)
     {
-        u32 sector_index = 0u;
-        while (sector_index < boot_volume.sectors_per_cluster && remaining != 0u)
+        u32 run_start = cluster;
+        u32 run_last = cluster;
+        u32 run_clusters = 1u;
+        u32 full_clusters = remaining / cluster_bytes;
+        u32 next_cluster = 0u;
+        u32 bytes;
+
+        while (run_clusters < full_clusters)
         {
-            u32 copy = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
-            if (!disk_read_sector(fat_cluster_lba(cluster) + sector_index, sector_buffer))
+            next_cluster = fat_next_cluster(run_last);
+            if (next_cluster == FAT_READ_ERROR || next_cluster < 2u || next_cluster >= FAT_EOC)
                 return 3u;
-            mem_copy(dst, sector_buffer, copy);
-            dst = dst + copy;
-            remaining = remaining - copy;
-            sector_index = sector_index + 1u;
+            if (next_cluster != run_last + 1u)
+                break;
+            run_last = next_cluster;
+            run_clusters = run_clusters + 1u;
+            next_cluster = 0u;
+        }
+
+        bytes = run_clusters * cluster_bytes;
+        if (!block_read((u64)fat_cluster_lba(run_start), dst, bytes))
+            return 3u;
+        dst = dst + bytes;
+        remaining = remaining - bytes;
+        if (remaining == 0u)
+            break;
+
+        if (next_cluster == 0u)
+            next_cluster = fat_next_cluster(run_last);
+        if (next_cluster == FAT_READ_ERROR || next_cluster < 2u || next_cluster >= FAT_EOC)
+            return 4u;
+        cluster = next_cluster;
+    }
+
+    if (remaining != 0u)
+    {
+        u32 full_bytes = remaining & ~(SECTOR_SIZE - 1u);
+        u32 sector_index = 0u;
+        if (full_bytes != 0u)
+        {
+            if (!block_read((u64)fat_cluster_lba(cluster), dst, full_bytes))
+                return 3u;
+            dst = dst + full_bytes;
+            remaining = remaining - full_bytes;
+            sector_index = full_bytes / SECTOR_SIZE;
         }
         if (remaining != 0u)
         {
-            cluster = fat_next_cluster(cluster);
-            if (cluster == FAT_READ_ERROR)
+            if (!disk_read_sector(fat_cluster_lba(cluster) + sector_index, sector_buffer))
                 return 3u;
-            if (cluster < 2u || cluster >= FAT_EOC)
-                return 4u;
+            mem_copy(dst, sector_buffer, remaining);
         }
     }
 
@@ -2300,12 +2818,22 @@ static s64 console_read_to_user(u64 buffer, u64 count, u32 flags)
         return -11l;
     while (done < count)
     {
-        u8 ch = (u8)uart_read_blocking();
-        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, &ch, 1ul))
+        u64 physical;
+        u64 chunk;
+        u64 offset = 0ul;
+        if (!user_translate(current_user_root_page_table, buffer + done, PTE_W, &physical))
             return -14l;
-        done = done + 1ul;
-        if ((flags & (u32)O_NONBLOCK) != 0u && !uart_can_read())
-            break;
+        chunk = PAGE_SIZE - (physical & PAGE_MASK);
+        if (chunk > count - done)
+            chunk = count - done;
+        while (offset < chunk)
+        {
+            ((u8*)physical)[offset] = (u8)uart_read_blocking();
+            offset = offset + 1ul;
+            done = done + 1ul;
+            if ((flags & (u32)O_NONBLOCK) != 0u && !uart_can_read())
+                return (s64)done;
+        }
     }
     return (s64)done;
 }
@@ -2370,14 +2898,18 @@ static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
 
 static s64 console_write_from_user(u64 buffer, u64 count)
 {
-    u64 i = 0ul;
-    while (i < count)
+    u64 done = 0ul;
+    while (done < count)
     {
-        u8 ch;
-        if (!user_load_u8(current_user_root_page_table, buffer + i, &ch))
+        u64 physical;
+        u64 chunk;
+        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
             return -14l;
-        console_putchar((int)ch);
-        i = i + 1ul;
+        chunk = PAGE_SIZE - (physical & PAGE_MASK);
+        if (chunk > count - done)
+            chunk = count - done;
+        uart_write_buffer((const u8*)physical, chunk);
+        done = done + chunk;
     }
     return (s64)count;
 }
@@ -2497,9 +3029,15 @@ static int fat_root_entry_at(u64 requested, char* name, u32* type, u64* inode)
         u32 sector_index = 0u;
         while (sector_index < boot_volume.sectors_per_cluster)
         {
+            u32 lba = fat_cluster_lba(cluster) + sector_index;
             u32 offset = 0u;
-            if (!disk_read_sector(fat_cluster_lba(cluster) + sector_index, dir_buffer))
-                return 0;
+            if (dir_buffer_valid == 0ul || dir_buffer_lba != lba)
+            {
+                if (!disk_read_sector(lba, dir_buffer))
+                    return 0;
+                dir_buffer_lba = lba;
+                dir_buffer_valid = 1ul;
+            }
             while (offset < SECTOR_SIZE)
             {
                 u8* entry = dir_buffer + offset;
@@ -2807,39 +3345,299 @@ static s64 sys_readlinkat_impl(u64 dirfd, u64 path_pointer, u64 buffer, u64 size
     return (s64)len;
 }
 
+static u64 vm_pte_flags(u64 prot)
+{
+    u64 flags = 0ul;
+    if ((prot & PROT_READ) != 0ul)
+        flags = flags | PTE_R;
+    if ((prot & PROT_WRITE) != 0ul)
+        flags = flags | PTE_R | PTE_W;
+    if ((prot & PROT_EXEC) != 0ul)
+        flags = flags | PTE_X;
+    return flags;
+}
+
+static struct vm_region* vm_find_region(u64 address)
+{
+    u32 index = 0u;
+    while (index < MAX_VM_REGIONS)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->used != 0u && address >= region->start && address < region->end)
+            return region;
+        index = index + 1u;
+    }
+    return NULL;
+}
+
+static int vm_range_covered(u64 start, u64 end)
+{
+    u64 cursor = start;
+    while (cursor < end)
+    {
+        struct vm_region* region = vm_find_region(cursor);
+        if (region == NULL)
+            return 0;
+        if (region->end <= cursor)
+            return 0;
+        cursor = region->end < end ? region->end : end;
+    }
+    return 1;
+}
+
+static int vm_range_overlaps(u64 start, u64 end)
+{
+    u32 index = 0u;
+    while (index < MAX_VM_REGIONS)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->used != 0u && start < region->end && end > region->start)
+            return 1;
+        index = index + 1u;
+    }
+    return 0;
+}
+
+static int vm_free_slot_count(void)
+{
+    u32 index = 0u;
+    int count = 0;
+    while (index < MAX_VM_REGIONS)
+    {
+        if (current_task->vm_regions[index].used == 0u)
+            count = count + 1;
+        index = index + 1u;
+    }
+    return count;
+}
+
+static struct vm_region* vm_allocate_region(void)
+{
+    u32 index = 0u;
+    while (index < MAX_VM_REGIONS)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->used == 0u)
+        {
+            region->used = 1u;
+            return region;
+        }
+        index = index + 1u;
+    }
+    return NULL;
+}
+
+static int vm_add_region(u64 start, u64 end, u64 prot, u64 flags)
+{
+    struct vm_region* region;
+    u32 index = 0u;
+    while (index < MAX_VM_REGIONS)
+    {
+        region = &current_task->vm_regions[index];
+        if (region->used != 0u && region->end == start && region->prot == prot && region->flags == flags)
+        {
+            region->end = end;
+            return 1;
+        }
+        if (region->used != 0u && region->start == end && region->prot == prot && region->flags == flags)
+        {
+            region->start = start;
+            return 1;
+        }
+        index = index + 1u;
+    }
+    region = vm_allocate_region();
+    if (region == NULL)
+        return 0;
+    region->start = start;
+    region->end = end;
+    region->prot = prot;
+    region->flags = flags;
+    return 1;
+}
+
+static int vm_remove_range(u64 start, u64 end)
+{
+    u32 index = 0u;
+    int splits = 0;
+    while (index < MAX_VM_REGIONS)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->used != 0u && start > region->start && end < region->end)
+            splits = splits + 1;
+        index = index + 1u;
+    }
+    if (vm_free_slot_count() < splits)
+        return 0;
+    index = 0u;
+    while (index < MAX_VM_REGIONS)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->used == 0u || start >= region->end || end <= region->start)
+        {
+            index = index + 1u;
+            continue;
+        }
+        if (start <= region->start && end >= region->end)
+        {
+            region->used = 0u;
+        }
+        else if (start <= region->start)
+        {
+            region->start = end;
+        }
+        else if (end >= region->end)
+        {
+            region->end = start;
+        }
+        else
+        {
+            struct vm_region* right = vm_allocate_region();
+            if (right == NULL)
+                return 0;
+            right->start = end;
+            right->end = region->end;
+            right->prot = region->prot;
+            right->flags = region->flags;
+            region->end = start;
+        }
+        index = index + 1u;
+    }
+    return 1;
+}
+
+static u64* user_leaf_pte(u64 root, u64 virtual_address)
+{
+    u64 table = root;
+    int level = 2;
+    while (level > 0)
+    {
+        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
+        if ((pte & PTE_V) == 0ul || (pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+            return NULL;
+        table = pte_physical(pte);
+        level = level - 1;
+    }
+    return &((u64*)table)[sv39_index(virtual_address, 0)];
+}
+
+static int vm_apply_protection(u64 start, u64 end, u64 prot)
+{
+    u64 page = start;
+    u64 pte_flags = vm_pte_flags(prot);
+    while (page < end)
+    {
+        u64* entry = user_leaf_pte(current_user_root_page_table, page);
+        if (pte_flags == 0ul)
+        {
+            if (entry != NULL && (*entry & PTE_V) != 0ul)
+            {
+                u64 physical = pte_physical(*entry);
+                *entry = pte_make_noaccess(physical);
+            }
+        }
+        else if (entry == NULL || ((*entry & PTE_V) == 0ul && (*entry & PTE_SOFT_NOACCESS) == 0ul))
+        {
+            if (!map_user_page(current_user_root_page_table, page, pte_flags))
+                return 0;
+        }
+        else
+        {
+            u64 physical = pte_physical(*entry);
+            *entry = pte_make(physical, pte_flags | PTE_U | PTE_A | PTE_D);
+        }
+        page = page + PAGE_SIZE;
+    }
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    return 1;
+}
+
+static s64 sys_munmap_impl(u64 address, u64 length)
+{
+    u64 start;
+    u64 end;
+    if ((address & PAGE_MASK) != 0ul || length == 0ul)
+        return -22l;
+    start = address;
+    length = align_up(length, PAGE_SIZE);
+    end = start + length;
+    if (end < start || !user_mapping_range_valid(start, length))
+        return -22l;
+    if (!unmap_user_pages(current_user_root_page_table, start, end))
+        return -22l;
+    if (!vm_remove_range(start, end))
+        return -12l;
+    return 0l;
+}
+
+static s64 sys_mprotect_impl(u64 address, u64 length, u64 prot)
+{
+    u64 start;
+    u64 end;
+    if ((address & PAGE_MASK) != 0ul || length == 0ul || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul)
+        return -22l;
+    start = address;
+    length = align_up(length, PAGE_SIZE);
+    end = start + length;
+    if (end < start || !vm_range_covered(start, end))
+        return -12l;
+    if (!vm_apply_protection(start, end, prot))
+        return -12l;
+    if (!vm_remove_range(start, end) || !vm_add_region(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS))
+        return -12l;
+    return 0l;
+}
+
 static s64 sys_mmap_impl(u64 address, u64 length, u64 prot, u64 flags, u64 fd, u64 offset)
 {
     u64 start;
     u64 end;
-    u64 pte_flags = 0ul;
+    u64 pte_flags;
     (void)offset;
-    if (length == 0ul)
+    if (length == 0ul || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul)
         return -22l;
-    if ((flags & MAP_ANONYMOUS) == 0ul)
+    if ((flags & (MAP_PRIVATE | MAP_ANONYMOUS)) != (MAP_PRIVATE | MAP_ANONYMOUS))
         return -19l;
     if (fd != (u64)-1l)
-        fd = fd;
+        return -22l;
     length = align_up(length, PAGE_SIZE);
     if ((flags & MAP_FIXED) != 0ul)
-        start = align_down(address, PAGE_SIZE);
+    {
+        if ((address & PAGE_MASK) != 0ul)
+            return -22l;
+        start = address;
+    }
     else
     {
         start = align_up(user_mmap_cursor, PAGE_SIZE);
-        user_mmap_cursor = start + length;
+        while (vm_range_overlaps(start, start + length))
+            start = start + length;
     }
     end = start + length;
-    if (end < start)
+    if (end < start || !user_mapping_range_valid(start, length))
         return -22l;
-    if ((prot & PROT_READ) != 0ul)
-        pte_flags = pte_flags | PTE_R;
-    if ((prot & PROT_WRITE) != 0ul)
-        pte_flags = pte_flags | PTE_R | PTE_W;
-    if ((prot & PROT_EXEC) != 0ul)
-        pte_flags = pte_flags | PTE_X;
-    if (pte_flags == 0ul)
-        pte_flags = PTE_R;
-    if (!map_user_range(current_user_root_page_table, start, end, pte_flags))
+    if ((flags & MAP_FIXED) != 0ul)
+    {
+        if (!unmap_user_pages(current_user_root_page_table, start, end) || !vm_remove_range(start, end))
+            return -12l;
+    }
+    else if (vm_range_overlaps(start, end))
+    {
         return -12l;
+    }
+    pte_flags = vm_pte_flags(prot);
+    if (pte_flags != 0ul && !map_user_range(current_user_root_page_table, start, end, pte_flags))
+    {
+        unmap_user_pages(current_user_root_page_table, start, end);
+        return -12l;
+    }
+    if (!vm_add_region(start, end, prot, flags & (MAP_PRIVATE | MAP_ANONYMOUS)))
+    {
+        unmap_user_pages(current_user_root_page_table, start, end);
+        return -12l;
+    }
+    if ((flags & MAP_FIXED) == 0ul)
+        user_mmap_cursor = end;
     return (s64)start;
 }
 
@@ -2922,7 +3720,7 @@ static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_imag
     loaded->phent = phentsize;
     loaded->phnum = phnum;
     loaded->brk_start = align_up(high, PAGE_SIZE);
-    if (!user_va_canonical(loaded->entry))
+    if (loaded->entry >= USER_VA_LIMIT)
         return 0;
     if (!user_translate(root, loaded->entry, PTE_X, &entry_physical))
         return 0;
@@ -2940,10 +3738,6 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     u32 word = 0u;
     u32 index = 0u;
     if (arguments->count == 0u)
-        return 0;
-    if (!map_user_stack(root))
-        return 0;
-    if (!user_copy_to(root, strings, arguments->bytes, (u64)arguments->bytes_used))
         return 0;
     stack[word] = (u64)arguments->count;
     word = word + 1u;
@@ -2976,6 +3770,10 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     stack[word + 1u] = 0ul;
     word = word + 2u;
     sp = align_down(align_down(strings, 16ul) - (u64)word * 8ul, 16ul);
+    if (!map_user_stack(root, sp))
+        return 0;
+    if (!user_copy_to(root, strings, arguments->bytes, (u64)arguments->bytes_used))
+        return 0;
     if (!user_copy_to(root, sp, stack, (u64)word * 8ul))
         return 0;
     *out_stack = sp;
@@ -2990,9 +3788,14 @@ static int grow_user_brk(u64 requested)
         return 0;
     old_limit = align_up(process_brk, PAGE_SIZE);
     new_limit = align_up(requested, PAGE_SIZE);
-    if (new_limit > old_limit)
+    if (requested > process_brk)
     {
-        if (!map_user_range(current_user_root_page_table, old_limit, new_limit, PTE_R | PTE_W))
+        if (!user_mapping_range_valid(process_brk_min, requested - process_brk_min))
+            return 0;
+    }
+    else if (new_limit < old_limit)
+    {
+        if (!unmap_user_pages(current_user_root_page_table, new_limit, old_limit))
             return 0;
     }
     process_brk = requested;
@@ -3094,7 +3897,14 @@ void kernel_trap_dispatch(struct trap_frame* frame)
         }
         if (nr == SYS_CLONE)
         {
-            frame->x[10] = (u64)(s64)process_clone(frame, frame->x[10], frame->x[11]);
+            u64 flags = frame->x[10];
+            s64 result = (s64)process_clone(frame, flags, frame->x[11]);
+            frame->x[10] = (u64)result;
+            if (result > 0l && (flags & CLONE_VFORK) != 0ul)
+            {
+                current_task->state = PROC_VFORK;
+                scheduler_switch(frame);
+            }
             return;
         }
         if (nr == SYS_EXECVE)
@@ -3114,9 +3924,14 @@ void kernel_trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_mmap_impl(frame->x[10], frame->x[11], frame->x[12], frame->x[13], frame->x[14], frame->x[15]);
             return;
         }
-        if (nr == SYS_MUNMAP || nr == SYS_MPROTECT)
+        if (nr == SYS_MUNMAP)
         {
-            frame->x[10] = 0ul;
+            frame->x[10] = (u64)sys_munmap_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_MPROTECT)
+        {
+            frame->x[10] = (u64)sys_mprotect_impl(frame->x[10], frame->x[11], frame->x[12]);
             return;
         }
         if (nr == SYS_BRK)
@@ -3142,6 +3957,13 @@ void kernel_trap_dispatch(struct trap_frame* frame)
     {
         scheduler_timer_interrupt(frame);
         return;
+    }
+    if ((cause == 13ul || cause == 15ul) && (frame->sstatus & SSTATUS_SPP) == 0ul)
+    {
+        if (map_user_stack_fault(current_user_root_page_table, frame->stval))
+            return;
+        if (map_user_brk_fault(current_user_root_page_table, frame->stval))
+            return;
     }
 
     puts("kernel: trap cause=");

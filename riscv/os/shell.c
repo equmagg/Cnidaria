@@ -1,4 +1,4 @@
-#define SHELL_LINE_CAPACITY 128
+﻿#define SHELL_LINE_CAPACITY 128
 #define SHELL_MAX_ARGUMENTS 16
 
 static int read_line(char* line, int capacity)

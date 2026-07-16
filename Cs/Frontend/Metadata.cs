@@ -2103,6 +2103,22 @@ namespace Cnidaria.Cs
                 typeFlags |= (int)System.Reflection.TypeAttributes.Sealed;
             }
 
+            bool hasExplicitStaticConstructor = false;
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is MethodSymbol method &&
+                    method.IsStatic &&
+                    method.Parameters.Length == 0 &&
+                    StringComparer.Ordinal.Equals(method.Name, ".cctor") &&
+                    !method.DeclaringSyntaxReferences.IsDefaultOrEmpty)
+                {
+                    hasExplicitStaticConstructor = true;
+                    break;
+                }
+            }
+            if (!hasExplicitStaticConstructor)
+                typeFlags |= (int)System.Reflection.TypeAttributes.BeforeFieldInit;
+
             Image.TypeDefs[typeDefIndex] = new TypeDefRow(
                 flags: typeFlags,
                 name: nameIdx,

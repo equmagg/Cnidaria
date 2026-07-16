@@ -15,17 +15,18 @@ namespace Cnidaria.C
         DiagnosticSeverity Severity { get; }
         string Message { get; }
         TextSpan Position { get; }
+        string GetMessage(string source);
     }
     public readonly struct SyntaxDiagnostic : IDiagnostic
     {
         public DiagnosticSeverity Severity { get; }
-        public string Message { get; }
+        public string Message => _message;
         public TextSpan Position { get; }
-
+        private readonly string _message;
         public SyntaxDiagnostic(DiagnosticSeverity severity, string? message, TextSpan position)
         {
             Severity = severity;
-            Message = message ?? string.Empty;
+            _message = message ?? string.Empty;
             Position = position;
         }
 
@@ -33,6 +34,8 @@ namespace Cnidaria.C
             : this(DiagnosticSeverity.Error, message, position)
         {
         }
+
+        public string GetMessage(string source) => _message + $" {Position.ToString(source)}";
 
         public static SyntaxDiagnostic Error(string message, TextSpan position)
             => new SyntaxDiagnostic(DiagnosticSeverity.Error, message, position);
@@ -55,9 +58,58 @@ namespace Cnidaria.C
             Start = start;
             Length = length;
         }
+        public static bool operator ==(TextSpan left, TextSpan right) => left.Start == right.Start && left.Length == right.Length;
+        public static bool operator !=(TextSpan left, TextSpan right) => !(left == right);
+        public override bool Equals(object? obj)
+        {
+            return obj != null && obj is TextSpan t && t.Start == this.Start && t.Length == this.Length;
+        }
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(Start, Length);
+        }
+        public override string ToString() => $"[{Start}..{End})";
+        public string ToString(string souce)
+        {
+            var res = GetLineAndColumn(souce, Start);
+            return $"[{res.line}, {res.column}]";
+        }
+        public static (int line, int column) GetLineAndColumn(string text, int index)
+        {
+            if (text == null)
+                throw new ArgumentNullException(nameof(text));
 
-        public static TextSpan FromBounds(int start, int end)
-            => new TextSpan(start, end - start);
+            if ((uint)index > (uint)text.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+
+            int line = 1;
+            int column = 1;
+
+            for (int i = 0; i < index; i++)
+            {
+                char c = text[i];
+
+                if (c == '\n')
+                {
+                    line++;
+                    column = 1;
+                }
+                else if (c == '\r')
+                {
+                    line++;
+                    column = 1;
+
+                    if (i + 1 < index && text[i + 1] == '\n')
+                        i++;
+                }
+                else
+                {
+                    column++;
+                }
+            }
+
+            return (line, column);
+        }
     }
 
     public readonly struct SyntaxTrivia
@@ -102,6 +154,47 @@ namespace Cnidaria.C
         }
     }
 
+    public enum SyntaxColor : byte
+    {
+        Text,
+        Keyword,
+        TypeKeyword,
+        Identifier,
+        TypeName,
+        FunctionName,
+        VariableName,
+        ParameterName,
+        FieldName,
+        LabelName,
+        MacroName,
+        Number,
+        String,
+        Character,
+        Comment,
+        PreprocessorKeyword,
+        PreprocessorText,
+        ExcludedCode,
+        Operator,
+        Punctuation,
+        Error
+    }
+    public readonly struct ColorSpan
+    {
+        public TextSpan Span { get; }
+        public SyntaxColor Color { get; }
+        public ColorSpan(TextSpan span, SyntaxColor color)
+        {
+            Span = span;
+            Color = color;
+        }
+        public bool Equals(ColorSpan other)
+            => other.Span.Start == this.Span.Start && other.Span.Length == this.Span.Length && other.Color == this.Color;
+
+        public override bool Equals(object? obj) => obj is ColorSpan other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(Span, Color);
+        public static bool operator ==(ColorSpan left, ColorSpan right) => left.Equals(right);
+        public static bool operator !=(ColorSpan left, ColorSpan right) => !left.Equals(right);
+    }
     public sealed class TypeNameTable
     {
         private readonly Stack<Dictionary<string, bool>> _scopes = new();
@@ -144,6 +237,9 @@ namespace Cnidaria.C
 
         public bool IsTypeName(string name)
         {
+            if (RVVectorType.TryParseBuiltinName(name, out _))
+                return true;
+
             foreach (var scope in _scopes)
             {
                 if (scope.TryGetValue(name, out var isTypedefName))

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace Cnidaria.C
 {
@@ -516,6 +517,7 @@ namespace Cnidaria.C
         private readonly Dictionary<SsaVariableKey, CandidateInfo> _candidates = new();
         private readonly List<CandidateInfo> _candidateOrder = new();
         private readonly HashSet<SsaVariableKey> _addressTaken = new();
+        private readonly HashSet<Symbol> _functionLocalSymbols = new();
         private readonly Dictionary<SsaVariableKey, SsaVariable> _variablesByKey = new();
         private readonly Dictionary<SsaVariable, HashSet<ControlFlowBlock>> _definitionBlocks = new();
         private readonly Dictionary<SsaVariable, HashSet<ControlFlowBlock>> _liveInBlocks = new();
@@ -589,7 +591,10 @@ namespace Cnidaria.C
             if (functionType is not null)
             {
                 foreach (var parameter in functionType.Parameters)
+                {
+                    _functionLocalSymbols.Add(parameter);
                     AddCandidate(SsaVariableKey.FromSymbol(parameter), parameter.Type, parameter.Name, StorageClass.Auto);
+                }
             }
 
             foreach (var temporary in _controlFlowFunction.Function.Temporaries)
@@ -608,7 +613,10 @@ namespace Cnidaria.C
             {
                 case GimpleDeclarationStatement declaration:
                     if (declaration.Symbol is TypedSymbol typed && declaration.Symbol is VariableSymbol or ParameterSymbol)
+                    {
+                        _functionLocalSymbols.Add(declaration.Symbol);
                         AddCandidate(SsaVariableKey.FromSymbol(declaration.Symbol), typed.Type, declaration.Symbol.Name, declaration.StorageClass);
+                    }
                     break;
 
                 case GimpleAssignmentStatement assignment:
@@ -830,6 +838,9 @@ namespace Cnidaria.C
 
             if (candidate.Key.Symbol is VariableSymbol variableSymbol)
             {
+                if (!_functionLocalSymbols.Contains(variableSymbol))
+                    return false;
+
                 var storageClass = variableSymbol.StorageClass == StorageClass.None
                     ? candidate.StorageClass
                     : variableSymbol.StorageClass;
@@ -1861,17 +1872,11 @@ namespace Cnidaria.C
             unchecked
             {
                 var hash = (int)Kind;
-                hash = (hash * 397) ^ (Symbol is null ? 0 : RuntimeHelpersShim.GetHashCode(Symbol));
-                hash = (hash * 397) ^ (Temporary is null ? 0 : RuntimeHelpersShim.GetHashCode(Temporary));
+                hash = (hash * 397) ^ (Symbol is null ? 0 : RuntimeHelpers.GetHashCode(Symbol));
+                hash = (hash * 397) ^ (Temporary is null ? 0 : RuntimeHelpers.GetHashCode(Temporary));
                 return hash;
             }
         }
-    }
-
-    internal static class RuntimeHelpersShim
-    {
-        public static int GetHashCode(object value)
-            => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(value);
     }
 
 }

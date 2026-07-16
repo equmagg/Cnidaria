@@ -18,7 +18,7 @@ namespace Cnidaria.Cs
             if (rationalizedMethod.LinearNodes.IsDefaultOrEmpty && rationalizedMethod.Blocks.Length != 0)
                 throw new InvalidOperationException("Lowering requires rationalized LIR nodes. Call GenTreeLinearIrRationalizer.RationalizeMethod first.");
 
-            LinearLoweringRefiner.Refine(rationalizedMethod);
+            LinearLoweringRefiner.Refine(rationalizedMethod, options);
             var result = LinearLiveness.Attach(rationalizedMethod);
 
             if (options.Validate)
@@ -29,12 +29,14 @@ namespace Cnidaria.Cs
     }
     internal static class LinearLoweringRefiner
     {
-        public static void Refine(GenTreeMethod method)
+        public static void Refine(GenTreeMethod method, LinearRationalizationOptions options)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
+            if (options is null)
+                throw new ArgumentNullException(nameof(options));
 
-            new Pass(method).Run();
+            new Pass(method, options).Run();
         }
 
         private sealed class Pass
@@ -43,11 +45,13 @@ namespace Cnidaria.Cs
             private readonly TargetInfo _target;
             private readonly GenTreeLinearLoweringClassifier _classifier;
 
-            public Pass(GenTreeMethod method)
+            public Pass(GenTreeMethod method, LinearRationalizationOptions options)
             {
                 _method = method;
                 _target = method.Target;
-                _classifier = new GenTreeLinearLoweringClassifier(_target);
+                _classifier = new GenTreeLinearLoweringClassifier(
+                    _target,
+                    options.GetNonCallOperationsClobberCallerSavedRegisters(_target));
             }
 
             public void Run()

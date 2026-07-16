@@ -104,6 +104,25 @@ namespace Cnidaria.Cs
                 if (node.LinearKind == GenTreeLinearKind.Tree && !node.HasLoweringFlag(GenTreeLinearFlags.IsStandaloneLoweredNode))
                     throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} is not marked as standalone lowered LIR.");
 
+                if (node.LinearKind == GenTreeLinearKind.GcPoll)
+                {
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
+                    {
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: GC poll node {node.LinearId} must be a GC safe point.");
+                    }
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill) &&
+                        !node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedRegistersPreserved))
+                    {
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: GC poll node {node.LinearId} has no caller-saved register policy.");
+                    }
+                }
+
+                if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill) &&
+                    node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedRegistersPreserved))
+                {
+                    throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} has conflicting caller-saved register policies.");
+                }
+
                 VerifyContainedAndRegOptionalOperands(method, node, useRefsByNodeAndUse);
                 VerifyInternalRegisterInvariants(node, internalRefsByNode.TryGetValue(node.LinearId, out var internals) ? internals : null);
                 VerifyUnusedValueInvariant(method, node, defRefsByNode.TryGetValue(node.LinearId, out var defs) ? defs : null);

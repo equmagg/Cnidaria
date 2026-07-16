@@ -109,6 +109,25 @@ namespace Cnidaria.Cs
             private readonly HashSet<int> _explicitLocalSlots = new();
             private readonly HashSet<int> _explicitTempSlots = new();
             private StackFrameLayout _layout = StackFrameLayout.Empty;
+            private TargetInfo Target => _method.GenTreeMethod.Target;
+
+            private StorageInfo StorageForDescriptor(GenLocalDescriptor descriptor)
+                => RegisterStackLayoutFinalizer.StorageForDescriptor(descriptor, Target);
+
+            private StorageInfo StorageForValue(GenTreeValueInfo valueInfo)
+                => RegisterStackLayoutFinalizer.StorageForValue(valueInfo, Target);
+
+            private StorageInfo StorageForType(RuntimeType type)
+                => RegisterStackLayoutFinalizer.StorageForType(type, Target);
+
+            private StorageInfo StorageForStackKind(GenStackKind stackKind)
+                => RegisterStackLayoutFinalizer.StorageForStackKind(stackKind, Target);
+
+            private StorageInfo StorageForRegisterClass(RegisterClass registerClass)
+                => RegisterStackLayoutFinalizer.StorageForRegisterClass(registerClass, Target);
+
+            private StorageInfo StorageForAbiSegment(AbiRegisterSegment segment)
+                => RegisterStackLayoutFinalizer.StorageForAbiSegment(segment, Target);
 
             public MethodBuilder(RegisterAllocatedMethod method, RegisterStackLayoutOptions options)
             {
@@ -272,7 +291,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private static bool SurvivingLocalLikeNodeRequiresHome(GenTree node)
+            private bool SurvivingLocalLikeNodeRequiresHome(GenTree node)
             {
                 var descriptor = node.LocalDescriptor;
                 if (descriptor is null)
@@ -292,13 +311,13 @@ namespace Cnidaria.Cs
                 var type = descriptor.Type ?? node.RuntimeType ?? node.Type;
                 var stackKind = descriptor.StackKind == GenStackKind.Unknown ? node.StackKind : descriptor.StackKind;
 
-                if (MachineAbi.RequiresStackHome(type, stackKind))
+                if (MachineAbi.RequiresStackHome(type, stackKind, Target))
                     return true;
 
                 if (type is not null && type.IsValueType && type.ContainsGcPointers)
                     return true;
 
-                var abi = MachineAbi.ClassifyValue(type, stackKind, isReturn: false);
+                var abi = MachineAbi.ClassifyValue(type, stackKind, isReturn: false, target: Target);
                 return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister;
             }
 
@@ -417,7 +436,7 @@ namespace Cnidaria.Cs
                 spec.Merge(registerClass, storage);
             }
 
-            private static StorageInfo FragmentStorageForOperand(RegisterOperand operand)
+            private StorageInfo FragmentStorageForOperand(RegisterOperand operand)
             {
                 if (operand.FrameSlotSize <= 0)
                     return StorageForRegisterClass(operand.RegisterClass);
@@ -478,6 +497,39 @@ namespace Cnidaria.Cs
                 AllocateOutgoingArgumentSlots(outgoingSlots, ref cursor);
                 int outgoingSize = cursor - outgoingOffset;
 
+                int gcSpillOffset = cursor;
+                int gcRootSpillSlotCount = 0;
+                int gcSpillSize = 0;
+                bool hasGcSafePoint = Target.IsRiscV && MethodHasGcSafePoint();
+                int typeOperationScratchSize = Target.IsRiscV ? ComputeTypeOperationScratchSize() : 0;
+                if (Target.IsRiscV && (hasGcSafePoint || typeOperationScratchSize != 0))
+                {
+                    int floatingArgumentSize = RegisterInfo.AbiFloatingRegisterSize(Target);
+                    cursor = AlignUp(cursor, Math.Max(Target.PointerSize, floatingArgumentSize));
+                    gcSpillOffset = cursor;
+                    gcRootSpillSlotCount = hasGcSafePoint ? ComputeGcRootSpillSlotCount() : 0;
+                    int gcRootSpillSize = checked(gcRootSpillSlotCount * Target.PointerSize);
+                    int gcSpillCursor = gcRootSpillSize;
+                    if (typeOperationScratchSize != 0)
+                    {
+                        int typeOperationScratchOffset = AlignUp(
+                            checked(gcSpillOffset + gcSpillCursor),
+                            ComputeTypeOperationScratchAlignment());
+                        gcSpillCursor = checked(typeOperationScratchOffset - gcSpillOffset + typeOperationScratchSize);
+                    }
+
+                    if (MethodHasReferenceNewObject())
+                    {
+                        gcSpillCursor = AlignUp(gcSpillCursor, Math.Max(Target.PointerSize, floatingArgumentSize));
+                        gcSpillCursor = checked(gcSpillCursor + 7 * Target.GeneralRegisterSize);
+                        gcSpillCursor = AlignUp(gcSpillCursor, Math.Max(1, floatingArgumentSize));
+                        gcSpillCursor = checked(gcSpillCursor + 8 * floatingArgumentSize);
+                    }
+
+                    gcSpillSize = gcSpillCursor;
+                    cursor = checked(cursor + gcSpillSize);
+                }
+
                 int frameSize = AlignUp(cursor, frameAlignment);
 
                 return new StackFrameLayout(
@@ -502,7 +554,155 @@ namespace Cnidaria.Cs
                     calleeSaved.ToImmutable(),
                     outgoingSlots.ToImmutable(),
                     usesFramePointer,
-                    SelectFrameModel(usesFramePointer, frameSize));
+                    SelectFrameModel(usesFramePointer, frameSize),
+                    gcSpillOffset,
+                    gcSpillSize,
+                    gcRootSpillSlotCount);
+            }
+
+
+            private bool MethodHasGcSafePoint()
+            {
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    GenTree node = _method.LinearNodes[i];
+                    if (node.TreeKind is
+                        GenTreeKind.ClassInit or
+                        GenTreeKind.GcPoll or
+                        GenTreeKind.NewObject or
+                        GenTreeKind.NewArray or
+                        GenTreeKind.Box)
+                    {
+                        return true;
+                    }
+                    if (node.TreeKind == GenTreeKind.Call &&
+                        (node.Method?.HasInternalCall != true ||
+                        (Target.IsRiscV && node.Method is not null && RiscVRuntime.IsGcSafePointInternalCall(node.Method))))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            private int ComputeTypeOperationScratchSize()
+            {
+                int size = 0;
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    GenTree node = _method.LinearNodes[i];
+                    RuntimeType? type = TypeOperationScratchType(node);
+                    if (type?.IsValueType != true)
+                        continue;
+
+                    size = Math.Max(size, Math.Max(1, type.SizeOf));
+                }
+
+                return size == 0 ? 0 : AlignUp(size, ComputeTypeOperationScratchAlignment());
+            }
+
+            private int ComputeTypeOperationScratchAlignment()
+            {
+                int alignment = Target.PointerSize;
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    RuntimeType? type = TypeOperationScratchType(_method.LinearNodes[i]);
+                    if (type?.IsValueType == true)
+                        alignment = Math.Max(alignment, Math.Max(1, type.AlignOf));
+                }
+                return alignment;
+            }
+
+            private RuntimeType? TypeOperationScratchType(GenTree node)
+            {
+                if (node.TreeKind is not (GenTreeKind.Box or GenTreeKind.UnboxAny))
+                    return null;
+
+                if (node.TreeKind == GenTreeKind.Box && !node.RegisterUses.IsDefaultOrEmpty)
+                    return _method.GenTreeMethod.GetValueInfo(node.RegisterUses[0]).Type ?? node.RuntimeType ?? node.Type;
+
+                return node.RuntimeType ?? node.Type;
+            }
+
+            private bool MethodHasReferenceNewObject()
+            {
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    GenTree node = _method.LinearNodes[i];
+                    if (node.TreeKind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == false)
+                        return true;
+                }
+                return false;
+            }
+
+            private int ComputeGcRootSpillSlotCount()
+            {
+                int count = 0;
+
+                for (int i = 0; i < _method.Allocations.Length; i++)
+                {
+                    var allocation = _method.Allocations[i];
+                    if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(allocation.ValueKey, out var info))
+                        continue;
+                    count = checked(count + GcCellCount(info.Type, info.StackKind));
+                }
+
+                count = checked(count + GcCellCount(_method.GenTreeMethod.ArgDescriptors));
+                count = checked(count + GcCellCount(_method.GenTreeMethod.LocalDescriptors));
+                count = checked(count + GcCellCount(_method.GenTreeMethod.TempDescriptors));
+                count = checked(count + GcSafePointOperandCellCount());
+                return checked(count + 1);
+            }
+
+            private int GcSafePointOperandCellCount()
+            {
+                int maximum = 0;
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    GenTree node = _method.LinearNodes[i];
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
+                        continue;
+
+                    int count = 0;
+                    int operandCount = Math.Min(node.Uses.Length, node.RegisterUses.Length);
+                    for (int u = 0; u < operandCount; u++)
+                    {
+                        if (u < node.UseRoles.Length && node.UseRoles[u] == OperandRole.HiddenReturnBuffer)
+                            continue;
+                        GenTree value = node.RegisterUses[u];
+                        if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(value.LinearValueKey, out var info))
+                            continue;
+                        count = checked(count + GcCellCount(info.Type, info.StackKind));
+                    }
+                    maximum = Math.Max(maximum, count);
+                }
+                return maximum;
+            }
+
+            private static int GcCellCount(ImmutableArray<GenLocalDescriptor> descriptors)
+            {
+                int count = 0;
+                for (int i = 0; i < descriptors.Length; i++)
+                {
+                    var descriptor = descriptors[i];
+                    if (descriptor.IsStructField)
+                        continue;
+                    count = checked(count + GcCellCount(descriptor.Type, descriptor.StackKind));
+                }
+                return count;
+            }
+
+            private static int GcCellCount(RuntimeType? type, GenStackKind stackKind)
+            {
+                if (type is not null)
+                {
+                    if (type.IsReferenceType || type.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                        return 1;
+                    if (type.IsValueType && type.ContainsGcPointers)
+                        return type.GcPointerOffsets.Length;
+                }
+
+                return stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null ? 1 : 0;
             }
 
             private RegisterStackFrameModel SelectFrameModel(bool usesFramePointer, int frameSize)
@@ -519,10 +719,16 @@ namespace Cnidaria.Cs
 
             private bool ShouldUseFramePointer()
             {
+                if (Target.IsRiscV && (MethodHasGcSafePoint() || ComputeTypeOperationScratchSize() != 0))
+                    return true;
+
                 if (_options.UseFramePointerForFunclets && _method.Funclets.Length > 1)
                     return true;
 
                 if (_method.GenTreeMethod.Cfg.ExceptionRegions.Length != 0)
+                    return true;
+
+                if (MethodHasDynamicStackAllocation())
                     return true;
 
                 if (UsesSpecificCalleeSavedRegister(MachineRegisters.FramePointer))
@@ -531,12 +737,22 @@ namespace Cnidaria.Cs
                 return _options.SaveFramePointerWhenFrameIsUsed;
             }
 
+            private bool MethodHasDynamicStackAllocation()
+            {
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    if (_method.LinearNodes[i].TreeKind == GenTreeKind.StackAlloc)
+                        return true;
+                }
+                return false;
+            }
+
             private bool MethodMayCall()
             {
-                for (int i = 0; i < _method.GenTreeMethod.LinearNodes.Length; i++)
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
-                    var node = _method.GenTreeMethod.LinearNodes[i];
-                    if (node.LinearKind == GenTreeLinearKind.GcPoll || node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
+                    var node = _method.LinearNodes[i];
+                    if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
                         return true;
                 }
 
@@ -581,7 +797,7 @@ namespace Cnidaria.Cs
                     CollectCalleeSavedRegisters(_method.Allocations[i], used);
             }
 
-            private static bool AllocationUsesCalleeSavedRegister(RegisterAllocationInfo allocation)
+            private bool AllocationUsesCalleeSavedRegister(RegisterAllocationInfo allocation)
             {
                 if (IsCalleeSavedRegisterOperand(allocation.Home))
                     return true;
@@ -637,7 +853,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static void CollectCalleeSavedRegisters(RegisterAllocationInfo allocation, SortedSet<MachineRegister> used)
+            private void CollectCalleeSavedRegisters(RegisterAllocationInfo allocation, SortedSet<MachineRegister> used)
             {
                 AddCalleeSavedRegister(allocation.Home, used);
 
@@ -654,24 +870,24 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private static bool IsCalleeSavedRegisterOperand(RegisterOperand operand)
-                => operand.IsRegister && MachineRegisters.IsCalleeSaved(operand.Register);
+            private bool IsCalleeSavedRegisterOperand(RegisterOperand operand)
+                => operand.IsRegister && RegisterInfo.IsCalleeSaved(Target, operand.Register);
 
-            private static void AddCalleeSavedRegister(RegisterOperand operand, SortedSet<MachineRegister> used)
+            private void AddCalleeSavedRegister(RegisterOperand operand, SortedSet<MachineRegister> used)
             {
                 if (IsCalleeSavedRegisterOperand(operand))
                     used.Add(operand.Register);
             }
 
-            private static void AllocateSavedRegisterSlot(
+            private void AllocateSavedRegisterSlot(
                 ImmutableArray<StackFrameSlot>.Builder slots,
                 ref int cursor,
                 ref int index,
                 StackFrameSlotKind kind,
                 MachineRegister register)
             {
-                int size = MachineRegisters.RegisterSaveSize(register);
-                int align = MachineRegisters.RegisterSaveAlignment(register);
+                int size = RegisterInfo.RegisterSaveSize(Target, register);
+                int align = RegisterInfo.RegisterSaveAlignment(Target, register);
                 cursor = AlignUp(cursor, align);
                 slots.Add(new StackFrameSlot(
                     kind,
@@ -710,7 +926,7 @@ namespace Cnidaria.Cs
                 ValidateExplicitUserSlots(StackFrameSlotKind.Local, _explicitLocalSlots, descriptors);
             }
 
-            private static bool RequiresDescriptorHome(GenLocalDescriptor descriptor, HashSet<int> explicitSlots)
+            private bool RequiresDescriptorHome(GenLocalDescriptor descriptor, HashSet<int> explicitSlots)
             {
                 if (explicitSlots.Contains(descriptor.Index))
                     return true;
@@ -727,7 +943,7 @@ namespace Cnidaria.Cs
                 if (!descriptor.SsaPromoted)
                     return true;
 
-                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind))
+                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind, Target))
                     return true;
 
                 if (descriptor.Type is not null && descriptor.Type.IsValueType && descriptor.Type.ContainsGcPointers)
@@ -771,17 +987,17 @@ namespace Cnidaria.Cs
             {
                 var argTypes = _method.GenTreeMethod.ArgTypes;
                 int hiddenReturnBufferHomeIndex = argTypes.Length;
-                if (MachineAbi.RequiresHiddenReturnBuffer(_method.GenTreeMethod.RuntimeMethod))
+                if (MachineAbi.RequiresHiddenReturnBuffer(_method.GenTreeMethod.RuntimeMethod, Target))
                 {
-                    cursor = AlignUp(cursor, TargetArchitecture.PointerSize);
+                    cursor = AlignUp(cursor, Target.PointerSize);
                     slots.Add(new StackFrameSlot(
                         StackFrameSlotKind.Argument,
                         hiddenReturnBufferHomeIndex,
                         cursor,
-                        TargetArchitecture.PointerSize,
-                        TargetArchitecture.PointerSize,
+                        Target.PointerSize,
+                        Target.PointerSize,
                         RegisterClass.General));
-                    cursor = checked(cursor + TargetArchitecture.PointerSize);
+                    cursor = checked(cursor + Target.PointerSize);
                 }
 
                 for (int i = 0; i < argTypes.Length; i++)
@@ -799,8 +1015,11 @@ namespace Cnidaria.Cs
             private bool RequiresIncomingArgumentHome(int index)
             {
                 RuntimeType argType = _method.GenTreeMethod.ArgTypes[index];
-                var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false);
-                if (argAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false, target: Target);
+                var effectiveArgAbi = GetEffectiveIncomingArgumentAbi(index, argAbi);
+                if (!MachineAbi.HaveMatchingArgumentValueLayout(argAbi, effectiveArgAbi, Target))
+                    return true;
+                if (effectiveArgAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
                     return true;
 
                 if (!TryGetTopLevelArgumentDescriptor(index, out var descriptor))
@@ -812,7 +1031,7 @@ namespace Cnidaria.Cs
                 if (!descriptor.SsaPromoted)
                     return true;
 
-                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind))
+                if (MachineAbi.RequiresStackHome(descriptor.Type, descriptor.StackKind, Target))
                     return true;
 
                 if (descriptor.Type is not null && descriptor.Type.IsValueType && descriptor.Type.ContainsGcPointers)
@@ -822,6 +1041,101 @@ namespace Cnidaria.Cs
                     return true;
 
                 return false;
+            }
+
+            private AbiValueInfo GetEffectiveIncomingArgumentAbi(int argumentIndex, AbiValueInfo requestedArgumentAbi)
+            {
+                int generalArgumentIndex = 0;
+                int floatArgumentIndex = 0;
+                int incomingStackArgumentIndex = 0;
+                int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
+                    _method.GenTreeMethod.RuntimeMethod,
+                    _method.GenTreeMethod.ArgTypes.Length,
+                    Target);
+
+                for (int i = 0; i <= argumentIndex; i++)
+                {
+                    if (hiddenReturnBufferIndex == i)
+                    {
+                        _ = MachineAbi.AssignScalarArgumentLocation(
+                            RegisterClass.General,
+                            Target.PointerSize,
+                            ref generalArgumentIndex,
+                            ref floatArgumentIndex,
+                            ref incomingStackArgumentIndex,
+                            Target);
+                    }
+
+                    RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
+                    var valueAbi = i == argumentIndex
+                        ? requestedArgumentAbi
+                        : MachineAbi.ClassifyValue(
+                            currentType,
+                            MachineAbi.StackKindForType(currentType),
+                            isReturn: false,
+                            target: Target);
+                    var effectiveAbi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
+                        valueAbi,
+                        generalArgumentIndex,
+                        floatArgumentIndex,
+                        Target);
+                    if (i == argumentIndex)
+                        return effectiveAbi;
+
+                    ConsumeIncomingArgumentAbi(
+                        effectiveAbi,
+                        ref generalArgumentIndex,
+                        ref floatArgumentIndex,
+                        ref incomingStackArgumentIndex);
+                }
+
+                throw new InvalidOperationException("Invalid incoming argument index " + argumentIndex.ToString() + ".");
+            }
+
+            private void ConsumeIncomingArgumentAbi(
+                AbiValueInfo abi,
+                ref int generalArgumentIndex,
+                ref int floatArgumentIndex,
+                ref int incomingStackArgumentIndex)
+            {
+                if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                {
+                    var registerClass = abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass;
+                    _ = MachineAbi.AssignScalarArgumentLocation(
+                        registerClass,
+                        abi.Size <= 0 ? Target.PointerSize : abi.Size,
+                        ref generalArgumentIndex,
+                        ref floatArgumentIndex,
+                        ref incomingStackArgumentIndex,
+                        Target);
+                    return;
+                }
+
+                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                {
+                    int aggregateStackSlot = -1;
+                    int aggregateStackBaseOffset = 0;
+                    var segments = MachineAbi.GetRegisterSegments(abi, Target);
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        _ = MachineAbi.AssignAggregateSegmentArgumentLocation(
+                            segments[i],
+                            ref generalArgumentIndex,
+                            ref floatArgumentIndex,
+                            ref incomingStackArgumentIndex,
+                            ref aggregateStackSlot,
+                            ref aggregateStackBaseOffset,
+                            Target);
+                    }
+                    return;
+                }
+
+                if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                {
+                    int stackSize = abi.Size <= 0 ? Target.PointerSize : abi.Size;
+                    incomingStackArgumentIndex = checked(
+                        incomingStackArgumentIndex + MachineAbi.StackSlotsForArgumentSize(stackSize, Target));
+                }
             }
 
             private bool TryGetTopLevelArgumentDescriptor(int index, out GenLocalDescriptor descriptor)
@@ -874,21 +1188,24 @@ namespace Cnidaria.Cs
                 GenStackKind parentStackKind = parentDescriptor.StackKind == GenStackKind.Unknown
                     ? MachineAbi.StackKindForType(parentType)
                     : parentDescriptor.StackKind;
-                var parentAbi = MachineAbi.ClassifyValue(parentType, parentStackKind, isReturn: false);
+                var parentAbi = MachineAbi.ClassifyValue(parentType, parentStackKind, isReturn: false, target: Target);
+                var effectiveParentAbi = GetEffectiveIncomingArgumentAbi(parentArgumentIndex, parentAbi);
+                if (!MachineAbi.HaveMatchingArgumentValueLayout(parentAbi, effectiveParentAbi, Target))
+                    return true;
 
                 if (parentAbi.PassingKind == AbiValuePassingKind.Void)
                     return false;
 
                 if (parentAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 {
-                    int scalarSize = Math.Max(1, parentAbi.Size <= 0 ? TargetArchitecture.PointerSize : parentAbi.Size);
+                    int scalarSize = Math.Max(1, parentAbi.Size <= 0 ? Target.PointerSize : parentAbi.Size);
                     return fieldOffset != 0 || fieldSize != scalarSize;
                 }
 
                 if (parentAbi.PassingKind != AbiValuePassingKind.MultiRegister)
                     return false;
 
-                var segments = MachineAbi.GetRegisterSegments(parentAbi);
+                var segments = MachineAbi.GetRegisterSegments(parentAbi, Target);
                 int fieldEnd = fieldOffset + fieldSize;
                 for (int s = 0; s < segments.Length; s++)
                 {
@@ -925,23 +1242,33 @@ namespace Cnidaria.Cs
                 int incomingStackArgumentIndex = 0;
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                     _method.GenTreeMethod.RuntimeMethod,
-                    _method.GenTreeMethod.ArgTypes.Length);
+                    _method.GenTreeMethod.ArgTypes.Length,
+                    Target);
 
                 for (int i = 0; i <= argumentIndex; i++)
                 {
                     if (hiddenReturnBufferIndex == i)
                         _ = MachineAbi.AssignScalarArgumentLocation(
                             RegisterClass.General,
-                            TargetArchitecture.PointerSize,
+                            Target.PointerSize,
                             ref generalArgumentIndex,
                             ref floatArgumentIndex,
-                            ref incomingStackArgumentIndex);
+                            ref incomingStackArgumentIndex,
+                            Target);
 
                     RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
                     GenStackKind currentStackKind = MachineAbi.StackKindForType(currentType);
-                    var abi = i == argumentIndex
+                    var valueAbi = i == argumentIndex
                         ? argumentAbi
-                        : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false);
+                        : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: Target);
+                    var abi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
+                        valueAbi,
+                        generalArgumentIndex,
+                        floatArgumentIndex,
+                        Target);
+
+                    if (i == argumentIndex && !MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, abi, Target))
+                        return false;
 
                     if (abi.PassingKind == AbiValuePassingKind.Void)
                         continue;
@@ -951,10 +1278,11 @@ namespace Cnidaria.Cs
                         var registerClass = abi.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : abi.RegisterClass;
                         _ = MachineAbi.AssignScalarArgumentLocation(
                             registerClass,
-                            abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size,
+                            abi.Size <= 0 ? Target.PointerSize : abi.Size,
                             ref generalArgumentIndex,
                             ref floatArgumentIndex,
-                            ref incomingStackArgumentIndex);
+                            ref incomingStackArgumentIndex,
+                            Target);
                         continue;
                     }
 
@@ -962,7 +1290,7 @@ namespace Cnidaria.Cs
                     {
                         int aggregateStackSlot = -1;
                         int aggregateStackBaseOffset = 0;
-                        var segments = MachineAbi.GetRegisterSegments(abi);
+                        var segments = MachineAbi.GetRegisterSegments(abi, Target);
                         for (int s = 0; s < segments.Length; s++)
                         {
                             var segmentLocation = MachineAbi.AssignAggregateSegmentArgumentLocation(
@@ -971,7 +1299,8 @@ namespace Cnidaria.Cs
                                 ref floatArgumentIndex,
                                 ref incomingStackArgumentIndex,
                                 ref aggregateStackSlot,
-                                ref aggregateStackBaseOffset);
+                                ref aggregateStackBaseOffset,
+                                Target);
 
                             if (i == argumentIndex && s == requestedSegmentIndex)
                             {
@@ -982,8 +1311,8 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    int stackSize = abi.Size <= 0 ? TargetArchitecture.PointerSize : abi.Size;
-                    incomingStackArgumentIndex = checked(incomingStackArgumentIndex + MachineAbi.StackSlotsForArgumentSize(stackSize));
+                    int stackSize = abi.Size <= 0 ? Target.PointerSize : abi.Size;
+                    incomingStackArgumentIndex = checked(incomingStackArgumentIndex + MachineAbi.StackSlotsForArgumentSize(stackSize, Target));
                 }
 
                 return false;
@@ -1032,10 +1361,10 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private static StorageInfo StorageForOutgoingArgumentSlot(RegisterClass registerClass, StorageInfo valueStorage)
+            private StorageInfo StorageForOutgoingArgumentSlot(RegisterClass registerClass, StorageInfo valueStorage)
             {
-                int size = Math.Max(MachineAbi.StackArgumentSlotSize, valueStorage.Size);
-                int align = Math.Max(MachineAbi.StackArgumentSlotSize, valueStorage.Alignment);
+                int size = Math.Max(Target.StackSlotSize, valueStorage.Size);
+                int align = Math.Max(Target.StackSlotSize, valueStorage.Alignment);
                 return new StorageInfo(size, align);
             }
 
@@ -1081,7 +1410,7 @@ namespace Cnidaria.Cs
                         align,
                         registerClass));
                     cursor = checked(cursor + size);
-                    nextIndex = checked(spec.Index + MachineAbi.StackSlotsForArgumentSize(size));
+                    nextIndex = checked(spec.Index + MachineAbi.StackSlotsForArgumentSize(size, Target));
                 }
             }
 
@@ -1252,26 +1581,26 @@ namespace Cnidaria.Cs
                 => _layout.UsesFramePointer ? RegisterFrameBase.FramePointer : RegisterFrameBase.StackPointer;
         }
 
-        private static StorageInfo StorageForDescriptor(GenLocalDescriptor descriptor)
+        private static StorageInfo StorageForDescriptor(GenLocalDescriptor descriptor, TargetInfo target)
         {
             if (descriptor.Type is not null)
-                return StorageForType(descriptor.Type);
+                return StorageForType(descriptor.Type, target);
 
-            return StorageForStackKind(descriptor.StackKind);
+            return StorageForStackKind(descriptor.StackKind, target);
         }
 
-        private static StorageInfo StorageForValue(GenTreeValueInfo valueInfo)
+        private static StorageInfo StorageForValue(GenTreeValueInfo valueInfo, TargetInfo target)
         {
             if (valueInfo.Type is not null)
-                return StorageForType(valueInfo.Type);
+                return StorageForType(valueInfo.Type, target);
 
-            return StorageForStackKind(valueInfo.StackKind);
+            return StorageForStackKind(valueInfo.StackKind, target);
         }
 
-        private static StorageInfo StorageForType(RuntimeType type)
+        private static StorageInfo StorageForType(RuntimeType type, TargetInfo target)
         {
             if (type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
-                return new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize);
+                return new StorageInfo(target.PointerSize, target.PointerSize);
 
             int size = type.SizeOf;
             int align = type.AlignOf;
@@ -1282,7 +1611,7 @@ namespace Cnidaria.Cs
             return new StorageInfo(size, align);
         }
 
-        private static StorageInfo StorageForStackKind(GenStackKind stackKind)
+        private static StorageInfo StorageForStackKind(GenStackKind stackKind, TargetInfo target)
         {
             return stackKind switch
             {
@@ -1290,27 +1619,31 @@ namespace Cnidaria.Cs
                 GenStackKind.I8 => new StorageInfo(8, 8),
                 GenStackKind.R4 => new StorageInfo(4, 4),
                 GenStackKind.R8 => new StorageInfo(8, 8),
-                GenStackKind.NativeInt => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
-                GenStackKind.NativeUInt => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
-                GenStackKind.Ref => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
-                GenStackKind.Null => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
-                GenStackKind.Ptr => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
-                GenStackKind.ByRef => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
+                GenStackKind.NativeInt => new StorageInfo(target.PointerSize, target.PointerSize),
+                GenStackKind.NativeUInt => new StorageInfo(target.PointerSize, target.PointerSize),
+                GenStackKind.Ref => new StorageInfo(target.PointerSize, target.PointerSize),
+                GenStackKind.Null => new StorageInfo(target.PointerSize, target.PointerSize),
+                GenStackKind.Ptr => new StorageInfo(target.PointerSize, target.PointerSize),
+                GenStackKind.ByRef => new StorageInfo(target.PointerSize, target.PointerSize),
                 GenStackKind.Value => new StorageInfo(8, 8),
-                _ => new StorageInfo(TargetArchitecture.PointerSize, TargetArchitecture.PointerSize),
+                _ => new StorageInfo(target.PointerSize, target.PointerSize),
             };
         }
 
-        private static StorageInfo StorageForRegisterClass(RegisterClass registerClass)
+        private static StorageInfo StorageForRegisterClass(RegisterClass registerClass, TargetInfo target)
         {
-            return registerClass == RegisterClass.Float
-                ? new StorageInfo(TargetArchitecture.FloatingRegisterSize, TargetArchitecture.FloatingRegisterSize)
-                : new StorageInfo(TargetArchitecture.GeneralRegisterSize, TargetArchitecture.GeneralRegisterSize);
+            if (registerClass != RegisterClass.Float)
+                return new StorageInfo(target.GeneralRegisterSize, target.GeneralRegisterSize);
+
+            int size = RegisterInfo.AbiFloatingRegisterSize(target);
+            if (size <= 0)
+                size = target.FloatingRegisterSize;
+            return new StorageInfo(size, size);
         }
 
-        private static StorageInfo StorageForAbiSegment(AbiRegisterSegment segment)
+        private static StorageInfo StorageForAbiSegment(AbiRegisterSegment segment, TargetInfo target)
         {
-            var fallback = StorageForRegisterClass(segment.RegisterClass);
+            var fallback = StorageForRegisterClass(segment.RegisterClass, target);
             int size = segment.Size <= 0 ? fallback.Size : segment.Size;
             int align = Math.Min(Math.Max(1, size), fallback.Alignment);
             return new StorageInfo(size, align);

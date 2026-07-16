@@ -10,6 +10,7 @@ namespace Cnidaria.RiscV
 {
     public sealed class RiscVZBootLayout
     {
+        public static readonly RiscVZBootLayout Default = new();
         public ulong Zs2LoadAddress { get; set; } = 0x80000000UL;
         public ulong Zs3LoadAddress { get; set; } = 0x80100000UL;
         public ulong SupervisorPayloadLoadAddress { get; set; } = 0x80200000UL;
@@ -158,12 +159,12 @@ namespace Cnidaria.RiscV
             RiscVEmulator machine,
             RiscVZBootLayout? layout = null,
             IEnumerable<RiscVBootFile>? additionalBootFiles = null,
-            string? autorunSource = null)
+            byte[]? autorunSource = null)
         {
             if (machine is null)
                 throw new ArgumentNullException(nameof(machine));
             layout ??= new RiscVZBootLayout();
-            byte[] kernelImage = RiscVKernel.BuildDefaultKernelImage();
+            byte[] kernelImage = RiscVKernel.DefaultKernel;
             byte[] dtb = BuildDefaultDeviceTree(new RiscVDeviceTreeLayout
             {
                 RamBase = machine.RamBase,
@@ -179,6 +180,7 @@ namespace Cnidaria.RiscV
                 BootHartId = checked((uint)machine.HartId),
             });
             var assemblySettings = CreateAssemblySettings(layout);
+
             var bootFiles = MergeDefaultUserlandFiles(additionalBootFiles, autorunSource);
             byte[] zs2Image = RiscVAssembler
                 .Assemble(DefaultZs2Source, RVTarget.Rv64GPrivileged, assemblySettings)
@@ -200,8 +202,7 @@ namespace Cnidaria.RiscV
         }
 
         private static IReadOnlyList<RiscVBootFile> MergeDefaultUserlandFiles(
-            IEnumerable<RiscVBootFile>? additionalBootFiles,
-            string? autorunSource)
+            IEnumerable<RiscVBootFile>? additionalBootFiles, byte[]? autorunSource)
         {
             var files = RiscVUserland.BuildDefaultBootFiles(autorunSource).ToList();
             if (additionalBootFiles is null)
@@ -817,9 +818,21 @@ namespace Cnidaria.RiscV
                 bytes.Add(0);
         }
     }
-    public sealed class RiscVUserlandLayout
+    public struct RiscVUserlandLayout
     {
+        public static readonly RiscVUserlandLayout Default = new();
         public ulong ImageBase { get; set; } = 0x00010000UL;
+        public RiscVUserlandLayout(ulong imageBase)
+        {
+            ImageBase = imageBase;
+        }
+        public static bool operator ==(RiscVUserlandLayout left, RiscVUserlandLayout right)
+            => left.ImageBase == right.ImageBase;
+        public static bool operator !=(RiscVUserlandLayout left, RiscVUserlandLayout right)
+            => !(left == right);
+        public override bool Equals(object? obj)
+            => obj is RiscVUserlandLayout l && this.ImageBase == l.ImageBase;
+        public override int GetHashCode() => ImageBase.GetHashCode();
     }
 
     public static class RiscVUserland
@@ -828,16 +841,19 @@ namespace Cnidaria.RiscV
         public static string DefaultInitSource => ReadUserSource("init.c");
         public static string DefaultShellSource => ReadUserSource("shell.c");
         public static string DefaultAutorunSource => ReadUserSource("autorun.c");
+        public static readonly byte[] DefaultInit = BuildProgram(DefaultInitSource, "riscv/os/init.c");
+        public static readonly byte[] DefaultShell = BuildProgram(DefaultShellSource, "riscv/os/shell.c");
+        public static readonly byte[] DefaultAutorun = BuildProgram(DefaultAutorunSource, "riscv/os/autorun.c");
 
         public static ImmutableArray<RiscVBootFile> BuildDefaultBootFiles(
-            string? autorunSource = null,
-            RiscVUserlandLayout? layout = null)
+            byte[]? autorunSource = null)
         {
-            layout ??= new RiscVUserlandLayout();
             return ImmutableArray.Create(
-                new RiscVBootFile("INIT.ELF", BuildProgram(DefaultInitSource, "riscv/os/init.c", layout)),
-                new RiscVBootFile("SHELL.ELF", BuildProgram(DefaultShellSource, "riscv/os/shell.c", layout)),
-                new RiscVBootFile("AUTORUN.ELF", BuildProgram(autorunSource ?? DefaultAutorunSource, "riscv/os/autorun.c", layout)));
+                    new RiscVBootFile("INIT.ELF", DefaultInit),
+                    new RiscVBootFile("SHELL.ELF", DefaultShell),
+                    autorunSource == null
+                    ? new RiscVBootFile("AUTORUN.ELF", DefaultAutorun)
+                    : new RiscVBootFile("AUTORUN.ELF", autorunSource));
         }
 
         public static byte[] BuildProgram(
@@ -849,10 +865,9 @@ namespace Cnidaria.RiscV
                 throw new ArgumentNullException(nameof(source));
             if (string.IsNullOrWhiteSpace(filePath))
                 throw new ArgumentException("User program path is empty.", nameof(filePath));
-
             layout ??= new RiscVUserlandLayout();
             var program = CompileProgram(RuntimeSource + "\n" + source, filePath);
-            return program.ToLinuxExecutableBytes(layout.ImageBase);
+            return program.ToLinuxExecutableBytes(layout.Value.ImageBase);
         }
 
         private static string ReadUserSource(string fileName)
@@ -868,7 +883,7 @@ namespace Cnidaria.RiscV
 
         private static RiscVProgram CompileProgram(string source, string filePath)
         {
-            var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RiscV64Linux);
+            var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RV64GLinux);
             var compilation = Cnidaria.C.Compilation.CreateFromSource(
                 source,
                 filePath: filePath,
@@ -891,7 +906,7 @@ namespace Cnidaria.RiscV
     internal static class RiscVKernel
     {
         public static string DefaultKernelSource => ReadKernelSource("kernel.c");
-
+        public static readonly byte[] DefaultKernel = BuildDefaultKernelImage();
         private static string ReadKernelSource(string fileName)
         {
             var asm = typeof(RiscVKernel).Assembly;
@@ -958,7 +973,10 @@ namespace Cnidaria.RiscV
         private static RiscVProgram CompileKernel(string source)
         {
             var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RiscV64.WithFeatures(
-                TargetArchitectureFeatures.RiscVA | TargetArchitectureFeatures.RiscVPrivileged | TargetArchitectureFeatures.RiscVV));
+                TargetArchitectureFeatures.RiscVG | 
+                TargetArchitectureFeatures.RiscVPrivileged | 
+                TargetArchitectureFeatures.RiscVV | 
+                TargetArchitectureFeatures.RiscVB));
             var compilation = Cnidaria.C.Compilation.CreateFromSource(
                 source,
                 filePath: "riscv/os/kernel.c",

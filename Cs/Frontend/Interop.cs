@@ -267,18 +267,19 @@ namespace Cnidaria.Cs
             if (clr.IsEnum)
             {
                 var underlying = Enum.GetUnderlyingType(clr);
-                var raw = ConvertArg(ctx, v, underlying) ?? Activator.CreateInstance(underlying)!;
-                return Enum.ToObject(clr, raw);
+                var raw = ConvertArg(ctx, v, underlying) ?? CreateDefaultEnumUnderlyingValue(underlying)!;
+                return CreateEnumValue(clr, raw);
             }
             if (clr.IsArray)
             {
-                if (clr.GetArrayRank() != 1) throw new NotSupportedException("Only SZARRAY supported in host marshaling.");
-                if (v.Kind == VmValueKind.Null) return null;
-                var elementClr = clr.GetElementType() ?? throw new InvalidOperationException("Array without element type.");
-                int length = ctx.GetArrayLength(v);
-                var result = Array.CreateInstance(elementClr, length);
-                for (int i = 0; i < length; i++) result.SetValue(ConvertArg(ctx, ctx.GetArrayElement(v, i), elementClr), i);
-                return result;
+                if (clr.GetArrayRank() != 1)
+                    throw new NotSupportedException("Only SZARRAY supported in host marshaling.");
+
+                if (v.Kind == VmValueKind.Null)
+                    return null;
+
+                Type elementClr = clr.GetElementType() ?? throw new InvalidOperationException("Array without element type.");
+                return ConvertArrayArg(ctx, v, clr, elementClr);
             }
             if (clr == typeof(string)) return ctx.ReadString(v);
             if (clr == typeof(int)) return v.AsInt32();
@@ -297,13 +298,79 @@ namespace Cnidaria.Cs
             if (clr == typeof(UIntPtr)) return _rts.Target.PointerSize == 8 ? new UIntPtr(unchecked((ulong)v.AsInt64())) : new UIntPtr(unchecked((uint)v.AsInt32()));
             throw new NotSupportedException($"Host arg type not supported: {clr.FullName}");
         }
+        private static object CreateEnumValue(Type enumType, object raw)
+        {
+            Type underlying = Enum.GetUnderlyingType(enumType);
+
+            if (underlying == typeof(byte)) return Enum.ToObject(enumType, Convert.ToByte(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(sbyte)) return Enum.ToObject(enumType, Convert.ToSByte(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(short)) return Enum.ToObject(enumType, Convert.ToInt16(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(ushort)) return Enum.ToObject(enumType, Convert.ToUInt16(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(int)) return Enum.ToObject(enumType, Convert.ToInt32(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(uint)) return Enum.ToObject(enumType, Convert.ToUInt32(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(long)) return Enum.ToObject(enumType, Convert.ToInt64(raw, CultureInfo.InvariantCulture));
+            if (underlying == typeof(ulong)) return Enum.ToObject(enumType, Convert.ToUInt64(raw, CultureInfo.InvariantCulture));
+
+            throw new InvalidOperationException($"Unexpected enum underlying type '{underlying.FullName}'.");
+        }
+        private object ConvertArrayArg(VmCallContext ctx, VmValue v, Type clr, Type elementClr)
+        {
+            int length = ctx.GetArrayLength(v);
+
+            if (elementClr == typeof(int))
+            {
+                var result = new int[length];
+                for (int i = 0; i < length; i++)
+                    result[i] = (int)ConvertArg(ctx, ctx.GetArrayElement(v, i), typeof(int))!;
+                return result;
+            }
+
+            if (elementClr == typeof(uint))
+            {
+                var result = new uint[length];
+                for (int i = 0; i < length; i++)
+                    result[i] = (uint)ConvertArg(ctx, ctx.GetArrayElement(v, i), typeof(uint))!;
+                return result;
+            }
+
+            if (elementClr == typeof(byte))
+            {
+                var result = new byte[length];
+                for (int i = 0; i < length; i++)
+                    result[i] = (byte)ConvertArg(ctx, ctx.GetArrayElement(v, i), typeof(byte))!;
+                return result;
+            }
+
+            if (elementClr == typeof(string))
+            {
+                var result = new string?[length];
+                for (int i = 0; i < length; i++)
+                    result[i] = (string?)ConvertArg(ctx, ctx.GetArrayElement(v, i), typeof(string));
+                return result;
+            }
+
+            throw new NotSupportedException($"Host array element type not supported: {elementClr.FullName}");
+        }
+        private static object CreateDefaultEnumUnderlyingValue(Type underlying)
+        {
+            if (underlying == typeof(byte)) return default(byte);
+            if (underlying == typeof(sbyte)) return default(sbyte);
+            if (underlying == typeof(short)) return default(short);
+            if (underlying == typeof(ushort)) return default(ushort);
+            if (underlying == typeof(int)) return default(int);
+            if (underlying == typeof(uint)) return default(uint);
+            if (underlying == typeof(long)) return default(long);
+            if (underlying == typeof(ulong)) return default(ulong);
+
+            throw new InvalidOperationException($"Unexpected enum underlying type '{underlying.FullName}'.");
+        }
 
         private VmValue ConvertRetStack(VmCallContext ctx, object? retObj, Type clr, Cnidaria.Cs.RuntimeType actualVmType)
         {
             if (clr.IsEnum)
             {
                 var underlying = Enum.GetUnderlyingType(clr);
-                object raw = retObj ?? Activator.CreateInstance(underlying)!;
+                object raw = retObj ?? CreateDefaultEnumUnderlyingValue(underlying);
                 if (raw.GetType() != underlying) raw = Convert.ChangeType(raw, underlying, CultureInfo.InvariantCulture)!;
                 return ConvertRetStack(ctx, raw, underlying, actualVmType);
             }

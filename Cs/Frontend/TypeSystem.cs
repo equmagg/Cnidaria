@@ -698,8 +698,8 @@ namespace Cnidaria.Cs
         }
     }
 
-    
-    
+
+
     public sealed class TargetInfo
     {
         public static TargetInfo RegisterBytecode32Bit { get; } = CreateRegisterBytecode(pointerSize: 4);
@@ -714,6 +714,7 @@ namespace Cnidaria.Cs
             callFrameAlignment: TargetArchitecture.CallFrameAlignment);
         public static TargetInfo RiscV32 { get; } = ForArchitecture(TargetArchitectureKind.RiscV32);
         public static TargetInfo RiscV64 { get; } = ForArchitecture(TargetArchitectureKind.RiscV64);
+        public static TargetInfo RVA23Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RVA23);
         public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.X86);
         public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
         public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
@@ -722,23 +723,25 @@ namespace Cnidaria.Cs
         public static TargetInfo Default => TargetArchitecture.PointerSize == 4 ? RegisterBytecode32Bit : RegisterBytecode64Bit;
         public static TargetInfo Default32Bit => RegisterBytecode32Bit;
         public static TargetInfo Default64Bit => RegisterBytecode64Bit;
-        public static TargetInfo ForArchitecture(TargetArchitectureKind architecture, TargetArchitectureFeatures features = TargetArchitectureFeatures.None)
+        public static TargetInfo ForArchitecture(TargetArchitectureKind architecture,
+            OperatingSystemKind operatingSystem = OperatingSystemKind.None,
+            TargetArchitectureFeatures features = TargetArchitectureFeatures.None)
         {
             return architecture switch
             {
                 TargetArchitectureKind.RegisterBytecode => RegisterBytecode32Bit.WithFeatures(features),
                 TargetArchitectureKind.RegisterBytecode64 => RegisterBytecode64Bit.WithFeatures(features),
-                TargetArchitectureKind.X86 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 4, 16, architectureFeatures: features
-                | TargetArchitectureFeatures.X86Sse2),
-                TargetArchitectureKind.X64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
-                | TargetArchitectureFeatures.X86Sse2),
-                TargetArchitectureKind.RiscV32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 16, 16, architectureFeatures: features
-                | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF),
-                TargetArchitectureKind.RiscV64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
-                | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVD),
-                TargetArchitectureKind.Arm32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 8, 8, architectureFeatures: features),
-                TargetArchitectureKind.Arm64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, architectureFeatures: features
-                 | TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat),
+                TargetArchitectureKind.X86 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 4, 16,
+                operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.X86Sse2),
+                TargetArchitectureKind.X64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16,
+                operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.X86Sse2),
+                TargetArchitectureKind.RiscV32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 16, 16,
+                operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF),
+                TargetArchitectureKind.RiscV64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, operatingSystem: operatingSystem,
+                architectureFeatures: features | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVD),
+                TargetArchitectureKind.Arm32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 8, 8, operatingSystem: operatingSystem, architectureFeatures: features),
+                TargetArchitectureKind.Arm64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, operatingSystem: operatingSystem,
+                architectureFeatures: features | TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat),
                 _ => throw new ArgumentOutOfRangeException(nameof(architecture))
             };
         }
@@ -753,6 +756,14 @@ namespace Cnidaria.Cs
         public int StackAlignment { get; }
         public int CallFrameAlignment { get; }
         public int ObjectHeaderSize => PointerSize * 2;
+        public int ManagedObjectHeaderSize => IsRiscV && OperatingSystem == OperatingSystemKind.Linux ? PointerSize : ObjectHeaderSize;
+        public int SyncBlockSize => PointerSize;
+        public int MinimumManagedObjectSize => PointerSize * 2;
+        public int MinimumGcObjectSize => SyncBlockSize + MinimumManagedObjectSize;
+        public int StringLengthOffset => ManagedObjectHeaderSize;
+        public int StringCharsOffset => StringLengthOffset + 4;
+        public int ArrayLengthOffset => ManagedObjectHeaderSize;
+        public int ArrayDataOffset => ArrayLengthOffset + (ManagedObjectHeaderSize == PointerSize ? (Is64Bit ? 8 : 4) : 8);
         public bool Is32Bit => PointerSize == 4;
         public bool Is64Bit => PointerSize == 8;
         public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
@@ -850,7 +861,7 @@ namespace Cnidaria.Cs
         {
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
             Target = target ?? TargetInfo.Default;
-            ObjectHeaderSize = Target.ObjectHeaderSize;
+            ObjectHeaderSize = Target.ManagedObjectHeaderSize;
 
             PrecreateAllTypeDefs();
             IndexWellKnownCoreTypes();
@@ -987,7 +998,7 @@ namespace Cnidaria.Cs
 
                 if (def.Kind == RuntimeTypeKind.Array)
                 {
-                    if (def.ArrayRank != actual.ArrayRank)
+                    if (def.ArrayRank != actual.ArrayRank || def.IsSzArray != actual.IsSzArray)
                         return false;
                     if (def.ElementType is null || actual.ElementType is null)
                         return false;
@@ -1168,7 +1179,7 @@ namespace Cnidaria.Cs
 
                 if (def.Kind == RuntimeTypeKind.Array)
                 {
-                    if (def.ArrayRank != actual.ArrayRank)
+                    if (def.ArrayRank != actual.ArrayRank || def.IsSzArray != actual.IsSzArray)
                         return false;
                     if (def.ElementType is null || actual.ElementType is null)
                         return false;
@@ -1508,7 +1519,18 @@ namespace Cnidaria.Cs
         {
             if (elementType is null) throw new ArgumentNullException(nameof(elementType));
 
-            var t = GetOrCreateArrayType(elementType);
+            var t = GetOrCreateArrayType(elementType, rank: 1, isSzArray: true);
+            EnsureLayout(t);
+            return t;
+        }
+
+        internal RuntimeType GetArrayType(RuntimeType elementType, int rank)
+        {
+            if (elementType is null) throw new ArgumentNullException(nameof(elementType));
+            if (rank <= 0) throw new ArgumentOutOfRangeException(nameof(rank));
+            var t = rank == 1
+                ? GetOrCreateArrayType(elementType, rank: 1, isSzArray: true)
+                : GetOrCreateArrayType(elementType, rank, isSzArray: false);
             EnsureLayout(t);
             return t;
         }
@@ -1608,7 +1630,10 @@ namespace Cnidaria.Cs
 
                     RuntimeTypeKind kind = InferKindFromTypeDef(m, td);
 
-                    var rt = new RuntimeType(_nextTypeId++, kind, asm: m.Name, ns: ns, name: name);
+                    var rt = new RuntimeType(_nextTypeId++, kind, asm: m.Name, ns: ns, name: name)
+                    {
+                        IsBeforeFieldInit = (((System.Reflection.TypeAttributes)td.Flags & System.Reflection.TypeAttributes.BeforeFieldInit) != 0)
+                    };
                     _typeCache[(m.Name, tok)] = rt;
                     _namedTypes[(m.Name, ns, name)] = rt;
                     _typeById[rt.TypeId] = rt;
@@ -2751,7 +2776,7 @@ namespace Cnidaria.Cs
                 case SigElementType.SZARRAY:
                     {
                         var elem = ReadTypeSig(contextModule, ref r);
-                        return GetOrCreateArrayType(elem, rank: 1);
+                        return GetOrCreateArrayType(elem, rank: 1, isSzArray: true);
                     }
 
                 case SigElementType.ARRAY:
@@ -2770,7 +2795,7 @@ namespace Cnidaria.Cs
                         if (rank == 0)
                             throw new BadImageFormatException("ARRAY signature with rank=0 is invalid.");
 
-                        return GetOrCreateArrayType(elem, checked((int)rank));
+                        return GetOrCreateArrayType(elem, checked((int)rank), isSzArray: false);
                     }
 
                 case SigElementType.PTR:
@@ -2820,17 +2845,17 @@ namespace Cnidaria.Cs
             }
         }
 
-        private RuntimeType GetOrCreateArrayType(RuntimeType elem)
-            => GetOrCreateArrayType(elem, rank: 1);
-        private RuntimeType GetOrCreateArrayType(RuntimeType elem, int rank)
+        private RuntimeType GetOrCreateArrayType(RuntimeType elem, int rank, bool isSzArray)
         {
             if (rank <= 0) throw new ArgumentOutOfRangeException(nameof(rank));
+            if (isSzArray && rank != 1) throw new ArgumentException("SZARRAY must have rank 1.", nameof(rank));
 
-            string key = "arr:" + rank + ":" + elem.TypeId;
+            string key = $"arr:{(isSzArray ? "sz:" : "md:")}{rank}:{elem.TypeId}";
             if (_constructedTypes.TryGetValue(key, out var t))
                 return t;
 
-            string suffix = rank == 1 ? "[]" : "[" + new string(',', rank - 1) + "]";
+            string suffix = isSzArray ? "[]" : rank == 1 ? "[*]" : "[" + new string(',', rank - 1) + "]";
+
             t = new RuntimeType(
                 _nextTypeId++,
                 RuntimeTypeKind.Array,
@@ -2841,6 +2866,7 @@ namespace Cnidaria.Cs
             t.BaseType = SystemArray;
             t.ElementType = elem;
             t.ArrayRank = rank;
+            t.IsSzArray = isSzArray;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -2907,6 +2933,7 @@ namespace Cnidaria.Cs
 
             t.GenericTypeDefinition = genericDef;
             t.GenericTypeArguments = args;
+            t.IsBeforeFieldInit = genericDef.IsBeforeFieldInit;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -3051,7 +3078,7 @@ namespace Cnidaria.Cs
             {
                 var elem = SubstituteRuntimeType(type.ElementType, ownerTypeArgs, methodTypeArgs);
                 if (!ReferenceEquals(elem, type.ElementType))
-                    return GetOrCreateArrayType(elem, type.ArrayRank <= 0 ? 1 : type.ArrayRank);
+                    return GetOrCreateArrayType(elem, type.ArrayRank <= 0 ? 1 : type.ArrayRank, type.IsSzArray);
                 return type;
             }
 
@@ -3212,12 +3239,14 @@ namespace Cnidaria.Cs
         public string Namespace { get; }
         public string Name { get; }
         public RuntimePrimitiveKind PrimitiveKind { get; internal set; }
+        public bool IsBeforeFieldInit { get; internal set; }
 
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef);
         public RuntimeType? BaseType { get; internal set; }
         public RuntimeType? ElementType { get; internal set; }
         public int ArrayRank { get; internal set; }
+        public bool IsSzArray { get; internal set; }
         public bool IsMethodGenericParameter { get; internal set; }
         public int GenericParameterOrdinal { get; internal set; } = -1;
         public RuntimeType? GenericTypeDefinition { get; internal set; }
@@ -3282,6 +3311,7 @@ namespace Cnidaria.Cs
         public bool HasInternalCall => (ImplFlags & MetadataFlagBits.InternalCall) != 0;
         public bool HasNoInlining => (ImplFlags & MetadataFlagBits.NoInlining) != 0;
         public bool HasAggressiveInlining => (ImplFlags & MetadataFlagBits.AggressiveInlining) != 0;
+        internal bool RequiresClassInitializationEntryCheck { get; set; }
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
         public Cnidaria.Cs.BytecodeFunction? Body { get; internal set; }

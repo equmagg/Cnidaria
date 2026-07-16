@@ -78,7 +78,7 @@ namespace Cnidaria.Cs
                 }
 
                 if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                    AddRegisterKills(result, node, usePosition, MachineRegisters.CallerSavedScalarRegisters);
+                    AddRegisterKills(result, node, usePosition, RegisterInfo.CallerSavedScalarRegisters(target));
             }
 
             AddInitialArgumentFixedRefPositions(result, method, layout, target);
@@ -160,21 +160,24 @@ namespace Cnidaria.Cs
             for (int i = 0; i <= argumentIndex; i++)
             {
                 if (hiddenReturnBufferInsertionIndex == i)
-                    _ = GetMaybeArgumentRegister(RegisterClass.General, ref general, ref floating);
+                    _ = GetMaybeArgumentRegister(target, RegisterClass.General, ref general, ref floating);
 
                 RuntimeType currentType = method.ArgTypes[i];
                 GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : StackKindForAbi(currentType);
-                var abi = i == argumentIndex
+                var valueAbi = i == argumentIndex
                     ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false, target: target)
                     : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: target);
+                var abi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(valueAbi, general, floating, target);
 
                 if (abi.PassingKind == AbiValuePassingKind.Void)
                     continue;
 
                 if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 {
-                    var register = GetMaybeArgumentRegister(abi.RegisterClass, ref general, ref floating);
-                    if (i == argumentIndex && register != MachineRegister.Invalid)
+                    var register = GetMaybeArgumentRegister(target, abi.RegisterClass, ref general, ref floating);
+                    if (i == argumentIndex &&
+                        register != MachineRegister.Invalid &&
+                        MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, abi, target, requireMatchingRegisterClasses: true))
                     {
                         result.Add(new LinearRefPosition(
                             -1,
@@ -182,7 +185,7 @@ namespace Cnidaria.Cs
                             -1,
                             LinearRefPositionKind.Def,
                             info.RepresentativeNode,
-                            abi.RegisterClass,
+                            valueAbi.RegisterClass,
                             register,
                             GetValueRefFlags(info) | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister));
                     }
@@ -192,24 +195,30 @@ namespace Cnidaria.Cs
                 if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                 {
                     var segments = MachineAbi.GetRegisterSegments(abi, target);
+                    var valueSegments = i == argumentIndex && valueAbi.PassingKind == AbiValuePassingKind.MultiRegister
+                        ? MachineAbi.GetRegisterSegments(valueAbi, target)
+                        : ImmutableArray<AbiRegisterSegment>.Empty;
+                    bool layoutsMatch = i == argumentIndex &&
+                        MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, abi, target, requireMatchingRegisterClasses: true);
                     for (int s = 0; s < segments.Length; s++)
                     {
                         var segment = segments[s];
-                        var register = GetMaybeArgumentRegister(segment.RegisterClass, ref general, ref floating);
-                        if (i == argumentIndex && register != MachineRegister.Invalid)
+                        var register = GetMaybeArgumentRegister(target, segment.RegisterClass, ref general, ref floating);
+                        if (layoutsMatch && register != MachineRegister.Invalid)
                         {
+                            var valueSegment = valueSegments[s];
                             result.Add(new LinearRefPosition(
                                 -1,
                                 position,
                                 -1,
                                 s,
-                                segment.Offset,
-                                segment.Size,
+                                valueSegment.Offset,
+                                valueSegment.Size,
                                 LinearRefPositionKind.Def,
                                 info.RepresentativeNode,
-                                segment.RegisterClass,
+                                valueSegment.RegisterClass,
                                 register,
-                                WithSegmentGcFlags(GetValueRefFlags(info) | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister, segment)));
+                                WithSegmentGcFlags(GetValueRefFlags(info) | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister, valueSegment)));
                         }
                     }
                     continue;
@@ -222,12 +231,12 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static MachineRegister GetMaybeArgumentRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+        private static MachineRegister GetMaybeArgumentRegister(TargetInfo target, RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
         {
             if (registerClass == RegisterClass.Float)
-                return MachineRegisters.GetFloatArgumentRegister(floatIndex++);
+                return RegisterInfo.GetFloatArgumentRegister(target, floatIndex++);
             if (registerClass == RegisterClass.General)
-                return MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
+                return RegisterInfo.GetIntegerArgumentRegister(target, generalIndex++);
             return MachineRegister.Invalid;
         }
 
@@ -596,38 +605,94 @@ namespace Cnidaria.Cs
                 node.Kind == GenTreeKind.NewObject,
                 target);
 
-            for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
+            for (int argumentIndex = 0; argumentIndex < node.RegisterUses.Length; argumentIndex++)
             {
-                var segment = descriptor.ArgumentSegments[i];
-                if (segment.IsHiddenReturnBuffer)
+                int firstSegmentIndex = -1;
+                int segmentCount = 0;
+                for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
+                {
+                    if (descriptor.ArgumentSegments[i].SourceArgumentIndex != argumentIndex)
+                        continue;
+                    if (firstSegmentIndex < 0)
+                        firstSegmentIndex = i;
+                    segmentCount++;
+                }
+
+                if (firstSegmentIndex < 0)
                     continue;
 
-                var value = segment.Value;
+                var value = node.RegisterUses[argumentIndex];
                 var info = method.GetValueInfo(value);
+                var valueAbi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, target);
+                var argumentAbi = descriptor.ArgumentSegments[firstSegmentIndex].ValueAbi;
+                bool fixedLayout = MachineAbi.HaveMatchingArgumentValueLayout(
+                    valueAbi,
+                    argumentAbi,
+                    target,
+                    requireMatchingRegisterClasses: true);
                 var flags = GetValueRefFlags(info);
                 if (IsLastUse(intervals, value, usePosition))
                     flags |= LinearRefPositionFlags.LastUse;
 
-                if (segment.IsRegister)
-                    flags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
+                if (valueAbi.PassingKind == AbiValuePassingKind.MultiRegister)
+                {
+                    var valueSegments = MachineAbi.GetRegisterSegments(valueAbi, target);
+                    for (int s = 0; s < valueSegments.Length; s++)
+                    {
+                        var valueSegment = valueSegments[s];
+                        MachineRegister fixedRegister = MachineRegister.Invalid;
+                        int operandIndex = descriptor.ArgumentSegments[firstSegmentIndex].OperandIndex;
+                        if (fixedLayout && s < segmentCount)
+                        {
+                            var argumentSegment = descriptor.ArgumentSegments[firstSegmentIndex + s];
+                            operandIndex = argumentSegment.OperandIndex;
+                            if (argumentSegment.IsRegister)
+                                fixedRegister = argumentSegment.Location.Register;
+                        }
 
-                if (segment.IsAbiSegment)
-                    flags = WithSegmentGcFlags(flags, segment.ToRegisterSegment());
-                else if (segment.ContainsGcPointers)
-                    flags |= LinearRefPositionFlags.GcRef;
+                        var segmentFlags = WithSegmentGcFlags(flags, valueSegment);
+                        if (fixedRegister != MachineRegister.Invalid)
+                            segmentFlags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
 
+                        result.Add(new LinearRefPosition(
+                            node.LinearId,
+                            usePosition,
+                            operandIndex,
+                            s,
+                            valueSegment.Offset,
+                            valueSegment.Size,
+                            LinearRefPositionKind.Use,
+                            value,
+                            valueSegment.RegisterClass,
+                            fixedRegister,
+                            segmentFlags));
+                    }
+                    continue;
+                }
+
+                var firstSegment = descriptor.ArgumentSegments[firstSegmentIndex];
+                MachineRegister scalarFixedRegister = MachineRegister.Invalid;
+                if (fixedLayout && segmentCount == 1 && firstSegment.IsRegister)
+                    scalarFixedRegister = firstSegment.Location.Register;
+
+                var scalarFlags = flags;
+                if (valueAbi.ContainsGcPointers)
+                    scalarFlags |= LinearRefPositionFlags.GcRef;
+                if (scalarFixedRegister != MachineRegister.Invalid)
+                    scalarFlags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
+
+                var registerClass = valueAbi.RegisterClass == RegisterClass.Invalid
+                    ? (info.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : info.RegisterClass)
+                    : valueAbi.RegisterClass;
                 result.Add(new LinearRefPosition(
                     node.LinearId,
                     usePosition,
-                    segment.OperandIndex,
-                    segment.IsAbiSegment ? segment.SegmentIndex : -1,
-                    segment.Offset,
-                    segment.Size,
+                    firstSegment.OperandIndex,
                     LinearRefPositionKind.Use,
                     value,
-                    segment.RegisterClass,
-                    segment.IsRegister ? segment.Location.Register : MachineRegister.Invalid,
-                    flags));
+                    registerClass,
+                    scalarFixedRegister,
+                    scalarFlags));
             }
 
             if (node.RegisterResult is not null)
@@ -662,8 +727,8 @@ namespace Cnidaria.Cs
             if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
             {
                 var reg = abi.RegisterClass == RegisterClass.Float
-                    ? MachineRegisters.FloatReturnValue0
-                    : MachineRegisters.ReturnValue0;
+                    ? RegisterInfo.GetFloatReturnRegister(target, 0)
+                    : RegisterInfo.GetIntegerReturnRegister(target, 0);
                 result.Add(new LinearRefPosition(
                     node.LinearId,
                     usePosition,
@@ -684,7 +749,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < segments.Length; i++)
                 {
                     var segment = segments[i];
-                    var reg = GetReturnRegister(segment.RegisterClass, ref generalRet, ref floatRet);
+                    var reg = GetReturnRegister(target, segment.RegisterClass, ref generalRet, ref floatRet);
                     result.Add(new LinearRefPosition(
                         node.LinearId,
                         usePosition,
@@ -728,8 +793,8 @@ namespace Cnidaria.Cs
             if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
             {
                 var reg = abi.RegisterClass == RegisterClass.Float
-                    ? MachineRegisters.FloatReturnValue0
-                    : MachineRegisters.ReturnValue0;
+                    ? RegisterInfo.GetFloatReturnRegister(info.Target, 0)
+                    : RegisterInfo.GetIntegerReturnRegister(info.Target, 0);
                 result.Add(new LinearRefPosition(
                     nodeId,
                     defPosition,
@@ -750,7 +815,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < segments.Length; i++)
                 {
                     var segment = segments[i];
-                    var reg = GetReturnRegister(segment.RegisterClass, ref generalRet, ref floatRet);
+                    var reg = GetReturnRegister(info.Target, segment.RegisterClass, ref generalRet, ref floatRet);
                     result.Add(new LinearRefPosition(
                         nodeId,
                         defPosition,
@@ -778,34 +843,12 @@ namespace Cnidaria.Cs
                 flags));
         }
 
-        private static MachineRegister GetReturnRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
+        private static MachineRegister GetReturnRegister(TargetInfo target, RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
         {
             if (registerClass == RegisterClass.Float)
-            {
-                int index = floatIndex++;
-                return index switch
-                {
-                    0 => MachineRegisters.FloatReturnValue0,
-                    1 => MachineRegisters.FloatReturnValue1,
-                    2 => MachineRegisters.FloatReturnValue2,
-                    3 => MachineRegisters.FloatReturnValue3,
-                    _ => MachineRegister.Invalid,
-                };
-            }
-
+                return RegisterInfo.GetFloatReturnRegister(target, floatIndex++);
             if (registerClass == RegisterClass.General)
-            {
-                int index = generalIndex++;
-                return index switch
-                {
-                    0 => MachineRegisters.ReturnValue0,
-                    1 => MachineRegisters.ReturnValue1,
-                    2 => MachineRegisters.ReturnValue2,
-                    3 => MachineRegisters.ReturnValue3,
-                    _ => MachineRegister.Invalid,
-                };
-            }
-
+                return RegisterInfo.GetIntegerReturnRegister(target, generalIndex++);
             return MachineRegister.Invalid;
         }
 

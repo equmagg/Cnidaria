@@ -1534,18 +1534,16 @@ namespace Cnidaria.Cs
         }
         private BoundExpression BindImplicitArrayCreation(ImplicitArrayCreationExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            if (node.Commas.Count != 0)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_ARRIMP000",
-                    DiagnosticSeverity.Error,
-                    "Only single-dimensional implicit array creation is supported.",
-                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
-                return new BoundBadExpression(node);
-            }
+            int rank = checked(node.Commas.Count + 1);
+            var rawLeaves = ImmutableArray.CreateBuilder<(ExpressionSyntax Syntax, BoundExpression Expression)>();
+            bool validShape = true;
 
-            var exprs = node.Initializer.Expressions;
-            if (exprs.Count == 0)
+            BindLeaves(node.Initializer, dimension: 0);
+
+            if (!validShape)
+                return new BoundBadExpression(node);
+
+            if (rawLeaves.Count == 0)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_ARRIMP001",
@@ -1555,14 +1553,10 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            var raw = ImmutableArray.CreateBuilder<BoundExpression>(exprs.Count);
-            for (int i = 0; i < exprs.Count; i++)
-                raw.Add(BindExpression(exprs[i], context, diagnostics));
-
             TypeSymbol? elemType = null;
-            for (int i = 0; i < raw.Count; i++)
+            for (int i = 0; i < rawLeaves.Count; i++)
             {
-                var t = raw[i].Type;
+                var t = rawLeaves[i].Expression.Type;
                 if (t is ErrorTypeSymbol)
                     continue;
 
@@ -1597,27 +1591,92 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            var converted = ImmutableArray.CreateBuilder<BoundExpression>(raw.Count);
-            for (int i = 0; i < raw.Count; i++)
+            TypeSymbol inferredElementType = elemType;
+            int leafIndex = 0;
+            var initializer = BuildInitializer(node.Initializer, dimension: 0);
+            var shape = InferRectangularInitializerShape(initializer, rank, context, diagnostics);
+            if (shape.Length < rank)
             {
-                converted.Add(ApplyConversion(
-                    exprSyntax: exprs[i],
-                    expr: raw[i],
-                    targetType: elemType,
-                    diagnosticNode: node,
-                    context: context,
-                    diagnostics: diagnostics,
-                    requireImplicit: true));
+                diagnostics.Add(new Diagnostic(
+                    "CN_ARRIMP006",
+                    DiagnosticSeverity.Error,
+                    "Cannot infer all array dimensions from the initializer.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Initializer.Span)));
+                return new BoundBadExpression(node);
             }
 
-            var init = new BoundArrayInitializerExpression(node.Initializer, elemType, converted.ToImmutable());
-            context.Recorder.RecordBound(node.Initializer, init);
-
             var int32 = context.Compilation.GetSpecialType(SpecialType.System_Int32);
-            var count = new BoundLiteralExpression(node, int32, converted.Count);
-            var arrayType = context.Compilation.CreateArrayType(elemType, rank: 1);
+            var dimensions = ImmutableArray.CreateBuilder<BoundExpression>(rank);
+            for (int i = 0; i < rank; i++)
+                dimensions.Add(new BoundLiteralExpression(node, int32, shape[i]));
 
-            return new BoundArrayCreationExpression(node, arrayType, elemType, count, init);
+            var arrayType = context.Compilation.CreateArrayType(inferredElementType, rank);
+            return new BoundArrayCreationExpression(node, arrayType, inferredElementType, dimensions.ToImmutable(), initializer);
+
+            void BindLeaves(InitializerExpressionSyntax current, int dimension)
+            {
+                for (int i = 0; i < current.Expressions.Count; i++)
+                {
+                    var expressionSyntax = current.Expressions[i];
+                    if (dimension + 1 < rank)
+                    {
+                        if (expressionSyntax is not InitializerExpressionSyntax nested)
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_ARRIMP004",
+                                DiagnosticSeverity.Error,
+                                "A nested initializer is required for a multidimensional array.",
+                                new Location(context.SemanticModel.SyntaxTree, expressionSyntax.Span)));
+                            validShape = false;
+                            continue;
+                        }
+
+                        BindLeaves(nested, dimension + 1);
+                        continue;
+                    }
+
+                    if (expressionSyntax is InitializerExpressionSyntax)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_ARRIMP005",
+                            DiagnosticSeverity.Error,
+                            "Array initializer nesting exceeds the declared rank.",
+                            new Location(context.SemanticModel.SyntaxTree, expressionSyntax.Span)));
+                        validShape = false;
+                        continue;
+                    }
+
+                    rawLeaves.Add((expressionSyntax, BindExpression(expressionSyntax, context, diagnostics)));
+                }
+            }
+
+            BoundArrayInitializerExpression BuildInitializer(InitializerExpressionSyntax current, int dimension)
+            {
+                var elements = ImmutableArray.CreateBuilder<BoundExpression>(current.Expressions.Count);
+                for (int i = 0; i < current.Expressions.Count; i++)
+                {
+                    var expressionSyntax = current.Expressions[i];
+                    if (dimension + 1 < rank)
+                    {
+                        elements.Add(BuildInitializer((InitializerExpressionSyntax)expressionSyntax, dimension + 1));
+                        continue;
+                    }
+
+                    var raw = rawLeaves[leafIndex++];
+                    elements.Add(ApplyConversion(
+                        exprSyntax: raw.Syntax,
+                        expr: raw.Expression,
+                        targetType: inferredElementType,
+                        diagnosticNode: node,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true));
+                }
+
+                var result = new BoundArrayInitializerExpression(current, inferredElementType, elements.ToImmutable());
+                context.Recorder.RecordBound(current, result);
+                return result;
+            }
         }
         internal BoundExpression BindExpressionWithTargetType(
             ExpressionSyntax exprSyntax,

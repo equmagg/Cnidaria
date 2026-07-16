@@ -85,6 +85,28 @@ namespace Cnidaria.Cs
             return (line, column);
         }
     }
+
+    public enum SyntaxColor : byte
+    {
+        
+    }
+    public readonly struct ColorSpan
+    {
+        public TextSpan Span { get; }
+        public SyntaxColor Color { get; }
+        public ColorSpan(TextSpan span, SyntaxColor color)
+        {
+            Span = span;
+            Color = color;
+        }
+        public bool Equals(ColorSpan other)
+            => other.Span.Start == this.Span.Start && other.Span.Length == this.Span.Length && other.Color == this.Color;
+
+        public override bool Equals(object? obj) => obj is ColorSpan other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(Span, Color);
+        public static bool operator ==(ColorSpan left, ColorSpan right) => left.Equals(right);
+        public static bool operator !=(ColorSpan left, ColorSpan right) => !left.Equals(right);
+    }
     public readonly struct SyntaxDiagnostic : IDiagnostic
     {
         public readonly int Position;

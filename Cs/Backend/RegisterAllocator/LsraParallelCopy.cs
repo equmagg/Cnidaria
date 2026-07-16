@@ -21,8 +21,13 @@ namespace Cnidaria.Cs
             GenTree? destinationValue,
             MoveFlags moveFlags = MoveFlags.None)
         {
-            if (!source.IsNone && !destination.IsNone && source.RegisterClass != destination.RegisterClass)
+            if (!source.IsNone &&
+                !destination.IsNone &&
+                source.RegisterClass != destination.RegisterClass &&
+                (moveFlags & MoveFlags.AbiArgument) == 0)
+            {
                 throw new InvalidOperationException($"Cannot move between different register classes: {source} -> {destination}.");
+            }
 
             Source = source;
             Destination = destination;

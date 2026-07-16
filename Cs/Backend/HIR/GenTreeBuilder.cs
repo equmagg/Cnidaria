@@ -75,6 +75,19 @@ namespace Cnidaria.Cs
             foreach (var item in _bodyByMethodId.Values)
                 BuildOne(item.module, item.body, item.method);
 
+            if (_rts.Target.IsRiscV)
+            {
+                foreach (GenTreeMethod method in _built.Values)
+                {
+                    foreach (RuntimeMethod declaredVirtual in method.VirtualDependencies)
+                    {
+                        var targets = GetVirtualTargets(declaredVirtual);
+                        for (int t = 0; t < targets.Length; t++)
+                            MarkIndirectTypeInitializationTarget(targets[t]);
+                    }
+                }
+            }
+
             return new GenTreeProgram(_rts, SortedBuiltMethods());
         }
 
@@ -99,6 +112,17 @@ namespace Cnidaria.Cs
                     methodContext: null);
 
                 Enqueue(entryMethod);
+
+                if (!entryMethod.DeclaringType.IsBeforeFieldInit &&
+                    !StringComparer.Ordinal.Equals(entryMethod.Name, ".cctor") &&
+                    (entryMethod.IsStatic ||
+                     entryMethod.DeclaringType.IsValueType ||
+                     StringComparer.Ordinal.Equals(entryMethod.Name, ".ctor")))
+                {
+                    _rts.EnsureConstructedMembers(entryMethod.DeclaringType);
+                    RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(entryMethod.DeclaringType);
+                    if (cctor is not null) Enqueue(cctor);
+                }
             }
 
             for (; ; )
@@ -127,7 +151,13 @@ namespace Cnidaria.Cs
                             virtualDependencies.Add(declaredVirtual);
                         var targets = GetVirtualTargets(declaredVirtual);
                         for (int t = 0; t < targets.Length; t++)
-                            Enqueue(targets[t]);
+                        {
+                            RuntimeMethod target = targets[t];
+                            RuntimeMethod? cctor = MarkIndirectTypeInitializationTarget(target);
+                            if (cctor is not null)
+                                Enqueue(cctor);
+                            Enqueue(target);
+                        }
                     }
                 }
                 bool added = EnqueueConstructedGenericBodiesDiscoveredDuringImport();
@@ -213,12 +243,37 @@ namespace Cnidaria.Cs
                         RuntimeMethod declaredVirtual = virtualDependencies[i];
                         var targets = GetVirtualTargets(declaredVirtual);
                         for (int t = 0; t < targets.Length; t++)
-                            added |= Enqueue(targets[t]);
+                        {
+                            RuntimeMethod target = targets[t];
+                            RuntimeMethod? cctor = MarkIndirectTypeInitializationTarget(target);
+                            if (cctor is not null)
+                                added |= Enqueue(cctor);
+                            added |= Enqueue(target);
+                        }
                     }
                 }
 
                 return added;
             }
+        }
+
+        private RuntimeMethod? MarkIndirectTypeInitializationTarget(RuntimeMethod target)
+        {
+            if (!_rts.Target.IsRiscV ||
+                target.DeclaringType.IsBeforeFieldInit ||
+                StringComparer.Ordinal.Equals(target.Name, ".cctor") ||
+                (!target.IsStatic && !target.DeclaringType.IsValueType))
+            {
+                return null;
+            }
+
+            _rts.EnsureConstructedMembers(target.DeclaringType);
+            RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(target.DeclaringType);
+            if (cctor is null)
+                return null;
+
+            target.RequiresClassInitializationEntryCheck = true;
+            return cctor;
         }
 
         private ImmutableArray<GenTreeMethod> SortedBuiltMethods()
@@ -2892,8 +2947,16 @@ namespace Cnidaria.Cs
             MarkInstantiatedType(delegateType);
             var targetMethod = _rts.ResolveMethodInMethodContext(_module, ins.Operand1, _method);
             AddDirectDependency(targetMethod);
-            if (targetMethod.IsStatic && !StringComparer.Ordinal.Equals(targetMethod.Name, ".cctor"))
-                AddTypeInitializerDependency(targetMethod.DeclaringType);
+            if (_rts.Target.IsRiscV && RequiresTypeInitializationBeforeCall(targetMethod))
+            {
+                _rts.EnsureConstructedMembers(targetMethod.DeclaringType);
+                RuntimeMethod? cctor = FindTypeInitializer(targetMethod.DeclaringType);
+                if (cctor is not null)
+                {
+                    targetMethod.RequiresClassInitializationEntryCheck = true;
+                    AddDirectDependency(cctor);
+                }
+            }
 
             ImmutableArray<GenTree> operands;
             if (ins.Op == BytecodeOp.NewDelegateClosed)
@@ -2952,16 +3015,18 @@ namespace Cnidaria.Cs
 
             var args = PopMany(stack, total, pc, ins.Op);
             var method = _rts.ResolveMethodInMethodContext(_module, ins.Operand0, _method);
+            bool requiresTypeInitialization = RequiresTypeInitializationBeforeCall(method);
             if (isVirtual)
-            {
                 AddVirtualDependency(method);
-            }
-            else if (RequiresTypeInitializationBeforeCall(method))
-            {
+            if (requiresTypeInitialization)
                 AddTypeInitializerDependency(method.DeclaringType);
-            }
 
             SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+            if (requiresTypeInitialization && NeedsTypeInitialization(method.DeclaringType))
+            {
+                args = MaterializeTypeInitializationOperands(statements, pc, ins.Op, args);
+                AppendTypeInitialization(stack, statements, pc, ins.Op, method.DeclaringType);
+            }
 
             if (!isVirtual && TryInlineCall(method, args, statements, successorPcs, stack, pc, ins.Op, out var inlineResult, out bool terminatedBlock))
             {
@@ -2973,7 +3038,9 @@ namespace Cnidaria.Cs
             }
 
             if (!isVirtual)
+            {
                 AddDirectDependency(method);
+            }
 
             bool returnsVoid = IsVoid(method.ReturnType);
             var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
@@ -2999,9 +3066,16 @@ namespace Cnidaria.Cs
             int argCount = ins.Operand1;
             var args = PopMany(stack, argCount, pc, ins.Op);
             var ctor = _rts.ResolveMethodInMethodContext(_module, ins.Operand0, _method);
-            AddTypeInitializerDependency(ctor.DeclaringType);
+            if (RequiresTypeInitializationBeforeNewObject(ctor.DeclaringType))
+                AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
+            if (RequiresTypeInitializationBeforeNewObject(t) && NeedsTypeInitialization(t))
+            {
+                SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+                args = MaterializeTypeInitializationOperands(statements, pc, ins.Op, args);
+                AppendTypeInitialization(stack, statements, pc, ins.Op, t);
+            }
             MarkInstantiatedType(t);
 
             if (t.IsValueType)
@@ -4083,6 +4157,8 @@ namespace Cnidaria.Cs
                 return false;
             if (StringComparer.Ordinal.Equals(callee.Name, ".cctor"))
                 return false;
+            if (RequiresTypeInitializationBeforeCall(callee) && FindTypeInitializer(callee.DeclaringType) is not null)
+                return false;
             if (body.ExceptionHandlers.Length != 0)
                 return false;
             if (args.Length != (callee.HasThis ? callee.ParameterTypes.Length + 1 : callee.ParameterTypes.Length))
@@ -4790,16 +4866,18 @@ namespace Cnidaria.Cs
             var args = PopMany(stack, total, callPc, ins.Op);
             var method = _rts.ResolveMethodInMethodContext(bodyModule, ins.Operand0, callerContext);
 
+            bool requiresTypeInitialization = RequiresTypeInitializationBeforeCall(method);
             if (isVirtual)
-            {
                 AddVirtualDependency(method);
-            }
-            else if (RequiresTypeInitializationBeforeCall(method))
-            {
+            if (requiresTypeInitialization)
                 AddTypeInitializerDependency(method.DeclaringType);
-            }
 
             SpillEvaluationStackForImportBarrier(statements, stack, callPc, ins.Op);
+            if (requiresTypeInitialization && NeedsTypeInitialization(method.DeclaringType))
+            {
+                args = MaterializeTypeInitializationOperands(statements, callPc, ins.Op, args);
+                AppendTypeInitialization(stack, statements, callPc, ins.Op, method.DeclaringType);
+            }
 
             if (!isVirtual && TryInlineCall(method, args, statements, callPc, ins.Op, out var inlineResult, inlineDepth + 1))
             {
@@ -4809,7 +4887,9 @@ namespace Cnidaria.Cs
             }
 
             if (!isVirtual)
+            {
                 AddDirectDependency(method);
+            }
 
             bool returnsVoid = IsVoid(method.ReturnType);
             var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
@@ -4833,9 +4913,16 @@ namespace Cnidaria.Cs
             int argCount = ins.Operand1;
             var args = PopMany(stack, argCount, callPc, ins.Op);
             var ctor = _rts.ResolveMethodInMethodContext(bodyModule, ins.Operand0, callee);
-            AddTypeInitializerDependency(ctor.DeclaringType);
+            if (RequiresTypeInitializationBeforeNewObject(ctor.DeclaringType))
+                AddTypeInitializerDependency(ctor.DeclaringType);
 
             var t = ctor.DeclaringType;
+            if (RequiresTypeInitializationBeforeNewObject(t) && NeedsTypeInitialization(t))
+            {
+                SpillEvaluationStackForImportBarrier(statements, stack, callPc, ins.Op);
+                args = MaterializeTypeInitializationOperands(statements, callPc, ins.Op, args);
+                AppendTypeInitialization(stack, statements, callPc, ins.Op, t);
+            }
             MarkInstantiatedType(t);
             if (t.IsValueType)
             {
@@ -4886,6 +4973,7 @@ namespace Cnidaria.Cs
 
                 case BytecodeOp.Ldsfld:
                     AddTypeInitializerDependency(field.DeclaringType);
+                    AppendTypeInitialization(stack, statements, callPc, ins.Op, field.DeclaringType);
                     PushImportedValue(stack, statements, Node(GenTreeKind.StaticField, callPc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                         field: field, int64: ins.Operand0));
                     break;
@@ -4893,6 +4981,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Ldsflda:
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
+                        AppendTypeInitialization(stack, statements, callPc, ins.Op, field.DeclaringType);
                         var byRef = _rts.GetByRefType(field.FieldType);
                         PushImportedValue(stack, statements, Node(GenTreeKind.StaticFieldAddr, callPc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             field: field, int64: ins.Operand0));
@@ -4903,7 +4992,14 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var value = Pop(stack, callPc, ins.Op);
-                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, callPc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
+                        GenTree storedValue = value.Node;
+                        if (NeedsTypeInitialization(field.DeclaringType))
+                        {
+                            SpillEvaluationStackForImportBarrier(statements, stack, callPc, ins.Op);
+                            storedValue = MaterializeTypeInitializationOperand(statements, callPc, ins.Op, storedValue);
+                            AppendTypeInitialization(stack, statements, callPc, ins.Op, field.DeclaringType);
+                        }
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, callPc, ins.Op, operands: One(storedValue), field: field, int64: ins.Operand0));
                         break;
                     }
             }
@@ -4941,6 +5037,7 @@ namespace Cnidaria.Cs
 
                 case BytecodeOp.Ldsfld:
                     AddTypeInitializerDependency(field.DeclaringType);
+                    AppendTypeInitialization(stack, statements, pc, ins.Op, field.DeclaringType);
                     PushImportedValue(stack, statements, Node(GenTreeKind.StaticField, pc, ins.Op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                         field: field, int64: ins.Operand0));
                     break;
@@ -4948,6 +5045,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Ldsflda:
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
+                        AppendTypeInitialization(stack, statements, pc, ins.Op, field.DeclaringType);
                         var byRef = _rts.GetByRefType(field.FieldType);
                         PushImportedValue(stack, statements, Node(GenTreeKind.StaticFieldAddr, pc, ins.Op, type: byRef, stackKind: GenStackKind.ByRef,
                             field: field, int64: ins.Operand0));
@@ -4958,7 +5056,14 @@ namespace Cnidaria.Cs
                     {
                         AddTypeInitializerDependency(field.DeclaringType);
                         var value = Pop(stack, pc, ins.Op);
-                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, pc, ins.Op, operands: One(value.Node), field: field, int64: ins.Operand0));
+                        GenTree storedValue = value.Node;
+                        if (NeedsTypeInitialization(field.DeclaringType))
+                        {
+                            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+                            storedValue = MaterializeTypeInitializationOperand(statements, pc, ins.Op, storedValue);
+                            AppendTypeInitialization(stack, statements, pc, ins.Op, field.DeclaringType);
+                        }
+                        AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreStaticField, pc, ins.Op, operands: One(storedValue), field: field, int64: ins.Operand0));
                         break;
                     }
             }
@@ -4966,13 +5071,72 @@ namespace Cnidaria.Cs
 
         private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
         {
-            if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+            if (StringComparer.Ordinal.Equals(target.Name, ".cctor") || target.DeclaringType.IsBeforeFieldInit)
                 return false;
 
-            if (target.IsStatic)
-                return true;
+            return target.IsStatic ||
+                target.DeclaringType.IsValueType ||
+                StringComparer.Ordinal.Equals(target.Name, ".ctor");
+        }
 
-            return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
+        private static bool RequiresTypeInitializationBeforeNewObject(RuntimeType type)
+            => !type.IsBeforeFieldInit;
+
+        private ImmutableArray<GenTree> MaterializeTypeInitializationOperands(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            ImmutableArray<GenTree> operands)
+        {
+            if (operands.IsDefaultOrEmpty)
+                return ImmutableArray<GenTree>.Empty;
+
+            var result = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
+            for (int i = 0; i < operands.Length; i++)
+            {
+                GenTree operand = operands[i];
+                var temp = CreateImporterSpillTemp(operand.Type, operand.StackKind);
+                statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(operand), int32: temp.Index));
+                result.Add(TempLoad(pc, sourceOp, temp).Node);
+            }
+            return result.ToImmutable();
+        }
+
+        private GenTree MaterializeTypeInitializationOperand(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            GenTree operand)
+        {
+            var temp = CreateImporterSpillTemp(operand.Type, operand.StackKind);
+            statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(operand), int32: temp.Index));
+            return TempLoad(pc, sourceOp, temp).Node;
+        }
+
+        private bool NeedsTypeInitialization(RuntimeType type)
+        {
+            if (!_rts.Target.IsRiscV)
+                return false;
+            _rts.EnsureConstructedMembers(type);
+            if (FindTypeInitializer(type) is null)
+                return false;
+            return !(StringComparer.Ordinal.Equals(_method.Name, ".cctor") && ReferenceEquals(_method.DeclaringType, type));
+        }
+
+        private bool AppendTypeInitialization(
+            List<StackValue> stack,
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            RuntimeType type)
+        {
+            if (!NeedsTypeInitialization(type))
+                return false;
+            RuntimeMethod cctor = FindTypeInitializer(type)!;
+            AddDirectDependency(cctor);
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, sourceOp);
+            statements.Add(Node(GenTreeKind.ClassInit, pc, sourceOp, runtimeType: type));
+            return true;
         }
 
         private void AddTypeInitializerDependency(RuntimeType type)
@@ -5188,6 +5352,7 @@ namespace Cnidaria.Cs
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
+                case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
@@ -5425,6 +5590,9 @@ namespace Cnidaria.Cs
                     return false;
 
                 if (StringComparer.Ordinal.Equals(callee.Name, ".cctor"))
+                    return false;
+
+                if (RequiresTypeInitializationBeforeCall(callee) && FindTypeInitializer(callee.DeclaringType) is not null)
                     return false;
 
                 if (calleeBody.ExceptionHandlers.Length != 0)

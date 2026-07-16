@@ -1,4 +1,4 @@
-_start:
+﻿_start:
     li sp, ${ZBOOT_UBOOT_STACK_ADDRESS}
     mv s1, a0
     mv s2, a1

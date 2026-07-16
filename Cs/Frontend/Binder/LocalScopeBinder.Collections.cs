@@ -56,7 +56,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    if (spreadType is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1)
+                    if (spreadType is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1 || !spreadArray.IsSZArray)
                         return false;
                     if (!ReferenceEquals(spreadArray.ElementType, spreadElementType))
                         return false;
@@ -223,7 +223,7 @@ namespace Cnidaria.Cs
             out ArrayTypeSymbol concreteArrayType,
             out TypeSymbol elementType)
         {
-            if (targetType is ArrayTypeSymbol at && at.Rank == 1)
+            if (targetType is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
             {
                 concreteArrayType = at;
                 elementType = at.ElementType;
@@ -553,7 +553,7 @@ namespace Cnidaria.Cs
                 if (spreadExpr is BoundUnboundCollectionExpression nestedCollection)
                     spreadExpr = BindCollectionExpression(spreadSyntax.Expression as CollectionExpressionSyntax ?? node, spreadArrayType, nestedCollection, context, diagnostics);
 
-                if (spreadExpr.Type is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1)
+                if (spreadExpr.Type is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1 || !spreadArray.IsSZArray)
                 {
                     diagnostics.Add(new Diagnostic(
                         "CN_COLL012",
@@ -916,7 +916,7 @@ namespace Cnidaria.Cs
                 if (spreadExpr is BoundUnboundCollectionExpression nestedCollection)
                     spreadExpr = BindCollectionExpression(spreadSyntax.Expression as CollectionExpressionSyntax ?? node, arrayType, nestedCollection, context, diagnostics);
 
-                if (spreadExpr.Type is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1)
+                if (spreadExpr.Type is not ArrayTypeSymbol spreadArray || spreadArray.Rank != 1 || !spreadArray.IsSZArray)
                 {
                     diagnostics.Add(new Diagnostic(
                         "CN_COLL006",

@@ -27,8 +27,6 @@ namespace Cnidaria.C
     }
 
 
-
-
     internal readonly struct DeclarationSpecifiers
     {
         public QualifiedType BaseType { get; }
@@ -616,10 +614,27 @@ namespace Cnidaria.C
             var sawFloat = false;
             var sawDouble = false;
             QualifiedType? namedBaseType = null;
+            var braceDepth = 0;
 
             for (var i = 0; i < _tokens.Length; i++)
             {
                 var token = _tokens[i];
+
+                if (token.Kind is SyntaxKind.OpenBraceToken or SyntaxKind.OpenBraceDigraphToken)
+                {
+                    braceDepth++;
+                    continue;
+                }
+
+                if (token.Kind is SyntaxKind.CloseBraceToken or SyntaxKind.CloseBraceDigraphToken)
+                {
+                    if (braceDepth > 0)
+                        braceDepth--;
+                    continue;
+                }
+
+                if (braceDepth != 0)
+                    continue;
 
                 switch (token.Kind)
                 {
@@ -763,6 +778,9 @@ namespace Cnidaria.C
 
         private QualifiedType ResolveTypedefName(SyntaxToken token)
         {
+            if (RVVectorType.TryParseBuiltinName(token.Text, out var vectorKind))
+                return _types.RiscVVector(vectorKind);
+
             if (_scope.LookupOrdinary(token.Text) is TypeAliasSymbol alias)
                 return alias.TargetType;
 

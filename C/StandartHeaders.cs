@@ -17,6 +17,7 @@ namespace Cnidaria.C
         internal static string StddefH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stddef.h");
         internal static string StdargH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdarg.h");
         internal static string StdioH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdio.h");
+        internal static string StdintH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdint.h");
         internal static string RiscVVectorH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.riscv_vector.h");
         private static string ReadEmbeddedText(string resourceName)
         {
@@ -33,6 +34,7 @@ namespace Cnidaria.C
                 new IncludeFile("stddef.h", StddefH),
                 new IncludeFile("stdio.h", StdioH),
                 new IncludeFile("stdarg.h", StdargH),
+                new IncludeFile("stdint.h", StdintH),
                 new IncludeFile("riscv_vector.h", RiscVVectorH));
         }
 

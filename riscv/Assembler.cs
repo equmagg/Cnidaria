@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace Cnidaria.RiscV
 {
@@ -130,6 +131,7 @@ namespace Cnidaria.RiscV
             var instructions = ImmutableArray.CreateBuilder<RVInstruction>();
             var labels = new Dictionary<string, int>(StringComparer.Ordinal);
             var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            var pc = 0;
 
             for (int lineIndex = 0; lineIndex < lines.Length; lineIndex++)
             {
@@ -146,7 +148,7 @@ namespace Cnidaria.RiscV
                     ValidateLabel(label, lineIndex + 1);
                     if (labels.ContainsKey(label))
                         throw new FormatException($"Duplicate RISC-V label '{label}' on line {lineIndex + 1}");
-                    labels.Add(label, instructions.Count * 4);
+                    labels.Add(label, pc);
                     line = line.Substring(colon + 1).Trim();
                     if (line.Length == 0)
                         break;
@@ -156,7 +158,10 @@ namespace Cnidaria.RiscV
                     continue;
 
                 foreach (var instruction in ParseInstruction(line, lineIndex + 1))
+                {
                     instructions.Add(instruction);
+                    pc = checked(pc + RVInstructionTable.GetEncodedSize(instruction.Opcode));
+                }
             }
 
             return new RiscVProgram(target, instructions.ToImmutable(), labels);
@@ -173,6 +178,12 @@ namespace Cnidaria.RiscV
             {
                 ValidateOperandCount(mnemonic, operands, 1, lineNumber);
                 return One(RVInstruction.Raw(unchecked((uint)ParseImmediate(operands[0]))));
+            }
+
+            if (mnemonic == ".hword" || mnemonic == ".half" || mnemonic == ".2byte")
+            {
+                ValidateOperandCount(mnemonic, operands, 1, lineNumber);
+                return One(RVInstruction.Raw16(unchecked((ushort)ParseImmediate(operands[0]))));
             }
 
             if (TryParsePseudo(mnemonic, operands, lineNumber, out var pseudo))
@@ -193,6 +204,14 @@ namespace Cnidaria.RiscV
                 case RVInstructionFormat.ShiftI:
                     ValidateOperandCount(mnemonic, operands, 3, lineNumber);
                     return One(RVInstruction.I(opcode, ParseGpr(operands[0]), ParseGpr(operands[1]), ParseImmediate(operands[2])));
+                case RVInstructionFormat.BitmanipUnary:
+                    ValidateOperandCount(mnemonic, operands, 2, lineNumber);
+                    return One(RVInstruction.R(opcode, ParseGpr(operands[0]), ParseGpr(operands[1]), RVRegister.X0));
+                case RVInstructionFormat.BitmanipShiftI:
+                    ValidateOperandCount(mnemonic, operands, 3, lineNumber);
+                    return One(RVInstruction.I(opcode, ParseGpr(operands[0]), ParseGpr(operands[1]), ParseImmediate(operands[2])));
+                case RVInstructionFormat.Compressed:
+                    return One(ParseCompressed(opcode, operands, lineNumber));
                 case RVInstructionFormat.S:
                     ValidateOperandCount(mnemonic, operands, 2, lineNumber);
                     return One(ParseStore(opcode, operands));
@@ -234,12 +253,16 @@ namespace Cnidaria.RiscV
                     return One(new RVInstruction(opcode));
                 case RVInstructionFormat.PrivilegedFence:
                     return One(ParsePrivilegedFence(opcode, operands, lineNumber));
+                case RVInstructionFormat.HypervisorLoad:
+                    return One(ParseHypervisorLoad(opcode, operands, lineNumber));
+                case RVInstructionFormat.HypervisorStore:
+                    return One(ParseHypervisorStore(opcode, operands, lineNumber));
                 case RVInstructionFormat.Csr:
                     ValidateOperandCount(mnemonic, operands, 3, lineNumber);
-                    return One(new RVInstruction(opcode, ParseGpr(operands[0]), ParseGpr(operands[2]), RVRegister.Invalid, ParseCsr(operands[1])));
+                    return One(new RVInstruction(opcode, ParseGpr(operands[0]), ParseGpr(operands[2]), RVRegister.Invalid, RiscVCsrs.Parse(operands[1])));
                 case RVInstructionFormat.CsrImmediate:
                     ValidateOperandCount(mnemonic, operands, 3, lineNumber);
-                    return One(new RVInstruction(opcode, ParseGpr(operands[0]), (RVRegister)ParseUimm(operands[2], 5), RVRegister.Invalid, ParseCsr(operands[1])));
+                    return One(new RVInstruction(opcode, ParseGpr(operands[0]), (RVRegister)ParseUimm(operands[2], 5), RVRegister.Invalid, RiscVCsrs.Parse(operands[1])));
                 case RVInstructionFormat.Amo:
                     return One(ParseAtomic(opcode, operands, atomicFlags, lineNumber));
                 case RVInstructionFormat.VectorConfig:
@@ -451,6 +474,122 @@ namespace Cnidaria.RiscV
             throw new FormatException($"Invalid jal operand count on line {lineNumber}");
         }
 
+        private static RVInstruction ParseCompressed(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
+        {
+            switch (opcode)
+            {
+                case RVInstrKind.CAddi4Spn:
+                    ValidateOperandCount("c.addi4spn", operands, 2, lineNumber);
+                    return new RVInstruction(opcode, ParseGpr(operands[0]), RVRegister.X2, RVRegister.Invalid, ParseImmediate(operands[1]));
+                case RVInstrKind.CLw:
+                case RVInstrKind.CLd:
+                case RVInstrKind.CFlw:
+                case RVInstrKind.CFld:
+                case RVInstrKind.CLwSp:
+                case RVInstrKind.CLdSp:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    return ParseCompressedLoad(opcode, operands);
+                case RVInstrKind.CSw:
+                case RVInstrKind.CSd:
+                case RVInstrKind.CFsw:
+                case RVInstrKind.CFsd:
+                case RVInstrKind.CSwSp:
+                case RVInstrKind.CSdSp:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    return ParseCompressedStore(opcode, operands);
+                case RVInstrKind.CNop:
+                case RVInstrKind.CEbreak:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 0, lineNumber);
+                    return new RVInstruction(opcode);
+                case RVInstrKind.CAddi:
+                case RVInstrKind.CAddiw:
+                case RVInstrKind.CSlli:
+                case RVInstrKind.CSrli:
+                case RVInstrKind.CSrai:
+                case RVInstrKind.CAndi:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    var rd = ParseGpr(operands[0]);
+                    return new RVInstruction(opcode, rd, rd, RVRegister.Invalid, ParseImmediate(operands[1]));
+                case RVInstrKind.CLi:
+                case RVInstrKind.CLui:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    return new RVInstruction(opcode, ParseGpr(operands[0]), RVRegister.Invalid, RVRegister.Invalid, ParseImmediate(operands[1]));
+                case RVInstrKind.CAddi16Sp:
+                    if (operands.Length == 1)
+                        return new RVInstruction(opcode, RVRegister.X2, RVRegister.X2, RVRegister.Invalid, ParseImmediate(operands[0]));
+                    if (operands.Length == 2)
+                    {
+                        var sp = ParseGpr(operands[0]);
+                        if (sp != RVRegister.X2)
+                            throw new FormatException("c.addi16sp requires sp");
+                        return new RVInstruction(opcode, RVRegister.X2, RVRegister.X2, RVRegister.Invalid, ParseImmediate(operands[1]));
+                    }
+                    throw new FormatException($"Invalid c.addi16sp operand count on line {lineNumber}");
+                case RVInstrKind.CSub:
+                case RVInstrKind.CXor:
+                case RVInstrKind.COr:
+                case RVInstrKind.CAnd:
+                case RVInstrKind.CSubw:
+                case RVInstrKind.CAddw:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    var crd = ParseGpr(operands[0]);
+                    return RVInstruction.R(opcode, crd, crd, ParseGpr(operands[1]));
+                case RVInstrKind.CJ:
+                    ValidateOperandCount("c.j", operands, 1, lineNumber);
+                    return TryParseImmediate(operands[0], out int jImm) ? RVInstruction.J(opcode, RVRegister.X0, jImm) : RVInstruction.J(opcode, RVRegister.X0, operands[0]);
+                case RVInstrKind.CJal:
+                    ValidateOperandCount("c.jal", operands, 1, lineNumber);
+                    return TryParseImmediate(operands[0], out int jalImm) ? RVInstruction.J(opcode, RVRegister.X1, jalImm) : RVInstruction.J(opcode, RVRegister.X1, operands[0]);
+                case RVInstrKind.CBeqz:
+                case RVInstrKind.CBnez:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    var rs1 = ParseGpr(operands[0]);
+                    return TryParseImmediate(operands[1], out int branchImm) ? RVInstruction.B(opcode, rs1, RVRegister.X0, branchImm) : RVInstruction.B(opcode, rs1, RVRegister.X0, operands[1]);
+                case RVInstrKind.CJr:
+                case RVInstrKind.CJalr:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 1, lineNumber);
+                    return new RVInstruction(opcode, RVRegister.Invalid, ParseGpr(operands[0]), RVRegister.Invalid);
+                case RVInstrKind.CMv:
+                case RVInstrKind.CAdd:
+                    ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+                    return RVInstruction.R(opcode, ParseGpr(operands[0]), ParseGpr(operands[0]), ParseGpr(operands[1]));
+                default:
+                    throw new FormatException($"Unsupported RISC-V compressed instruction on line {lineNumber}");
+            }
+        }
+
+        private static RVInstruction ParseCompressedLoad(RVInstrKind opcode, ImmutableArray<string> operands)
+        {
+            var memory = ParseMemoryOperand(operands[1]);
+            var rd = opcode is RVInstrKind.CFlw or RVInstrKind.CFld ? ParseFpr(operands[0]) : ParseGpr(operands[0]);
+            return RVInstruction.I(opcode, rd, memory.Base, memory.Offset);
+        }
+
+        private static RVInstruction ParseCompressedStore(RVInstrKind opcode, ImmutableArray<string> operands)
+        {
+            var memory = ParseMemoryOperand(operands[1]);
+            var rs2 = opcode is RVInstrKind.CFsw or RVInstrKind.CFsd ? ParseFpr(operands[0]) : ParseGpr(operands[0]);
+            return RVInstruction.S(opcode, rs2, memory.Base, memory.Offset);
+        }
+
+        private static RVInstruction ParseHypervisorLoad(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
+        {
+            ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+            var memory = ParseMemoryOperand(operands[1]);
+            if (memory.Offset != 0)
+                throw new FormatException($"Hypervisor load does not accept an offset on line {lineNumber}");
+            return new RVInstruction(opcode, ParseGpr(operands[0]), memory.Base);
+        }
+
+        private static RVInstruction ParseHypervisorStore(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
+        {
+            ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
+            var memory = ParseMemoryOperand(operands[1]);
+            if (memory.Offset != 0)
+                throw new FormatException($"Hypervisor store does not accept an offset on line {lineNumber}");
+            return new RVInstruction(opcode, rs1: memory.Base, rs2: ParseGpr(operands[0]));
+        }
+
         private static RVInstruction ParsePrivilegedFence(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
         {
             if (operands.Length > 2)
@@ -564,7 +703,7 @@ namespace Cnidaria.RiscV
         {
             var register = RVRegisters.Parse(text);
             if (!RVRegisters.IsInteger(register))
-                throw new FormatException($"Expected RISC-V integer register: {text}");
+                throw new FormatException($"Expected integer register: {text}");
             return register;
         }
 
@@ -572,7 +711,7 @@ namespace Cnidaria.RiscV
         {
             var register = RVRegisters.Parse(text);
             if (!RVRegisters.IsFloat(register))
-                throw new FormatException($"Expected RISC-V floating-point register: {text}");
+                throw new FormatException($"Expected floating-point register: {text}");
             return register;
         }
 
@@ -580,7 +719,7 @@ namespace Cnidaria.RiscV
         {
             var register = RVRegisters.Parse(text);
             if (!RVRegisters.IsVector(register))
-                throw new FormatException($"Expected RISC-V vector register: {text}");
+                throw new FormatException($"Expected vector register: {text}");
             return register;
         }
 
@@ -589,7 +728,7 @@ namespace Cnidaria.RiscV
             int open = text.IndexOf('(');
             int close = text.LastIndexOf(')');
             if (open < 0 || close != text.Length - 1 || close <= open + 1)
-                throw new FormatException($"Invalid RISC-V memory operand: {text}");
+                throw new FormatException($"Invalid memory operand: {text}");
             string offsetText = text.Substring(0, open).Trim();
             string baseText = text.Substring(open + 1, close - open - 1).Trim();
             int offset = offsetText.Length == 0 ? 0 : ParseImmediate(offsetText);
@@ -604,7 +743,7 @@ namespace Cnidaria.RiscV
                 return ParseUimm(operands[0], 8);
             if (operands.Length == 2)
                 return (ParseFenceMask(operands[0]) << 4) | ParseFenceMask(operands[1]);
-            throw new FormatException("Invalid RISC-V fence operand count");
+            throw new FormatException("Invalid fence operand count");
         }
 
         private static int ParseFenceMask(string text)
@@ -629,19 +768,17 @@ namespace Cnidaria.RiscV
                     case '0':
                         break;
                     default:
-                        throw new FormatException($"Invalid RISC-V fence mask: {text}");
+                        throw new FormatException($"Invalid fence mask: {text}");
                 }
             }
             return mask;
         }
 
-        private static int ParseCsr(string text)
-            => RiscVCsrs.Parse(text);
 
         private static int ParseVType(ImmutableArray<string> operands, int start)
         {
             if (start >= operands.Length)
-                throw new FormatException("Missing RISC-V vector type");
+                throw new FormatException("Missing vector type");
             if (operands.Length - start == 1 && TryParseImmediate(operands[start], out int raw))
                 return raw;
 
@@ -973,19 +1110,19 @@ namespace Cnidaria.RiscV
         private static void ValidateLabel(string label, int lineNumber)
         {
             if (label.Length == 0 || !(char.IsLetter(label[0]) || label[0] == '_' || label[0] == '.'))
-                throw new FormatException($"Invalid RISC-V label on line {lineNumber}");
+                throw new FormatException($"Invalid label on line {lineNumber}");
             for (int i = 1; i < label.Length; i++)
             {
                 char c = label[i];
                 if (!(char.IsLetterOrDigit(c) || c == '_' || c == '.' || c == '$'))
-                    throw new FormatException($"Invalid RISC-V label on line {lineNumber}");
+                    throw new FormatException($"Invalid label on line {lineNumber}");
             }
         }
 
         private static void ValidateOperandCount(string mnemonic, ImmutableArray<string> operands, int expected, int lineNumber)
         {
             if (operands.Length != expected)
-                throw new FormatException($"RISC-V instruction '{mnemonic}' expects {expected} operands on line {lineNumber}");
+                throw new FormatException($"instruction '{mnemonic}' expects {expected} operands on line {lineNumber}");
         }
     }
 
@@ -1029,9 +1166,9 @@ namespace Cnidaria.RiscV
             }
 
             var sb = new StringBuilder();
+            var pc = 0;
             for (int i = 0; i < text.Instructions.Length; i++)
             {
-                int pc = i * 4;
                 if (labelsByPc.TryGetValue(pc, out var labels))
                 {
                     labels.Sort(StringComparer.Ordinal);
@@ -1039,6 +1176,7 @@ namespace Cnidaria.RiscV
                         sb.Append(label).AppendLine(":");
                 }
                 sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options));
+                pc = checked(pc + RVInstructionTable.GetEncodedSize(text.Instructions[i].Opcode));
             }
             return sb.ToString();
         }
@@ -1100,14 +1238,15 @@ namespace Cnidaria.RiscV
                 }
             }
 
+            var pc = 0;
             for (var i = 0; i < text.Instructions.Length; i++)
             {
-                var pc = checked(i * 4);
                 WriteLabels(sb, labelsByPc, pc);
                 sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options));
+                pc = checked(pc + RVInstructionTable.GetEncodedSize(text.Instructions[i].Opcode));
             }
 
-            WriteLabels(sb, labelsByPc, checked(text.Instructions.Length * 4));
+            WriteLabels(sb, labelsByPc, text.SizeInBytes);
         }
         private static void WriteDataSection(
             StringBuilder sb,
@@ -1292,58 +1431,127 @@ namespace Cnidaria.RiscV
             switch (metadata.Format)
             {
                 case RVInstructionFormat.Raw:
-                    return ".word 0x" + unchecked((uint)instruction.Immediate).ToString("X8", CultureInfo.InvariantCulture).ToLowerInvariant();
+                    return $".word 0x{unchecked((uint)instruction.Immediate).ToString("X8", CultureInfo.InvariantCulture).ToLowerInvariant()}";
+                case RVInstructionFormat.Raw16:
+                    return $".hword 0x{unchecked((ushort)instruction.Immediate).ToString("X4", CultureInfo.InvariantCulture).ToLowerInvariant()}";
                 case RVInstructionFormat.R:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}, {Reg(instruction.Rs2, options)}";
                 case RVInstructionFormat.I:
                     if (RVInstructionTable.IsLoad(instruction.Opcode) || instruction.Opcode == RVInstrKind.Jalr)
-                        return mnemonic + " " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction) + "(" + Reg(instruction.Rs1, options) + ")";
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + ImmOrSymbol(instruction);
+                        return $"{mnemonic} {Reg(instruction.Rd, options)}, {ImmOrSymbol(instruction)}(" + Reg(instruction.Rs1, options) + ")";
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}, {ImmOrSymbol(instruction)}";
                 case RVInstructionFormat.ShiftI:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + instruction.Immediate.ToString();
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}, {instruction.Immediate}";
+                case RVInstructionFormat.BitmanipUnary:
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}";
+                case RVInstructionFormat.BitmanipShiftI:
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}, {instruction.Immediate}";
+                case RVInstructionFormat.Compressed:
+                    return WriteCompressed(mnemonic, instruction, options);
                 case RVInstructionFormat.S:
-                    return mnemonic + " " + Reg(instruction.Rs2, options) + ", " + ImmOrSymbol(instruction) + "(" + Reg(instruction.Rs1, options) + ")";
+                    return $"{mnemonic} {Reg(instruction.Rs2, options)}, {ImmOrSymbol(instruction)}({Reg(instruction.Rs1, options)})";
                 case RVInstructionFormat.FloatLoad:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction) + "(" + Reg(instruction.Rs1, options) + ")";
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {ImmOrSymbol(instruction)}({Reg(instruction.Rs1, options)})";
                 case RVInstructionFormat.FloatStore:
-                    return mnemonic + " " + Reg(instruction.Rs2, options) + ", " + ImmOrSymbol(instruction) + "(" + Reg(instruction.Rs1, options) + ")";
+                    return $"{mnemonic} {Reg(instruction.Rs2, options)}, {ImmOrSymbol(instruction)}({Reg(instruction.Rs1, options)})";
                 case RVInstructionFormat.FloatRRR:
                 case RVInstructionFormat.FloatCompare:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}, " + Reg(instruction.Rs2, options);
                 case RVInstructionFormat.FloatConvertFromInteger:
                 case RVInstructionFormat.FloatConvertToInteger:
                 case RVInstructionFormat.FloatConvert:
                 case RVInstructionFormat.FloatMoveToInteger:
                 case RVInstructionFormat.FloatMoveFromInteger:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {Reg(instruction.Rs1, options)}";
                 case RVInstructionFormat.B:
-                    return mnemonic + " " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options) + ", " + ImmOrSymbol(instruction);
+                    return $"{mnemonic} {Reg(instruction.Rs1, options)}, {Reg(instruction.Rs2, options)}, {ImmOrSymbol(instruction)}";
                 case RVInstructionFormat.U:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {ImmOrSymbol(instruction)}";
                 case RVInstructionFormat.J:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {ImmOrSymbol(instruction)}";
                 case RVInstructionFormat.Fence:
                     return WriteFence(instruction.Immediate);
                 case RVInstructionFormat.System:
                     return mnemonic;
                 case RVInstructionFormat.PrivilegedFence:
                     return WritePrivilegedFence(mnemonic, instruction, options);
+                case RVInstructionFormat.HypervisorLoad:
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, ({Reg(instruction.Rs1, options)})";
+                case RVInstructionFormat.HypervisorStore:
+                    return $"{mnemonic} {Reg(instruction.Rs2, options)}, ({Reg(instruction.Rs1, options)})";
                 case RVInstructionFormat.Csr:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + RiscVCsrs.Format(instruction.Immediate) + ", " + Reg(instruction.Rs1, options);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {RiscVCsrs.Format(instruction.Immediate)}, {Reg(instruction.Rs1, options)}";
                 case RVInstructionFormat.CsrImmediate:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", " + RiscVCsrs.Format(instruction.Immediate) + ", " + ((int)instruction.Rs1).ToString();
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {RiscVCsrs.Format(instruction.Immediate)}, {(int)instruction.Rs1}";
                 case RVInstructionFormat.Amo:
                     return WriteAtomic(mnemonic, instruction, options);
                 case RVInstructionFormat.VectorConfig:
                     return WriteVectorConfig(mnemonic, instruction, options);
                 case RVInstructionFormat.VectorLoad:
-                    return mnemonic + " " + Reg(instruction.Rd, options) + ", (" + Reg(instruction.Rs1, options) + ")" + MaskSuffix(instruction);
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, ({Reg(instruction.Rs1, options)}){MaskSuffix(instruction)}";
                 case RVInstructionFormat.VectorStore:
-                    return mnemonic + " " + Reg(instruction.Rs2, options) + ", (" + Reg(instruction.Rs1, options) + ")" + MaskSuffix(instruction);
+                    return $"{mnemonic} {Reg(instruction.Rs2, options)}, ({Reg(instruction.Rs1, options)}){MaskSuffix(instruction)}";
                 case RVInstructionFormat.VectorOp:
                     return WriteVectorOp(mnemonic, metadata, instruction, options);
                 default:
-                    throw new NotSupportedException($"Unsupported RISC-V instruction format: {metadata.Format}");
+                    throw new NotSupportedException($"Unsupported instruction format: {metadata.Format}");
+            }
+        }
+
+        private static string WriteCompressed(string mnemonic, RVInstruction instruction, RiscVAssemblyWriterOptions options)
+        {
+            switch (instruction.Opcode)
+            {
+                case RVInstrKind.CNop:
+                case RVInstrKind.CEbreak:
+                    return mnemonic;
+                case RVInstrKind.CAddi4Spn:
+                    return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction);
+                case RVInstrKind.CLw:
+                case RVInstrKind.CLd:
+                case RVInstrKind.CFlw:
+                case RVInstrKind.CFld:
+                case RVInstrKind.CLwSp:
+                case RVInstrKind.CLdSp:
+                    return $"{mnemonic} {Reg(instruction.Rd, options)}, {ImmOrSymbol(instruction)}({Reg(instruction.Rs1, options)})";
+                case RVInstrKind.CSw:
+                case RVInstrKind.CSd:
+                case RVInstrKind.CFsw:
+                case RVInstrKind.CFsd:
+                case RVInstrKind.CSwSp:
+                case RVInstrKind.CSdSp:
+                    return $"{mnemonic} " + Reg(instruction.Rs2, options) + ", " + ImmOrSymbol(instruction) + "(" + Reg(instruction.Rs1, options) + ")";
+                case RVInstrKind.CAddi:
+                case RVInstrKind.CAddiw:
+                case RVInstrKind.CLi:
+                case RVInstrKind.CLui:
+                case RVInstrKind.CSlli:
+                case RVInstrKind.CSrli:
+                case RVInstrKind.CSrai:
+                case RVInstrKind.CAndi:
+                    return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + ImmOrSymbol(instruction);
+                case RVInstrKind.CAddi16Sp:
+                    return $"{mnemonic} " + ImmOrSymbol(instruction);
+                case RVInstrKind.CSub:
+                case RVInstrKind.CXor:
+                case RVInstrKind.COr:
+                case RVInstrKind.CAnd:
+                case RVInstrKind.CSubw:
+                case RVInstrKind.CAddw:
+                case RVInstrKind.CMv:
+                case RVInstrKind.CAdd:
+                    return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options);
+                case RVInstrKind.CJ:
+                case RVInstrKind.CJal:
+                    return $"{mnemonic} " + ImmOrSymbol(instruction);
+                case RVInstrKind.CBeqz:
+                case RVInstrKind.CBnez:
+                    return $"{mnemonic} " + Reg(instruction.Rs1, options) + ", " + ImmOrSymbol(instruction);
+                case RVInstrKind.CJr:
+                case RVInstrKind.CJalr:
+                    return $"{mnemonic} " + Reg(instruction.Rs1, options);
+                default:
+                    throw new NotSupportedException($"Unsupported compressed opcode: {instruction.Opcode}");
             }
         }
 
@@ -1378,32 +1586,32 @@ namespace Cnidaria.RiscV
             if ((instruction.Rs1 == RVRegister.Invalid || instruction.Rs1 == RVRegister.X0) && (instruction.Rs2 == RVRegister.Invalid || instruction.Rs2 == RVRegister.X0))
                 return mnemonic;
             if (instruction.Rs2 == RVRegister.Invalid || instruction.Rs2 == RVRegister.X0)
-                return mnemonic + " " + Reg(instruction.Rs1, options);
-            return mnemonic + " " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
+                return $"{mnemonic} " + Reg(instruction.Rs1, options);
+            return $"{mnemonic} " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
         }
 
         private static string WriteAtomic(string mnemonic, RVInstruction instruction, RiscVAssemblyWriterOptions options)
         {
             mnemonic += AtomicSuffix(instruction);
             if (instruction.Opcode is RVInstrKind.LrW or RVInstrKind.LrD)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", (" + Reg(instruction.Rs1, options) + ")";
-            return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", (" + Reg(instruction.Rs1, options) + ")";
+                return $"{mnemonic} " + Reg(instruction.Rd, options) + ", (" + Reg(instruction.Rs1, options) + ")";
+            return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", (" + Reg(instruction.Rs1, options) + ")";
         }
 
         private static string WriteVectorConfig(string mnemonic, RVInstruction instruction, RiscVAssemblyWriterOptions options)
         {
             if (instruction.Opcode == RVInstrKind.Vsetvli)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + FormatVType(instruction.Immediate, options);
+                return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + FormatVType(instruction.Immediate, options);
             if (instruction.Opcode == RVInstrKind.Vsetivli)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + ((int)instruction.Rs1) + ", " + FormatVType(instruction.Immediate, options);
-            return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
+                return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + ((int)instruction.Rs1) + ", " + FormatVType(instruction.Immediate, options);
+            return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
         }
 
         private static string WriteVectorOp(string mnemonic, RVInstructionMetadata metadata, RVInstruction instruction, RiscVAssemblyWriterOptions options)
         {
             if (metadata.Funct3 == 3)
-                return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + instruction.Immediate + MaskSuffix(instruction);
-            return mnemonic + " " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + Reg(instruction.Rs1, options) + MaskSuffix(instruction);
+                return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + instruction.Immediate + MaskSuffix(instruction);
+            return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs2, options) + ", " + Reg(instruction.Rs1, options) + MaskSuffix(instruction);
         }
 
         private static string Reg(RVRegister register, RiscVAssemblyWriterOptions options)

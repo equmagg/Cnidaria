@@ -212,7 +212,7 @@ namespace Cnidaria.Cs
             }
         }
     }
-    
+
 
     internal static class InlineArrayFacts
     {
@@ -496,9 +496,11 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeSymbol> _interfaces;
         public override SymbolKind Kind => SymbolKind.ArrayType;
         public override string Name
-            => Rank == 1
+            => IsSZArray
                 ? $"{ElementType.Name}[]"
-                : $"{ElementType.Name}[{new string(',', Rank - 1)}]";
+                : Rank == 1
+                    ? $"{ElementType.Name}[*]"
+                    : $"{ElementType.Name}[{new string(',', Rank - 1)}]";
 
         public override Symbol? ContainingSymbol => null;
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -509,12 +511,14 @@ namespace Cnidaria.Cs
             => _interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : _interfaces;
         public TypeSymbol ElementType { get; }
         public int Rank { get; }
+        public bool IsSZArray { get; }
 
         public ArrayTypeSymbol(
-            TypeSymbol elementType, int rank, NamedTypeSymbol arrayBase, ImmutableArray<TypeSymbol> interfaces)
+            TypeSymbol elementType, int rank, bool isSZArray, NamedTypeSymbol arrayBase, ImmutableArray<TypeSymbol> interfaces)
         {
             ElementType = elementType;
             Rank = rank;
+            IsSZArray = isSZArray;
             _arrayBase = arrayBase;
             _interfaces = interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : interfaces;
         }
@@ -1439,7 +1443,7 @@ namespace Cnidaria.Cs
                 case ArrayTypeSymbol at:
                     {
                         var elem = Substitute(at.ElementType, types, map);
-                        return ReferenceEquals(elem, at.ElementType) ? at : types.GetArrayType(elem, at.Rank);
+                        return ReferenceEquals(elem, at.ElementType) ? at : types.GetArrayType(elem, at.Rank, at.IsSZArray);
                     }
                 case PointerTypeSymbol pt:
                     {
@@ -1531,7 +1535,7 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeSymbol> _lazyInterfaces;
         private bool _lazyInterfacesInitialized;
         public override Accessibility DeclaredAccessibility => _originalDefinition.DeclaredAccessibility;
-        public override bool IsFromMetadata => _originalDefinition.IsFromMetadata; 
+        public override bool IsFromMetadata => _originalDefinition.IsFromMetadata;
         public override bool IsSealed => _originalDefinition.IsSealed;
         public override bool IsRefLikeType => _originalDefinition.IsRefLikeType;
         public override bool IsReadOnlyStruct => _originalDefinition.IsReadOnlyStruct;

@@ -1077,7 +1077,7 @@ namespace Cnidaria.Cs
         private static bool IsValidAttributeParameterType(TypeSymbol t)
         {
             if (t is ArrayTypeSymbol arr)
-                return arr.Rank == 1 && IsValidNonArrayAttributeParameterType(arr.ElementType);
+                return arr.IsSZArray && IsValidNonArrayAttributeParameterType(arr.ElementType);
 
             return IsValidNonArrayAttributeParameterType(t);
         }

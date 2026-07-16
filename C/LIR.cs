@@ -159,7 +159,16 @@ namespace Cnidaria.C
                     continue;
 
                 foreach (var declaration in global.Declarators)
+                {
+                    if (declaration.StorageClass == StorageClass.Typedef ||
+                        declaration.Symbol is TypeAliasSymbol ||
+                        declaration.Symbol is FunctionSymbol ||
+                        declaration.Type.Type is FunctionType)
+                    {
+                        continue;
+                    }
                     globals.Add(new LirGlobal(declaration.Symbol, declaration.Type, declaration.StorageClass, declaration.Initializer));
+                }
             }
 
             foreach (var function in ssaGraph.Functions)
@@ -1716,10 +1725,9 @@ namespace Cnidaria.C
             if (rewrittenBase?.Name is not null)
                 return GetOperand(rewrittenBase.Name);
 
-            if (rewrittenBase is not null && !rewrittenBase.IsAddress)
-                return EmitValue(block, rewrittenBase);
-
-            return EmitValue(block, originalBase);
+            return rewrittenBase is null
+                ? EmitValue(block, originalBase)
+                : EmitValue(block, originalBase, rewrittenBase);
         }
         private LirAddress EmitMemberAddress(LirBlock block, GimpleMemberAccessExpression memberAccess, SsaExpression? expression)
         {

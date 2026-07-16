@@ -70,7 +70,7 @@ namespace Cnidaria.Cs
                     q.Enqueue((m, f));
             }
         }
-        
+
         private static string FormatOperandComment(
             IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
             Cnidaria.Cs.RuntimeModule currentModule,
@@ -100,7 +100,12 @@ namespace Cnidaria.Cs
                 case BytecodeOp.DefaultValue:
                 case BytecodeOp.Newarr:
                 case BytecodeOp.Ldelem:
+                case BytecodeOp.Ldelema:
                 case BytecodeOp.Stelem:
+                case BytecodeOp.NewMdarr:
+                case BytecodeOp.LdelemMd:
+                case BytecodeOp.LdelemaMd:
+                case BytecodeOp.StelemMd:
                     return $"   // {FormatTypeToken(currentModule, ins.Operand0)}";
 
                 case BytecodeOp.Ldfld:

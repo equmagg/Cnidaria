@@ -3370,6 +3370,7 @@ namespace Cnidaria.Cs
                         result = AddHelperOpaqueException(result, node);
                         break;
 
+                    case GenTreeKind.ClassInit:
                     case GenTreeKind.Call:
                     case GenTreeKind.NewObject:
                     case GenTreeKind.NewDelegate:

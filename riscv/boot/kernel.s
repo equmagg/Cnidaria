@@ -1,4 +1,4 @@
-_start:
+﻿_start:
     j kernel_boot_start
 
 kernel_enter_user:
@@ -36,11 +36,11 @@ supervisor_trap_vector:
     addi sp, sp, -288
     sd x0, 0(sp)
     sd x1, 8(sp)
+    sd x5, 40(sp)
     csrrs t0, sscratch, zero
     sd t0, 16(sp)
     sd x3, 24(sp)
     sd x4, 32(sp)
-    sd x5, 40(sp)
     sd x6, 48(sp)
     sd x7, 56(sp)
     sd x8, 64(sp)

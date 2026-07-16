@@ -70,6 +70,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.ExceptionObject:
                     sb.Append("exception");
                     return;
+                case GenTreeKind.ClassInit:
+                    sb.Append("classinit ").Append(TypeName(node.RuntimeType));
+                    return;
                 case GenTreeKind.Unary:
                     sb.Append(node.SourceOp.ToString().ToLowerInvariant()).Append('(');
                     AppendOperands(sb, node);

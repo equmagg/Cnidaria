@@ -145,6 +145,10 @@ namespace Cnidaria.Cs
         public static LinearRationalizationOptions Default => new LinearRationalizationOptions();
 
         public bool Validate { get; set; } = true;
+        public bool? NonCallOperationsClobberCallerSavedRegisters { get; set; }
+
+        public bool GetNonCallOperationsClobberCallerSavedRegisters(TargetInfo target)
+            => NonCallOperationsClobberCallerSavedRegisters ?? !target.IsRegisterBytecode;
     }
     internal static class GenTreeLinearIrRationalizer
     {
@@ -170,7 +174,7 @@ namespace Cnidaria.Cs
                 cfg = method.Cfg;
             }
 
-            var builder = new MethodBuilder(method, cfg, ssa);
+            var builder = new MethodBuilder(method, cfg, ssa, options);
             return builder.Run();
         }
 
@@ -181,6 +185,7 @@ namespace Cnidaria.Cs
             private readonly SsaMethod? _ssa;
             private readonly TargetInfo _target;
             private readonly GenTreeLinearLoweringClassifier _classifier;
+            private readonly bool _nonCallOperationsClobberCallerSavedRegisters;
             private readonly Dictionary<GenTreeValueKey, GenTreeValueInfo> _valueInfos = new();
             private readonly Dictionary<SsaSlot, SsaSlotInfo> _ssaSlotInfos = new();
             private readonly Dictionary<SsaValueName, SsaValueDefinition> _ssaDefinitions = new();
@@ -193,13 +198,18 @@ namespace Cnidaria.Cs
             private int _currentBlockId;
             private int _currentBlockOrdinal;
 
-            public MethodBuilder(GenTreeMethod method, ControlFlowGraph cfg, SsaMethod? ssa)
+            public MethodBuilder(
+                GenTreeMethod method,
+                ControlFlowGraph cfg,
+                SsaMethod? ssa,
+                LinearRationalizationOptions options)
             {
                 _method = method;
                 _cfg = cfg;
                 _ssa = ssa;
                 _target = method.Target;
-                _classifier = new GenTreeLinearLoweringClassifier(_target);
+                _nonCallOperationsClobberCallerSavedRegisters = options.GetNonCallOperationsClobberCallerSavedRegisters(_target);
+                _classifier = new GenTreeLinearLoweringClassifier(_target, _nonCallOperationsClobberCallerSavedRegisters);
                 _nodesByBlock = new List<GenTree>[method.Blocks.Length];
                 for (int i = 0; i < _nodesByBlock.Length; i++)
                     _nodesByBlock[i] = new List<GenTree>();
@@ -1889,9 +1899,14 @@ namespace Cnidaria.Cs
                     flags: GenTreeFlags.SideEffect | GenTreeFlags.Ordered,
                     operands: ImmutableArray<GenTree>.Empty);
 
+                var flags = GenTreeLinearFlags.IsStandaloneLoweredNode | GenTreeLinearFlags.GcSafePoint;
+                if (_nonCallOperationsClobberCallerSavedRegisters)
+                    flags |= GenTreeLinearFlags.CallerSavedKill;
+                else
+                    flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
+
                 var lowering = new GenTreeLinearLoweringInfo(
-                    GenTreeLinearFlags.IsStandaloneLoweredNode |
-                    GenTreeLinearFlags.GcSafePoint,
+                    flags,
                     0,
                     0);
                 pollTree.SetLinearState(

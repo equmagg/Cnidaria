@@ -199,6 +199,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.SizeOf:
                     sb.Append("sizeof(").Append(TypeName(source.RuntimeType)).Append(')');
                     return;
+                case GenTreeKind.ClassInit:
+                    sb.Append("classinit ").Append(TypeName(source.RuntimeType));
+                    return;
                 case GenTreeKind.Unary:
                     sb.Append(source.SourceOp.ToString().ToLowerInvariant()).Append(' ');
                     AppendUses(sb, node);

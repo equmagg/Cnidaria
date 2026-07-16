@@ -25,6 +25,9 @@ namespace Cnidaria.C
                 };
             }
 
+            if (type.Type is RVVectorType)
+                return LirRegisterClass.Vector;
+
             return type.Type.Kind switch
             {
                 TypeKind.Pointer or TypeKind.Function => LirRegisterClass.Address,

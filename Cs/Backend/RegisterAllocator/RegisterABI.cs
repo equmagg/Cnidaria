@@ -225,6 +225,38 @@ namespace Cnidaria.Cs
         private static int GeneralRegisterSlotSizeFor(TargetInfo? target) => EffectiveTarget(target).GeneralRegisterSize;
         private static int StackArgumentSlotSizeFor(TargetInfo? target) => EffectiveTarget(target).StackSlotSize;
 
+        private static MachineRegister IntegerArgumentRegister(TargetInfo? target, int index)
+            => MachineRegisters.GetIntegerArgumentRegister(index);
+
+        private static MachineRegister FloatingArgumentRegister(TargetInfo? target, int index)
+            => RiscVAbiFloatingRegisterSize(target) == 0
+                ? MachineRegister.Invalid
+                : MachineRegisters.GetFloatArgumentRegister(index);
+
+        public static int RiscVAbiFloatingRegisterSize(TargetInfo? target)
+        {
+            var effectiveTarget = EffectiveTarget(target);
+            if (!effectiveTarget.IsRiscV)
+                return effectiveTarget.FloatingRegisterSize;
+            if ((effectiveTarget.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)
+                return 8;
+            if ((effectiveTarget.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)
+                return 4;
+            return 0;
+        }
+
+        private static bool UsesFloatingRegister(RuntimeType? type, GenStackKind stackKind, TargetInfo? target)
+        {
+            int size = stackKind == GenStackKind.R4 ? 4 : stackKind == GenStackKind.R8 ? 8 : 0;
+            if (type is not null && IsFloatScalar(type, out int typeSize))
+                size = typeSize;
+            if (size == 0)
+                return false;
+
+            var effectiveTarget = EffectiveTarget(target);
+            return !effectiveTarget.IsRiscV || size <= RiscVAbiFloatingRegisterSize(effectiveTarget);
+        }
+
         public static int StackSlotsForArgumentSize(int size, TargetInfo? target = null)
         {
             int slotSize = StackArgumentSlotSizeFor(target);
@@ -373,11 +405,13 @@ namespace Cnidaria.Cs
 
             if (stackKind is GenStackKind.R4 or GenStackKind.R8)
             {
-                if (type is not null && IsFloatScalar(type, out int floatSize))
-                    return Scalar(RegisterClass.Float, floatSize, Math.Min(8, Math.Max(4, floatSize)), containsGcPointers: false);
-                return stackKind == GenStackKind.R4
-                    ? Scalar(RegisterClass.Float, 4, 4, containsGcPointers: false)
-                    : Scalar(RegisterClass.Float, 8, 8, containsGcPointers: false);
+                int floatSize = type is not null && IsFloatScalar(type, out int exactFloatSize)
+                    ? exactFloatSize
+                    : stackKind == GenStackKind.R4 ? 4 : 8;
+                int floatAlignment = Math.Min(8, Math.Max(4, floatSize));
+                return UsesFloatingRegister(type, stackKind, target)
+                    ? Scalar(RegisterClass.Float, floatSize, floatAlignment, containsGcPointers: false)
+                    : IntegerScalar(floatSize, floatAlignment, containsGcPointers: false, target: target);
             }
 
             if (stackKind is GenStackKind.I4)
@@ -464,6 +498,128 @@ namespace Cnidaria.Cs
             return abi.RegisterSegments;
         }
 
+        internal static AbiValueInfo AdjustArgumentAbiForRegisterAvailability(
+            AbiValueInfo abi,
+            int generalArgumentIndex,
+            int floatArgumentIndex,
+            TargetInfo? target = null)
+        {
+            var effectiveTarget = EffectiveTarget(target);
+            if (!effectiveTarget.IsRiscV || !abi.IsRegisterPassed)
+                return abi;
+
+            var segments = GetRegisterSegments(abi, effectiveTarget);
+            int requiredGeneralRegisters = 0;
+            int requiredFloatRegisters = 0;
+            for (int i = 0; i < segments.Length; i++)
+            {
+                if (segments[i].RegisterClass == RegisterClass.General)
+                    requiredGeneralRegisters++;
+                else if (segments[i].RegisterClass == RegisterClass.Float)
+                    requiredFloatRegisters++;
+            }
+
+            if (requiredFloatRegisters == 0 ||
+                HasArgumentRegisters(RegisterClass.General, generalArgumentIndex, requiredGeneralRegisters, effectiveTarget) &&
+                HasArgumentRegisters(RegisterClass.Float, floatArgumentIndex, requiredFloatRegisters, effectiveTarget))
+            {
+                return abi;
+            }
+
+            int size = Math.Max(1, abi.Size);
+            int alignment = Math.Max(1, abi.Alignment);
+            int slotSize = GeneralRegisterSlotSizeFor(effectiveTarget);
+            if (size <= slotSize)
+                return Scalar(RegisterClass.General, size, alignment, abi.ContainsGcPointers);
+
+            return MultiRegisterInteger(
+                size,
+                alignment,
+                abi.ContainsGcPointers,
+                MaxIntegerRegisterSlots,
+                (offset, segmentSize) => SegmentRangeContainsGcPointer(segments, offset, segmentSize),
+                effectiveTarget);
+        }
+
+        internal static bool HaveMatchingArgumentValueLayout(
+            AbiValueInfo valueAbi,
+            AbiValueInfo argumentAbi,
+            TargetInfo? target = null,
+            bool requireMatchingRegisterClasses = false)
+        {
+            var valueSegments = GetArgumentValueLayoutSegments(valueAbi, target);
+            var argumentSegments = GetArgumentValueLayoutSegments(argumentAbi, target);
+            if (valueSegments.Length != argumentSegments.Length)
+                return false;
+
+            for (int i = 0; i < valueSegments.Length; i++)
+            {
+                var valueSegment = valueSegments[i];
+                var argumentSegment = argumentSegments[i];
+                if (valueSegment.Offset != argumentSegment.Offset || valueSegment.Size != argumentSegment.Size)
+                    return false;
+                if (requireMatchingRegisterClasses && valueSegment.RegisterClass != argumentSegment.RegisterClass)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static ImmutableArray<AbiRegisterSegment> GetArgumentValueLayoutSegments(AbiValueInfo abi, TargetInfo? target)
+        {
+            if (abi.PassingKind is AbiValuePassingKind.ScalarRegister or AbiValuePassingKind.MultiRegister)
+                return GetRegisterSegments(abi, target);
+
+            if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+            {
+                return ImmutableArray.Create(new AbiRegisterSegment(
+                    RegisterClass.General,
+                    0,
+                    Math.Max(1, abi.Size <= 0 ? PointerSizeFor(target) : abi.Size),
+                    abi.ContainsGcPointers));
+            }
+
+            return ImmutableArray<AbiRegisterSegment>.Empty;
+        }
+
+        private static bool HasArgumentRegisters(
+            RegisterClass registerClass,
+            int startIndex,
+            int count,
+            TargetInfo target)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                var register = registerClass == RegisterClass.Float
+                    ? FloatingArgumentRegister(target, checked(startIndex + i))
+                    : IntegerArgumentRegister(target, checked(startIndex + i));
+                if (register == MachineRegister.Invalid)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool SegmentRangeContainsGcPointer(
+            ImmutableArray<AbiRegisterSegment> segments,
+            int offset,
+            int size)
+        {
+            int end = checked(offset + size);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                var segment = segments[i];
+                if (!segment.ContainsGcPointers)
+                    continue;
+
+                int segmentEnd = checked(segment.Offset + segment.Size);
+                if (offset < segmentEnd && segment.Offset < end)
+                    return true;
+            }
+
+            return false;
+        }
+
         public static int HiddenReturnBufferInsertionIndex(RuntimeMethod? method, int explicitArgumentCount, TargetInfo? target = null)
         {
             if (method is null || !RequiresHiddenReturnBuffer(method, target))
@@ -535,6 +691,7 @@ namespace Cnidaria.Cs
                 var value = arguments[i];
                 var info = getValueInfo(value);
                 var abi = ClassifyValue(info.Type, info.StackKind, isReturn: false, target: target);
+                abi = AdjustArgumentAbiForRegisterAvailability(abi, generalArg, floatArg, target);
                 if (abi.PassingKind == AbiValuePassingKind.Void)
                     continue;
 
@@ -670,13 +827,13 @@ namespace Cnidaria.Cs
             MachineRegister register;
             if (segment.RegisterClass == RegisterClass.Float)
             {
-                register = MachineRegisters.GetFloatArgumentRegister(floatIndex++);
+                register = FloatingArgumentRegister(target, floatIndex++);
                 if (register != MachineRegister.Invalid)
                     return AbiArgumentLocation.ForRegister(RegisterClass.Float, register, segment.Size);
             }
             else if (segment.RegisterClass == RegisterClass.General)
             {
-                register = MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
+                register = IntegerArgumentRegister(target, generalIndex++);
                 if (register != MachineRegister.Invalid)
                     return AbiArgumentLocation.ForRegister(RegisterClass.General, register, segment.Size);
             }
@@ -714,7 +871,7 @@ namespace Cnidaria.Cs
         {
             if (registerClass == RegisterClass.Float)
             {
-                var reg = MachineRegisters.GetFloatArgumentRegister(floatIndex++);
+                var reg = FloatingArgumentRegister(target, floatIndex++);
                 if (reg != MachineRegister.Invalid)
                     return AbiArgumentLocation.ForRegister(RegisterClass.Float, reg, size <= 0 ? 8 : size);
                 return AbiArgumentLocation.ForStack(RegisterClass.Float, outgoingIndex++, 0, size <= 0 ? 8 : size);
@@ -722,7 +879,7 @@ namespace Cnidaria.Cs
 
             if (registerClass == RegisterClass.General)
             {
-                var reg = MachineRegisters.GetIntegerArgumentRegister(generalIndex++);
+                var reg = IntegerArgumentRegister(target, generalIndex++);
                 if (reg != MachineRegister.Invalid)
                     return AbiArgumentLocation.ForRegister(RegisterClass.General, reg, size <= 0 ? GeneralRegisterSlotSizeFor(target) : size);
                 return AbiArgumentLocation.ForStack(RegisterClass.General, outgoingIndex++, 0, size <= 0 ? GeneralRegisterSlotSizeFor(target) : size);
@@ -786,9 +943,16 @@ namespace Cnidaria.Cs
                 return false;
 
             if (type.Name is "Single" or "Double")
-                abi = Scalar(RegisterClass.Float, size, align, containsGcPointers: false);
+            {
+                var stackKind = type.Name == "Single" ? GenStackKind.R4 : GenStackKind.R8;
+                abi = UsesFloatingRegister(type, stackKind, target)
+                    ? Scalar(RegisterClass.Float, size, align, containsGcPointers: false)
+                    : IntegerScalar(size, align, containsGcPointers: false, target: target);
+            }
             else
+            {
                 abi = IntegerScalar(size, align, containsGcPointers: false, target: target);
+            }
             return true;
         }
 
@@ -973,8 +1137,11 @@ namespace Cnidaria.Cs
 
             if (IsFloatScalar(fieldType, out size))
             {
-                registerClass = RegisterClass.Float;
-                return true;
+                var stackKind = size <= 4 ? GenStackKind.R4 : GenStackKind.R8;
+                registerClass = UsesFloatingRegister(fieldType, stackKind, target)
+                    ? RegisterClass.Float
+                    : RegisterClass.General;
+                return registerClass == RegisterClass.Float || size <= GeneralRegisterSlotSizeFor(target);
             }
 
             if (fieldType.Kind is RuntimeTypeKind.Pointer)

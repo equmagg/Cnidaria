@@ -33,10 +33,10 @@ Console.WriteLine(output);
 ```
 
 ## Pipeline
-We roughly follow Roslyn/RyuJiT compilation phases.
-Stack-based bytecode, being an IL analogue, can be directly interpreted for near zero startup time.
-For more complex and performant scripts you can compile it into low level register bytecode, sacrificing some compilation time for all the serious optimizations and performance.
-
+We roughly follow Roslyn/RyuJiT(ILC) compilation phases.
+Stack-based bytecode, being an IL analogue, can be directly interpreted for minimal startup time.
+For more complex and performant scripts you can sacrifice some compilation time for all the serious optimizations and performance, targeting either low level register bytecode, which is better suited for VM execution, or a native target like RISC-V. Compilation to x86_64 binary is possible, but it does not have an emulator and hence loses any security considerations.
+ 
 Source code -> stack bytecode path mimics Roslyn pipeline
 ```
 Lexer > Tokens
@@ -50,16 +50,18 @@ stack bytecode -> register bytecode path mimics RyuJiT pipeline
 ```
 stack-based bytecode > Import/Morph/Inline/Physical Promotion > GenTree HIR
 CFG/SSA anotation > VN-based SSA optimization > rationalization > LIR
-LSRA (register allocation) > target specific CodeGen > target > register VM (if target is register bytecode)
+LSRA (register allocation) > target specific CodeGen > target > execution
 ```
-SSA/VN-based optimizations we currenly implement in order:
-Constant folding
-Сonstant/fact propagation
-Copy propagation
-Redundant Branch Optimization
-Common Subexpression Elimination
-Dead Code Elimination
-Strength reduction
+SSA/VN-based optimizations we currently implement in order:
+
+- Constant folding
+- Assertion propagation (work in progress)
+- Constant/fact propagation
+- Copy propagation
+- Redundant Branch Optimization
+- Common Subexpression Elimination
+- Dead Code Elimination
+- Strength reduction
 
 ---
 
@@ -146,6 +148,16 @@ int main()
     return 0;
 }
 """;
+var comp = Cnidaria.C.Compilation.Create(code, Cnidaria.C.TargetInfo.RV64GLinux); 
+foreach(var diag in comp.GetDiagnostics())
+{
+    Console.WriteLine(diag.Message);
+}
+var cfg = Cnidaria.C.ControlFlowGraph.Build(comp.GetSemanticModel(comp.SyntaxTrees[0]));
+var ssa = Cnidaria.C.SsaGraph.Build(cfg);
+var lir = Cnidaria.C.LirModule.Lower(ssa);
+var program = Cnidaria.C.RiscVCodeGenerator.Generate(lir);
+
 var layout = new Cnidaria.RiscV.RiscVZBootLayout();
 var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfig
 {
@@ -156,7 +168,7 @@ var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfi
     BlockDeviceSize = layout.RequiredBootChainStorageSize
 });
 
-Cnidaria.RiscV.RiscVZBoot.LoadDefaultBootChain(machine, layout, autorunSource: code);
+Cnidaria.RiscV.RiscVZBoot.LoadDefaultBootChain(machine, layout, autorunSource: program.ToLinuxExecutableBytes());
 var result = machine.Run(10_000_000);
 while (machine.Uart.TryReadOutput(out byte b))
     Console.Write((char)b);

@@ -9,6 +9,14 @@ using Cnidaria.RiscV;
 
 namespace Cnidaria.C
 {
+    public sealed class RiscVCodeGeneratorOptions
+    {
+        public static RiscVCodeGeneratorOptions Default => new RiscVCodeGeneratorOptions();
+
+        public bool EmitStartup { get; set; } = true;
+        public string EntryFunctionName { get; set; } = "main";
+    }
+
     public sealed class RiscVCodeGenerator
     {
         private const string TextSectionName = ".text";
@@ -22,14 +30,20 @@ namespace Cnidaria.C
         private static readonly MachineRegister GpScratch1 = MachineRegister.X6;
         private static readonly MachineRegister GpScratch2 = MachineRegister.X7;
         private static readonly MachineRegister GpScratch3 = MachineRegister.X28;
+        private static readonly MachineRegister GpVectorConfigScratch = MachineRegister.X29;
         private static readonly MachineRegister FpScratch0 = MachineRegister.F0;
         private static readonly MachineRegister FpScratch1 = MachineRegister.F1;
         private static readonly MachineRegister FpScratch2 = MachineRegister.F2;
+        private static readonly MachineRegister VecScratch0 = MachineRegister.V28;
+        private static readonly MachineRegister VecScratch1 = MachineRegister.V29;
+        private static readonly MachineRegister VecScratch2 = MachineRegister.V30;
+        private static readonly MachineRegister VecScratch3 = MachineRegister.V31;
 
         private readonly LirModule _module;
         private readonly TargetInfo _target;
         private readonly RVTarget _machineTarget;
         private readonly LSRAOptions _allocationOptions;
+        private readonly RiscVCodeGeneratorOptions _options;
         private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
         private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
@@ -42,7 +56,10 @@ namespace Cnidaria.C
         private TextSectionBuilder _text = null!;
         private int _nextLocalId;
 
-        private RiscVCodeGenerator(LirModule module, LSRAOptions? allocationOptions)
+        private RiscVCodeGenerator(
+            LirModule module,
+            LSRAOptions? allocationOptions,
+            RiscVCodeGeneratorOptions? options)
         {
             _module = module ?? throw new ArgumentNullException(nameof(module));
             _target = module.SemanticModel.Compilation.Options.Target;
@@ -50,10 +67,14 @@ namespace Cnidaria.C
                 throw new NotSupportedException("RISC-V C backend requires RiscV32 or RiscV64 target.");
             _machineTarget = RVTarget.FromTargetInfo(_target);
             _allocationOptions = allocationOptions ?? LSRAOptions.ForTarget(_target);
+            _options = options ?? RiscVCodeGeneratorOptions.Default;
         }
 
-        public static RiscVProgram Generate(LirModule module, LSRAOptions? allocationOptions = null)
-            => new RiscVCodeGenerator(module, allocationOptions).Generate();
+        public static RiscVProgram Generate(
+            LirModule module,
+            LSRAOptions? allocationOptions = null,
+            RiscVCodeGeneratorOptions? options = null)
+            => new RiscVCodeGenerator(module, allocationOptions, options).Generate();
 
         private RiscVProgram Generate()
         {
@@ -63,10 +84,10 @@ namespace Cnidaria.C
             foreach (var function in _module.Functions)
                 EmitFunction(function);
 
-            var selectedEntry = _functionLabelsByName.TryGetValue("main", out var mainLabel)
-                ? mainLabel
+            var selectedEntry = _functionLabelsByName.TryGetValue(_options.EntryFunctionName, out var entryLabel)
+                ? entryLabel
                 : (_functionLabels.Values.FirstOrDefault() ?? string.Empty);
-            var entry = IsLinuxExecutableTarget
+            var entry = IsLinuxExecutableTarget && _options.EmitStartup
                 ? EmitLinuxRuntime(selectedEntry)
                 : selectedEntry;
 
@@ -151,10 +172,18 @@ namespace Cnidaria.C
         {
             foreach (var global in _module.Globals)
             {
-                if (global.Symbol is null || global.StorageClass == StorageClass.Extern)
+                if (global.Symbol is null ||
+                    global.StorageClass == StorageClass.Typedef ||
+                    global.Symbol is TypeAliasSymbol ||
+                    global.Symbol is FunctionSymbol ||
+                    global.Type.Type is FunctionType)
                 {
-                    if (global.Symbol is not null)
-                        AddExternalObjectSymbol(global.Symbol);
+                    continue;
+                }
+
+                if (global.StorageClass == StorageClass.Extern)
+                {
+                    AddExternalObjectSymbol(global.Symbol);
                     continue;
                 }
 
@@ -447,6 +476,20 @@ namespace Cnidaria.C
         private static bool IsLongDouble(QualifiedType type)
             => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
 
+        private static bool IsRiscVVectorType(QualifiedType type)
+            => type.Type is RVVectorType;
+
+        private static bool IsRiscVVectorIntrinsicCall(LirInstruction instruction)
+        {
+            if (instruction.Kind != LirInstructionKind.Call || instruction.Operands.Length == 0)
+                return false;
+
+            var callee = instruction.Operands[0];
+            return callee.Kind == LirOperandKind.Symbol &&
+                callee.Symbol is FunctionSymbol function &&
+                function.Name.StartsWith("__riscv_v", StringComparison.Ordinal);
+        }
+
         private sealed class FunctionEmissionContext
         {
             private readonly RiscVCodeGenerator _owner;
@@ -473,7 +516,9 @@ namespace Cnidaria.C
                 _allocation = allocation ?? throw new ArgumentNullException(nameof(allocation));
                 _functionLabel = functionLabel ?? string.Empty;
                 _labels = labels ?? throw new ArgumentNullException(nameof(labels));
-                _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i => i.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly);
+                _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i =>
+                    i.Kind == LirInstructionKind.InlineAssembly ||
+                    i.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(i));
                 _raSaveOffset = _hasCalls ? AlignUp(_allocation.Frame.FrameSize, _owner._target.PointerAlignment) : -1;
                 _riscVVarArgsSaveAreaSize = ComputeRiscVVarArgsSaveAreaSize();
                 var baseFrameSize = _allocation.Frame.FrameSize;
@@ -759,7 +804,7 @@ namespace Cnidaria.C
                 if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
                     throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
 
-                var register = GetWritableRegister(destination, UsesHardwareFloating(destination.Type) ? FpScratch0 : GpScratch0);
+                var register = GetWritableRegister(destination, PreferredScratch(destination.Type, GpScratch0, FpScratch0, VecScratch0));
                 finalizers.Add(() => StoreWritableRegisterIfSpilled(destination, register));
                 return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(register)));
             }
@@ -782,7 +827,7 @@ namespace Cnidaria.C
                 if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
                     throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
 
-                var preferred = UsesHardwareFloating(value.Type) ? FpScratch1 : GpScratch1;
+                var preferred = PreferredScratch(value.Type, GpScratch1, FpScratch1, VecScratch1);
                 return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(LoadOperand(value, preferred))));
             }
 
@@ -911,7 +956,7 @@ namespace Cnidaria.C
                 }
 
                 var scalarLocation = CAbi.AssignArgumentLocation(value, ref _parameters, _owner._allocationOptions.StackArgumentSlotSize);
-                var destination = GetWritableRegister(instruction.Result, IsFloatType(type) && scalarLocation.RegisterClass == AbiRegisterClass.Floating ? FpScratch0 : GpScratch0);
+                var destination = GetWritableRegister(instruction.Result, PreferredScratch(type, GpScratch0, FpScratch0, VecScratch0));
                 if (scalarLocation.Kind == AbiLocationKind.Register)
                 {
                     MoveRegister(destination, scalarLocation.Register);
@@ -949,7 +994,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var destination = GetWritableRegister(instruction.Result, UsesHardwareFloating(instruction.Result.Type) ? FpScratch0 : GpScratch0);
+                var destination = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type, GpScratch0, FpScratch0, VecScratch0));
                 LoadOperandIntoAs(instruction.Operands[0], destination, instruction.Result.Type, instruction);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
@@ -973,8 +1018,10 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var destination = GetWritableRegister(instruction.Result, UsesHardwareFloating(instruction.Result.Type) ? FpScratch0 : GpScratch0);
-                if (IsFloatType(instruction.Result.Type) && UsesHardwareFloating(instruction.Result.Type))
+                var destination = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type, GpScratch0, FpScratch0, VecScratch0));
+                if (IsRiscVVectorType(instruction.Result.Type))
+                    ZeroVectorRegister(destination);
+                else if (IsFloatType(instruction.Result.Type) && UsesHardwareFloating(instruction.Result.Type))
                     LoadFloatingImmediate(destination, 0.0, instruction.Result.Type);
                 else
                     MoveRegister(destination, MachineRegister.X0);
@@ -1728,7 +1775,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var dst = GetWritableRegister(instruction.Result, UsesHardwareFloating(instruction.Result.Type) ? FpScratch0 : GpScratch0);
+                var dst = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type, GpScratch0, FpScratch0, VecScratch0));
                 var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
                 LoadFromMemory(dst, address.BaseRegister, address.Offset, SizeOfRegisterType(instruction.Result.Type), IsSignedIntegerType(instruction.Result.Type));
                 NormalizeScalarRegister(dst, instruction.Result.Type);
@@ -1767,7 +1814,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var src = LoadOperandAs(instruction.Operands[0], storeType, UsesHardwareFloating(storeType) ? FpScratch0 : GpScratch0, instruction);
+                var src = LoadOperandAs(instruction.Operands[0], storeType, PreferredScratch(storeType, GpScratch0, FpScratch0, VecScratch0), instruction);
                 var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
                 StoreToMemory(src, address.BaseRegister, address.Offset, Math.Min(SizeOfRegisterType(storeType), SizeOf(storeType)));
             }
@@ -1785,6 +1832,8 @@ namespace Cnidaria.C
             {
                 if (instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Call has no callee operand.");
+                if (TryEmitRiscVVectorIntrinsic(instruction))
+                    return;
 
                 MarshalCallArguments(instruction, 1);
                 PrepareVariadicCall(instruction);
@@ -1801,6 +1850,327 @@ namespace Cnidaria.C
 
                 EmitCallResult(instruction);
             }
+
+            private bool TryEmitRiscVVectorIntrinsic(LirInstruction instruction)
+            {
+                if (!IsRiscVVectorIntrinsicCall(instruction))
+                    return false;
+
+                if (!_owner._machineTarget.HasV)
+                    throw Unsupported(instruction, "RISC-V vector intrinsic requires the V extension.");
+
+                var function = (FunctionSymbol)instruction.Operands[0].Symbol!;
+                var name = function.Name.Substring("__riscv_".Length);
+                if (!TryGetRiscVVectorElementWidth(name, out var elementWidth))
+                    throw Unsupported(instruction, "Cannot determine the vector element width for intrinsic '" + function.Name + "'.");
+
+                if (name.StartsWith("vsetvlmax_", StringComparison.Ordinal))
+                {
+                    RequireIntrinsicOperandCount(instruction, 1);
+                    if (instruction.Result is null)
+                        throw Unsupported(instruction, "vsetvlmax intrinsic has no result.");
+                    var destination = GetWritableRegister(instruction.Result, GpScratch0);
+                    EmitVectorConfiguration(destination, MachineRegister.X0, elementWidth);
+                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    return true;
+                }
+
+                if (name.StartsWith("vsetvl_", StringComparison.Ordinal))
+                {
+                    RequireIntrinsicOperandCount(instruction, 2);
+                    if (instruction.Result is null)
+                        throw Unsupported(instruction, "vsetvl intrinsic has no result.");
+                    var avl = LoadOperand(instruction.Operands[1], GpScratch1);
+                    var destination = GetWritableRegister(instruction.Result, GpScratch0);
+                    EmitVectorConfiguration(destination, avl, elementWidth);
+                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    return true;
+                }
+
+                var firstSeparator = name.IndexOf('_');
+                var secondSeparator = firstSeparator < 0 ? -1 : name.IndexOf('_', firstSeparator + 1);
+                if (firstSeparator <= 0 || secondSeparator <= firstSeparator + 1)
+                    throw Unsupported(instruction, "Invalid RISC-V vector intrinsic name '" + function.Name + "'.");
+
+                var mnemonic = name.Substring(0, firstSeparator);
+                var form = name.Substring(firstSeparator + 1, secondSeparator - firstSeparator - 1);
+                ValidateVectorFloatingPointSupport(instruction, name);
+
+                if (mnemonic.StartsWith("vle", StringComparison.Ordinal))
+                {
+                    RequireIntrinsicOperandCount(instruction, 3);
+                    if (instruction.Result is null)
+                        throw Unsupported(instruction, "Vector load intrinsic has no result.");
+                    var address = LoadOperand(instruction.Operands[1], GpScratch0);
+                    var vl = LoadOperand(instruction.Operands[2], GpScratch1);
+                    var destination = GetWritableRegister(instruction.Result, VecScratch0);
+                    EmitVectorConfiguration(MachineRegister.X0, vl, elementWidth);
+                    Emit(RVInstruction.Vl(VectorLoadOpcode(elementWidth), ToVectorRegister(destination), ToRegister(address)));
+                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    return true;
+                }
+
+                if (mnemonic.StartsWith("vse", StringComparison.Ordinal))
+                {
+                    RequireIntrinsicOperandCount(instruction, 4);
+                    var address = LoadOperand(instruction.Operands[1], GpScratch0);
+                    var source = LoadOperand(instruction.Operands[2], VecScratch0);
+                    var vl = LoadOperand(instruction.Operands[3], GpScratch1);
+                    EmitVectorConfiguration(MachineRegister.X0, vl, elementWidth);
+                    Emit(RVInstruction.Vs(VectorStoreOpcode(elementWidth), ToVectorRegister(source), ToRegister(address)));
+                    return true;
+                }
+
+                var opcode = VectorIntrinsicOpcode(mnemonic + "_" + form);
+                var accumulator = mnemonic is "vmadd" or "vnmsub" or "vmacc" or "vnmsac";
+                if (accumulator)
+                    EmitVectorAccumulatorIntrinsic(instruction, opcode, form, elementWidth);
+                else
+                    EmitVectorOrdinaryIntrinsic(instruction, opcode, form, elementWidth);
+                return true;
+            }
+
+            private void EmitVectorOrdinaryIntrinsic(LirInstruction instruction, RVInstrKind opcode, string form, int elementWidth)
+            {
+                RequireIntrinsicOperandCount(instruction, 4);
+                if (instruction.Result is null)
+                    throw Unsupported(instruction, "Vector intrinsic has no result.");
+
+                var vs2 = LoadOperand(instruction.Operands[1], VecScratch1);
+                MachineRegister second;
+                if (form == "vv")
+                    second = LoadOperand(instruction.Operands[2], VecScratch2);
+                else if (form == "vf")
+                    second = LoadOperand(instruction.Operands[2], FpScratch0);
+                else if (form == "vx")
+                    second = LoadVectorIntegerScalarOperand(instruction.Operands[2], GpScratch0, instruction);
+                else
+                    throw Unsupported(instruction, "Unsupported vector intrinsic operand form '" + form + "'.");
+                var vl = LoadOperand(instruction.Operands[3], GpScratch1);
+
+                EmitVectorConfiguration(MachineRegister.X0, vl, elementWidth);
+                if (form == "vv")
+                    Emit(RVInstruction.Vv(opcode, ToVectorRegister(VecScratch0), ToVectorRegister(vs2), ToVectorRegister(second)));
+                else if (form == "vf")
+                    Emit(RVInstruction.Vx(opcode, ToVectorRegister(VecScratch0), ToVectorRegister(vs2), ToFloatRegister(second)));
+                else
+                    Emit(RVInstruction.Vx(opcode, ToVectorRegister(VecScratch0), ToVectorRegister(vs2), ToRegister(second)));
+
+                var destination = GetWritableRegister(instruction.Result, VecScratch0);
+                MoveVectorRegister(destination, VecScratch0);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void EmitVectorAccumulatorIntrinsic(LirInstruction instruction, RVInstrKind opcode, string form, int elementWidth)
+            {
+                RequireIntrinsicOperandCount(instruction, 5);
+                if (instruction.Result is null)
+                    throw Unsupported(instruction, "Vector accumulator intrinsic has no result.");
+
+                var oldDestination = LoadOperand(instruction.Operands[1], VecScratch1);
+                MachineRegister vs1;
+                if (form == "vv")
+                    vs1 = LoadOperand(instruction.Operands[2], VecScratch2);
+                else if (form == "vx")
+                    vs1 = LoadVectorIntegerScalarOperand(instruction.Operands[2], GpScratch0, instruction);
+                else
+                    throw Unsupported(instruction, "Unsupported vector accumulator operand form '" + form + "'.");
+                var vs2 = LoadOperand(instruction.Operands[3], VecScratch3);
+                var vl = LoadOperand(instruction.Operands[4], GpScratch1);
+
+                MoveVectorRegister(VecScratch0, oldDestination);
+                EmitVectorConfiguration(MachineRegister.X0, vl, elementWidth);
+                if (form == "vv")
+                    Emit(RVInstruction.Vv(opcode, ToVectorRegister(VecScratch0), ToVectorRegister(vs2), ToVectorRegister(vs1)));
+                else
+                    Emit(RVInstruction.Vx(opcode, ToVectorRegister(VecScratch0), ToVectorRegister(vs2), ToRegister(vs1)));
+
+                var destination = GetWritableRegister(instruction.Result, VecScratch0);
+                MoveVectorRegister(destination, VecScratch0);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private MachineRegister LoadVectorIntegerScalarOperand(LirOperand operand, MachineRegister scratch, LirInstruction instruction)
+            {
+                if (IsRv32WideInteger(operand.Type))
+                {
+                    LoadWideIntegerLowWord(operand, scratch, instruction);
+                    return scratch;
+                }
+                return LoadOperand(operand, scratch);
+            }
+
+            private void ValidateVectorFloatingPointSupport(LirInstruction instruction, string name)
+            {
+                if (name.Contains("_f32m1", StringComparison.Ordinal) && !_owner._machineTarget.HasF)
+                    throw Unsupported(instruction, "32-bit floating-point vector intrinsic requires the F extension.");
+                if (name.Contains("_f64m1", StringComparison.Ordinal) && !_owner._machineTarget.HasD)
+                    throw Unsupported(instruction, "64-bit floating-point vector intrinsic requires the D extension.");
+            }
+
+            private static bool TryGetRiscVVectorElementWidth(string name, out int elementWidth)
+            {
+                if (name.Contains("64m1", StringComparison.Ordinal))
+                    elementWidth = 64;
+                else if (name.Contains("32m1", StringComparison.Ordinal))
+                    elementWidth = 32;
+                else if (name.Contains("16m1", StringComparison.Ordinal))
+                    elementWidth = 16;
+                else if (name.Contains("8m1", StringComparison.Ordinal))
+                    elementWidth = 8;
+                else
+                {
+                    elementWidth = 0;
+                    return false;
+                }
+                return true;
+            }
+
+            private void RequireIntrinsicOperandCount(LirInstruction instruction, int count)
+            {
+                if (instruction.Operands.Length != count)
+                    throw Unsupported(instruction, "RISC-V vector intrinsic has an invalid operand count.");
+            }
+
+            private void EmitVectorConfiguration(MachineRegister destination, MachineRegister avl, int elementWidth)
+                => Emit(RVInstruction.Vsetvli(ToRegister(destination), ToRegister(avl), VectorTypeImmediate(elementWidth)));
+
+            private void EmitVectorMaxConfiguration(int elementWidth)
+                => EmitVectorConfiguration(GpVectorConfigScratch, MachineRegister.X0, elementWidth);
+
+            private static int VectorTypeImmediate(int elementWidth)
+            {
+                var vsew = elementWidth switch
+                {
+                    8 => 0,
+                    16 => 1,
+                    32 => 2,
+                    64 => 3,
+                    _ => throw new ArgumentOutOfRangeException(nameof(elementWidth)),
+                };
+                return (vsew << 3) | (1 << 6) | (1 << 7);
+            }
+
+            private static RVInstrKind VectorLoadOpcode(int elementWidth)
+                => elementWidth switch
+                {
+                    8 => RVInstrKind.Vle8V,
+                    16 => RVInstrKind.Vle16V,
+                    32 => RVInstrKind.Vle32V,
+                    64 => RVInstrKind.Vle64V,
+                    _ => throw new ArgumentOutOfRangeException(nameof(elementWidth)),
+                };
+
+            private static RVInstrKind VectorStoreOpcode(int elementWidth)
+                => elementWidth switch
+                {
+                    8 => RVInstrKind.Vse8V,
+                    16 => RVInstrKind.Vse16V,
+                    32 => RVInstrKind.Vse32V,
+                    64 => RVInstrKind.Vse64V,
+                    _ => throw new ArgumentOutOfRangeException(nameof(elementWidth)),
+                };
+
+            private static RVInstrKind VectorIntrinsicOpcode(string key)
+                => key switch
+                {
+                    "vadd_vv" => RVInstrKind.VaddVv,
+                    "vadd_vx" => RVInstrKind.VaddVx,
+                    "vand_vv" => RVInstrKind.VandVv,
+                    "vand_vx" => RVInstrKind.VandVx,
+                    "vdiv_vv" => RVInstrKind.VdivVv,
+                    "vdiv_vx" => RVInstrKind.VdivVx,
+                    "vdivu_vv" => RVInstrKind.VdivuVv,
+                    "vdivu_vx" => RVInstrKind.VdivuVx,
+                    "vfadd_vf" => RVInstrKind.VfaddVf,
+                    "vfadd_vv" => RVInstrKind.VfaddVv,
+                    "vfdiv_vf" => RVInstrKind.VfdivVf,
+                    "vfdiv_vv" => RVInstrKind.VfdivVv,
+                    "vfmax_vf" => RVInstrKind.VfmaxVf,
+                    "vfmax_vv" => RVInstrKind.VfmaxVv,
+                    "vfmin_vf" => RVInstrKind.VfminVf,
+                    "vfmin_vv" => RVInstrKind.VfminVv,
+                    "vfmul_vf" => RVInstrKind.VfmulVf,
+                    "vfmul_vv" => RVInstrKind.VfmulVv,
+                    "vfrdiv_vf" => RVInstrKind.VfrdivVf,
+                    "vfrsub_vf" => RVInstrKind.VfrsubVf,
+                    "vfsgnj_vf" => RVInstrKind.VfsgnjVf,
+                    "vfsgnj_vv" => RVInstrKind.VfsgnjVv,
+                    "vfsgnjn_vf" => RVInstrKind.VfsgnjnVf,
+                    "vfsgnjn_vv" => RVInstrKind.VfsgnjnVv,
+                    "vfsgnjx_vf" => RVInstrKind.VfsgnjxVf,
+                    "vfsgnjx_vv" => RVInstrKind.VfsgnjxVv,
+                    "vfsub_vf" => RVInstrKind.VfsubVf,
+                    "vfsub_vv" => RVInstrKind.VfsubVv,
+                    "vmacc_vv" => RVInstrKind.VmaccVv,
+                    "vmacc_vx" => RVInstrKind.VmaccVx,
+                    "vmadd_vv" => RVInstrKind.VmaddVv,
+                    "vmadd_vx" => RVInstrKind.VmaddVx,
+                    "vmax_vv" => RVInstrKind.VmaxVv,
+                    "vmax_vx" => RVInstrKind.VmaxVx,
+                    "vmaxu_vv" => RVInstrKind.VmaxuVv,
+                    "vmaxu_vx" => RVInstrKind.VmaxuVx,
+                    "vmfeq_vf" => RVInstrKind.VmfeqVf,
+                    "vmfeq_vv" => RVInstrKind.VmfeqVv,
+                    "vmfge_vf" => RVInstrKind.VmfgeVf,
+                    "vmfgt_vf" => RVInstrKind.VmfgtVf,
+                    "vmfle_vf" => RVInstrKind.VmfleVf,
+                    "vmfle_vv" => RVInstrKind.VmfleVv,
+                    "vmflt_vf" => RVInstrKind.VmfltVf,
+                    "vmflt_vv" => RVInstrKind.VmfltVv,
+                    "vmfne_vf" => RVInstrKind.VmfneVf,
+                    "vmfne_vv" => RVInstrKind.VmfneVv,
+                    "vmin_vv" => RVInstrKind.VminVv,
+                    "vmin_vx" => RVInstrKind.VminVx,
+                    "vminu_vv" => RVInstrKind.VminuVv,
+                    "vminu_vx" => RVInstrKind.VminuVx,
+                    "vmseq_vv" => RVInstrKind.VmseqVv,
+                    "vmseq_vx" => RVInstrKind.VmseqVx,
+                    "vmsgt_vx" => RVInstrKind.VmsgtVx,
+                    "vmsgtu_vx" => RVInstrKind.VmsgtuVx,
+                    "vmsle_vv" => RVInstrKind.VmsleVv,
+                    "vmsle_vx" => RVInstrKind.VmsleVx,
+                    "vmsleu_vv" => RVInstrKind.VmsleuVv,
+                    "vmsleu_vx" => RVInstrKind.VmsleuVx,
+                    "vmslt_vv" => RVInstrKind.VmsltVv,
+                    "vmslt_vx" => RVInstrKind.VmsltVx,
+                    "vmsltu_vv" => RVInstrKind.VmsltuVv,
+                    "vmsltu_vx" => RVInstrKind.VmsltuVx,
+                    "vmsne_vv" => RVInstrKind.VmsneVv,
+                    "vmsne_vx" => RVInstrKind.VmsneVx,
+                    "vmul_vv" => RVInstrKind.VmulVv,
+                    "vmul_vx" => RVInstrKind.VmulVx,
+                    "vmulh_vv" => RVInstrKind.VmulhVv,
+                    "vmulh_vx" => RVInstrKind.VmulhVx,
+                    "vmulhsu_vv" => RVInstrKind.VmulhsuVv,
+                    "vmulhsu_vx" => RVInstrKind.VmulhsuVx,
+                    "vmulhu_vv" => RVInstrKind.VmulhuVv,
+                    "vmulhu_vx" => RVInstrKind.VmulhuVx,
+                    "vnmsac_vv" => RVInstrKind.VnmsacVv,
+                    "vnmsac_vx" => RVInstrKind.VnmsacVx,
+                    "vnmsub_vv" => RVInstrKind.VnmsubVv,
+                    "vnmsub_vx" => RVInstrKind.VnmsubVx,
+                    "vor_vv" => RVInstrKind.VorVv,
+                    "vor_vx" => RVInstrKind.VorVx,
+                    "vrem_vv" => RVInstrKind.VremVv,
+                    "vrem_vx" => RVInstrKind.VremVx,
+                    "vremu_vv" => RVInstrKind.VremuVv,
+                    "vremu_vx" => RVInstrKind.VremuVx,
+                    "vrgather_vv" => RVInstrKind.VrgatherVv,
+                    "vrgather_vx" => RVInstrKind.VrgatherVx,
+                    "vrsub_vx" => RVInstrKind.VrsubVx,
+                    "vsll_vv" => RVInstrKind.VsllVv,
+                    "vsll_vx" => RVInstrKind.VsllVx,
+                    "vsra_vv" => RVInstrKind.VsraVv,
+                    "vsra_vx" => RVInstrKind.VsraVx,
+                    "vsrl_vv" => RVInstrKind.VsrlVv,
+                    "vsrl_vx" => RVInstrKind.VsrlVx,
+                    "vsub_vv" => RVInstrKind.VsubVv,
+                    "vsub_vx" => RVInstrKind.VsubVx,
+                    "vxor_vv" => RVInstrKind.VxorVv,
+                    "vxor_vx" => RVInstrKind.VxorVx,
+                    _ => throw new NotSupportedException("Unsupported RISC-V vector intrinsic opcode '" + key + "'."),
+                };
 
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
             {
@@ -2266,7 +2636,7 @@ namespace Cnidaria.C
                     }
                     else
                     {
-                        var source = LoadOperand(copy.Source, GpScratch0);
+                        var source = LoadOperand(copy.Source, PreferredScratch(copy.Source.Type, GpScratch0, FpScratch0, VecScratch0));
                         StoreToMemory(source, Sp, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type));
                         tempCursor += AlignUp(SizeOfRegisterType(copy.Destination.Type), _owner._allocationOptions.SpillSlotAlignment);
                     }
@@ -2284,7 +2654,7 @@ namespace Cnidaria.C
                     }
                     else
                     {
-                        var destination = GetWritableRegister(copy.Destination, UsesHardwareFloating(copy.Destination.Type) ? FpScratch0 : GpScratch0);
+                        var destination = GetWritableRegister(copy.Destination, PreferredScratch(copy.Destination.Type, GpScratch0, FpScratch0, VecScratch0));
                         LoadFromMemory(destination, Sp, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type), IsSignedIntegerType(copy.Destination.Type));
                         NormalizeScalarRegister(destination, copy.Destination.Type);
                         StoreWritableRegisterIfSpilled(copy.Destination, destination);
@@ -2353,7 +2723,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var destination = GetWritableRegister(copy.Destination, UsesHardwareFloating(copy.Destination.Type) ? FpScratch0 : GpScratch0);
+                var destination = GetWritableRegister(copy.Destination, PreferredScratch(copy.Destination.Type, GpScratch0, FpScratch0, VecScratch0));
                 LoadOperandIntoAs(copy.Source, destination, copy.Destination.Type, instruction);
                 StoreWritableRegisterIfSpilled(copy.Destination, destination);
             }
@@ -2407,6 +2777,16 @@ namespace Cnidaria.C
 
             private MachineRegister LoadOperandAs(LirOperand operand, QualifiedType targetType, MachineRegister scratch, LirInstruction instruction)
             {
+                if (IsRiscVVectorType(targetType))
+                {
+                    if (!IsRiscVVectorType(operand.Type))
+                        throw Unsupported(instruction, "Implicit scalar-to-vector load is not supported.");
+                    return LoadOperand(operand, IsVectorRegister(scratch) ? scratch : VecScratch0);
+                }
+
+                if (IsRiscVVectorType(operand.Type))
+                    throw Unsupported(instruction, "Implicit vector-to-scalar load is not supported.");
+
                 if (IsFloatType(targetType))
                 {
                     if (!UsesHardwareFloating(targetType) && !IsFloatRegister(scratch))
@@ -2433,9 +2813,11 @@ namespace Cnidaria.C
 
             private void LoadOperandIntoAs(LirOperand operand, MachineRegister destination, QualifiedType targetType, LirInstruction instruction)
             {
-                var scratch = IsFloatType(targetType) && (UsesHardwareFloating(targetType) || IsFloatRegister(destination))
-                    ? (destination == FpScratch0 ? FpScratch1 : FpScratch0)
-                    : (destination == GpScratch0 ? GpScratch1 : GpScratch0);
+                var scratch = IsRiscVVectorType(targetType)
+                    ? (destination == VecScratch0 ? VecScratch1 : VecScratch0)
+                    : IsFloatType(targetType) && (UsesHardwareFloating(targetType) || IsFloatRegister(destination))
+                        ? (destination == FpScratch0 ? FpScratch1 : FpScratch0)
+                        : (destination == GpScratch0 ? GpScratch1 : GpScratch0);
                 var source = LoadOperandAs(operand, targetType, scratch, instruction);
                 MoveRegister(destination, source);
                 NormalizeScalarRegister(destination, targetType);
@@ -2474,7 +2856,9 @@ namespace Cnidaria.C
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
                             throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
-                        if (UsesHardwareFloating(operand.Type) && !IsFloatRegister(preferred))
+                        if (IsRiscVVectorType(operand.Type) && !IsVectorRegister(preferred))
+                            preferred = VecScratch0;
+                        else if (UsesHardwareFloating(operand.Type) && !IsFloatRegister(preferred))
                             preferred = FpScratch0;
                         LoadFromMemory(preferred, Sp, offset, SizeOfRegisterType(operand.Type), IsSignedIntegerType(operand.Type));
                         NormalizeScalarRegister(preferred, operand.Type);
@@ -2492,7 +2876,13 @@ namespace Cnidaria.C
                     case LirOperandKind.Undefined:
                     case LirOperandKind.Void:
                     case LirOperandKind.None:
-                        if (IsFloatRegister(preferred) && IsFloatType(operand.Type))
+                        if (IsRiscVVectorType(operand.Type))
+                        {
+                            if (!IsVectorRegister(preferred))
+                                preferred = VecScratch0;
+                            ZeroVectorRegister(preferred);
+                        }
+                        else if (IsFloatRegister(preferred) && IsFloatType(operand.Type))
                             LoadFloatingImmediate(preferred, 0.0, operand.Type);
                         else
                             MoveRegister(preferred, MachineRegister.X0);
@@ -2509,7 +2899,9 @@ namespace Cnidaria.C
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return alloc.PhysicalRegister;
-                if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
+                if (IsRiscVVectorType(register.Type) && !IsVectorRegister(preferred))
+                    preferred = VecScratch0;
+                else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
                     preferred = FpScratch0;
                 LoadFromMemory(preferred, Sp, alloc.StackOffset, SizeOfRegisterType(register.Type), IsSignedIntegerType(register.Type));
                 NormalizeScalarRegister(preferred, register.Type);
@@ -2521,7 +2913,9 @@ namespace Cnidaria.C
                 if (IsAggregateType(register.Type) || RequiresStackBackedScalar(register.Type))
                     throw new NotSupportedException("Virtual register " + register.Name + " must be accessed through its storage address.");
                 var alloc = _allocation[register];
-                if (alloc.IsSpilled && UsesHardwareFloating(register.Type) && !IsFloatRegister(scratch))
+                if (alloc.IsSpilled && IsRiscVVectorType(register.Type) && !IsVectorRegister(scratch))
+                    scratch = VecScratch0;
+                else if (alloc.IsSpilled && UsesHardwareFloating(register.Type) && !IsFloatRegister(scratch))
                     scratch = FpScratch0;
                 return alloc.IsSpilled ? scratch : alloc.PhysicalRegister;
             }
@@ -2856,14 +3250,52 @@ namespace Cnidaria.C
 
             private void LoadFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size, bool signed)
             {
+                if (IsVectorRegister(destination))
+                {
+                    LoadVectorFromMemory(destination, baseRegister, offset, size);
+                    return;
+                }
                 var opcode = IsFloatRegister(destination) ? FloatingLoadOpcode(size) : LoadOpcode(size, signed);
                 EmitMemory(opcode, destination, baseRegister, offset, isStore: false);
             }
 
             private void StoreToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size)
             {
+                if (IsVectorRegister(source))
+                {
+                    StoreVectorToMemory(source, baseRegister, offset, size);
+                    return;
+                }
                 var opcode = IsFloatRegister(source) ? FloatingStoreOpcode(size) : StoreOpcode(size);
                 EmitMemory(opcode, source, baseRegister, offset, isStore: true);
+            }
+
+            private void LoadVectorFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size)
+            {
+                if (size != TargetRegisterInfo.VectorRegisterSize(_owner._target))
+                    throw new NotSupportedException("RISC-V vector spills require one complete vector register.");
+                var address = baseRegister;
+                if (offset != 0)
+                {
+                    AddImmediate(GpScratch3, baseRegister, offset);
+                    address = GpScratch3;
+                }
+                EmitVectorMaxConfiguration(8);
+                Emit(RVInstruction.Vl(RVInstrKind.Vle8V, ToVectorRegister(destination), ToRegister(address)));
+            }
+
+            private void StoreVectorToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size)
+            {
+                if (size != TargetRegisterInfo.VectorRegisterSize(_owner._target))
+                    throw new NotSupportedException("RISC-V vector spills require one complete vector register.");
+                var address = baseRegister;
+                if (offset != 0)
+                {
+                    AddImmediate(GpScratch3, baseRegister, offset);
+                    address = GpScratch3;
+                }
+                EmitVectorMaxConfiguration(8);
+                Emit(RVInstruction.Vs(RVInstrKind.Vse8V, ToVectorRegister(source), ToRegister(address)));
             }
 
             private void EmitMemory(RVInstrKind opcode, MachineRegister valueRegister, MachineRegister baseRegister, int offset, bool isStore)
@@ -3080,10 +3512,39 @@ namespace Cnidaria.C
                 Emit(RVInstruction.R(delta < 0 ? RVInstrKind.Sub : RVInstrKind.Add, ToRegister(Sp), ToRegister(Sp), ToRegister(GpScratch0)));
             }
 
+            private MachineRegister PreferredScratch(QualifiedType type, MachineRegister general, MachineRegister floating, MachineRegister vector)
+            {
+                if (IsRiscVVectorType(type))
+                    return vector;
+                return UsesHardwareFloating(type) ? floating : general;
+            }
+
+
+            private void MoveVectorRegister(MachineRegister destination, MachineRegister source)
+            {
+                if (destination == source)
+                    return;
+                EmitVectorMaxConfiguration(8);
+                Emit(RVInstruction.Vx(RVInstrKind.VaddVx, ToVectorRegister(destination), ToVectorRegister(source), RVRegister.X0));
+            }
+
+            private void ZeroVectorRegister(MachineRegister destination)
+            {
+                EmitVectorMaxConfiguration(8);
+                Emit(RVInstruction.Vv(RVInstrKind.VxorVv, ToVectorRegister(destination), ToVectorRegister(destination), ToVectorRegister(destination)));
+            }
+
             private void MoveRegister(MachineRegister destination, MachineRegister source)
             {
                 if (destination == source)
                     return;
+                if (IsVectorRegister(destination) || IsVectorRegister(source))
+                {
+                    if (!IsVectorRegister(destination) || !IsVectorRegister(source))
+                        throw new NotSupportedException("Cross-class register move requires an explicit conversion or bitcast.");
+                    MoveVectorRegister(destination, source);
+                    return;
+                }
                 if (IsFloatRegister(destination) || IsFloatRegister(source))
                 {
                     if (!IsFloatRegister(destination) || !IsFloatRegister(source))
@@ -3106,7 +3567,7 @@ namespace Cnidaria.C
 
             private void NormalizeScalarRegister(MachineRegister register, QualifiedType type)
             {
-                if (IsFloatType(type))
+                if (IsRiscVVectorType(type) || IsFloatType(type))
                     return;
                 NormalizeIntegerRegister(register, type);
             }
@@ -3206,6 +3667,8 @@ namespace Cnidaria.C
 
             private int SizeOfRegisterType(QualifiedType type)
             {
+                if (IsRiscVVectorType(type))
+                    return TargetRegisterInfo.VectorRegisterSize(_owner._target);
                 if (IsPointerLike(type))
                     return _owner._target.PointerSize;
                 if (IsFloatType(type))
@@ -3224,6 +3687,8 @@ namespace Cnidaria.C
 
             private int RegisterSaveSize(MachineRegister register)
             {
+                if (IsVectorRegister(register))
+                    return TargetRegisterInfo.VectorRegisterSize(_owner._target);
                 if (IsFloatRegister(register))
                     return Math.Max(4, CAbi.RiscVAbiFloatingRegisterSize(_owner._target));
                 return Math.Max(1, _owner._target.RegisterSize);
@@ -3234,7 +3699,7 @@ namespace Cnidaria.C
 
             private bool RequiresSoftwareScalar(QualifiedType type)
             {
-                if (IsAggregateType(type) || IsPointerLike(type))
+                if (IsAggregateType(type) || IsPointerLike(type) || IsRiscVVectorType(type))
                     return false;
                 if (IsFloatType(type))
                     return !UsesHardwareFloating(type) && SizeOf(type) > _owner._target.RegisterSize;
@@ -3242,7 +3707,7 @@ namespace Cnidaria.C
             }
 
             private bool RequiresStackBackedScalar(QualifiedType type)
-                => !IsAggregateType(type) && !IsPointerLike(type) && !UsesHardwareFloating(type) && SizeOf(type) > _owner._target.RegisterSize;
+                => !IsAggregateType(type) && !IsPointerLike(type) && !IsRiscVVectorType(type) && !UsesHardwareFloating(type) && SizeOf(type) > _owner._target.RegisterSize;
 
             private bool RequiresBlockCopyStorage(QualifiedType type)
                 => IsAggregateType(type) || RequiresStackBackedScalar(type);
@@ -3353,8 +3818,18 @@ namespace Cnidaria.C
                 throw new NotSupportedException("Expected a floating-point register.");
             }
 
+            private static RVRegister ToVectorRegister(MachineRegister register)
+            {
+                if (register >= MachineRegister.V0 && register <= MachineRegister.V31)
+                    return (RVRegister)(int)register;
+                throw new NotSupportedException("Expected a vector register.");
+            }
+
             private static bool IsFloatRegister(MachineRegister register)
                 => register >= MachineRegister.F0 && register <= MachineRegister.F31;
+
+            private static bool IsVectorRegister(MachineRegister register)
+                => register >= MachineRegister.V0 && register <= MachineRegister.V31;
 
             private static int ImmediateToInt32(LirOperand operand)
             {

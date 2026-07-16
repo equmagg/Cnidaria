@@ -14,11 +14,12 @@
 	<EmbeddedResource Include="C\StandardHeaders\**\*.h" Pack="true" />
 	<EmbeddedResource Include="riscv\boot\**\*.s" Pack="true" />
 	<EmbeddedResource Include="riscv\os\**\*.c" Pack="true" />
+	<EmbeddedResource Include="Cs\Backend\CLR\**\*.c" Pack="true" />
   </ItemGroup>
 
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>2.8.0</Version>
+    <Version>2.9.0</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe interpreter collection</Description>
 

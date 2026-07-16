@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Text;
 
 namespace Cnidaria.Cs
 {
@@ -978,6 +977,7 @@ namespace Cnidaria.Cs
                     defs |= IndirectMemoryKinds(node);
                     break;
 
+                case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
@@ -1759,69 +1759,11 @@ namespace Cnidaria.Cs
             return result;
         }
 
-        private static bool TryGetLoadSlot(GenTree node, out SsaSlot slot)
-            => SsaSlotHelpers.TryGetLoadSlot(node, out slot);
-
-        private static bool TryGetStoreSlot(GenTree node, out SsaSlot slot)
-            => SsaSlotHelpers.TryGetStoreSlot(node, out slot);
-
         private static bool TryGetDirectLoadSlot(GenTree node, out SsaSlot slot)
             => SsaSlotHelpers.TryGetDirectLoadSlot(node, out slot);
 
         private static bool TryGetDirectStoreSlot(GenTree node, out SsaSlot slot)
             => SsaSlotHelpers.TryGetDirectStoreSlot(node, out slot);
 
-        private static GenStackKind StackKindOf(RuntimeType? type)
-        {
-            if (type is null)
-                return GenStackKind.Unknown;
-
-            if (type.Namespace == "System" && type.Name == "Void")
-                return GenStackKind.Void;
-
-            if (type.IsReferenceType)
-                return GenStackKind.Ref;
-
-            if (type.Kind == RuntimeTypeKind.Pointer)
-                return GenStackKind.Ptr;
-
-            if (type.Kind == RuntimeTypeKind.ByRef)
-                return GenStackKind.ByRef;
-
-            if (type.Kind == RuntimeTypeKind.TypeParam)
-                return GenStackKind.Value;
-
-            if (type.Kind == RuntimeTypeKind.Enum)
-                return type.SizeOf <= 4 ? GenStackKind.I4 : GenStackKind.I8;
-
-            if (type.Namespace == "System")
-            {
-                switch (type.Name)
-                {
-                    case "Boolean":
-                    case "Char":
-                    case "SByte":
-                    case "Byte":
-                    case "Int16":
-                    case "UInt16":
-                    case "Int32":
-                    case "UInt32":
-                        return GenStackKind.I4;
-                    case "Int64":
-                    case "UInt64":
-                        return GenStackKind.I8;
-                    case "Single":
-                        return GenStackKind.R4;
-                    case "Double":
-                        return GenStackKind.R8;
-                    case "IntPtr":
-                        return GenStackKind.NativeInt;
-                    case "UIntPtr":
-                        return GenStackKind.NativeUInt;
-                }
-            }
-
-            return GenStackKind.Value;
-        }
     }
 }

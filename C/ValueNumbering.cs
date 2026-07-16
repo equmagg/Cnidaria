@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace Cnidaria.C
@@ -1029,10 +1030,10 @@ namespace Cnidaria.C
             switch (value)
             {
                 case GimpleSymbolValue symbolValue:
-                    return "symbol:" + RuntimeHelpersShim.GetHashCode(symbolValue.Symbol).ToString(CultureInfo.InvariantCulture) + ":" + symbolValue.Symbol.Name;
+                    return "symbol:" + RuntimeHelpers.GetHashCode(symbolValue.Symbol).ToString(CultureInfo.InvariantCulture) + ":" + symbolValue.Symbol.Name;
 
                 case GimpleTemporaryValue temporary:
-                    return "temporary:" + RuntimeHelpersShim.GetHashCode(temporary).ToString(CultureInfo.InvariantCulture) + ":" + temporary.Ordinal.ToString(CultureInfo.InvariantCulture);
+                    return "temporary:" + RuntimeHelpers.GetHashCode(temporary).ToString(CultureInfo.InvariantCulture) + ":" + temporary.Ordinal.ToString(CultureInfo.InvariantCulture);
 
                 case GimpleUnaryExpression unary:
                     return TokenKey(unary.OperatorToken);
@@ -1072,13 +1073,12 @@ namespace Cnidaria.C
         private static string FieldKey(GimpleMemberAccessExpression member)
         {
             if (member.Field is not null)
-                return "field:" + RuntimeHelpersShim.GetHashCode(member.Field).ToString(CultureInfo.InvariantCulture) + ":" + member.Field.Name;
+                return "field:" + RuntimeHelpers.GetHashCode(member.Field).ToString(CultureInfo.InvariantCulture) + ":" + member.Field.Name;
 
             return "name:" + member.NameToken.Text;
         }
 
-        private static string TokenKey(SyntaxToken token)
-            => token.Kind + ":" + token.Text;
+        private static string TokenKey(SyntaxToken token) => $"{token.Kind}:{token.Text}";
 
         private static string TypeKey(QualifiedType type)
             => GimpleTypeHelpers.Normalize(type).ToDisplayString();

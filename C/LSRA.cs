@@ -158,7 +158,7 @@ namespace Cnidaria.C
                 foreach (var instruction in block.Instructions)
                 {
                     var pos = position++;
-                    if (instruction.Kind == LirInstructionKind.Call)
+                    if (instruction.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(instruction))
                         _callPositions.Add(pos);
                     else if (instruction.Kind == LirInstructionKind.InlineAssembly)
                         _inlineAssemblyPositions.Add(pos);
@@ -471,7 +471,11 @@ namespace Cnidaria.C
         {
             if (_target.IsRegisterBytecode)
                 return false;
-            if (register.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory or LirRegisterClass.Aggregate)
+            if (register.RegisterClass is
+                LirRegisterClass.Void or
+                LirRegisterClass.Memory or
+                LirRegisterClass.Aggregate or
+                LirRegisterClass.Vector)
                 return false;
             if (CAbi.IsAggregate(register.Type))
                 return false;
@@ -801,6 +805,9 @@ namespace Cnidaria.C
                 if (!pair.Value.IsSpilled)
                     continue;
 
+                if (pair.Key.RegisterClass == LirRegisterClass.Vector)
+                    throw new NotImplementedException("Vector register spilling is not implemented.");
+
                 offset = AlignUp(offset, _options.SpillSlotAlignment);
                 spillOffsets.Add(pair.Key, offset);
                 offset = checked(offset + SpillSlotSizeFor(pair.Key));
@@ -819,6 +826,7 @@ namespace Cnidaria.C
             var usedRegisters = allocations.Values
                 .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
                 .Select(static a => a.PhysicalRegister)
+                .Where(register => TargetRegisterInfo.IsCalleeSaved(_target, register))
                 .Distinct()
                 .OrderBy(static r => (int)r)
                 .ToImmutableArray();
@@ -870,7 +878,7 @@ namespace Cnidaria.C
             var maxSize = 0;
             foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
             {
-                if (instruction.Kind != LirInstructionKind.Call)
+                if (instruction.Kind != LirInstructionKind.Call || IsRiscVVectorIntrinsicCall(instruction))
                     continue;
 
                 var size = CAbi.ComputeOutgoingArgumentAreaSize(
@@ -883,6 +891,17 @@ namespace Cnidaria.C
             }
 
             return maxSize;
+        }
+
+        private bool IsRiscVVectorIntrinsicCall(LirInstruction instruction)
+        {
+            if (!_target.IsRiscV || instruction.Kind != LirInstructionKind.Call || instruction.Operands.Length == 0)
+                return false;
+
+            var callee = instruction.Operands[0];
+            return callee.Kind == LirOperandKind.Symbol &&
+                callee.Symbol is FunctionSymbol function &&
+                function.Name.StartsWith("__riscv_v", StringComparison.Ordinal);
         }
 
         private int ComputeParallelCopyTempSize(

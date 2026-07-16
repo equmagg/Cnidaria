@@ -410,7 +410,10 @@ namespace Cnidaria.Cs
             calleeSavedSlots: ImmutableArray<StackFrameSlot>.Empty,
             outgoingArgumentSlots: ImmutableArray<StackFrameSlot>.Empty,
             usesFramePointer: false,
-            frameModel: RegisterStackFrameModel.Leaf);
+            frameModel: RegisterStackFrameModel.Leaf,
+            gcSpillAreaOffset: 0,
+            gcSpillAreaSize: 0,
+            gcRootSpillSlotCount: 0);
 
         public int FrameSize { get; }
         public int FrameAlignment { get; }
@@ -428,6 +431,9 @@ namespace Cnidaria.Cs
         public int SpillAreaSize { get; }
         public int OutgoingArgumentAreaOffset { get; }
         public int OutgoingArgumentAreaSize { get; }
+        public int GcSpillAreaOffset { get; }
+        public int GcSpillAreaSize { get; }
+        public int GcRootSpillSlotCount { get; }
         public ImmutableArray<StackFrameSlot> ArgumentSlots { get; }
         public ImmutableArray<StackFrameSlot> LocalSlots { get; }
         public ImmutableArray<StackFrameSlot> TempSlots { get; }
@@ -466,12 +472,23 @@ namespace Cnidaria.Cs
             ImmutableArray<StackFrameSlot> calleeSavedSlots,
             ImmutableArray<StackFrameSlot> outgoingArgumentSlots,
             bool usesFramePointer = false,
-            RegisterStackFrameModel frameModel = RegisterStackFrameModel.Leaf)
+            RegisterStackFrameModel frameModel = RegisterStackFrameModel.Leaf,
+            int gcSpillAreaOffset = 0,
+            int gcSpillAreaSize = 0,
+            int gcRootSpillSlotCount = 0)
         {
             if (frameSize < 0)
                 throw new ArgumentOutOfRangeException(nameof(frameSize));
             if (frameAlignment <= 0)
                 throw new ArgumentOutOfRangeException(nameof(frameAlignment));
+            if (gcSpillAreaOffset < 0)
+                throw new ArgumentOutOfRangeException(nameof(gcSpillAreaOffset));
+            if (gcSpillAreaSize < 0)
+                throw new ArgumentOutOfRangeException(nameof(gcSpillAreaSize));
+            if (gcRootSpillSlotCount < 0)
+                throw new ArgumentOutOfRangeException(nameof(gcRootSpillSlotCount));
+            if (checked(gcSpillAreaOffset + gcSpillAreaSize) > frameSize)
+                throw new ArgumentOutOfRangeException(nameof(gcSpillAreaSize));
 
             FrameSize = frameSize;
             FrameAlignment = frameAlignment;
@@ -489,6 +506,9 @@ namespace Cnidaria.Cs
             SpillAreaSize = spillAreaSize;
             OutgoingArgumentAreaOffset = outgoingArgumentAreaOffset;
             OutgoingArgumentAreaSize = outgoingArgumentAreaSize;
+            GcSpillAreaOffset = gcSpillAreaOffset;
+            GcSpillAreaSize = gcSpillAreaSize;
+            GcRootSpillSlotCount = gcRootSpillSlotCount;
             ArgumentSlots = argumentSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : argumentSlots;
             LocalSlots = localSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : localSlots;
             TempSlots = tempSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : tempSlots;

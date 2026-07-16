@@ -1,4 +1,4 @@
-_start:
+﻿_start:
     li sp, ${ZBOOT_ZS3_STACK_ADDRESS} # Temporary M mode stack, default 0x80110000
     # All non-delegated traps enter machine_trap_vector in direct mtvec mode
     la t0, machine_trap_vector

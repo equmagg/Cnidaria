@@ -891,9 +891,14 @@ namespace Cnidaria.Cs
                     int nextBlockId = i + 1 < order.Length ? order[i + 1] : -1;
                     var block = _method.Blocks[blockId];
                     _currentEmitNextBlockId = nextBlockId;
+                    int firstBodyNode = blockId == 0
+                        ? GenTreeLirKinds.PrologPrefixLength(block.LinearNodes)
+                        : 0;
+                    for (int j = 0; j < firstBodyNode; j++)
+                        EmitGenTreeNode(block.LinearNodes[j]);
                     _asm.Bind(_blockLabels[blockId]);
                     _blockStartPc[blockId] = _asm.Pc;
-                    for (int j = 0; j < block.LinearNodes.Length; j++)
+                    for (int j = firstBodyNode; j < block.LinearNodes.Length; j++)
                         EmitGenTreeNode(block.LinearNodes[j]);
 
                     EmitBlockLayoutFixup(blockId, nextBlockId);

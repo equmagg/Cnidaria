@@ -63,7 +63,7 @@ namespace Cnidaria.RiscV
 
             var sections = new List<ElfSectionLayout>
             {
-                new ElfSectionLayout(".text", RVObjectSectionKind.Text, 4, new byte[obj.Text.Instructions.Length * 4], obj.Text.Instructions.Length * 4)
+                new ElfSectionLayout(".text", RVObjectSectionKind.Text, 4, new byte[obj.Text.SizeInBytes], obj.Text.SizeInBytes)
             };
 
             foreach (var section in obj.DataSections)
@@ -179,9 +179,9 @@ namespace Cnidaria.RiscV
         private static void EncodeText(RiscVProgram obj, ElfSectionLayout text, IReadOnlyDictionary<string, ulong> symbols, byte[] image)
         {
             var relocations = obj.Text.Relocations.ToDictionary(static r => r.Offset, static r => r);
+            var sectionOffset = 0;
             for (var i = 0; i < obj.Text.Instructions.Length; i++)
             {
-                var sectionOffset = checked(i * 4);
                 var instruction = obj.Text.Instructions[i];
                 if (relocations.TryGetValue(sectionOffset, out var relocation))
                     instruction = ResolveRelocatedInstruction(instruction, relocation, sectionOffset, relocations, text.Address, symbols);
@@ -189,7 +189,9 @@ namespace Cnidaria.RiscV
                     instruction = ResolveSymbolicInstruction(instruction, checked(text.Address + (ulong)sectionOffset), symbols);
 
                 var encoded = RiscVCodeEncoder.Encode(instruction, obj.Target);
-                WriteUInt32(image, checked(text.FileOffset + sectionOffset), encoded, obj.Target.Endianness);
+                var size = RVInstructionTable.GetEncodedSize(instruction.Opcode);
+                RiscVCodeEncoder.WriteInstruction(image, checked(text.FileOffset + sectionOffset), encoded, size, obj.Target.Endianness);
+                sectionOffset = checked(sectionOffset + size);
             }
         }
 

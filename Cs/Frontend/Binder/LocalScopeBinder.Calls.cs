@@ -2259,7 +2259,7 @@ namespace Cnidaria.Cs
                 if (usesParamsExpansion && p == paramsIndex &&
                     expandedParamsArgs is not null && expandedParamsArgs.Contains(a))
                 {
-                    if (parameterType is not ArrayTypeSymbol paramsArray || paramsArray.Rank != 1)
+                    if (parameterType is not ArrayTypeSymbol paramsArray || paramsArray.Rank != 1 || !paramsArray.IsSZArray)
                         return false;
 
                     parameterType = paramsArray.ElementType;
@@ -2338,7 +2338,9 @@ namespace Cnidaria.Cs
                     return;
 
                 case ArrayTypeSymbol parameterArray:
-                    if (argumentType is ArrayTypeSymbol argumentArray && parameterArray.Rank == argumentArray.Rank)
+                    if (argumentType is ArrayTypeSymbol argumentArray &&
+                        parameterArray.Rank == argumentArray.Rank &&
+                        parameterArray.IsSZArray == argumentArray.IsSZArray)
                         InferMethodTypeArgumentsFromTypes(parameterArray.ElementType, argumentArray.ElementType, typeParameters, inferences);
                     return;
 
@@ -2624,7 +2626,7 @@ namespace Cnidaria.Cs
                 }
 
                 // Params expansion form
-                if (ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1)
+                if (ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
                 {
                     int fixedCount = ps.Length - 1;
 
@@ -2965,7 +2967,7 @@ namespace Cnidaria.Cs
                 ps = scoredMethod.Parameters;
                 int paramsIndex = ps.Length - 1;
 
-                if (ps[paramsIndex].Type is not ArrayTypeSymbol constructedParamsArray || constructedParamsArray.Rank != 1)
+                if (ps[paramsIndex].Type is not ArrayTypeSymbol constructedParamsArray || constructedParamsArray.Rank != 1 || !constructedParamsArray.IsSZArray)
                     return false;
 
                 var elementType = constructedParamsArray.ElementType;
@@ -3167,7 +3169,7 @@ namespace Cnidaria.Cs
             {
                 if (p.IsParams)
                 {
-                    if (p.Type is not ArrayTypeSymbol at || at.Rank != 1)
+                    if (p.Type is not ArrayTypeSymbol at || at.Rank != 1 || !at.IsSZArray)
                     {
                         var bad = new BoundBadExpression(diagnosticNode);
                         bad.SetType(p.Type);

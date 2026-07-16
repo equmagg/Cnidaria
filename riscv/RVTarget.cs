@@ -81,6 +81,18 @@ namespace Cnidaria.RiscV
             Relocations = relocations.IsDefault ? ImmutableArray<RVObjectRelocation>.Empty : relocations;
         }
 
+        public int SizeInBytes => RVInstructionTable.GetEncodedSize(Instructions);
+
+        public int GetInstructionOffset(int index)
+        {
+            if ((uint)index > (uint)Instructions.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            var offset = 0;
+            for (var i = 0; i < index; i++)
+                offset = checked(offset + RVInstructionTable.GetEncodedSize(Instructions[i].Opcode));
+            return offset;
+        }
+
         public byte[] Encode(RVTarget target)
             => RiscVCodeEncoder.Encode(Instructions, target, Labels);
 
@@ -257,6 +269,8 @@ namespace Cnidaria.RiscV
         D = 1UL << 4,
         C = 1UL << 5,
         V = 1UL << 6,
+        B = 1UL << 7,
+        H = 1UL << 8,
         Zicsr = 1UL << 16,
         Zifencei = 1UL << 17,
         Privileged = 1UL << 32,
@@ -279,6 +293,10 @@ namespace Cnidaria.RiscV
         R,
         I,
         ShiftI,
+        BitmanipUnary,
+        BitmanipShiftI,
+        Compressed,
+        Raw16,
         S,
         FloatLoad,
         FloatStore,
@@ -302,6 +320,8 @@ namespace Cnidaria.RiscV
         VectorLoad,
         VectorStore,
         PrivilegedFence,
+        HypervisorLoad,
+        HypervisorStore,
     }
 
     public enum RVRelocationKind : byte
@@ -325,6 +345,7 @@ namespace Cnidaria.RiscV
     {
         Invalid = 0,
         Raw32,
+        Raw16,
         Lui,
         Auipc,
         Jal,
@@ -602,6 +623,100 @@ namespace Cnidaria.RiscV
         VfrdivVf,
         VfmulVv,
         VfmulVf,
+        Andn,
+        Orn,
+        Xnor,
+        Clz,
+        Ctz,
+        Cpop,
+        Clzw,
+        Ctzw,
+        Cpopw,
+        Max,
+        Maxu,
+        Min,
+        Minu,
+        SextB,
+        SextH,
+        ZextH,
+        Rol,
+        Ror,
+        Rori,
+        Rolw,
+        Rorw,
+        Roriw,
+        OrcB,
+        Rev8,
+        Sh1Add,
+        Sh2Add,
+        Sh3Add,
+        AddUw,
+        Sh1AddUw,
+        Sh2AddUw,
+        Sh3AddUw,
+        SlliUw,
+        Bclr,
+        Bext,
+        Binv,
+        Bset,
+        Bclri,
+        Bexti,
+        Binvi,
+        Bseti,
+        Clmul,
+        Clmulr,
+        Clmulh,
+        CAddi4Spn,
+        CFld,
+        CLw,
+        CFlw,
+        CFsd,
+        CSw,
+        CFsw,
+        CLd,
+        CSd,
+        CNop,
+        CAddi,
+        CJal,
+        CAddiw,
+        CLi,
+        CAddi16Sp,
+        CLui,
+        CSrli,
+        CSrai,
+        CAndi,
+        CSub,
+        CXor,
+        COr,
+        CAnd,
+        CSubw,
+        CAddw,
+        CJ,
+        CBeqz,
+        CBnez,
+        CSlli,
+        CLwSp,
+        CLdSp,
+        CJr,
+        CMv,
+        CEbreak,
+        CJalr,
+        CAdd,
+        CSwSp,
+        CSdSp,
+        HlvB,
+        HlvBu,
+        HlvH,
+        HlvHu,
+        HlvxHu,
+        HlvW,
+        HlvWu,
+        HlvxWu,
+        HlvD,
+        HsvB,
+        HsvH,
+        HsvW,
+        HsvD,
     }
 
     public enum RVRegister : byte
@@ -732,6 +847,7 @@ namespace Cnidaria.RiscV
         HEDeleg = 0x602,
         HIDeleg = 0x603,
         HIe = 0x604,
+        HTimeDelta = 0x605,
         HCounterEn = 0x606,
         HGEIe = 0x607,
         HTVal = 0x643,
@@ -739,6 +855,7 @@ namespace Cnidaria.RiscV
         HVIp = 0x645,
         HGEIp = 0xE12,
         HEnvCfg = 0x60A,
+        HTimeDeltaH = 0x615,
         HEnvCfgH = 0x61A,
         HStateEn0 = 0x60C,
         HStateEn1 = 0x60D,
@@ -809,6 +926,8 @@ namespace Cnidaria.RiscV
             | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei, TargetEndianness.Little);
         public static RVTarget Rv64GPrivileged { get; } = new RVTarget(64, RVAbiKind.Lp64D, RVIsaFlags.I | RVIsaFlags.M | RVIsaFlags.A | RVIsaFlags.F | RVIsaFlags.D
             | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei | RVIsaFlags.Privileged, TargetEndianness.Little);
+        public static RVTarget Rv64GHPrivileged { get; } = new RVTarget(64, RVAbiKind.Lp64D, RVIsaFlags.I | RVIsaFlags.M | RVIsaFlags.A | RVIsaFlags.F | RVIsaFlags.D
+            | RVIsaFlags.H | RVIsaFlags.Zicsr | RVIsaFlags.Zifencei | RVIsaFlags.Privileged, TargetEndianness.Little);
         public static RVTarget FromTargetInfo(Cnidaria.C.TargetInfo target)
         {
             if (target is null)
@@ -830,6 +949,10 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.C;
             if ((features & TargetArchitectureFeatures.RiscVV) != 0)
                 flags |= RVIsaFlags.V;
+            if ((features & TargetArchitectureFeatures.RiscVB) != 0)
+                flags |= RVIsaFlags.B;
+            if ((features & TargetArchitectureFeatures.RiscVH) != 0)
+                flags |= RVIsaFlags.H;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -860,6 +983,10 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.C;
             if ((features & TargetArchitectureFeatures.RiscVV) != 0)
                 flags |= RVIsaFlags.V;
+            if ((features & TargetArchitectureFeatures.RiscVB) != 0)
+                flags |= RVIsaFlags.B;
+            if ((features & TargetArchitectureFeatures.RiscVH) != 0)
+                flags |= RVIsaFlags.H;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -883,6 +1010,8 @@ namespace Cnidaria.RiscV
         public bool HasD => Has(RVIsaFlags.D);
         public bool HasC => Has(RVIsaFlags.C);
         public bool HasV => Has(RVIsaFlags.V);
+        public bool HasB => Has(RVIsaFlags.B);
+        public bool HasH => Has(RVIsaFlags.H);
         public bool HasZicsr => Has(RVIsaFlags.Zicsr);
         public bool HasZifencei => Has(RVIsaFlags.Zifencei);
         public bool HasPrivileged => Has(RVIsaFlags.Privileged);
@@ -926,6 +1055,10 @@ namespace Cnidaria.RiscV
                 suffix += "c";
             if (HasV)
                 suffix += "v";
+            if (HasB)
+                suffix += "b";
+            if (HasH)
+                suffix += "h";
             return suffix;
         }
     }
@@ -1226,9 +1359,11 @@ namespace Cnidaria.RiscV
                 ["hedeleg"] = 0x602,
                 ["hideleg"] = 0x603,
                 ["hie"] = 0x604,
+                ["htimedelta"] = 0x605,
                 ["hcounteren"] = 0x606,
                 ["hgeie"] = 0x607,
                 ["henvcfg"] = 0x60A,
+                ["htimedeltah"] = 0x615,
                 ["henvcfgh"] = 0x61A,
                 ["htval"] = 0x643,
                 ["hip"] = 0x644,
@@ -1397,6 +1532,9 @@ namespace Cnidaria.RiscV
         public static RVInstruction Raw(uint word)
             => new RVInstruction(RVInstrKind.Raw32, immediate: unchecked((int)word));
 
+        public static RVInstruction Raw16(ushort halfword)
+            => new RVInstruction(RVInstrKind.Raw16, immediate: halfword);
+
         public static RVInstruction R(RVInstrKind opcode, RVRegister rd, RVRegister rs1, RVRegister rs2)
             => new RVInstruction(opcode, rd, rs1, rs2);
 
@@ -1462,7 +1600,7 @@ namespace Cnidaria.RiscV
         private readonly Dictionary<string, int> _labels = new Dictionary<string, int>(StringComparer.Ordinal);
 
         public int Count => _instructions.Count;
-        public int Position => _instructions.Count * 4;
+        public int Position => RVInstructionTable.GetEncodedSize(_instructions);
 
         public void Emit(RVInstruction instruction)
             => _instructions.Add(instruction);
@@ -1501,9 +1639,32 @@ namespace Cnidaria.RiscV
             throw new ArgumentOutOfRangeException(nameof(opcode));
         }
 
+        public static int GetEncodedSize(RVInstrKind opcode)
+        {
+            var format = Get(opcode).Format;
+            return format is RVInstructionFormat.Compressed or RVInstructionFormat.Raw16 ? 2 : 4;
+        }
+
+        public static int GetEncodedSize(IEnumerable<RVInstruction> instructions)
+        {
+            if (instructions is null)
+                throw new ArgumentNullException(nameof(instructions));
+            var size = 0;
+            foreach (var instruction in instructions)
+                size = checked(size + GetEncodedSize(instruction.Opcode));
+            return size;
+        }
+
+        public static bool IsCompressed(RVInstrKind opcode)
+        {
+            var format = Get(opcode).Format;
+            return format is RVInstructionFormat.Compressed or RVInstructionFormat.Raw16;
+        }
+
         public static string GetMnemonic(RVInstrKind opcode) => opcode switch
         {
             RVInstrKind.Raw32 => ".word",
+            RVInstrKind.Raw16 => ".hword",
             RVInstrKind.Lui => "lui",
             RVInstrKind.Auipc => "auipc",
             RVInstrKind.Jal => "jal",
@@ -1648,6 +1809,19 @@ namespace Cnidaria.RiscV
             RVInstrKind.SfenceInvalIr => "sfence.inval.ir",
             RVInstrKind.HfenceVvma => "hfence.vvma",
             RVInstrKind.HfenceGvma => "hfence.gvma",
+            RVInstrKind.HlvB => "hlv.b",
+            RVInstrKind.HlvBu => "hlv.bu",
+            RVInstrKind.HlvH => "hlv.h",
+            RVInstrKind.HlvHu => "hlv.hu",
+            RVInstrKind.HlvxHu => "hlvx.hu",
+            RVInstrKind.HlvW => "hlv.w",
+            RVInstrKind.HlvWu => "hlv.wu",
+            RVInstrKind.HlvxWu => "hlvx.wu",
+            RVInstrKind.HlvD => "hlv.d",
+            RVInstrKind.HsvB => "hsv.b",
+            RVInstrKind.HsvH => "hsv.h",
+            RVInstrKind.HsvW => "hsv.w",
+            RVInstrKind.HsvD => "hsv.d",
             RVInstrKind.Csrrw => "csrrw",
             RVInstrKind.Csrrs => "csrrs",
             RVInstrKind.Csrrc => "csrrc",
@@ -1781,6 +1955,87 @@ namespace Cnidaria.RiscV
             RVInstrKind.VfrdivVf => "vfrdiv.vf",
             RVInstrKind.VfmulVv => "vfmul.vv",
             RVInstrKind.VfmulVf => "vfmul.vf",
+            RVInstrKind.Andn => "andn",
+            RVInstrKind.Orn => "orn",
+            RVInstrKind.Xnor => "xnor",
+            RVInstrKind.Clz => "clz",
+            RVInstrKind.Ctz => "ctz",
+            RVInstrKind.Cpop => "cpop",
+            RVInstrKind.Clzw => "clzw",
+            RVInstrKind.Ctzw => "ctzw",
+            RVInstrKind.Cpopw => "cpopw",
+            RVInstrKind.Max => "max",
+            RVInstrKind.Maxu => "maxu",
+            RVInstrKind.Min => "min",
+            RVInstrKind.Minu => "minu",
+            RVInstrKind.SextB => "sext.b",
+            RVInstrKind.SextH => "sext.h",
+            RVInstrKind.ZextH => "zext.h",
+            RVInstrKind.Rol => "rol",
+            RVInstrKind.Ror => "ror",
+            RVInstrKind.Rori => "rori",
+            RVInstrKind.Rolw => "rolw",
+            RVInstrKind.Rorw => "rorw",
+            RVInstrKind.Roriw => "roriw",
+            RVInstrKind.OrcB => "orc.b",
+            RVInstrKind.Rev8 => "rev8",
+            RVInstrKind.Sh1Add => "sh1add",
+            RVInstrKind.Sh2Add => "sh2add",
+            RVInstrKind.Sh3Add => "sh3add",
+            RVInstrKind.AddUw => "add.uw",
+            RVInstrKind.Sh1AddUw => "sh1add.uw",
+            RVInstrKind.Sh2AddUw => "sh2add.uw",
+            RVInstrKind.Sh3AddUw => "sh3add.uw",
+            RVInstrKind.SlliUw => "slli.uw",
+            RVInstrKind.Bclr => "bclr",
+            RVInstrKind.Bext => "bext",
+            RVInstrKind.Binv => "binv",
+            RVInstrKind.Bset => "bset",
+            RVInstrKind.Bclri => "bclri",
+            RVInstrKind.Bexti => "bexti",
+            RVInstrKind.Binvi => "binvi",
+            RVInstrKind.Bseti => "bseti",
+            RVInstrKind.Clmul => "clmul",
+            RVInstrKind.Clmulr => "clmulr",
+            RVInstrKind.Clmulh => "clmulh",
+            RVInstrKind.CAddi4Spn => "c.addi4spn",
+            RVInstrKind.CFld => "c.fld",
+            RVInstrKind.CLw => "c.lw",
+            RVInstrKind.CFlw => "c.flw",
+            RVInstrKind.CFsd => "c.fsd",
+            RVInstrKind.CSw => "c.sw",
+            RVInstrKind.CFsw => "c.fsw",
+            RVInstrKind.CLd => "c.ld",
+            RVInstrKind.CSd => "c.sd",
+            RVInstrKind.CNop => "c.nop",
+            RVInstrKind.CAddi => "c.addi",
+            RVInstrKind.CJal => "c.jal",
+            RVInstrKind.CAddiw => "c.addiw",
+            RVInstrKind.CLi => "c.li",
+            RVInstrKind.CAddi16Sp => "c.addi16sp",
+            RVInstrKind.CLui => "c.lui",
+            RVInstrKind.CSrli => "c.srli",
+            RVInstrKind.CSrai => "c.srai",
+            RVInstrKind.CAndi => "c.andi",
+            RVInstrKind.CSub => "c.sub",
+            RVInstrKind.CXor => "c.xor",
+            RVInstrKind.COr => "c.or",
+            RVInstrKind.CAnd => "c.and",
+            RVInstrKind.CSubw => "c.subw",
+            RVInstrKind.CAddw => "c.addw",
+            RVInstrKind.CJ => "c.j",
+            RVInstrKind.CBeqz => "c.beqz",
+            RVInstrKind.CBnez => "c.bnez",
+            RVInstrKind.CSlli => "c.slli",
+            RVInstrKind.CLwSp => "c.lwsp",
+            RVInstrKind.CLdSp => "c.ldsp",
+            RVInstrKind.CJr => "c.jr",
+            RVInstrKind.CMv => "c.mv",
+            RVInstrKind.CEbreak => "c.ebreak",
+            RVInstrKind.CJalr => "c.jalr",
+            RVInstrKind.CAdd => "c.add",
+            RVInstrKind.CSwSp => "c.swsp",
+            RVInstrKind.CSdSp => "c.sdsp",
             _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
         };
 
@@ -1798,20 +2053,26 @@ namespace Cnidaria.RiscV
         {
             if (TryGetOpcode(mnemonic, out var opcode))
                 return opcode;
-            throw new FormatException("Unknown RISC-V mnemonic: " + mnemonic);
+            throw new FormatException($"Unknown mnemonic: {mnemonic}");
         }
 
         public static bool IsBranch(RVInstrKind opcode)
-            => opcode is RVInstrKind.Beq or RVInstrKind.Bne or RVInstrKind.Blt or RVInstrKind.Bge or RVInstrKind.Bltu or RVInstrKind.Bgeu;
+            => opcode is RVInstrKind.Beq or RVInstrKind.Bne or RVInstrKind.Blt or RVInstrKind.Bge or
+                         RVInstrKind.Bltu or RVInstrKind.Bgeu or RVInstrKind.CBeqz or RVInstrKind.CBnez;
 
         public static bool IsLoad(RVInstrKind opcode)
-            => opcode is RVInstrKind.Lb or RVInstrKind.Lh or RVInstrKind.Lw or RVInstrKind.Lbu or RVInstrKind.Lhu or RVInstrKind.Lwu or RVInstrKind.Ld or RVInstrKind.Flw or RVInstrKind.Fld;
+            => opcode is RVInstrKind.Lb or RVInstrKind.Lh or RVInstrKind.Lw or RVInstrKind.Lbu or RVInstrKind.Lhu or RVInstrKind.Lwu or
+                         RVInstrKind.Ld or RVInstrKind.Flw or RVInstrKind.Fld or RVInstrKind.CLw or RVInstrKind.CLd or RVInstrKind.CFlw or
+                         RVInstrKind.CFld or RVInstrKind.CLwSp or RVInstrKind.CLdSp or RVInstrKind.HlvB or RVInstrKind.HlvBu or
+                         RVInstrKind.HlvH or RVInstrKind.HlvHu or RVInstrKind.HlvxHu or RVInstrKind.HlvW or RVInstrKind.HlvWu or
+                         RVInstrKind.HlvxWu or RVInstrKind.HlvD;
 
         public static bool IsStore(RVInstrKind opcode)
-            => opcode is RVInstrKind.Sb or RVInstrKind.Sh or RVInstrKind.Sw or RVInstrKind.Sd or RVInstrKind.Fsw or RVInstrKind.Fsd;
+            => opcode is RVInstrKind.Sb or RVInstrKind.Sh or RVInstrKind.Sw or RVInstrKind.Sd or RVInstrKind.Fsw or RVInstrKind.Fsd or
+                         RVInstrKind.CSw or RVInstrKind.CSd or RVInstrKind.CFsw or RVInstrKind.CFsd or RVInstrKind.CSwSp or RVInstrKind.CSdSp or
+                         RVInstrKind.HsvB or RVInstrKind.HsvH or RVInstrKind.HsvW or RVInstrKind.HsvD;
 
-        public static bool IsAmo(RVInstrKind opcode)
-            => Get(opcode).Format == RVInstructionFormat.Amo;
+        public static bool IsAmo(RVInstrKind opcode) => Get(opcode).Format == RVInstructionFormat.Amo;
 
         public static bool IsVector(RVInstrKind opcode)
         {
@@ -1828,7 +2089,7 @@ namespace Cnidaria.RiscV
         private static Dictionary<string, RVInstrKind> CreateMnemonicMap()
         {
             var map = new Dictionary<string, RVInstrKind>(StringComparer.OrdinalIgnoreCase);
-            foreach (RVInstrKind opcode in Enum.GetValues(typeof(RVInstrKind)))
+            foreach (RVInstrKind opcode in Enum.GetValues<RVInstrKind>())
             {
                 if (opcode is RVInstrKind.Invalid)
                     continue;
@@ -1985,8 +2246,21 @@ namespace Cnidaria.RiscV
             Add(map, RVInstrKind.SinvalVma, RVInstructionFormat.PrivilegedFence, RVIsaFlags.Privileged, false, 0x73, 0, 0x0B);
             Add(map, RVInstrKind.SfenceWInval, RVInstructionFormat.System, RVIsaFlags.Privileged, false, 0x73, 0, 0);
             Add(map, RVInstrKind.SfenceInvalIr, RVInstructionFormat.System, RVIsaFlags.Privileged, false, 0x73, 0, 0);
-            Add(map, RVInstrKind.HfenceVvma, RVInstructionFormat.PrivilegedFence, RVIsaFlags.Privileged, false, 0x73, 0, 0x11);
-            Add(map, RVInstrKind.HfenceGvma, RVInstructionFormat.PrivilegedFence, RVIsaFlags.Privileged, false, 0x73, 0, 0x31);
+            Add(map, RVInstrKind.HfenceVvma, RVInstructionFormat.PrivilegedFence, RVIsaFlags.H, false, 0x73, 0, 0x11);
+            Add(map, RVInstrKind.HfenceGvma, RVInstructionFormat.PrivilegedFence, RVIsaFlags.H, false, 0x73, 0, 0x31);
+            Add(map, RVInstrKind.HlvB, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x30);
+            Add(map, RVInstrKind.HlvBu, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x30);
+            Add(map, RVInstrKind.HlvH, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x32);
+            Add(map, RVInstrKind.HlvHu, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x32);
+            Add(map, RVInstrKind.HlvxHu, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x32);
+            Add(map, RVInstrKind.HlvW, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x34);
+            Add(map, RVInstrKind.HlvWu, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, true, 0x73, 4, 0x34);
+            Add(map, RVInstrKind.HlvxWu, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, false, 0x73, 4, 0x34);
+            Add(map, RVInstrKind.HlvD, RVInstructionFormat.HypervisorLoad, RVIsaFlags.H, true, 0x73, 4, 0x36);
+            Add(map, RVInstrKind.HsvB, RVInstructionFormat.HypervisorStore, RVIsaFlags.H, false, 0x73, 4, 0x31);
+            Add(map, RVInstrKind.HsvH, RVInstructionFormat.HypervisorStore, RVIsaFlags.H, false, 0x73, 4, 0x33);
+            Add(map, RVInstrKind.HsvW, RVInstructionFormat.HypervisorStore, RVIsaFlags.H, false, 0x73, 4, 0x35);
+            Add(map, RVInstrKind.HsvD, RVInstructionFormat.HypervisorStore, RVIsaFlags.H, true, 0x73, 4, 0x37);
             Add(map, RVInstrKind.Csrrw, RVInstructionFormat.Csr, RVIsaFlags.Zicsr, false, 0x73, 1, 0);
             Add(map, RVInstrKind.Csrrs, RVInstructionFormat.Csr, RVIsaFlags.Zicsr, false, 0x73, 2, 0);
             Add(map, RVInstrKind.Csrrc, RVInstructionFormat.Csr, RVIsaFlags.Zicsr, false, 0x73, 3, 0);
@@ -2120,10 +2394,100 @@ namespace Cnidaria.RiscV
             AddVectorOp(map, RVInstrKind.VfrdivVf, 5, 33);
             AddVectorOp(map, RVInstrKind.VfmulVv, 1, 36);
             AddVectorOp(map, RVInstrKind.VfmulVf, 5, 36);
+            Add(map, RVInstrKind.Raw16, RVInstructionFormat.Raw16, RVIsaFlags.C, false, 0, 0, 0);
+            Add(map, RVInstrKind.Andn, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 7, 0x20);
+            Add(map, RVInstrKind.Orn, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 6, 0x20);
+            Add(map, RVInstrKind.Xnor, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 4, 0x20);
+            Add(map, RVInstrKind.Clz, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 1, 0);
+            Add(map, RVInstrKind.Ctz, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 1, 0);
+            Add(map, RVInstrKind.Cpop, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 1, 0);
+            Add(map, RVInstrKind.Clzw, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, true, 0x1B, 1, 0);
+            Add(map, RVInstrKind.Ctzw, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, true, 0x1B, 1, 0);
+            Add(map, RVInstrKind.Cpopw, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, true, 0x1B, 1, 0);
+            Add(map, RVInstrKind.Max, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 6, 0x05);
+            Add(map, RVInstrKind.Maxu, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 7, 0x05);
+            Add(map, RVInstrKind.Min, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 4, 0x05);
+            Add(map, RVInstrKind.Minu, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 5, 0x05);
+            Add(map, RVInstrKind.SextB, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 1, 0);
+            Add(map, RVInstrKind.SextH, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 1, 0);
+            Add(map, RVInstrKind.ZextH, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x33, 4, 0x04);
+            Add(map, RVInstrKind.Rol, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x30);
+            Add(map, RVInstrKind.Ror, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 5, 0x30);
+            Add(map, RVInstrKind.Rori, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, false, 0x13, 5, 0x30);
+            Add(map, RVInstrKind.Rolw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 1, 0x30);
+            Add(map, RVInstrKind.Rorw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 5, 0x30);
+            Add(map, RVInstrKind.Roriw, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, true, 0x1B, 5, 0x30);
+            Add(map, RVInstrKind.OrcB, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 5, 0);
+            Add(map, RVInstrKind.Rev8, RVInstructionFormat.BitmanipUnary, RVIsaFlags.B, false, 0x13, 5, 0);
+            Add(map, RVInstrKind.Sh1Add, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 2, 0x10);
+            Add(map, RVInstrKind.Sh2Add, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 4, 0x10);
+            Add(map, RVInstrKind.Sh3Add, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 6, 0x10);
+            Add(map, RVInstrKind.AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 0, 0x04);
+            Add(map, RVInstrKind.Sh1AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 2, 0x10);
+            Add(map, RVInstrKind.Sh2AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 4, 0x10);
+            Add(map, RVInstrKind.Sh3AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 6, 0x10);
+            Add(map, RVInstrKind.SlliUw, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, true, 0x1B, 1, 0x04);
+            Add(map, RVInstrKind.Bclr, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x24);
+            Add(map, RVInstrKind.Bext, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 5, 0x24);
+            Add(map, RVInstrKind.Binv, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x34);
+            Add(map, RVInstrKind.Bset, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x14);
+            Add(map, RVInstrKind.Bclri, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, false, 0x13, 1, 0x24);
+            Add(map, RVInstrKind.Bexti, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, false, 0x13, 5, 0x24);
+            Add(map, RVInstrKind.Binvi, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, false, 0x13, 1, 0x34);
+            Add(map, RVInstrKind.Bseti, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, false, 0x13, 1, 0x14);
+            Add(map, RVInstrKind.Clmul, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x05);
+            Add(map, RVInstrKind.Clmulr, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 2, 0x05);
+            Add(map, RVInstrKind.Clmulh, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 3, 0x05);
+            AddCompressed(map, RVInstrKind.CAddi4Spn);
+            AddCompressed(map, RVInstrKind.CFld, false, RVIsaFlags.C | RVIsaFlags.D);
+            AddCompressed(map, RVInstrKind.CLw);
+            AddCompressed(map, RVInstrKind.CFlw, false, RVIsaFlags.C | RVIsaFlags.F);
+            AddCompressed(map, RVInstrKind.CFsd, false, RVIsaFlags.C | RVIsaFlags.D);
+            AddCompressed(map, RVInstrKind.CSw);
+            AddCompressed(map, RVInstrKind.CFsw, false, RVIsaFlags.C | RVIsaFlags.F);
+            AddCompressed(map, RVInstrKind.CLd, true);
+            AddCompressed(map, RVInstrKind.CSd, true);
+            AddCompressed(map, RVInstrKind.CNop);
+            AddCompressed(map, RVInstrKind.CAddi);
+            AddCompressed(map, RVInstrKind.CJal);
+            AddCompressed(map, RVInstrKind.CAddiw, true);
+            AddCompressed(map, RVInstrKind.CLi);
+            AddCompressed(map, RVInstrKind.CAddi16Sp);
+            AddCompressed(map, RVInstrKind.CLui);
+            AddCompressed(map, RVInstrKind.CSrli);
+            AddCompressed(map, RVInstrKind.CSrai);
+            AddCompressed(map, RVInstrKind.CAndi);
+            AddCompressed(map, RVInstrKind.CSub);
+            AddCompressed(map, RVInstrKind.CXor);
+            AddCompressed(map, RVInstrKind.COr);
+            AddCompressed(map, RVInstrKind.CAnd);
+            AddCompressed(map, RVInstrKind.CSubw, true);
+            AddCompressed(map, RVInstrKind.CAddw, true);
+            AddCompressed(map, RVInstrKind.CJ);
+            AddCompressed(map, RVInstrKind.CBeqz);
+            AddCompressed(map, RVInstrKind.CBnez);
+            AddCompressed(map, RVInstrKind.CSlli);
+            AddCompressed(map, RVInstrKind.CLwSp);
+            AddCompressed(map, RVInstrKind.CLdSp, true);
+            AddCompressed(map, RVInstrKind.CJr);
+            AddCompressed(map, RVInstrKind.CMv);
+            AddCompressed(map, RVInstrKind.CEbreak);
+            AddCompressed(map, RVInstrKind.CJalr);
+            AddCompressed(map, RVInstrKind.CAdd);
+            AddCompressed(map, RVInstrKind.CSwSp);
+            AddCompressed(map, RVInstrKind.CSdSp, true);
             return map;
         }
 
-        private static void Add(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, RVInstructionFormat format, RVIsaFlags requiredIsa, bool requires64Bit, byte op, byte funct3, byte funct7)
+        private static void Add(
+            Dictionary<RVInstrKind, RVInstructionMetadata> map,
+            RVInstrKind opcode,
+            RVInstructionFormat format,
+            RVIsaFlags requiredIsa,
+            bool requires64Bit,
+            byte op,
+            byte funct3,
+            byte funct7)
             => map.Add(opcode, new RVInstructionMetadata(format, requiredIsa, requires64Bit, op, funct3, funct7));
 
         private static void AddFloatR(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, RVIsaFlags requiredIsa, byte funct7)
@@ -2131,6 +2495,10 @@ namespace Cnidaria.RiscV
 
         private static void AddAmo(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, bool requires64Bit, byte funct3, byte funct5)
             => Add(map, opcode, RVInstructionFormat.Amo, RVIsaFlags.A, requires64Bit, 0x2F, funct3, funct5);
+
+        private static void AddCompressed(
+            Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, bool requires64Bit = false, RVIsaFlags requiredIsa = RVIsaFlags.C)
+            => Add(map, opcode, RVInstructionFormat.Compressed, requiredIsa, requires64Bit, 0, 0, 0);
 
         private static void AddVectorLoad(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, byte width)
             => Add(map, opcode, RVInstructionFormat.VectorLoad, RVIsaFlags.V, false, 0x07, width, 0);
