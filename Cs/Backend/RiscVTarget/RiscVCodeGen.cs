@@ -482,6 +482,17 @@ namespace Cnidaria.Cs
                     return ResolveExternalSymbol(internalCallLabel);
                 }
 
+                if (method.IsExtern)
+                {
+                    ValidateExternalMethod(method);
+                    var externalLabel = _options.ExternalSymbolResolver?.Invoke(method);
+                    if (string.IsNullOrWhiteSpace(externalLabel))
+                        externalLabel = method.DllImportData?.EntryPointName;
+                    if (string.IsNullOrWhiteSpace(externalLabel))
+                        externalLabel = method.Name;
+                    return ResolveExternalSymbol(externalLabel);
+                }
+
                 if (_methodLabels.TryGetValue(method.MethodId, out var label))
                     return label;
 
@@ -1362,6 +1373,16 @@ namespace Cnidaria.Cs
                     }
                     label = ResolveExternalSymbol(internalCallLabel);
                 }
+                else if (target.IsExtern)
+                {
+                    ValidateExternalMethod(target);
+                    string? externalLabel = _options.ExternalSymbolResolver?.Invoke(target);
+                    if (string.IsNullOrWhiteSpace(externalLabel))
+                        externalLabel = target.DllImportData?.EntryPointName;
+                    if (string.IsNullOrWhiteSpace(externalLabel))
+                        externalLabel = target.Name;
+                    label = ResolveExternalSymbol(externalLabel);
+                }
                 else if (_methodLabels.TryGetValue(target.MethodId, out string? methodLabel))
                 {
                     label = methodLabel;
@@ -1378,6 +1399,67 @@ namespace Cnidaria.Cs
                 }
 
                 _virtualDispatchMethodLabels.Add(target.MethodId, label);
+                return true;
+            }
+
+            private static void ValidateExternalMethod(RuntimeMethod method)
+            {
+                if (method.GenericArity != 0 || method.DeclaringType.GenericTypeDefinition is not null)
+                    throw new NotSupportedException($"Generic external method M{method.MethodId} '{method.Name}' is not supported.");
+
+                var import = method.DllImportData;
+                if (import is not null)
+                {
+                    if (!method.IsStatic)
+                        throw new NotSupportedException($"DllImport method M{method.MethodId} '{method.Name}' must be static.");
+                    if (string.IsNullOrWhiteSpace(import.ModuleName))
+                        throw new NotSupportedException($"DllImport method M{method.MethodId} '{method.Name}' has no library name.");
+                    int characterSet = (int)import.CharacterSet;
+                    if (characterSet < (int)System.Runtime.InteropServices.CharSet.None ||
+                        characterSet > (int)System.Runtime.InteropServices.CharSet.Auto)
+                    {
+                        throw new NotSupportedException(
+                            $"CharSet value '{characterSet}' is invalid for RISC-V P/Invoke method M{method.MethodId} '{method.Name}'.");
+                    }
+                    if (import.CallingConvention is not System.Runtime.InteropServices.CallingConvention.Winapi and
+                        not System.Runtime.InteropServices.CallingConvention.Cdecl)
+                    {
+                        throw new NotSupportedException(
+                            $"Calling convention '{import.CallingConvention}' is not supported for RISC-V P/Invoke method M{method.MethodId} '{method.Name}'.");
+                    }
+                    if (!import.PreserveSig)
+                        throw new NotSupportedException($"PreserveSig=false is not supported for P/Invoke method M{method.MethodId} '{method.Name}'.");
+                    if (import.SetLastError)
+                        throw new NotSupportedException($"SetLastError=true is not supported for P/Invoke method M{method.MethodId} '{method.Name}'.");
+                }
+
+                if (!IsSupportedExternalAbiType(method.ReturnType, allowVoid: true))
+                {
+                    throw new NotSupportedException(
+                        $"Return type '{method.ReturnType.Namespace}.{method.ReturnType.Name}' is not supported for external method M{method.MethodId} '{method.Name}'.");
+                }
+
+                var parameters = method.ParameterTypes;
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    if (IsSupportedExternalAbiType(parameters[i], allowVoid: false))
+                        continue;
+
+                    throw new NotSupportedException(
+                        $"Parameter {i} type '{parameters[i].Namespace}.{parameters[i].Name}' is not supported for external method M{method.MethodId} '{method.Name}'.");
+                }
+            }
+
+            private static bool IsSupportedExternalAbiType(RuntimeType type, bool allowVoid)
+            {
+                if (type.PrimitiveKind == RuntimePrimitiveKind.Void)
+                    return allowVoid;
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
+                    return true;
+                if (type.Kind == RuntimeTypeKind.ByRef)
+                    return type.ElementType is not null && IsSupportedExternalAbiType(type.ElementType, allowVoid: false);
+                if (type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType || type.ContainsGcPointers)
+                    return false;
                 return true;
             }
 
@@ -3000,7 +3082,7 @@ namespace Cnidaria.Cs
                                 _target.SyncBlockSize +
                                 _target.ArrayDataOffset +
                                 (descriptor.Type.IsSzArray ? 0 : descriptor.Type.ArrayRank * 8))
-                            : descriptor.Type.Kind == RuntimeTypeKind.Pointer
+                            : descriptor.Type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer
                                 ? 0
                                 : descriptor.Type.Kind == RuntimeTypeKind.ByRef
                                     ? 1
@@ -3158,7 +3240,7 @@ namespace Cnidaria.Cs
                     return 1;
                 if (type.Kind == RuntimeTypeKind.Array)
                     return type.IsSzArray ? 2 : 3;
-                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                     return 4;
                 return 0;
             }
@@ -3166,7 +3248,7 @@ namespace Cnidaria.Cs
             private int GetArrayComponentSize(RuntimeType arrayType)
             {
                 RuntimeType elementType = arrayType.ElementType ?? throw new InvalidOperationException("Array runtime type has no element type.");
-                if (elementType.IsReferenceType || elementType.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                if (elementType.IsReferenceType || elementType.Kind is RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
                     return _target.PointerSize;
                 return Math.Max(1, elementType.SizeOf);
             }
@@ -3179,7 +3261,7 @@ namespace Cnidaria.Cs
                 const uint hasComponentSize = 0x80000000u;
 
                 uint flags = GetMethodTableElementType(descriptor.Type) << (int)elementTypeShift;
-                if (descriptor.Type.Kind is RuntimeTypeKind.Array or RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                if (descriptor.Type.Kind is RuntimeTypeKind.Array or RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                     flags |= parameterizedKind;
                 if (descriptor.Fields.Length != 0 || descriptor.ComponentFields.Length != 0)
                     flags |= hasPointers;
@@ -3237,6 +3319,7 @@ namespace Cnidaria.Cs
                     RuntimeTypeKind.Array => type.IsSzArray ? 0x18u : 0x17u,
                     RuntimeTypeKind.ByRef => 0x19u,
                     RuntimeTypeKind.Pointer => 0x1au,
+                    RuntimeTypeKind.FunctionPointer => 0x1bu,
                     RuntimeTypeKind.Class => 0x14u,
                     _ => 0u,
                 };
@@ -3421,6 +3504,7 @@ namespace Cnidaria.Cs
                             return true;
                         }
                         if (node.TreeKind == GenTreeKind.DelegateInvoke ||
+                            node.TreeKind == GenTreeKind.IndirectCall ||
                             node.TreeKind == GenTreeKind.VirtualCall ||
                             (node.TreeKind == GenTreeKind.Call &&
                              (node.Method?.HasInternalCall != true ||
@@ -4024,6 +4108,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.TempAddr:
                             EmitAddressTree(node);
                             return;
+                        case GenTreeKind.FunctionPointer:
+                            EmitFunctionPointer(node);
+                            return;
                         case GenTreeKind.Unary:
                             EmitUnary(node);
                             return;
@@ -4048,6 +4135,9 @@ namespace Cnidaria.Cs
                             return;
                         case GenTreeKind.Call:
                             EmitCall(node);
+                            return;
+                        case GenTreeKind.IndirectCall:
+                            EmitIndirectFunctionPointerCall(node);
                             return;
                         case GenTreeKind.VirtualCall:
                             EmitVirtualCall(node);
@@ -4127,10 +4217,42 @@ namespace Cnidaria.Cs
                             EmitDelegateCombineOrRemove(node, remove: true);
                             return;
                         case GenTreeKind.AllocHGlobal:
+                            EmitAllocHGlobal(node);
+                            return;
                         case GenTreeKind.FreeHGlobal:
+                            EmitFreeHGlobal(node);
+                            return;
                         default:
                             throw Unsupported(node, $"Unsupported GenTree kind {node.TreeKind}");
                     }
+                }
+
+                private void EmitAllocHGlobal(GenTree node)
+                {
+                    if (node.Uses.Length != 1 || node.Results.Length != 1)
+                        throw Unsupported(node, "AllocHGlobal requires one size operand and one result");
+
+                    MachineRegister size = RequireUseRegisterForOperand(node, 0, "allocation size");
+                    MachineRegister result = RequireResultRegister(node);
+                    _owner.EmitMove(RVRegister.X10, ToIntegerRegister(size));
+                    MarkEhCallSite(node, "alloc_hglobal");
+                    _owner.EmitPcrelTransfer(
+                        _owner.ResolveExternalSymbol(RiscVRuntime.AllocHGlobalSymbol),
+                        link: true);
+                    _owner.EmitMove(ToIntegerRegister(result), RVRegister.X10);
+                }
+
+                private void EmitFreeHGlobal(GenTree node)
+                {
+                    if (node.Uses.Length != 1 || node.Results.Length != 0)
+                        throw Unsupported(node, "FreeHGlobal requires one pointer operand and no result");
+
+                    MachineRegister pointer = RequireUseRegisterForOperand(node, 0, "allocation pointer");
+                    _owner.EmitMove(RVRegister.X10, ToIntegerRegister(pointer));
+                    MarkEhCallSite(node, "free_hglobal");
+                    _owner.EmitPcrelTransfer(
+                        _owner.ResolveExternalSymbol(RiscVRuntime.FreeHGlobalSymbol),
+                        link: true);
                 }
 
 
@@ -4208,8 +4330,6 @@ namespace Cnidaria.Cs
 
                     if (!boxedType.IsValueType)
                         throw Unsupported(node, "Box source must be a value type or an instantiated reference type");
-                    if (Target.OperatingSystem != OperatingSystemKind.Linux)
-                        throw Unsupported(node, "Boxing is implemented only for Linux RISC-V targets");
                     if (TypeOperationScratchSize < Math.Max(1, boxedType.SizeOf))
                         throw Unsupported(node, "Type-operation scratch area is smaller than the box source");
 
@@ -4878,6 +4998,14 @@ namespace Cnidaria.Cs
                     throw Unsupported(node, "Address tree has an invalid operand shape");
                 }
 
+                private void EmitFunctionPointer(GenTree node)
+                {
+                    RuntimeMethod method = node.Method ?? throw Unsupported(node, "function pointer node has no runtime method");
+                    _owner.EmitMaterializeAddress(
+                        _owner.ResolveMethodLabel(method),
+                        ToIntegerRegister(RequireResultRegister(node)));
+                }
+
                 private void EmitUnary(GenTree node)
                 {
                     var destination = RequireResultRegister(node);
@@ -4916,6 +5044,10 @@ namespace Cnidaria.Cs
                                 -1));
                             if (IsI4(type, kind) && MachineTarget.Is64Bit)
                                 _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, ToIntegerRegister(destination), ToIntegerRegister(destination), 0));
+                            return;
+                        case BytecodeOp.FnPtrToPtr:
+                        case BytecodeOp.PtrToFnPtr:
+                            _owner.EmitMove(ToIntegerRegister(destination), ToIntegerRegister(source));
                             return;
                         default:
                             throw Unsupported(node, $"Unsupported unary opcode {node.SourceOp}");
@@ -5080,21 +5212,24 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_div_nonzero_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, nonZero);
-                    EmitManagedExceptionThrow(node, "DivideByZeroException");
-                    _owner.DefineLabel(nonZero);
-
-                    string perform = _owner.CreateLocalLabel($"{_methodLabel}_div_perform_{node.LinearId}");
-                    if (!unsigned)
+                    if ((node.Flags & GenTreeFlags.DivModNoByZero) == 0)
                     {
+                        string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_div_nonzero_{node.LinearId}");
+                        EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, nonZero);
+                        EmitManagedExceptionThrow(node, "DivideByZeroException");
+                        _owner.DefineLabel(nonZero);
+                    }
+
+                    if (!unsigned && (node.Flags & GenTreeFlags.DivModNoOverflow) == 0)
+                    {
+                        string perform = _owner.CreateLocalLabel($"{_methodLabel}_div_perform_{node.LinearId}");
                         _owner.EmitLoadImmediate(RVRegister.X30, -1);
                         EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X30, perform);
                         _owner.EmitLoadImmediate(RVRegister.X30, i4 ? int.MinValue : long.MinValue);
                         EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X30, perform);
                         EmitManagedExceptionThrow(node, "OverflowException");
+                        _owner.DefineLabel(perform);
                     }
-                    _owner.DefineLabel(perform);
 
                     bool divide = node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un;
                     RVInstrKind opcode = divide
@@ -5818,7 +5953,8 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "VirtualCall receiver is not in the first integer argument register");
 
                     RVRegister receiver = ToIntegerRegister(receiverRegister);
-                    EmitNullCheck(node, receiver, "virtual_call");
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, receiver, "virtual_call");
 
                     if (method.DeclaringType.Kind != RuntimeTypeKind.Interface &&
                         (method.DeclaringType.IsValueType || method.VTableSlot < 0))
@@ -5904,9 +6040,6 @@ namespace Cnidaria.Cs
 
                 private void EmitNewDelegate(GenTree node)
                 {
-                    if (Target.OperatingSystem != OperatingSystemKind.Linux)
-                        throw Unsupported(node, "Delegate allocation is implemented only for Linux RISC-V targets");
-
                     RuntimeType delegateType = node.RuntimeType ?? node.Type ??
                         throw Unsupported(node, "NewDelegate node has no delegate runtime type");
                     RuntimeMethod targetMethod = node.Method ??
@@ -5980,7 +6113,8 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "DelegateInvoke has no receiver operand");
 
                     LoadDelegateInvokeOperand(node.Uses[receiverUseIndex], MachineRegister.X28, Target.PointerSize);
-                    EmitNullCheck(node, RVRegister.X28, "delegate_invoke");
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, RVRegister.X28, "delegate_invoke");
 
                     int methodPtrOffset = _owner.FindDelegateFieldOffset(delegateType, "_methodPtr");
                     int invocationListOffset = _owner.FindDelegateFieldOffset(delegateType, "_invocationList");
@@ -6126,8 +6260,6 @@ namespace Cnidaria.Cs
 
                 private void EmitDelegateCombineOrRemove(GenTree node, bool remove)
                 {
-                    if (Target.OperatingSystem != OperatingSystemKind.Linux)
-                        throw Unsupported(node, "Delegate combination is implemented only for Linux RISC-V targets");
                     if (node.Uses.Length != 2 || node.Results.Length != 1 || !node.Results[0].IsRegister)
                         throw Unsupported(node, "Delegate combine/remove requires two register operands and one register result");
                     if (!node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
@@ -6195,6 +6327,35 @@ namespace Cnidaria.Cs
                 {
                     _owner.EmitLoadImmediate(RVRegister.X10, code);
                     _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.FailFastSymbol), link: false);
+                }
+
+                private void EmitIndirectFunctionPointerCall(GenTree node)
+                {
+                    RuntimeType signature = node.RuntimeType ?? throw Unsupported(node, "indirect call has no function pointer signature");
+                    if (signature.Kind != RuntimeTypeKind.FunctionPointer || signature.FunctionPointerCallingConvention != 0)
+                        throw Unsupported(node, "indirect call has an unsupported function pointer signature");
+
+                    int targetIndex = -1;
+                    for (int i = 0; i < node.UseRoles.Length; i++)
+                    {
+                        if (node.UseRoles[i] == OperandRole.IndirectCallTarget)
+                        {
+                            if (targetIndex >= 0)
+                                throw Unsupported(node, "indirect call has multiple target operands");
+                            targetIndex = i;
+                        }
+                    }
+                    if (targetIndex < 0 || !node.Uses[targetIndex].IsRegister)
+                        throw Unsupported(node, "indirect call has no target register");
+
+                    SafePointDraft safePoint = PrepareSafePoint(node);
+                    MarkEhCallSite(node, "calli");
+                    _owner.Emit(RVInstruction.I(
+                        RVInstrKind.Jalr,
+                        RVRegister.X1,
+                        ToIntegerRegister(node.Uses[targetIndex].Register),
+                        0));
+                    _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
                 private void EmitCall(GenTree node)
@@ -6328,7 +6489,8 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Array data reference requires one array use and one register result");
 
                     RVRegister array = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "array data reference"));
-                    EmitArrayNullCheck(node, array);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitArrayNullCheck(node, array);
                     EmitMemoryLoad(MachineRegister.X30, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
@@ -6400,7 +6562,7 @@ namespace Cnidaria.Cs
 
                     RVRegister array = ToIntegerRegister(node.Uses[arrayUseIndex].Register);
                     RVRegister index = ToIntegerRegister(node.Uses[indexUseIndex].Register);
-                    if (!nullChecked)
+                    if (!nullChecked && (node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         EmitArrayNullCheck(node, array);
 
                     if (MachineTarget.Is64Bit && IsI4(OperandType(node, 1), OperandStackKind(node, 1)))
@@ -6414,11 +6576,14 @@ namespace Cnidaria.Cs
                         index = RVRegister.X29;
                     }
 
-                    EmitMemoryLoad(MachineRegister.X30, array, Target.ArrayLengthOffset, 4, signed: true);
-                    string inRange = _owner.CreateLocalLabel(_methodLabel + "_array_index_in_range");
-                    EmitLongConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
-                    EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
-                    _owner.DefineLabel(inRange);
+                    if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                    {
+                        EmitMemoryLoad(MachineRegister.X30, array, Target.ArrayLengthOffset, 4, signed: true);
+                        string inRange = _owner.CreateLocalLabel(_methodLabel + "_array_index_in_range");
+                        EmitLongConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
+                        EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
+                        _owner.DefineLabel(inRange);
+                    }
 
                     int elementSize = ArrayElementSize(elementType);
                     if (elementSize != 1)
@@ -6470,7 +6635,8 @@ namespace Cnidaria.Cs
                     string done = _owner.CreateLocalLabel(_methodLabel + "_array_element_type_ok");
                     string fail = _owner.CreateLocalLabel(_methodLabel + "_array_element_type_fail");
 
-                    EmitArrayNullCheck(node, array);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitArrayNullCheck(node, array);
                     EmitMemoryLoad(MachineRegister.X30, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
@@ -7075,9 +7241,6 @@ namespace Cnidaria.Cs
 
                 private void EmitNewObject(GenTree node)
                 {
-                    if (Target.OperatingSystem != OperatingSystemKind.Linux)
-                        throw Unsupported(node, "Reference allocation is implemented only for Linux RISC-V targets");
-
                     RuntimeMethod constructor = node.Method ?? throw Unsupported(node, "NewObject node has no constructor");
                     RuntimeType objectType = constructor.DeclaringType;
                     if (!constructor.HasThis)
@@ -7196,7 +7359,8 @@ namespace Cnidaria.Cs
                     RuntimeType fieldType = field.FieldType;
                     GenStackKind kind = StackKindForType(fieldType);
                     RVRegister instance = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "field instance"));
-                    EmitNullCheck(node, instance, "field");
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, instance, "field");
 
                     switch (node.TreeKind)
                     {
@@ -7295,14 +7459,16 @@ namespace Cnidaria.Cs
                     if (node.TreeKind == GenTreeKind.LoadIndirect)
                     {
                         RVRegister address = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "indirect load address"));
-                        EmitNullCheck(node, address, "indirect_load");
+                        if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                            EmitNullCheck(node, address, "indirect_load");
                         EmitValueFromAddress(node, type, kind, address);
                         return;
                     }
 
                     RuntimeType storeType = type ?? throw Unsupported(node, "Indirect store has no runtime type");
                     RVRegister destination = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "indirect store address"));
-                    EmitNullCheck(node, destination, "indirect_store");
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, destination, "indirect_store");
                     EmitValueToAddress(
                         node,
                         RequireCodegenUseIndexForOperand(node, 1, "indirect store value"),
@@ -8115,7 +8281,7 @@ namespace Cnidaria.Cs
                         RuntimePrimitiveKind.Int64 or RuntimePrimitiveKind.UInt64 => GenStackKind.I8,
                         RuntimePrimitiveKind.NativeInt => GenStackKind.NativeInt,
                         RuntimePrimitiveKind.NativeUInt => GenStackKind.NativeUInt,
-                        _ => type.Kind is RuntimeTypeKind.Pointer ? GenStackKind.Ptr :
+                        _ => type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer ? GenStackKind.Ptr :
                              type.Kind is RuntimeTypeKind.ByRef ? GenStackKind.ByRef :
                              type.IsValueType && type.PrimitiveKind == RuntimePrimitiveKind.None ? GenStackKind.Value : GenStackKind.I4,
                     };
@@ -8153,7 +8319,10 @@ namespace Cnidaria.Cs
 
                 private static bool IsAggregate(RuntimeType? type, GenStackKind kind)
                     => kind == GenStackKind.Value ||
-                       (type is not null && type.IsValueType && type.PrimitiveKind == RuntimePrimitiveKind.None);
+                       (type is not null &&
+                        type.Kind != RuntimeTypeKind.FunctionPointer &&
+                        type.IsValueType &&
+                        type.PrimitiveKind == RuntimePrimitiveKind.None);
 
                 private void RequireFloatingExtension(int size)
                 {
@@ -8265,6 +8434,11 @@ namespace Cnidaria.Cs
                 while (_data.Count < aligned)
                     _data.Add(0);
                 return aligned;
+                static int AlignUp(int value, int alignment)
+                {
+                    int remainder = value % alignment;
+                    return remainder == 0 ? value : checked(value + alignment - remainder);
+                }
             }
 
             public void EmitBytes(byte[] bytes)
@@ -8280,11 +8454,6 @@ namespace Cnidaria.Cs
             public RVDataSection ToSection()
                 => new RVDataSection(Name, Kind, Alignment, _data.ToImmutableArray(), 0, _relocations.ToImmutableArray());
 
-            private static int AlignUp(int value, int alignment)
-            {
-                int remainder = value % alignment;
-                return remainder == 0 ? value : checked(value + alignment - remainder);
-            }
         }
     }
 }

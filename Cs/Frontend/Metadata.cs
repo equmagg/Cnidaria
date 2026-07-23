@@ -65,7 +65,8 @@ namespace Cnidaria.Cs
         MethodSpec,
         Constant,
         Property,
-        CustomAttribute
+        CustomAttribute,
+        PInvokeMap
     }
 
     public interface IMetadataView
@@ -96,12 +97,13 @@ namespace Cnidaria.Cs
         ConstantRow GetConstant(int rid);
         PropertyRow GetProperty(int rid);
         CustomAttributeRow GetCustomAttribute(int rid);
+        PInvokeMapRow GetPInvokeMap(int rid);
 
     }
     internal sealed class FlatMetadataView : IMetadataView
     {
         private readonly ReadOnlyMemory<byte> _data;
-        private readonly SectionDesc[] _sections = new SectionDesc[(int)FlatMdSection.CustomAttributeTable + 1];
+        private readonly SectionDesc[] _sections = new SectionDesc[(int)FlatMdSection.PInvokeMapTable + 1];
         public FlatMetadataView(ReadOnlyMemory<byte> data)
         {
             _data = data;
@@ -128,6 +130,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.Constant => Section(FlatMdSection.ConstantTable).Count,
             MetadataTableKind.Property => Section(FlatMdSection.PropertyTable).Count,
             MetadataTableKind.CustomAttribute => Section(FlatMdSection.CustomAttributeTable).Count,
+            MetadataTableKind.PInvokeMap => Section(FlatMdSection.PInvokeMapTable).Count,
             _ => throw new ArgumentOutOfRangeException(nameof(table))
         };
 
@@ -190,6 +193,15 @@ namespace Cnidaria.Cs
             int value = ReadI32(_data.Span, p); p += 4;
             byte target = _data.Span[p];
             return new CustomAttributeRow(parentToken, attributeTypeToken, value, target);
+        }
+        public PInvokeMapRow GetPInvokeMap(int rid)
+        {
+            int p = GetRowOffset(FlatMdSection.PInvokeMapTable, rid, 16);
+            int methodToken = ReadI32(_data.Span, p); p += 4;
+            int moduleName = ReadI32(_data.Span, p); p += 4;
+            int entryPointName = ReadI32(_data.Span, p); p += 4;
+            uint flags = BinaryPrimitives.ReadUInt32LittleEndian(_data.Span.Slice(p, 4));
+            return new PInvokeMapRow(methodToken, moduleName, entryPointName, flags);
         }
         public InterfaceImplRow GetInterfaceImpl(int rid)
         {
@@ -484,6 +496,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.Constant => _md.Constants.Count,
             MetadataTableKind.Property => _md.Properties.Count,
             MetadataTableKind.CustomAttribute => _md.CustomAttributes.Count,
+            MetadataTableKind.PInvokeMap => _md.PInvokeMaps.Count,
             _ => throw new ArgumentOutOfRangeException(nameof(table))
         };
 
@@ -527,6 +540,7 @@ namespace Cnidaria.Cs
         public ConstantRow GetConstant(int rid) => _md.Constants[rid - 1];
         public PropertyRow GetProperty(int rid) => _md.Properties[rid - 1];
         public CustomAttributeRow GetCustomAttribute(int rid) => _md.CustomAttributes[rid - 1];
+        public PInvokeMapRow GetPInvokeMap(int rid) => _md.PInvokeMaps[rid - 1];
     }
     internal enum FlatMdSection : ushort
     {
@@ -557,6 +571,7 @@ namespace Cnidaria.Cs
         PropertyTable = 112,
         MethodSpecTable = 113,
         CustomAttributeTable = 114,
+        PInvokeMapTable = 115,
     }
     internal sealed class AttrBlobWriter
     {
@@ -775,6 +790,7 @@ namespace Cnidaria.Cs
             WriteProperties(md.Properties, plan.Get(FlatMdSection.PropertyTable), dest);
             WriteMethodSpecs(md.MethodSpecs, plan.Get(FlatMdSection.MethodSpecTable), dest);
             WriteCustomAttributes(md.CustomAttributes, plan.Get(FlatMdSection.CustomAttributeTable), dest);
+            WritePInvokeMaps(md.PInvokeMaps, plan.Get(FlatMdSection.PInvokeMapTable), dest);
         }
         private static LayoutPlan BuildPlan(MetadataImage md)
         {
@@ -823,6 +839,8 @@ namespace Cnidaria.Cs
 
             Add(ref i, FlatMdSection.CustomAttributeTable, elemSize: 16, count: md.CustomAttributes.Count,
                 size: checked(md.CustomAttributes.Count * 16), ref cursor, sections);
+            Add(ref i, FlatMdSection.PInvokeMapTable, elemSize: 16, count: md.PInvokeMaps.Count,
+                size: checked(md.PInvokeMaps.Count * 16), ref cursor, sections);
 
             return new LayoutPlan(
                 headerSize: headerBytes,
@@ -949,6 +967,18 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Blob heap size mismatch.");
         }
 
+        private static void WritePInvokeMaps(List<PInvokeMapRow> rows, SectionDesc s, Span<byte> dest)
+        {
+            int p = s.Offset;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                WriteI32(dest, ref p, r.MethodToken);
+                WriteI32(dest, ref p, r.ModuleName);
+                WriteI32(dest, ref p, r.EntryPointName);
+                WriteU32(dest, ref p, r.Flags);
+            }
+        }
         private static void WriteCustomAttributes(List<CustomAttributeRow> rows, SectionDesc s, Span<byte> dest)
         {
             int p = s.Offset;
@@ -1244,6 +1274,7 @@ namespace Cnidaria.Cs
         public List<ConstantRow> Constants { get; } = new();
         public List<PropertyRow> Properties { get; } = new();
         public List<CustomAttributeRow> CustomAttributes { get; } = new();
+        public List<PInvokeMapRow> PInvokeMaps { get; } = new();
         public MetadataImage(string moduleName, string defaultExternalAssemblyName)
         {
             ModuleName = moduleName ?? "";
@@ -1385,6 +1416,21 @@ namespace Cnidaria.Cs
             DeclarationMethodToken = declarationMethodToken;
         }
     }
+    public struct PInvokeMapRow
+    {
+        public int MethodToken;
+        public int ModuleName;
+        public int EntryPointName;
+        public uint Flags;
+
+        public PInvokeMapRow(int methodToken, int moduleName, int entryPointName, uint flags)
+        {
+            MethodToken = methodToken;
+            ModuleName = moduleName;
+            EntryPointName = entryPointName;
+            Flags = flags;
+        }
+    }
     public struct FieldRow
     {
         public ushort Flags;
@@ -1523,7 +1569,10 @@ namespace Cnidaria.Cs
         VAR = 0x13,
         ARRAY = 0x14,
         GENERICINST = 0x15,
+        FNPTR = 0x1B,
         OBJECT = 0x1C,
+        CMOD_REQD = 0x1F,
+        CMOD_OPT = 0x20,
         I = 0x18,
         U = 0x19,
         SZARRAY = 0x1D,
@@ -1599,6 +1648,7 @@ namespace Cnidaria.Cs
 
         private readonly Dictionary<TypeSymbol, int> _typeRefTokens
             = new(ReferenceEqualityComparer<TypeSymbol>.Instance);
+        private readonly Dictionary<(string Assembly, string Namespace, string Name), int> _externalTypeRefTokens = new();
         private readonly Dictionary<TypeSymbol, int> _typeSpecTokens
             = new(ReferenceEqualityComparer<TypeSymbol>.Instance);
 
@@ -1898,6 +1948,24 @@ namespace Cnidaria.Cs
             _assemblyRefTokenByName[name] = tok;
             return tok;
         }
+        private int GetOrAddExternalTypeRef(string @namespace, string name, string? assemblyName = null)
+        {
+            string assembly = string.IsNullOrEmpty(assemblyName)
+                ? Image.DefaultExternalAssemblyName
+                : assemblyName;
+            var key = (assembly, @namespace, name);
+            if (_externalTypeRefTokens.TryGetValue(key, out var token))
+                return token;
+
+            int scopeToken = EnsureAssemblyRef(assembly);
+            int namespaceIndex = Image.Strings.Add(@namespace);
+            int nameIndex = Image.Strings.Add(name);
+            int rid = Image.TypeRefs.Count + 1;
+            Image.TypeRefs.Add(new TypeRefRow(scopeToken, nameIndex, namespaceIndex));
+            token = MetadataToken.Make(MetadataToken.TypeRef, rid);
+            _externalTypeRefTokens.Add(key, token);
+            return token;
+        }
 
         private ImmutableArray<NamedTypeSymbol> CollectAllModuleTypes(NamespaceSymbol root)
         {
@@ -2060,7 +2128,27 @@ namespace Cnidaria.Cs
                         mflags |= MetadataFlagBits.Extension;
 
                     ushort implFlags = MethodAttributeFacts.GetMethodImplFlags(m);
+                    if (m.IsExtern)
+                        implFlags |= MetadataFlagBits.Extern;
+                    var dllImport = m.GetDllImportData();
+                    if (dllImport is not null)
+                    {
+                        mflags |= (ushort)System.Reflection.MethodAttributes.PinvokeImpl;
+                        if (dllImport.PreserveSig)
+                            implFlags |= (ushort)System.Reflection.MethodImplAttributes.PreserveSig;
+                        else
+                            implFlags &= unchecked((ushort)~(ushort)System.Reflection.MethodImplAttributes.PreserveSig);
+                    }
                     Image.Methods.Add(new MethodDefRow(implFlags: implFlags, flags: mflags, name: mNameIdx, signature: sigIdx, paramList: paramListRid));
+                    if (dllImport is not null)
+                    {
+                        int methodToken = _methodDefTokens[m];
+                        Image.PInvokeMaps.Add(new PInvokeMapRow(
+                            methodToken,
+                            Image.Strings.Add(dllImport.ModuleName),
+                            Image.Strings.Add(dllImport.EntryPointName),
+                            PInvokeMetadataFlags.Encode(dllImport)));
+                    }
                     if (isExplicitInterfaceImpl)
                     {
                         int bodyMethodToken = _methodDefTokens[m];
@@ -2523,6 +2611,26 @@ namespace Cnidaria.Cs
                     WriteTypeSig(w, ptr.PointedAtType);
                     return;
 
+                case FunctionPointerTypeSymbol functionPointer:
+                    w.Byte((byte)SigElementType.FNPTR);
+                    w.Byte(functionPointer.CallingConvention switch
+                    {
+                        FunctionPointerCallingConvention.Managed => (byte)0x00,
+                        FunctionPointerCallingConvention.Cdecl => (byte)0x01,
+                        FunctionPointerCallingConvention.Stdcall => (byte)0x02,
+                        FunctionPointerCallingConvention.Thiscall => (byte)0x03,
+                        FunctionPointerCallingConvention.Fastcall => (byte)0x04,
+                        _ => (byte)0x09
+                    });
+                    w.CompressedUInt((uint)functionPointer.Parameters.Length);
+                    WriteFunctionPointerSignatureType(w, functionPointer.ReturnType, functionPointer.ReturnRefKind);
+                    for (int i = 0; i < functionPointer.Parameters.Length; i++)
+                    {
+                        var parameter = functionPointer.Parameters[i];
+                        WriteFunctionPointerSignatureType(w, parameter.Type, parameter.RefKind);
+                    }
+                    return;
+
                 case ArrayTypeSymbol arr:
                     if (arr.Rank == 1)
                     {
@@ -2591,6 +2699,52 @@ namespace Cnidaria.Cs
                 default:
                     throw new NotSupportedException($"TypeSig not supported: {type.GetType().Name}");
             }
+        }
+        private void WriteFunctionPointerSignatureType(
+            SigWriter writer,
+            TypeSymbol type,
+            FunctionPointerRefKind refKind)
+        {
+            if (refKind != FunctionPointerRefKind.None)
+            {
+                writer.Byte((byte)SigElementType.BYREF);
+                switch (refKind)
+                {
+                    case FunctionPointerRefKind.Out:
+                        WriteFunctionPointerCustomModifier(
+                            writer,
+                            true,
+                            "System.Runtime.InteropServices",
+                            "OutAttribute");
+                        break;
+                    case FunctionPointerRefKind.In:
+                        WriteFunctionPointerCustomModifier(
+                            writer,
+                            true,
+                            "System.Runtime.InteropServices",
+                            "InAttribute");
+                        break;
+                    case FunctionPointerRefKind.RefReadOnly:
+                        WriteFunctionPointerCustomModifier(
+                            writer,
+                            false,
+                            "System.Runtime.CompilerServices",
+                            "RequiresLocationAttribute");
+                        break;
+                }
+            }
+            WriteTypeSig(writer, type);
+        }
+
+        private void WriteFunctionPointerCustomModifier(
+            SigWriter writer,
+            bool required,
+            string @namespace,
+            string name)
+        {
+            writer.Byte((byte)(required ? SigElementType.CMOD_REQD : SigElementType.CMOD_OPT));
+            int token = GetOrAddExternalTypeRef(@namespace, name);
+            writer.CompressedUInt(SigEncoding.EncodeTypeDefOrRef(token));
         }
         private static void CollectEffectiveTypeArguments(NamedTypeSymbol type, List<TypeSymbol> dest)
         {

@@ -33,6 +33,11 @@ namespace Cnidaria.Cs
                 return CanConvertMethodGroupToDelegate(methodGroup, target, context)
                     ? new Conversion(ConversionKind.Identity)
                     : new Conversion(ConversionKind.None);
+            if (expr is BoundFunctionPointerMethodGroupExpression functionPointerMethodGroup)
+                return target is FunctionPointerTypeSymbol functionPointerType &&
+                    TryResolveFunctionPointerMethodGroup(functionPointerMethodGroup, functionPointerType, context, out _)
+                    ? new Conversion(ConversionKind.Identity)
+                    : new Conversion(ConversionKind.None);
             if (expr is BoundStackAllocArrayCreationExpression sa &&
                 TryGetSpanLikeElementType(target, out _, out var spanElemType) &&
                 ReferenceEquals(sa.ElementType, spanElemType))
@@ -173,6 +178,20 @@ namespace Cnidaria.Cs
                 case (ByRefTypeSymbol aa, ByRefTypeSymbol bb):
                     return AreSameType(aa.ElementType, bb.ElementType);
 
+                case (FunctionPointerTypeSymbol aa, FunctionPointerTypeSymbol bb):
+                    if (aa.CallingConvention != bb.CallingConvention ||
+                        aa.ReturnRefKind != bb.ReturnRefKind ||
+                        aa.Parameters.Length != bb.Parameters.Length ||
+                        !AreSameType(aa.ReturnType, bb.ReturnType))
+                        return false;
+                    for (int i = 0; i < aa.Parameters.Length; i++)
+                    {
+                        if (aa.Parameters[i].RefKind != bb.Parameters[i].RefKind ||
+                            !AreSameType(aa.Parameters[i].Type, bb.Parameters[i].Type))
+                            return false;
+                    }
+                    return true;
+
                 case (TupleTypeSymbol aa, TupleTypeSymbol bb):
                     if (aa.ElementTypes.Length != bb.ElementTypes.Length)
                         return false;
@@ -222,6 +241,59 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
+        private static bool HasImplicitFunctionPointerConversion(
+            FunctionPointerTypeSymbol source,
+            FunctionPointerTypeSymbol destination)
+        {
+            if (source.CallingConvention != destination.CallingConvention ||
+                source.Parameters.Length != destination.Parameters.Length ||
+                source.ReturnRefKind != destination.ReturnRefKind)
+                return false;
+
+            for (int i = 0; i < source.Parameters.Length; i++)
+            {
+                var sourceParameter = source.Parameters[i];
+                var destinationParameter = destination.Parameters[i];
+                if (sourceParameter.RefKind != destinationParameter.RefKind)
+                    return false;
+
+                if (sourceParameter.RefKind == FunctionPointerRefKind.None)
+                {
+                    if (!HasFunctionPointerSignatureTypeConversion(sourceParameter.Type, destinationParameter.Type))
+                        return false;
+                }
+                else if (!AreSameType(sourceParameter.Type, destinationParameter.Type))
+                {
+                    return false;
+                }
+            }
+
+            if (source.ReturnRefKind == FunctionPointerRefKind.None)
+                return HasFunctionPointerSignatureTypeConversion(destination.ReturnType, source.ReturnType);
+
+            return AreSameType(source.ReturnType, destination.ReturnType);
+        }
+
+        private static bool HasFunctionPointerSignatureTypeConversion(TypeSymbol source, TypeSymbol destination)
+        {
+            if (AreSameType(source, destination))
+                return true;
+
+            if (HasImplicitReferenceConversion(source, destination))
+                return true;
+
+            if (destination is PointerTypeSymbol destinationPointer &&
+                destinationPointer.PointedAtType.SpecialType == SpecialType.System_Void &&
+                source is PointerTypeSymbol or FunctionPointerTypeSymbol)
+                return true;
+
+            if (source is FunctionPointerTypeSymbol sourceFunctionPointer &&
+                destination is FunctionPointerTypeSymbol destinationFunctionPointer)
+                return HasImplicitFunctionPointerConversion(sourceFunctionPointer, destinationFunctionPointer);
+
+            return false;
+        }
+
         internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, TargetInfo? targetInfo = null)
         {
             targetInfo ??= TargetInfo.Default;
@@ -251,7 +323,7 @@ namespace Cnidaria.Cs
             // null literal
             if (expr.Type is NullTypeSymbol)
             {
-                if (target.IsReferenceType || target is PointerTypeSymbol)
+                if (target.IsReferenceType || target is PointerTypeSymbol or FunctionPointerTypeSymbol)
                     return new Conversion(ConversionKind.NullLiteral);
                 if (TryGetSystemNullableInfo(target, out _, out _))
                     return new Conversion(ConversionKind.NullLiteral);
@@ -279,11 +351,13 @@ namespace Cnidaria.Cs
                 return new Conversion(underlyingConv2.IsImplicit ? ConversionKind.ImplicitNullable : ConversionKind.ExplicitNullable);
             }
             if (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is null
-                && (target.IsReferenceType || target is PointerTypeSymbol))
+                && (target.IsReferenceType || target is PointerTypeSymbol or FunctionPointerTypeSymbol))
                 return new Conversion(ConversionKind.NullLiteral);
 
             // pointer conversions
             if (target is PointerTypeSymbol && TryImplicitConstantZeroPointerConversion(expr))
+                return new Conversion(ConversionKind.ImplicitConstant);
+            if (target is FunctionPointerTypeSymbol && TryImplicitConstantZeroPointerConversion(expr))
                 return new Conversion(ConversionKind.ImplicitConstant);
             if (expr.Type is PointerTypeSymbol fromPtr && target is PointerTypeSymbol toPtr)
             {
@@ -316,6 +390,22 @@ namespace Cnidaria.Cs
             {
                 return new Conversion(ConversionKind.ExplicitNumeric);
             }
+            if (expr.Type is FunctionPointerTypeSymbol && target is PointerTypeSymbol functionPointerTargetPointer &&
+                functionPointerTargetPointer.PointedAtType.SpecialType == SpecialType.System_Void)
+                return new Conversion(ConversionKind.ImplicitNumeric);
+            if (expr.Type is PointerTypeSymbol functionPointerSourcePointer &&
+                functionPointerSourcePointer.PointedAtType.SpecialType == SpecialType.System_Void &&
+                target is FunctionPointerTypeSymbol)
+                return new Conversion(ConversionKind.ExplicitNumeric);
+            if (expr.Type is FunctionPointerTypeSymbol sourceFunctionPointer &&
+                target is FunctionPointerTypeSymbol destinationFunctionPointer)
+            {
+                return new Conversion(HasImplicitFunctionPointerConversion(sourceFunctionPointer, destinationFunctionPointer)
+                    ? ConversionKind.ImplicitNumeric
+                    : ConversionKind.ExplicitNumeric);
+            }
+            if (expr.Type is FunctionPointerTypeSymbol || target is FunctionPointerTypeSymbol)
+                return new Conversion(ConversionKind.None);
 
             // tuple conversions
             if (expr.Type is TupleTypeSymbol fromTuple && target is TupleTypeSymbol toTuple)

@@ -597,15 +597,28 @@ namespace Cnidaria.Cs
             int defPosition,
             TargetInfo target)
         {
+            GenTree? indirectTarget = null;
+            ImmutableArray<GenTree> callArguments = node.RegisterUses;
+            if (node.Kind == GenTreeKind.IndirectCall)
+            {
+                if (node.RegisterUses.IsDefaultOrEmpty)
+                    throw new InvalidOperationException("Indirect call has no target operand.");
+                indirectTarget = node.RegisterUses[0];
+                var arguments = ImmutableArray.CreateBuilder<GenTree>(node.RegisterUses.Length - 1);
+                for (int i = 1; i < node.RegisterUses.Length; i++)
+                    arguments.Add(node.RegisterUses[i]);
+                callArguments = arguments.ToImmutable();
+            }
+
             var descriptor = MachineAbi.BuildCallDescriptor(
-                node.RegisterUses,
+                callArguments,
                 method.GetValueInfo,
                 node.RegisterResult,
                 node.Method,
                 node.Kind == GenTreeKind.NewObject,
                 target);
 
-            for (int argumentIndex = 0; argumentIndex < node.RegisterUses.Length; argumentIndex++)
+            for (int argumentIndex = 0; argumentIndex < callArguments.Length; argumentIndex++)
             {
                 int firstSegmentIndex = -1;
                 int segmentCount = 0;
@@ -621,7 +634,7 @@ namespace Cnidaria.Cs
                 if (firstSegmentIndex < 0)
                     continue;
 
-                var value = node.RegisterUses[argumentIndex];
+                var value = callArguments[argumentIndex];
                 var info = method.GetValueInfo(value);
                 var valueAbi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, target);
                 var argumentAbi = descriptor.ArgumentSegments[firstSegmentIndex].ValueAbi;
@@ -693,6 +706,30 @@ namespace Cnidaria.Cs
                     registerClass,
                     scalarFixedRegister,
                     scalarFlags));
+            }
+
+            if (indirectTarget is not null)
+            {
+                var info = method.GetValueInfo(indirectTarget);
+                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, target);
+                if (abi.PassingKind != AbiValuePassingKind.ScalarRegister || abi.RegisterClass != RegisterClass.General)
+                    throw new InvalidOperationException("Indirect call target is not a scalar general-register value.");
+
+                var flags = GetValueRefFlags(info) |
+                    LinearRefPositionFlags.FixedRegister |
+                    LinearRefPositionFlags.RequiresRegister;
+                if (IsLastUse(intervals, indirectTarget, usePosition))
+                    flags |= LinearRefPositionFlags.LastUse;
+
+                result.Add(new LinearRefPosition(
+                    node.LinearId,
+                    usePosition,
+                    descriptor.ArgumentSegments.Length,
+                    LinearRefPositionKind.Use,
+                    indirectTarget,
+                    RegisterClass.General,
+                    MachineRegisters.TreeScratch3,
+                    flags));
             }
 
             if (node.RegisterResult is not null)

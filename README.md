@@ -55,7 +55,7 @@ LSRA (register allocation) > target specific CodeGen > target > execution
 SSA/VN-based optimizations we currently implement in order:
 
 - Constant folding
-- Assertion propagation (work in progress)
+- Assertion propagation
 - Constant/fact propagation
 - Copy propagation
 - Redundant Branch Optimization

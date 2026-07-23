@@ -646,14 +646,14 @@ Console.Write(BitConverter.DoubleToInt64Bits(1.0) == unchecked((long)0x3FF000000
 Console.Write(BitConverter.DoubleToInt64Bits(-1.0) == unchecked((long)0xBFF0000000000000));
 Console.Write(BitConverter.DoubleToInt64Bits(double.PositiveInfinity) == unchecked((long)0x7FF0000000000000));
 Console.Write(BitConverter.DoubleToInt64Bits(double.NegativeInfinity) == unchecked((long)0xFFF0000000000000));
-", "truetruetruetruetruetrue");
+", "TrueTrueTrueTrueTrueTrue");
             // 65 Math.Pow
             RunTest(@"
 Console.Write(Math.Pow(2, 3) == 8.0);
 Console.Write(Math.Pow(2, -3) == 0.125);
 Console.Write(Math.Pow(0.25, 0.5) == 0.5);
 Console.Write(Math.Pow(16, 0.25) == 2.0);
-", "truetruetruetrue");
+", "TrueTrueTrueTrue");
             // 66 Split(char separator)
             RunTest(@"
 string str = ""aa,b,,c"";
@@ -1191,7 +1191,7 @@ Console.Write(b);
             RunTest(@"
 int x = unchecked(2147483647 + 1);
 Console.WriteLine(x == -2147483648);
-", "true");
+", "True");
             // 107 unchecked conversion truncates
             RunTest(@"
 long x = 300;
@@ -1467,7 +1467,7 @@ internal class Program
         Console.Write(n is A);
     }
 }
-", "truetruefalse");
+", "TrueTrueFalse");
             // 124 boxing and virtual call
             RunTest(@"
 object x = 123;
@@ -1605,7 +1605,7 @@ int c = 8 >> 35;
 Console.Write(a == -2147483648);
 Console.Write(b);
 Console.Write(c);
-", "true11");
+", "True11");
 
             // 137 long shift count masking
             RunTest(@"
@@ -1615,7 +1615,7 @@ long c = 16L >> 68;
 Console.Write(a == unchecked((long)0x8000000000000000));
 Console.Write(b);
 Console.Write(c);
-", "true11");
+", "True11");
 
             // 138 signed integer division truncates toward zero
             RunTest(@"
@@ -1761,7 +1761,7 @@ internal class Program
         Console.WriteLine(n.Next == null);
     }
 }
-", "true");
+", "True");
             // 149 class array reference aliases
             RunTest(@"
 namespace Ns;
@@ -1839,7 +1839,7 @@ internal class Program
         Console.Write(x is string);
     }
 }
-", "truetruetruefalse");
+", "TrueTrueTrueFalse");
 
             // 153 explicit downcast
             RunTest(@"
@@ -2248,18 +2248,18 @@ catch (OverflowException)
 {
     Console.Write(""bad"");
 }
-", "true");
+", "True");
             // 185 nullable default has no value
             RunTest(@"
 Nullable<int> n = default(Nullable<int>);
 Console.Write(n.HasValue);
-", "false");
+", "False");
             // 186 nullable null assignment
             RunTest(@"
 int? n = 5;
 n = null;
 Console.Write(n.HasValue);
-", "false");
+", "False");
             // 187 tuple names preserved
             RunTest(@"
 (int left, int right) a = (3, 4);
@@ -2372,13 +2372,13 @@ Console.WriteLine(b);
 float x = 1.5f;
 float y = 2.25f;
 Console.WriteLine(x + y == 3.75f);
-", "true");
+", "True");
             // 198 double comparison with NaN
             RunTest(@"
 double n = double.NaN;
 Console.Write(n == n);
 Console.Write(n != n);
-", "falsetrue");
+", "FalseTrue");
             // 199 Math.Min Max Abs
             RunTest(@"
 Console.Write(Math.Min(3, 7));
@@ -2994,7 +2994,41 @@ internal class Program
     }
 }
 ", "43,62,105,999");
-
+            // 217 function pointer invokation
+            RunTest(@"
+namespace Ns;
+internal class Program
+{
+    static int Square(int value) => value * value;
+    
+    public static unsafe void Main(string[] args)
+    {
+        delegate*<int, int> pointer = &Square;
+        Console.Write(pointer(7));
+        Console.Write(pointer != null);
+    }
+}
+", "49True");
+            // 218 generic function pointer
+            RunTest(@"
+namespace Ns;
+internal class Program
+{
+    static int Select(int value) => value + 1;
+    static long Select(long value) => value + 2;
+    static T Identity<T>(T value) => value;
+    
+    public static unsafe void Main(string[] args)
+    {
+        delegate*<int, int> first = &Select;
+        delegate*<long, long> second = &Select;
+        delegate*<int, int> generic = &Identity;
+        Console.Write(first(10));
+        Console.Write(second(10));
+        Console.Write(generic(13));
+    }
+}
+", "111213");
 
             Console.WriteLine($"Tests ran: {TestsRan}, tests failed {TestsFailed}");
             foreach (var msg in FailedMessages)

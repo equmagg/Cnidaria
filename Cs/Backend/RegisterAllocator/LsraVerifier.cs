@@ -1451,6 +1451,7 @@ namespace Cnidaria.Cs
         private static bool IsCallLike(GenTreeKind kind)
             => kind is
                 GenTreeKind.Call or
+                GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
@@ -1504,11 +1505,12 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Call-like node must preserve one operand role per ABI argument operand or fragment.");
 
             var descriptor = BuildExpectedCallDescriptorFromAllocatedShape(method, node);
-            if (descriptor.ArgumentSegments.Length != node.Uses.Length)
+            int indirectTargetCount = node.Kind == GenTreeKind.IndirectCall ? 1 : 0;
+            if (descriptor.ArgumentSegments.Length + indirectTargetCount != node.Uses.Length)
             {
                 throw new InvalidOperationException(
                     $"Call-like node ABI operand count mismatch. Actual: {node.Uses.Length}" +
-                    $", expected: {descriptor.ArgumentSegments.Length}.");
+                    $", expected: {descriptor.ArgumentSegments.Length + indirectTargetCount}.");
             }
 
             for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
@@ -1535,6 +1537,17 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException(
                         $"Call argument {i} is not in the expected ABI location. Actual: {node.Uses[i]}, expected: {expected}.");
                 }
+            }
+
+            if (node.Kind == GenTreeKind.IndirectCall)
+            {
+                int targetIndex = node.Uses.Length - 1;
+                if (targetIndex < 0 || node.UseRoles[targetIndex] != OperandRole.IndirectCallTarget)
+                    throw new InvalidOperationException("Indirect call has no target operand role.");
+                if (!node.Uses[targetIndex].Equals(RegisterOperand.ForRegister(MachineRegisters.TreeScratch3)))
+                    throw new InvalidOperationException("Indirect call target is not in the reserved target register.");
+                if (node.RegisterUses[targetIndex].StackKind != GenStackKind.Ptr)
+                    throw new InvalidOperationException("Indirect call target does not have pointer stack kind.");
             }
 
             if (node.RegisterResult is not null)
@@ -1607,7 +1620,10 @@ namespace Cnidaria.Cs
             int generalArgumentIndex = node.Kind == GenTreeKind.NewObject && node.Method?.HasThis == true ? 1 : 0;
             int floatArgumentIndex = 0;
             int index = 0;
-            while (index < node.RegisterUses.Length)
+            int argumentOperandCount = node.Kind == GenTreeKind.IndirectCall
+                ? node.RegisterUses.Length - 1
+                : node.RegisterUses.Length;
+            while (index < argumentOperandCount)
             {
                 var role = node.UseRoles[index];
                 if (role == OperandRole.HiddenReturnBuffer)

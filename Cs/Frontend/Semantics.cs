@@ -51,7 +51,7 @@ namespace Cnidaria.Cs
         ExplicitNullable,
         ImplicitStackAlloc,
     }
-    public enum TypeKind : byte { Class, Struct, Interface, Enum, Delegate, Error, Dynamic, Unknown }
+    public enum TypeKind : byte { Class, Struct, Interface, Enum, Delegate, Error, Dynamic, Unknown, FunctionPointer }
     public enum DiagnosticSeverity : byte { Hidden, Info, Warning, Error }
     public enum SymbolKind : byte
     {
@@ -64,6 +64,7 @@ namespace Cnidaria.Cs
         ArrayType,
         PointerType,
         ByRefType,
+        FunctionPointerType,
         Error
     }
     internal enum BoundBinaryOperatorKind : byte
@@ -214,6 +215,61 @@ namespace Cnidaria.Cs
     }
     public sealed class TypeManager
     {
+        private readonly struct FunctionPointerTypeKey : IEquatable<FunctionPointerTypeKey>
+        {
+            public readonly FunctionPointerCallingConvention CallingConvention;
+            public readonly TypeSymbol ReturnType;
+            public readonly FunctionPointerRefKind ReturnRefKind;
+            public readonly ImmutableArray<FunctionPointerParameter> Parameters;
+
+            public FunctionPointerTypeKey(
+                FunctionPointerCallingConvention callingConvention,
+                TypeSymbol returnType,
+                FunctionPointerRefKind returnRefKind,
+                ImmutableArray<FunctionPointerParameter> parameters)
+            {
+                CallingConvention = callingConvention;
+                ReturnType = returnType;
+                ReturnRefKind = returnRefKind;
+                Parameters = parameters.IsDefault ? ImmutableArray<FunctionPointerParameter>.Empty : parameters;
+            }
+
+            public bool Equals(FunctionPointerTypeKey other)
+            {
+                if (CallingConvention != other.CallingConvention ||
+                    ReturnRefKind != other.ReturnRefKind ||
+                    !ReferenceEquals(ReturnType, other.ReturnType) ||
+                    Parameters.Length != other.Parameters.Length)
+                    return false;
+
+                for (int i = 0; i < Parameters.Length; i++)
+                {
+                    if (Parameters[i].RefKind != other.Parameters[i].RefKind ||
+                        !ReferenceEquals(Parameters[i].Type, other.Parameters[i].Type))
+                        return false;
+                }
+
+                return true;
+            }
+
+            public override bool Equals(object? obj) => obj is FunctionPointerTypeKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = (int)CallingConvention;
+                    hash = (hash * 31) + (int)ReturnRefKind;
+                    hash = (hash * 31) + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(ReturnType);
+                    for (int i = 0; i < Parameters.Length; i++)
+                    {
+                        hash = (hash * 31) + (int)Parameters[i].RefKind;
+                        hash = (hash * 31) + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Parameters[i].Type);
+                    }
+                    return hash;
+                }
+            }
+        }
         private readonly struct TupleTypeKey : IEquatable<TupleTypeKey>
         {
             public readonly ImmutableArray<TypeSymbol> Types;
@@ -303,6 +359,7 @@ namespace Cnidaria.Cs
         private readonly NamedTypeSymbol[] _specialTypes;
         private readonly Dictionary<(TypeSymbol elem, int rank, bool isSZArray), ArrayTypeSymbol> _arrayTypes = new();
         private readonly Dictionary<TypeSymbol, PointerTypeSymbol> _pointerTypes = new();
+        private readonly Dictionary<FunctionPointerTypeKey, FunctionPointerTypeSymbol> _functionPointerTypes = new();
         private readonly Dictionary<TupleTypeKey, TupleTypeSymbol> _tupleTypes = new();
         private readonly Dictionary<TypeSymbol, ByRefTypeSymbol> _byRefTypes = new();
         private readonly Dictionary<SubstitutedNamedTypeKey, SubstitutedNamedTypeSymbol> _namedTypeInstantiations = new();
@@ -399,6 +456,17 @@ namespace Cnidaria.Cs
             if (!_pointerTypes.TryGetValue(pointedAtType, out var pt))
                 _pointerTypes[pointedAtType] = pt = new PointerTypeSymbol(pointedAtType);
             return pt;
+        }
+        public FunctionPointerTypeSymbol GetFunctionPointerType(
+            FunctionPointerCallingConvention callingConvention,
+            TypeSymbol returnType,
+            FunctionPointerRefKind returnRefKind,
+            ImmutableArray<FunctionPointerParameter> parameters)
+        {
+            var key = new FunctionPointerTypeKey(callingConvention, returnType, returnRefKind, parameters);
+            if (!_functionPointerTypes.TryGetValue(key, out var type))
+                _functionPointerTypes[key] = type = new FunctionPointerTypeSymbol(callingConvention, returnType, returnRefKind, parameters);
+            return type;
         }
         public TupleTypeSymbol GetTupleType(ImmutableArray<TypeSymbol> elementTypes, ImmutableArray<string?> elementNames)
         {
@@ -744,6 +812,7 @@ namespace Cnidaria.Cs
             BaseTypeBinder.BindAll(compilation, trees, bag);
             ExplicitInterfaceImplementationBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
+            PlatformInvokeBinder.ValidateAll(compilation, trees, bag);
 
             diagnostics = bag.ToImmutable();
             return compilation;
@@ -769,6 +838,7 @@ namespace Cnidaria.Cs
             NameConflictBinder.BindAll(compilation, bag);
             BaseTypeBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
+            PlatformInvokeBinder.ValidateAll(compilation, trees, bag);
 
             diagnostics = bag.ToImmutable();
             return compilation;
@@ -813,6 +883,12 @@ namespace Cnidaria.Cs
         public NamedTypeSymbol GetSpecialType(SpecialType st) => _types.GetSpecialType(st);
         public PointerTypeSymbol CreatePointerType(TypeSymbol pointedAtType)
             => _types.GetPointerType(pointedAtType);
+        public FunctionPointerTypeSymbol CreateFunctionPointerType(
+            FunctionPointerCallingConvention callingConvention,
+            TypeSymbol returnType,
+            FunctionPointerRefKind returnRefKind,
+            ImmutableArray<FunctionPointerParameter> parameters)
+            => _types.GetFunctionPointerType(callingConvention, returnType, returnRefKind, parameters);
         public ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank)
             => _types.GetArrayType(elementType, rank);
         internal ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank, bool isSZArray)
@@ -987,7 +1063,7 @@ namespace Cnidaria.Cs
                         StringComparer.Ordinal.Equals(body.Method.Name, ".cctor"))
                     {
                         body = PrependTypeInitializerStatements(compilation, tree, model, body);
-                    }    
+                    }
                     EmitBody(body);
                 }
                 foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
@@ -2518,6 +2594,9 @@ namespace Cnidaria.Cs
         StaticData,
         SpanCollection,
         AddressOf,
+        FunctionPointerLoad,
+        FunctionPointerMethodGroup,
+        FunctionPointerInvocation,
         RefExpression,
         PointerIndirection,
         PointerElementAccess,

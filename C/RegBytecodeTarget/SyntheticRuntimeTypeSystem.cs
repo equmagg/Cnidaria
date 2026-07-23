@@ -99,7 +99,7 @@ namespace Cnidaria.C
         public ConstantRow GetConstant(int rid) => throw EmptyTable(nameof(GetConstant), rid);
         public PropertyRow GetProperty(int rid) => throw EmptyTable(nameof(GetProperty), rid);
         public CustomAttributeRow GetCustomAttribute(int rid) => throw EmptyTable(nameof(GetCustomAttribute), rid);
-
+        public PInvokeMapRow GetPInvokeMap(int rid) => throw EmptyTable(nameof(GetPInvokeMap), rid);
 
         private static TypeDefRow[] BuildTypeDefs()
         {

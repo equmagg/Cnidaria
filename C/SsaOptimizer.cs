@@ -162,6 +162,7 @@ namespace Cnidaria.C
             {
                 var instructionByDefinition = new Dictionary<SsaName, SsaInstruction>();
                 var phiByResult = new Dictionary<SsaName, SsaPhi>();
+                var declarationsBySymbol = new Dictionary<Symbol, List<SsaInstruction>>();
 
                 foreach (var block in blocks)
                 {
@@ -172,6 +173,17 @@ namespace Cnidaria.C
                     {
                         foreach (var definition in instruction.Definitions)
                             instructionByDefinition[definition.Name] = instruction;
+
+                        if (instruction.Statement is GimpleDeclarationStatement { Symbol: not null } declaration)
+                        {
+                            if (!declarationsBySymbol.TryGetValue(declaration.Symbol, out var declarations))
+                            {
+                                declarations = new List<SsaInstruction>();
+                                declarationsBySymbol.Add(declaration.Symbol, declarations);
+                            }
+
+                            declarations.Add(instruction);
+                        }
                     }
                 }
 
@@ -208,6 +220,19 @@ namespace Cnidaria.C
 
                     if (instructionByDefinition.TryGetValue(name, out var instruction))
                         MarkInstructionLive(instruction, liveInstructions, workList);
+                }
+
+                var referencedSymbols = new HashSet<Symbol>();
+                foreach (var instruction in liveInstructions)
+                    SymbolCollector.Collect(instruction.Statement, referencedSymbols);
+
+                foreach (var symbol in referencedSymbols)
+                {
+                    if (!declarationsBySymbol.TryGetValue(symbol, out var declarations))
+                        continue;
+
+                    foreach (var declaration in declarations)
+                        MarkInstructionLive(declaration, liveInstructions, workList);
                 }
 
                 var result = ImmutableArray.CreateBuilder<SsaBlock>(blocks.Length);
@@ -262,6 +287,9 @@ namespace Cnidaria.C
 
                 if ((instruction.Flags & (SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall)) != 0)
                     return false;
+
+                if (instruction.Statement is GimpleDeclarationStatement or GimpleNopStatement)
+                    return true;
 
                 if (instruction.Definitions.Length == 0 && instruction.Statement is not GimpleExpressionStatement)
                     return false;

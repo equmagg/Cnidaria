@@ -109,16 +109,17 @@ namespace Cnidaria.C
 
         private string EmitWindowsRuntime(string userEntryLabel)
         {
-            AddWindowsImportSymbols();
+            AddExternalSymbol("__imp_GetStdHandle", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_WriteFile", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_ExitProcess", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_GetProcessHeap", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_HeapAlloc", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_HeapReAlloc", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_HeapFree", X86ObjectSymbolKind.Object);
+
             return EmitWindowsStart(userEntryLabel);
         }
-
         private string EmitLinuxRuntime(string userEntryLabel)
-        {
-            return EmitLinuxStart(userEntryLabel);
-        }
-
-        private string EmitLinuxStart(string userEntryLabel)
         {
             var label = CreateUniqueGlobalLabel("_start");
             var startOffset = _text.ByteLength;
@@ -159,12 +160,6 @@ namespace Cnidaria.C
             return label;
         }
 
-        private void AddWindowsImportSymbols()
-        {
-            AddExternalSymbol("__imp_GetStdHandle", X86ObjectSymbolKind.Object);
-            AddExternalSymbol("__imp_WriteFile", X86ObjectSymbolKind.Object);
-            AddExternalSymbol("__imp_ExitProcess", X86ObjectSymbolKind.Object);
-        }
 
         private string EmitWindowsStart(string userEntryLabel)
         {

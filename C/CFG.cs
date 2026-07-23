@@ -55,6 +55,10 @@ namespace Cnidaria.C
             if (gimpleTree is null)
                 throw new ArgumentNullException(nameof(gimpleTree));
 
+            gimpleTree = Inliner.Inline(
+                gimpleTree,
+                gimpleTree.SemanticModel.Compilation.Options.Inlining);
+
             var functions = ImmutableArray.CreateBuilder<ControlFlowFunction>();
             foreach (var member in gimpleTree.Members)
             {
@@ -63,6 +67,16 @@ namespace Cnidaria.C
             }
 
             return new ControlFlowGraph(gimpleTree, functions.ToImmutable());
+        }
+
+        internal ControlFlowGraph WithTrimmedMembers(
+            GimpleTree gimpleTree,
+            ImmutableArray<ControlFlowFunction> functions)
+        {
+            if (gimpleTree is null)
+                throw new ArgumentNullException(nameof(gimpleTree));
+
+            return new ControlFlowGraph(gimpleTree, functions);
         }
     }
 

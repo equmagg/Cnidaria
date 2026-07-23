@@ -20,6 +20,7 @@ typedef signed long isize;
 #define RH_HEAP_COMMIT_GRANULARITY (64ul * 1024ul)
 #define RH_PAGE_SIZE 4096ul
 #define RH_HEAP_ALIGNMENT 16ul
+#define RH_HGLOBAL_HEADER_SIZE RH_HEAP_ALIGNMENT
 #define RH_BLOCK_HEADER_SIZE (POINTER_SIZE * 4ul)
 #define RH_BLOCK_FREE 0ul
 #define RH_BLOCK_OBJECT 1ul
@@ -1027,6 +1028,51 @@ static int rh_os_decommit(void* address, usize size)
 static int rh_os_release(void* address, usize size)
 {
     return rh_syscall2(RH_SYS_MUNMAP, (usize)address, size) == 0l;
+}
+
+void* RhpAllocHGlobal(usize size)
+{
+    usize maximum = (usize)-1;
+    usize payload_size = size == 0ul ? 1ul : size;
+    usize total_size;
+    usize mapping_size;
+    isize result;
+    u8* base;
+
+    if (payload_size > maximum - RH_HGLOBAL_HEADER_SIZE)
+        RhpFallbackFailFast(141);
+    total_size = RH_HGLOBAL_HEADER_SIZE + payload_size;
+    if (total_size > maximum - (RH_PAGE_SIZE - 1ul))
+        RhpFallbackFailFast(141);
+    mapping_size = rh_align_up(total_size, RH_PAGE_SIZE);
+    result = rh_syscall6(
+        RH_SYS_MMAP,
+        0ul,
+        mapping_size,
+        RH_PROT_READ | RH_PROT_WRITE,
+        RH_MAP_PRIVATE | RH_MAP_ANONYMOUS,
+        (usize)-1,
+        0ul);
+    if (result < 0l)
+        RhpFallbackFailFast(141);
+
+    base = (u8*)(usize)result;
+    *(usize*)base = mapping_size;
+    return (void*)(base + RH_HGLOBAL_HEADER_SIZE);
+}
+
+void RhpFreeHGlobal(void* pointer)
+{
+    u8* base;
+    usize mapping_size;
+
+    if (pointer == (void*)0)
+        return;
+
+    base = (u8*)pointer - RH_HGLOBAL_HEADER_SIZE;
+    mapping_size = *(usize*)base;
+    if (!rh_os_release(base, mapping_size))
+        RhpFallbackFailFast(153);
 }
 
 static int rh_ensure_committed(u8* required)

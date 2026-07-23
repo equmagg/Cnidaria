@@ -26,6 +26,7 @@ namespace Cnidaria.Cs
         Ptr,   // payload: offset in mem, aux: elementSize
         ByRef, // payload: offset in mem, aux: elementSize
         Value, // payload: absolute address of value bytes in current frame blob arena, aux: byte size
+        FunctionPointer,
         Null,
     }
     internal readonly struct Slot
@@ -730,6 +731,10 @@ namespace Cnidaria.Cs
                                         break;
                                 }
 
+                                if (rm.IsExtern)
+                                    throw new PlatformNotSupportedException(
+                                        $"Extern method calls are not supported by the stack VM: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
+
                                 if (hasThis != 0 && rm.DeclaringType.IsValueType)
                                 {
                                     int thisIndex = _curEvalSp - total;
@@ -780,6 +785,102 @@ namespace Cnidaria.Cs
                             }
                             break;
 
+                        case BytecodeOp.Ldftn:
+                            {
+                                var method = ResolveRuntimeMethodOrThrow(mod, ins.Operand0, _curLayout?.Method);
+                                if (!method.IsStatic)
+                                    throw new InvalidOperationException("Function pointers to instance methods are not supported.");
+                                PushSlot(new Slot(SlotKind.FunctionPointer, method.MethodId));
+                            }
+                            break;
+
+                        case BytecodeOp.FnPtrToPtr:
+                            {
+                                var functionPointer = PopSlot();
+                                if (functionPointer.Kind == SlotKind.Null)
+                                {
+                                    PushSlot(functionPointer);
+                                    break;
+                                }
+                                if (functionPointer.Kind != SlotKind.FunctionPointer)
+                                    throw new InvalidOperationException($"FnPtrToPtr requires a function pointer, got {functionPointer.Kind}.");
+                                PushSlot(new Slot(SlotKind.Ptr, GetFunctionPointerNativeValue(functionPointer)));
+                            }
+                            break;
+
+                        case BytecodeOp.PtrToFnPtr:
+                            {
+                                var pointer = PopSlot();
+                                if (pointer.Kind == SlotKind.Null)
+                                {
+                                    PushSlot(pointer);
+                                    break;
+                                }
+                                if (pointer.Kind != SlotKind.Ptr)
+                                    throw new InvalidOperationException($"PtrToFnPtr requires a pointer, got {pointer.Kind}.");
+                                PushSlot(CreateFunctionPointerSlot(pointer.Payload));
+                            }
+                            break;
+
+                        case BytecodeOp.Calli:
+                            {
+                                int argumentCount = ins.Operand1;
+                                int functionPointerIndex = _curEvalSp - argumentCount - 1;
+                                if ((uint)functionPointerIndex >= (uint)_curEvalSp)
+                                    throw new InvalidOperationException("Eval stack underflow for Calli.");
+
+                                var functionPointer = _hotEvalSlots[functionPointerIndex];
+                                if (functionPointer.Kind == SlotKind.Null)
+                                    throw new NullReferenceException("Attempted to invoke a null function pointer.");
+                                if (functionPointer.Kind != SlotKind.FunctionPointer)
+                                    throw new InvalidOperationException($"Calli requires a function pointer, got {functionPointer.Kind}.");
+                                if (functionPointer.Aux != 0)
+                                    throw new PlatformNotSupportedException("Calls through native function pointer addresses are not supported by the stack VM.");
+
+                                var target = _rts.GetMethodById(checked((int)functionPointer.Payload));
+                                var signature = _rts.ResolveTypeInMethodContext(mod, ins.Operand0, _curLayout?.Method);
+                                ValidateFunctionPointerCallTarget(signature, target, argumentCount);
+
+                                if (target.IsStatic && !StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                                {
+                                    if (TryDeferTypeInitialization(target.DeclaringType, resumePc: pc, ct, limits))
+                                        break;
+                                }
+
+                                if (target.IsExtern)
+                                    throw new PlatformNotSupportedException(
+                                        $"Extern function pointer calls are not supported by the stack VM: {target.DeclaringType.Namespace}.{target.DeclaringType.Name}.{target.Name}");
+
+                                for (int i = 0; i < argumentCount; i++)
+                                    _hotEvalSlots[functionPointerIndex + i] = _hotEvalSlots[functionPointerIndex + i + 1];
+                                _curEvalSp--;
+
+                                if (TryInvokeHostOverride(target, argumentCount, ct))
+                                    break;
+
+                                if (TryInvokeIntrinsic(target, argumentCount, ct))
+                                    break;
+
+                                var targetModule = target.BodyModule;
+                                var targetFunction = target.Body;
+                                if (targetModule is null || targetFunction is null)
+                                    throw new MissingMethodException(
+                                        $"No body for function pointer target: {target.DeclaringType.Namespace}.{target.DeclaringType.Name}.{target.Name}");
+
+                                int callerModuleId = ReadI32(_frameBase + 20);
+                                PushFrame(
+                                    targetModule,
+                                    targetFunction,
+                                    returnPc: _curPc,
+                                    returnMethodToken: fn.MethodToken,
+                                    returnModuleId: callerModuleId,
+                                    ct,
+                                    limits,
+                                    totalArgsOnCallerStack: argumentCount,
+                                    runtimeMethod: target);
+                            }
+                            break;
+
                         case BytecodeOp.CallVirt:
                             {
                                 int callTok = ins.Operand0;
@@ -800,6 +901,9 @@ namespace Cnidaria.Cs
 
                                 var declared = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
                                 var targetRm = ResolveVirtualDispatch(receiverType, declared);
+                                if (targetRm.IsExtern)
+                                    throw new PlatformNotSupportedException(
+                                        $"Extern method calls are not supported by the stack VM: {targetRm.DeclaringType.Namespace}.{targetRm.DeclaringType.Name}.{targetRm.Name}");
                                 if (targetRm.DeclaringType.IsValueType && receiver.Kind == SlotKind.Ref)
                                 {
                                     int boxedObjAbs = checked((int)receiver.Payload);
@@ -1315,7 +1419,7 @@ namespace Cnidaria.Cs
             // Static data heap fallback roots
             foreach (var kv in _staticDataHeapObjectByInstruction)
             {
-                if (kv.Value != 0) 
+                if (kv.Value != 0)
                     TryMarkObject(kv.Value);
             }
             // Intern pool roots
@@ -1558,6 +1662,9 @@ namespace Cnidaria.Cs
                     }
                     continue;
                 }
+
+                if (curType.Kind == RuntimeTypeKind.FunctionPointer)
+                    continue;
 
                 if (!curType.IsValueType)
                     continue;
@@ -2425,6 +2532,9 @@ namespace Cnidaria.Cs
         {
             if (!t.IsValueType) return false;
 
+            if (t.Kind == RuntimeTypeKind.FunctionPointer)
+                return true;
+
             if (t.Kind == RuntimeTypeKind.Enum)
                 return true;
 
@@ -2515,6 +2625,15 @@ namespace Cnidaria.Cs
                                 Consider(callee.DeclaringType);
                             for (int i = 0; i < callee.ParameterTypes.Length; i++)
                                 Consider(callee.ParameterTypes[i]);
+                            break;
+                        }
+
+                    case BytecodeOp.Calli:
+                        {
+                            var signature = _rts.ResolveTypeInMethodContext(module, ins.Operand0, rm);
+                            Consider(signature.FunctionPointerReturnType);
+                            for (int i = 0; i < signature.FunctionPointerParameterTypes.Length; i++)
+                                Consider(signature.FunctionPointerParameterTypes[i]);
                             break;
                         }
 
@@ -2609,7 +2728,7 @@ namespace Cnidaria.Cs
             }
 
             // Pointers and byrefs default to null ptr
-            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
             {
                 PushSlot(new Slot(SlotKind.Null, 0));
                 return;
@@ -4415,6 +4534,12 @@ namespace Cnidaria.Cs
                 return p == 0 ? new Slot(SlotKind.Null, 0) : new Slot(SlotKind.Ptr, p);
             }
 
+            if (t.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                long p = ReadNativeInt(abs);
+                return p == 0 ? new Slot(SlotKind.Null, 0) : CreateFunctionPointerSlot(p);
+            }
+
             if (t.Kind == RuntimeTypeKind.ByRef)
             {
                 long p = ReadNativeInt(abs);
@@ -4508,6 +4633,15 @@ namespace Cnidaria.Cs
 
                 long p = v.Kind == SlotKind.Null ? 0 : v.Payload;
                 WriteNativeInt(abs, p);
+                return;
+            }
+
+            if (t.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                if (v.Kind is not (SlotKind.FunctionPointer or SlotKind.Null))
+                    throw new InvalidOperationException($"Storing {v.Kind} into function pointer.");
+
+                WriteNativeInt(abs, v.Kind == SlotKind.Null ? 0 : GetFunctionPointerNativeValue(v));
                 return;
             }
 
@@ -5242,6 +5376,8 @@ namespace Cnidaria.Cs
                 case SlotKind.ByRef:
                 case SlotKind.Ref:
                     return a.Payload == b.Payload ? 1 : 0;
+                case SlotKind.FunctionPointer:
+                    return GetFunctionPointerNativeValue(a) == GetFunctionPointerNativeValue(b) ? 1 : 0;
                 case SlotKind.Value:
                     {
                         if (a.Aux != b.Aux)
@@ -5277,13 +5413,150 @@ namespace Cnidaria.Cs
             }
         }
 
+        private long GetFunctionPointerNativeValue(Slot functionPointer)
+        {
+            if (functionPointer.Kind != SlotKind.FunctionPointer)
+                throw new InvalidOperationException($"Expected function pointer, got {functionPointer.Kind}.");
+            if (functionPointer.Aux != 0)
+                return functionPointer.Payload;
+
+            uint methodId = checked((uint)functionPointer.Payload);
+            return _rts.Target.PointerSize == 8
+                ? unchecked((long)(0x8000000000000000UL | methodId))
+                : unchecked((int)(0x80000000U | methodId));
+        }
+
+        private Slot CreateFunctionPointerSlot(long nativeValue)
+        {
+            if (_rts.Target.PointerSize == 8)
+            {
+                ulong value = unchecked((ulong)nativeValue);
+                if ((value & 0xFFFFFFFF00000000UL) == 0x8000000000000000UL)
+                    return new Slot(SlotKind.FunctionPointer, checked((int)(value & 0xFFFFFFFFUL)));
+            }
+            else
+            {
+                uint value = unchecked((uint)(int)nativeValue);
+                if ((value & 0x80000000U) != 0)
+                    return new Slot(SlotKind.FunctionPointer, checked((int)(value & 0x7FFFFFFFU)));
+            }
+
+            return new Slot(SlotKind.FunctionPointer, nativeValue, aux: 1);
+        }
+
         private static bool ToBool(Slot v)
         {
             if (v.Kind == SlotKind.I4) return v.AsI4Checked() != 0;
             if (v.Kind == SlotKind.Null) return false;
             if (v.Kind == SlotKind.Ref) return v.Payload != 0;
-            if (v.Kind == SlotKind.Ptr || v.Kind == SlotKind.ByRef) return v.Payload != 0;
+            if (v.Kind == SlotKind.Ptr || v.Kind == SlotKind.ByRef || v.Kind == SlotKind.FunctionPointer) return v.Payload != 0;
             throw new InvalidOperationException($"Cannot convert {v.Kind} to bool");
+        }
+
+        private void ValidateFunctionPointerCallTarget(
+            RuntimeType signature,
+            RuntimeMethod target,
+            int argumentCount)
+        {
+            if (signature.Kind != RuntimeTypeKind.FunctionPointer)
+                throw new InvalidOperationException($"Calli signature token resolved to '{signature.Kind}'.");
+            if (!target.IsStatic)
+                throw new InvalidOperationException("Function pointer target must be static.");
+            if (signature.FunctionPointerCallingConvention != 0)
+                throw new InvalidOperationException("Managed function pointer target requires the managed calling convention.");
+            if (signature.FunctionPointerParameterTypes.Length != argumentCount || target.ParameterTypes.Length != argumentCount)
+                throw new InvalidOperationException("Function pointer argument count does not match target method.");
+            if (signature.FunctionPointerReturnType is null)
+                throw new InvalidOperationException("Function pointer signature has no return type.");
+
+            var targetReturnType = target.ReturnType;
+            bool targetReturnsByRef = targetReturnType.Kind == RuntimeTypeKind.ByRef;
+            if (targetReturnsByRef)
+                targetReturnType = targetReturnType.ElementType ?? throw new InvalidOperationException("Invalid by-ref return type.");
+            if (targetReturnsByRef != signature.FunctionPointerReturnByRef)
+                throw new InvalidOperationException("Function pointer return type does not match target method.");
+            if (targetReturnsByRef)
+            {
+                if (targetReturnType.TypeId != signature.FunctionPointerReturnType.TypeId)
+                    throw new InvalidOperationException("Function pointer return type does not match target method.");
+            }
+            else if (!HasRuntimeFunctionPointerSignatureTypeConversion(signature.FunctionPointerReturnType, targetReturnType))
+            {
+                throw new InvalidOperationException("Function pointer return type does not match target method.");
+            }
+
+            for (int i = 0; i < argumentCount; i++)
+            {
+                var targetParameterType = target.ParameterTypes[i];
+                bool targetParameterByRef = targetParameterType.Kind == RuntimeTypeKind.ByRef;
+                if (targetParameterByRef)
+                    targetParameterType = targetParameterType.ElementType ?? throw new InvalidOperationException("Invalid by-ref parameter type.");
+                if (targetParameterByRef != signature.FunctionPointerParameterByRef[i])
+                    throw new InvalidOperationException($"Function pointer parameter {i} does not match target method.");
+
+                if (targetParameterByRef)
+                {
+                    if (targetParameterType.TypeId != signature.FunctionPointerParameterTypes[i].TypeId)
+                        throw new InvalidOperationException($"Function pointer parameter {i} does not match target method.");
+                }
+                else if (!HasRuntimeFunctionPointerSignatureTypeConversion(
+                    targetParameterType,
+                    signature.FunctionPointerParameterTypes[i]))
+                {
+                    throw new InvalidOperationException($"Function pointer parameter {i} does not match target method.");
+                }
+            }
+        }
+
+        private bool HasRuntimeFunctionPointerSignatureTypeConversion(RuntimeType source, RuntimeType destination)
+        {
+            if (source.TypeId == destination.TypeId)
+                return true;
+
+            if (source.IsReferenceType && destination.IsReferenceType && IsAssignableTo(source, destination))
+                return true;
+
+            if (destination.Kind == RuntimeTypeKind.Pointer &&
+                destination.ElementType?.PrimitiveKind == RuntimePrimitiveKind.Void &&
+                source.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
+                return true;
+
+            if (source.Kind == RuntimeTypeKind.FunctionPointer && destination.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                if (source.FunctionPointerCallingConvention != destination.FunctionPointerCallingConvention ||
+                    source.FunctionPointerParameterTypes.Length != destination.FunctionPointerParameterTypes.Length ||
+                    source.FunctionPointerReturnByRef != destination.FunctionPointerReturnByRef ||
+                    source.FunctionPointerReturnType is null ||
+                    destination.FunctionPointerReturnType is null)
+                    return false;
+
+                for (int i = 0; i < source.FunctionPointerParameterTypes.Length; i++)
+                {
+                    if (source.FunctionPointerParameterByRef[i] != destination.FunctionPointerParameterByRef[i])
+                        return false;
+
+                    if (source.FunctionPointerParameterByRef[i])
+                    {
+                        if (source.FunctionPointerParameterTypes[i].TypeId != destination.FunctionPointerParameterTypes[i].TypeId)
+                            return false;
+                    }
+                    else if (!HasRuntimeFunctionPointerSignatureTypeConversion(
+                        source.FunctionPointerParameterTypes[i],
+                        destination.FunctionPointerParameterTypes[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                if (source.FunctionPointerReturnByRef)
+                    return source.FunctionPointerReturnType.TypeId == destination.FunctionPointerReturnType.TypeId;
+
+                return HasRuntimeFunctionPointerSignatureTypeConversion(
+                    destination.FunctionPointerReturnType,
+                    source.FunctionPointerReturnType);
+            }
+
+            return false;
         }
 
         private Slot DoConv(Slot v, NumericConvKind kind, NumericConvFlags flags)
@@ -5853,7 +6126,7 @@ namespace Cnidaria.Cs
         }
         private FastCellKind ClassifyFastCell(RuntimeType t)
         {
-            if (t.IsReferenceType || t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (t.IsReferenceType || t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
                 return FastCellKind.None;
 
             if (t.Kind == RuntimeTypeKind.Enum)
@@ -5911,7 +6184,7 @@ namespace Cnidaria.Cs
                 return true;
             if (t.IsReferenceType)
                 return true;
-            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
                 return false;
             if (IsNoRefPrimitive(t))
                 return false;
@@ -5930,7 +6203,7 @@ namespace Cnidaria.Cs
             if (t.IsReferenceType)
                 return true;
 
-            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
                 return false;
 
             if (IsNoRefPrimitive(t))

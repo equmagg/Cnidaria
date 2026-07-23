@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -779,7 +779,7 @@ namespace Cnidaria.Cs
                     return GenStackKind.Ref;
                 if (type.Kind == RuntimeTypeKind.ByRef)
                     return GenStackKind.ByRef;
-                if (type.Kind == RuntimeTypeKind.Pointer)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                     return GenStackKind.Ptr;
                 if (type.Name == "Single")
                     return GenStackKind.R4;

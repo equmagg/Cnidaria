@@ -947,6 +947,8 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.Neg:
                     case BytecodeOp.Not:
+                    case BytecodeOp.FnPtrToPtr:
+                    case BytecodeOp.PtrToFnPtr:
                     case BytecodeOp.PtrToByRef:
                     case BytecodeOp.CastClass:
                     case BytecodeOp.Isinst:
@@ -1137,6 +1139,14 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.LdClosureSlot:
                         EmitLoadClosureSlot(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.Ldftn:
+                        EmitFunctionPointerLoad(stack, statements, pc, ins);
+                        break;
+
+                    case BytecodeOp.Calli:
+                        EmitIndirectCall(stack, statements, pc, ins);
                         break;
 
                     case BytecodeOp.NewDelegate:
@@ -1610,7 +1620,7 @@ namespace Cnidaria.Cs
             if (value.StackKind == GenStackKind.Void)
                 return false;
 
-            if (value.Kind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+            if (value.Kind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                 return false;
 
             const GenTreeFlags materializeFlags =
@@ -1628,6 +1638,7 @@ namespace Cnidaria.Cs
 
             return value.Kind is
                 GenTreeKind.Call or
+                GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
                 GenTreeKind.NewObject or
                 GenTreeKind.NewArray or
@@ -2696,6 +2707,8 @@ namespace Cnidaria.Cs
             {
                 BytecodeOp.Neg => GenTreeKind.Unary,
                 BytecodeOp.Not => GenTreeKind.Unary,
+                BytecodeOp.FnPtrToPtr => GenTreeKind.Unary,
+                BytecodeOp.PtrToFnPtr => GenTreeKind.Unary,
                 BytecodeOp.PtrToByRef => GenTreeKind.PointerToByRef,
                 BytecodeOp.CastClass => GenTreeKind.CastClass,
                 BytecodeOp.Isinst => GenTreeKind.IsInst,
@@ -2706,6 +2719,12 @@ namespace Cnidaria.Cs
 
             switch (ins.Op)
             {
+                case BytecodeOp.FnPtrToPtr:
+                case BytecodeOp.PtrToFnPtr:
+                    type = null;
+                    stackKind = GenStackKind.Ptr;
+                    break;
+
                 case BytecodeOp.PtrToByRef:
                     stackKind = GenStackKind.ByRef;
                     type = null;
@@ -2803,6 +2822,15 @@ namespace Cnidaria.Cs
             if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
             {
                 MarkInstantiatedTypeClosure(type.ElementType);
+                return;
+            }
+
+            if (type.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                MarkInstantiatedTypeClosure(type.FunctionPointerReturnType);
+                RuntimeType[] parameters = type.FunctionPointerParameterTypes;
+                for (int i = 0; i < parameters.Length; i++)
+                    MarkInstantiatedTypeClosure(parameters[i]);
                 return;
             }
 
@@ -2939,6 +2967,79 @@ namespace Cnidaria.Cs
         {
             var closure = Pop(stack, pc, ins.Op);
             PushImportedValue(stack, statements, LoadObjectArrayElement(pc, ins.Op, closure.Node, ins.Operand0));
+        }
+
+        private void EmitFunctionPointerLoad(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            var targetMethod = _rts.ResolveMethodInMethodContext(_module, ins.Operand0, _method);
+            if (!targetMethod.IsStatic)
+                throw Fail(pc, ins.Op, "Function pointer target must be static.");
+            if (targetMethod.IsExtern || targetMethod.HasInternalCall || targetMethod.Body is null)
+                throw Fail(pc, ins.Op, "Function pointer target must use a managed method body.");
+
+            AddDirectDependency(targetMethod);
+            if (RequiresTypeInitializationBeforeCall(targetMethod))
+            {
+                _rts.EnsureConstructedMembers(targetMethod.DeclaringType);
+                RuntimeMethod? cctor = FindTypeInitializer(targetMethod.DeclaringType);
+                if (cctor is not null)
+                {
+                    targetMethod.RequiresClassInitializationEntryCheck = true;
+                    AddDirectDependency(cctor);
+                }
+            }
+
+            PushImportedValue(stack, statements, Node(
+                GenTreeKind.FunctionPointer,
+                pc,
+                ins.Op,
+                stackKind: GenStackKind.Ptr,
+                int64: targetMethod.MethodId,
+                method: targetMethod));
+        }
+
+        private void EmitIndirectCall(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
+        {
+            int argumentCount = ins.Operand1;
+            var operands = PopMany(stack, checked(argumentCount + 1), pc, ins.Op);
+            var signature = ResolveType(ins.Operand0);
+            if (signature.Kind != RuntimeTypeKind.FunctionPointer)
+                throw Fail(pc, ins.Op, $"Calli signature token resolved to '{signature.Kind}'.");
+            if (signature.FunctionPointerCallingConvention != 0)
+                throw Fail(pc, ins.Op, "Only managed function pointer calling convention is supported.");
+            if (signature.FunctionPointerParameterTypes.Length != argumentCount ||
+                signature.FunctionPointerParameterByRef.Length != argumentCount)
+            {
+                throw Fail(pc, ins.Op, "Function pointer argument count does not match the call site.");
+            }
+            MarkInstantiatedTypeClosure(signature);
+
+            RuntimeType returnElementType = signature.FunctionPointerReturnType
+                ?? throw Fail(pc, ins.Op, "Function pointer signature has no return type.");
+            bool returnsVoid = !signature.FunctionPointerReturnByRef && IsVoid(returnElementType);
+            RuntimeType? returnType = returnsVoid
+                ? null
+                : signature.FunctionPointerReturnByRef
+                    ? _rts.GetByRefType(returnElementType)
+                    : returnElementType;
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+
+            var call = Node(
+                GenTreeKind.IndirectCall,
+                pc,
+                ins.Op,
+                type: returnType,
+                stackKind: returnsVoid ? GenStackKind.Void : StackKindOf(returnType),
+                operands: operands,
+                int32: argumentCount,
+                int64: ins.Operand0,
+                runtimeType: signature);
+
+            if (returnsVoid)
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(call)));
+            else
+                PushImportedValue(stack, statements, call);
         }
 
         private void EmitNewDelegate(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)
@@ -5257,7 +5358,7 @@ namespace Cnidaria.Cs
         {
             GenTreeFlags flags = GenTreeFlags.None;
             for (int i = 0; i < operands.Length; i++)
-                flags |= operands[i].Flags;
+                flags |= operands[i].Flags & ~GenTreeFlags.AssertionProperties;
 
             switch (kind)
             {
@@ -5354,6 +5455,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
+                case GenTreeKind.IndirectCall:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
                     flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
@@ -5657,7 +5759,7 @@ namespace Cnidaria.Cs
             if (type.IsReferenceType)
                 return GenStackKind.Ref;
 
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                 return GenStackKind.Ptr;
 
             if (type.Kind == RuntimeTypeKind.ByRef)

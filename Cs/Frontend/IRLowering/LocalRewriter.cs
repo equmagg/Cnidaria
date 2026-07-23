@@ -162,6 +162,7 @@ namespace Cnidaria.Cs
                 BoundSizeOfExpression e => e,
                 BoundUnboundLambdaExpression e => e,
                 BoundMethodGroupExpression e => e,
+                BoundFunctionPointerMethodGroupExpression e => e,
                 BoundLambdaExpression e => RewriteLambdaExpression(e),
                 BoundClosureCellCreationExpression e => RewriteClosureCellCreationExpression(e),
                 BoundClosureCreationExpression e => RewriteClosureCreationExpression(e),
@@ -180,6 +181,8 @@ namespace Cnidaria.Cs
 
                 BoundRefExpression e => RewriteRefExpression(e),
                 BoundAddressOfExpression e => RewriteAddressOfExpression(e),
+                BoundFunctionPointerLoadExpression e => e,
+                BoundFunctionPointerInvocationExpression e => RewriteFunctionPointerInvocationExpression(e),
                 BoundPointerIndirectionExpression e => RewritePointerIndirectionExpression(e),
                 BoundPointerElementAccessExpression e => RewritePointerElementAccessExpression(e),
 
@@ -719,6 +722,19 @@ namespace Cnidaria.Cs
             if (!ReferenceEquals(operand, node.Operand))
                 return new BoundAddressOfExpression((PrefixUnaryExpressionSyntax)node.Syntax, (PointerTypeSymbol)node.Type, operand);
 
+            return node;
+        }
+
+        protected virtual BoundExpression RewriteFunctionPointerInvocationExpression(BoundFunctionPointerInvocationExpression node)
+        {
+            var invokedExpression = RewriteExpression(node.InvokedExpression);
+            var arguments = RewriteExpressions(node.Arguments, out var argumentsChanged);
+            if (!ReferenceEquals(invokedExpression, node.InvokedExpression) || argumentsChanged)
+                return new BoundFunctionPointerInvocationExpression(
+                    (InvocationExpressionSyntax)node.Syntax,
+                    invokedExpression,
+                    node.FunctionPointerType,
+                    arguments);
             return node;
         }
 

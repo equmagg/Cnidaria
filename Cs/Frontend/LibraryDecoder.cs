@@ -130,6 +130,12 @@ namespace Cnidaria.Cs
         }
         public PointerTypeSymbol CreatePointerType(TypeSymbol pointedAtType)
             => _types.GetPointerType(pointedAtType);
+        public FunctionPointerTypeSymbol CreateFunctionPointerType(
+            FunctionPointerCallingConvention callingConvention,
+            TypeSymbol returnType,
+            FunctionPointerRefKind returnRefKind,
+            ImmutableArray<FunctionPointerParameter> parameters)
+            => _types.GetFunctionPointerType(callingConvention, returnType, returnRefKind, parameters);
         public ByRefTypeSymbol CreateByRefType(TypeSymbol elementType)
             => _types.GetByRefType(elementType);
         public ArrayTypeSymbol CreateArrayType(TypeSymbol elementType, int rank)
@@ -380,7 +386,8 @@ namespace Cnidaria.Cs
             bool isOverride,
             bool isSealed,
             bool isExtensionMethod,
-            ImmutableArray<TypeParameterSymbol> typeParameters)
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            bool isExtern = false)
         {
             var m = new ExternalMethodSymbol(
                 name: name,
@@ -394,7 +401,8 @@ namespace Cnidaria.Cs
                 isAbstract: isAbstract,
                 isOverride: isOverride,
                 isSealed: isSealed,
-                isExtensionMethod: isExtensionMethod);
+                isExtensionMethod: isExtensionMethod,
+                isExtern: isExtern);
 
             if (!typeParameters.IsDefaultOrEmpty && m is ExternalMethodSymbol em)
                 em.SetTypeParameters(typeParameters);
@@ -1327,7 +1335,9 @@ namespace Cnidaria.Cs
                         isOverride: isOverride,
                         isSealed: isSealed,
                         isExtensionMethod: isExtensionMethod,
-                        typeParameters: mtps);
+                        typeParameters: mtps,
+                        isExtern: (mdRow.ImplFlags & MetadataFlagBits.Extern) != 0 ||
+                                  (mdRow.Flags & (ushort)System.Reflection.MethodAttributes.PinvokeImpl) != 0);
 
                     ApplyParamRefKinds(ms, mdRow.ParamList, (int)paramCount);
                     ApplyParamDefaultValues(ms, mdRow.ParamList, (int)paramCount, constByParent);
@@ -1777,6 +1787,12 @@ namespace Cnidaria.Cs
                 SigElementType.BYREF
                     => core.CreateByRefType(ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters)),
 
+                SigElementType.FNPTR
+                    => ReadFunctionPointerType(core, typeByRid, ref reader, declaringType, methodTypeParameters),
+
+                SigElementType.CMOD_REQD or SigElementType.CMOD_OPT
+                    => ReadModifiedType(core, typeByRid, ref reader, declaringType, methodTypeParameters),
+
                 SigElementType.SZARRAY
                     => core.CreateArrayType(ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters), rank: 1, isSZArray: true),
 
@@ -1785,6 +1801,124 @@ namespace Cnidaria.Cs
 
                 _ => new ErrorTypeSymbol($"sig:{et}", containing: null, locations: ImmutableArray<Location>.Empty)
             };
+        }
+        private TypeSymbol ReadFunctionPointerType(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            ref SigReader reader,
+            NamedTypeSymbol? declaringType,
+            ImmutableArray<TypeParameterSymbol> methodTypeParameters)
+        {
+            byte rawCallingConvention = reader.ReadByte();
+            var callingConvention = (rawCallingConvention & 0x0F) switch
+            {
+                0x00 => FunctionPointerCallingConvention.Managed,
+                0x01 => FunctionPointerCallingConvention.Cdecl,
+                0x02 => FunctionPointerCallingConvention.Stdcall,
+                0x03 => FunctionPointerCallingConvention.Thiscall,
+                0x04 => FunctionPointerCallingConvention.Fastcall,
+                _ => FunctionPointerCallingConvention.Unmanaged
+            };
+            int parameterCount = checked((int)reader.ReadCompressedUInt());
+            var returnType = ReadFunctionPointerSignatureType(
+                core,
+                typeByRid,
+                ref reader,
+                declaringType,
+                methodTypeParameters,
+                out var returnRefKind);
+            var parameters = ImmutableArray.CreateBuilder<FunctionPointerParameter>(parameterCount);
+            for (int i = 0; i < parameterCount; i++)
+            {
+                var parameterType = ReadFunctionPointerSignatureType(
+                    core,
+                    typeByRid,
+                    ref reader,
+                    declaringType,
+                    methodTypeParameters,
+                    out var parameterRefKind);
+                parameters.Add(new FunctionPointerParameter(parameterType, parameterRefKind));
+            }
+            return core.CreateFunctionPointerType(callingConvention, returnType, returnRefKind, parameters.ToImmutable());
+        }
+
+        private TypeSymbol ReadFunctionPointerSignatureType(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            ref SigReader reader,
+            NamedTypeSymbol? declaringType,
+            ImmutableArray<TypeParameterSymbol> methodTypeParameters,
+            out FunctionPointerRefKind refKind)
+        {
+            bool isByRef = reader.PeekByte() == (byte)SigElementType.BYREF;
+            if (isByRef)
+                _ = reader.ReadByte();
+
+            refKind = isByRef ? FunctionPointerRefKind.Ref : FunctionPointerRefKind.None;
+            while (reader.PeekByte() == (byte)SigElementType.CMOD_REQD ||
+                   reader.PeekByte() == (byte)SigElementType.CMOD_OPT)
+            {
+                var modifierKind = (SigElementType)reader.ReadByte();
+                uint modifierType = reader.ReadCompressedUInt();
+                var modifierName = GetModifierTypeName(modifierType, typeByRid);
+                if (modifierKind == SigElementType.CMOD_REQD &&
+                    modifierName == ("System.Runtime.InteropServices", "OutAttribute"))
+                {
+                    refKind = FunctionPointerRefKind.Out;
+                }
+                else if (modifierKind == SigElementType.CMOD_REQD &&
+                    modifierName == ("System.Runtime.InteropServices", "InAttribute"))
+                {
+                    refKind = FunctionPointerRefKind.In;
+                }
+                else if (modifierKind == SigElementType.CMOD_OPT &&
+                    modifierName == ("System.Runtime.CompilerServices", "RequiresLocationAttribute"))
+                {
+                    refKind = FunctionPointerRefKind.RefReadOnly;
+                }
+            }
+
+            return ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
+        }
+
+        private TypeSymbol ReadModifiedType(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            ref SigReader reader,
+            NamedTypeSymbol? declaringType,
+            ImmutableArray<TypeParameterSymbol> methodTypeParameters)
+        {
+            _ = reader.ReadCompressedUInt();
+            return ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
+        }
+
+        private (string Namespace, string Name) GetModifierTypeName(
+            uint encoded,
+            NamedTypeSymbol[] typeByRid)
+        {
+            int tag = (int)(encoded & 0x3u);
+            int rid = checked((int)(encoded >> 2));
+            if (tag == 0 && (uint)rid < (uint)typeByRid.Length && typeByRid[rid] is { } type)
+                return (GetNamespaceName(type.ContainingSymbol), type.Name);
+
+            if (tag == 1 && rid > 0 && rid <= _md.GetRowCount(MetadataTableKind.TypeRef))
+            {
+                var row = _md.GetTypeRef(rid);
+                return (_md.GetString(row.Namespace), SplitArity(_md.GetString(row.Name)).name);
+            }
+
+            return (string.Empty, string.Empty);
+        }
+
+        private static string GetNamespaceName(Symbol? symbol)
+        {
+            var names = new Stack<string>();
+            for (var current = symbol; current is not null; current = current.ContainingSymbol)
+            {
+                if (current is NamespaceSymbol ns && !string.IsNullOrEmpty(ns.Name))
+                    names.Push(ns.Name);
+            }
+            return string.Join(".", names);
         }
         private static TypeSymbol ReadVar(NamedTypeSymbol? declaringType, ref SigReader reader)
         {
@@ -2000,6 +2134,11 @@ namespace Cnidaria.Cs
             {
                 if ((uint)_i >= (uint)_s.Length) throw new InvalidOperationException("Signature underflow.");
                 return _s[_i++];
+            }
+            public byte PeekByte()
+            {
+                if ((uint)_i >= (uint)_s.Length) throw new InvalidOperationException("Signature underflow.");
+                return _s[_i];
             }
 
             public uint ReadCompressedUInt()

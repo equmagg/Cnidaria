@@ -57,7 +57,7 @@ namespace Cnidaria.Cs
         {
             if (t is TypeParameterSymbol tp)
                 return (tp.GenericConstraint & GenericConstraintsFlags.UnmanagedConstraint) != 0;
-            if (t is PointerTypeSymbol)
+            if (t is PointerTypeSymbol or FunctionPointerTypeSymbol)
                 return true;
             if (t is ByRefTypeSymbol)
                 return false;
@@ -231,6 +231,8 @@ namespace Cnidaria.Cs
                     return ContainsRefLike(br.ElementType);
                 case PointerTypeSymbol ptr:
                     return ContainsRefLike(ptr.PointedAtType);
+                case FunctionPointerTypeSymbol:
+                    return false;
                 case ArrayTypeSymbol arr:
                     return ContainsRefLike(arr.ElementType);
                 case TupleTypeSymbol tuple:

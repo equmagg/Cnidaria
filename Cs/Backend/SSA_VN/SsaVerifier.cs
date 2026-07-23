@@ -707,6 +707,8 @@ namespace Cnidaria.Cs
             int statementIndex,
             SsaTree tree)
         {
+            VerifyAssertionProperties(method, tree.Source);
+
             if (tree.Value.HasValue)
                 VerifyLocalUse(method, definitions, definitionsBySlot, localLiveness, tree.Value.Value, blockId, statementIndex, tree.Source.Id);
 
@@ -718,6 +720,28 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < tree.Operands.Length; i++)
                 VerifyTreeUses(method, definitions, definitionsBySlot, memoryDefinitions, memoryDefinitionsByKind, localLiveness, blockId, statementIndex, tree.Operands[i]);
+        }
+
+        private static void VerifyAssertionProperties(SsaMethod method, GenTree node)
+        {
+            GenTreeFlags divModFlags = node.Flags & (GenTreeFlags.DivModNoByZero | GenTreeFlags.DivModNoOverflow);
+            if (divModFlags == 0)
+                return;
+
+            if (node.Kind != GenTreeKind.Binary ||
+                node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ||
+                node.Operands.Length != 2 ||
+                !GenTreeArithmeticSemantics.IsIntegralArithmeticType(node.Type, node.StackKind))
+            {
+                throw new InvalidOperationException($"SSA node has invalid div/mod assertion flags: {node}.");
+            }
+
+            bool expectedCanThrow = GenTreeArithmeticSemantics.DivRemCanThrow(node, method.GenTreeMethod.Target);
+            for (int i = 0; i < node.Operands.Length; i++)
+                expectedCanThrow |= node.Operands[i].CanThrow;
+
+            if (node.CanThrow != expectedCanThrow)
+                throw new InvalidOperationException($"SSA div/mod exception flags are inconsistent: {node}.");
         }
 
         private static void VerifyTreeDefinitions(

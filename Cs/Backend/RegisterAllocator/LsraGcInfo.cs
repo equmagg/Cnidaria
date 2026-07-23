@@ -116,6 +116,9 @@ namespace Cnidaria.Cs
                 if (node is null || !node.HasLoweringFlag(GenTreeLinearFlags.AbiCall))
                     return false;
 
+                if (node.TreeKind == GenTreeKind.IndirectCall)
+                    return true;
+
                 var method = node.Method;
                 if (method is null || method.HasInternalCall)
                     return false;
@@ -1176,7 +1179,7 @@ namespace Cnidaria.Cs
 
                 if (GenTreeLirKinds.IsRealTree(node) && node.Source is not null)
                 {
-                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke or GenTreeKind.NewObject or GenTreeKind.Throw or GenTreeKind.Rethrow)
+                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke or GenTreeKind.NewObject or GenTreeKind.Throw or GenTreeKind.Rethrow)
                     {
                         kind = RegisterGcInterruptibleRangeKind.Call;
                         return true;

@@ -10,14 +10,16 @@ namespace Cnidaria.C
     {
         public const string BuiltinVaStartName = "__builtin_va_start";
         public const string BuiltinVaArgName = "__builtin_va_arg";
-        public const string PrintfIntrinsicName = "__printf";
-        public const string MallocIntrinsicName = "malloc";
-        public const string FreeIntrinsicName = "free";
+        public const string PrintfIntrinsicName = "__printf"; // classified as intrinsic for Register Bytecode only
+        public const string MallocIntrinsicName = "malloc"; // classified as intrinsic for Register Bytecode only
+        public const string FreeIntrinsicName = "free"; // classified as intrinsic for Register Bytecode only
 
-        internal static string StddefH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stddef.h");
         internal static string StdargH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdarg.h");
-        internal static string StdioH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdio.h");
+        internal static string StddefH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stddef.h");
         internal static string StdintH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdint.h");
+        internal static string StdioH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdio.h");
+        internal static string StdlibH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.stdlib.h");
+        internal static string StringH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.string.h");
         internal static string RiscVVectorH { get; } = ReadEmbeddedText("Cnidaria.C.StandardHeaders.riscv_vector.h");
         private static string ReadEmbeddedText(string resourceName)
         {
@@ -31,10 +33,12 @@ namespace Cnidaria.C
         public static ImmutableArray<IncludeFile> CreateFiles()
         {
             return ImmutableArray.Create(
-                new IncludeFile("stddef.h", StddefH),
-                new IncludeFile("stdio.h", StdioH),
                 new IncludeFile("stdarg.h", StdargH),
+                new IncludeFile("stddef.h", StddefH),
                 new IncludeFile("stdint.h", StdintH),
+                new IncludeFile("stdio.h", StdioH),
+                new IncludeFile("stdlib.h", StdlibH),
+                new IncludeFile("string.h", StringH),
                 new IncludeFile("riscv_vector.h", RiscVVectorH));
         }
 

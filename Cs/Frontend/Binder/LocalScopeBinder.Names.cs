@@ -667,6 +667,20 @@ namespace Cnidaria.Cs
         {
             EnsureUnsafe(node, context, diagnostics);
 
+            if (operand is BoundMethodGroupExpression methodGroup)
+            {
+                var candidates = methodGroup.Methods.Where(m => m.IsStatic && !m.IsConstructor).ToImmutableArray();
+                if (candidates.Length != 0)
+                    return new BoundFunctionPointerMethodGroupExpression(node, methodGroup);
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR_ADDR001",
+                    DiagnosticSeverity.Error,
+                    "The address-of operator for a function pointer requires a static method.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
+                return new BoundBadExpression(node);
+            }
+
             if (!operand.IsLValue)
             {
                 diagnostics.Add(new Diagnostic(
@@ -723,6 +737,167 @@ namespace Cnidaria.Cs
 
             var ptrType = context.Compilation.CreatePointerType(operand.Type);
             return new BoundAddressOfExpression(node, ptrType, operand);
+        }
+
+        private bool TryResolveFunctionPointerMethodGroup(
+            BoundFunctionPointerMethodGroupExpression expression,
+            FunctionPointerTypeSymbol targetType,
+            BindingContext context,
+            out MethodSymbol? method)
+        {
+            method = null;
+
+            var candidates = expression.MethodGroup.Methods
+                .Where(candidate =>
+                    candidate.IsStatic &&
+                    !candidate.IsConstructor &&
+                    candidate.Parameters.Length == targetType.Parameters.Length)
+                .ToImmutableArray();
+
+            if (candidates.IsDefaultOrEmpty)
+                return false;
+
+            var arguments = ImmutableArray.CreateBuilder<BoundExpression>(targetType.Parameters.Length);
+            var refKindTokens = new SyntaxToken?[targetType.Parameters.Length];
+            var expressionSyntax = (ExpressionSyntax)expression.Syntax;
+
+            for (int i = 0; i < targetType.Parameters.Length; i++)
+            {
+                var parameter = targetType.Parameters[i];
+                BoundExpression argument = new BoundTypeOnlyExpression(expressionSyntax, parameter.Type);
+                if (parameter.RefKind != FunctionPointerRefKind.None)
+                {
+                    argument = new BoundRefExpression(
+                        expression.Syntax,
+                        context.Compilation.CreateByRefType(parameter.Type),
+                        argument);
+
+                    var tokenKind = parameter.RefKind switch
+                    {
+                        FunctionPointerRefKind.Ref => SyntaxKind.RefKeyword,
+                        FunctionPointerRefKind.Out => SyntaxKind.OutKeyword,
+                        FunctionPointerRefKind.In or FunctionPointerRefKind.RefReadOnly => SyntaxKind.InKeyword,
+                        _ => SyntaxKind.None
+                    };
+
+                    if (tokenKind != SyntaxKind.None)
+                    {
+                        refKindTokens[i] = new SyntaxToken(
+                            tokenKind,
+                            expression.Syntax.Span,
+                            valueText: null,
+                            value: null,
+                            leadingTrivia: Array.Empty<SyntaxTrivia>(),
+                            trailingTrivia: Array.Empty<SyntaxTrivia>());
+                    }
+                }
+
+                arguments.Add(argument);
+            }
+
+            var probeDiagnostics = new DiagnosticBag();
+            if (!TryResolveOverload(
+                candidates: candidates,
+                args: arguments.ToImmutable(),
+                getArgExprSyntax: _ => expressionSyntax,
+                chosen: out var selected,
+                convertedArgs: out _,
+                context: context,
+                diagnostics: probeDiagnostics,
+                diagnosticNode: expression.Syntax,
+                getArgRefKindKeyword: i => refKindTokens[i],
+                allowParamsExpansion: false))
+            {
+                return false;
+            }
+
+            if (selected is null || !FunctionPointerSignatureMatches(selected, targetType))
+                return false;
+
+            method = selected;
+            return true;
+        }
+
+        private static FunctionPointerRefKind GetFunctionPointerRefKind(
+            TypeSymbol type,
+            ParameterRefKind refKind,
+            bool isReadOnlyRef)
+        {
+            return refKind switch
+            {
+                ParameterRefKind.Ref => isReadOnlyRef ? FunctionPointerRefKind.RefReadOnly : FunctionPointerRefKind.Ref,
+                ParameterRefKind.Out => FunctionPointerRefKind.Out,
+                ParameterRefKind.In => FunctionPointerRefKind.In,
+                _ => type is ByRefTypeSymbol
+                    ? isReadOnlyRef ? FunctionPointerRefKind.RefReadOnly : FunctionPointerRefKind.Ref
+                    : FunctionPointerRefKind.None
+            };
+        }
+
+        private static bool IsRefReadonlyMethodReturn(MethodSymbol method)
+        {
+            var references = method.DeclaringSyntaxReferences;
+            for (int i = 0; i < references.Length; i++)
+            {
+                TypeSyntax? returnType = references[i].Node switch
+                {
+                    MethodDeclarationSyntax declaration => declaration.ReturnType,
+                    LocalFunctionStatementSyntax localFunction => localFunction.ReturnType,
+                    _ => null
+                };
+
+                if (returnType is RefTypeSyntax refType &&
+                    refType.ReadOnlyKeyword.Kind == SyntaxKind.ReadOnlyKeyword)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool FunctionPointerSignatureMatches(MethodSymbol method, FunctionPointerTypeSymbol type)
+        {
+            if (type.CallingConvention != FunctionPointerCallingConvention.Managed ||
+                method.Parameters.Length != type.Parameters.Length)
+                return false;
+
+            var methodReturnType = method.ReturnType is ByRefTypeSymbol returnByRef ? returnByRef.ElementType : method.ReturnType;
+            var methodReturnRefKind = GetFunctionPointerRefKind(
+                method.ReturnType,
+                ParameterRefKind.None,
+                IsRefReadonlyMethodReturn(method));
+            if (methodReturnRefKind != type.ReturnRefKind)
+                return false;
+
+            if (methodReturnRefKind == FunctionPointerRefKind.None)
+            {
+                if (!HasFunctionPointerSignatureTypeConversion(type.ReturnType, methodReturnType))
+                    return false;
+            }
+            else if (!AreSameType(methodReturnType, type.ReturnType))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < method.Parameters.Length; i++)
+            {
+                var parameter = method.Parameters[i];
+                var parameterType = parameter.Type is ByRefTypeSymbol byRef ? byRef.ElementType : parameter.Type;
+                var parameterRefKind = GetFunctionPointerRefKind(parameter.Type, parameter.RefKind, parameter.IsReadOnlyRef);
+                if (parameterRefKind != type.Parameters[i].RefKind)
+                    return false;
+
+                if (parameterRefKind == FunctionPointerRefKind.None)
+                {
+                    if (!HasFunctionPointerSignatureTypeConversion(parameterType, type.Parameters[i].Type))
+                        return false;
+                }
+                else if (!AreSameType(parameterType, type.Parameters[i].Type))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private BoundExpression BindPointerIndirection(
@@ -999,7 +1174,7 @@ namespace Cnidaria.Cs
             accessReceiver = null!;
             condition = null!;
 
-            if (receiver.Type.SpecialType == SpecialType.System_Void || receiver.Type is PointerTypeSymbol or ByRefTypeSymbol)
+            if (receiver.Type.SpecialType == SpecialType.System_Void || receiver.Type is PointerTypeSymbol or ByRefTypeSymbol or FunctionPointerTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_CONDACCESS001",

@@ -397,12 +397,12 @@ namespace Cnidaria.Cs
                 return new ErrorTypeSymbol("void", containing: null, ImmutableArray<Location>.Empty);
             }
 
-            if (exceptionType is PointerTypeSymbol)
+            if (exceptionType is PointerTypeSymbol or FunctionPointerTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_TRYTYPE001",
                     DiagnosticSeverity.Error,
-                    "Cannot catch a pointer type.",
+                    "Cannot catch a pointer or function pointer type.",
                     new Location(context.SemanticModel.SyntaxTree, typeSyntax.Span)));
                 return new ErrorTypeSymbol("ptr", containing: null, ImmutableArray<Location>.Empty);
             }

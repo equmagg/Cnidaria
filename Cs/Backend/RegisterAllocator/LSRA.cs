@@ -55,6 +55,7 @@ namespace Cnidaria.Cs
     {
         Normal,
         HiddenReturnBuffer,
+        IndirectCallTarget,
     }
     internal enum MoveKind : byte
     {
@@ -5544,7 +5545,19 @@ namespace Cnidaria.Cs
                 var stackMoves = new List<RegisterResolvedMove>();
                 var argumentPackingHomes = new Dictionary<GenTree, RegisterOperand>();
                 bool referenceTypeNewObject = node.Kind == GenTreeKind.NewObject;
-                var descriptor = MachineAbi.BuildCallDescriptor(node.RegisterUses, _method.GetValueInfo, node.RegisterResult, node.Method, referenceTypeNewObject, _method.Target);
+                GenTree? indirectCallTarget = null;
+                ImmutableArray<GenTree> callArguments = node.RegisterUses;
+                if (node.Kind == GenTreeKind.IndirectCall)
+                {
+                    if (node.RegisterUses.IsDefaultOrEmpty)
+                        throw new InvalidOperationException("Indirect call has no target operand.");
+                    indirectCallTarget = node.RegisterUses[0];
+                    var argumentBuilder = ImmutableArray.CreateBuilder<GenTree>(node.RegisterUses.Length - 1);
+                    for (int i = 1; i < node.RegisterUses.Length; i++)
+                        argumentBuilder.Add(node.RegisterUses[i]);
+                    callArguments = argumentBuilder.ToImmutable();
+                }
+                var descriptor = MachineAbi.BuildCallDescriptor(callArguments, _method.GetValueInfo, node.RegisterResult, node.Method, referenceTypeNewObject, _method.Target);
 
                 RegisterOperand finalResult = RegisterOperand.None;
                 RegisterOperand callResult = RegisterOperand.None;
@@ -5672,6 +5685,32 @@ namespace Cnidaria.Cs
                         stackMoves.Add(move);
                     else
                         registerMoves.Add(move);
+                }
+
+                if (indirectCallTarget is not null)
+                {
+                    var targetInfo = _method.GetValueInfo(indirectCallTarget);
+                    var targetAbi = MachineAbi.ClassifyValue(targetInfo.Type, targetInfo.StackKind, isReturn: false, target: _method.Target);
+                    if (targetAbi.PassingKind != AbiValuePassingKind.ScalarRegister || targetAbi.RegisterClass != RegisterClass.General)
+                        throw new InvalidOperationException("Indirect call target is not a scalar general-register value.");
+
+                    var sourceLocation = ValueLocationForUse(indirectCallTarget, position, targetAbi);
+                    if (!sourceLocation.IsScalar)
+                        throw new InvalidOperationException("Indirect call target has no scalar allocation source.");
+                    RegisterOperand source = sourceLocation.Scalar;
+                    RegisterOperand target = RegisterOperand.ForRegister(MachineRegisters.TreeScratch3);
+                    targets.Add(target);
+                    callRegisterUses.Add(indirectCallTarget);
+                    callUseRoles.Add(OperandRole.IndirectCallTarget);
+                    if (!source.Equals(target))
+                    {
+                        registerMoves.Add(new RegisterResolvedMove(
+                            source,
+                            target,
+                            indirectCallTarget,
+                            indirectCallTarget,
+                            MoveFlags.AbiArgument));
+                    }
                 }
 
                 for (int i = 0; i < stackMoves.Count; i++)
@@ -6410,7 +6449,18 @@ namespace Cnidaria.Cs
                 {
                     if (IsAbiCall(node))
                     {
-                        var descriptor = MachineAbi.BuildCallDescriptor(node.RegisterUses, method.GetValueInfo, node.RegisterResult, node.Method, node.Kind == GenTreeKind.NewObject, method.Target);
+                        ImmutableArray<GenTree> callArguments = node.RegisterUses;
+                        if (node.Kind == GenTreeKind.IndirectCall)
+                        {
+                            if (node.RegisterUses.IsDefaultOrEmpty)
+                                throw new InvalidOperationException("Indirect call has no target operand.");
+                            var arguments = ImmutableArray.CreateBuilder<GenTree>(node.RegisterUses.Length - 1);
+                            for (int i = 1; i < node.RegisterUses.Length; i++)
+                                arguments.Add(node.RegisterUses[i]);
+                            callArguments = arguments.ToImmutable();
+                        }
+
+                        var descriptor = MachineAbi.BuildCallDescriptor(callArguments, method.GetValueInfo, node.RegisterResult, node.Method, node.Kind == GenTreeKind.NewObject, method.Target);
                         for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
                         {
                             var segment = descriptor.ArgumentSegments[i];

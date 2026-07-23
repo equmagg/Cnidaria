@@ -295,6 +295,8 @@ namespace Cnidaria.C
                 _ => target.PointerSize == 8 ? "unknown64" : "unknown32",
             };
 
+            macros["__SIZEOF_POINTER__"] = target.PointerSize.ToString();
+
             var operatingSystem = target.OperatingSystem switch
             {
                 OperatingSystemKind.None => "unknown",
@@ -361,7 +363,7 @@ namespace Cnidaria.C
                 (target.ArchitectureFeatures & TargetArchitectureFeatures.X86Sse2) != 0)
             {
                 macros["__SSE__"] = "1";
-                macros["__SSE__"] = "1";
+                macros["__SSE2__"] = "1";
                 macros["_M_IX86_FP"] = "2";
             }
 

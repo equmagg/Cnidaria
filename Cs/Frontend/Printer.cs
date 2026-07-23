@@ -315,6 +315,19 @@ namespace Cnidaria.Cs
                 case SigElementType.BYREF:
                     return MatchType(defModule, ref def, memberRefModule, ref mr);
 
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    {
+                        int dModifierToken = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
+                        int mModifierToken = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
+                        if (ResolveTypeTokenFullName(defModule, dModifierToken) !=
+                            ResolveTypeTokenFullName(memberRefModule, mModifierToken))
+                        {
+                            return false;
+                        }
+                        return MatchType(defModule, ref def, memberRefModule, ref mr);
+                    }
+
                 case SigElementType.ARRAY:
                     {
                         if (!MatchType(defModule, ref def, memberRefModule, ref mr))
@@ -369,6 +382,22 @@ namespace Cnidaria.Cs
 
                         return true;
                     }
+
+                case SigElementType.FNPTR:
+                    {
+                        if (def.ReadByte() != mr.ReadByte())
+                            return false;
+                        uint dParameterCount = def.ReadCompressedUInt();
+                        uint mParameterCount = mr.ReadCompressedUInt();
+                        if (dParameterCount != mParameterCount)
+                            return false;
+                        if (!MatchType(defModule, ref def, memberRefModule, ref mr))
+                            return false;
+                        for (int i = 0; i < dParameterCount; i++)
+                            if (!MatchType(defModule, ref def, memberRefModule, ref mr))
+                                return false;
+                        return true;
+                    }
             }
 
             return true;
@@ -388,6 +417,12 @@ namespace Cnidaria.Cs
                     SkipType((SigElementType)r.ReadByte(), ref r);
                     return;
 
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    _ = r.ReadCompressedUInt();
+                    SkipType((SigElementType)r.ReadByte(), ref r);
+                    return;
+
                 case SigElementType.ARRAY:
                     SkipType((SigElementType)r.ReadByte(), ref r);
                     _ = r.ReadCompressedUInt();
@@ -402,6 +437,14 @@ namespace Cnidaria.Cs
                     _ = r.ReadCompressedUInt();
                     uint argc = r.ReadCompressedUInt();
                     for (int i = 0; i < argc; i++)
+                        SkipType((SigElementType)r.ReadByte(), ref r);
+                    return;
+
+                case SigElementType.FNPTR:
+                    _ = r.ReadByte();
+                    uint parameterCount = r.ReadCompressedUInt();
+                    SkipType((SigElementType)r.ReadByte(), ref r);
+                    for (int i = 0; i < parameterCount; i++)
                         SkipType((SigElementType)r.ReadByte(), ref r);
                     return;
 

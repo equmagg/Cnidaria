@@ -191,11 +191,168 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics)
         {
             var receiver = BindExpression(inv.Expression, context, diagnostics);
+            if (!receiver.HasErrors && receiver.Type is FunctionPointerTypeSymbol functionPointerType)
+                return BindFunctionPointerInvocation(inv, receiver, functionPointerType, argSyntaxes, args, context, diagnostics);
             if (!receiver.HasErrors && TryGetDelegateInvokeMethod(receiver.Type, out _, out _))
                 return BindDelegateInvocation(inv, receiver, argSyntaxes, args, context, diagnostics);
 
             return BindUnsupportedInvocation(inv, context, diagnostics);
         }
+
+        private BoundExpression BindFunctionPointerInvocation(
+            InvocationExpressionSyntax inv,
+            BoundExpression receiver,
+            FunctionPointerTypeSymbol functionPointerType,
+            SeparatedSyntaxList<ArgumentSyntax> argSyntaxes,
+            ImmutableArray<BoundExpression> args,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            EnsureUnsafe(inv, context, diagnostics);
+
+            if (args.Length != functionPointerType.Parameters.Length)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR_CALL001",
+                    DiagnosticSeverity.Error,
+                    $"Function pointer requires {functionPointerType.Parameters.Length} argument(s), but {args.Length} were supplied.",
+                    new Location(context.SemanticModel.SyntaxTree, inv.ArgumentList.Span)));
+                return new BoundBadExpression(inv);
+            }
+
+            var converted = ImmutableArray.CreateBuilder<BoundExpression>(args.Length);
+            bool hasErrors = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                var argumentSyntax = argSyntaxes[i];
+                var parameter = functionPointerType.Parameters[i];
+                if (argumentSyntax.NameColon is not null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_CALL002",
+                        DiagnosticSeverity.Error,
+                        "Function pointer arguments cannot be named.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentSyntax.NameColon.Span)));
+                    hasErrors = true;
+                }
+
+                var actualRefKind = GetArgRefKind(argumentSyntax.RefKindKeyword);
+                var expectedRefKind = parameter.RefKind switch
+                {
+                    FunctionPointerRefKind.Ref => ParameterRefKind.Ref,
+                    FunctionPointerRefKind.Out => ParameterRefKind.Out,
+                    FunctionPointerRefKind.In => ParameterRefKind.In,
+                    FunctionPointerRefKind.RefReadOnly => ParameterRefKind.In,
+                    _ => ParameterRefKind.None
+                };
+
+                bool isInputParameter = parameter.RefKind is FunctionPointerRefKind.In or FunctionPointerRefKind.RefReadOnly;
+                bool refKindMatches = actualRefKind == expectedRefKind ||
+                    isInputParameter && (actualRefKind == ParameterRefKind.None || actualRefKind == ParameterRefKind.Ref);
+                if (!refKindMatches)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_CALL003",
+                        DiagnosticSeverity.Error,
+                        $"Argument {i + 1} must be passed with '{FormatFunctionPointerRefKind(parameter.RefKind)}'.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentSyntax.Span)));
+                    converted.Add(args[i]);
+                    hasErrors = true;
+                    continue;
+                }
+
+                if (parameter.RefKind == FunctionPointerRefKind.In && actualRefKind == ParameterRefKind.Ref)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_CALL005",
+                        DiagnosticSeverity.Warning,
+                        $"Argument {i + 1} is passed with 'ref' to an 'in' function pointer parameter.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentSyntax.Span)));
+                }
+                else if (parameter.RefKind == FunctionPointerRefKind.RefReadOnly && actualRefKind == ParameterRefKind.None)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_CALL006",
+                        DiagnosticSeverity.Warning,
+                        $"Argument {i + 1} should be passed with 'in' or 'ref' to a 'ref readonly' function pointer parameter.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentSyntax.Span)));
+                }
+
+                if (parameter.RefKind == FunctionPointerRefKind.None)
+                {
+                    var value = ApplyConversion(
+                        argumentSyntax.Expression,
+                        args[i],
+                        parameter.Type,
+                        argumentSyntax.Expression,
+                        context,
+                        diagnostics,
+                        requireImplicit: true);
+                    converted.Add(value);
+                    hasErrors |= value.HasErrors;
+                    continue;
+                }
+
+                if (isInputParameter && actualRefKind == ParameterRefKind.None)
+                {
+                    var value = ApplyConversion(
+                        argumentSyntax.Expression,
+                        args[i],
+                        parameter.Type,
+                        argumentSyntax.Expression,
+                        context,
+                        diagnostics,
+                        requireImplicit: true);
+                    if (value.HasErrors)
+                    {
+                        converted.Add(value);
+                        hasErrors = true;
+                        continue;
+                    }
+
+                    var temp = NewTemp("<fnptr-in$>", parameter.Type);
+                    var local = new BoundLocalExpression(argumentSyntax.Expression, temp);
+                    var assignment = new BoundAssignmentExpression(argumentSyntax.Expression, local, value);
+                    var reference = new BoundRefExpression(
+                        argumentSyntax.Expression,
+                        context.Compilation.CreateByRefType(parameter.Type),
+                        new BoundLocalExpression(argumentSyntax.Expression, temp));
+                    converted.Add(new BoundSequenceExpression(
+                        argumentSyntax.Expression,
+                        ImmutableArray.Create(temp),
+                        ImmutableArray.Create<BoundStatement>(
+                            new BoundExpressionStatement(argumentSyntax.Expression, assignment)),
+                        reference));
+                    continue;
+                }
+
+                if (args[i].Type is not ByRefTypeSymbol byRef || !AreSameType(byRef.ElementType, parameter.Type))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_CALL004",
+                        DiagnosticSeverity.Error,
+                        $"Argument {i + 1} must be a variable of type '{parameter.Type.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, argumentSyntax.Expression.Span)));
+                    hasErrors = true;
+                }
+                converted.Add(args[i]);
+            }
+
+            if (hasErrors)
+                return new BoundBadExpression(inv);
+
+            return new BoundFunctionPointerInvocationExpression(inv, receiver, functionPointerType, converted.ToImmutable());
+        }
+
+        private static string FormatFunctionPointerRefKind(FunctionPointerRefKind refKind)
+            => refKind switch
+            {
+                FunctionPointerRefKind.Ref => "ref",
+                FunctionPointerRefKind.Out => "out",
+                FunctionPointerRefKind.In => "in",
+                FunctionPointerRefKind.RefReadOnly => "in",
+                _ => "value"
+            };
 
         private BoundExpression BindDelegateInvocation(
             InvocationExpressionSyntax inv,
@@ -253,6 +410,8 @@ namespace Cnidaria.Cs
 
             if (TryBindSimpleValue(id, out var simpleValue))
             {
+                if (!simpleValue.HasErrors && simpleValue.Type is FunctionPointerTypeSymbol functionPointerType)
+                    return BindFunctionPointerInvocation(inv, simpleValue, functionPointerType, argSyntaxes, args, context, diagnostics);
                 if (!simpleValue.HasErrors && TryGetDelegateInvokeMethod(simpleValue.Type, out _, out _))
                     return BindDelegateInvocation(inv, simpleValue, argSyntaxes, args, context, diagnostics);
 
@@ -268,6 +427,9 @@ namespace Cnidaria.Cs
                 if (memberValue.HasErrors)
                     return new BoundBadExpression(inv);
 
+                if (memberValue.Type is FunctionPointerTypeSymbol functionPointerType)
+                    return BindFunctionPointerInvocation(inv, memberValue, functionPointerType, argSyntaxes, args, context, diagnostics);
+
                 if (TryGetDelegateInvokeMethod(memberValue.Type, out _, out _))
                     return BindDelegateInvocation(inv, memberValue, argSyntaxes, args, context, diagnostics);
 
@@ -282,6 +444,9 @@ namespace Cnidaria.Cs
             {
                 if (importedStaticMemberValue.HasErrors)
                     return new BoundBadExpression(inv);
+
+                if (importedStaticMemberValue.Type is FunctionPointerTypeSymbol functionPointerType)
+                    return BindFunctionPointerInvocation(inv, importedStaticMemberValue, functionPointerType, argSyntaxes, args, context, diagnostics);
 
                 if (TryGetDelegateInvokeMethod(importedStaticMemberValue.Type, out _, out _))
                     return BindDelegateInvocation(inv, importedStaticMemberValue, argSyntaxes, args, context, diagnostics);
@@ -536,6 +701,11 @@ namespace Cnidaria.Cs
                 var probeDiagnostics = new DiagnosticBag();
                 var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
                 var probeValue = BindMemberAccess(ma, BindValueKind.RValue, probeContext, probeDiagnostics);
+                if (!probeValue.HasErrors && probeValue.Type is FunctionPointerTypeSymbol functionPointerType)
+                {
+                    var functionPointerValue = BindMemberAccess(ma, BindValueKind.RValue, context, diagnostics);
+                    return BindFunctionPointerInvocation(inv, functionPointerValue, functionPointerType, argSyntaxes, args, context, diagnostics);
+                }
                 if (!probeValue.HasErrors && TryGetDelegateInvokeMethod(probeValue.Type, out _, out _))
                 {
                     var delegateValue = BindMemberAccess(ma, BindValueKind.RValue, context, diagnostics);
@@ -1431,7 +1601,18 @@ namespace Cnidaria.Cs
         {
             var b = ImmutableArray.CreateBuilder<TypeSymbol>(args.Count);
             for (int i = 0; i < args.Count; i++)
-                b.Add(BindType(args[i], context, diagnostics));
+            {
+                var typeArgument = BindType(args[i], context, diagnostics);
+                if (typeArgument is FunctionPointerTypeSymbol)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_GENERIC001",
+                        DiagnosticSeverity.Error,
+                        $"The type '{typeArgument.Name}' may not be used as a type argument.",
+                        new Location(context.SemanticModel.SyntaxTree, args[i].Span)));
+                }
+                b.Add(typeArgument);
+            }
             return b.ToImmutable();
         }
         private BoundExpression BindImplicitObjectCreation(
@@ -2349,6 +2530,30 @@ namespace Cnidaria.Cs
                         InferMethodTypeArgumentsFromTypes(parameterPointer.PointedAtType, argumentPointer.PointedAtType, typeParameters, inferences);
                     return;
 
+                case FunctionPointerTypeSymbol parameterFunctionPointer:
+                    if (argumentType is FunctionPointerTypeSymbol argumentFunctionPointer &&
+                        parameterFunctionPointer.CallingConvention == argumentFunctionPointer.CallingConvention &&
+                        parameterFunctionPointer.ReturnRefKind == argumentFunctionPointer.ReturnRefKind &&
+                        parameterFunctionPointer.Parameters.Length == argumentFunctionPointer.Parameters.Length)
+                    {
+                        InferMethodTypeArgumentsFromTypes(
+                            parameterFunctionPointer.ReturnType,
+                            argumentFunctionPointer.ReturnType,
+                            typeParameters,
+                            inferences);
+                        for (int i = 0; i < parameterFunctionPointer.Parameters.Length; i++)
+                        {
+                            if (parameterFunctionPointer.Parameters[i].RefKind != argumentFunctionPointer.Parameters[i].RefKind)
+                                return;
+                            InferMethodTypeArgumentsFromTypes(
+                                parameterFunctionPointer.Parameters[i].Type,
+                                argumentFunctionPointer.Parameters[i].Type,
+                                typeParameters,
+                                inferences);
+                        }
+                    }
+                    return;
+
                 case TupleTypeSymbol parameterTuple:
                     if (argumentType is TupleTypeSymbol argumentTuple &&
                         parameterTuple.ElementTypes.Length == argumentTuple.ElementTypes.Length)
@@ -2444,6 +2649,14 @@ namespace Cnidaria.Cs
                 case PointerTypeSymbol pt:
                     return ContainsAnyMethodTypeParameter(pt.PointedAtType, typeParameters);
 
+                case FunctionPointerTypeSymbol functionPointer:
+                    if (ContainsAnyMethodTypeParameter(functionPointer.ReturnType, typeParameters))
+                        return true;
+                    for (int i = 0; i < functionPointer.Parameters.Length; i++)
+                        if (ContainsAnyMethodTypeParameter(functionPointer.Parameters[i].Type, typeParameters))
+                            return true;
+                    return false;
+
                 case TupleTypeSymbol tt:
                     for (int i = 0; i < tt.ElementTypes.Length; i++)
                     {
@@ -2522,7 +2735,8 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics,
             SyntaxNode diagnosticNode,
             Func<int, SyntaxToken?>? getArgRefKindKeyword = null,
-            Func<int, string?>? getArgName = null)
+            Func<int, string?>? getArgName = null,
+            bool allowParamsExpansion = true)
         {
             chosen = null;
             convertedArgs = default;
@@ -2626,7 +2840,7 @@ namespace Cnidaria.Cs
                 }
 
                 // Params expansion form
-                if (ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
+                if (allowParamsExpansion && ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
                 {
                     int fixedCount = ps.Length - 1;
 

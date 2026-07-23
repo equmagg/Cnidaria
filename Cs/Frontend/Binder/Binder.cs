@@ -108,6 +108,9 @@ namespace Cnidaria.Cs
                 case PointerTypeSyntax pt:
                     return BindPointerType(pt, context, diagnostics);
 
+                case FunctionPointerTypeSyntax fp:
+                    return BindFunctionPointerType(fp, context, diagnostics);
+
                 case TupleTypeSyntax tt:
                     return BindTupleType(tt, context, diagnostics);
 
@@ -171,7 +174,7 @@ namespace Cnidaria.Cs
             if (element.Kind == SymbolKind.Error)
                 return element;
 
-            if (element is PointerTypeSymbol or ByRefTypeSymbol || element.SpecialType == SpecialType.System_Void)
+            if (element is PointerTypeSymbol or ByRefTypeSymbol or FunctionPointerTypeSymbol || element.SpecialType == SpecialType.System_Void)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_TYPE_NULL002",
@@ -386,6 +389,161 @@ namespace Cnidaria.Cs
 
             return _compilation.CreatePointerType(elem);
         }
+        private TypeSymbol BindFunctionPointerType(FunctionPointerTypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics)
+        {
+            if (!IsUnsafeContext(context.ContainingSymbol, Flags))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_UNSAFE_TYPE001",
+                    DiagnosticSeverity.Warning,
+                    "Function pointer types may only be used in an unsafe context.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+            }
+
+            var callingConvention = BindFunctionPointerCallingConvention(syntax, context, diagnostics);
+            var items = syntax.ParameterList.Parameters;
+            if (items.Count == 0)
+                return new ErrorTypeSymbol("delegate*", containing: null, ImmutableArray<Location>.Empty);
+
+            var parameters = ImmutableArray.CreateBuilder<FunctionPointerParameter>(Math.Max(0, items.Count - 1));
+            for (int i = 0; i < items.Count - 1; i++)
+            {
+                var item = items[i];
+                var type = BindType(item.Type, context, diagnostics);
+                var refKind = BindFunctionPointerRefKind(item, isReturn: false, context, diagnostics);
+                if (type.SpecialType == SpecialType.System_Void)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR001",
+                        DiagnosticSeverity.Error,
+                        "Function pointer parameters cannot have type 'void'.",
+                        new Location(context.SemanticModel.SyntaxTree, item.Type.Span)));
+                }
+                parameters.Add(new FunctionPointerParameter(type, refKind));
+            }
+
+            var returnItem = items[items.Count - 1];
+            var returnType = BindType(returnItem.Type, context, diagnostics);
+            var returnRefKind = BindFunctionPointerRefKind(returnItem, isReturn: true, context, diagnostics);
+            if (returnType.SpecialType == SpecialType.System_Void && returnRefKind != FunctionPointerRefKind.None)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR002",
+                    DiagnosticSeverity.Error,
+                    "A function pointer cannot return 'void' by reference.",
+                    new Location(context.SemanticModel.SyntaxTree, returnItem.Span)));
+            }
+
+            return _compilation.CreateFunctionPointerType(callingConvention, returnType, returnRefKind, parameters.ToImmutable());
+        }
+
+        private static FunctionPointerCallingConvention BindFunctionPointerCallingConvention(
+            FunctionPointerTypeSyntax syntax,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var convention = syntax.CallingConvention;
+            if (convention is null || convention.ManagedOrUnmanagedKeyword.ContextualKind == SyntaxKind.ManagedKeyword)
+                return FunctionPointerCallingConvention.Managed;
+
+            var list = convention.UnmanagedCallingConventionList;
+            if (list is null)
+                return FunctionPointerCallingConvention.Unmanaged;
+
+            string? name = list.CallingConventions[0].Name.ValueText;
+            return name switch
+            {
+                "Cdecl" => FunctionPointerCallingConvention.Cdecl,
+                "Stdcall" => FunctionPointerCallingConvention.Stdcall,
+                "Thiscall" => FunctionPointerCallingConvention.Thiscall,
+                "Fastcall" => FunctionPointerCallingConvention.Fastcall,
+                _ => ReportUnsupportedConvention(name, list.CallingConventions[0], context, diagnostics)
+            };
+        }
+
+        private static FunctionPointerCallingConvention ReportUnsupportedConvention(
+            string? name,
+            FunctionPointerUnmanagedCallingConventionSyntax syntax,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            diagnostics.Add(new Diagnostic(
+                "CN_FNPTR004",
+                DiagnosticSeverity.Error,
+                $"Unsupported unmanaged calling convention '{name}'.",
+                new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+            return FunctionPointerCallingConvention.Unmanaged;
+        }
+
+        private static FunctionPointerRefKind BindFunctionPointerRefKind(
+            FunctionPointerParameterSyntax syntax,
+            bool isReturn,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            bool hasRef = false;
+            bool hasOut = false;
+            bool hasIn = false;
+            bool hasReadOnly = false;
+
+            for (int i = 0; i < syntax.Modifiers.Count; i++)
+            {
+                var modifier = syntax.Modifiers[i];
+                switch (modifier.Kind)
+                {
+                    case SyntaxKind.RefKeyword:
+                        hasRef = true;
+                        break;
+                    case SyntaxKind.OutKeyword:
+                        hasOut = true;
+                        break;
+                    case SyntaxKind.InKeyword:
+                        hasIn = true;
+                        break;
+                    case SyntaxKind.ReadOnlyKeyword:
+                        hasReadOnly = true;
+                        break;
+                    default:
+                        diagnostics.Add(new Diagnostic(
+                            "CN_FNPTR005",
+                            DiagnosticSeverity.Error,
+                            $"Modifier '{modifier.ValueText ?? modifier.Kind.ToString()}' is not valid in a function pointer signature.",
+                            new Location(context.SemanticModel.SyntaxTree, modifier.Span)));
+                        break;
+                }
+            }
+
+            int refModifierCount = (hasRef ? 1 : 0) + (hasOut ? 1 : 0) + (hasIn ? 1 : 0);
+            if (refModifierCount > 1 || (hasReadOnly && !hasRef))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR006",
+                    DiagnosticSeverity.Error,
+                    "Invalid function pointer ref modifier combination.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return FunctionPointerRefKind.None;
+            }
+
+            if (isReturn && (hasOut || hasIn))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR007",
+                    DiagnosticSeverity.Error,
+                    "Function pointer return types may only use 'ref' or 'ref readonly'.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return FunctionPointerRefKind.None;
+            }
+
+            if (hasRef && hasReadOnly)
+                return FunctionPointerRefKind.RefReadOnly;
+            if (hasRef)
+                return FunctionPointerRefKind.Ref;
+            if (hasOut)
+                return FunctionPointerRefKind.Out;
+            if (hasIn)
+                return FunctionPointerRefKind.In;
+            return FunctionPointerRefKind.None;
+        }
         private TypeSymbol BindArrayType(ArrayTypeSyntax a, BindingContext context, DiagnosticBag diagnostics)
         {
             TypeSymbol t = BindType(a.ElementType, context, diagnostics);
@@ -438,6 +596,14 @@ namespace Cnidaria.Cs
             for (int i = 0; i < args.Count; i++)
             {
                 var ta = BindType(args[i], context, diagnostics);
+                if (ta is FunctionPointerTypeSymbol)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FNPTR_GENERIC001",
+                        DiagnosticSeverity.Error,
+                        $"The type '{ta.Name}' may not be used as a type argument.",
+                        new Location(context.SemanticModel.SyntaxTree, args[i].Span)));
+                }
                 b.Add(ta);
             }
             return b.ToImmutable();

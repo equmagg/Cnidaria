@@ -2394,6 +2394,14 @@ namespace Cnidaria.Cs
                 case ByRefTypeSymbol:
                     return true;
 
+                case FunctionPointerTypeSymbol functionPointer:
+                    if (ContainsUnsafeType(functionPointer.ReturnType))
+                        return true;
+                    for (int i = 0; i < functionPointer.Parameters.Length; i++)
+                        if (ContainsUnsafeType(functionPointer.Parameters[i].Type))
+                            return true;
+                    return true;
+
                 case ArrayTypeSymbol array:
                     return ContainsUnsafeType(array.ElementType);
 

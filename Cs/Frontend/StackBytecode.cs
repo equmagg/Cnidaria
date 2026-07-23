@@ -153,6 +153,11 @@ namespace Cnidaria.Cs
         LdelemMd,   // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> value
         LdelemaMd,  // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> byref
         StelemMd,   // operand0: array Type token, operand1: rank, stack: arrayref, indices..., value ->
+
+        Ldftn,  // operand0: method token
+        Calli,  // operand0: function pointer type token, operand1: argCount
+        FnPtrToPtr,
+        PtrToFnPtr,
     }
     internal enum NumericConvKind : byte
     {
@@ -735,7 +740,7 @@ namespace Cnidaria.Cs
                     SpecialType.System_UInt64 => 8,
                     SpecialType.System_Double => 8,
                     SpecialType.System_Decimal => 16,
-                    _ => (type.IsReferenceType || type is PointerTypeSymbol || type is ByRefTypeSymbol)
+                    _ => (type.IsReferenceType || type is PointerTypeSymbol || type is FunctionPointerTypeSymbol || type is ByRefTypeSymbol)
                         ? _target.PointerSize
                         : throw new NotSupportedException($"No known size for '{type.Name}'.")
                 };
@@ -1070,6 +1075,25 @@ namespace Cnidaria.Cs
                             return;
                         }
                         EmitCall(call, mode);
+                        return;
+
+                    case BoundFunctionPointerLoadExpression functionPointerLoad:
+                        EmitFunctionPointerLoad(functionPointerLoad, mode);
+                        return;
+
+                    case BoundFunctionPointerInvocationExpression functionPointerInvocation:
+                        if (mode == EmitMode.Value &&
+                            functionPointerInvocation.FunctionPointerType.ReturnRefKind != FunctionPointerRefKind.None)
+                        {
+                            EmitFunctionPointerInvocation(functionPointerInvocation, EmitMode.Value);
+                            _il.Emit(
+                                BytecodeOp.Ldobj,
+                                operand0: _tokens.GetTypeToken(functionPointerInvocation.FunctionPointerType.ReturnType),
+                                pop: 1,
+                                push: 1);
+                            return;
+                        }
+                        EmitFunctionPointerInvocation(functionPointerInvocation, mode);
                         return;
 
                     case BoundLambdaExpression lambda:
@@ -1462,7 +1486,7 @@ namespace Cnidaria.Cs
             }
             private static bool UsesUnsignedIntegerSemantics(TypeSymbol t)
             {
-                if (t is PointerTypeSymbol)
+                if (t is PointerTypeSymbol or FunctionPointerTypeSymbol)
                     return true;
 
                 var st = t is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum
@@ -2295,6 +2319,37 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard && push == 1)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            private void EmitFunctionPointerLoad(BoundFunctionPointerLoadExpression expression, EmitMode mode)
+            {
+                if (mode == EmitMode.Discard)
+                    return;
+
+                _il.Emit(
+                    BytecodeOp.Ldftn,
+                    operand0: _tokens.GetMethodToken(expression.Method),
+                    pop: 0,
+                    push: 1);
+            }
+
+            private void EmitFunctionPointerInvocation(
+                BoundFunctionPointerInvocationExpression expression,
+                EmitMode mode)
+            {
+                EmitExpression(expression.InvokedExpression, EmitMode.Value);
+                for (int i = 0; i < expression.Arguments.Length; i++)
+                    EmitExpression(expression.Arguments[i], EmitMode.Value);
+
+                short push = (short)(IsVoid(expression.FunctionPointerType.ReturnType) ? 0 : 1);
+                _il.Emit(
+                    BytecodeOp.Calli,
+                    operand0: _tokens.GetTypeToken(expression.FunctionPointerType),
+                    operand1: expression.Arguments.Length,
+                    pop: checked((short)(expression.Arguments.Length + 1)),
+                    push: push);
+
+                if (mode == EmitMode.Discard && push != 0)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
             private bool TryEmitIntrinsic(BoundCallExpression call, EmitMode mode)
             {
                 var def = call.Method.OriginalDefinition;
@@ -2795,6 +2850,24 @@ namespace Cnidaria.Cs
                     case ConversionKind.ImplicitNumeric:
                     case ConversionKind.ExplicitNumeric:
                     case ConversionKind.ImplicitConstant:
+                        if (conv.Type is FunctionPointerTypeSymbol && TryGetConstantInt64(conv.Operand, out long functionPointerConstant) && functionPointerConstant == 0)
+                        {
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+                            _il.Emit(BytecodeOp.Ldnull, pop: 0, push: 1);
+                            return;
+                        }
+                        if (conv.Operand.Type is FunctionPointerTypeSymbol && conv.Type is PointerTypeSymbol)
+                        {
+                            _il.Emit(BytecodeOp.FnPtrToPtr, pop: 1, push: 1);
+                            return;
+                        }
+                        if (conv.Operand.Type is PointerTypeSymbol && conv.Type is FunctionPointerTypeSymbol)
+                        {
+                            _il.Emit(BytecodeOp.PtrToFnPtr, pop: 1, push: 1);
+                            return;
+                        }
+                        if (conv.Operand.Type is FunctionPointerTypeSymbol && conv.Type is FunctionPointerTypeSymbol)
+                            return;
                         if (conv.Operand.Type is PointerTypeSymbol && conv.Type is PointerTypeSymbol)
                             return;
                         EmitNumericConv(conv.Operand.Type, conv.Type, conv.IsChecked);
@@ -2815,6 +2888,25 @@ namespace Cnidaria.Cs
 
                     default:
                         throw new NotSupportedException($"Conversion kind '{conv.Conversion.Kind}' is not supported.");
+                }
+            }
+            private static bool TryGetConstantInt64(BoundExpression expression, out long value)
+            {
+                value = 0;
+                if (!expression.ConstantValueOpt.HasValue)
+                    return false;
+
+                switch (expression.ConstantValueOpt.Value)
+                {
+                    case sbyte v: value = v; return true;
+                    case byte v: value = v; return true;
+                    case short v: value = v; return true;
+                    case ushort v: value = v; return true;
+                    case int v: value = v; return true;
+                    case uint v: value = v; return true;
+                    case long v: value = v; return true;
+                    case ulong v when v <= long.MaxValue: value = (long)v; return true;
+                    default: return false;
                 }
             }
             private void EmitNumericConv(TypeSymbol sourceType, TypeSymbol targetType, bool isChecked)
@@ -3084,6 +3176,11 @@ namespace Cnidaria.Cs
 
                     case BoundCallExpression call when call.Method.ReturnType is ByRefTypeSymbol:
                         EmitCall(call, EmitMode.Value);
+                        return;
+
+                    case BoundFunctionPointerInvocationExpression functionPointerInvocation
+                        when functionPointerInvocation.FunctionPointerType.ReturnRefKind != FunctionPointerRefKind.None:
+                        EmitFunctionPointerInvocation(functionPointerInvocation, EmitMode.Value);
                         return;
 
                     case BoundIndexerAccessExpression ia when ia.Indexer.GetMethod?.ReturnType is ByRefTypeSymbol:

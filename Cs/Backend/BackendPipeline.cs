@@ -279,8 +279,7 @@ namespace Cnidaria.Cs
 
         private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
         {
-            if (method.Target.IsRiscV)
-                method = GenTreeClassInitializationEntryInserter.Insert(method);
+            method = GenTreeClassInitializationEntryInserter.Insert(method);
 
             method = GenTreeMorpher.MorphMethod(method);
             method = GenTreeLocalRewriter.RewriteMethod(method);
@@ -315,8 +314,7 @@ namespace Cnidaria.Cs
                     method = GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir);
             }
 
-            if (method.Target.IsRiscV)
-                method = GenTreeClassInitializationOptimizer.OptimizeMethod(method);
+            method = GenTreeClassInitializationOptimizer.OptimizeMethod(method);
 
             var cfg = ControlFlowGraph.Build(method);
             method.AttachFlowGraph(cfg);
@@ -524,19 +522,19 @@ namespace Cnidaria.Cs
             {
                 var statements = method.Blocks[b].Statements;
                 for (int s = 0; s < statements.Length; s++)
-                    NormalizeFlags(statements[s], target);
+                    NormalizeTreeFlags(statements[s], target);
             }
 
             method.SetPhase(phase);
             return method;
         }
 
-        private static GenTreeFlags NormalizeFlags(GenTree node, TargetInfo target)
+        internal static GenTreeFlags NormalizeTreeFlags(GenTree node, TargetInfo target)
         {
-            var flags = node.Flags;
+            var flags = node.Flags & ~GenTreeFlags.CanThrow;
             for (int i = 0; i < node.Operands.Length; i++)
             {
-                var childFlags = NormalizeFlags(node.Operands[i], target);
+                var childFlags = NormalizeTreeFlags(node.Operands[i], target);
                 if ((childFlags & GenTreeFlags.ContainsCall) != 0)
                     flags |= GenTreeFlags.ContainsCall;
                 if ((childFlags & GenTreeFlags.CanThrow) != 0)
@@ -547,12 +545,17 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.MemoryRead;
                 if ((childFlags & GenTreeFlags.MemoryWrite) != 0)
                     flags |= GenTreeFlags.MemoryWrite;
+                if ((childFlags & GenTreeFlags.GlobalRef) != 0)
+                    flags |= GenTreeFlags.GlobalRef;
+                if ((childFlags & GenTreeFlags.Ordered) != 0)
+                    flags |= GenTreeFlags.Ordered;
             }
 
             switch (node.Kind)
             {
                 case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
+                case GenTreeKind.IndirectCall:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
                 case GenTreeKind.NewObject:
@@ -567,11 +570,48 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
                     break;
 
+                case GenTreeKind.StaticData:
+                case GenTreeKind.StackAlloc:
+                case GenTreeKind.AllocHGlobal:
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.FreeHGlobal:
+                    flags |= GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    break;
+
                 case GenTreeKind.Field:
-                case GenTreeKind.StaticField:
-                case GenTreeKind.LoadIndirect:
-                case GenTreeKind.ArrayElement:
+                case GenTreeKind.FieldAddr:
                     flags |= GenTreeFlags.MemoryRead;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.StaticField:
+                case GenTreeKind.StaticFieldAddr:
+                    flags |= GenTreeFlags.MemoryRead;
+                    break;
+
+                case GenTreeKind.LoadIndirect:
+                    flags |= GenTreeFlags.MemoryRead;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.ArrayElement:
+                case GenTreeKind.ArrayElementAddr:
+                    flags |= GenTreeFlags.MemoryRead;
+                    if ((node.Flags & (GenTreeFlags.NullCheckEliminated | GenTreeFlags.BoundsCheckEliminated)) !=
+                        (GenTreeFlags.NullCheckEliminated | GenTreeFlags.BoundsCheckEliminated))
+                    {
+                        flags |= GenTreeFlags.CanThrow;
+                    }
+                    break;
+
+                case GenTreeKind.ArrayDataRef:
+                    flags |= GenTreeFlags.MemoryRead;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.StoreLocal:
@@ -593,10 +633,23 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.StoreField:
-                case GenTreeKind.StoreStaticField:
-                case GenTreeKind.StoreIndirect:
-                case GenTreeKind.StoreArrayElement:
                     flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.StoreStaticField:
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.StoreIndirect:
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.StoreArrayElement:
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.Branch:
@@ -739,7 +792,7 @@ namespace Cnidaria.Cs
 
                 GenTreeFlags flags = GenTreeFlags.None;
                 for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags;
+                    flags |= node.Operands[i].Flags & ~GenTreeFlags.AssertionProperties;
 
                 flags |= GenTreeFlags.Indirect;
                 if (localFieldAccess.IsUse || localFieldAccess.IsPartialDefinition)

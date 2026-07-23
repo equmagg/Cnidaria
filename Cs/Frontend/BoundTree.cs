@@ -481,6 +481,61 @@ namespace Cnidaria.Cs
             Operand = operand;
         }
     }
+    internal sealed class BoundFunctionPointerLoadExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.FunctionPointerLoad;
+        public MethodSymbol Method { get; }
+
+        public BoundFunctionPointerLoadExpression(
+            PrefixUnaryExpressionSyntax syntax,
+            FunctionPointerTypeSymbol type,
+            MethodSymbol method)
+            : base(syntax)
+        {
+            Type = type;
+            Method = method;
+        }
+    }
+    internal sealed class BoundFunctionPointerMethodGroupExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.FunctionPointerMethodGroup;
+        public BoundMethodGroupExpression MethodGroup { get; }
+
+        public BoundFunctionPointerMethodGroupExpression(
+            PrefixUnaryExpressionSyntax syntax,
+            BoundMethodGroupExpression methodGroup)
+            : base(syntax)
+        {
+            MethodGroup = methodGroup;
+            Type = UnboundMethodGroupTypeSymbol.Instance;
+            HasErrors = methodGroup.HasErrors;
+        }
+    }
+
+    internal sealed class BoundFunctionPointerInvocationExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.FunctionPointerInvocation;
+        public BoundExpression InvokedExpression { get; }
+        public ImmutableArray<BoundExpression> Arguments { get; }
+        public FunctionPointerTypeSymbol FunctionPointerType { get; }
+        public override bool IsLValue => FunctionPointerType.ReturnRefKind != FunctionPointerRefKind.None;
+
+        public BoundFunctionPointerInvocationExpression(
+            InvocationExpressionSyntax syntax,
+            BoundExpression invokedExpression,
+            FunctionPointerTypeSymbol functionPointerType,
+            ImmutableArray<BoundExpression> arguments)
+            : base(syntax)
+        {
+            InvokedExpression = invokedExpression;
+            FunctionPointerType = functionPointerType;
+            Arguments = arguments;
+            Type = functionPointerType.ReturnType;
+            HasErrors = invokedExpression.HasErrors;
+            for (int i = 0; i < arguments.Length; i++)
+                HasErrors |= arguments[i].HasErrors;
+        }
+    }
 
     internal sealed class BoundPointerIndirectionExpression : BoundExpression
     {

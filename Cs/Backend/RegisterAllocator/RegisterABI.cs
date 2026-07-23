@@ -284,7 +284,7 @@ namespace Cnidaria.Cs
                 return GenStackKind.Void;
             if (type.IsReferenceType)
                 return GenStackKind.Ref;
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                 return GenStackKind.Ptr;
             if (type.Kind == RuntimeTypeKind.ByRef)
                 return GenStackKind.ByRef;
@@ -385,7 +385,7 @@ namespace Cnidaria.Cs
 
             if (type is not null)
             {
-                if (type.Kind is RuntimeTypeKind.Pointer)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                     return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: false);
 
                 if (type.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam || type.IsReferenceType)
@@ -1144,7 +1144,7 @@ namespace Cnidaria.Cs
                 return registerClass == RegisterClass.Float || size <= GeneralRegisterSlotSizeFor(target);
             }
 
-            if (fieldType.Kind is RuntimeTypeKind.Pointer)
+            if (fieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
             {
                 registerClass = RegisterClass.General;
                 size = PointerSizeFor(target);
@@ -1323,7 +1323,7 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsScalarStorageValue(RuntimeType type)
-            => IsPrimitiveWrapper(type) || type.Kind == RuntimeTypeKind.Enum || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef;
+            => IsPrimitiveWrapper(type) || type.Kind == RuntimeTypeKind.Enum || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef;
 
         private static bool IsVoid(RuntimeType type)
             => type.Namespace == "System" && type.Name == "Void";

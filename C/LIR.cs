@@ -652,8 +652,8 @@ namespace Cnidaria.C
         private LoweredLirFunction Lower()
         {
             IndexPromotedVariables();
-            ScanLocalDeclarations();
             IndexReachableControlFlowBlocks();
+            ScanLocalDeclarations();
             IndexUsedSsaNames();
             CreateVirtualRegistersForSsaNames();
             CreateBaseBlocks();
@@ -680,15 +680,32 @@ namespace Cnidaria.C
 
         private void ScanLocalDeclarations()
         {
-            foreach (var block in _controlFlowFunction.Function.Blocks)
+            var referencedSymbols = new HashSet<Symbol>();
+            foreach (var block in _function.Blocks)
             {
-                foreach (var statement in block.Statements)
-                {
-                    if (statement is not GimpleDeclarationStatement declarationStatement)
-                        continue;
+                if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
+                    continue;
 
-                    if (declarationStatement.Symbol is null)
+                foreach (var instruction in block.Instructions)
+                {
+                    if (instruction.Statement is not GimpleDeclarationStatement)
+                        SymbolCollector.Collect(instruction.Statement, referencedSymbols);
+                }
+            }
+
+            foreach (var block in _function.Blocks)
+            {
+                if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
+                    continue;
+
+                foreach (var instruction in block.Instructions)
+                {
+                    if (instruction.Statement is not GimpleDeclarationStatement declarationStatement ||
+                        declarationStatement.Symbol is null ||
+                        !referencedSymbols.Contains(declarationStatement.Symbol))
+                    {
                         continue;
+                    }
 
                     _localDeclarationsBySymbol[declarationStatement.Symbol] = declarationStatement.Declaration;
                     if (!_promotedSymbols.ContainsKey(declarationStatement.Symbol) && IsStackAllocatedLocal(declarationStatement.Declaration))

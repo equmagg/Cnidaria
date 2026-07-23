@@ -571,10 +571,10 @@ namespace Cnidaria.Cs
                     case Op.I32Add: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
                     case Op.I32Sub: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) - (int)GetGpr(ins.Rs2))); break;
                     case Op.I32Mul: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) * (int)GetGpr(ins.Rs2))); break;
-                    case Op.I32Div: DivI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
-                    case Op.I32Rem: RemI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
-                    case Op.U32Div: DivU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
-                    case Op.U32Rem: RemU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I32Div: DivI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.I32Rem: RemI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.U32Div: DivU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.U32Rem: RemU32(ins.Rd, (uint)GetGpr(ins.Rs1), (uint)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
                     case Op.I32Neg: SetI32(ins.Rd, unchecked(-(int)GetGpr(ins.Rs1))); break;
                     case Op.I32AddOvf: AddOvfI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
                     case Op.I32SubOvf: SubOvfI32(ins.Rd, (int)GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), executingPc); break;
@@ -626,10 +626,10 @@ namespace Cnidaria.Cs
                     case Op.I64Add: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) + GetGpr(ins.Rs2))); break;
                     case Op.I64Sub: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) - GetGpr(ins.Rs2))); break;
                     case Op.I64Mul: SetGpr(ins.Rd, unchecked(GetGpr(ins.Rs1) * GetGpr(ins.Rs2))); break;
-                    case Op.I64Div: DivI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
-                    case Op.I64Rem: RemI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
-                    case Op.U64Div: DivU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
-                    case Op.U64Rem: RemU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc); break;
+                    case Op.I64Div: DivI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.I64Rem: RemI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.U64Div: DivU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
+                    case Op.U64Rem: RemU64(ins.Rd, (ulong)GetGpr(ins.Rs1), (ulong)GetGpr(ins.Rs2), executingPc, (InstructionFlags)ins.Aux); break;
                     case Op.I64Neg: SetGpr(ins.Rd, unchecked(-GetGpr(ins.Rs1))); break;
                     case Op.I64AddOvf: AddOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
                     case Op.I64SubOvf: SubOvfI64(ins.Rd, GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc); break;
@@ -897,11 +897,14 @@ namespace Cnidaria.Cs
                         SetI32(ins.Rd, ReadI32Unchecked(arrAbs + ArrayLengthOffset));
                         break;
                     case Op.LdArrayDataAddr:
-                        ValidateArrayRefForExecution(GetGpr(ins.Rs1), out int dataArrAbs);
+                        ValidateArrayRefForExecution(
+                            GetGpr(ins.Rs1),
+                            out int dataArrAbs,
+                            skipNullCheck: (((InstructionFlags)ins.Aux) & InstructionFlags.NoNullCheck) != 0);
                         SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
                         break;
                     case Op.LdElemAddr:
-                        SetGpr(ins.Rd, GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), TypeLayout(ins.Imm)));
+                        SetGpr(ins.Rd, GetArrayElementAddress(ins, TypeLayout(ins.Imm)));
                         break;
                     case Op.LdElemI1: LoadElemInt(ins, 1, true); break;
                     case Op.LdElemU1: LoadElemInt(ins, 1, false); break;
@@ -932,7 +935,7 @@ namespace Cnidaria.Cs
                     case Op.StElemI1:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteU8Unchecked(abs, unchecked((byte)GetGpr(ins.Rd)));
                         }
@@ -940,7 +943,7 @@ namespace Cnidaria.Cs
                     case Op.StElemI2:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteU16Unchecked(abs, unchecked((ushort)GetGpr(ins.Rd)));
                         }
@@ -948,7 +951,7 @@ namespace Cnidaria.Cs
                     case Op.StElemI4:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteI32Unchecked(abs, unchecked((int)GetGpr(ins.Rd)));
                         }
@@ -956,7 +959,7 @@ namespace Cnidaria.Cs
                     case Op.StElemI8:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteI64Unchecked(abs, GetGpr(ins.Rd));
                         }
@@ -966,7 +969,7 @@ namespace Cnidaria.Cs
                     case Op.StElemPtr:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteNativeUnchecked(abs, GetGpr(ins.Rd));
                         }
@@ -974,7 +977,7 @@ namespace Cnidaria.Cs
                     case Op.StElemF32:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteI32Unchecked(abs, unchecked((int)(uint)GetFpr(ins.Rd)));
                         }
@@ -982,7 +985,7 @@ namespace Cnidaria.Cs
                     case Op.StElemF64:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             WriteI64Unchecked(abs, GetFpr(ins.Rd));
                         }
@@ -990,7 +993,7 @@ namespace Cnidaria.Cs
                     case Op.StElemObj:
                         {
                             TypeLayoutRecord elem = TypeLayout(ins.Imm);
-                            int abs = GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), elem);
+                            int abs = GetArrayElementAddress(ins, elem);
                             CheckWritableRange(abs, elem.Size);
                             CopyBlock(abs, GetAddress(ins.Rd), elem.Size);
                         }
@@ -1072,7 +1075,12 @@ namespace Cnidaria.Cs
                             break;
                         }
                     case Op.LdVTableEntry:
-                        SetGpr(ins.Rd, LoadVTableEntry(GetGpr(ins.Rs1), checked((int)ins.Imm)));
+                        SetGpr(
+                            ins.Rd,
+                            LoadVTableEntry(
+                                GetGpr(ins.Rs1),
+                                checked((int)ins.Imm),
+                                skipNullCheck: (((InstructionFlags)ins.Aux) & InstructionFlags.NoNullCheck) != 0));
                         break;
                     case Op.CallVoid:
                     case Op.CallI:
@@ -1107,7 +1115,7 @@ namespace Cnidaria.Cs
                         {
                             int targetEntryPc = checked((int)GetGpr(ins.Rs1));
 
-                            if (targetEntryPc < 0)
+                            if (targetEntryPc == 0)
                                 throw new NullReferenceException("function pointer is null.");
                             if (!_image.MethodIndexByEntryPc.TryGetValue(targetEntryPc, out int targetMethodIndex))
                                 throw new MissingMethodException($"Indirect register call target PC is absent from register image: {targetEntryPc}");
@@ -2414,7 +2422,7 @@ namespace Cnidaria.Cs
                 return value == 0 ? VmValue.Null : new VmValue(VmValueKind.Ref, value);
             }
 
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
             {
                 long value = ReadNative(abs);
                 return value == 0 ? VmValue.Null : new VmValue(VmValueKind.Ptr, value);
@@ -2477,7 +2485,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
             {
                 if (value.Kind is not (VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Null))
                     throw new InvalidOperationException($"Storing {value.Kind} into pointer.");
@@ -2569,7 +2577,7 @@ namespace Cnidaria.Cs
                 return raw == 0 ? VmValue.Null : new VmValue(VmValueKind.Ref, raw);
             }
 
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
             {
                 long raw = ReadAbiScalarArgument(rm, logicalIndex);
                 return raw == 0 ? VmValue.Null : new VmValue(VmValueKind.Ptr, raw);
@@ -2642,7 +2650,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (type.Kind == RuntimeTypeKind.Pointer)
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
             {
                 if (value.Kind is not (VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Null))
                     throw new InvalidOperationException($"Return type mismatch: expected ptr, got {value.Kind}.");
@@ -3257,7 +3265,7 @@ namespace Cnidaria.Cs
         private int MaterializeAbiArgumentToStack(RuntimeMethod method, int logicalIndex, RuntimeType type)
         {
             int size = StorageSizeOf(type);
-            int align = type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
+            int align = type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
                     ? TargetArchitecture.PointerSize
                     : Math.Max(1, type.AlignOf);
             int dst = StackAllocBytes(size, align);
@@ -3421,7 +3429,7 @@ namespace Cnidaria.Cs
         {
             RuntimeType t = GetLogicalArgumentType(method, logicalIndex);
             var abi = MachineAbi.ClassifyValue(t, MachineAbi.StackKindForType(t), isReturn: false);
-            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister && (t.Kind == RuntimeTypeKind.ByRef || t.Kind == RuntimeTypeKind.Pointer || t.IsReferenceType))
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister && (t.Kind == RuntimeTypeKind.ByRef || t.Kind == RuntimeTypeKind.Pointer || t.Kind == RuntimeTypeKind.FunctionPointer || t.IsReferenceType))
                 return ReadAbiScalarArgument(method, logicalIndex);
 
             var slices = GetAbiArgumentSlices(method, logicalIndex);
@@ -3667,9 +3675,9 @@ namespace Cnidaria.Cs
             return (int)v;
         }
 
-        private int LoadVTableEntry(long receiverRef, int slot)
+        private int LoadVTableEntry(long receiverRef, int slot, bool skipNullCheck)
         {
-            if (receiverRef == 0)
+            if (!skipNullCheck && receiverRef == 0)
                 throw new NullReferenceException();
             if (slot < 0)
                 throw new MissingMethodException($"Invalid virtual dispatch slot {slot}.");
@@ -3723,8 +3731,7 @@ namespace Cnidaria.Cs
 
         private int ArrayEA(InstrDesc ins)
         {
-            return GetArrayElementAddress(GetGpr(ins.Rs1), (int)GetGpr(ins.Rs2), TypeLayout(ins.Imm));
-
+            return GetArrayElementAddress(ins, TypeLayout(ins.Imm));
         }
 
         private void LoadElemInt(InstrDesc ins, int size, bool signed)
@@ -3744,12 +3751,13 @@ namespace Cnidaria.Cs
             int size = InstrDesc.FieldSize(instruction.Imm);
             FieldAccessFlags flags = Aux.FieldFlags(instruction.Aux);
             bool declaringTypeIsValueType = (flags & FieldAccessFlags.DeclaringTypeIsValueType) != 0;
-            return GetInstanceFieldAddress(offset, size, declaringTypeIsValueType, receiver, writable);
+            bool skipNullCheck = (Aux.FieldInstructionFlags(instruction.Aux) & InstructionFlags.NoNullCheck) != 0;
+            return GetInstanceFieldAddress(offset, size, declaringTypeIsValueType, receiver, writable, skipNullCheck);
         }
 
-        private int GetInstanceFieldAddress(int offset, int size, bool declaringTypeIsValueType, long receiver, bool writable)
+        private int GetInstanceFieldAddress(int offset, int size, bool declaringTypeIsValueType, long receiver, bool writable, bool skipNullCheck)
         {
-            if (receiver == 0)
+            if (!skipNullCheck && receiver == 0)
                 throw new NullReferenceException();
             if (receiver < int.MinValue || receiver > int.MaxValue)
                 throw new AccessViolationException("Field receiver is outside VM address space.");
@@ -3997,13 +4005,46 @@ namespace Cnidaria.Cs
             return obj;
         }
 
+        private int GetArrayElementAddress(InstrDesc instruction, TypeLayoutRecord elemType)
+        {
+            InstructionFlags flags = (InstructionFlags)instruction.Aux;
+            long arrRef = GetGpr(instruction.Rs1);
+            int index = unchecked((int)GetGpr(instruction.Rs2));
+            ValidateArrayRefForExecution(
+                arrRef,
+                out int arrAbs,
+                skipNullCheck: (flags & InstructionFlags.NoNullCheck) != 0);
+            if ((flags & InstructionFlags.NoBoundsCheck) == 0)
+            {
+                int len = ReadI32(arrAbs + ArrayLengthOffset);
+                if ((uint)index >= (uint)len)
+                    throw new IndexOutOfRangeException();
+            }
+            int elemSize = elemType.Size;
+            return checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+        }
+
         private int GetArrayElementAddress(long arrRef, int index, TypeLayoutRecord elemType)
         {
             ValidateArrayRefForExecution(arrRef, out int arrAbs);
+
+            TypeLayoutRecord arrType = GetObjectTypeLayoutFromRef(arrRef);
+            if (!arrType.IsArray || arrType.ElementTypeLayoutIndex < 0)
+                throw new ArrayTypeMismatchException();
+
+            TypeLayoutRecord actualElemType = TypeLayout(arrType.ElementTypeLayoutIndex);
+            if (actualElemType.RuntimeTypeId != elemType.RuntimeTypeId)
+                throw new ArrayTypeMismatchException();
+
             int len = ReadI32(arrAbs + ArrayLengthOffset);
-            if ((uint)index >= (uint)len) throw new IndexOutOfRangeException();
+            if ((uint)index >= (uint)len)
+                throw new IndexOutOfRangeException();
+
             int elemSize = elemType.Size;
             int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+
+            CheckHeapAccess(abs, elemSize);
+            CheckWritableRange(abs, elemSize);
             return abs;
         }
 
@@ -5432,15 +5473,15 @@ namespace Cnidaria.Cs
             => ThrowManaged(AllocExceptionRef("System", "InvalidCastException", string.Empty), pc, preserveExistingThrowSite: false);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DivI32(byte rd, int lhs, int rhs, int pc)
+        private void DivI32(byte rd, int lhs, int rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
             }
 
-            if (lhs == int.MinValue && rhs == -1)
+            if ((flags & InstructionFlags.DivModNoOverflow) == 0 && lhs == int.MinValue && rhs == -1)
             {
                 ThrowOverflow(pc);
                 return;
@@ -5450,15 +5491,15 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void RemI32(byte rd, int lhs, int rhs, int pc)
+        private void RemI32(byte rd, int lhs, int rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
             }
 
-            if (lhs == int.MinValue && rhs == -1)
+            if ((flags & InstructionFlags.DivModNoOverflow) == 0 && lhs == int.MinValue && rhs == -1)
             {
                 ThrowOverflow(pc);
                 return;
@@ -5468,9 +5509,9 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DivU32(byte rd, uint lhs, uint rhs, int pc)
+        private void DivU32(byte rd, uint lhs, uint rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
@@ -5480,9 +5521,9 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void RemU32(byte rd, uint lhs, uint rhs, int pc)
+        private void RemU32(byte rd, uint lhs, uint rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
@@ -5492,15 +5533,15 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DivI64(byte rd, long lhs, long rhs, int pc)
+        private void DivI64(byte rd, long lhs, long rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
             }
 
-            if (lhs == long.MinValue && rhs == -1)
+            if ((flags & InstructionFlags.DivModNoOverflow) == 0 && lhs == long.MinValue && rhs == -1)
             {
                 ThrowOverflow(pc);
                 return;
@@ -5510,15 +5551,15 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void RemI64(byte rd, long lhs, long rhs, int pc)
+        private void RemI64(byte rd, long lhs, long rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
             }
 
-            if (lhs == long.MinValue && rhs == -1)
+            if ((flags & InstructionFlags.DivModNoOverflow) == 0 && lhs == long.MinValue && rhs == -1)
             {
                 ThrowOverflow(pc);
                 return;
@@ -5528,9 +5569,9 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DivU64(byte rd, ulong lhs, ulong rhs, int pc)
+        private void DivU64(byte rd, ulong lhs, ulong rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
@@ -5540,9 +5581,9 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void RemU64(byte rd, ulong lhs, ulong rhs, int pc)
+        private void RemU64(byte rd, ulong lhs, ulong rhs, int pc, InstructionFlags flags)
         {
-            if (rhs == 0)
+            if ((flags & InstructionFlags.DivModNoByZero) == 0 && rhs == 0)
             {
                 ThrowDivideByZero(pc);
                 return;
@@ -6085,7 +6126,7 @@ namespace Cnidaria.Cs
         private long ReadSizedInteger(int abs, RuntimeType type)
         {
             int size = StorageSizeOf(type);
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
                 return ReadNative(abs);
             switch (size)
             {
@@ -6100,7 +6141,7 @@ namespace Cnidaria.Cs
         private void WriteSizedInteger(int abs, RuntimeType type, long value)
         {
             int size = StorageSizeOf(type);
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef || IsNativeIntType(type))
             {
                 WriteNative(abs, value);
                 return;
@@ -6204,9 +6245,9 @@ namespace Cnidaria.Cs
             return value & ~((long)mask);
         }
 
-        private void ValidateArrayRefForExecution(long objRef, out int abs)
+        private void ValidateArrayRefForExecution(long objRef, out int abs, bool skipNullCheck = false)
         {
-            if (objRef == 0) throw new NullReferenceException();
+            if (!skipNullCheck && objRef == 0) throw new NullReferenceException();
             if (objRef < int.MinValue || objRef > int.MaxValue)
                 throw new AccessViolationException("Array reference is outside VM address space.");
             abs = checked((int)objRef);
@@ -6362,7 +6403,7 @@ namespace Cnidaria.Cs
         }
 
         private int StorageSizeOf(RuntimeType type)
-            => type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
+            => type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam
                     ? TargetArchitecture.PointerSize
                     : Math.Max(1, type.SizeOf);
 

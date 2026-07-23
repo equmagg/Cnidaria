@@ -20,6 +20,8 @@ namespace Cnidaria.Cs
 
     internal static class SsaCommonSubexpressionEliminator
     {
+        private const int MaxCandidateCount = 64;
+
         public static SsaCseResult OptimizeMethod(SsaMethod method, SsaOptimizationOptions options, int nextSyntheticTreeId)
         {
             if (method is null)
@@ -29,8 +31,7 @@ namespace Cnidaria.Cs
             if (method.ValueNumbers is null || method.Blocks.Length == 0)
                 return new SsaCseResult(method, changed: false, nextSyntheticTreeId);
 
-            var optimizer = new Optimizer(method, nextSyntheticTreeId);
-            return optimizer.Run();
+            return new Optimizer(method, options, nextSyntheticTreeId).Run();
         }
 
         private readonly struct CseKey : IEquatable<CseKey>
@@ -56,8 +57,8 @@ namespace Cnidaria.Cs
             public readonly ValueNumberPair NormalValue;
             public readonly List<Occurrence> Occurrences = new List<Occurrence>();
             public bool Selected;
+            public bool LiveAcrossCall;
             public GenLocalDescriptor? TempDescriptor;
-            public SsaSlot TempSlot;
             public int Cost;
             public int UseCount;
             public int DefCount;
@@ -82,14 +83,19 @@ namespace Cnidaria.Cs
             public readonly int StatementIndex;
             public readonly int TreeIndex;
             public readonly GenTree Node;
+            public readonly ValueNumber ExceptionSet;
             public readonly double Weight;
             public bool IsDef;
             public bool IsUse;
-            public Occurrence? ReachingDef;
-            public int SsaVersion;
-            public SsaValueName SsaName;
 
-            public Occurrence(Candidate candidate, SsaBlock block, int statementIndex, int treeIndex, GenTree node, double weight)
+            public Occurrence(
+                Candidate candidate,
+                SsaBlock block,
+                int statementIndex,
+                int treeIndex,
+                GenTree node,
+                ValueNumber exceptionSet,
+                double weight)
             {
                 Candidate = candidate;
                 Block = block;
@@ -97,26 +103,100 @@ namespace Cnidaria.Cs
                 StatementIndex = statementIndex;
                 TreeIndex = treeIndex;
                 Node = node;
+                ExceptionSet = exceptionSet;
                 Weight = Math.Max(1.0, weight);
+            }
+        }
+
+        private sealed class AvailabilityState
+        {
+            public readonly HashSet<Candidate> Available;
+            public readonly HashSet<Candidate> AvailableAcrossCall;
+
+            public AvailabilityState()
+            {
+                Available = new HashSet<Candidate>();
+                AvailableAcrossCall = new HashSet<Candidate>();
+            }
+
+            public AvailabilityState(IEnumerable<Candidate> candidates)
+            {
+                Available = new HashSet<Candidate>(candidates);
+                AvailableAcrossCall = new HashSet<Candidate>(candidates);
+            }
+
+            private AvailabilityState(HashSet<Candidate> available, HashSet<Candidate> availableAcrossCall)
+            {
+                Available = available;
+                AvailableAcrossCall = availableAcrossCall;
+            }
+
+            public AvailabilityState Clone()
+                => new AvailabilityState(new HashSet<Candidate>(Available), new HashSet<Candidate>(AvailableAcrossCall));
+
+            public bool SetEquals(AvailabilityState other)
+                => Available.SetEquals(other.Available) && AvailableAcrossCall.SetEquals(other.AvailableAcrossCall);
+
+            public void IntersectWith(AvailabilityState other)
+            {
+                Available.IntersectWith(other.Available);
+                AvailableAcrossCall.IntersectWith(other.AvailableAcrossCall);
+            }
+        }
+
+        private readonly struct RefThresholds
+        {
+            public readonly double Aggressive;
+            public readonly double Moderate;
+
+            public RefThresholds(double aggressive, double moderate)
+            {
+                Aggressive = aggressive;
+                Moderate = moderate;
+            }
+        }
+
+        private enum PromotionKind : byte
+        {
+            Aggressive,
+            Moderate,
+            Conservative,
+        }
+
+        private readonly struct PendingStore
+        {
+            public readonly int TreeIndex;
+            public readonly GenTree Store;
+
+            public PendingStore(int treeIndex, GenTree store)
+            {
+                TreeIndex = treeIndex;
+                Store = store;
             }
         }
 
         private sealed class Optimizer
         {
             private readonly SsaMethod _method;
+            private readonly SsaOptimizationOptions _options;
             private readonly TargetInfo _target;
             private readonly SsaValueNumberingResult _vn;
             private readonly Dictionary<CseKey, Candidate> _candidateByKey = new Dictionary<CseKey, Candidate>();
             private readonly List<Candidate> _candidates = new List<Candidate>();
             private readonly Dictionary<GenTree, Occurrence> _occurrenceByNode = new Dictionary<GenTree, Occurrence>(ReferenceEqualityComparer<GenTree>.Instance);
+            private readonly RefThresholds _generalThresholds;
+            private readonly RefThresholds _floatThresholds;
             private int _nextSyntheticTreeId;
 
-            public Optimizer(SsaMethod method, int nextSyntheticTreeId)
+            public Optimizer(SsaMethod method, SsaOptimizationOptions options, int nextSyntheticTreeId)
             {
                 _method = method;
+                _options = options;
                 _target = method.GenTreeMethod.Target;
                 _vn = method.ValueNumbers!;
                 _nextSyntheticTreeId = Math.Max(nextSyntheticTreeId, MaxTreeId(method) + 1);
+                _generalThresholds = BuildRefThresholds(RegisterClass.General);
+                _floatThresholds = BuildRefThresholds(RegisterClass.Float);
             }
 
             public SsaCseResult Run()
@@ -130,8 +210,7 @@ namespace Cnidaria.Cs
                 if (!SelectCandidates())
                     return new SsaCseResult(_method, changed: false, _nextSyntheticTreeId);
 
-                var rewritten = RewriteSelectedCandidates();
-                return new SsaCseResult(rewritten, changed: true, _nextSyntheticTreeId);
+                return new SsaCseResult(RewriteSelectedCandidates(), changed: true, _nextSyntheticTreeId);
             }
 
             private void LocateCandidates()
@@ -144,17 +223,13 @@ namespace Cnidaria.Cs
                     {
                         var item = block.TreeList[i];
                         var node = item.Tree.Source;
-                        if (node.Parent is null)
-                            continue;
-                        if (!CanConsider(node))
+                        if (node.Parent is null || !CanConsider(node))
                             continue;
                         if (!_vn.TryGetTreeValue(node, out var pair))
                             continue;
 
                         var liberalNormal = _vn.Store.VNNormalValue(pair.Liberal);
-                        if (!liberalNormal.IsValid)
-                            continue;
-                        if (_vn.Store.TryGetConstant(liberalNormal, out _))
+                        if (!liberalNormal.IsValid || _vn.Store.TryGetConstant(liberalNormal, out _))
                             continue;
 
                         var conservativeNormal = _vn.Store.VNNormalValue(pair.Conservative);
@@ -164,6 +239,9 @@ namespace Cnidaria.Cs
                         var key = new CseKey(liberalNormal, node.StackKind, node.Type);
                         if (!_candidateByKey.TryGetValue(key, out var candidate))
                         {
+                            if (_candidates.Count >= MaxCandidateCount)
+                                continue;
+
                             candidate = new Candidate(
                                 _candidates.Count + 1,
                                 key,
@@ -172,7 +250,15 @@ namespace Cnidaria.Cs
                             _candidates.Add(candidate);
                         }
 
-                        var occurrence = new Occurrence(candidate, block, item.StatementIndex, item.TreeIndex, node, blockWeight);
+                        var exceptionSet = _vn.Store.VNExceptionSet(pair.Liberal);
+                        var occurrence = new Occurrence(
+                            candidate,
+                            block,
+                            item.StatementIndex,
+                            item.TreeIndex,
+                            node,
+                            exceptionSet,
+                            blockWeight);
                         candidate.Occurrences.Add(occurrence);
                         _occurrenceByNode[node] = occurrence;
                     }
@@ -196,12 +282,13 @@ namespace Cnidaria.Cs
 
             private void ComputeAvailability()
             {
-                var inMaps = new Dictionary<Candidate, Occurrence?>[_method.Blocks.Length];
-                var outMaps = new Dictionary<Candidate, Occurrence?>[_method.Blocks.Length];
+                var inStates = new AvailabilityState[_method.Blocks.Length];
+                var outStates = new AvailabilityState[_method.Blocks.Length];
                 for (int b = 0; b < _method.Blocks.Length; b++)
                 {
-                    inMaps[b] = new Dictionary<Candidate, Occurrence?>();
-                    outMaps[b] = new Dictionary<Candidate, Occurrence?>();
+                    bool boundary = IsAvailabilityBoundary(b);
+                    inStates[b] = boundary ? new AvailabilityState() : new AvailabilityState(_candidates);
+                    outStates[b] = boundary ? TransferBlock(b, inStates[b], mark: false) : new AvailabilityState(_candidates);
                 }
 
                 bool changed;
@@ -214,79 +301,76 @@ namespace Cnidaria.Cs
                         if ((uint)blockId >= (uint)_method.Blocks.Length)
                             continue;
 
-                        var input = ComputeBlockInput(blockId, outMaps);
-                        if (!SameMap(input, inMaps[blockId]))
+                        var input = ComputeBlockInput(blockId, outStates);
+                        if (!input.SetEquals(inStates[blockId]))
                         {
-                            inMaps[blockId] = input;
+                            inStates[blockId] = input;
                             changed = true;
                         }
 
                         var output = TransferBlock(blockId, input, mark: false);
-                        if (!SameMap(output, outMaps[blockId]))
+                        if (!output.SetEquals(outStates[blockId]))
                         {
-                            outMaps[blockId] = output;
+                            outStates[blockId] = output;
                             changed = true;
                         }
                     }
-                } while (changed);
+                }
+                while (changed);
 
+                ResetOccurrenceClassification();
                 for (int b = 0; b < _method.Blocks.Length; b++)
-                    TransferBlock(b, inMaps[b], mark: true);
+                    TransferBlock(b, inStates[b], mark: true);
             }
 
-            private Dictionary<Candidate, Occurrence?> ComputeBlockInput(int blockId, Dictionary<Candidate, Occurrence?>[] outMaps)
+            private AvailabilityState ComputeBlockInput(int blockId, AvailabilityState[] outStates)
             {
+                if (IsAvailabilityBoundary(blockId))
+                    return new AvailabilityState();
+
                 var preds = _method.Cfg.Blocks[blockId].Predecessors;
                 if (preds.Length == 0)
-                    return new Dictionary<Candidate, Occurrence?>();
+                    return new AvailabilityState();
 
-                Dictionary<Candidate, Occurrence?>? result = null;
+                AvailabilityState? result = null;
                 for (int p = 0; p < preds.Length; p++)
                 {
                     int predId = preds[p].FromBlockId;
-                    if ((uint)predId >= (uint)outMaps.Length)
-                        return new Dictionary<Candidate, Occurrence?>();
+                    if ((uint)predId >= (uint)outStates.Length)
+                        return new AvailabilityState();
 
-                    var predOut = outMaps[predId];
                     if (result is null)
-                    {
-                        result = new Dictionary<Candidate, Occurrence?>(predOut);
-                        continue;
-                    }
-
-                    var remove = new List<Candidate>();
-                    foreach (var item in result)
-                    {
-                        if (!predOut.TryGetValue(item.Key, out var predDef) || !ReferenceEquals(predDef, item.Value))
-                            remove.Add(item.Key);
-                    }
-
-                    for (int i = 0; i < remove.Count; i++)
-                        result.Remove(remove[i]);
+                        result = outStates[predId].Clone();
+                    else
+                        result.IntersectWith(outStates[predId]);
                 }
 
-                return result ?? new Dictionary<Candidate, Occurrence?>();
+                return result ?? new AvailabilityState();
             }
 
-            private Dictionary<Candidate, Occurrence?> TransferBlock(int blockId, Dictionary<Candidate, Occurrence?> input, bool mark)
+            private AvailabilityState TransferBlock(int blockId, AvailabilityState input, bool mark)
             {
-                var current = new Dictionary<Candidate, Occurrence?>(input);
+                var current = input.Clone();
                 var list = _method.Blocks[blockId].TreeList;
                 for (int i = 0; i < list.Length; i++)
                 {
                     var node = list[i].Tree.Source;
+                    if (IsCallBoundary(node))
+                        current.AvailableAcrossCall.Clear();
+
                     if (!_occurrenceByNode.TryGetValue(node, out var occurrence))
                         continue;
+
                     var candidate = occurrence.Candidate;
-                    if (current.TryGetValue(candidate, out var reachingDef) && reachingDef is not null)
+                    if (current.Available.Contains(candidate))
                     {
                         if (mark)
                         {
                             occurrence.IsUse = true;
-                            occurrence.IsDef = false;
-                            occurrence.ReachingDef = reachingDef;
                             candidate.UseCount++;
                             candidate.WeightedUseCount += occurrence.Weight;
+                            if (!current.AvailableAcrossCall.Contains(candidate))
+                                candidate.LiveAcrossCall = true;
                         }
                     }
                     else
@@ -294,30 +378,49 @@ namespace Cnidaria.Cs
                         if (mark)
                         {
                             occurrence.IsDef = true;
-                            occurrence.IsUse = false;
-                            occurrence.ReachingDef = null;
                             candidate.DefCount++;
                             candidate.WeightedDefCount += occurrence.Weight;
                         }
-                        current[candidate] = occurrence;
+                        current.Available.Add(candidate);
                     }
+
+                    current.AvailableAcrossCall.Add(candidate);
                 }
 
                 return current;
             }
 
-            private static bool SameMap(Dictionary<Candidate, Occurrence?> left, Dictionary<Candidate, Occurrence?> right)
+            private void ResetOccurrenceClassification()
             {
-                if (left.Count != right.Count)
-                    return false;
-                foreach (var item in left)
+                for (int i = 0; i < _candidates.Count; i++)
                 {
-                    if (!right.TryGetValue(item.Key, out var rightValue))
-                        return false;
-                    if (!ReferenceEquals(item.Value, rightValue))
-                        return false;
+                    var candidate = _candidates[i];
+                    candidate.UseCount = 0;
+                    candidate.DefCount = 0;
+                    candidate.WeightedUseCount = 0;
+                    candidate.WeightedDefCount = 0;
+                    candidate.LiveAcrossCall = false;
+                    for (int o = 0; o < candidate.Occurrences.Count; o++)
+                    {
+                        candidate.Occurrences[o].IsDef = false;
+                        candidate.Occurrences[o].IsUse = false;
+                    }
                 }
-                return true;
+            }
+
+            private bool IsAvailabilityBoundary(int blockId)
+            {
+                var block = _method.Cfg.Blocks[blockId];
+                if (block.Predecessors.Length == 0)
+                    return true;
+
+                for (int i = 0; i < block.Predecessors.Length; i++)
+                {
+                    if (block.Predecessors[i].Kind == CfgEdgeKind.Exception)
+                        return true;
+                }
+
+                return false;
             }
 
             private bool SelectCandidates()
@@ -327,6 +430,8 @@ namespace Cnidaria.Cs
                 {
                     var candidate = _candidates[i];
                     if (candidate.UseCount == 0 || candidate.DefCount == 0)
+                        continue;
+                    if (!HasCompatibleExceptionSets(candidate))
                         continue;
                     if (!AllDefinitionOccurrencesCanBeMaterialized(candidate))
                         continue;
@@ -340,15 +445,13 @@ namespace Cnidaria.Cs
 
                 selectable.Sort(static (left, right) =>
                 {
-                    double leftBenefit = left.EstimatedNoCseCost - left.EstimatedYesCseCost;
-                    double rightBenefit = right.EstimatedNoCseCost - right.EstimatedYesCseCost;
-                    int c = rightBenefit.CompareTo(leftBenefit);
+                    int c = right.Cost.CompareTo(left.Cost);
                     if (c != 0)
                         return c;
-                    c = right.Cost.CompareTo(left.Cost);
+                    c = right.WeightedUseCount.CompareTo(left.WeightedUseCount);
                     if (c != 0)
                         return c;
-                    c = right.UseCount.CompareTo(left.UseCount);
+                    c = left.WeightedDefCount.CompareTo(right.WeightedDefCount);
                     if (c != 0)
                         return c;
                     return left.Index.CompareTo(right.Index);
@@ -371,173 +474,156 @@ namespace Cnidaria.Cs
                 return any;
             }
 
+            private bool HasCompatibleExceptionSets(Candidate candidate)
+            {
+                ValueNumber required = _vn.Store.VNForEmptyExcSet();
+                for (int i = 0; i < candidate.Occurrences.Count; i++)
+                {
+                    var occurrence = candidate.Occurrences[i];
+                    if (!occurrence.IsUse || _vn.Store.IsEmptyExcSet(occurrence.ExceptionSet))
+                        continue;
+
+                    if (_vn.Store.IsEmptyExcSet(required))
+                        required = occurrence.ExceptionSet;
+                    else if (required != occurrence.ExceptionSet)
+                        return false;
+                }
+
+                if (_vn.Store.IsEmptyExcSet(required))
+                    return true;
+
+                for (int i = 0; i < candidate.Occurrences.Count; i++)
+                {
+                    var occurrence = candidate.Occurrences[i];
+                    if (occurrence.IsDef && occurrence.ExceptionSet != required)
+                        return false;
+                    if (occurrence.IsUse && !_vn.Store.IsEmptyExcSet(occurrence.ExceptionSet) && occurrence.ExceptionSet != required)
+                        return false;
+                }
+
+                return true;
+            }
+
             private bool PassesProfitabilityCheck(Candidate candidate)
             {
                 if (candidate.Cost <= 1 || candidate.UseCount <= 0 || candidate.DefCount <= 0)
                     return false;
 
                 var representative = candidate.Occurrences[0].Node;
-                bool liveAcrossCall = CandidateMayBeLiveAcrossCall(candidate);
                 bool canEnregister = CanEnregisterCse(representative);
-                bool cheapPure = IsCheapPureExpression(representative);
-                bool memoryOrAddress = IsMemoryOrAddressExpression(representative);
-                double cseRefCnt = CseRefCount(candidate);
-
-                if (liveAcrossCall && cheapPure && !memoryOrAddress)
-                    return false;
-
-                if (liveAcrossCall && !memoryOrAddress && cseRefCnt < 16.0 && candidate.Cost <= 6)
-                    return false;
-
-                EstimateCseAccessCosts(candidate, liveAcrossCall, canEnregister, memoryOrAddress, cseRefCnt, out int cseDefCost, out int cseUseCost, out int cseDefUseCost, out double extraYesCost);
+                PromotionKind promotion = ClassifyPromotion(candidate, representative, canEnregister);
+                EstimateCseAccessCosts(candidate, promotion, canEnregister, out int cseDefCost, out int cseUseCost, out double extraYesCost);
 
                 double noCseCost = candidate.WeightedUseCount * candidate.Cost;
-                double yesCseCost = (candidate.WeightedDefCount * (cseDefCost + cseDefUseCost)) +
-                                    (candidate.WeightedUseCount * cseUseCost) +
+                double yesCseCost = candidate.WeightedDefCount * cseDefCost +
+                                    candidate.WeightedUseCount * cseUseCost +
                                     extraYesCost;
 
                 candidate.EstimatedNoCseCost = noCseCost;
                 candidate.EstimatedYesCseCost = yesCseCost;
-
-                int unweightedNoCseCost = candidate.UseCount * candidate.Cost;
-                int unweightedYesCseCost = candidate.DefCount * (cseDefCost + cseDefUseCost) +
-                                           candidate.UseCount * cseUseCost +
-                                           (int)Math.Ceiling(extraYesCost);
-                bool hasWeightedBenefit = candidate.WeightedUseCount != candidate.UseCount ||
-                                          candidate.WeightedDefCount != candidate.DefCount;
-                if (!hasWeightedBenefit && unweightedYesCseCost >= unweightedNoCseCost)
-                    return false;
-
-                double savings = noCseCost - yesCseCost;
-                double requiredSavings = RequiredSavings(candidate, liveAcrossCall, cheapPure, memoryOrAddress, canEnregister);
-                if (savings < requiredSavings)
-                    return false;
-
-                if (!hasWeightedBenefit && candidate.Cost <= 2 && candidate.UseCount < 3)
-                    return false;
-
-                if (!hasWeightedBenefit && candidate.Cost == 3 && candidate.UseCount < 2)
-                    return false;
-
-                return true;
+                return noCseCost > yesCseCost;
             }
 
-            private static double CseRefCount(Candidate candidate)
-                => (candidate.WeightedDefCount * 2.0) + candidate.WeightedUseCount;
-
-            private static double RequiredSavings(Candidate candidate, bool liveAcrossCall, bool cheapPure, bool memoryOrAddress, bool canEnregister)
+            private PromotionKind ClassifyPromotion(Candidate candidate, GenTree representative, bool canEnregister)
             {
-                double required = Math.Max(1.0, candidate.WeightedDefCount * 0.5);
-
-                if (liveAcrossCall)
-                    required += candidate.WeightedDefCount + Math.Max(1.0, candidate.WeightedUseCount * 0.25);
-
-                if (cheapPure && !memoryOrAddress)
-                    required += Math.Max(1.0, candidate.WeightedUseCount * 0.5);
-
                 if (!canEnregister)
-                    required += candidate.WeightedDefCount + candidate.WeightedUseCount;
+                    return PromotionKind.Conservative;
 
-                return required;
+                double refCount = candidate.WeightedDefCount * 2.0 + candidate.WeightedUseCount;
+                RefThresholds thresholds = IsFloatStackKind(representative.StackKind) ? _floatThresholds : _generalThresholds;
+                if (refCount >= thresholds.Aggressive)
+                    return PromotionKind.Aggressive;
+                if (refCount >= thresholds.Moderate)
+                    return PromotionKind.Moderate;
+                return PromotionKind.Conservative;
             }
 
-            private void EstimateCseAccessCosts(
+            private static void EstimateCseAccessCosts(
                 Candidate candidate,
-                bool liveAcrossCall,
+                PromotionKind promotion,
                 bool canEnregister,
-                bool memoryOrAddress,
-                double cseRefCnt,
                 out int cseDefCost,
                 out int cseUseCost,
-                out int cseDefUseCost,
                 out double extraYesCost)
             {
-                extraYesCost = 0.0;
-
-                if (canEnregister && !liveAcrossCall && cseRefCnt >= 12.0)
-                {
-                    cseDefCost = 1;
-                    cseUseCost = 1;
-                    cseDefUseCost = 1;
-                    return;
-                }
-
-                if (canEnregister && !liveAcrossCall && cseRefCnt >= 6.0)
+                extraYesCost = 0;
+                if (!canEnregister)
                 {
                     cseDefCost = 2;
-                    cseUseCost = 1;
-                    cseDefUseCost = 1;
+                    cseUseCost = 3;
                     return;
                 }
 
-                if (canEnregister && !liveAcrossCall)
+                switch (promotion)
                 {
-                    cseDefCost = 2;
-                    cseUseCost = 2;
-                    cseDefUseCost = 2;
-                    return;
+                    case PromotionKind.Aggressive:
+                        cseDefCost = 1;
+                        cseUseCost = 1;
+                        break;
+                    case PromotionKind.Moderate:
+                        cseDefCost = 2;
+                        cseUseCost = 1;
+                        break;
+                    default:
+                        cseDefCost = 2;
+                        cseUseCost = 2;
+                        break;
                 }
 
-                cseDefCost = 2;
-                cseUseCost = canEnregister ? 3 : 4;
-                cseDefUseCost = canEnregister ? 3 : 4;
+                if (candidate.LiveAcrossCall && promotion == PromotionKind.Conservative)
+                    extraYesCost = Math.Max(1.0, candidate.WeightedDefCount * 0.5);
+            }
 
-                if (liveAcrossCall)
+            private RefThresholds BuildRefThresholds(RegisterClass registerClass)
+            {
+                var weights = new List<double>();
+                var descriptors = _method.GenTreeMethod.AllLocalDescriptors;
+                for (int i = 0; i < descriptors.Length; i++)
                 {
-                    extraYesCost += Math.Max(1.0, candidate.WeightedDefCount);
+                    var descriptor = descriptors[i];
+                    if (!descriptor.LRACandidate || descriptor.DoNotEnregister || descriptor.HasMemoryAlias)
+                        continue;
+                    if (RegisterClassOf(descriptor.StackKind) != registerClass)
+                        continue;
 
-                    if (!memoryOrAddress)
-                        extraYesCost += Math.Max(1.0, candidate.WeightedUseCount * 0.5);
-
-                    if (!canEnregister || cseRefCnt < 12.0)
-                    {
-                        cseUseCost++;
-                        cseDefUseCost++;
-                    }
+                    double weight = descriptor.WeightedDefCount * 2.0 + descriptor.WeightedUseCount;
+                    if (weight > 0)
+                        weights.Add(weight);
                 }
-            }
 
-            private static bool IsMemoryOrAddressExpression(GenTree node)
-            {
-                if (IsMemoryReadCandidate(node))
-                    return true;
+                weights.Sort(static (left, right) => right.CompareTo(left));
+                var allocatable = registerClass == RegisterClass.Float
+                    ? RegisterInfo.AllocatableFloatingRegisters(_target)
+                    : RegisterInfo.AllocatableGeneralRegisters(_target);
 
-                return node.Kind is
-                    GenTreeKind.FieldAddr or
-                    GenTreeKind.StaticFieldAddr or
-                    GenTreeKind.ArrayDataRef or
-                    GenTreeKind.ArrayElementAddr or
-                    GenTreeKind.PointerElementAddr or
-                    GenTreeKind.PointerDiff;
-            }
-
-            private static bool IsCheapPureExpression(GenTree node)
-            {
-                if (IsMemoryOrAddressExpression(node))
-                    return false;
-
-                return node.Kind switch
+                int calleeSaved = 0;
+                int callerSaved = 0;
+                for (int i = 0; i < allocatable.Length; i++)
                 {
-                    GenTreeKind.Unary => node.SourceOp is BytecodeOp.Neg or BytecodeOp.Not,
-                    GenTreeKind.Conv => true,
-                    GenTreeKind.SizeOf => true,
-                    GenTreeKind.StaticData => true,
-                    GenTreeKind.Binary => node.SourceOp is
-                        BytecodeOp.Add or
-                        BytecodeOp.Sub or
-                        BytecodeOp.And or
-                        BytecodeOp.Or or
-                        BytecodeOp.Xor or
-                        BytecodeOp.Shl or
-                        BytecodeOp.Shr or
-                        BytecodeOp.Shr_Un or
-                        BytecodeOp.Ceq or
-                        BytecodeOp.Clt or
-                        BytecodeOp.Clt_Un or
-                        BytecodeOp.Cgt or
-                        BytecodeOp.Cgt_Un,
-                    _ => false,
-                };
+                    if (RegisterInfo.IsCalleeSaved(_target, allocatable[i]))
+                        calleeSaved++;
+                    else if (RegisterInfo.IsCallerSaved(_target, allocatable[i]))
+                        callerSaved++;
+                }
+
+                int aggressiveCount = Math.Max(1, calleeSaved * 3 / 2);
+                int moderateCount = Math.Max(1, calleeSaved * 3 + callerSaved * 2);
+                double aggressive = WeightAt(weights, aggressiveCount, addUnity: true);
+                double moderate = WeightAt(weights, moderateCount, addUnity: false);
+                int multiplier = weights.Count > 4 ? 3 : weights.Count > 2 ? 2 : 1;
+                aggressive = Math.Max(multiplier, aggressive);
+                moderate = Math.Max(multiplier * 0.5, moderate);
+                if (moderate > aggressive)
+                    moderate = aggressive;
+                return new RefThresholds(aggressive, moderate);
+            }
+
+            private static double WeightAt(List<double> weights, int oneBasedIndex, bool addUnity)
+            {
+                if (oneBasedIndex <= 0 || oneBasedIndex > weights.Count)
+                    return 0;
+                double value = weights[oneBasedIndex - 1];
+                return addUnity ? value + 1.0 : value;
             }
 
             private bool CanEnregisterCse(GenTree node)
@@ -548,58 +634,17 @@ namespace Cnidaria.Cs
                 if (node.Type is not null)
                     return MachineAbi.IsPhysicallyPromotableStorage(node.Type, node.StackKind, _target);
 
-                return node.StackKind is
-                    GenStackKind.I4 or
-                    GenStackKind.I8 or
-                    GenStackKind.R4 or
-                    GenStackKind.R8 or
-                    GenStackKind.NativeInt or
-                    GenStackKind.NativeUInt or
-                    GenStackKind.Ref or
-                    GenStackKind.Ptr;
+                return RegisterClassOf(node.StackKind) is RegisterClass.General or RegisterClass.Float;
             }
 
-            private bool CandidateMayBeLiveAcrossCall(Candidate candidate)
-            {
-                bool methodContainsCall = false;
-                for (int b = 0; b < _method.Blocks.Length && !methodContainsCall; b++)
-                {
-                    var statements = _method.Blocks[b].Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                    {
-                        if (TreeContainsCall(statements[s].Source))
-                        {
-                            methodContainsCall = true;
-                            break;
-                        }
-                    }
-                }
+            private static RegisterClass RegisterClassOf(GenStackKind stackKind)
+                => IsFloatStackKind(stackKind) ? RegisterClass.Float :
+                   stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ref or GenStackKind.Ptr
+                       ? RegisterClass.General
+                       : RegisterClass.Invalid;
 
-                if (!methodContainsCall)
-                    return false;
-
-                for (int i = 0; i < candidate.Occurrences.Count; i++)
-                {
-                    var use = candidate.Occurrences[i];
-                    if (!use.IsUse || use.ReachingDef is null)
-                        continue;
-
-                    var def = use.ReachingDef;
-                    if (def.BlockId != use.BlockId)
-                        return true;
-
-                    var statements = _method.Blocks[def.BlockId].Statements;
-                    int first = Math.Min(def.StatementIndex + 1, statements.Length);
-                    int last = Math.Min(use.StatementIndex, statements.Length - 1);
-                    for (int s = first; s <= last; s++)
-                    {
-                        if (TreeContainsCall(statements[s].Source))
-                            return true;
-                    }
-                }
-
-                return false;
-            }
+            private static bool IsFloatStackKind(GenStackKind stackKind)
+                => stackKind is GenStackKind.R4 or GenStackKind.R8;
 
             private double BlockWeight(int blockId)
             {
@@ -610,31 +655,24 @@ namespace Cnidaria.Cs
                         depth++;
                 }
 
-                return 1.0 + (8.0 * depth);
+                double weight = 1.0;
+                for (int i = 0; i < depth; i++)
+                    weight *= 8.0;
+                return weight;
             }
 
-            private static bool TreeContainsCall(GenTree node)
+            private static bool IsCallBoundary(GenTree node)
             {
-                if ((node.Flags & GenTreeFlags.ContainsCall) != 0)
-                    return true;
-
-                if (node.Kind is GenTreeKind.Call or
+                return node.Kind is
+                    GenTreeKind.Call or
+                    GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
                     GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
                     GenTreeKind.DelegateCombine or
                     GenTreeKind.DelegateRemove or
                     GenTreeKind.DelegateInvoke or
-                    GenTreeKind.GcPoll)
-                    return true;
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                {
-                    if (TreeContainsCall(node.Operands[i]))
-                        return true;
-                }
-
-                return false;
+                    GenTreeKind.GcPoll;
             }
 
             private static bool AllDefinitionOccurrencesCanBeMaterialized(Candidate candidate)
@@ -654,10 +692,7 @@ namespace Cnidaria.Cs
                     return false;
 
                 var statement = occurrence.Block.Statements[occurrence.StatementIndex].Source;
-                if (occurrence.Node.Parent is null)
-                    return false;
-
-                if (!CanExtractFromStatementKind(statement.Kind))
+                if (occurrence.Node.Parent is null || !CanExtractFromStatementKind(statement.Kind))
                     return false;
 
                 var statementTreeList = occurrence.Block.StatementTreeLists[occurrence.StatementIndex];
@@ -676,7 +711,6 @@ namespace Cnidaria.Cs
 
                 var subtree = new HashSet<GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
                 AddSubtree(occurrence.Node, subtree);
-
                 int subtreeStart = occurrenceIndex;
                 for (int i = 0; i < occurrenceIndex; i++)
                 {
@@ -684,9 +718,10 @@ namespace Cnidaria.Cs
                         subtreeStart = Math.Min(subtreeStart, i);
                 }
 
+                bool movingCanThrow = (occurrence.Node.Flags & GenTreeFlags.CanThrow) != 0;
                 for (int i = 0; i < subtreeStart; i++)
                 {
-                    if (BlocksExtractionBefore(statementTreeList[i]))
+                    if (BlocksExtractionBefore(statementTreeList[i].Source, movingCanThrow))
                         return false;
                 }
 
@@ -709,25 +744,20 @@ namespace Cnidaria.Cs
                     GenTreeKind.BranchFalse;
             }
 
-            private static bool BlocksExtractionBefore(SsaTree tree)
+            private static bool BlocksExtractionBefore(GenTree node, bool movingCanThrow)
             {
-                var node = tree.Source;
-                if (tree.Value.HasValue || tree.StoreTarget.HasValue || tree.LocalFieldBaseValue.HasValue || tree.HasMemoryEffects)
-                    return true;
-
                 if ((node.Flags & (GenTreeFlags.ContainsCall |
-                                   GenTreeFlags.CanThrow |
                                    GenTreeFlags.SideEffect |
-                                   GenTreeFlags.MemoryRead |
                                    GenTreeFlags.MemoryWrite |
                                    GenTreeFlags.LocalDef |
+                                   GenTreeFlags.AddressExposed |
                                    GenTreeFlags.Allocation |
                                    GenTreeFlags.ControlFlow |
                                    GenTreeFlags.ExceptionFlow |
                                    GenTreeFlags.Ordered)) != 0)
                     return true;
 
-                return false;
+                return movingCanThrow && (node.Flags & GenTreeFlags.CanThrow) != 0;
             }
 
             private static bool ConflictsWithSelected(Candidate candidate, HashSet<GenTree> occupied)
@@ -767,329 +797,36 @@ namespace Cnidaria.Cs
 
             private SsaMethod RewriteSelectedCandidates()
             {
-                var valueDefinitions = _method.ValueDefinitions.ToBuilder();
-                var ssaLocalDescriptors = _method.SsaLocalDescriptors.ToBuilder();
-                var slots = _method.Slots.ToBuilder();
-                var ssaValues = new Dictionary<SsaValueName, ValueNumberPair>();
-                foreach (var item in _vn.SsaValues)
-                    ssaValues[item.Key] = item.Value;
-                var treeValues = new Dictionary<GenTree, ValueNumberPair>(ReferenceEqualityComparer<GenTree>.Instance);
-                foreach (var item in _vn.TreeValues)
-                    treeValues[item.Key] = item.Value;
-                var perCandidateDescriptors = new Dictionary<Candidate, ImmutableArray<SsaDescriptor>>();
-
                 for (int i = 0; i < _candidates.Count; i++)
                 {
                     var candidate = _candidates[i];
                     if (!candidate.Selected)
                         continue;
 
-                    var descriptor = _method.GenTreeMethod.AppendCompilerTemp(
+                    candidate.TempDescriptor = _method.GenTreeMethod.AppendCompilerTemp(
                         GenTempKind.CommonSubexpression,
                         candidate.Occurrences[0].Node.Type,
                         candidate.Occurrences[0].Node.StackKind);
-                    descriptor.MarkRegularPromotedScalar(NextSyntheticVarIndex());
-                    candidate.TempDescriptor = descriptor;
-                    candidate.TempSlot = new SsaSlot(descriptor);
-
-                    var perSsa = ImmutableArray.CreateBuilder<SsaDescriptor>();
-                    perSsa.Add(null!);
-                    int version = SsaConfig.FirstSsaNumber;
-
-                    for (int o = 0; o < candidate.Occurrences.Count; o++)
-                    {
-                        var occurrence = candidate.Occurrences[o];
-                        if (!occurrence.IsDef)
-                            continue;
-
-                        occurrence.SsaVersion = version++;
-                        occurrence.SsaName = new SsaValueName(candidate.TempSlot, occurrence.SsaVersion);
-                        var ssaDescriptor = new SsaDescriptor(
-                            candidate.TempSlot,
-                            occurrence.SsaVersion,
-                            SsaDefinitionKind.Store,
-                            occurrence.BlockId,
-                            -1,
-                            -1,
-                            defNode: null,
-                            descriptor.Type,
-                            descriptor.StackKind);
-                        ssaDescriptor.SetValueNumbers(candidate.NormalValue);
-                        perSsa.Add(ssaDescriptor);
-                    }
-
-                    for (int o = 0; o < candidate.Occurrences.Count; o++)
-                    {
-                        var occurrence = candidate.Occurrences[o];
-                        if (!occurrence.IsUse || occurrence.ReachingDef is null)
-                            continue;
-                        occurrence.SsaName = occurrence.ReachingDef.SsaName;
-                        perSsa[occurrence.SsaName.Version].AddUse(occurrence.BlockId);
-                    }
-
-                    var perSsaArray = perSsa.ToImmutable();
-                    descriptor.SetSsaDescriptors(perSsaArray);
-                    perCandidateDescriptors[candidate] = perSsaArray;
-                    ssaLocalDescriptors.Add(new SsaLocalDescriptor(
-                        candidate.TempSlot,
-                        descriptor.Type,
-                        descriptor.StackKind,
-                        addressExposed: false,
-                        isSsaPromoted: true,
-                        descriptor,
-                        perSsaArray));
-                    slots.Add(new SsaSlotInfo(
-                        candidate.TempSlot,
-                        descriptor.Type,
-                        descriptor.StackKind,
-                        addressExposed: false,
-                        memoryAliased: false,
-                        category: GenLocalCategory.CompilerTemp,
-                        lclNum: descriptor.LclNum,
-                        varIndex: descriptor.VarIndex,
-                        tracked: descriptor.Tracked,
-                        inSsa: true,
-                        localDescriptor: descriptor));
                 }
 
-                var newStatementsByBlock = RewriteTrees(treeValues, perCandidateDescriptors);
-                _method.GenTreeMethod.ReplaceBlocksPreservingFlow(MaterializeGenTreeBlocks(newStatementsByBlock));
-
-                for (int i = 0; i < _candidates.Count; i++)
-                {
-                    var candidate = _candidates[i];
-                    if (!candidate.Selected || !perCandidateDescriptors.TryGetValue(candidate, out var descriptors))
-                        continue;
-
-                    for (int ssaNum = SsaConfig.FirstSsaNumber; ssaNum < descriptors.Length; ssaNum++)
-                    {
-                        var descriptor = descriptors[ssaNum];
-                        valueDefinitions.Add(new SsaValueDefinition(descriptor));
-                        ssaValues[descriptor.Name] = descriptor.ValueNumbers;
-                    }
-                }
-
-                valueDefinitions.Sort(static (left, right) => left.Name.CompareTo(right.Name));
-                ssaLocalDescriptors.Sort(static (left, right) => left.Slot.CompareTo(right.Slot));
-                slots.Sort(static (left, right) => left.Slot.CompareTo(right.Slot));
-
-                var newBlocks = ImmutableArray.CreateBuilder<SsaBlock>(_method.Blocks.Length);
-                for (int b = 0; b < _method.Blocks.Length; b++)
-                {
-                    var oldBlock = _method.Blocks[b];
-                    var statements = newStatementsByBlock[b];
-                    newBlocks.Add(new SsaBlock(
-                        oldBlock.CfgBlock,
-                        oldBlock.Phis,
-                        statements,
-                        oldBlock.MemoryPhis,
-                        oldBlock.MemoryIn,
-                        oldBlock.MemoryOut));
-                }
-
-                var newBlocksArray = newBlocks.ToImmutable();
-                RefreshDefinitionLocations(valueDefinitions, _method.MemoryDefinitions, newBlocksArray, out var valueDefinitionsArray, out var memoryDefinitionsArray);
-                RecomputeDescriptorUseTracking(valueDefinitionsArray, memoryDefinitionsArray, newBlocksArray);
-
-                var valueNumbering = new SsaValueNumberingResult(
-                    _vn.Store,
-                    ssaValues,
-                    treeValues,
-                    _vn.MemoryValues,
-                    _vn.HeapIn,
-                    _vn.HeapOut,
-                    _vn.ByrefExposedIn,
-                    _vn.ByrefExposedOut,
-                    _vn.LoopMemoryDependencies);
-
-                return new SsaMethod(
-                    _method.GenTreeMethod,
-                    _method.Cfg,
-                    slots.ToImmutable(),
-                    _method.InitialValues,
-                    valueDefinitionsArray,
-                    newBlocksArray,
-                    valueNumbering,
-                    ssaLocalDescriptors.ToImmutable(),
-                    _method.InitialMemoryValues,
-                    memoryDefinitionsArray);
+                var statements = RewriteTrees();
+                var rewritten = _method.GenTreeMethod.CloneWithBlocks(MaterializeGenTreeBlocks(statements));
+                bool includeExceptionEdges = HasExceptionEdges(_method.Cfg);
+                var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
+                rewritten.AttachFlowGraph(cfg);
+                var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
+                rewritten.AttachHirLiveness(liveness);
+                var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
+                return SsaValueNumbering.BuildMethod(rebuilt, validate: _options.Validate);
             }
 
-            private static void RefreshDefinitionLocations(
-                ImmutableArray<SsaValueDefinition>.Builder valueDefinitions,
-                ImmutableArray<SsaMemoryDefinition> memoryDefinitions,
-                ImmutableArray<SsaBlock> blocks,
-                out ImmutableArray<SsaValueDefinition> valueDefinitionsArray,
-                out ImmutableArray<SsaMemoryDefinition> memoryDefinitionsArray)
+            private ImmutableArray<GenTree>[] RewriteTrees()
             {
-                var localDescriptors = new Dictionary<SsaValueName, SsaDescriptor>();
-                for (int i = 0; i < valueDefinitions.Count; i++)
-                    localDescriptors[valueDefinitions[i].Name] = valueDefinitions[i].Descriptor;
-
-                var memoryDescriptors = new Dictionary<SsaMemoryValueName, SsaMemoryDescriptor>();
-                for (int i = 0; i < memoryDefinitions.Length; i++)
-                    memoryDescriptors[memoryDefinitions[i].Name] = memoryDefinitions[i].Descriptor;
-
-                for (int b = 0; b < blocks.Length; b++)
-                {
-                    var block = blocks[b];
-                    for (int i = 0; i < block.TreeList.Length; i++)
-                    {
-                        var item = block.TreeList[i];
-                        var tree = item.Tree;
-
-                        if (tree.StoreTarget.HasValue && localDescriptors.TryGetValue(tree.StoreTarget.Value, out var localDescriptor))
-                        {
-                            localDescriptor.DefStatementIndex = item.StatementIndex;
-                            localDescriptor.DefTreeId = tree.Source.Id;
-                            localDescriptor.DefNode = tree.Source;
-                        }
-
-                        for (int m = 0; m < tree.MemoryDefinitions.Length; m++)
-                        {
-                            if (memoryDescriptors.TryGetValue(tree.MemoryDefinitions[m], out var memoryDescriptor))
-                            {
-                                memoryDescriptor.DefStatementIndex = item.StatementIndex;
-                                memoryDescriptor.DefTreeId = tree.Source.Id;
-                                memoryDescriptor.DefNode = tree.Source;
-                            }
-                        }
-                    }
-                }
-
-                var rebuiltValues = ImmutableArray.CreateBuilder<SsaValueDefinition>(valueDefinitions.Count);
-                for (int i = 0; i < valueDefinitions.Count; i++)
-                    rebuiltValues.Add(new SsaValueDefinition(valueDefinitions[i].Descriptor));
-                rebuiltValues.Sort(static (left, right) => left.Name.CompareTo(right.Name));
-                valueDefinitionsArray = rebuiltValues.ToImmutable();
-
-                var rebuiltMemory = ImmutableArray.CreateBuilder<SsaMemoryDefinition>(memoryDefinitions.Length);
-                for (int i = 0; i < memoryDefinitions.Length; i++)
-                    rebuiltMemory.Add(new SsaMemoryDefinition(memoryDefinitions[i].Descriptor));
-                memoryDefinitionsArray = rebuiltMemory.ToImmutable();
-            }
-
-            private static void RecomputeDescriptorUseTracking(
-                ImmutableArray<SsaValueDefinition> valueDefinitions,
-                ImmutableArray<SsaMemoryDefinition> memoryDefinitions,
-                ImmutableArray<SsaBlock> blocks)
-            {
-                var descriptors = new Dictionary<SsaValueName, SsaDescriptor>();
-                for (int i = 0; i < valueDefinitions.Length; i++)
-                {
-                    var descriptor = valueDefinitions[i].Descriptor;
-                    descriptor.ResetUseTracking();
-                    descriptors[descriptor.Name] = descriptor;
-                }
-
-                var memoryDescriptors = new Dictionary<SsaMemoryValueName, SsaMemoryDescriptor>();
-                for (int i = 0; i < memoryDefinitions.Length; i++)
-                {
-                    var descriptor = memoryDefinitions[i].Descriptor;
-                    descriptor.ResetUseTracking();
-                    memoryDescriptors[descriptor.Name] = descriptor;
-                }
-
-                for (int i = 0; i < valueDefinitions.Length; i++)
-                {
-                    var descriptor = valueDefinitions[i].Descriptor;
-                    if (!descriptor.HasUseDefSsaNum)
-                        continue;
-
-                    var previous = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
-                    if (descriptors.TryGetValue(previous, out var previousDescriptor))
-                        previousDescriptor.AddUse(descriptor.DefBlockId);
-                }
-
-                for (int b = 0; b < blocks.Length; b++)
-                {
-                    var block = blocks[b];
-                    for (int p = 0; p < block.Phis.Length; p++)
-                    {
-                        var phi = block.Phis[p];
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                        {
-                            if (descriptors.TryGetValue(phi.Inputs[i].Value, out var descriptor))
-                                descriptor.AddPhiUse(block.Id);
-                        }
-                    }
-
-                    for (int p = 0; p < block.MemoryPhis.Length; p++)
-                    {
-                        var phi = block.MemoryPhis[p];
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                        {
-                            if (memoryDescriptors.TryGetValue(phi.Inputs[i].Value, out var descriptor))
-                                descriptor.AddPhiUse(block.Id);
-                        }
-                    }
-
-                    for (int i = 0; i < block.TreeList.Length; i++)
-                    {
-                        var tree = block.TreeList[i].Tree;
-                        if (tree.Value.HasValue && descriptors.TryGetValue(tree.Value.Value, out var valueDescriptor))
-                            valueDescriptor.AddUse(block.Id);
-
-                        if (tree.LocalFieldBaseValue.HasValue && descriptors.TryGetValue(tree.LocalFieldBaseValue.Value, out var baseDescriptor))
-                            baseDescriptor.AddUse(block.Id);
-
-                        for (int m = 0; m < tree.MemoryUses.Length; m++)
-                        {
-                            if (memoryDescriptors.TryGetValue(tree.MemoryUses[m], out var memoryDescriptor))
-                                memoryDescriptor.AddUse(block.Id);
-                        }
-                    }
-                }
-            }
-
-            private int NextSyntheticVarIndex()
-            {
-                int max = -1;
-                var descriptors = _method.GenTreeMethod.AllLocalDescriptors;
-                for (int i = 0; i < descriptors.Length; i++)
-                {
-                    if (descriptors[i].VarIndex > max)
-                        max = descriptors[i].VarIndex;
-                }
-                return max + 1;
-            }
-
-            private ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(ImmutableArray<SsaTree>[] statementsByBlock)
-            {
-                var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(_method.GenTreeMethod.Blocks.Length);
-                for (int b = 0; b < _method.GenTreeMethod.Blocks.Length; b++)
-                {
-                    var oldBlock = _method.GenTreeMethod.Blocks[b];
-                    var statements = ImmutableArray.CreateBuilder<GenTree>(statementsByBlock[b].Length);
-                    for (int s = 0; s < statementsByBlock[b].Length; s++)
-                        statements.Add(statementsByBlock[b][s].Source);
-
-                    blocks.Add(new GenTreeBlock(
-                        oldBlock.Id,
-                        oldBlock.StartPc,
-                        oldBlock.EndPcExclusive,
-                        oldBlock.EntryStackDepth,
-                        oldBlock.ExitStackDepth,
-                        oldBlock.JumpKind,
-                        oldBlock.Flags,
-                        statements.ToImmutable(),
-                        oldBlock.SuccessorBlockIds,
-                        oldBlock.SuccessorPcs));
-                }
-                return blocks.ToImmutable();
-            }
-
-            private ImmutableArray<SsaTree>[] RewriteTrees(
-                Dictionary<GenTree, ValueNumberPair> treeValues,
-                Dictionary<Candidate, ImmutableArray<SsaDescriptor>> perCandidateDescriptors)
-            {
-                var result = new ImmutableArray<SsaTree>[_method.Blocks.Length];
+                var result = new ImmutableArray<GenTree>[_method.Blocks.Length];
                 var replacementByNode = new Dictionary<GenTree, GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
-                var storeDescriptorByNode = new Dictionary<GenTree, SsaDescriptor>(ReferenceEqualityComparer<GenTree>.Instance);
-                var storesBeforeStatement = new List<GenTree>[_method.Blocks.Length][];
-
+                var storesBeforeStatement = new List<PendingStore>[_method.Blocks.Length][];
                 for (int b = 0; b < _method.Blocks.Length; b++)
-                    storesBeforeStatement[b] = new List<GenTree>[_method.Blocks[b].Statements.Length];
+                    storesBeforeStatement[b] = new List<PendingStore>[_method.Blocks[b].Statements.Length];
 
                 for (int i = 0; i < _candidates.Count; i++)
                 {
@@ -1102,29 +839,19 @@ namespace Cnidaria.Cs
                         var occurrence = candidate.Occurrences[o];
                         if (occurrence.IsDef)
                         {
-                            var use = CreateUse(candidate, occurrence);
-                            replacementByNode[occurrence.Node] = use;
-                            treeValues[use] = candidate.NormalValue;
-
-                            var descriptors = perCandidateDescriptors[candidate];
-                            var store = CreateStore(candidate, occurrence, descriptors);
-                            treeValues[store] = candidate.NormalValue;
-                            storeDescriptorByNode[store] = descriptors[occurrence.SsaVersion];
-
+                            replacementByNode[occurrence.Node] = CreateUse(candidate, occurrence);
                             var blockStores = storesBeforeStatement[occurrence.BlockId];
                             var statementStores = blockStores[occurrence.StatementIndex];
                             if (statementStores is null)
                             {
-                                statementStores = new List<GenTree>();
+                                statementStores = new List<PendingStore>();
                                 blockStores[occurrence.StatementIndex] = statementStores;
                             }
-                            statementStores.Add(store);
+                            statementStores.Add(new PendingStore(occurrence.TreeIndex, CreateStore(candidate, occurrence)));
                         }
                         else if (occurrence.IsUse)
                         {
-                            var replacement = CreateUse(candidate, occurrence);
-                            replacementByNode[occurrence.Node] = replacement;
-                            treeValues[replacement] = candidate.NormalValue;
+                            replacementByNode[occurrence.Node] = CreateUse(candidate, occurrence);
                         }
                     }
                 }
@@ -1136,32 +863,52 @@ namespace Cnidaria.Cs
                     for (int s = 0; s < oldBlock.Statements.Length; s++)
                         inserted += storesBeforeStatement[b][s]?.Count ?? 0;
 
-                    var statements = ImmutableArray.CreateBuilder<SsaTree>(oldBlock.Statements.Length + inserted);
+                    var rewritten = ImmutableArray.CreateBuilder<GenTree>(oldBlock.Statements.Length + inserted);
                     for (int s = 0; s < oldBlock.Statements.Length; s++)
                     {
                         var stores = storesBeforeStatement[b][s];
                         if (stores is not null)
                         {
+                            stores.Sort(static (left, right) => left.TreeIndex.CompareTo(right.TreeIndex));
                             for (int i = 0; i < stores.Count; i++)
                             {
-                                RefreshFlags(stores[i]);
-                                if (storeDescriptorByNode.TryGetValue(stores[i], out var descriptor))
-                                    descriptor.DefStatementIndex = statements.Count;
-                                statements.Add(new SsaTree(stores[i]));
+                                RefreshFlags(stores[i].Store);
+                                rewritten.Add(stores[i].Store);
                             }
                         }
 
                         var source = RewriteNode(oldBlock.Statements[s].Source, replacementByNode);
                         RefreshFlags(source);
-                        statements.Add(new SsaTree(source));
+                        rewritten.Add(source);
                     }
-                    result[b] = statements.ToImmutable();
+                    result[b] = rewritten.ToImmutable();
                 }
 
                 return result;
             }
 
-            private GenTree CreateStore(Candidate candidate, Occurrence occurrence, ImmutableArray<SsaDescriptor> descriptors)
+            private ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(ImmutableArray<GenTree>[] statementsByBlock)
+            {
+                var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(_method.GenTreeMethod.Blocks.Length);
+                for (int b = 0; b < _method.GenTreeMethod.Blocks.Length; b++)
+                {
+                    var oldBlock = _method.GenTreeMethod.Blocks[b];
+                    blocks.Add(new GenTreeBlock(
+                        oldBlock.Id,
+                        oldBlock.StartPc,
+                        oldBlock.EndPcExclusive,
+                        oldBlock.EntryStackDepth,
+                        oldBlock.ExitStackDepth,
+                        oldBlock.JumpKind,
+                        oldBlock.Flags,
+                        statementsByBlock[b],
+                        oldBlock.SuccessorBlockIds,
+                        oldBlock.SuccessorPcs));
+                }
+                return blocks.ToImmutable();
+            }
+
+            private GenTree CreateStore(Candidate candidate, Occurrence occurrence)
             {
                 var temp = candidate.TempDescriptor!;
                 var store = new GenTree(
@@ -1171,14 +918,14 @@ namespace Cnidaria.Cs
                     occurrence.Node.SourceOp,
                     temp.Type,
                     temp.StackKind,
-                    occurrence.Node.Flags | GenTreeFlags.SideEffect | GenTreeFlags.LocalDef | GenTreeFlags.Ordered,
+                    (occurrence.Node.Flags & ~GenTreeFlags.AssertionProperties) |
+                    GenTreeFlags.SideEffect |
+                    GenTreeFlags.LocalDef |
+                    GenTreeFlags.Ordered,
                     ImmutableArray.Create(occurrence.Node),
                     int32: temp.Index);
                 store.LocalDescriptor = temp;
-                store.AttachSsaDefinition(occurrence.SsaName, temp.Type, temp.StackKind);
                 store.CseNumber = EncodeCseDef(candidate.Index);
-                descriptors[occurrence.SsaVersion].DefNode = store;
-                descriptors[occurrence.SsaVersion].DefTreeId = store.Id;
                 return store;
             }
 
@@ -1196,7 +943,6 @@ namespace Cnidaria.Cs
                     ImmutableArray<GenTree>.Empty,
                     int32: temp.Index);
                 use.LocalDescriptor = temp;
-                use.AttachSsaUse(occurrence.SsaName);
                 use.CseNumber = EncodeCseUse(candidate.Index);
                 return use;
             }
@@ -1205,7 +951,6 @@ namespace Cnidaria.Cs
             {
                 if (replacements.TryGetValue(node, out var replacement))
                     return replacement;
-
                 if (node.Operands.Length == 0)
                     return node;
 
@@ -1224,14 +969,26 @@ namespace Cnidaria.Cs
                 return node;
             }
 
+            private static bool HasExceptionEdges(ControlFlowGraph cfg)
+            {
+                for (int b = 0; b < cfg.Blocks.Length; b++)
+                {
+                    var successors = cfg.Blocks[b].Successors;
+                    for (int s = 0; s < successors.Length; s++)
+                    {
+                        if (successors[s].Kind == CfgEdgeKind.Exception)
+                            return true;
+                    }
+                }
+                return false;
+            }
+
             private static int EncodeCseDef(int index) => index << 1;
             private static int EncodeCseUse(int index) => (index << 1) | 1;
 
             private static bool CanConsider(GenTree node)
             {
-                if (!ProducesValue(node))
-                    return false;
-                if (!CanMaterializeInTemp(node))
+                if (!ProducesValue(node) || !CanMaterializeInTemp(node))
                     return false;
 
                 if ((node.Flags & (GenTreeFlags.ContainsCall |
@@ -1272,10 +1029,8 @@ namespace Cnidaria.Cs
             {
                 if (node.SsaMemoryUses.IsDefaultOrEmpty || !node.SsaMemoryDefinitions.IsDefaultOrEmpty)
                     return false;
-
                 if ((node.Flags & GenTreeFlags.MemoryRead) == 0)
                     return false;
-
                 if ((node.Flags & (GenTreeFlags.SideEffect |
                                    GenTreeFlags.MemoryWrite |
                                    GenTreeFlags.LocalDef |
@@ -1369,7 +1124,7 @@ namespace Cnidaria.Cs
 
                 var flags = node.Flags;
                 for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags;
+                    flags |= node.Operands[i].Flags & ~GenTreeFlags.AssertionProperties;
                 node.Flags = flags;
             }
 

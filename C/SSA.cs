@@ -160,7 +160,12 @@ namespace Cnidaria.C
                 functions.Add(ssaFunction);
             }
 
-            return new SsaGraph(controlFlowGraph, functions.ToImmutable());
+            var functionArray = functions.ToImmutable();
+            var trimResult = Trimmer.Trim(
+                controlFlowGraph,
+                functionArray,
+                controlFlowGraph.SemanticModel.Compilation.Options.Trimming);
+            return new SsaGraph(trimResult.ControlFlowGraph, trimResult.Functions);
         }
     }
 

@@ -979,6 +979,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
+                case GenTreeKind.IndirectCall:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
                     uses = SsaMemoryKindSet.All;

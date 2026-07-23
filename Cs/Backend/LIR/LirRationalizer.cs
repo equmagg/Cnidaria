@@ -918,14 +918,25 @@ namespace Cnidaria.Cs
                 if (!ProducesValue(tree))
                     return false;
 
-                if (tree.Kind is GenTreeKind.Call or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+                if (tree.Kind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                 {
-                    var method = tree.Method;
-                    if (method is null)
-                        return true;
+                    RuntimeType? returnType;
+                    GenStackKind returnKind;
+                    if (tree.Kind == GenTreeKind.IndirectCall)
+                    {
+                        returnType = tree.Type;
+                        returnKind = tree.StackKind;
+                    }
+                    else
+                    {
+                        var method = tree.Method;
+                        if (method is null)
+                            return true;
+                        returnType = method.ReturnType;
+                        returnKind = MachineAbi.StackKindForType(returnType);
+                    }
 
-                    var returnKind = MachineAbi.StackKindForType(method.ReturnType);
-                    var returnAbi = MachineAbi.ClassifyValue(method.ReturnType, returnKind, isReturn: true, target: _target);
+                    var returnAbi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true, target: _target);
                     return returnAbi.PassingKind is AbiValuePassingKind.Indirect or AbiValuePassingKind.Stack;
                 }
 
@@ -942,6 +953,7 @@ namespace Cnidaria.Cs
 
                 return tree.Kind is
                     GenTreeKind.Call or
+                    GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
                     GenTreeKind.DelegateInvoke or
                     GenTreeKind.NewObject or

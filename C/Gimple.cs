@@ -58,16 +58,24 @@ namespace Cnidaria.C
         public SemanticModel SemanticModel { get; }
         public ImmutableArray<GimpleNode> Members { get; }
         public ImmutableArray<SemanticDiagnostic> Diagnostics { get; }
+        internal bool HasInliningApplied { get; }
 
         public GimpleTree(
             SemanticModel semanticModel,
             ImmutableArray<GimpleNode> members,
-            ImmutableArray<SemanticDiagnostic> diagnostics)
+            ImmutableArray<SemanticDiagnostic> diagnostics,
+            bool hasInliningApplied = false)
         {
             SemanticModel = semanticModel ?? throw new ArgumentNullException(nameof(semanticModel));
             Members = NormalizeMembers(members);
             Diagnostics = diagnostics.IsDefault ? ImmutableArray<SemanticDiagnostic>.Empty : diagnostics;
+            HasInliningApplied = hasInliningApplied;
         }
+
+        internal GimpleTree WithInliningApplied()
+            => HasInliningApplied
+                ? this
+                : new GimpleTree(SemanticModel, Members, Diagnostics, hasInliningApplied: true);
 
         private static ImmutableArray<GimpleNode> NormalizeMembers(ImmutableArray<GimpleNode> members)
         {

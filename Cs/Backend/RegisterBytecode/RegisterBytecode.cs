@@ -73,6 +73,8 @@ namespace Cnidaria.Cs
         GcSafePoint = 1 << 6,
         MayThrow = 1 << 7,
         PreserveException = 1 << 8,
+        DivModNoByZero = 1 << 9,
+        DivModNoOverflow = 1 << 10,
     }
 
     [Flags]
@@ -1385,6 +1387,15 @@ namespace Cnidaria.Cs
             {
                 if (inst.Imm < 0 || inst.Imm > int.MaxValue)
                     throw new InvalidOperationException($"Invalid vtable slot at PC {pc}");
+                if (((InstructionFlags)inst.Aux & ~(InstructionFlags.MayThrow | InstructionFlags.NoNullCheck)) != 0)
+                    throw new InvalidOperationException($"Invalid vtable instruction flags at PC {pc}");
+                return;
+            }
+
+            if (inst.Op == Op.LdArrayDataAddr)
+            {
+                if (((InstructionFlags)inst.Aux & ~(InstructionFlags.MayThrow | InstructionFlags.NoNullCheck)) != 0)
+                    throw new InvalidOperationException($"Invalid array-data instruction flags at PC {pc}");
                 return;
             }
 
@@ -1397,6 +1408,9 @@ namespace Cnidaria.Cs
             if (IsArrayElementLayoutInstruction(inst.Op))
             {
                 ValidateTableIndex(inst.Imm, TypeLayouts.Length, pc, "array element type layout");
+                InstructionFlags flags = (InstructionFlags)inst.Aux;
+                if ((flags & ~(InstructionFlags.MayThrow | InstructionFlags.WriteBarrier | InstructionFlags.NoNullCheck | InstructionFlags.NoBoundsCheck)) != 0)
+                    throw new InvalidOperationException($"Invalid array instruction flags at PC {pc}");
                 return;
             }
 
@@ -2099,7 +2113,7 @@ namespace Cnidaria.Cs
             if (type.IsValueType) flags |= TypeLayoutFlags.ValueType;
             if (type.IsReferenceType) flags |= TypeLayoutFlags.ReferenceType;
             if (type.Kind == RuntimeTypeKind.Array) flags |= TypeLayoutFlags.Array;
-            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam) flags |= TypeLayoutFlags.PointerLike;
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam) flags |= TypeLayoutFlags.PointerLike;
             if (type.PrimitiveKind is RuntimePrimitiveKind.NativeInt or RuntimePrimitiveKind.NativeUInt) flags |= TypeLayoutFlags.NativeInt;
             if (type.PrimitiveKind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.UInt16 or RuntimePrimitiveKind.UInt32 or RuntimePrimitiveKind.UInt64 or RuntimePrimitiveKind.NativeUInt) flags |= TypeLayoutFlags.UnsignedSmall;
             if (type.PrimitiveKind == RuntimePrimitiveKind.Char) flags |= TypeLayoutFlags.Char;
@@ -2184,7 +2198,11 @@ namespace Cnidaria.Cs
             return _typeLayouts[typeLayoutIndex];
         }
 
-        public void LdVTableEntry(MachineRegister rd, MachineRegister receiver, RuntimeMethod declaredMethod)
+        public void LdVTableEntry(
+            MachineRegister rd,
+            MachineRegister receiver,
+            RuntimeMethod declaredMethod,
+            InstructionFlags flags = InstructionFlags.None)
         {
             if (declaredMethod is null) throw new ArgumentNullException(nameof(declaredMethod));
             if (!declaredMethod.HasThis)
@@ -2215,7 +2233,7 @@ namespace Cnidaria.Cs
                 Op.LdVTableEntry,
                 RegisterVmIsa.EncodeRegister(rd),
                 RegisterVmIsa.EncodeRegister(receiver),
-                aux: Aux.Instruction(InstructionFlags.MayThrow),
+                aux: Aux.Instruction(InstructionFlags.MayThrow | flags),
                 imm: slot));
 
             if (isInterfaceDispatch)
@@ -2574,14 +2592,14 @@ namespace Cnidaria.Cs
 
         private static int StorageSizeOfForLayout(RuntimeType type, int pointerSize)
         {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
                 return pointerSize;
             return Math.Max(1, type.SizeOf);
         }
 
         private static int StorageAlignOfForLayout(RuntimeType type, int pointerSize)
         {
-            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+            if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
                 return pointerSize;
             return Math.Max(1, type.AlignOf);
         }
@@ -2728,6 +2746,8 @@ namespace Cnidaria.Cs
         public void MovPtr(MachineRegister rd, MachineRegister rs) => Emit(new InstrDesc(Op.MovPtr, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs)));
         public void LiI32(MachineRegister rd, int value) => Emit(InstrDesc.Li(Op.LiI32, rd, value));
         public void LiI64(MachineRegister rd, long value) => Emit(InstrDesc.Li(Op.LiI64, rd, value));
+        public void LoadLabelAddress(MachineRegister rd, Label target)
+            => EmitTarget(InstrDesc.Li(Op.LiI64, rd, -1), target);
         public void LiF32Bits(MachineRegister rd, int bits) => Emit(InstrDesc.Li(Op.LiF32Bits, rd, bits));
         public void LiF64Bits(MachineRegister rd, long bits) => Emit(InstrDesc.Li(Op.LiF64Bits, rd, bits));
         public void LiNull(MachineRegister rd) => Emit(InstrDesc.Li(Op.LiNull, rd, 0));

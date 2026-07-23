@@ -1092,14 +1092,14 @@ namespace Cnidaria.Cs
             bool IsNullLiteral(BoundExpression e) =>
                 e.Type is NullTypeSymbol || (e.ConstantValueOpt.HasValue && e.ConstantValueOpt.Value is null);
 
-            if (IsNullLiteral(left) && right.Type is PointerTypeSymbol)
+            if (IsNullLiteral(left) && right.Type is PointerTypeSymbol or FunctionPointerTypeSymbol)
             {
                 EnsureUnsafe(diagnosticNode, ctx, diagnostics);
                 leftOut = ApplyConversion((ExpressionSyntax)left.Syntax, left, right.Type, diagnosticNode, ctx, diagnostics, requireImplicit: true);
                 return !leftOut.HasErrors;
             }
 
-            if (IsNullLiteral(right) && left.Type is PointerTypeSymbol)
+            if (IsNullLiteral(right) && left.Type is PointerTypeSymbol or FunctionPointerTypeSymbol)
             {
                 EnsureUnsafe(diagnosticNode, ctx, diagnostics);
                 rightOut = ApplyConversion((ExpressionSyntax)right.Syntax, right, left.Type, diagnosticNode, ctx, diagnostics, requireImplicit: true);
@@ -1110,6 +1110,20 @@ namespace Cnidaria.Cs
             {
                 EnsureUnsafe(diagnosticNode, ctx, diagnostics);
                 return ReferenceEquals(left.Type, right.Type);
+            }
+
+            if (left.Type is FunctionPointerTypeSymbol && right.Type is FunctionPointerTypeSymbol)
+            {
+                EnsureUnsafe(diagnosticNode, ctx, diagnostics);
+                if (!AreSameType(left.Type, right.Type))
+                    return false;
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR_CMP001",
+                    DiagnosticSeverity.Warning,
+                    "Comparison of function pointers might yield an unexpected result because function pointers can have multiple representations.",
+                    new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return true;
             }
 
             return false;

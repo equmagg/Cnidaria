@@ -16,6 +16,8 @@ namespace Cnidaria.Cs
         public const string CurrentFramePointerSymbol = "RhpCurrentFramePointer";
         public const string NewFastSymbol = "RhpNewFast";
         public const string NewArraySymbol = "RhpNewArray";
+        public const string AllocHGlobalSymbol = "RhpAllocHGlobal";
+        public const string FreeHGlobalSymbol = "RhpFreeHGlobal";
         public const string DelegateCombineSymbol = "RhpDelegateCombine";
         public const string DelegateRemoveSymbol = "RhpDelegateRemove";
         public const string ArrayGetLengthSymbol = "RhpArrayGetLength";

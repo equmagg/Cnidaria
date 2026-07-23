@@ -64,6 +64,17 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
                 hasErrors = true;
             }
+            if (!leftTarget.HasErrors &&
+                leftTarget is BoundFunctionPointerInvocationExpression functionPointerInvocation &&
+                functionPointerInvocation.FunctionPointerType.ReturnRefKind == FunctionPointerRefKind.RefReadOnly)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR_RET001",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign through a 'ref readonly' function pointer return value.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
+                hasErrors = true;
+            }
             // Simple assignment
             if (node.Kind == SyntaxKind.SimpleAssignmentExpression)
             {

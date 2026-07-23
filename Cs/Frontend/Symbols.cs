@@ -6,6 +6,36 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
+    public enum FunctionPointerCallingConvention : byte
+    {
+        Managed,
+        Unmanaged,
+        Cdecl,
+        Stdcall,
+        Thiscall,
+        Fastcall
+    }
+
+    public enum FunctionPointerRefKind : byte
+    {
+        None,
+        Ref,
+        Out,
+        In,
+        RefReadOnly
+    }
+
+    public readonly struct FunctionPointerParameter
+    {
+        public TypeSymbol Type { get; }
+        public FunctionPointerRefKind RefKind { get; }
+
+        public FunctionPointerParameter(TypeSymbol type, FunctionPointerRefKind refKind)
+        {
+            Type = type;
+            RefKind = refKind;
+        }
+    }
     public enum AttributeApplicationTarget : byte
     {
         Default = 0,
@@ -82,11 +112,81 @@ namespace Cnidaria.Cs
             Target = target;
         }
     }
+    public sealed class DllImportData
+    {
+        public string ModuleName { get; }
+        public string EntryPointName { get; }
+        public System.Runtime.InteropServices.CharSet CharacterSet { get; }
+        public System.Runtime.InteropServices.CallingConvention CallingConvention { get; }
+        public bool ExactSpelling { get; }
+        public bool SetLastError { get; }
+        public bool BestFitMapping { get; }
+        public bool PreserveSig { get; }
+        public bool ThrowOnUnmappableCharacter { get; }
+
+        public DllImportData(
+            string moduleName,
+            string entryPointName,
+            System.Runtime.InteropServices.CharSet characterSet,
+            System.Runtime.InteropServices.CallingConvention callingConvention,
+            bool exactSpelling,
+            bool setLastError,
+            bool bestFitMapping,
+            bool preserveSig,
+            bool throwOnUnmappableCharacter)
+        {
+            ModuleName = moduleName ?? string.Empty;
+            EntryPointName = entryPointName ?? string.Empty;
+            CharacterSet = characterSet;
+            CallingConvention = callingConvention;
+            ExactSpelling = exactSpelling;
+            SetLastError = setLastError;
+            BestFitMapping = bestFitMapping;
+            PreserveSig = preserveSig;
+            ThrowOnUnmappableCharacter = throwOnUnmappableCharacter;
+        }
+    }
+    internal static class PInvokeMetadataFlags
+    {
+        private const uint CharSetMask = 0x0000000F;
+        private const uint CallingConventionMask = 0x000000F0;
+        private const int CallingConventionShift = 4;
+        private const uint ExactSpelling = 1u << 8;
+        private const uint SetLastError = 1u << 9;
+        private const uint BestFitMapping = 1u << 10;
+        private const uint PreserveSig = 1u << 11;
+        private const uint ThrowOnUnmappableCharacter = 1u << 12;
+
+        public static uint Encode(DllImportData data)
+        {
+            uint flags = ((uint)data.CharacterSet & CharSetMask) |
+                         (((uint)data.CallingConvention << CallingConventionShift) & CallingConventionMask);
+            if (data.ExactSpelling) flags |= ExactSpelling;
+            if (data.SetLastError) flags |= SetLastError;
+            if (data.BestFitMapping) flags |= BestFitMapping;
+            if (data.PreserveSig) flags |= PreserveSig;
+            if (data.ThrowOnUnmappableCharacter) flags |= ThrowOnUnmappableCharacter;
+            return flags;
+        }
+
+        public static DllImportData Decode(string moduleName, string entryPointName, uint flags)
+            => new DllImportData(
+                moduleName,
+                entryPointName,
+                (System.Runtime.InteropServices.CharSet)(flags & CharSetMask),
+                (System.Runtime.InteropServices.CallingConvention)((flags & CallingConventionMask) >> CallingConventionShift),
+                (flags & ExactSpelling) != 0,
+                (flags & SetLastError) != 0,
+                (flags & BestFitMapping) != 0,
+                (flags & PreserveSig) != 0,
+                (flags & ThrowOnUnmappableCharacter) != 0);
+    }
     internal static class MetadataFlagBits
     {
         public const ushort NoInlining = 0x0008;
         public const ushort AggressiveInlining = 0x0100;
         public const ushort InternalCall = 0x1000;
+        public const ushort Extern = 0x8000;
         public const ushort Extension = 0x8000;
         public const int CustomAttribute = 0x0C000000;
     }
@@ -116,6 +216,87 @@ namespace Cnidaria.Cs
             => (GetMethodImplFlags(method) & MetadataFlagBits.NoInlining) != 0;
         public static bool HasAggressiveInlining(MethodSymbol method)
             => (GetMethodImplFlags(method) & MetadataFlagBits.AggressiveInlining) != 0;
+        public static DllImportData? GetDllImportData(MethodSymbol method)
+        {
+            if (method is null)
+                return null;
+
+            var definition = method.OriginalDefinition;
+            var attrs = definition.GetAttributes();
+            for (int i = 0; i < attrs.Length; i++)
+            {
+                var attr = attrs[i];
+                if (!IsAttribute(attr, "System.Runtime.InteropServices", "DllImportAttribute"))
+                    continue;
+
+                string moduleName = string.Empty;
+                if (!attr.ConstructorArguments.IsDefaultOrEmpty && attr.ConstructorArguments[0].Value is string module)
+                    moduleName = module;
+
+                string entryPointName = definition.Name;
+                var characterSet = System.Runtime.InteropServices.CharSet.None;
+                var callingConvention = System.Runtime.InteropServices.CallingConvention.Winapi;
+                bool exactSpelling = false;
+                bool setLastError = false;
+                bool bestFitMapping = false;
+                bool preserveSig = true;
+                bool throwOnUnmappableCharacter = false;
+
+                var named = attr.NamedArguments;
+                for (int j = 0; j < named.Length; j++)
+                {
+                    var argument = named[j];
+                    switch (argument.Name)
+                    {
+                        case "EntryPoint":
+                            if (argument.Value.Value is string entryPoint && entryPoint.Length != 0)
+                                entryPointName = entryPoint;
+                            break;
+                        case "CharSet":
+                            if (TryConvertToInt32(argument.Value.Value, out int charSetValue))
+                                characterSet = (System.Runtime.InteropServices.CharSet)charSetValue;
+                            break;
+                        case "CallingConvention":
+                            if (TryConvertToInt32(argument.Value.Value, out int callingConventionValue))
+                                callingConvention = (System.Runtime.InteropServices.CallingConvention)callingConventionValue;
+                            break;
+                        case "ExactSpelling":
+                            if (argument.Value.Value is bool exact)
+                                exactSpelling = exact;
+                            break;
+                        case "SetLastError":
+                            if (argument.Value.Value is bool lastError)
+                                setLastError = lastError;
+                            break;
+                        case "BestFitMapping":
+                            if (argument.Value.Value is bool bestFit)
+                                bestFitMapping = bestFit;
+                            break;
+                        case "PreserveSig":
+                            if (argument.Value.Value is bool preserve)
+                                preserveSig = preserve;
+                            break;
+                        case "ThrowOnUnmappableChar":
+                            if (argument.Value.Value is bool throwOnUnmappable)
+                                throwOnUnmappableCharacter = throwOnUnmappable;
+                            break;
+                    }
+                }
+
+                return new DllImportData(
+                    moduleName,
+                    entryPointName,
+                    characterSet,
+                    callingConvention,
+                    exactSpelling,
+                    setLastError,
+                    bestFitMapping,
+                    preserveSig,
+                    throwOnUnmappableCharacter);
+            }
+
+            return null;
+        }
 
         public static bool HasIntrinsic(MethodSymbol method)
             => HasAttribute(method, "System", "IntrinsicAttribute");
@@ -170,6 +351,23 @@ namespace Cnidaria.Cs
                 return true;
 
             return TryConvertToUInt16(args[0].Value, out value);
+        }
+
+        private static bool TryConvertToInt32(object? value, out int result)
+        {
+            switch (value)
+            {
+                case byte v: result = v; return true;
+                case sbyte v: result = v; return true;
+                case short v: result = v; return true;
+                case ushort v: result = v; return true;
+                case int v: result = v; return true;
+                case uint v: result = unchecked((int)v); return true;
+                case long v: result = unchecked((int)v); return true;
+                case ulong v: result = unchecked((int)v); return true;
+                case Enum e: result = Convert.ToInt32(e); return true;
+                default: result = 0; return false;
+            }
         }
 
         private static bool TryConvertToUInt16(object? value, out ushort result)
@@ -539,6 +737,83 @@ namespace Cnidaria.Cs
         public PointerTypeSymbol(TypeSymbol pointedAtType)
             => PointedAtType = pointedAtType;
     }
+    public sealed class FunctionPointerTypeSymbol : TypeSymbol
+    {
+        public override SymbolKind Kind => SymbolKind.FunctionPointerType;
+        public override Symbol? ContainingSymbol => null;
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+        public override bool IsValueType => true;
+
+        public FunctionPointerCallingConvention CallingConvention { get; }
+        public TypeSymbol ReturnType { get; }
+        public FunctionPointerRefKind ReturnRefKind { get; }
+        public ImmutableArray<FunctionPointerParameter> Parameters { get; }
+
+        public FunctionPointerTypeSymbol(
+            FunctionPointerCallingConvention callingConvention,
+            TypeSymbol returnType,
+            FunctionPointerRefKind returnRefKind,
+            ImmutableArray<FunctionPointerParameter> parameters)
+        {
+            CallingConvention = callingConvention;
+            ReturnType = returnType;
+            ReturnRefKind = returnRefKind;
+            Parameters = parameters.IsDefault ? ImmutableArray<FunctionPointerParameter>.Empty : parameters;
+        }
+
+        public override string Name
+        {
+            get
+            {
+                var builder = new StringBuilder("delegate*");
+                switch (CallingConvention)
+                {
+                    case FunctionPointerCallingConvention.Unmanaged:
+                        builder.Append(" unmanaged");
+                        break;
+                    case FunctionPointerCallingConvention.Cdecl:
+                    case FunctionPointerCallingConvention.Stdcall:
+                    case FunctionPointerCallingConvention.Thiscall:
+                    case FunctionPointerCallingConvention.Fastcall:
+                        builder.Append(" unmanaged[").Append(CallingConvention).Append(']');
+                        break;
+                }
+
+                builder.Append('<');
+                for (int i = 0; i < Parameters.Length; i++)
+                {
+                    if (i != 0)
+                        builder.Append(", ");
+                    AppendRefKind(builder, Parameters[i].RefKind);
+                    builder.Append(Parameters[i].Type.Name);
+                }
+                if (Parameters.Length != 0)
+                    builder.Append(", ");
+                AppendRefKind(builder, ReturnRefKind);
+                builder.Append(ReturnType.Name).Append('>');
+                return builder.ToString();
+            }
+        }
+
+        private static void AppendRefKind(StringBuilder builder, FunctionPointerRefKind refKind)
+        {
+            switch (refKind)
+            {
+                case FunctionPointerRefKind.Ref:
+                    builder.Append("ref ");
+                    break;
+                case FunctionPointerRefKind.Out:
+                    builder.Append("out ");
+                    break;
+                case FunctionPointerRefKind.In:
+                    builder.Append("in ");
+                    break;
+                case FunctionPointerRefKind.RefReadOnly:
+                    builder.Append("ref readonly ");
+                    break;
+            }
+        }
+    }
     public sealed class ByRefTypeSymbol : TypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.ByRefType;
@@ -709,6 +984,8 @@ namespace Cnidaria.Cs
         public abstract bool IsStatic { get; }
         public abstract bool IsConstructor { get; }
         public abstract bool IsAsync { get; }
+        public virtual bool IsExtern => false;
+        public DllImportData? GetDllImportData() => MethodAttributeFacts.GetDllImportData(this);
         public virtual bool IsExtensionMethod => false;
         public virtual bool IsVirtual => false;
         public virtual bool IsAbstract => false;
@@ -1358,6 +1635,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic { get; }
         public override bool IsConstructor { get; }
         public override bool IsAsync { get; }
+        public override bool IsExtern { get; }
         private bool _isVirtual;
         private bool _isAbstract;
         private bool _isOverride;
@@ -1385,7 +1663,8 @@ namespace Cnidaria.Cs
             ImmutableArray<Location> locations,
             Accessibility declaredAccessibility = Accessibility.Public,
             bool isExtensionMethod = false,
-            bool isUnsafe = false)
+            bool isUnsafe = false,
+            bool isExtern = false)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1394,6 +1673,7 @@ namespace Cnidaria.Cs
             IsStatic = isStatic;
             IsConstructor = isConstructor;
             IsAsync = isAsync;
+            IsExtern = isExtern;
             _isExtensionMethod = isExtensionMethod;
             IsUnsafe = isUnsafe;
             Locations = locations;
@@ -1449,6 +1729,22 @@ namespace Cnidaria.Cs
                     {
                         var p = Substitute(pt.PointedAtType, types, map);
                         return ReferenceEquals(p, pt.PointedAtType) ? pt : types.GetPointerType(p);
+                    }
+                case FunctionPointerTypeSymbol fp:
+                    {
+                        var returnType = Substitute(fp.ReturnType, types, map);
+                        bool changed = !ReferenceEquals(returnType, fp.ReturnType);
+                        var parameters = ImmutableArray.CreateBuilder<FunctionPointerParameter>(fp.Parameters.Length);
+                        for (int i = 0; i < fp.Parameters.Length; i++)
+                        {
+                            var parameter = fp.Parameters[i];
+                            var parameterType = Substitute(parameter.Type, types, map);
+                            changed |= !ReferenceEquals(parameterType, parameter.Type);
+                            parameters.Add(new FunctionPointerParameter(parameterType, parameter.RefKind));
+                        }
+                        return changed
+                            ? types.GetFunctionPointerType(fp.CallingConvention, returnType, fp.ReturnRefKind, parameters.ToImmutable())
+                            : fp;
                     }
                 case TupleTypeSymbol tt:
                     {
@@ -1781,6 +2077,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic => _original.IsStatic;
         public override bool IsConstructor => _original.IsConstructor;
         public override bool IsAsync => _original.IsAsync;
+        public override bool IsExtern => _original.IsExtern;
         public override bool IsExtensionMethod => _original.IsExtensionMethod;
         public override bool IsVirtual => _original.IsVirtual;
         public override bool IsAbstract => _original.IsAbstract;
@@ -1882,6 +2179,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic => _definition.IsStatic;
         public override bool IsConstructor => _definition.IsConstructor;
         public override bool IsAsync => _definition.IsAsync;
+        public override bool IsExtern => _definition.IsExtern;
         public override bool IsExtensionMethod => _definition.IsExtensionMethod;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _definition.TypeParameters;
 
@@ -2148,6 +2446,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic { get; }
         public override bool IsConstructor { get; }
         public override bool IsAsync => false;
+        public override bool IsExtern { get; }
         public override bool IsExtensionMethod => _isExtensionMethod;
         public override bool IsVirtual => _isVirtual;
         public override bool IsAbstract => _isAbstract;
@@ -2165,13 +2464,15 @@ namespace Cnidaria.Cs
             bool isAbstract,
             bool isOverride,
             bool isSealed,
-            bool isExtensionMethod)
+            bool isExtensionMethod,
+            bool isExtern = false)
         {
             Name = name;
             ContainingSymbol = containing;
             ReturnType = returnType;
             IsStatic = isStatic;
             IsConstructor = isConstructor;
+            IsExtern = isExtern;
             DeclaredAccessibility = declaredAccessibility;
             _isVirtual = isVirtual;
             _isAbstract = isAbstract;

@@ -348,6 +348,29 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
+            if (expr is BoundFunctionPointerMethodGroupExpression functionPointerMethodGroup)
+            {
+                if (targetType is FunctionPointerTypeSymbol functionPointerType &&
+                    TryResolveFunctionPointerMethodGroup(functionPointerMethodGroup, functionPointerType, context, out var method))
+                {
+                    var bound = new BoundFunctionPointerLoadExpression(
+                        (PrefixUnaryExpressionSyntax)functionPointerMethodGroup.Syntax,
+                        functionPointerType,
+                        method!);
+                    context.Recorder.RecordBound(exprSyntax, bound);
+                    return bound;
+                }
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_FNPTR_CONV001",
+                    DiagnosticSeverity.Error,
+                    $"No overload is compatible with function pointer type '{targetType.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                var bad = new BoundBadExpression(exprSyntax);
+                bad.SetType(targetType);
+                context.Recorder.RecordBound(exprSyntax, bad);
+                return bad;
+            }
             // Target typed lambda / anonymous method
             if (expr is BoundUnboundLambdaExpression unboundLambda)
             {

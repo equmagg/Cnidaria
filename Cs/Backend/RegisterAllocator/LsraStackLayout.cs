@@ -575,6 +575,8 @@ namespace Cnidaria.Cs
                     {
                         return true;
                     }
+                    if (node.TreeKind == GenTreeKind.IndirectCall)
+                        return true;
                     if (node.TreeKind == GenTreeKind.Call &&
                         (node.Method?.HasInternalCall != true ||
                         (Target.IsRiscV && node.Method is not null && RiscVRuntime.IsGcSafePointInternalCall(node.Method))))
@@ -1599,7 +1601,7 @@ namespace Cnidaria.Cs
 
         private static StorageInfo StorageForType(RuntimeType type, TargetInfo target)
         {
-            if (type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (type.Kind == RuntimeTypeKind.TypeParam || type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                 return new StorageInfo(target.PointerSize, target.PointerSize);
 
             int size = type.SizeOf;

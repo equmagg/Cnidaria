@@ -97,6 +97,14 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
+                case GenTreeKind.FunctionPointer:
+                    sb.Append("ldftn ").Append(MethodName(node.Method));
+                    return;
+                case GenTreeKind.IndirectCall:
+                    sb.Append("calli ").Append(TypeName(node.RuntimeType)).Append('(');
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:

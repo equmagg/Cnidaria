@@ -870,12 +870,12 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(wholeSyntax);
             }
 
-            if (patternType is PointerTypeSymbol)
+            if (patternType is PointerTypeSymbol or FunctionPointerTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS008",
                     DiagnosticSeverity.Error,
-                    "Pattern type cannot be a pointer type.",
+                    "Pattern type cannot be a pointer or function pointer type.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return new BoundBadExpression(wholeSyntax);
             }

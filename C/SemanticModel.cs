@@ -82,11 +82,16 @@ namespace Cnidaria.C
     public sealed class CompilationOptions
     {
         public TargetInfo Target { get; }
-
+        public InliningOptions Inlining { get; }
+        public TrimmingOptions Trimming { get; }
         public CompilationOptions(
-            TargetInfo? target = null)
+            TargetInfo? target = null,
+            InliningOptions? inlining = null,
+            TrimmingOptions? trimming = null)
         {
             Target = target ?? TargetInfo.Default;
+            Inlining = inlining ?? InliningOptions.Default;
+            Trimming = trimming ?? TrimmingOptions.Default;
         }
     }
 

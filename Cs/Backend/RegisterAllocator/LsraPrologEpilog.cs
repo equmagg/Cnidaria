@@ -436,7 +436,7 @@ namespace Cnidaria.Cs
                     return GenStackKind.ByRef;
                 if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
                     return GenStackKind.Ref;
-                if (type.Kind == RuntimeTypeKind.Pointer)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                     return GenStackKind.Ptr;
                 if (type.Name == "Single")
                     return GenStackKind.R4;

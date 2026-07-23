@@ -203,10 +203,12 @@ namespace Cnidaria.Cs
         UnboxAny,
         NewObject,
         NewArray,
+        FunctionPointer,
         Call,
         VirtualCall,
         ExceptionObject,
         DefaultValue,
+        SsaNormalize,
     }
 
     internal enum ValueNumberFieldSequenceKind : byte
@@ -499,9 +501,9 @@ namespace Cnidaria.Cs
         public ValueNumberConstantKey Constant { get; }
         public ValueNumberFunction Function { get; }
         public ImmutableArray<ValueNumber> Args { get; private set; }
-        public int StableId { get; }
+        public long StableId { get; }
 
-        public ValueNumberEntry(ValueNumberKind kind, GenStackKind stackKind, RuntimeType? type, ValueNumberConstantKey constant, ValueNumberFunction function, ImmutableArray<ValueNumber> args, int stableId)
+        public ValueNumberEntry(ValueNumberKind kind, GenStackKind stackKind, RuntimeType? type, ValueNumberConstantKey constant, ValueNumberFunction function, ImmutableArray<ValueNumber> args, long stableId)
         {
             Kind = kind;
             StackKind = stackKind;
@@ -570,12 +572,12 @@ namespace Cnidaria.Cs
 
     internal readonly struct ValueNumberStableUniqueKey : IEquatable<ValueNumberStableUniqueKey>
     {
-        public readonly int StableId;
+        public readonly long StableId;
         public readonly ValueNumberFunction Function;
         public readonly ValueNumberType TypeKey;
         public readonly ImmutableArray<ValueNumber> Args;
 
-        public ValueNumberStableUniqueKey(int stableId, ValueNumberFunction function, GenStackKind stackKind, RuntimeType? type, ImmutableArray<ValueNumber> args)
+        public ValueNumberStableUniqueKey(long stableId, ValueNumberFunction function, GenStackKind stackKind, RuntimeType? type, ImmutableArray<ValueNumber> args)
         {
             StableId = stableId;
             Function = function;
@@ -603,7 +605,7 @@ namespace Cnidaria.Cs
         {
             unchecked
             {
-                int hash = StableId;
+                int hash = StableId.GetHashCode();
                 hash = (hash * 397) ^ (int)Function;
                 hash = (hash * 397) ^ TypeKey.GetHashCode();
                 for (int i = 0; i < Args.Length; i++)
@@ -709,7 +711,7 @@ namespace Cnidaria.Cs
             return vn;
         }
 
-        public ValueNumber VNForStableUnique(int stableId, GenStackKind stackKind, RuntimeType? type, ValueNumberFunction function, ImmutableArray<ValueNumber> args)
+        public ValueNumber VNForStableUnique(long stableId, GenStackKind stackKind, RuntimeType? type, ValueNumberFunction function, ImmutableArray<ValueNumber> args)
         {
             if (args.IsDefault)
                 args = ImmutableArray<ValueNumber>.Empty;
@@ -795,7 +797,7 @@ namespace Cnidaria.Cs
             if (function == ValueNumberFunction.MapSelect && args.Length == 2)
                 return VNForMapSelect(stackKind, type, args[0], args[1]);
 
-            if (function == ValueNumberFunction.BitCast && args.Length == 2)
+            if ((function is ValueNumberFunction.BitCast or ValueNumberFunction.SsaNormalize) && args.Length == 2)
             {
                 var argEntry = GetEntryOrNull(args[0]);
                 if (argEntry is not null && argEntry.StackKind == stackKind && SameRuntimeType(argEntry.Type, type))
@@ -959,15 +961,30 @@ namespace Cnidaria.Cs
                 or ValueNumberFunction.NewArrOverflowExc
                 or ValueNumberFunction.HelperOpaqueExc;
 
-        public bool IsConstant(ValueNumber vn) => TryGetEntry(vn, out var entry) && entry.Kind == ValueNumberKind.Constant;
+        public bool IsConstant(ValueNumber vn) => TryGetConstant(vn, out _);
 
         public bool TryGetConstant(ValueNumber vn, out ValueNumberConstantKey constant)
         {
-            if (TryGetEntry(vn, out var entry) && entry.Kind == ValueNumberKind.Constant)
+            if (TryGetEntry(vn, out var entry))
             {
-                constant = entry.Constant;
-                return true;
+                if (entry.Kind == ValueNumberKind.Constant)
+                {
+                    constant = entry.Constant;
+                    return true;
+                }
+
+                if ((entry.Function is ValueNumberFunction.BitCast or ValueNumberFunction.SsaNormalize) &&
+                    entry.Args.Length == 2 &&
+                    (entry.StackKind is GenStackKind.Ref or GenStackKind.Null) &&
+                    TryGetEntry(entry.Args[0], out var source) &&
+                    source.Kind == ValueNumberKind.Constant &&
+                    source.Constant.Kind == ValueNumberConstantKind.Null)
+                {
+                    constant = ValueNumberConstantKey.Null(entry.Type);
+                    return true;
+                }
             }
+
             constant = default;
             return false;
         }
@@ -1150,7 +1167,7 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    if (entry.Function == ValueNumberFunction.BitCast && entry.Args.Length >= 1)
+                    if ((entry.Function is ValueNumberFunction.BitCast or ValueNumberFunction.SsaNormalize) && entry.Args.Length >= 1)
                     {
                         return VNForMapSelectWork(
                             stackKind,
@@ -1324,6 +1341,17 @@ namespace Cnidaria.Cs
 
             if (args.Length == 1)
             {
+                if (function == ValueNumberFunction.ArrayLength &&
+                    TryGetEntry(args[0], out var arrayEntry) &&
+                    arrayEntry.Function == ValueNumberFunction.NewArray &&
+                    arrayEntry.Args.Length != 0 &&
+                    TryGetEntry(arrayEntry.Args[0], out var lengthEntry) &&
+                    lengthEntry.StackKind == GenStackKind.I4)
+                {
+                    folded = arrayEntry.Args[0];
+                    return true;
+                }
+
                 if (TryGetConstant(args[0], out var const0))
                 {
                     switch (function)
@@ -2031,11 +2059,11 @@ namespace Cnidaria.Cs
                 {
                     int blockId = _method.Blocks[i].Id;
                     if (!_heapIn.ContainsKey(blockId))
-                        _heapIn[blockId] = OpaqueMemory(blockId);
+                        _heapIn[blockId] = OpaqueMemoryForBlock(blockId, SsaMemoryKind.GcHeap);
                     if (!_heapOut.ContainsKey(blockId))
                         _heapOut[blockId] = _heapIn[blockId];
                     if (!_byrefExposedIn.ContainsKey(blockId))
-                        _byrefExposedIn[blockId] = OpaqueMemory(blockId);
+                        _byrefExposedIn[blockId] = OpaqueMemoryForBlock(blockId, SsaMemoryKind.ByrefExposed);
                     if (!_byrefExposedOut.ContainsKey(blockId))
                         _byrefExposedOut[blockId] = _byrefExposedIn[blockId];
                 }
@@ -2256,18 +2284,18 @@ namespace Cnidaria.Cs
                     {
                         case SsaMemoryKind.GcHeap:
                             if (heap == oldHeap)
-                                heap = OpaqueMemory(blockId);
+                                heap = OpaqueMemoryForDefinition(name, blockId);
                             SetMemoryValue(name, heap);
                             break;
 
                         case SsaMemoryKind.ByrefExposed:
                             if (byrefExposed == oldByrefExposed)
-                                byrefExposed = OpaqueMemory(blockId);
+                                byrefExposed = OpaqueMemoryForDefinition(name, blockId);
                             SetMemoryValue(name, byrefExposed);
                             break;
 
                         default:
-                            SetMemoryValue(name, OpaqueMemory(blockId));
+                            SetMemoryValue(name, OpaqueMemoryForDefinition(name, blockId));
                             break;
                     }
                 }
@@ -2362,7 +2390,7 @@ namespace Cnidaria.Cs
                         if (tree.LocalFieldBaseValue.HasValue || tree.LocalField is not null)
                             throw new InvalidOperationException("Malformed SSA local-field store metadata at node " + tree.Source.Id.ToString() + ".");
 
-                        normalized = NormalizeStore(rhs, info.StackKind, info.Type);
+                        normalized = NormalizeSsaStore(rhs, info.StackKind, info.Type);
                     }
                     SetSsaValue(target, normalized);
                     PublishMemoryDefinitions(tree, operands, blockId, statementIndex, oldHeap, oldByrefExposed, ref heap, ref byrefExposed);
@@ -2464,12 +2492,15 @@ namespace Cnidaria.Cs
                         return Func(node, ValueNumberFunction.ArrayDataRef, operands);
                     case GenTreeKind.NewArray:
                         return NewArray(node, operands, ref heap, blockId);
+                    case GenTreeKind.FunctionPointer:
+                        return Func(node, ValueNumberFunction.FunctionPointer, operands, _store.VNForMethod(node.Method ?? throw new InvalidOperationException("Function pointer node has no target method.")));
                     case GenTreeKind.NewObject:
                     case GenTreeKind.NewDelegate:
                     case GenTreeKind.DelegateCombine:
                     case GenTreeKind.DelegateRemove:
                         return NewObject(node, operands, ref heap, blockId);
                     case GenTreeKind.Call:
+                    case GenTreeKind.IndirectCall:
                     case GenTreeKind.VirtualCall:
                     case GenTreeKind.DelegateInvoke:
                         return Call(node, operands, ref heap, ref byrefExposed, blockId);
@@ -2535,10 +2566,10 @@ namespace Cnidaria.Cs
                     _store.VNNormalValue(oldLocal.Liberal),
                     selector,
                     storedLiberal);
-                ValueNumber liberal = Normalize(liberalMap, localStackKind, localType);
+                ValueNumber liberal = NormalizeSsaValue(liberalMap, localStackKind, localType);
                 ValueNumber conservative = oldLocal.BothEqual && storedLiberal == storedConservative
                     ? liberal
-                    : Normalize(
+                    : NormalizeSsaValue(
                         _store.VNForFunc(
                             GenStackKind.Unknown,
                             null,
@@ -2769,13 +2800,13 @@ namespace Cnidaria.Cs
                 if (TryDecodeArrayElementAddress(addr, out var arrayAddress))
                     return LoadArrayElementBySelector(node, arrayAddress.ElementClass, arrayAddress.Array, arrayAddress.Index, arrayAddress.Offset, heap, blockId, statementIndex);
 
-                ValueNumber memory = IsLocalAddress(addr) ||
+                bool localStorage = IsLocalAddress(addr) ||
                     MayBeLocalStorageByRefAliasAddress(node.Operands.Length == 0 ? null : node.Operands[0]) ||
-                    (TryDecodeFieldAddress(addr, out var localFieldAddress) && IsLocalAddress(localFieldAddress.BaseAddress))
-                    ? byrefExposed
-                    : OpaqueMemory(blockId);
+                    (TryDecodeFieldAddress(addr, out var localFieldAddress) && IsLocalAddress(localFieldAddress.BaseAddress));
                 ValueNumber type = _store.VNForType(node.Type ?? node.RuntimeType);
-                ValueNumber value = _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.ByrefExposedLoad, type, addr, memory);
+                ValueNumber value = localStorage
+                    ? _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.ByrefExposedLoad, type, addr, byrefExposed)
+                    : _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.ByrefExposedLoad, type, addr, heap, byrefExposed);
                 return node.CanThrow ? WithException(node, value) : ValueNumberPair.Same(value);
             }
 
@@ -2802,7 +2833,6 @@ namespace Cnidaria.Cs
                 ValueNumber stored = OperandNormal(operands, 1, ValueNumberCategory.Liberal);
                 if (MayBeLocalStorageByRefAliasAddress(node.Operands[0]))
                 {
-                    byrefExposed = OpaqueMemory(blockId);
                     return ValueNumberPair.Same(stored);
                 }
 
@@ -2810,7 +2840,6 @@ namespace Cnidaria.Cs
                 {
                     if (IsLocalAddress(receiverAddress.BaseAddress))
                     {
-                        byrefExposed = OpaqueMemory(blockId);
                         return ValueNumberPair.Same(stored);
                     }
 
@@ -2860,7 +2889,6 @@ namespace Cnidaria.Cs
                 {
                     if (IsLocalAddress(fieldAddress.BaseAddress))
                     {
-                        byrefExposed = OpaqueMemory(blockId);
                         return ValueNumberPair.Same(result);
                     }
 
@@ -2877,13 +2905,6 @@ namespace Cnidaria.Cs
                     return ValueNumberPair.Same(result);
                 }
 
-                if (IsLocalAddress(addr) || MayBeLocalStorageByRefAliasAddress(node.Operands.Length == 0 ? null : node.Operands[0]))
-                    byrefExposed = OpaqueMemory(blockId);
-                else
-                {
-                    heap = OpaqueMemory(blockId);
-                    byrefExposed = OpaqueMemory(blockId);
-                }
                 return ValueNumberPair.Same(result);
             }
 
@@ -3106,7 +3127,6 @@ namespace Cnidaria.Cs
             private ValueNumberPair NewArray(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber heap, int blockId)
             {
                 ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.NewArray, ArgsFromPairs(operands).Add(_store.VNForType(node.RuntimeType ?? node.Type)));
-                heap = OpaqueMemory(blockId);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
@@ -3116,7 +3136,6 @@ namespace Cnidaria.Cs
                 if (node.Method is not null)
                     newObjArgs = newObjArgs.Add(_store.VNForMethod(node.Method));
                 ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.NewObject, newObjArgs);
-                heap = OpaqueMemory(blockId);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
@@ -3138,21 +3157,42 @@ namespace Cnidaria.Cs
                     ValueNumberFunction.Box,
                     args);
 
-                heap = OpaqueMemory(blockId);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
             private ValueNumberPair Call(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber heap, ref ValueNumber byrefExposed, int blockId)
             {
+                if (IsArrayLengthGetter(node) && operands.Length != 0)
+                {
+                    ValueNumber liberalArray = OperandNormal(operands, 0, ValueNumberCategory.Liberal);
+                    ValueNumber conservativeArray = OperandNormal(operands, 0, ValueNumberCategory.Conservative);
+                    ValueNumber liberalLength = _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, liberalArray);
+                    ValueNumber conservativeLength = conservativeArray == liberalArray
+                        ? liberalLength
+                        : _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, conservativeArray);
+                    return new ValueNumberPair(liberalLength, conservativeLength);
+                }
+
                 var args = ArgsFromPairs(operands);
                 if (node.Method is not null)
                     args = args.Add(_store.VNForMethod(node.Method));
                 args = args.Add(heap).Add(byrefExposed);
                 ValueNumberFunction func = node.Kind == GenTreeKind.VirtualCall ? ValueNumberFunction.VirtualCall : ValueNumberFunction.Call;
                 ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, func, args);
-                heap = OpaqueMemory(blockId);
-                byrefExposed = OpaqueMemory(blockId);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
+            }
+
+            private static bool IsArrayLengthGetter(GenTree node)
+            {
+                RuntimeMethod? method = node.Method;
+                return method is not null &&
+                       method.HasThis &&
+                       !method.IsStatic &&
+                       method.ParameterTypes.Length == 0 &&
+                       method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
+                       StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
+                       StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                       StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array");
             }
 
             private ValueNumberPair LocalAddress(GenTree node, int blockId)
@@ -3215,26 +3255,18 @@ namespace Cnidaria.Cs
                     ? _store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.MemOpaque, OpaqueArgs(blockId))
                     : ValueNumberStore.NoVN;
 
-                if (node.WritesMemory || node.ContainsCall || node.HasSideEffect)
-                {
-                    heap = OpaqueMemory(blockId);
-                    byrefExposed = OpaqueMemory(blockId);
-                }
-
                 return node.CanThrow && liberal.IsValid ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
             private ValueNumberPair OpaqueByrefExposedStore(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber byrefExposed, int blockId)
             {
                 ValueNumber value = operands.Length == 0 ? ValueNumberStore.NoVN : OperandNormal(operands, operands.Length - 1, ValueNumberCategory.Liberal);
-                byrefExposed = OpaqueMemory(blockId);
                 return ValueNumberPair.Same(value);
             }
 
             private ValueNumberPair OpaqueStore(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber heap, int blockId)
             {
                 ValueNumber value = operands.Length == 0 ? ValueNumberStore.NoVN : OperandNormal(operands, operands.Length - 1, ValueNumberCategory.Liberal);
-                heap = OpaqueMemory(blockId);
                 return ValueNumberPair.Same(value);
             }
 
@@ -3363,6 +3395,7 @@ namespace Cnidaria.Cs
                         result = AddException(result, ValueNumberFunction.InvalidCastExc, OperandNormal(operands, 0), _store.VNForType(node.RuntimeType ?? node.Type));
                         break;
 
+                    case GenTreeKind.IndirectCall:
                     case GenTreeKind.VirtualCall:
                     case GenTreeKind.DelegateInvoke:
                         if (operands.Length != 0)
@@ -3370,8 +3403,14 @@ namespace Cnidaria.Cs
                         result = AddHelperOpaqueException(result, node);
                         break;
 
-                    case GenTreeKind.ClassInit:
                     case GenTreeKind.Call:
+                        if (IsArrayLengthGetter(node) && operands.Length != 0)
+                            result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
+                        else
+                            result = AddHelperOpaqueException(result, node);
+                        break;
+
+                    case GenTreeKind.ClassInit:
                     case GenTreeKind.NewObject:
                     case GenTreeKind.NewDelegate:
                     case GenTreeKind.DelegateCombine:
@@ -3402,14 +3441,20 @@ namespace Cnidaria.Cs
 
             private bool DivRemMayThrowDivideByZero(GenTree node, ValueNumber divisor)
             {
+                if ((node.Flags & GenTreeFlags.DivModNoByZero) != 0)
+                    return false;
+
                 int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind, _target);
                 return !TryGetIntegralConstant(divisor, bits, out _, out ulong unsignedDivisor) || unsignedDivisor == 0;
             }
 
             private bool SignedDivRemMayThrowArithmetic(GenTree node, ValueNumber dividend, ValueNumber divisor)
             {
-                if (node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Rem))
+                if ((node.Flags & GenTreeFlags.DivModNoOverflow) != 0 ||
+                    node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Rem))
+                {
                     return false;
+                }
 
                 int bits = GenTreeArithmeticSemantics.IntegralBits(node.Type, node.StackKind, _target);
                 if (TryGetIntegralConstant(divisor, bits, out long signedDivisor, out ulong unsignedDivisor))
@@ -3487,6 +3532,25 @@ namespace Cnidaria.Cs
                 return liberal == conservativeValue
                     ? ValueNumberPair.Same(liberal)
                     : new ValueNumberPair(liberal, conservativeValue);
+            }
+
+            private ValueNumberPair NormalizeSsaStore(ValueNumberPair value, GenStackKind stackKind, RuntimeType? type)
+            {
+                ValueNumber liberal = NormalizeSsaValue(value.Liberal, stackKind, type);
+                ValueNumber conservative = value.BothEqual ? liberal : NormalizeSsaValue(value.Conservative, stackKind, type);
+                return new ValueNumberPair(liberal, conservative);
+            }
+
+            private ValueNumber NormalizeSsaValue(ValueNumber value, GenStackKind stackKind, RuntimeType? type)
+            {
+                ValueNumber normal = _store.VNNormalValue(value);
+
+                if (!_store.TryGetEntry(normal, out var entry))
+                    return normal;
+                if (entry.StackKind == stackKind && SameRuntimeType(entry.Type, type))
+                    return normal;
+
+                return _store.VNForFunc(stackKind, type, ValueNumberFunction.SsaNormalize, normal, _store.VNForCanonicalType(type));
             }
 
             private ValueNumberPair NormalizeStore(ValueNumberPair value, GenStackKind stackKind, RuntimeType? type)
@@ -3641,8 +3705,24 @@ namespace Cnidaria.Cs
             private static int StableSyntheticId(int blockId, int statementIndex, ValueNumberFunction function)
                 => HashCode.Combine(blockId, statementIndex, (int)function);
 
-            private ValueNumber OpaqueMemory(int blockId)
-                => _store.VNForFunc(GenStackKind.Unknown, null, ValueNumberFunction.MemOpaque, LoopNumberVNForBlock(blockId));
+            private ValueNumber OpaqueMemoryForDefinition(SsaMemoryValueName name, int blockId)
+                => OpaqueMemory(StableMemoryIdentity(1, name.Version, name.Kind), blockId);
+
+            private ValueNumber OpaqueMemoryForBlock(int blockId, SsaMemoryKind kind)
+                => OpaqueMemory(StableMemoryIdentity(2, blockId, kind), blockId);
+
+            private ValueNumber OpaqueMemory(long stableId, int blockId)
+                => _store.VNForStableUnique(
+                    stableId,
+                    GenStackKind.Unknown,
+                    null,
+                    ValueNumberFunction.MemOpaque,
+                    ImmutableArray.Create(LoopNumberVNForBlock(blockId)));
+
+            private static long StableMemoryIdentity(int scope, int id, SsaMemoryKind kind)
+                => ((long)(uint)scope << 56) |
+                   ((long)(uint)MemoryKindStableId(kind) << 32) |
+                   (uint)id;
 
             private ImmutableArray<ValueNumber> OpaqueArgs(int blockId)
                 => ImmutableArray.Create(LoopNumberVNForBlock(blockId));
@@ -3753,7 +3833,7 @@ namespace Cnidaria.Cs
                 if (type.IsReferenceType)
                     return GenStackKind.Ref;
 
-                if (type.Kind == RuntimeTypeKind.Pointer)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                     return GenStackKind.Ptr;
 
                 if (type.Kind == RuntimeTypeKind.ByRef)
@@ -3979,7 +4059,7 @@ namespace Cnidaria.Cs
                         return hash;
                     }
 
-                    if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
+                    if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
                     {
                         hash = Mix(hash, type.TypeId);
                         return hash;

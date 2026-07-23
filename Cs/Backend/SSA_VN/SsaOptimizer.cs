@@ -15,6 +15,7 @@ namespace Cnidaria.Cs
         public bool EnableDeadDefinitionsElimination { get; set; } = true;
         public bool EnableCopyPropagation { get; set; } = true;
         public bool EnableCommonSubexpressionElimination { get; set; } = true;
+        public bool EnableAssertionPropagation { get; set; } = true;
         public bool EnableRedundantBranchOptimization { get; set; } = true;
         public bool EnableBranchJumpThreading { get; set; } = true;
         public bool EnableDeadCodeElimination { get; set; } = true;
@@ -142,7 +143,29 @@ namespace Cnidaria.Cs
 
             public SsaMethod Run()
             {
-                var current = EnsureValueNumbers(_original);
+                var current = RunScalarOptimizationFixedPoint(_original);
+
+                if (_options.EnableCommonSubexpressionElimination)
+                {
+                    var cse = SsaCommonSubexpressionEliminator.OptimizeMethod(current, _options, _nextSyntheticTreeId);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, cse.NextSyntheticTreeId);
+                    current = EnsureValueNumbers(cse.Method);
+                }
+
+                if (_options.EnableAssertionPropagation)
+                {
+                    var assertions = SsaAssertionPropagator.OptimizeMethod(current, _nextSyntheticTreeId);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, assertions.NextSyntheticTreeId);
+                    if (assertions.Changed)
+                        current = RunScalarOptimizationFixedPoint(WithBlocks(current, assertions.Blocks));
+                }
+
+                return EnsureValueNumbers(current);
+            }
+
+            private SsaMethod RunScalarOptimizationFixedPoint(SsaMethod method)
+            {
+                var current = EnsureValueNumbers(method);
 
                 for (int iteration = 0; iteration < _options.MaxIterations; iteration++)
                 {
@@ -195,15 +218,6 @@ namespace Cnidaria.Cs
                     }
 
                     current = EnsureValueNumbers(next);
-                }
-
-                current = EnsureValueNumbers(current);
-
-                if (_options.EnableCommonSubexpressionElimination)
-                {
-                    var cse = SsaCommonSubexpressionEliminator.OptimizeMethod(current, _options, _nextSyntheticTreeId);
-                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, cse.NextSyntheticTreeId);
-                    current = cse.Method;
                 }
 
                 return EnsureValueNumbers(current);
@@ -2334,7 +2348,7 @@ namespace Cnidaria.Cs
                         BytecodeOp.Pop,
                         null,
                         GenStackKind.Void,
-                        operand.Flags,
+                        operand.Flags & ~GenTreeFlags.AssertionProperties,
                         ImmutableArray.Create(operand));
 
                 private GenTree CloneTreeWithTarget(GenTree tree, int targetBlockId)
@@ -3301,9 +3315,7 @@ namespace Cnidaria.Cs
                 if (template.CanThrow)
                     return false;
                 if (constant.Kind == ConstKind.Null)
-                {
-                    return template.Kind == GenTreeKind.ConstNull;
-                }
+                    return template.StackKind is GenStackKind.Ref or GenStackKind.Null;
 
                 return IsIntegerLike(template.StackKind);
             }
@@ -4160,7 +4172,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < operands.Length; i++)
                 {
                     genOperands.Add(operands[i].Source);
-                    flags |= operands[i].Source.Flags;
+                    flags |= operands[i].Source.Flags & ~GenTreeFlags.AssertionProperties;
                 }
 
                 return new GenTree(

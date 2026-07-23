@@ -271,7 +271,7 @@ namespace Cnidaria.Cs
 
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
-            else if (MayClobberCallerSaved(source))
+            else if (MayClobberCallerSaved(source, _target))
                 flags |= _nonCallOperationsClobberCallerSavedRegisters
                     ? GenTreeLinearFlags.CallerSavedKill
                     : GenTreeLinearFlags.CallerSavedRegistersPreserved;
@@ -384,6 +384,16 @@ namespace Cnidaria.Cs
             static GenStackKind StoreTargetKind(GenTree source, RuntimeType? storageType, int operandIndex)
                 => storageType is not null ? MachineAbi.StackKindForType(storageType) : OperandStackKind(source, operandIndex);
 
+            static LinearMemoryAccessFlags NullCheckFlag(GenTree source)
+                => (source.Flags & GenTreeFlags.NullCheckEliminated) == 0
+                    ? LinearMemoryAccessFlags.NullCheck
+                    : LinearMemoryAccessFlags.None;
+
+            static LinearMemoryAccessFlags BoundsCheckFlag(GenTree source)
+                => (source.Flags & GenTreeFlags.BoundsCheckEliminated) == 0
+                    ? LinearMemoryAccessFlags.BoundsCheck
+                    : LinearMemoryAccessFlags.None;
+
             switch (source.Kind)
             {
                 case GenTreeKind.Local:
@@ -439,13 +449,13 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.Field:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Read
-                        | LinearMemoryAccessFlags.NullCheck | TypeFlags(source.Type, source.StackKind),
+                        | NullCheckFlag(source) | TypeFlags(source.Type, source.StackKind),
                         addressOperandIndex: 0, field: source.Field, size: SizeOf(source.Type,
                         source.StackKind), alignment: AlignOf(source.Type, source.StackKind));
 
                 case GenTreeKind.FieldAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck, addressOperandIndex: 0,
+                        | LinearMemoryAccessFlags.ByRefAddress | NullCheckFlag(source), addressOperandIndex: 0,
                         field: source.Field, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.StaticField:
@@ -463,7 +473,7 @@ namespace Cnidaria.Cs
                         RuntimeType? valueType = StoreTargetType(source, 1);
                         GenStackKind valueKind = StoreTargetKind(source, valueType, 1);
                         return new LinearMemoryAccess(LinearMemoryAccessKind.Field, LinearMemoryAccessFlags.Write
-                            | LinearMemoryAccessFlags.NullCheck | StoreTypeFlags(valueType, valueKind),
+                            | NullCheckFlag(source) | StoreTypeFlags(valueType, valueKind),
                             addressOperandIndex: 0, valueOperandIndex: 1, elementType: valueType,
                             field: source.Field, size: SizeOf(valueType, valueKind), alignment: AlignOf(valueType, valueKind));
                     }
@@ -479,7 +489,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.LoadIndirect:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.Indirect, LinearMemoryAccessFlags.Read
-                        | TypeFlags(source.RuntimeType ?? source.Type, source.StackKind), addressOperandIndex: 0,
+                        | NullCheckFlag(source) | TypeFlags(source.RuntimeType ?? source.Type, source.StackKind), addressOperandIndex: 0,
                         elementType: source.RuntimeType ?? source.Type,
                         size: SizeOf(source.RuntimeType ?? source.Type, source.StackKind), alignment: AlignOf(source.RuntimeType ?? source.Type, source.StackKind));
 
@@ -488,20 +498,20 @@ namespace Cnidaria.Cs
                         RuntimeType? valueType = StoreTargetType(source, 1);
                         GenStackKind valueKind = StoreTargetKind(source, valueType, 1);
                         return new LinearMemoryAccess(LinearMemoryAccessKind.Indirect, LinearMemoryAccessFlags.Write
-                            | StoreTypeFlags(valueType, valueKind), addressOperandIndex: 0, valueOperandIndex: 1,
+                            | NullCheckFlag(source) | StoreTypeFlags(valueType, valueKind), addressOperandIndex: 0, valueOperandIndex: 1,
                             elementType: valueType, size: SizeOf(valueType, valueKind), alignment: AlignOf(valueType, valueKind));
                     }
 
                 case GenTreeKind.ArrayElement:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayElement, LinearMemoryAccessFlags.Read
-                        | LinearMemoryAccessFlags.NullCheck | LinearMemoryAccessFlags.BoundsCheck
+                        | NullCheckFlag(source) | BoundsCheckFlag(source)
                         | TypeFlags(source.RuntimeType ?? source.Type, source.StackKind), addressOperandIndex: 0,
                         indexOperandIndex: 1, elementType: source.RuntimeType ?? source.Type,
                         size: SizeOf(source.RuntimeType ?? source.Type, source.StackKind), alignment: AlignOf(source.RuntimeType ?? source.Type, source.StackKind));
 
                 case GenTreeKind.ArrayElementAddr:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayElement, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck | LinearMemoryAccessFlags.BoundsCheck,
+                        | LinearMemoryAccessFlags.ByRefAddress | NullCheckFlag(source) | BoundsCheckFlag(source),
                         addressOperandIndex: 0, indexOperandIndex: 1, elementType: source.RuntimeType,
                         size: pointerSize, alignment: pointerSize);
 
@@ -510,14 +520,14 @@ namespace Cnidaria.Cs
                         RuntimeType? valueType = StoreTargetType(source, 2);
                         GenStackKind valueKind = StoreTargetKind(source, valueType, 2);
                         return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayElement, LinearMemoryAccessFlags.Write
-                            | LinearMemoryAccessFlags.NullCheck | LinearMemoryAccessFlags.BoundsCheck | StoreTypeFlags(valueType, valueKind),
+                            | NullCheckFlag(source) | BoundsCheckFlag(source) | StoreTypeFlags(valueType, valueKind),
                             addressOperandIndex: 0, indexOperandIndex: 1, valueOperandIndex: 2, elementType: valueType,
                             size: SizeOf(valueType, valueKind), alignment: AlignOf(valueType, valueKind));
                     }
 
                 case GenTreeKind.ArrayDataRef:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayData, LinearMemoryAccessFlags.Address
-                        | LinearMemoryAccessFlags.ByRefAddress | LinearMemoryAccessFlags.NullCheck,
+                        | LinearMemoryAccessFlags.ByRefAddress | NullCheckFlag(source),
                         addressOperandIndex: 0, size: pointerSize, alignment: pointerSize);
 
                 case GenTreeKind.PointerElementAddr:
@@ -540,12 +550,13 @@ namespace Cnidaria.Cs
             return source.Kind is
                 GenTreeKind.ClassInit or
                 GenTreeKind.Call or
+                GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
         }
 
-        public static bool MayClobberCallerSaved(GenTree source)
+        public static bool MayClobberCallerSaved(GenTree source, TargetInfo target)
         {
             if (IsAbiCall(source))
                 return true;
@@ -556,6 +567,8 @@ namespace Cnidaria.Cs
                 GenTreeKind.DelegateCombine or
                 GenTreeKind.DelegateRemove or
                 GenTreeKind.Box or
+                GenTreeKind.AllocHGlobal or
+                GenTreeKind.FreeHGlobal or
                 GenTreeKind.CastClass or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.Throw or
@@ -565,14 +578,18 @@ namespace Cnidaria.Cs
             if (source.Kind == GenTreeKind.Branch && source.SourceOp == BytecodeOp.Leave)
                 return true;
 
-            if (source.Kind == GenTreeKind.Binary && source.SourceOp is
-                BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
-                BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
-                BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un or
-                BytecodeOp.Div or BytecodeOp.Div_Un or
-                BytecodeOp.Rem or BytecodeOp.Rem_Un)
+            if (source.Kind == GenTreeKind.Binary)
             {
-                return true;
+                if (source.SourceOp is
+                    BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
+                    BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
+                    BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un)
+                {
+                    return true;
+                }
+
+                if (source.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
+                    return GenTreeArithmeticSemantics.DivRemCanThrow(source, target);
             }
 
             if (source.Kind == GenTreeKind.Conv && (source.ConvFlags & NumericConvFlags.Checked) != 0)

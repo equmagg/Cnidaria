@@ -932,6 +932,7 @@ namespace Cnidaria.Cs
             var name = syntax.Identifier.ValueText ?? "";
             var isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
             var isAsync = HasModifier(syntax.Modifiers, SyntaxKind.AsyncKeyword);
+            var isExtern = HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword);
             var isOverride = HasModifier(syntax.Modifiers, SyntaxKind.OverrideKeyword);
             var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var isVirtualKeyword = HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
@@ -979,7 +980,8 @@ namespace Cnidaria.Cs
                 declaredAccessibility: declaredAcc,
                 isExtensionMethod: syntax.ParameterList.Parameters.Count != 0
                     && HasModifier(syntax.ParameterList.Parameters[0].Modifiers, SyntaxKind.ThisKeyword),
-                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container));
+                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container),
+                isExtern: isExtern);
 
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);

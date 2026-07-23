@@ -1177,4 +1177,224 @@ namespace Cnidaria.Cs
             }
         }
     }
+    internal static class PlatformInvokeBinder
+    {
+        public static void ValidateAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
+        {
+            for (int i = 0; i < trees.Length; i++)
+                ValidateTree(compilation, trees[i], diagnostics);
+        }
+
+        public static void ValidateTree(Compilation compilation, SyntaxTree tree, DiagnosticBag diagnostics)
+        {
+            if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declarations))
+                return;
+
+            foreach (var pair in declarations)
+            {
+                if (pair.Key is not MethodDeclarationSyntax syntax || pair.Value is not SourceMethodSymbol method)
+                    continue;
+
+                ValidateMethod(compilation, tree, syntax, method, diagnostics);
+            }
+        }
+
+        private static void ValidateMethod(
+            Compilation compilation,
+            SyntaxTree tree,
+            MethodDeclarationSyntax syntax,
+            SourceMethodSymbol method,
+            DiagnosticBag diagnostics)
+        {
+            bool hasBody = syntax.Body is not null || syntax.ExpressionBody is not null;
+            var location = new Location(tree, syntax.Span);
+            DllImportData? import = method.GetDllImportData();
+
+            if (method.IsExtern && syntax.AttributeLists.Count == 0)
+            {
+                diagnostics.Add(new Diagnostic("CN_EXTERN000", 
+                    DiagnosticSeverity.Warning,
+                    $"Method, operator, or accessor '{method.Name}' is marked external and has no attributes on it. " +
+                    $"Consider adding a DllImport attribute to specify the external implementation.",
+                    new Location(tree, syntax.Identifier.Span)));
+            }
+
+            if (method.IsExtern && hasBody)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXTERN001",
+                    DiagnosticSeverity.Error,
+                    $"Method '{method.Name}' is marked extern and cannot declare a body.",
+                    location));
+            }
+
+            if (!hasBody && !method.IsExtern && !method.IsAbstract)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXTERN002",
+                    DiagnosticSeverity.Error,
+                    $"Method '{method.Name}' must declare a body because it is not marked abstract or extern.",
+                    location));
+            }
+
+            if (method.IsExtern && method.IsAbstract)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXTERN003",
+                    DiagnosticSeverity.Error,
+                    $"Method '{method.Name}' cannot be both abstract and extern.",
+                    location));
+            }
+
+            if (method.IsExtern && method.IsAsync)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXTERN004",
+                    DiagnosticSeverity.Error,
+                    $"Method '{method.Name}' cannot be both async and extern.",
+                    location));
+            }
+
+            if (method.IsExtern && !compilation.Target.IsRiscV && !compilation.Target.IsX86)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXTERN005",
+                    DiagnosticSeverity.Error,
+                    $"Extern methods are not supported for target '{compilation.Target.Architecture}'.",
+                    location));
+            }
+
+            if (method.IsExtern)
+            {
+                if (IsGenericExternContext(method))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_EXTERN006",
+                        DiagnosticSeverity.Error,
+                        "An extern method cannot be generic or declared in a generic type.",
+                        location));
+                }
+
+                if (!IsSupportedInteropType(method.ReturnType, allowVoid: true))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_EXTERN007",
+                        DiagnosticSeverity.Error,
+                        $"Return type '{method.ReturnType.Name}' is not supported by direct native interop.",
+                        location));
+                }
+
+                var parameters = method.Parameters;
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    if (IsSupportedInteropType(parameters[i].Type, allowVoid: false))
+                        continue;
+
+                    diagnostics.Add(new Diagnostic(
+                        "CN_EXTERN008",
+                        DiagnosticSeverity.Error,
+                        $"Parameter '{parameters[i].Name}' has type '{parameters[i].Type.Name}', which is not supported by direct native interop.",
+                        location));
+                }
+            }
+
+            if (import is null)
+                return;
+
+            if (!method.IsStatic || !method.IsExtern)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE001",
+                    DiagnosticSeverity.Error,
+                    "DllImportAttribute requires a method marked static and extern.",
+                    location));
+            }
+
+            if (string.IsNullOrWhiteSpace(import.ModuleName))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE003",
+                    DiagnosticSeverity.Error,
+                    "DllImportAttribute requires a non-empty library name.",
+                    location));
+            }
+
+            int charSet = (int)import.CharacterSet;
+            if (charSet < (int)System.Runtime.InteropServices.CharSet.None ||
+                charSet > (int)System.Runtime.InteropServices.CharSet.Auto)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE004",
+                    DiagnosticSeverity.Error,
+                    $"DllImportAttribute specifies invalid CharSet value '{charSet}'.",
+                    location));
+            }
+
+            int callingConvention = (int)import.CallingConvention;
+            if (callingConvention < (int)System.Runtime.InteropServices.CallingConvention.Winapi ||
+                callingConvention > (int)System.Runtime.InteropServices.CallingConvention.FastCall)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE005",
+                    DiagnosticSeverity.Error,
+                    $"DllImportAttribute specifies invalid CallingConvention value '{callingConvention}'.",
+                    location));
+            }
+
+            if (compilation.Target.IsRiscV &&
+                import.CallingConvention is not System.Runtime.InteropServices.CallingConvention.Winapi and
+                not System.Runtime.InteropServices.CallingConvention.Cdecl)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE006",
+                    DiagnosticSeverity.Error,
+                    $"Calling convention '{import.CallingConvention}' is not supported by the RISC-V target.",
+                    location));
+            }
+
+            if (!import.PreserveSig)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE007",
+                    DiagnosticSeverity.Error,
+                    "DllImport PreserveSig=false is not supported.",
+                    location));
+            }
+
+            if (import.SetLastError)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE008",
+                    DiagnosticSeverity.Error,
+                    "DllImport SetLastError=true is not supported.",
+                    location));
+            }
+        }
+
+        private static bool IsGenericExternContext(SourceMethodSymbol method)
+        {
+            if (!method.TypeParameters.IsDefaultOrEmpty)
+                return true;
+
+            for (Symbol? containing = method.ContainingSymbol; containing is NamedTypeSymbol type; containing = type.ContainingSymbol)
+            {
+                if (!type.TypeParameters.IsDefaultOrEmpty)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsSupportedInteropType(TypeSymbol type, bool allowVoid)
+        {
+            if (allowVoid && type.SpecialType == SpecialType.System_Void)
+                return true;
+
+            if (type is ByRefTypeSymbol byRef)
+                return GenericConstraintFacts.IsUnmanagedType(byRef.ElementType);
+
+            return GenericConstraintFacts.IsUnmanagedType(type);
+        }
+    }
+
 }

@@ -10159,9 +10159,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static unsafe void Write(bool value)
         {
             if (value)
-                _Write((char*)(stackalloc char[] { 't', 'r', 'u', 'e', '\0' }));
+                _Write((char*)(stackalloc char[] { 'T', 'r', 'u', 'e', '\0' }));
             else
-                _Write((char*)(stackalloc char[] { 'f', 'a', 'l', 's', 'e', '\0' }));
+                _Write((char*)(stackalloc char[] { 'F', 'a', 'l', 's', 'e', '\0' }));
         }
         public static unsafe void Write(char* value) { _Write(value); }
         public static void Write(ReadOnlySpan<char> value) { _Write(value); }
@@ -10181,9 +10181,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public unsafe static void WriteLine(bool value) 
         {
             if (value)
-                _Write((char*)(stackalloc char[] { 't', 'r', 'u', 'e', '\n', '\0' }));
+                _Write((char*)(stackalloc char[] { 'T', 'r', 'u', 'e', '\n', '\0' }));
             else
-                _Write((char*)(stackalloc char[] { 'f', 'a', 'l', 's', 'e', '\n', '\0' }));
+                _Write((char*)(stackalloc char[] { 'F', 'a', 'l', 's', 'e', '\n', '\0' }));
         }
         public unsafe static void WriteLine(float value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
         public unsafe static void WriteLine(double value) { Write(value); uint nl = '\n';  _Write((char*)&nl); }
@@ -10381,6 +10381,49 @@ namespace System.Runtime.InteropServices
 
             list._size = count;
         }
+    }
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class UnmanagedCallersOnlyAttribute : Attribute
+    {
+        public UnmanagedCallersOnlyAttribute()
+        {
+        }
+
+        public string? EntryPoint;
+    }
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class DllImportAttribute : Attribute
+    {
+        public DllImportAttribute(string dllName)
+        {
+            Value = dllName;
+        }
+
+        public string Value { get; }
+
+        public string? EntryPoint;
+        public CharSet CharSet = CharSet.None;
+        public bool SetLastError;
+        public bool ExactSpelling;
+        public CallingConvention CallingConvention = CallingConvention.Winapi;
+        public bool BestFitMapping;
+        public bool PreserveSig = true;
+        public bool ThrowOnUnmappableChar;
+    }
+    public enum CallingConvention
+    {
+        Winapi = 1,
+        Cdecl = 2,
+        StdCall = 3,
+        ThisCall = 4,
+        FastCall = 5,
+    }
+    public enum CharSet
+    {
+        None = 1,        // User didn't specify how to marshal strings.
+        Ansi = 2,        // Strings should be marshalled as ANSI 1 byte chars.
+        Unicode = 3,     // Strings should be marshalled as Unicode 2 byte chars.
+        Auto = 4,        // Marshal Strings in the right way for the target system.
     }
 }
 namespace System.Runtime.CompilerServices

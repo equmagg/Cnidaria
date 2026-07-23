@@ -14,6 +14,7 @@ namespace Cnidaria.Cs
         public Dictionary<(string ns, string name), int> TypeDefByFullName { get; } = new();
 
         public Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; } = new();
+        internal Dictionary<int, DllImportData> PInvokesByMethodToken { get; } = new();
         private readonly Dictionary<int, string> _sigKeyCache = new();
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
@@ -25,6 +26,7 @@ namespace Cnidaria.Cs
 
             BuildTypeIndex();
             BuildMethodIndex();
+            BuildPInvokeIndex();
         }
 
         private string GetSigKey(int sigBlobIdx)
@@ -103,6 +105,28 @@ namespace Cnidaria.Cs
                     AppendTypeKey(sb, ref r);
                     sb.Append('>');
                     break;
+
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    sb.Append("mod<");
+                    AppendTypeDefOrRefKey(sb, r.ReadCompressedUInt());
+                    sb.Append(',');
+                    AppendTypeKey(sb, ref r);
+                    sb.Append('>');
+                    break;
+
+                case SigElementType.FNPTR:
+                    {
+                        byte callingConvention = r.ReadByte();
+                        uint parameterCount = r.ReadCompressedUInt();
+                        sb.Append("fn<cc=").Append(callingConvention).Append(",pc=").Append(parameterCount).Append(",ret=");
+                        AppendTypeKey(sb, ref r);
+                        sb.Append(",args=[");
+                        for (int i = 0; i < parameterCount; i++)
+                            AppendTypeKey(sb, ref r);
+                        sb.Append("]>");
+                        break;
+                    }
 
                 case SigElementType.VAR:
                 case SigElementType.MVAR:
@@ -222,6 +246,23 @@ namespace Cnidaria.Cs
             }
         }
 
+        private void BuildPInvokeIndex()
+        {
+            int count = Md.GetRowCount(MetadataTableKind.PInvokeMap);
+            for (int rid = 1; rid <= count; rid++)
+            {
+                var row = Md.GetPInvokeMap(rid);
+                if (MetadataToken.Table(row.MethodToken) != MetadataToken.MethodDef)
+                    throw new InvalidOperationException($"P/Invoke map contains invalid method token 0x{row.MethodToken:X8}.");
+                int methodRid = MetadataToken.Rid(row.MethodToken);
+                if (methodRid <= 0 || methodRid > Md.GetRowCount(MetadataTableKind.MethodDef))
+                    throw new InvalidOperationException($"P/Invoke map method token is out of range: 0x{row.MethodToken:X8}.");
+                var data = PInvokeMetadataFlags.Decode(Md.GetString(row.ModuleName), Md.GetString(row.EntryPointName), row.Flags);
+                if (!PInvokesByMethodToken.TryAdd(row.MethodToken, data))
+                    throw new InvalidOperationException($"Duplicate P/Invoke map for method token 0x{row.MethodToken:X8}.");
+            }
+        }
+
         public string GetSignatureKeyFromThisModule(int sigBlobIdx) => GetSigKey(sigBlobIdx);
     }
     internal ref struct SigReader
@@ -234,6 +275,12 @@ namespace Cnidaria.Cs
         {
             if ((uint)_i >= (uint)_s.Length) throw new InvalidOperationException("Signature underflow.");
             return _s[_i++];
+        }
+
+        public byte PeekByte()
+        {
+            if ((uint)_i >= (uint)_s.Length) throw new InvalidOperationException("Signature underflow.");
+            return _s[_i];
         }
 
         public uint ReadCompressedUInt()
@@ -453,6 +500,19 @@ namespace Cnidaria.Cs
                 case SigElementType.BYREF:
                     return MatchType(defModule, ref def, memberRefModule, ref mr);
 
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    {
+                        int dModifierToken = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
+                        int mModifierToken = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
+                        if (ResolveTypeTokenFullName(defModule, dModifierToken) !=
+                            ResolveTypeTokenFullName(memberRefModule, mModifierToken))
+                        {
+                            return false;
+                        }
+                        return MatchType(defModule, ref def, memberRefModule, ref mr);
+                    }
+
                 case SigElementType.ARRAY:
                     {
                         if (!MatchType(defModule, ref def, memberRefModule, ref mr))
@@ -507,6 +567,26 @@ namespace Cnidaria.Cs
 
                         return true;
                     }
+
+                case SigElementType.FNPTR:
+                    {
+                        if (def.ReadByte() != mr.ReadByte())
+                            return false;
+
+                        uint dParameterCount = def.ReadCompressedUInt();
+                        uint mParameterCount = mr.ReadCompressedUInt();
+                        if (dParameterCount != mParameterCount)
+                            return false;
+
+                        if (!MatchType(defModule, ref def, memberRefModule, ref mr))
+                            return false;
+
+                        for (int i = 0; i < dParameterCount; i++)
+                            if (!MatchType(defModule, ref def, memberRefModule, ref mr))
+                                return false;
+
+                        return true;
+                    }
             }
 
             return true;
@@ -526,6 +606,12 @@ namespace Cnidaria.Cs
                     SkipType((SigElementType)r.ReadByte(), ref r);
                     return;
 
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    _ = r.ReadCompressedUInt();
+                    SkipType((SigElementType)r.ReadByte(), ref r);
+                    return;
+
                 case SigElementType.ARRAY:
                     SkipType((SigElementType)r.ReadByte(), ref r);
                     _ = r.ReadCompressedUInt();
@@ -540,6 +626,14 @@ namespace Cnidaria.Cs
                     _ = r.ReadCompressedUInt();
                     uint argc = r.ReadCompressedUInt();
                     for (int i = 0; i < argc; i++)
+                        SkipType((SigElementType)r.ReadByte(), ref r);
+                    return;
+
+                case SigElementType.FNPTR:
+                    _ = r.ReadByte();
+                    uint parameterCount = r.ReadCompressedUInt();
+                    SkipType((SigElementType)r.ReadByte(), ref r);
+                    for (int i = 0; i < parameterCount; i++)
                         SkipType((SigElementType)r.ReadByte(), ref r);
                     return;
 
@@ -1012,6 +1106,9 @@ namespace Cnidaria.Cs
                     return CompatibleType(def.ElementType, actual.ElementType);
                 }
 
+                if (def.Kind == RuntimeTypeKind.FunctionPointer)
+                    return FunctionPointerTypesCompatible(def, actual);
+
                 if (def.GenericTypeDefinition is not null)
                 {
                     if (actual.GenericTypeDefinition is null)
@@ -1192,6 +1289,9 @@ namespace Cnidaria.Cs
                         return false;
                     return CompatibleType(def.ElementType, actual.ElementType);
                 }
+
+                if (def.Kind == RuntimeTypeKind.FunctionPointer)
+                    return FunctionPointerTypesCompatible(def, actual);
 
                 if (def.GenericTypeDefinition is not null)
                 {
@@ -1436,6 +1536,15 @@ namespace Cnidaria.Cs
             if (t is null) return false;
             if (t.Kind == RuntimeTypeKind.TypeParam)
                 return t.IsMethodGenericParameter == wantMethod;
+            if (t.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                if (t.FunctionPointerReturnType is not null && UsesTypeParameters(t.FunctionPointerReturnType, wantMethod))
+                    return true;
+                for (int i = 0; i < t.FunctionPointerParameterTypes.Length; i++)
+                    if (UsesTypeParameters(t.FunctionPointerParameterTypes[i], wantMethod))
+                        return true;
+                return false;
+            }
             if (t.ElementType is not null)
                 return UsesTypeParameters(t.ElementType, wantMethod);
             if (t.GenericTypeArguments.Length != 0)
@@ -1445,6 +1554,26 @@ namespace Cnidaria.Cs
                         return true;
             }
             return false;
+        }
+
+        private static bool FunctionPointerTypesCompatible(RuntimeType left, RuntimeType right)
+        {
+            if (left.Kind != RuntimeTypeKind.FunctionPointer || right.Kind != RuntimeTypeKind.FunctionPointer ||
+                left.FunctionPointerCallingConvention != right.FunctionPointerCallingConvention ||
+                left.FunctionPointerReturnByRef != right.FunctionPointerReturnByRef ||
+                left.FunctionPointerReturnType is null || right.FunctionPointerReturnType is null ||
+                left.FunctionPointerReturnType.TypeId != right.FunctionPointerReturnType.TypeId ||
+                left.FunctionPointerParameterTypes.Length != right.FunctionPointerParameterTypes.Length)
+                return false;
+
+            for (int i = 0; i < left.FunctionPointerParameterTypes.Length; i++)
+            {
+                if (left.FunctionPointerParameterByRef[i] != right.FunctionPointerParameterByRef[i] ||
+                    left.FunctionPointerParameterTypes[i].TypeId != right.FunctionPointerParameterTypes[i].TypeId)
+                    return false;
+            }
+
+            return true;
         }
         private RuntimeMethod GetOrCreateConstructedMethod(RuntimeMethod genericMethod, RuntimeType[] methodArgs)
         {
@@ -1480,6 +1609,7 @@ namespace Cnidaria.Cs
 
             m.BodyModule = genericMethod.BodyModule;
             m.Body = genericMethod.Body;
+            m.DllImportData = genericMethod.DllImportData;
             m.GenericMethodDefinition = genericMethod;
             m.GenericArity = genericMethod.GenericArity;
             m.MethodGenericArguments = methodArgs;
@@ -1681,6 +1811,7 @@ namespace Cnidaria.Cs
                     LayoutStaticFields(t);
                     return;
                 case RuntimeTypeKind.Pointer:
+                case RuntimeTypeKind.FunctionPointer:
                     t.SizeOf = Target.PointerSize;
                     t.AlignOf = Target.PointerSize;
                     t.InstanceSize = Target.PointerSize;
@@ -1775,7 +1906,7 @@ namespace Cnidaria.Cs
         {
             EnsureLayout(fieldType);
 
-            if (fieldType.Kind == RuntimeTypeKind.Pointer)
+            if (fieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
                 return;
 
             if (fieldType.IsReferenceType || fieldType.Kind is RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam)
@@ -1988,7 +2119,7 @@ namespace Cnidaria.Cs
             if (fieldType.IsReferenceType)
                 return (Target.PointerSize, Target.PointerSize);
 
-            if (fieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            if (fieldType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
                 return (Target.PointerSize, Target.PointerSize);
 
             return (fieldType.SizeOf, fieldType.AlignOf);
@@ -2549,6 +2680,8 @@ namespace Cnidaria.Cs
                     mr.ImplFlags);
                 rm.BodyModule = m;
                 rm.GenericArity = genericArity;
+                if (m.PInvokesByMethodToken.TryGetValue(methodTok, out var dllImport))
+                    rm.DllImportData = dllImport;
                 if (m.MethodsByDefToken.TryGetValue(methodTok, out var bodyFn))
                     rm.Body = bodyFn;
                 _methodById[rm.MethodId] = rm;
@@ -2810,6 +2943,29 @@ namespace Cnidaria.Cs
                         return GetOrCreateByRefType(elem);
                     }
 
+                case SigElementType.CMOD_REQD:
+                case SigElementType.CMOD_OPT:
+                    _ = r.ReadCompressedUInt();
+                    return ReadTypeSig(contextModule, ref r);
+
+                case SigElementType.FNPTR:
+                    {
+                        byte callingConvention = r.ReadByte();
+                        uint parameterCount = r.ReadCompressedUInt();
+                        var returnType = ReadFunctionPointerSignatureType(contextModule, ref r, out bool returnByRef);
+                        int parameterCountInt = checked((int)parameterCount);
+                        var parameterTypes = new RuntimeType[parameterCountInt];
+                        var parameterByRef = new bool[parameterCountInt];
+                        for (int i = 0; i < parameterTypes.Length; i++)
+                            parameterTypes[i] = ReadFunctionPointerSignatureType(contextModule, ref r, out parameterByRef[i]);
+                        return GetOrCreateFunctionPointerType(
+                            callingConvention,
+                            returnType,
+                            returnByRef,
+                            parameterTypes,
+                            parameterByRef);
+                    }
+
                 case SigElementType.VAR:
                     {
                         uint ord = r.ReadCompressedUInt();
@@ -2843,6 +2999,23 @@ namespace Cnidaria.Cs
                 default:
                     throw new NotSupportedException($"TypeSig element not supported: {et}");
             }
+        }
+
+        private RuntimeType ReadFunctionPointerSignatureType(
+            RuntimeModule contextModule,
+            ref SigReader reader,
+            out bool isByRef)
+        {
+            isByRef = reader.PeekByte() == (byte)SigElementType.BYREF;
+            if (isByRef)
+                _ = reader.ReadByte();
+            while (reader.PeekByte() == (byte)SigElementType.CMOD_REQD ||
+                   reader.PeekByte() == (byte)SigElementType.CMOD_OPT)
+            {
+                _ = reader.ReadByte();
+                _ = reader.ReadCompressedUInt();
+            }
+            return ReadTypeSig(contextModule, ref reader);
         }
 
         private RuntimeType GetOrCreateArrayType(RuntimeType elem, int rank, bool isSzArray)
@@ -3019,6 +3192,7 @@ namespace Cnidaria.Cs
 
                     dst.BodyModule = src.BodyModule;
                     dst.Body = src.Body;
+                    dst.DllImportData = src.DllImportData;
                     dst.GenericArity = src.GenericArity;
                     _methodById[dst.MethodId] = dst;
                     methods[i] = dst;
@@ -3098,6 +3272,27 @@ namespace Cnidaria.Cs
                 return type;
             }
 
+            if (type.Kind == RuntimeTypeKind.FunctionPointer && type.FunctionPointerReturnType is not null)
+            {
+                var returnType = SubstituteRuntimeType(type.FunctionPointerReturnType, ownerTypeArgs, methodTypeArgs);
+                bool changed = !ReferenceEquals(returnType, type.FunctionPointerReturnType);
+                var parameterTypes = new RuntimeType[type.FunctionPointerParameterTypes.Length];
+                for (int i = 0; i < parameterTypes.Length; i++)
+                {
+                    parameterTypes[i] = SubstituteRuntimeType(type.FunctionPointerParameterTypes[i], ownerTypeArgs, methodTypeArgs);
+                    changed |= !ReferenceEquals(parameterTypes[i], type.FunctionPointerParameterTypes[i]);
+                }
+
+                if (changed)
+                    return GetOrCreateFunctionPointerType(
+                        type.FunctionPointerCallingConvention,
+                        returnType,
+                        type.FunctionPointerReturnByRef,
+                        parameterTypes,
+                        type.FunctionPointerParameterByRef);
+                return type;
+            }
+
             if (type.GenericTypeDefinition is null &&
                 ownerTypeArgs.Length != 0 &&
                 type.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Struct or RuntimeTypeKind.Interface &&
@@ -3157,6 +3352,38 @@ namespace Cnidaria.Cs
             return t;
         }
 
+        private RuntimeType GetOrCreateFunctionPointerType(
+            byte callingConvention,
+            RuntimeType returnType,
+            bool returnByRef,
+            RuntimeType[] parameterTypes,
+            bool[] parameterByRef)
+        {
+            var keyBuilder = new StringBuilder();
+            keyBuilder.Append("fnptr:").Append(callingConvention).Append(':').Append(returnByRef ? 'r' : 'v').Append(':').Append(returnType.TypeId);
+            for (int i = 0; i < parameterTypes.Length; i++)
+                keyBuilder.Append(':').Append(parameterByRef[i] ? 'r' : 'v').Append(':').Append(parameterTypes[i].TypeId);
+            string key = keyBuilder.ToString();
+
+            if (_constructedTypes.TryGetValue(key, out var existing))
+                return existing;
+
+            var type = new RuntimeType(
+                _nextTypeId++,
+                RuntimeTypeKind.FunctionPointer,
+                asm: returnType.AssemblyName,
+                ns: string.Empty,
+                name: "delegate*");
+            type.FunctionPointerCallingConvention = callingConvention;
+            type.FunctionPointerReturnType = returnType;
+            type.FunctionPointerReturnByRef = returnByRef;
+            type.FunctionPointerParameterTypes = parameterTypes;
+            type.FunctionPointerParameterByRef = parameterByRef;
+            _constructedTypes[key] = type;
+            _typeById[type.TypeId] = type;
+            return type;
+        }
+
         private static int DecodeTypeDefOrRefEncodedToToken(int encoded)
         {
             int tag = encoded & 0x3;
@@ -3207,6 +3434,7 @@ namespace Cnidaria.Cs
         Pointer,    // PTR
         ByRef,      // BYREF
         TypeParam,  // VAR/MVAR
+        FunctionPointer,
     }
 
     internal enum RuntimePrimitiveKind : byte
@@ -3241,10 +3469,15 @@ namespace Cnidaria.Cs
         public RuntimePrimitiveKind PrimitiveKind { get; internal set; }
         public bool IsBeforeFieldInit { get; internal set; }
 
-        public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum;
-        public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef);
+        public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer;
+        public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer);
         public RuntimeType? BaseType { get; internal set; }
         public RuntimeType? ElementType { get; internal set; }
+        public byte FunctionPointerCallingConvention { get; internal set; }
+        public RuntimeType? FunctionPointerReturnType { get; internal set; }
+        public bool FunctionPointerReturnByRef { get; internal set; }
+        public RuntimeType[] FunctionPointerParameterTypes { get; internal set; } = Array.Empty<RuntimeType>();
+        public bool[] FunctionPointerParameterByRef { get; internal set; } = Array.Empty<bool>();
         public int ArrayRank { get; internal set; }
         public bool IsSzArray { get; internal set; }
         public bool IsMethodGenericParameter { get; internal set; }
@@ -3308,13 +3541,16 @@ namespace Cnidaria.Cs
         public bool IsFinal { get; }
         public ushort Flags { get; }
         public ushort ImplFlags { get; }
+        public bool IsExtern => (ImplFlags & MetadataFlagBits.Extern) != 0 ||
+            (Flags & (ushort)System.Reflection.MethodAttributes.PinvokeImpl) != 0;
+        public DllImportData? DllImportData { get; internal set; }
         public bool HasInternalCall => (ImplFlags & MetadataFlagBits.InternalCall) != 0;
         public bool HasNoInlining => (ImplFlags & MetadataFlagBits.NoInlining) != 0;
         public bool HasAggressiveInlining => (ImplFlags & MetadataFlagBits.AggressiveInlining) != 0;
         internal bool RequiresClassInitializationEntryCheck { get; set; }
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
-        public Cnidaria.Cs.BytecodeFunction? Body { get; internal set; }
+        public BytecodeFunction? Body { get; internal set; }
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         internal RuntimeType[] MethodGenericArguments { get; set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }

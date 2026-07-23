@@ -96,7 +96,7 @@ namespace Cnidaria.Cs
             if (type is null || type is ErrorTypeSymbol)
                 return false;
 
-            if (type.IsReferenceType || type is ArrayTypeSymbol || type is PointerTypeSymbol || type is ByRefTypeSymbol)
+            if (type.IsReferenceType || type is ArrayTypeSymbol || type is PointerTypeSymbol || type is ByRefTypeSymbol || type is FunctionPointerTypeSymbol)
             {
                 size = target.PointerSize;
                 align = target.PointerSize;

@@ -217,11 +217,26 @@ namespace Cnidaria.Cs
                     sb.Append(' ');
                     AppendUses(sb, node);
                     return;
+                case GenTreeKind.FunctionPointer:
+                    sb.Append("ldftn ").Append(MethodName(source.Method));
+                    return;
+                case GenTreeKind.IndirectCall:
+                    sb.Append("calli ");
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.Call:
+                    sb.Append("call ");
+                    sb.Append(MethodName(source.Method)).Append(' ');
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.VirtualCall:
+                    sb.Append("callvirt ");
+                    sb.Append(MethodName(source.Method)).Append(' ');
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.DelegateInvoke:
-                    sb.Append(source.Kind == GenTreeKind.VirtualCall ? "callvirt " : source.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ")
-                      .Append(MethodName(source.Method)).Append(' ');
+                    sb.Append("delegate_invoke ");
+                    sb.Append(MethodName(source.Method)).Append(' ');
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.NewDelegate:

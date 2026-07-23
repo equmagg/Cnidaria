@@ -53,8 +53,10 @@ namespace Cnidaria.Cs
         Unary,
         Binary,
         Conv,
+        FunctionPointer,
 
         Call,
+        IndirectCall,
         VirtualCall,
         NewObject,
         NewDelegate,
@@ -145,6 +147,11 @@ namespace Cnidaria.Cs
         VarUseAsg = 1u << 15,
         VarDeath = 1u << 16,
         Prolog = 1u << 17,
+        NullCheckEliminated = 1u << 18,
+        BoundsCheckEliminated = 1u << 19,
+        DivModNoByZero = 1u << 20,
+        DivModNoOverflow = 1u << 21,
+        AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal enum GenTreeBlockJumpKind : byte
     {
@@ -1232,35 +1239,64 @@ namespace Cnidaria.Cs
         {
             if (node.Kind != GenTreeKind.Binary)
                 return false;
-            return DivRemCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
+            return DivRemCanDivideByZero(node, target) || DivRemCanOverflow(node, target);
         }
 
         public static bool DivRemCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
-        {
-            if (sourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
-                return false;
+            => DivRemCanDivideByZero(sourceOp, type, stackKind, operands, target) ||
+               DivRemCanOverflow(sourceOp, type, stackKind, operands, target);
 
-            if (!IsIntegralArithmeticType(type, stackKind))
+        public static bool DivRemCanDivideByZero(GenTree node, TargetInfo target)
+        {
+            if (node.Kind != GenTreeKind.Binary)
                 return false;
+            if ((node.Flags & GenTreeFlags.DivModNoByZero) != 0)
+                return false;
+            return DivRemCanDivideByZero(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
+        }
+
+        public static bool DivRemCanOverflow(GenTree node, TargetInfo target)
+        {
+            if (node.Kind != GenTreeKind.Binary)
+                return false;
+            if ((node.Flags & GenTreeFlags.DivModNoOverflow) != 0)
+                return false;
+            return DivRemCanOverflow(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
+        }
+
+        private static bool DivRemCanDivideByZero(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+        {
+            if (sourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ||
+                !IsIntegralArithmeticType(type, stackKind))
+            {
+                return false;
+            }
 
             if (operands.Length < 2)
                 return true;
 
             int bits = IntegralBits(type, stackKind, target);
-            if (!TryGetIntegralConstant(operands[1], bits, out long signedDivisor, out ulong unsignedDivisor))
+            return !TryGetIntegralConstant(operands[1], bits, out _, out ulong unsignedDivisor) || unsignedDivisor == 0;
+        }
+
+        private static bool DivRemCanOverflow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+        {
+            if (sourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un ||
+                sourceOp is not (BytecodeOp.Div or BytecodeOp.Rem) ||
+                !IsIntegralArithmeticType(type, stackKind))
+            {
+                return false;
+            }
+
+            if (operands.Length < 2)
                 return true;
 
-            if (unsignedDivisor == 0)
-                return true;
-
-            if (sourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un)
+            int bits = IntegralBits(type, stackKind, target);
+            if (TryGetIntegralConstant(operands[1], bits, out long signedDivisor, out _) && signedDivisor != -1)
                 return false;
 
-            if (signedDivisor != -1)
+            if (TryGetIntegralConstant(operands[0], bits, out long signedDividend, out _) && !IsSignedMinValue(signedDividend, bits))
                 return false;
-
-            if (operands.Length >= 1 && TryGetIntegralConstant(operands[0], bits, out long signedDividend, out _))
-                return IsSignedMinValue(signedDividend, bits);
 
             return true;
         }
@@ -1272,7 +1308,7 @@ namespace Cnidaria.Cs
                 if (type.PrimitiveKind is RuntimePrimitiveKind.Single or RuntimePrimitiveKind.Double or RuntimePrimitiveKind.Decimal or RuntimePrimitiveKind.Void)
                     return false;
 
-                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                     return false;
 
                 if (type.PrimitiveKind is RuntimePrimitiveKind.Boolean or RuntimePrimitiveKind.Char or
@@ -1778,7 +1814,7 @@ namespace Cnidaria.Cs
         {
             if (type.IsReferenceType) return GenStackKind.Ref;
             if (type.Kind == RuntimeTypeKind.ByRef) return GenStackKind.ByRef;
-            if (type.Kind == RuntimeTypeKind.Pointer) return GenStackKind.Ptr;
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer) return GenStackKind.Ptr;
             if (type.Name == "Single") return GenStackKind.R4;
             if (type.Name == "Double") return GenStackKind.R8;
             if (type.SizeOf <= 4) return GenStackKind.I4;

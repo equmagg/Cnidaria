@@ -28,7 +28,8 @@ namespace Cnidaria.X86
         private const uint SectionExecute = 0x20000000;
         private const int ImportDirectoryIndex = 1;
         private static readonly ImmutableArray<WindowsImportDll> Kernel32Imports = ImmutableArray.Create(
-            new WindowsImportDll("KERNEL32.dll", ImmutableArray.Create("GetStdHandle", "WriteFile", "ExitProcess")));
+            new WindowsImportDll("KERNEL32.dll", ImmutableArray.Create(
+                "GetStdHandle", "WriteFile", "ExitProcess", "GetProcessHeap", "HeapAlloc", "HeapReAlloc", "HeapFree")));
 
         public static ulong DefaultImageBase(X86Target target)
             => target is not null && target.Is64Bit ? 0x0000000140000000UL : 0x00400000UL;
