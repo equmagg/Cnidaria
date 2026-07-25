@@ -1,5 +1,6 @@
 ﻿using Cnidaria.C;
 using Cnidaria.RiscV;
+using Cnidaria.X86;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -126,6 +127,36 @@ namespace Cnidaria.Cs
                 image);
         }
 
+        public static X86Program CompileX86Program(
+            GenTreeProgram program,
+            BackendOptions? options = null,
+            X86CodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (program is null)
+                throw new ArgumentNullException(nameof(program));
+
+            options ??= BackendOptions.Default;
+            var lowered = GenTreeBackendPipeline.RunProgram(
+                program, options, nonCallOperationsClobberCallerSavedRegisters: false);
+            return X86CodeGenerator.Build(
+                lowered.RegisterAllocatedProgram, codeGeneratorOptions, lowered.RegisterAllocatedProgram.Target);
+        }
+
+        public static X86Program CompileX86Method(
+            GenTreeMethod method,
+            BackendOptions? options = null,
+            X86CodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            options ??= BackendOptions.Default;
+            var lowered = GenTreeBackendPipeline.RunMethod(
+                method, options, nonCallOperationsClobberCallerSavedRegisters: false);
+            return X86CodeGenerator.Build(
+                lowered.RegisterAllocatedProgram, codeGeneratorOptions, lowered.RegisterAllocatedProgram.Target);
+        }
+
         public static RiscVProgram CompileRiscVProgram(
             GenTreeProgram program,
             BackendOptions? options = null,
@@ -136,9 +167,7 @@ namespace Cnidaria.Cs
 
             options ??= BackendOptions.Default;
             var lowered = GenTreeBackendPipeline.RunProgram(
-                program,
-                options,
-                nonCallOperationsClobberCallerSavedRegisters: true);
+                program, options, nonCallOperationsClobberCallerSavedRegisters: true);
             return RiscVCodeGenerator.Build(
                 lowered.RegisterAllocatedProgram,
                 codeGeneratorOptions,
@@ -155,9 +184,7 @@ namespace Cnidaria.Cs
 
             options ??= BackendOptions.Default;
             var lowered = GenTreeBackendPipeline.RunMethod(
-                method,
-                options,
-                nonCallOperationsClobberCallerSavedRegisters: true);
+                method, options, nonCallOperationsClobberCallerSavedRegisters: true);
             return RiscVCodeGenerator.Build(
                 lowered.RegisterAllocatedProgram,
                 codeGeneratorOptions,

@@ -151,6 +151,7 @@ namespace Cnidaria.Cs
         BoundsCheckEliminated = 1u << 19,
         DivModNoByZero = 1u << 20,
         DivModNoOverflow = 1u << 21,
+        MakeCse = 1u << 22,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal enum GenTreeBlockJumpKind : byte

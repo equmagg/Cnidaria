@@ -174,11 +174,70 @@ namespace Cnidaria.C
             if (string.IsNullOrEmpty(constraint))
                 return string.Empty;
 
-            var index = 0;
-            while (index < constraint.Length && (constraint[index] == '&' || constraint[index] == '%' || constraint[index] == '!'))
-                index++;
+            var index = SkipModifiers(constraint, 0);
+            if (index < constraint.Length && (constraint[index] == '=' || constraint[index] == '+'))
+            {
+                var marker = constraint[index++];
+                index = SkipModifiers(constraint, index);
+                return marker + constraint.Substring(index);
+            }
+
             return constraint.Substring(index);
         }
+
+        public static bool IsEarlyClobber(string constraint)
+        {
+            if (string.IsNullOrEmpty(constraint))
+                return false;
+
+            var index = 0;
+            while (index < constraint.Length && IsModifier(constraint[index]))
+            {
+                if (constraint[index] == '&')
+                    return true;
+                index++;
+            }
+
+            if (index < constraint.Length && (constraint[index] == '=' || constraint[index] == '+'))
+                index++;
+
+            while (index < constraint.Length && IsModifier(constraint[index]))
+            {
+                if (constraint[index] == '&')
+                    return true;
+                index++;
+            }
+
+            return false;
+        }
+
+        public static string? MatchingOperand(string constraint)
+        {
+            var text = OperandConstraint(constraint).Trim();
+            if (text.Length == 0)
+                return null;
+
+            var index = 0;
+            while (index < text.Length && char.IsDigit(text[index]))
+                index++;
+            if (index == text.Length && index != 0)
+                return text;
+
+            if (text.Length >= 3 && text[0] == '[' && text[text.Length - 1] == ']')
+                return text.Substring(1, text.Length - 2).Trim();
+
+            return null;
+        }
+
+        private static int SkipModifiers(string constraint, int index)
+        {
+            while (index < constraint.Length && IsModifier(constraint[index]))
+                index++;
+            return index;
+        }
+
+        private static bool IsModifier(char ch)
+            => ch == '&' || ch == '%' || ch == '!';
 
         public static bool IsOutput(string constraint)
         {

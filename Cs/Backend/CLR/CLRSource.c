@@ -1,14 +1,53 @@
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
-typedef unsigned long usize;
-typedef signed long isize;
 
+#if __SIZEOF_POINTER__ == 8
+typedef unsigned long long usize;
+typedef signed long long isize;
+#else
+typedef unsigned int usize;
+typedef signed int isize;
+#endif
+
+#define SYNC_BLOCK_SIZE __SIZEOF_POINTER__
+#define MANAGED_OBJECT_HEADER_SIZE __SIZEOF_POINTER__
+#define MINIMUM_MANAGED_OBJECT_SIZE __SIZEOF_POINTER__ * 2
+#define MINIMUM_GC_OBJECT_SIZE SYNC_BLOCK_SIZE + MINIMUM_MANAGED_OBJECT_SIZE
+#define STRING_LENGTH_OFFSET __SIZEOF_POINTER__
+#define STRING_CHARS_OFFSET __SIZEOF_POINTER__ + 4
+#define ARRAY_LENGTH_OFFSET __SIZEOF_POINTER__
+#define ARRAY_DATA_OFFSET __SIZEOF_POINTER__ * 2
+
+#if defined(__linux__) && (defined(__riscv) || defined(__aarch64__))
 #define RH_SYS_WRITE 64ul
 #define RH_SYS_EXIT 93ul
 #define RH_SYS_MUNMAP 215ul
 #define RH_SYS_MMAP 222ul
 #define RH_SYS_MPROTECT 226ul
+#elif defined(__linux__) && defined(__x86_64__)
+#define RH_SYS_WRITE 1ul
+#define RH_SYS_EXIT 60ul
+#define RH_SYS_MUNMAP 11ul
+#define RH_SYS_MMAP 9ul
+#define RH_SYS_MPROTECT 10ul
+#elif defined(__linux__) && defined(__i386__)
+#define RH_SYS_WRITE 4ul
+#define RH_SYS_EXIT 1ul
+#define RH_SYS_MUNMAP 91ul
+#define RH_SYS_MMAP 90ul
+#define RH_SYS_MPROTECT 125ul
+#elif defined(_WIN32)
+#define RH_WIN_MEM_COMMIT 0x00001000u
+#define RH_WIN_MEM_RESERVE 0x00002000u
+#define RH_WIN_MEM_DECOMMIT 0x00004000u
+#define RH_WIN_MEM_RELEASE 0x00008000u
+#define RH_WIN_PAGE_NOACCESS 0x01u
+#define RH_WIN_PAGE_READWRITE 0x04u
+#else
+#error Unsupported CLR runtime target
+#endif
+
 #define RH_PROT_NONE 0ul
 #define RH_PROT_READ 1ul
 #define RH_PROT_WRITE 2ul
@@ -21,7 +60,7 @@ typedef signed long isize;
 #define RH_PAGE_SIZE 4096ul
 #define RH_HEAP_ALIGNMENT 16ul
 #define RH_HGLOBAL_HEADER_SIZE RH_HEAP_ALIGNMENT
-#define RH_BLOCK_HEADER_SIZE (POINTER_SIZE * 4ul)
+#define RH_BLOCK_HEADER_SIZE (__SIZEOF_POINTER__ * 4ul)
 #define RH_BLOCK_FREE 0ul
 #define RH_BLOCK_OBJECT 1ul
 #define RH_BLOCK_MARK 1ul
@@ -47,7 +86,7 @@ typedef signed long isize;
 #define RH_TYPE_SZARRAY 2ul
 #define RH_TYPE_MDARRAY 3ul
 #define RH_TYPE_PARAMETERIZED 4ul
-#define RH_MINIMUM_GC_OBJECT_SIZE (POINTER_SIZE * 3ul)
+#define RH_MINIMUM_GC_OBJECT_SIZE MINIMUM_GC_OBJECT_SIZE
 #define RH_EH_MAX_FRAMES 4096ul
 #define RH_EH_MAX_CONTINUATIONS 256ul
 #define RH_EH_MAX_CATCH_CONTEXTS 256ul
@@ -206,6 +245,7 @@ RhObject* RhpCurrentException;
 void RhpFallbackFailFast(int code);
 void RhpEhTransfer(void* frame_pointer, const void* target, const void* register_context);
 
+#if defined(__linux__) && defined(__riscv)
 static isize rh_syscall1(usize number, usize arg0)
 {
     usize result = arg0;
@@ -233,6 +273,384 @@ static isize rh_syscall6(usize number, usize arg0, usize arg1, usize arg2, usize
     __asm__ volatile("ecall" : [result] "+{a0}"(result) : [arg1] "{a1}"(arg1), [arg2] "{a2}"(arg2), [arg3] "{a3}"(arg3), [arg4] "{a4}"(arg4), [arg5] "{a5}"(arg5), [number] "{a7}"(number) : "memory");
     return (isize)result;
 }
+#elif defined(__linux__) && defined(__aarch64__)
+static isize rh_syscall1(usize number, usize arg0)
+{
+    usize result = arg0;
+    __asm__ volatile("svc #0" : [result] "+{x0}"(result) : [number] "{x8}"(number) : "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall2(usize number, usize arg0, usize arg1)
+{
+    usize result = arg0;
+    __asm__ volatile("svc #0" : [result] "+{x0}"(result) : [arg1] "{x1}"(arg1), [number] "{x8}"(number) : "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall3(usize number, usize arg0, usize arg1, usize arg2)
+{
+    usize result = arg0;
+    __asm__ volatile("svc #0" : [result] "+{x0}"(result) : [arg1] "{x1}"(arg1), [arg2] "{x2}"(arg2), [number] "{x8}"(number) : "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall6(usize number, usize arg0, usize arg1, usize arg2, usize arg3, usize arg4, usize arg5)
+{
+    usize result = arg0;
+    __asm__ volatile(
+        "svc #0"
+        : [result] "+{x0}"(result)
+        : [arg1] "{x1}"(arg1), [arg2] "{x2}"(arg2), [arg3] "{x3}"(arg3), [arg4] "{x4}"(arg4), [arg5] "{x5}"(arg5), [number] "{x8}"(number)
+        : "memory");
+    return (isize)result;
+}
+#elif defined(__linux__) && defined(__x86_64__)
+static isize rh_syscall1(usize number, usize arg0)
+{
+    usize result = number;
+    __asm__ volatile("syscall" : [result] "+{rax}"(result) : [arg0] "{rdi}"(arg0) : "rcx", "r11", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall2(usize number, usize arg0, usize arg1)
+{
+    usize result = number;
+    __asm__ volatile("syscall" : [result] "+{rax}"(result) : [arg0] "{rdi}"(arg0), [arg1] "{rsi}"(arg1) : "rcx", "r11", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall3(usize number, usize arg0, usize arg1, usize arg2)
+{
+    usize result = number;
+    __asm__ volatile("syscall" : [result] "+{rax}"(result) : [arg0] "{rdi}"(arg0), [arg1] "{rsi}"(arg1), [arg2] "{rdx}"(arg2) : "rcx", "r11", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall6(usize number, usize arg0, usize arg1, usize arg2, usize arg3, usize arg4, usize arg5)
+{
+    usize result = number;
+    __asm__ volatile(
+        "syscall"
+        : [result] "+{rax}"(result)
+        : [arg0] "{rdi}"(arg0), [arg1] "{rsi}"(arg1), [arg2] "{rdx}"(arg2), [arg3] "{r10}"(arg3), [arg4] "{r8}"(arg4), [arg5] "{r9}"(arg5)
+        : "rcx", "r11", "memory");
+    return (isize)result;
+}
+#elif defined(__linux__) && defined(__i386__)
+static isize rh_syscall1(usize number, usize arg0)
+{
+    usize result = number;
+    __asm__ volatile(
+        "push ebx\n"
+        ".byte 0xcd, 0x80\n"
+        "pop ebx"
+        : [result] "+{eax}"(result)
+        : [arg0] "{ebx}"(arg0)
+        : "ecx", "edx", "cc", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall2(usize number, usize arg0, usize arg1)
+{
+    usize result = number;
+    __asm__ volatile(
+        "push ebx\n"
+        ".byte 0xcd, 0x80\n"
+        "pop ebx"
+        : [result] "+{eax}"(result)
+        : [arg0] "{ebx}"(arg0), [arg1] "{ecx}"(arg1)
+        : "edx", "cc", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall3(usize number, usize arg0, usize arg1, usize arg2)
+{
+    usize result = number;
+    __asm__ volatile(
+        "push ebx\n"
+        ".byte 0xcd, 0x80\n"
+        "pop ebx"
+        : [result] "+{eax}"(result)
+        : [arg0] "{ebx}"(arg0), [arg1] "{ecx}"(arg1), [arg2] "{edx}"(arg2)
+        : "cc", "memory");
+    return (isize)result;
+}
+
+static isize rh_syscall6(usize number, usize arg0, usize arg1, usize arg2, usize arg3, usize arg4, usize arg5)
+{
+    usize arguments[6];
+    usize result = number;
+    arguments[0] = arg0;
+    arguments[1] = arg1;
+    arguments[2] = arg2;
+    arguments[3] = arg3;
+    arguments[4] = arg4;
+    arguments[5] = arg5;
+    __asm__ volatile(
+        "push ebx\n"
+        ".byte 0xcd, 0x80\n"
+        "pop ebx"
+        : [result] "+{eax}"(result)
+        : [arguments] "{ebx}"(arguments)
+        : "ecx", "edx", "esi", "edi", "cc", "memory");
+    return (isize)result;
+}
+#elif defined(_WIN32) && defined(__x86_64__)
+static void* rh_windows_virtual_alloc(void* address, usize size, u32 allocation_type, u32 protection)
+{
+    void* result;
+    void* address_arg = address;
+    usize size_arg = size;
+    usize allocation_type_arg = (usize)allocation_type;
+    usize protection_arg = (usize)protection;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "call qword ptr[rip + __imp_VirtualAlloc]\n"
+        "add rsp, 32"
+        : "={rax}"(result), [address] "+{rcx}"(address_arg), [size] "+{rdx}"(size_arg),
+        [allocation_type] "+{r8}"(allocation_type_arg), [protection] "+{r9}"(protection_arg)
+        :
+        : "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
+    return result;
+}
+
+static int rh_windows_virtual_free(void* address, usize size, u32 free_type)
+{
+    usize result;
+    void* address_arg = address;
+    usize size_arg = size;
+    usize free_type_arg = (usize)free_type;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "call qword ptr[rip + __imp_VirtualFree]\n"
+        "add rsp, 32"
+        : "={rax}"(result), [address] "+{rcx}"(address_arg), [size] "+{rdx}"(size_arg), [free_type] "+{r8}"(free_type_arg)
+        :
+        : "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
+    return result != 0ul;
+}
+
+static void* rh_windows_stdout(void)
+{
+    void* result;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "mov ecx, -11\n"
+        "call qword ptr[rip + __imp_GetStdHandle]\n"
+        "add rsp, 32"
+        : "={rax}"(result)
+        :
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
+    return result;
+}
+
+static usize rh_windows_write(void* handle, const void* data, u32 length)
+{
+    usize result;
+    void* handle_arg = handle;
+    const void* data_arg = data;
+    usize length_arg = (usize)length;
+    u32 written = 0u;
+    __asm__ volatile(
+        "lea r9, %[written]\n"
+        "sub rsp, 48\n"
+        "mov qword ptr[rsp + 32], 0\n"
+        "call qword ptr[rip + __imp_WriteFile]\n"
+        "add rsp, 48"
+        : "={rax}"(result), [handle] "+{rcx}"(handle_arg), [data] "+{rdx}"(data_arg),
+        [length] "+{r8}"(length_arg), [written] "=m"(written)
+        :
+        : "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
+    if (result == 0ul)
+        return 0ul;
+    return (usize)written;
+}
+
+static void rh_windows_exit(u32 code)
+{
+    usize code_arg = (usize)code;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "call qword ptr[rip + __imp_ExitProcess]\n"
+        "add rsp, 32"
+        : [code] "+{rcx}"(code_arg)
+        :
+        : "rax", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
+}
+
+#elif defined(_WIN32) && defined(__i386__)
+static void* rh_windows_virtual_alloc(void* address, usize size, u32 allocation_type, u32 protection)
+{
+    usize result = (usize)address;
+    usize size_arg = size;
+    usize allocation_type_arg = (usize)allocation_type;
+    usize protection_arg = (usize)protection;
+    __asm__ volatile(
+        "push esi\n"
+        "push edx\n"
+        "push ecx\n"
+        "push eax\n"
+        "call dword ptr[__imp_VirtualAlloc]"
+        : [result] "+{eax}"(result), [size] "+{ecx}"(size_arg),
+        [allocation_type] "+{edx}"(allocation_type_arg), [protection] "+{esi}"(protection_arg)
+        :
+        : "cc", "memory");
+    return (void*)result;
+}
+
+static int rh_windows_virtual_free(void* address, usize size, u32 free_type)
+{
+    usize result = (usize)address;
+    usize size_arg = size;
+    usize free_type_arg = (usize)free_type;
+    __asm__ volatile(
+        "push edx\n"
+        "push ecx\n"
+        "push eax\n"
+        "call dword ptr[__imp_VirtualFree]"
+        : [result] "+{eax}"(result), [size] "+{ecx}"(size_arg), [free_type] "+{edx}"(free_type_arg)
+        :
+        : "cc", "memory");
+    return result != 0ul;
+}
+
+static void* rh_windows_stdout(void)
+{
+    usize result = (usize)-11;
+    __asm__ volatile(
+        "push eax\n"
+        "call dword ptr[__imp_GetStdHandle]"
+        : [result] "+{eax}"(result)
+        :
+        : "cc", "memory");
+    return (void*)result;
+}
+
+static usize rh_windows_write(void* handle, const void* data, u32 length)
+{
+    usize result = (usize)handle;
+    usize data_arg = (usize)data;
+    usize length_arg = (usize)length;
+    u32 written = 0u;
+    __asm__ volatile(
+        "push ebx\n"
+        "lea ebx, %[written]\n"
+        "add ebx, 4\n"
+        "push 0\n"
+        "push ebx\n"
+        "push edx\n"
+        "push ecx\n"
+        "push eax\n"
+        "call dword ptr[__imp_WriteFile]\n"
+        "pop ebx"
+        : [result] "+{eax}"(result), [data] "+{ecx}"(data_arg), [length] "+{edx}"(length_arg), [written] "=m"(written)
+        :
+        : "cc", "memory");
+    if (result == 0ul)
+        return 0ul;
+    return (usize)written;
+}
+
+static void rh_windows_exit(u32 code)
+{
+    usize code_arg = (usize)code;
+    __asm__ volatile(
+        "push eax\n"
+        "call dword ptr[__imp_ExitProcess]"
+        : [code] "+{eax}"(code_arg)
+        :
+        : "cc", "memory");
+}
+#elif defined(_WIN32) && defined(__aarch64__)
+static void* rh_windows_virtual_alloc(void* address, usize size, u32 allocation_type, u32 protection)
+{
+    void* result = address;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_VirtualAlloc\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(result)
+        : [size] "{x1}"(size), [allocation_type] "{x2}"((usize)allocation_type), [protection] "{x3}"((usize)protection)
+        : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    return result;
+}
+
+static int rh_windows_virtual_free(void* address, usize size, u32 free_type)
+{
+    usize result = (usize)address;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_VirtualFree\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(result)
+        : [size] "{x1}"(size), [free_type] "{x2}"((usize)free_type)
+        : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    return result != 0ul;
+}
+
+static void* rh_windows_stdout(void)
+{
+    usize result = (usize)(isize)-11;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_GetStdHandle\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(result)
+        :
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    return (void*)result;
+}
+
+static usize rh_windows_write(void* handle, const void* data, u32 length)
+{
+    usize result = (usize)handle;
+    u32 written = 0u;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "mov x4, #0\n"
+        "ldr x16, __imp_WriteFile\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(result)
+        : [data] "{x1}"(data), [length] "{x2}"((usize)length), [written] "{x3}"(&written)
+        : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    if (result == 0ul)
+        return 0ul;
+    return (usize)written;
+}
+
+static void rh_windows_exit(u32 code)
+{
+    usize code_arg = (usize)code;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_ExitProcess\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : [code] "+{x0}"(code_arg)
+        :
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+}
+#endif
 
 static usize rh_align_up(usize value, usize alignment)
 {
@@ -269,7 +687,7 @@ static usize rh_element_type(const RhMethodTable* type)
 
 static const RhMethodTable** rh_interface_map(const RhMethodTable* type)
 {
-    const void* map = *(const void**)((const u8*)type + 16ul + POINTER_SIZE);
+    const void* map = *(const void**)((const u8*)type + 16ul + __SIZEOF_POINTER__);
     return (const RhMethodTable**)map;
 }
 
@@ -941,6 +1359,7 @@ static void rh_memmove(void* destination, const void* source, usize size)
 static void rh_write_all(const u8* data, usize length)
 {
     usize offset = 0ul;
+#if defined(__linux__)
     while (offset < length)
     {
         isize result = rh_syscall3(RH_SYS_WRITE, 1ul, (usize)(data + offset), length - offset);
@@ -948,6 +1367,18 @@ static void rh_write_all(const u8* data, usize length)
             return;
         offset = offset + (usize)result;
     }
+#elif defined(_WIN32)
+    void* handle = rh_windows_stdout();
+    while (offset < length)
+    {
+        usize remaining = length - offset;
+        u32 chunk = remaining > 0xfffffffful ? 0xffffffffu : (u32)remaining;
+        usize written = rh_windows_write(handle, data + offset, chunk);
+        if (written == 0ul)
+            return;
+        offset = offset + written;
+    }
+#endif
 }
 
 static usize rh_encode_utf8(u32 scalar, u8* buffer)
@@ -979,7 +1410,11 @@ static usize rh_encode_utf8(u32 scalar, u8* buffer)
 
 void RhpFallbackFailFast(int code)
 {
+#if defined(__linux__)
     rh_syscall1(RH_SYS_EXIT, (usize)code);
+#elif defined(_WIN32)
+    rh_windows_exit((u32)code);
+#endif
     for (;;)
     {
     }
@@ -987,6 +1422,7 @@ void RhpFallbackFailFast(int code)
 
 static void* rh_os_reserve(usize size)
 {
+#if defined(__linux__)
     isize result = rh_syscall6(
         RH_SYS_MMAP,
         0ul,
@@ -998,36 +1434,53 @@ static void* rh_os_reserve(usize size)
     if (result < 0l)
         return (void*)0;
     return (void*)(usize)result;
+#elif defined(_WIN32)
+    return rh_windows_virtual_alloc((void*)0, size, RH_WIN_MEM_RESERVE, RH_WIN_PAGE_NOACCESS);
+#endif
 }
 
 static int rh_os_commit(void* address, usize size)
 {
+#if defined(__linux__)
     return rh_syscall3(
         RH_SYS_MPROTECT,
         (usize)address,
         size,
         RH_PROT_READ | RH_PROT_WRITE) == 0l;
+#elif defined(_WIN32)
+    return rh_windows_virtual_alloc(address, size, RH_WIN_MEM_COMMIT, RH_WIN_PAGE_READWRITE) == address;
+#endif
 }
 
 static int rh_os_decommit(void* address, usize size)
 {
-    isize result;
     if (size == 0ul)
         return 1;
-    result = rh_syscall6(
-        RH_SYS_MMAP,
-        (usize)address,
-        size,
-        RH_PROT_NONE,
-        RH_MAP_PRIVATE | RH_MAP_ANONYMOUS | RH_MAP_FIXED,
-        (usize)-1,
-        0ul);
-    return result == (isize)(usize)address;
+#if defined(__linux__)
+    {
+        isize result = rh_syscall6(
+            RH_SYS_MMAP,
+            (usize)address,
+            size,
+            RH_PROT_NONE,
+            RH_MAP_PRIVATE | RH_MAP_ANONYMOUS | RH_MAP_FIXED,
+            (usize)-1,
+            0ul);
+        return result == (isize)(usize)address;
+    }
+#elif defined(_WIN32)
+    return rh_windows_virtual_free(address, size, RH_WIN_MEM_DECOMMIT);
+#endif
 }
 
 static int rh_os_release(void* address, usize size)
 {
+#if defined(__linux__)
     return rh_syscall2(RH_SYS_MUNMAP, (usize)address, size) == 0l;
+#elif defined(_WIN32)
+    (void)size;
+    return rh_windows_virtual_free(address, 0ul, RH_WIN_MEM_RELEASE);
+#endif
 }
 
 void* RhpAllocHGlobal(usize size)
@@ -1036,7 +1489,6 @@ void* RhpAllocHGlobal(usize size)
     usize payload_size = size == 0ul ? 1ul : size;
     usize total_size;
     usize mapping_size;
-    isize result;
     u8* base;
 
     if (payload_size > maximum - RH_HGLOBAL_HEADER_SIZE)
@@ -1045,18 +1497,15 @@ void* RhpAllocHGlobal(usize size)
     if (total_size > maximum - (RH_PAGE_SIZE - 1ul))
         RhpFallbackFailFast(141);
     mapping_size = rh_align_up(total_size, RH_PAGE_SIZE);
-    result = rh_syscall6(
-        RH_SYS_MMAP,
-        0ul,
-        mapping_size,
-        RH_PROT_READ | RH_PROT_WRITE,
-        RH_MAP_PRIVATE | RH_MAP_ANONYMOUS,
-        (usize)-1,
-        0ul);
-    if (result < 0l)
+    base = (u8*)rh_os_reserve(mapping_size);
+    if (base == (u8*)0)
         RhpFallbackFailFast(141);
+    if (!rh_os_commit(base, mapping_size))
+    {
+        rh_os_release(base, mapping_size);
+        RhpFallbackFailFast(141);
+    }
 
-    base = (u8*)(usize)result;
     *(usize*)base = mapping_size;
     return (void*)(base + RH_HGLOBAL_HEADER_SIZE);
 }
@@ -1135,7 +1584,7 @@ void RhpInitialize(
     const RhStaticRoot* static_roots,
     usize static_root_count)
 {
-    if (sizeof(usize) != POINTER_SIZE ||
+    if (sizeof(usize) != __SIZEOF_POINTER__ ||
         RH_PAGE_SIZE == 0ul ||
         (RH_PAGE_SIZE & (RH_PAGE_SIZE - 1ul)) != 0ul ||
         RH_HEAP_COMMIT_GRANULARITY < RH_PAGE_SIZE ||
@@ -1146,25 +1595,29 @@ void RhpInitialize(
         (RH_HEAP_RESERVE & (RH_PAGE_SIZE - 1ul)) != 0ul ||
         sizeof(int) != 4ul ||
         sizeof(u16) != 2ul ||
-        SYNC_BLOCK_SIZE != POINTER_SIZE ||
-        STRING_LENGTH_OFFSET != POINTER_SIZE ||
+        SYNC_BLOCK_SIZE != __SIZEOF_POINTER__ ||
+        MANAGED_OBJECT_HEADER_SIZE < __SIZEOF_POINTER__ ||
+        (MANAGED_OBJECT_HEADER_SIZE & (__SIZEOF_POINTER__ - 1ul)) != 0ul ||
+        MINIMUM_GC_OBJECT_SIZE < SYNC_BLOCK_SIZE + MANAGED_OBJECT_HEADER_SIZE ||
+        STRING_LENGTH_OFFSET != MANAGED_OBJECT_HEADER_SIZE ||
         STRING_CHARS_OFFSET != STRING_LENGTH_OFFSET + 4ul ||
-        ARRAY_LENGTH_OFFSET != POINTER_SIZE ||
-        ARRAY_DATA_OFFSET != POINTER_SIZE * 2ul ||
+        ARRAY_LENGTH_OFFSET != MANAGED_OBJECT_HEADER_SIZE ||
+        ARRAY_DATA_OFFSET < ARRAY_LENGTH_OFFSET + 4ul ||
+        (ARRAY_DATA_OFFSET & (__SIZEOF_POINTER__ - 1ul)) != 0ul ||
         sizeof(RhBlock) != RH_BLOCK_HEADER_SIZE ||
-        sizeof(RhObject) != POINTER_SIZE ||
-        sizeof(RhGcField) != POINTER_SIZE * 2ul ||
-        sizeof(RhMethodTable) != 16ul + POINTER_SIZE ||
-        sizeof(RhTypeInfo) != POINTER_SIZE * 6ul ||
-        sizeof(RhRoot) != POINTER_SIZE * 2ul ||
-        sizeof(RhSafePoint) != POINTER_SIZE * 5ul ||
-        sizeof(RhStaticRoot) != POINTER_SIZE * 2ul ||
-        sizeof(RhEhClause) != POINTER_SIZE * 12ul ||
-        sizeof(RhEhMethodInfo) != POINTER_SIZE * 2ul ||
-        sizeof(RhEhFrame) != POINTER_SIZE * 3ul ||
+        sizeof(RhObject) != __SIZEOF_POINTER__ ||
+        sizeof(RhGcField) != __SIZEOF_POINTER__ * 2ul ||
+        sizeof(RhMethodTable) != 16ul + __SIZEOF_POINTER__ ||
+        sizeof(RhTypeInfo) != __SIZEOF_POINTER__ * 6ul ||
+        sizeof(RhRoot) != __SIZEOF_POINTER__ * 2ul ||
+        sizeof(RhSafePoint) != __SIZEOF_POINTER__ * 5ul ||
+        sizeof(RhStaticRoot) != __SIZEOF_POINTER__ * 2ul ||
+        sizeof(RhEhClause) != __SIZEOF_POINTER__ * 12ul ||
+        sizeof(RhEhMethodInfo) != __SIZEOF_POINTER__ * 2ul ||
+        sizeof(RhEhFrame) != __SIZEOF_POINTER__ * 3ul ||
         sizeof(RhEhRegisterContext) != 512ul ||
-        sizeof(RhEhContinuation) != POINTER_SIZE * 6ul ||
-        sizeof(RhCatchContext) != POINTER_SIZE * 4ul ||
+        sizeof(RhEhContinuation) != __SIZEOF_POINTER__ * 6ul ||
+        sizeof(RhCatchContext) != __SIZEOF_POINTER__ * 4ul ||
         stack_base == (void*)0 ||
         (safe_point_count != 0ul && safe_points == (const RhSafePoint*)0) ||
         (type_info_count != 0ul && type_infos == (const RhTypeInfo*)0) ||
@@ -1248,7 +1701,7 @@ static usize rh_gc_object_size(const RhObject* object, const RhBlock* block, int
             RhpFallbackFailFast(code);
     }
 
-    if (gc_size < SYNC_BLOCK_SIZE + POINTER_SIZE ||
+    if (gc_size < SYNC_BLOCK_SIZE + MANAGED_OBJECT_HEADER_SIZE ||
         rh_total_block_size(gc_size) == 0ul ||
         rh_total_block_size(gc_size) > block->size)
     {
@@ -1452,7 +1905,7 @@ static void rh_drain_mark_stack(void)
         {
             const RhGcField* field = &info->gc_fields[i];
             void* value;
-            if (object_size < POINTER_SIZE || field->offset > object_size - POINTER_SIZE)
+            if (object_size < __SIZEOF_POINTER__ || field->offset > object_size - __SIZEOF_POINTER__)
                 RhpFallbackFailFast(139);
             value = *(void**)((u8*)object + field->offset);
             rh_mark_field_value(value, field->kind);
@@ -1464,7 +1917,7 @@ static void rh_drain_mark_stack(void)
             int length = *(const int*)((const u8*)object + ARRAY_LENGTH_OFFSET);
             usize component_size = rh_component_size(type);
             usize element_index = 0ul;
-            if (length < 0 || component_size < POINTER_SIZE)
+            if (length < 0 || component_size < __SIZEOF_POINTER__)
                 RhpFallbackFailFast(139);
             while (element_index < (usize)length)
             {
@@ -1474,7 +1927,7 @@ static void rh_drain_mark_stack(void)
                 {
                     const RhGcField* field = &info->component_gc_fields[field_index];
                     void* value;
-                    if (field->offset > component_size - POINTER_SIZE)
+                    if (field->offset > component_size - __SIZEOF_POINTER__)
                         RhpFallbackFailFast(139);
                     value = *(void**)(element + field->offset);
                     rh_mark_field_value(value, field->kind);
@@ -1804,7 +2257,7 @@ static void* rh_delegate_leaf_at(
     list = rh_delegate_read_slot(delegate_ref, invocation_list_offset);
     if (list == (void*)0 || count == 1ul)
         return delegate_ref;
-    delegate_ref = *(void**)((u8*)list + ARRAY_DATA_OFFSET + index * POINTER_SIZE);
+    delegate_ref = *(void**)((u8*)list + ARRAY_DATA_OFFSET + index * __SIZEOF_POINTER__);
     if (delegate_ref == (void*)0 || ((RhObject*)delegate_ref)->type != delegate_type)
         RhpFallbackFailFast(152);
     return delegate_ref;
@@ -1889,7 +2342,7 @@ void* RhpDelegateCombine(
     index = 0ul;
     while (index < left_count)
     {
-        *(void**)((u8*)list + ARRAY_DATA_OFFSET + index * POINTER_SIZE) = rh_delegate_leaf_at(
+        *(void**)((u8*)list + ARRAY_DATA_OFFSET + index * __SIZEOF_POINTER__) = rh_delegate_leaf_at(
             left,
             index,
             delegate_type,
@@ -1901,7 +2354,7 @@ void* RhpDelegateCombine(
     index = 0ul;
     while (index < right_count)
     {
-        *(void**)((u8*)list + ARRAY_DATA_OFFSET + (left_count + index) * POINTER_SIZE) = rh_delegate_leaf_at(
+        *(void**)((u8*)list + ARRAY_DATA_OFFSET + (left_count + index) * __SIZEOF_POINTER__) = rh_delegate_leaf_at(
             right,
             index,
             delegate_type,
@@ -1993,7 +2446,7 @@ void* RhpDelegateRemove(
         }
         else
         {
-            *(void**)((u8*)list + ARRAY_DATA_OFFSET + destination_index * POINTER_SIZE) = rh_delegate_leaf_at(
+            *(void**)((u8*)list + ARRAY_DATA_OFFSET + destination_index * __SIZEOF_POINTER__) = rh_delegate_leaf_at(
                 source,
                 source_index,
                 delegate_type,
@@ -2155,27 +2608,27 @@ int RhpArrayCopy(
     }
     else
     {
-        if (source_component_size != POINTER_SIZE || destination_component_size != POINTER_SIZE ||
+        if (source_component_size != __SIZEOF_POINTER__ || destination_component_size != __SIZEOF_POINTER__ ||
             source_element == (const RhMethodTable*)0 || destination_element == (const RhMethodTable*)0 ||
             !rh_is_reference_type(source_element) || !rh_is_reference_type(destination_element))
         {
             return 0;
         }
 
-        source = (const u8*)source_array + ARRAY_DATA_OFFSET + (usize)source_index * POINTER_SIZE;
-        destination = (u8*)destination_array + ARRAY_DATA_OFFSET + (usize)destination_index * POINTER_SIZE;
+        source = (const u8*)source_array + ARRAY_DATA_OFFSET + (usize)source_index * __SIZEOF_POINTER__;
+        destination = (u8*)destination_array + ARRAY_DATA_OFFSET + (usize)destination_index * __SIZEOF_POINTER__;
         if (!rh_is_assignable(source_element, destination_element))
         {
             usize i = 0ul;
             while (i < (usize)length)
             {
-                const RhObject* value = *(const RhObject**)(source + i * POINTER_SIZE);
+                const RhObject* value = *(const RhObject**)(source + i * __SIZEOF_POINTER__);
                 if (value != (const RhObject*)0 && !rh_is_assignable(value->type, destination_element))
                     return 0;
                 i = i + 1ul;
             }
         }
-        byte_count = (usize)length * POINTER_SIZE;
+        byte_count = (usize)length * __SIZEOF_POINTER__;
     }
 
 #ifdef __riscv_vector

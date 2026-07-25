@@ -15,7 +15,7 @@ namespace Cnidaria.Cs
 
             VerifyAllValuesAllocated(method);
             VerifyNoOverlappingRegisterIntervals(method);
-            VerifyNoCallerSavedLiveAcrossCalls(method);
+            VerifyNoKilledRegisterLiveAcrossKills(method);
             VerifyStackFrameLayout(method);
             VerifyNodeOperands(method);
             VerifyCfgEdgeLocations(method);
@@ -990,8 +990,8 @@ namespace Cnidaria.Cs
             {
                 case FrameOperation.AllocateFrame:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.StackPointer, "frame allocation result");
-                    RequireSingleRegisterUse(node, MachineRegisters.StackPointer, "frame allocation use");
+                    RequireRegister(result, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "frame allocation result");
+                    RequireSingleRegisterUse(node, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "frame allocation use");
                     RequireImmediate(node, method.StackFrame.FrameSize, "frame allocation size");
                     return;
 
@@ -1001,7 +1001,7 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException("Return-address prolog node must write a return-address frame slot.");
                     if (result.FrameBase != RegisterFrameBase.StackPointer)
                         throw new InvalidOperationException("Return-address prolog node must write a stack-pointer-relative frame slot.");
-                    RequireSingleRegisterUse(node, MachineRegisters.ReturnAddress, "return-address save use");
+                    RequireSingleRegisterUse(node, RegisterInfo.ReturnAddress(method.GenTreeMethod.Target), "return-address save use");
                     RequireImmediate(node, 0, "return-address save immediate");
                     return;
 
@@ -1018,31 +1018,35 @@ namespace Cnidaria.Cs
 
                 case FrameOperation.EstablishFramePointer:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.FramePointer, "frame pointer establishment result");
-                    RequireSingleRegisterUse(node, MachineRegisters.StackPointer, "frame pointer establishment use");
+                    RequireRegister(result, RegisterInfo.FramePointer(method.GenTreeMethod.Target), "frame pointer establishment result");
+                    RequireSingleRegisterUse(node, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "frame pointer establishment use");
                     RequireImmediate(node, 0, "frame pointer establishment immediate");
                     return;
 
                 case FrameOperation.EnterFuncletFrame:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    if (!result.IsRegister || result.Register is not (MachineRegister.X2 or MachineRegister.X8))
+                    if (!result.IsRegister ||
+                        (result.Register != RegisterInfo.StackPointer(method.GenTreeMethod.Target) &&
+                         result.Register != RegisterInfo.FramePointer(method.GenTreeMethod.Target)))
                         throw new InvalidOperationException("Funclet prolog must establish either SP or FP as the funclet frame anchor.");
-                    RequireSingleRegisterUse(node, MachineRegisters.StackPointer, "funclet frame establishment use");
+                    RequireSingleRegisterUse(node, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "funclet frame establishment use");
                     RequireImmediate(node, 0, "funclet frame establishment immediate");
                     return;
 
                 case FrameOperation.LeaveFuncletFrame:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.StackPointer, "funclet frame detach result");
-                    if (node.Uses.Length != 1 || !node.Uses[0].IsRegister || node.Uses[0].Register is not (MachineRegister.X2 or MachineRegister.X8))
+                    RequireRegister(result, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "funclet frame detach result");
+                    if (node.Uses.Length != 1 || !node.Uses[0].IsRegister ||
+                        (node.Uses[0].Register != RegisterInfo.StackPointer(method.GenTreeMethod.Target) &&
+                         node.Uses[0].Register != RegisterInfo.FramePointer(method.GenTreeMethod.Target)))
                         throw new InvalidOperationException("Funclet epilog must read exactly one SP or FP frame anchor.");
                     RequireImmediate(node, 0, "funclet frame detach immediate");
                     return;
 
                 case FrameOperation.RestoreStackPointerFromFramePointer:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.StackPointer, "stack pointer restore result");
-                    RequireSingleRegisterUse(node, MachineRegisters.FramePointer, "stack pointer restore use");
+                    RequireRegister(result, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "stack pointer restore result");
+                    RequireSingleRegisterUse(node, RegisterInfo.FramePointer(method.GenTreeMethod.Target), "stack pointer restore use");
                     RequireImmediate(node, 0, "stack pointer restore immediate");
                     return;
 
@@ -1061,7 +1065,7 @@ namespace Cnidaria.Cs
 
                 case FrameOperation.RestoreReturnAddress:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.ReturnAddress, "return-address restore result");
+                    RequireRegister(result, RegisterInfo.ReturnAddress(method.GenTreeMethod.Target), "return-address restore result");
                     if (node.Uses.Length != 1
                         || !node.Uses[0].IsFrameSlot
                         || node.Uses[0].FrameSlotKind != StackFrameSlotKind.ReturnAddress)
@@ -1073,8 +1077,8 @@ namespace Cnidaria.Cs
 
                 case FrameOperation.FreeFrame:
                     RequireFrameKind(node, GenTreeKind.StackFrameOp);
-                    RequireRegister(result, MachineRegisters.StackPointer, "frame free result");
-                    RequireSingleRegisterUse(node, MachineRegisters.StackPointer, "frame free use");
+                    RequireRegister(result, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "frame free result");
+                    RequireSingleRegisterUse(node, RegisterInfo.StackPointer(method.GenTreeMethod.Target), "frame free use");
                     RequireImmediate(node, method.StackFrame.FrameSize, "frame free size");
                     return;
 
@@ -1221,10 +1225,16 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static void VerifyNoCallerSavedLiveAcrossCalls(RegisterAllocatedMethod method)
+        private static void VerifyNoKilledRegisterLiveAcrossKills(RegisterAllocatedMethod method)
         {
-            var callPositions = BuildCallPositions(method.GenTreeMethod);
-            if (callPositions.Length == 0)
+            var kills = ImmutableArray.CreateBuilder<LinearRefPosition>();
+            for (int i = 0; i < method.GenTreeMethod.RefPositions.Length; i++)
+            {
+                LinearRefPosition position = method.GenTreeMethod.RefPositions[i];
+                if (position.Kind == LinearRefPositionKind.Kill && position.RegisterMask != 0)
+                    kills.Add(position);
+            }
+            if (kills.Count == 0)
                 return;
 
             var segments = CollectLocatedRegisterSegments(method);
@@ -1233,39 +1243,28 @@ namespace Cnidaria.Cs
                 var located = segments[i];
                 var segment = located.Segment;
                 var allocation = located.Allocation;
-                if (!RegisterInfo.IsCallerSaved(method.GenTreeMethod.Target, segment.Location.Register))
-                    continue;
+                ulong registerMask = MachineRegisters.MaskOf(segment.Location.Register);
 
-                for (int c = 0; c < callPositions.Length; c++)
+                for (int k = 0; k < kills.Count; k++)
                 {
-                    int callPos = callPositions[c];
-
-                    if (!segment.Contains(callPos + 1))
+                    LinearRefPosition kill = kills[k];
+                    if ((kill.RegisterMask & registerMask) == 0)
                         continue;
 
-                    if (RangesCrossCall(allocation.Ranges, callPos))
+                    int killPosition = kill.Position;
+                    if (!segment.Contains(killPosition + 1))
+                        continue;
+
+                    if (RangesCrossCall(allocation.Ranges, killPosition))
                     {
                         throw new InvalidOperationException(
-                            "Caller-saved register " + MachineRegisters.Format(segment.Location.Register) +
-                            $" assigned to allocation segment of {located.DisplayName} live across call at GenTree LIR position {callPos}.");
+                            $"Killed register {MachineRegisters.Format(segment.Location.Register)}" +
+                            $" assigned to allocation segment of {located.DisplayName} live across kill at GenTree LIR position {killPosition}.");
                     }
                 }
             }
         }
 
-        private static ImmutableArray<int> BuildCallPositions(GenTreeMethod method)
-        {
-            var positions = new SortedSet<int>();
-            for (int i = 0; i < method.RefPositions.Length; i++)
-            {
-                var rp = method.RefPositions[i];
-                if (rp.Kind == LinearRefPositionKind.Kill && rp.RegisterMask != 0)
-                    positions.Add(rp.Position);
-            }
-
-
-            return positions.ToImmutableArray();
-        }
 
         private static bool RangesCrossCall(ImmutableArray<LinearLiveRange> ranges, int callPosition)
         {
@@ -1286,7 +1285,12 @@ namespace Cnidaria.Cs
 
             if (layout.FrameAlignment <= 0)
                 throw new InvalidOperationException("Invalid stack frame alignment.");
-            if (layout.FrameSize < 0 || layout.FrameSize % layout.FrameAlignment != 0)
+
+            bool frameSizeAligned = layout.FrameSize == 0 ||
+                (method.GenTreeMethod.Target.IsX86
+                    ? checked(layout.FrameSize + method.GenTreeMethod.Target.PointerSize) % layout.FrameAlignment == 0
+                    : layout.FrameSize % layout.FrameAlignment == 0);
+            if (layout.FrameSize < 0 || !frameSizeAligned)
                 throw new InvalidOperationException("Invalid finalized stack frame size " + layout.FrameSize + ".");
 
             if (method.Funclets.Length > 1)
@@ -1411,6 +1415,7 @@ namespace Cnidaria.Cs
             }
 
             if (node.MoveKind == MoveKind.MemoryToMemory &&
+                !method.GenTreeMethod.Target.IsX86 &&
                 !IsBlockCopyMove(method, node))
             {
                 throw new InvalidOperationException(
@@ -1544,7 +1549,7 @@ namespace Cnidaria.Cs
                 int targetIndex = node.Uses.Length - 1;
                 if (targetIndex < 0 || node.UseRoles[targetIndex] != OperandRole.IndirectCallTarget)
                     throw new InvalidOperationException("Indirect call has no target operand role.");
-                if (!node.Uses[targetIndex].Equals(RegisterOperand.ForRegister(MachineRegisters.TreeScratch3)))
+                if (!node.Uses[targetIndex].Equals(RegisterOperand.ForRegister(RegisterInfo.IndirectCallTargetRegister(method.GenTreeMethod.Target))))
                     throw new InvalidOperationException("Indirect call target is not in the reserved target register.");
                 if (node.RegisterUses[targetIndex].StackKind != GenStackKind.Ptr)
                     throw new InvalidOperationException("Indirect call target does not have pointer stack kind.");

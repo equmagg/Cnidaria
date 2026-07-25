@@ -359,13 +359,16 @@ namespace Cnidaria.C
         public static TargetInfo RegisterBytecode64 { get; } = CreateRegisterBytecode(pointerSize: 8);
         public static TargetInfo RiscV32 { get; } = ForArchitecture(TargetArchitectureKind.RiscV32);
         public static TargetInfo RiscV64 { get; } = ForArchitecture(TargetArchitectureKind.RiscV64);
-        public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.X86);
-        public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
-        public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
+        public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.I386);
+        public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X86_64);
+        public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32, OperatingSystemKind.None, 
+            TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 | TargetArchitectureFeatures.ArmNeon);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
+        public static TargetInfo Arm64Linux { get; } = ForArchitecture(TargetArchitectureKind.Arm64, OperatingSystemKind.Linux);
+        public static TargetInfo Arm64Windows { get; } = ForArchitecture(TargetArchitectureKind.Arm64, OperatingSystemKind.Windows);
         public static TargetInfo RV64GLinux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RiscVG);
-        public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Windows);
-        public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X64, OperatingSystemKind.Linux);
+        public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Windows);
+        public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux);
         public static TargetInfo Default => RegisterBytecode32;
 
         public static TargetInfo ForArchitecture(
@@ -373,10 +376,14 @@ namespace Cnidaria.C
             OperatingSystemKind operatingSystem = OperatingSystemKind.None,
             TargetArchitectureFeatures features = TargetArchitectureFeatures.None)
         {
-            if (architecture is TargetArchitectureKind.X86 or TargetArchitectureKind.X64)
+            if (architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64)
                 features |= TargetArchitectureFeatures.X86Sse2;
             if (architecture == TargetArchitectureKind.Arm64)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                    | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
+            if (architecture == TargetArchitectureKind.Arm32 && operatingSystem == OperatingSystemKind.Windows)
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                    | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVA;
             if (architecture == TargetArchitectureKind.RiscV64)
@@ -386,13 +393,15 @@ namespace Cnidaria.C
                 TargetArchitectureKind.RegisterBytecode => RegisterBytecode32.WithFeatures(features),
                 TargetArchitectureKind.RegisterBytecode64 => RegisterBytecode64.WithFeatures(features),
                 TargetArchitectureKind.RiscV32 => CreateILP32(TargetArchitectureKind.RiscV32, features, operatingSystem),
-                TargetArchitectureKind.X86 => CreateILP32(TargetArchitectureKind.X86, features, operatingSystem),
+                TargetArchitectureKind.I386 => CreateILP32(TargetArchitectureKind.I386, features, operatingSystem),
                 TargetArchitectureKind.Arm32 => CreateArm32(features, operatingSystem),
                 TargetArchitectureKind.RiscV64 => CreateLP64(TargetArchitectureKind.RiscV64, features, operatingSystem),
-                TargetArchitectureKind.X64 => operatingSystem == OperatingSystemKind.Windows
+                TargetArchitectureKind.X86_64 => operatingSystem == OperatingSystemKind.Windows
                     ? CreateWindowsX64(features)
-                    : CreateLP64(TargetArchitectureKind.X64, features, operatingSystem),
-                TargetArchitectureKind.Arm64 => CreateArm64(features, operatingSystem),
+                    : CreateLP64(TargetArchitectureKind.X86_64, features, operatingSystem),
+                TargetArchitectureKind.Arm64 => operatingSystem == OperatingSystemKind.Windows
+                    ? CreateWindowsArm64(features)
+                    : CreateArm64(features, operatingSystem),
                 _ => throw new ArgumentOutOfRangeException(nameof(architecture)),
             };
         }
@@ -420,7 +429,7 @@ namespace Cnidaria.C
         public bool Is64Bit => PointerSize == 8;
         public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
         public bool IsRiscV => Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;
-        public bool IsX86 => Architecture is TargetArchitectureKind.X86 or TargetArchitectureKind.X64;
+        public bool IsX86 => Architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64;
         public bool IsArm => Architecture is TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
         public bool HasFeature(TargetArchitectureFeatures feature)
             => (ArchitectureFeatures & feature) == feature;
@@ -453,10 +462,14 @@ namespace Cnidaria.C
             if (registerAlignment <= 0)
                 throw new ArgumentOutOfRangeException(nameof(registerAlignment));
 
-            if (architecture is TargetArchitectureKind.X86 or TargetArchitectureKind.X64)
+            if (architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64)
                 features |= TargetArchitectureFeatures.X86Sse2;
             if (architecture == TargetArchitectureKind.Arm64)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                    | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
+            if (architecture == TargetArchitectureKind.Arm32 && operatingSystem == OperatingSystemKind.Windows)
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                    | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVM;
 
@@ -579,7 +592,7 @@ namespace Cnidaria.C
                 longDoubleLayout: new PrimitiveLayout(8, 8),
                 boolLayout: new PrimitiveLayout(1, 1),
                 endianness: TargetEndianness.Little,
-                charSignedness: CharSignedness.ImplementationDefined,
+                charSignedness: operatingSystem == OperatingSystemKind.Windows ? CharSignedness.Signed : CharSignedness.Unsigned,
                 architecture: TargetArchitectureKind.Arm32,
                 operatingSystem: operatingSystem,
                 features: features);
@@ -597,12 +610,33 @@ namespace Cnidaria.C
                 longLongLayout: new PrimitiveLayout(8, 8),
                 floatLayout: new PrimitiveLayout(4, 4),
                 doubleLayout: new PrimitiveLayout(8, 8),
-                longDoubleLayout: new PrimitiveLayout(16, 16),
+                longDoubleLayout: operatingSystem == OperatingSystemKind.MacOs ? new PrimitiveLayout(8, 8) : new PrimitiveLayout(16, 16),
                 boolLayout: new PrimitiveLayout(1, 1),
                 endianness: TargetEndianness.Little,
-                charSignedness: CharSignedness.ImplementationDefined,
+                charSignedness: operatingSystem is OperatingSystemKind.Windows or OperatingSystemKind.MacOs ? CharSignedness.Signed : CharSignedness.Unsigned,
                 architecture: TargetArchitectureKind.Arm64,
                 operatingSystem: operatingSystem,
+                features: features);
+
+        private static TargetInfo CreateWindowsArm64(TargetArchitectureFeatures features)
+            => new TargetInfo(
+                pointerSize: 8,
+                pointerAlignment: 8,
+                registerSize: 8,
+                registerAlignment: 8,
+                charLayout: new PrimitiveLayout(1, 1),
+                shortLayout: new PrimitiveLayout(2, 2),
+                intLayout: new PrimitiveLayout(4, 4),
+                longLayout: new PrimitiveLayout(4, 4),
+                longLongLayout: new PrimitiveLayout(8, 8),
+                floatLayout: new PrimitiveLayout(4, 4),
+                doubleLayout: new PrimitiveLayout(8, 8),
+                longDoubleLayout: new PrimitiveLayout(8, 8),
+                boolLayout: new PrimitiveLayout(1, 1),
+                endianness: TargetEndianness.Little,
+                charSignedness: CharSignedness.Signed,
+                architecture: TargetArchitectureKind.Arm64,
+                operatingSystem: OperatingSystemKind.Windows,
                 features: features);
 
         private static TargetInfo CreateWindowsX64(TargetArchitectureFeatures features)
@@ -622,7 +656,7 @@ namespace Cnidaria.C
                 boolLayout: new PrimitiveLayout(1, 1),
                 endianness: TargetEndianness.Little,
                 charSignedness: CharSignedness.ImplementationDefined,
-                architecture: TargetArchitectureKind.X64,
+                architecture: TargetArchitectureKind.X86_64,
                 operatingSystem: OperatingSystemKind.Windows,
                  features: features);
 

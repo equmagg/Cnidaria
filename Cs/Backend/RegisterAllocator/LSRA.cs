@@ -33,10 +33,15 @@ namespace Cnidaria.Cs
             {
                 AllocatableGeneralRegisters = RegisterInfo.AllocatableGeneralRegisters(target),
                 AllocatableFloatRegisters = RegisterInfo.AllocatableFloatingRegisters(target),
+                ParallelCopyScratchRegister0 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.General),
+                ParallelCopyScratchRegister1 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.General),
+                ParallelCopyFloatScratchRegister0 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.Float),
+                ParallelCopyFloatScratchRegister1 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.Float),
                 StackLayoutOptions = new RegisterStackLayoutOptions
                 {
                     FrameAlignment = target.CallFrameAlignment,
-                    SaveFramePointerWhenFrameIsUsed = target.IsRiscV,
+                    SaveFramePointerWhenFrameIsUsed = target.IsRiscV || target.Architecture == TargetArchitectureKind.I386,
+                    SaveReturnAddressForNonLeafMethods = RegisterInfo.ReturnAddress(target) != MachineRegister.Invalid,
                 },
             };
         }
@@ -2713,7 +2718,6 @@ namespace Cnidaria.Cs
                         positions.Add(rp.Position);
                 }
 
-
                 return positions.ToImmutableArray();
             }
 
@@ -4135,7 +4139,7 @@ namespace Cnidaria.Cs
                        !resultValue.LinearValueKey.Equals(useValue.LinearValueKey);
             }
 
-            private static bool TryFoldMoveWithPrevious(
+            private bool TryFoldMoveWithPrevious(
                 GenTree previous,
                 GenTree current,
                 int blockId,
@@ -4235,9 +4239,12 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool IsScratchRegister(MachineRegister register)
+            private bool IsScratchRegister(MachineRegister register)
             {
-                return register == MachineRegisters.BackendScratch ||
+                return (!_method.Target.IsX86 &&
+                        (register == RegisterInfo.ParallelCopyScratch(_method.Target, RegisterClass.General) ||
+                         register == RegisterInfo.ParallelCopyScratch(_method.Target, RegisterClass.Float))) ||
+                       register == MachineRegisters.BackendScratch ||
                        register == MachineRegisters.TreeScratch3 ||
                        register == MachineRegisters.ParallelCopyScratch0 ||
                        register == MachineRegisters.ParallelCopyScratch1 ||
@@ -4540,13 +4547,7 @@ namespace Cnidaria.Cs
                    GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
 
             private MachineRegister GetMaybeArgumentRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
-            {
-                if (registerClass == RegisterClass.Float)
-                    return RegisterInfo.GetFloatArgumentRegister(_method.Target, floatIndex++);
-                if (registerClass == RegisterClass.General)
-                    return RegisterInfo.GetIntegerArgumentRegister(_method.Target, generalIndex++);
-                return MachineRegister.Invalid;
-            }
+                => MachineAbi.ConsumeArgumentRegister(_method.Target, registerClass, ref generalIndex, ref floatIndex);
 
 
             private void EmitGcPollNode(
@@ -5067,6 +5068,9 @@ namespace Cnidaria.Cs
                 if (!destination.IsMemoryOperand || !source.IsMemoryOperand)
                     return false;
 
+                if (_method.Target.IsX86)
+                    return true;
+
                 if (!IsWideMemoryOperand(destination) && !IsWideMemoryOperand(source))
                     return false;
 
@@ -5099,24 +5103,83 @@ namespace Cnidaria.Cs
                 return scratch;
             }
 
-            private MachineRegister GetTreeScratchRegister(RegisterClass registerClass, int index)
+            private MachineRegister GetTreeScratchRegister(GenTree node, RegisterClass registerClass, int index, int position)
             {
-                var scratchPool = registerClass switch
+                if (registerClass is not (RegisterClass.General or RegisterClass.Float))
+                    throw new InvalidOperationException($"Cannot select a scratch register for {registerClass} tree node.");
+
+                int availableIndex = 0;
+                var seen = new HashSet<MachineRegister>();
+
+                bool TryCandidate(MachineRegister candidate, out MachineRegister scratch)
+                {
+                    scratch = MachineRegister.Invalid;
+                    if (candidate == MachineRegister.Invalid || !seen.Add(candidate))
+                        return false;
+                    if (!MachineRegisters.IsRegisterInClass(candidate, registerClass))
+                        return false;
+                    if (IsInternalRegisterForNode(node, candidate))
+                        return false;
+                    if (IsRegisterAllocatedAt(candidate, position) || IsRegisterAllocatedAt(candidate, position + 1))
+                        return false;
+                    if (availableIndex++ != index)
+                        return false;
+                    scratch = candidate;
+                    return true;
+                }
+
+                var reservedPool = registerClass switch
                 {
                     RegisterClass.General => MachineRegisters.TreeScratchGprs,
                     RegisterClass.Float => MachineRegisters.TreeScratchFprs,
                     _ => ImmutableArray<MachineRegister>.Empty,
                 };
 
-                var scratch = (uint)index < (uint)scratchPool.Length
-                    ? scratchPool[index]
-                    : MachineRegister.Invalid;
+                var targetScratch = RegisterInfo.ParallelCopyScratch(_method.Target, registerClass);
+                if (TryCandidate(targetScratch, out var selected))
+                    return selected;
 
-                if (scratch == MachineRegister.Invalid)
-                    throw new InvalidOperationException($"Not enough reserved scratch registers to normalize a {registerClass} tree node.");
+                if (!_method.Target.IsX86)
+                {
+                    for (int i = 0; i < reservedPool.Length; i++)
+                        if (TryCandidate(reservedPool[i], out selected))
+                            return selected;
+                }
 
-                ValidateReservedScratch(scratch, registerClass);
-                return scratch;
+                var allocatable = _options.GetAllocatableRegisters(registerClass);
+                for (int i = 0; i < allocatable.Length; i++)
+                    if (TryCandidate(allocatable[i], out selected))
+                        return selected;
+
+                throw new InvalidOperationException($"Not enough scratch registers to normalize {node} for {registerClass} at position {position}.");
+            }
+
+            private bool IsInternalRegisterForNode(GenTree node, MachineRegister register)
+            {
+                if (!_allocatedInternalRegisters.TryGetValue(node.LinearId, out var registers) &&
+                    !_allocatedInternalRegisters.TryGetValue(node.Id, out registers))
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < registers.Count; i++)
+                    if (registers[i].Register == register)
+                        return true;
+                return false;
+            }
+
+            private bool IsRegisterAllocatedAt(MachineRegister register, int position)
+            {
+                foreach (var allocation in _allocations.Values)
+                {
+                    var info = _method.GetValueInfo(allocation.Value);
+                    var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, _method.Target);
+                    var location = allocation.ValueLocationAt(position, abi);
+                    for (int i = 0; i < location.Count; i++)
+                        if (location[i].IsRegister && location[i].Register == register)
+                            return true;
+                }
+                return false;
             }
 
             private void ValidateReservedScratch(MachineRegister scratch, RegisterClass registerClass)
@@ -5330,8 +5393,6 @@ namespace Cnidaria.Cs
                 var postTreeStores = new List<RegisterResolvedMove>();
                 var scratchUseCounts = new Dictionary<RegisterClass, int>();
 
-                ReserveInternalScratchRegisters(node, scratchUseCounts);
-
                 for (int i = 0; i < node.RegisterUses.Length; i++)
                 {
                     var value = node.RegisterUses[i];
@@ -5356,7 +5417,7 @@ namespace Cnidaria.Cs
                             }
 
                             int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                            var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                            var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                             EmitMoveSequence(
                                 node.LinearBlockId,
                                 scratch,
@@ -5381,7 +5442,7 @@ namespace Cnidaria.Cs
                     }
 
                     int scalarScratchIndex = NextScratchIndex(scratchUseCounts, scalarHome.RegisterClass);
-                    var scalarScratch = RegisterOperand.ForRegister(GetTreeScratchRegister(scalarHome.RegisterClass, scalarScratchIndex));
+                    var scalarScratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, scalarHome.RegisterClass, scalarScratchIndex, position));
                     EmitMoveSequence(
                         node.LinearBlockId,
                         scalarScratch,
@@ -5410,7 +5471,7 @@ namespace Cnidaria.Cs
                             for (int s = 0; s < segments.Length; s++)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                             }
@@ -5432,7 +5493,7 @@ namespace Cnidaria.Cs
                                 }
 
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                                 if (!finalFragment.IsNone)
@@ -5454,7 +5515,7 @@ namespace Cnidaria.Cs
                             {
                                 var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(resultClass, scratchIndex));
+                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
                             }
                             else
                             {
@@ -5464,7 +5525,7 @@ namespace Cnidaria.Cs
                         else
                         {
                             int scratchIndex = NextScratchIndex(scratchUseCounts, finalResult.RegisterClass);
-                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(finalResult.RegisterClass, scratchIndex));
+                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, finalResult.RegisterClass, scratchIndex, position));
                             postTreeStores.Add(new RegisterResolvedMove(nodeResult, finalResult, resultValue, resultValue));
                         }
 
@@ -5698,7 +5759,7 @@ namespace Cnidaria.Cs
                     if (!sourceLocation.IsScalar)
                         throw new InvalidOperationException("Indirect call target has no scalar allocation source.");
                     RegisterOperand source = sourceLocation.Scalar;
-                    RegisterOperand target = RegisterOperand.ForRegister(MachineRegisters.TreeScratch3);
+                    RegisterOperand target = RegisterOperand.ForRegister(RegisterInfo.IndirectCallTargetRegister(_method.Target));
                     targets.Add(target);
                     callRegisterUses.Add(indirectCallTarget);
                     callUseRoles.Add(OperandRole.IndirectCallTarget);
@@ -5950,15 +6011,6 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Cannot address an ABI fragment inside operand: {operand}.");
             }
 
-            private static void ReserveInternalScratchRegisters(GenTree node, Dictionary<RegisterClass, int> scratchUseCounts)
-            {
-                if (node.LinearLowering.InternalGeneralRegisters != 0)
-                    scratchUseCounts[RegisterClass.General] = node.LinearLowering.InternalGeneralRegisters;
-
-                if (node.LinearLowering.InternalFloatRegisters != 0)
-                    scratchUseCounts[RegisterClass.Float] = node.LinearLowering.InternalFloatRegisters;
-            }
-
             private static int NextScratchIndex(Dictionary<RegisterClass, int> scratchUseCounts, RegisterClass registerClass)
             {
                 scratchUseCounts.TryGetValue(registerClass, out int index);
@@ -5982,8 +6034,6 @@ namespace Cnidaria.Cs
                 var resultGenTrees = ImmutableArray.CreateBuilder<GenTree>();
                 var postTreeStores = new List<RegisterResolvedMove>();
                 var scratchUseCounts = new Dictionary<RegisterClass, int>();
-
-                ReserveInternalScratchRegisters(node, scratchUseCounts);
 
                 for (int i = 0; i < node.RegisterUses.Length; i++)
                 {
@@ -6014,7 +6064,7 @@ namespace Cnidaria.Cs
                             if (requiresRegister && !home.IsRegister)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                 EmitMoveSequence(
                                     node.LinearBlockId,
                                     scratch,
@@ -6038,7 +6088,7 @@ namespace Cnidaria.Cs
                     {
                         var reloadClass = RegisterClassForReload(valueInfo, abi, scalarHome);
                         int scratchIndex = NextScratchIndex(scratchUseCounts, reloadClass);
-                        var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(reloadClass, scratchIndex));
+                        var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, reloadClass, scratchIndex, position));
                         EmitMoveSequence(
                             node.LinearBlockId,
                             scratch,
@@ -6069,7 +6119,7 @@ namespace Cnidaria.Cs
                             for (int s = 0; s < segments.Length; s++)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                             }
@@ -6088,13 +6138,13 @@ namespace Cnidaria.Cs
                                     if (RequiresCodegenResultOperand(node, resultAbi))
                                     {
                                         int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                        nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                        nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                     }
                                 }
                                 else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalFragment.IsRegister)
                                 {
                                     int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                    nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(segments[s].RegisterClass, scratchIndex));
+                                    nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
                                     postTreeStores.Add(new RegisterResolvedMove(nodeFragment, finalFragment, resultValue, resultValue));
                                 }
 
@@ -6116,14 +6166,14 @@ namespace Cnidaria.Cs
                             {
                                 var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(resultClass, scratchIndex));
+                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
                             }
                         }
                         else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalResult.IsRegister)
                         {
                             var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                             int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(resultClass, scratchIndex));
+                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
                             postTreeStores.Add(new RegisterResolvedMove(nodeResult, finalResult, resultValue, resultValue));
                         }
 

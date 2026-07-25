@@ -288,14 +288,16 @@ namespace Cnidaria.C
             {
                 TargetArchitectureKind.RiscV32 => "riscv32",
                 TargetArchitectureKind.RiscV64 => "riscv64",
-                TargetArchitectureKind.X86 => "x86",
-                TargetArchitectureKind.X64 => "x64",
+                TargetArchitectureKind.I386 => "x86",
+                TargetArchitectureKind.X86_64 => "x64",
                 TargetArchitectureKind.Arm32 => "arm",
                 TargetArchitectureKind.Arm64 => "arm64",
                 _ => target.PointerSize == 8 ? "unknown64" : "unknown32",
             };
 
             macros["__SIZEOF_POINTER__"] = target.PointerSize.ToString();
+            if (target.CharSignedness == CharSignedness.Unsigned)
+                macros["__CHAR_UNSIGNED__"] = "1";
 
             var operatingSystem = target.OperatingSystem switch
             {
@@ -338,25 +340,53 @@ namespace Cnidaria.C
             if (target.Architecture == TargetArchitectureKind.Arm32)
             {
                 macros["__ARM_ARCH"] = "7";
+                macros["__ARM_ARCH_7A__"] = "1";
+                macros["__ARM_ARCH_ISA_ARM"] = "1";
+                macros["__ARM_ARCH_ISA_THUMB"] = "2";
+                macros["__ARM_ARCH_PROFILE"] = "'A'";
                 macros["__ARM_32BIT_STATE"] = "1";
+                macros["__ARM_EABI__"] = "1";
+                macros["__ARM_PCS"] = "1";
+                macros[target.Endianness == TargetEndianness.Little ? "__ARMEL__" : "__ARMEB__"] = "1";
                 if (target.HasFeature(TargetArchitectureFeatures.ArmVfp))
+                {
                     macros["__VFP_FP__"] = "1";
+                    macros["__ARM_FP"] = "12";
+                }
                 if (target.HasFeature(TargetArchitectureFeatures.ArmNeon))
+                {
                     macros["__ARM_NEON"] = "1";
+                    macros["__ARM_NEON__"] = "1";
+                    macros["__ARM_NEON_FP"] = "4";
+                }
                 if (target.HasFeature(TargetArchitectureFeatures.ArmVfpD32))
                     macros["__ARM_VFPV3_D32__"] = "1";
                 if (target.HasFeature(TargetArchitectureFeatures.ArmHardFloat))
                     macros["__ARM_PCS_VFP"] = "1";
                 else
                     macros["__SOFTFP__"] = "1";
+                if (target.OperatingSystem == OperatingSystemKind.Windows)
+                {
+                    macros["_M_ARM_FP"] = "31";
+                    macros["_M_ARM_NT"] = "1";
+                    macros["_M_ARMT"] = "_M_ARM";
+                    macros["_M_THUMB"] = "_M_ARM";
+                }
             }
 
             if (target.Architecture == TargetArchitectureKind.Arm64)
             {
                 macros["__ARM_ARCH"] = "8";
+                macros["__ARM_ARCH_8A__"] = "1";
                 macros["__ARM_ARCH_ISA_A64"] = "1";
+                macros["__ARM_ARCH_PROFILE"] = "'A'";
+                macros["__ARM_PCS_AAPCS64"] = "1";
+                macros["__ARM_FP"] = "14";
                 macros["__ARM_FEATURE_FMA"] = "1";
                 macros["__ARM_NEON"] = "1";
+                macros["__ARM_NEON__"] = "1";
+                macros["__ARM_NEON_FP"] = "14";
+                macros[target.Endianness == TargetEndianness.Little ? "__AARCH64EL__" : "__AARCH64EB__"] = "1";
             }
 
             if (target.IsX86 &&
@@ -425,17 +455,24 @@ namespace Cnidaria.C
 
                 case "arm":
                     macros["__arm__"] = "1";
-                    macros["_M_ARM"] = "7";
+                    if (OperatingSystem == "windows")
+                        macros["_M_ARM"] = "7";
                     macros["__ARM_ARCH"] = "7";
+                    macros["__ARM_ARCH_7A__"] = "1";
                     macros["__ARM_32BIT_STATE"] = "1";
+                    macros["__ARM_EABI__"] = "1";
+                    macros["__ARMEL__"] = "1";
                     break;
 
                 case "arm64":
                 case "aarch64":
                     macros["__aarch64__"] = "1";
-                    macros["_M_ARM64"] = "1";
+                    if (OperatingSystem == "windows")
+                        macros["_M_ARM64"] = "1";
                     macros["__ARM_ARCH"] = "8";
+                    macros["__ARM_ARCH_8A__"] = "1";
                     macros["__ARM_ARCH_ISA_A64"] = "1";
+                    macros["__AARCH64EL__"] = "1";
                     break;
 
                 case "wasm":

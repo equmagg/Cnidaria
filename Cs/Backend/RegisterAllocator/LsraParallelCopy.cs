@@ -238,8 +238,6 @@ namespace Cnidaria.Cs
         {
             if (!MachineRegisters.IsRegisterInClass(register, registerClass))
                 throw new InvalidOperationException($"Invalid {registerClass} parallel-copy scratch register {register}.");
-            if (!MachineRegisters.IsReserved(register))
-                throw new InvalidOperationException($"Parallel-copy scratch register {MachineRegisters.Format(register)} must be reserved.");
         }
     }
 }

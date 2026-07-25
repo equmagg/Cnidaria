@@ -75,7 +75,7 @@ namespace Cnidaria.Cs
             foreach (var item in _bodyByMethodId.Values)
                 BuildOne(item.module, item.body, item.method);
 
-            if (_rts.Target.IsRiscV)
+            if (!_rts.Target.IsRegisterBytecode)
             {
                 foreach (GenTreeMethod method in _built.Values)
                 {
@@ -259,7 +259,7 @@ namespace Cnidaria.Cs
 
         private RuntimeMethod? MarkIndirectTypeInitializationTarget(RuntimeMethod target)
         {
-            if (!_rts.Target.IsRiscV ||
+            if (_rts.Target.IsRegisterBytecode ||
                 target.DeclaringType.IsBeforeFieldInit ||
                 StringComparer.Ordinal.Equals(target.Name, ".cctor") ||
                 (!target.IsStatic && !target.DeclaringType.IsValueType))
@@ -3048,7 +3048,7 @@ namespace Cnidaria.Cs
             MarkInstantiatedType(delegateType);
             var targetMethod = _rts.ResolveMethodInMethodContext(_module, ins.Operand1, _method);
             AddDirectDependency(targetMethod);
-            if (_rts.Target.IsRiscV && RequiresTypeInitializationBeforeCall(targetMethod))
+            if (!_rts.Target.IsRegisterBytecode && RequiresTypeInitializationBeforeCall(targetMethod))
             {
                 _rts.EnsureConstructedMembers(targetMethod.DeclaringType);
                 RuntimeMethod? cctor = FindTypeInitializer(targetMethod.DeclaringType);
@@ -5216,7 +5216,7 @@ namespace Cnidaria.Cs
 
         private bool NeedsTypeInitialization(RuntimeType type)
         {
-            if (!_rts.Target.IsRiscV)
+            if (_rts.Target.IsRegisterBytecode)
                 return false;
             _rts.EnsureConstructedMembers(type);
             if (FindTypeInitializer(type) is null)

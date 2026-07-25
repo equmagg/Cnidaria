@@ -53,11 +53,11 @@ namespace Cnidaria.Cs
             public readonly long StackMemoryUsed;
             public readonly long HeapMemoryUsed;
             public ExecutionContext(
-                long instructionsCount, 
-                TimeSpan timeElapsed, 
-                TimeSpan buildTime, 
-                TimeSpan compilationTime, 
-                long stackMemoryUsed, 
+                long instructionsCount,
+                TimeSpan timeElapsed,
+                TimeSpan buildTime,
+                TimeSpan compilationTime,
+                long stackMemoryUsed,
                 long heapMemoryUsed)
             {
                 InstructionsCount = instructionsCount;
@@ -248,6 +248,157 @@ namespace Cnidaria.Cs
                 return (output.ToString(), diagnostics, ExecutionContext.Empty);
             }
         }
+        public static (byte[]? executable, List<IDiagnostic> diagnostics) CompileToX86Executable(
+            string source, TargetInfo? target = null)
+        {
+            var (program, diags) = CompileToX86(source, target);
+            return (program?.ToExecutableBytes(), diags);
+        }
+        public static (Cnidaria.X86.X86Program? program, List<IDiagnostic> diagnostics) CompileToX86(
+            string source, TargetInfo? target = null)
+        {
+            target ??= TargetInfo.X64Windows;
+            var standardLib = target.Is64Bit ? StandartLibrary64Bit : StandartLibrary32Bit;
+            var extendedLib = target.Is64Bit ? ExtendedLibrary64Bit : ExtendedLibrary32Bit;
+            var diagnostics = new List<IDiagnostic>(extendedLib.diags);
+
+            try
+            {
+                var parser = new Parser(source, new LexerOptions { TargetPointerSize = target.PointerSize });
+                CompilationUnitSyntax root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var references = new MetadataReferenceSet(new[]
+                {
+                    standardLib.meta,
+                    extendedLib.meta,
+                });
+                Compilation compilation = CompilationFactory.Create(
+                    trees,
+                    references,
+                    new CompilationOptions(target),
+                    out var declarationDiagnostics);
+                AddDiagnostics(diagnostics, declarationDiagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                var (metadata, functions, buildDiagnostics, exception) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: references.ResolveAssemblyName,
+                    print: false);
+                if (exception is not null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, exception.ToString(), default));
+                AddDiagnostics(diagnostics, buildDiagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                byte[] flatMetadata = FlatMetadataBuilder.Build(metadata);
+                IMetadataView appMetadata = new FlatMetadataView(flatMetadata);
+                var standardModule = new RuntimeModule(standardLib.meta.ModuleName, standardLib.meta, standardLib.funcs);
+                var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta, extendedLib.funcs);
+                var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata, functions);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+                if (!modules.TryAdd(standardModule.Name, standardModule) ||
+                    !modules.TryAdd(extendedModule.Name, extendedModule) ||
+                    !modules.TryAdd(appModule.Name, appModule))
+                {
+                    throw new InvalidOperationException("Duplicate runtime module name in the compilation.");
+                }
+
+                int entryToken = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                var runtimeTypeSystem = new RuntimeTypeSystem(modules, target);
+                GenTreeProgram program = GenTreeBuilder.BuildReachableProgram(modules, runtimeTypeSystem, appModule, entryToken);
+                Cnidaria.X86.X86Program nativeProgram = BackendPipeline.CompileX86Program(program);
+                return (nativeProgram, diagnostics);
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (null, diagnostics);
+            }
+        }
+
+        public static (Cnidaria.RiscV.RiscVProgram? program, List<IDiagnostic> diagnostics) CompileToRiscV(
+            string source, TargetInfo? target = null)
+        {
+            var diagnostics = new List<IDiagnostic>(ExtendedLibrary64Bit.diags);
+
+            try
+            {
+                target ??= TargetInfo.RVA23Linux;
+
+                var parser = new Parser(source, new LexerOptions { TargetPointerSize = target.PointerSize });
+                CompilationUnitSyntax root = parser.Parse();
+                AddDiagnostics(diagnostics, parser.LexerDiagnostics);
+                AddDiagnostics(diagnostics, parser.Diagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+                var standardLib = target.Is64Bit ? StandartLibrary64Bit : StandartLibrary32Bit;
+                var extendedLib = target.Is64Bit ? ExtendedLibrary64Bit : ExtendedLibrary32Bit;
+
+                var tree = new SyntaxTree(root, "app");
+                var trees = ImmutableArray.Create(tree);
+                var references = new MetadataReferenceSet(new[]
+                {
+                    standardLib.meta,
+                    extendedLib.meta,
+                });
+                Compilation compilation = CompilationFactory.Create(
+                    trees,
+                    references,
+                    new CompilationOptions(target),
+                    out var declarationDiagnostics);
+                AddDiagnostics(diagnostics, declarationDiagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                var (metadata, functions, buildDiagnostics, exception) = compilation.BuildModule(
+                    moduleName: "app",
+                    tree: tree,
+                    includeCoreTypesInTypeDefs: false,
+                    defaultExternalAssemblyName: "std",
+                    externalAssemblyResolver: references.ResolveAssemblyName,
+                    print: false);
+                if (exception is not null)
+                    diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, exception.ToString(), default));
+                AddDiagnostics(diagnostics, buildDiagnostics);
+                if (HasErrors(diagnostics))
+                    return (null, diagnostics);
+
+                byte[] flatMetadata = FlatMetadataBuilder.Build(metadata);
+                IMetadataView appMetadata = new FlatMetadataView(flatMetadata);
+                var standardModule = new RuntimeModule(standardLib.meta.ModuleName, standardLib.meta, standardLib.funcs);
+                var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta, extendedLib.funcs);
+                var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata, functions);
+                var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
+                if (!modules.TryAdd(standardModule.Name, standardModule) ||
+                    !modules.TryAdd(extendedModule.Name, extendedModule) ||
+                    !modules.TryAdd(appModule.Name, appModule))
+                {
+                    throw new InvalidOperationException("Duplicate runtime module name in the compilation.");
+                }
+
+                int entryToken = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                var runtimeTypeSystem = new RuntimeTypeSystem(modules, target);
+                GenTreeProgram program = GenTreeBuilder.BuildReachableProgram(modules, runtimeTypeSystem, appModule, entryToken);
+                Cnidaria.RiscV.RiscVProgram nativeProgram = BackendPipeline.CompileRiscVProgram(program);
+                return (nativeProgram, diagnostics);
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+                return (null, diagnostics);
+            }
+        }
+
         /// <summary>
         /// Compiles source code to register based bytecode image as a byte array
         /// </summary>

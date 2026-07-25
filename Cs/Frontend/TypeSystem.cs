@@ -809,8 +809,10 @@ namespace Cnidaria.Cs
         public static TargetInfo RiscV32 { get; } = ForArchitecture(TargetArchitectureKind.RiscV32);
         public static TargetInfo RiscV64 { get; } = ForArchitecture(TargetArchitectureKind.RiscV64);
         public static TargetInfo RVA23Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RVA23);
-        public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.X86);
-        public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X64);
+        public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.I386);
+        public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X86_64);
+        public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux);
+        public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Windows);
         public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
 
@@ -825,9 +827,10 @@ namespace Cnidaria.Cs
             {
                 TargetArchitectureKind.RegisterBytecode => RegisterBytecode32Bit.WithFeatures(features),
                 TargetArchitectureKind.RegisterBytecode64 => RegisterBytecode64Bit.WithFeatures(features),
-                TargetArchitectureKind.X86 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 4, 16,
+                TargetArchitectureKind.I386 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 4,
+                operatingSystem == OperatingSystemKind.Windows ? 4 : 16,
                 operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.X86Sse2),
-                TargetArchitectureKind.X64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16,
+                TargetArchitectureKind.X86_64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16,
                 operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.X86Sse2),
                 TargetArchitectureKind.RiscV32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 16, 16,
                 operatingSystem: operatingSystem, architectureFeatures: features | TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF),
@@ -850,7 +853,7 @@ namespace Cnidaria.Cs
         public int StackAlignment { get; }
         public int CallFrameAlignment { get; }
         public int ObjectHeaderSize => PointerSize * 2;
-        public int ManagedObjectHeaderSize => IsRiscV && OperatingSystem == OperatingSystemKind.Linux ? PointerSize : ObjectHeaderSize;
+        public int ManagedObjectHeaderSize => IsRegisterBytecode ? ObjectHeaderSize : PointerSize;
         public int SyncBlockSize => PointerSize;
         public int MinimumManagedObjectSize => PointerSize * 2;
         public int MinimumGcObjectSize => SyncBlockSize + MinimumManagedObjectSize;
@@ -862,7 +865,7 @@ namespace Cnidaria.Cs
         public bool Is64Bit => PointerSize == 8;
         public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
         public bool IsRiscV => Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;
-        public bool IsX86 => Architecture is TargetArchitectureKind.X86 or TargetArchitectureKind.X64;
+        public bool IsX86 => Architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64;
         public bool IsArm => Architecture is TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
         public TargetInfo(
             TargetArchitectureKind architecture,

@@ -6378,6 +6378,19 @@ namespace Cnidaria.Cs
                         _owner.EmitPcrelTransfer(_owner.ResolveMethodLabel(method), link: true);
                         return;
                     }
+                    if (Target.OperatingSystem == OperatingSystemKind.Linux &&
+                        string.Equals(method.DeclaringType.Namespace, "System.Runtime.InteropServices", StringComparison.Ordinal) &&
+                        string.Equals(method.DeclaringType.Name, "Marshal", StringComparison.Ordinal) &&
+                        string.Equals(method.Name, "LinuxRequestShutdown", StringComparison.Ordinal))
+                    {
+                        _owner.EmitLoadImmediate(RVRegister.X10, MachineTarget.Is64Bit ? 0xfee1deadL : unchecked((int)0xfee1deadu));
+                        _owner.EmitLoadImmediate(RVRegister.X11, 0x28121969L);
+                        _owner.EmitLoadImmediate(RVRegister.X12, 0x4321fedcL);
+                        _owner.EmitMove(RVRegister.X13, RVRegister.X0);
+                        _owner.EmitLoadImmediate(RVRegister.X17, 142);
+                        _owner.Emit(new RVInstruction(RVInstrKind.Ecall));
+                        return;
+                    }
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     MarkEhCallSite(node, "call");

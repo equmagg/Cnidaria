@@ -1,4 +1,4 @@
-﻿using Cnidaria.RiscV;
+﻿using Cnidaria.X86;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
@@ -8,7 +8,7 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
-    internal static class RiscVRuntime
+    internal static class X86Runtime
     {
         public const string InitializeSymbol = "RhpInitialize";
         public const string GcPollSymbol = "RhpGcPoll";
@@ -43,20 +43,20 @@ namespace Cnidaria.Cs
         private const string ConsoleWriteUtf16ZSymbol = "RhpConsoleWriteUtf16Z";
         private const string ConsoleWriteStringSymbol = "RhpConsoleWriteString";
 
-        private static readonly ConcurrentDictionary<string, Lazy<RiscVProgram>> RuntimeObjects =
-            new ConcurrentDictionary<string, Lazy<RiscVProgram>>(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, Lazy<X86Program>> RuntimeObjects =
+            new ConcurrentDictionary<string, Lazy<X86Program>>(StringComparer.Ordinal);
 
-        public static RiscVProgram GetObject(TargetInfo target)
+        public static X86Program GetObject(TargetInfo target)
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
-            if (!target.IsRiscV || target.OperatingSystem != OperatingSystemKind.Linux)
-                throw new NotSupportedException("The embedded RISC-V runtime supports Linux RISC-V targets only.");
+            if (!target.IsX86 || target.OperatingSystem is not (OperatingSystemKind.Linux or OperatingSystemKind.Windows))
+                throw new NotSupportedException("The embedded x86 runtime supports Linux and Windows targets only.");
 
-            string key = $"{target.Architecture}:{(ulong)target.ArchitectureFeatures}:{target.Endianness}";
+            string key = $"{target.Architecture}:{target.OperatingSystem}:{(ulong)target.ArchitectureFeatures}:{target.Endianness}";
             return RuntimeObjects.GetOrAdd(
                 key,
-                _ => new Lazy<RiscVProgram>(
+                _ => new Lazy<X86Program>(
                     () => Compile(target),
                     LazyThreadSafetyMode.ExecutionAndPublication)).Value;
         }
@@ -200,15 +200,15 @@ namespace Cnidaria.Cs
             => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
                StringComparer.Ordinal.Equals(type.Name, name);
 
-        private static RiscVProgram Compile(TargetInfo target)
+        private static X86Program Compile(TargetInfo target)
         {
             var cTarget = Cnidaria.C.TargetInfo
-                .ForArchitecture(target.Architecture, OperatingSystemKind.Linux, target.ArchitectureFeatures)
+                .ForArchitecture(target.Architecture, target.OperatingSystem, target.ArchitectureFeatures)
                 .WithFeatures(target.ArchitectureFeatures);
             string source = ReadRuntimeSource("CLRSource.c");
             var compilation = Cnidaria.C.Compilation.CreateFromSource(
                 source,
-                filePath: "runtime/riscv_linux_runtime.c",
+                filePath: $"runtime/{(target.Is32Bit ? "x86" : "x64")}_{(target.OperatingSystem == OperatingSystemKind.Windows ? "windows" : "linux")}_runtime.c",
                 includeStandardHeaders: false,
                 options: new Cnidaria.C.CompilationOptions(cTarget));
             var errors = compilation.GetDiagnostics()
@@ -216,15 +216,15 @@ namespace Cnidaria.Cs
                 .Select(diagnostic => diagnostic.GetMessage(source))
                 .ToArray();
             if (errors.Length != 0)
-                throw new InvalidOperationException($"RISC-V runtime compilation failed: {string.Join("\n", errors)}");
+                throw new InvalidOperationException($"x86 runtime compilation failed: {string.Join("\n", errors)}");
 
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
             var cfg = Cnidaria.C.ControlFlowGraph.Build(semanticModel);
             var ssa = Cnidaria.C.SsaGraph.Build(cfg);
             var lir = Cnidaria.C.LirModule.Lower(ssa);
-            return Cnidaria.C.RiscVCodeGenerator.Generate(
+            return Cnidaria.C.X86CodeGenerator.Generate(
                 lir,
-                options: new Cnidaria.C.RiscVCodeGeneratorOptions
+                options: new Cnidaria.C.X86CodeGeneratorOptions
                 {
                     EmitStartup = false,
                     EntryFunctionName = InitializeSymbol,
@@ -232,7 +232,7 @@ namespace Cnidaria.Cs
         }
         private static string ReadRuntimeSource(string fileName)
         {
-            var asm = typeof(RiscVRuntime).Assembly;
+            var asm = typeof(X86Runtime).Assembly;
             string resourceName = $"Cnidaria.Cs.Backend.CLR.{fileName}";
             using (var s = asm.GetManifestResourceStream(resourceName))
             {

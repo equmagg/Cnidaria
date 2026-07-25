@@ -1495,7 +1495,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            private static bool TryCreateContainedOperand(GenTree parent, int operandIndex, GenTree operand, out LirOperandFlags result)
+            private bool TryCreateContainedOperand(GenTree parent, int operandIndex, GenTree operand, out LirOperandFlags result)
             {
                 if (CanContainBinaryImmediate(parent, operandIndex, operand) ||
                     CanContainDefaultStoreValue(parent, operandIndex, operand))
@@ -1522,7 +1522,7 @@ namespace Cnidaria.Cs
                 };
             }
 
-            private static bool CanContainBinaryImmediate(GenTree parent, int operandIndex, GenTree operand)
+            private bool CanContainBinaryImmediate(GenTree parent, int operandIndex, GenTree operand)
             {
                 if (parent.Kind != GenTreeKind.Binary || operandIndex != 1)
                     return false;
@@ -1541,6 +1541,14 @@ namespace Cnidaria.Cs
 
                 if (parent.SourceOp == BytecodeOp.Cgt_Un)
                     return false;
+
+                if (_target.Architecture == TargetArchitectureKind.X86_64 &&
+                    operand.Kind == GenTreeKind.ConstI8 &&
+                    parent.SourceOp is not (BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un) &&
+                    (operand.Int64 < int.MinValue || operand.Int64 > int.MaxValue))
+                {
+                    return false;
+                }
 
                 return IsBinaryImmediateOp(parent.SourceOp);
             }
@@ -1912,10 +1920,10 @@ namespace Cnidaria.Cs
                     operands: ImmutableArray<GenTree>.Empty);
 
                 var flags = GenTreeLinearFlags.IsStandaloneLoweredNode | GenTreeLinearFlags.GcSafePoint;
-                if (_nonCallOperationsClobberCallerSavedRegisters)
-                    flags |= GenTreeLinearFlags.CallerSavedKill;
-                else
+                if (_target.IsRegisterBytecode)
                     flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
+                else
+                    flags |= GenTreeLinearFlags.CallerSavedKill;
 
                 var lowering = new GenTreeLinearLoweringInfo(
                     flags,

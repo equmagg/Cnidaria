@@ -57,7 +57,7 @@ namespace Cnidaria.C
             return target.Architecture switch
             {
                 TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => CreateTargetOptions(target),
-                TargetArchitectureKind.X86 or TargetArchitectureKind.X64 => CreateTargetOptions(target),
+                TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64 => CreateTargetOptions(target),
                 TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64 => CreateTargetOptions(target),
                 _ => Default
             };
@@ -84,7 +84,7 @@ namespace Cnidaria.C
         private readonly LSRAOptions _options;
         private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
         private readonly List<int> _callPositions = new();
-        private readonly List<int> _inlineAssemblyPositions = new();
+        private readonly List<InlineAssemblySite> _inlineAssemblySites = new();
 
         private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options)
         {
@@ -99,7 +99,7 @@ namespace Cnidaria.C
         private AllocationResult Allocate()
         {
             _callPositions.Clear();
-            _inlineAssemblyPositions.Clear();
+            _inlineAssemblySites.Clear();
             var intervals = BuildIntervals();
             var allocations = new Dictionary<LirVirtualRegister, VirtualRegisterAllocation>();
 
@@ -109,9 +109,9 @@ namespace Cnidaria.C
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
             }
 
-            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblyPositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblySites);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblySites);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _target, _callPositions, _inlineAssemblySites);
 
             foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
             {
@@ -161,7 +161,7 @@ namespace Cnidaria.C
                     if (instruction.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(instruction))
                         _callPositions.Add(pos);
                     else if (instruction.Kind == LirInstructionKind.InlineAssembly)
-                        _inlineAssemblyPositions.Add(pos);
+                        _inlineAssemblySites.Add(CreateInlineAssemblySite(instruction, pos));
                     RecordCopyPreferences(instruction);
                     VisitInstructionUses(
                         instruction,
@@ -209,6 +209,117 @@ namespace Cnidaria.C
             }
 
             return intervals;
+        }
+
+        private InlineAssemblySite CreateInlineAssemblySite(LirInstruction instruction, int position)
+        {
+            var reserved = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            var touched = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
+                return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
+
+            foreach (var output in asmStatement.Outputs)
+            {
+                if (output.Target is null ||
+                    InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Register)
+                {
+                    continue;
+                }
+
+                ReserveInlineAssemblyOperand(reserved, touched, output.Constraint, output.Target.Type);
+            }
+
+            foreach (var input in asmStatement.Inputs)
+            {
+                if (input.Value is null ||
+                    InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) != InlineAsmOperandStorage.Register ||
+                    InlineAsmConstraints.MatchingOperand(input.Constraint) is not null)
+                {
+                    continue;
+                }
+
+                ReserveInlineAssemblyOperand(reserved, touched, input.Constraint, input.Value.Type);
+            }
+
+            foreach (var clobber in asmStatement.Clobbers)
+            {
+                if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
+                    string.Equals(clobber, "cc", StringComparison.Ordinal) ||
+                    string.Equals(clobber, "redzone", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (TryParseInlineAssemblyRegister(clobber, out var register))
+                    AddInlineAssemblyRegister(reserved, touched, register);
+            }
+
+            return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
+        }
+
+        private void ReserveInlineAssemblyOperand(
+            ImmutableHashSet<MachineRegister>.Builder reserved,
+            ImmutableHashSet<MachineRegister>.Builder touched,
+            string constraint,
+            QualifiedType type)
+        {
+            var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(constraint);
+            var registerClass = CAbi.PreferredLirRegisterClass(_target, type);
+            if (explicitRegister is not null &&
+                TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
+            {
+                AddInlineAssemblyRegister(reserved, touched, fixedRegister);
+                return;
+            }
+
+            var registers = registerClass switch
+            {
+                LirRegisterClass.General or LirRegisterClass.Address => _options.GeneralRegisters,
+                LirRegisterClass.Floating => _options.FloatingRegisters,
+                LirRegisterClass.Vector => _options.VectorRegisters,
+                _ => ImmutableArray<MachineRegister>.Empty,
+            };
+            reserved.UnionWith(registers);
+        }
+
+        private void AddInlineAssemblyRegister(
+            ImmutableHashSet<MachineRegister>.Builder reserved,
+            ImmutableHashSet<MachineRegister>.Builder touched,
+            MachineRegister register)
+        {
+            if (_target.Architecture == TargetArchitectureKind.Arm32 &&
+                register >= MachineRegister.V0 && register <= MachineRegister.V15)
+            {
+                var vectorIndex = (int)register - (int)MachineRegister.V0;
+                var firstDouble = (MachineRegister)((int)MachineRegister.F0 + checked(vectorIndex * 2));
+                reserved.Add(firstDouble);
+                touched.Add(firstDouble);
+                var secondDouble = (MachineRegister)((int)firstDouble + 1);
+                reserved.Add(secondDouble);
+                touched.Add(secondDouble);
+                return;
+            }
+
+            reserved.Add(register);
+            touched.Add(register);
+        }
+
+        private bool TryParseInlineAssemblyRegister(string text, out MachineRegister register)
+        {
+            foreach (var registerClass in new[]
+            {
+                LirRegisterClass.General,
+                LirRegisterClass.Address,
+                LirRegisterClass.Vector,
+                LirRegisterClass.Floating,
+            })
+            {
+                if (TargetRegisterInfo.TryParseExplicitRegister(_target, text, registerClass, out register))
+                    return true;
+            }
+
+            register = MachineRegister.Invalid;
+            return false;
         }
 
         private static void ComputeBlockLiveness(
@@ -494,7 +605,7 @@ namespace Cnidaria.C
             IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
             TargetInfo target,
             IReadOnlyList<int> callPositions,
-            IReadOnlyList<int> inlineAssemblyPositions)
+            IReadOnlyList<InlineAssemblySite> inlineAssemblySites)
         {
             if (physicalRegisters.IsDefaultOrEmpty)
                 return;
@@ -512,7 +623,7 @@ namespace Cnidaria.C
             {
                 ExpireOldIntervals(interval, active, allocations);
 
-                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, target, callPositions, inlineAssemblyPositions);
+                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, target, callPositions, inlineAssemblySites);
                 if (allowedRegisters.IsDefaultOrEmpty)
                 {
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
@@ -539,25 +650,48 @@ namespace Cnidaria.C
             ImmutableArray<MachineRegister> physicalRegisters,
             TargetInfo target,
             IReadOnlyList<int> callPositions,
-            IReadOnlyList<int> inlineAssemblyPositions)
+            IReadOnlyList<InlineAssemblySite> inlineAssemblySites)
         {
             if (interval.Register.HasFixedRegister)
                 return ImmutableArray.Create(interval.Register.FixedRegister);
 
-            if (IntervalSpansPosition(interval, inlineAssemblyPositions))
-                return ImmutableArray<MachineRegister>.Empty;
-
-            if (!IntervalSpansPosition(interval, callPositions))
-                return physicalRegisters;
-
+            var spansCall = IntervalSpansPosition(interval, callPositions);
             var builder = ImmutableArray.CreateBuilder<MachineRegister>();
             foreach (var register in physicalRegisters)
             {
-                if (TargetRegisterInfo.IsCalleeSaved(target, register))
+                if (spansCall && !CanUseRegisterAcrossCall(target, interval, register))
+                    continue;
+
+                var reserved = false;
+                foreach (var site in inlineAssemblySites)
+                {
+                    if (!IntervalSpansPosition(interval, site.Position))
+                        continue;
+                    if (site.ReservedRegisters.Contains(register))
+                    {
+                        reserved = true;
+                        break;
+                    }
+                }
+
+                if (!reserved)
                     builder.Add(register);
             }
 
             return builder.ToImmutable();
+        }
+
+        private static bool CanUseRegisterAcrossCall(TargetInfo target, LiveInterval interval, MachineRegister register)
+        {
+            if (!TargetRegisterInfo.IsCalleeSaved(target, register))
+                return false;
+            if (target.Architecture == TargetArchitectureKind.Arm64 &&
+                interval.Register.RegisterClass == LirRegisterClass.Vector &&
+                Math.Max(1, target.SizeOf(interval.Register.Type)) > 8)
+            {
+                return false;
+            }
+            return true;
         }
 
         private static bool IntervalSpansPosition(LiveInterval interval, IReadOnlyList<int> positions)
@@ -574,6 +708,9 @@ namespace Cnidaria.C
 
             return false;
         }
+
+        private static bool IntervalSpansPosition(LiveInterval interval, int position)
+            => position >= interval.Start && position + 1 < interval.End;
 
         private static int ActiveRegisterCount(List<LiveInterval> active, ImmutableArray<MachineRegister> registers)
         {
@@ -805,27 +942,26 @@ namespace Cnidaria.C
                 if (!pair.Value.IsSpilled)
                     continue;
 
-                if (pair.Key.RegisterClass == LirRegisterClass.Vector)
-                    throw new NotImplementedException("Vector register spilling is not implemented.");
-
-                offset = AlignUp(offset, _options.SpillSlotAlignment);
+                offset = AlignUp(offset, SpillSlotAlignmentFor(pair.Key));
                 spillOffsets.Add(pair.Key, offset);
                 offset = checked(offset + SpillSlotSizeFor(pair.Key));
             }
             var spillAreaSize = checked(offset - spillAreaOffset);
 
             var parallelCopyTempSize = ComputeParallelCopyTempSize(allocations, spillOffsets);
-            offset = AlignUp(offset, _options.SpillSlotAlignment);
+            offset = AlignUp(offset, _options.StackAlignment);
             var parallelCopyTempOffset = offset;
             offset = checked(offset + parallelCopyTempSize);
             offset = AlignUp(offset, _options.SpillSlotAlignment);
             var floatingImmediateTempOffset = offset;
-            var floatingImmediateTempSize = AlignUp(Math.Max(8, _options.SpillSlotSize), _options.SpillSlotAlignment);
+            var floatingImmediateTempMinimum = _target.Architecture == TargetArchitectureKind.I386 ? 32 : 8;
+            var floatingImmediateTempSize = AlignUp(Math.Max(floatingImmediateTempMinimum, _options.SpillSlotSize), _options.SpillSlotAlignment);
             offset = checked(offset + floatingImmediateTempSize);
 
             var usedRegisters = allocations.Values
                 .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
                 .Select(static a => a.PhysicalRegister)
+                .Concat(_inlineAssemblySites.SelectMany(static site => site.TouchedRegisters))
                 .Where(register => TargetRegisterInfo.IsCalleeSaved(_target, register))
                 .Distinct()
                 .OrderBy(static r => (int)r)
@@ -911,6 +1047,9 @@ namespace Cnidaria.C
             var maxSize = 0;
             foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
             {
+                if (instruction.Kind == LirInstructionKind.InlineAssembly)
+                    maxSize = Math.Max(maxSize, ComputeInlineAssemblyTempSize(instruction));
+
                 if (instruction.Kind != LirInstructionKind.ParallelCopy)
                     continue;
 
@@ -936,6 +1075,43 @@ namespace Cnidaria.C
 
             return maxSize;
         }
+
+        private int ComputeInlineAssemblyTempSize(LirInstruction instruction)
+        {
+            if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
+                return 0;
+
+            var registerOperandCount = 0;
+            var maxSize = 0;
+            foreach (var output in asmStatement.Outputs)
+            {
+                if (output.Target is null ||
+                    InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Register)
+                {
+                    continue;
+                }
+
+                registerOperandCount++;
+                maxSize = Math.Max(maxSize, InlineAssemblyTempSlotSize(output.Target.Type));
+            }
+
+            foreach (var input in asmStatement.Inputs)
+            {
+                if (input.Value is null ||
+                    InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) != InlineAsmOperandStorage.Register)
+                {
+                    continue;
+                }
+
+                registerOperandCount++;
+                maxSize = Math.Max(maxSize, InlineAssemblyTempSlotSize(input.Value.Type));
+            }
+
+            return registerOperandCount > 1 ? maxSize : 0;
+        }
+
+        private int InlineAssemblyTempSlotSize(QualifiedType type)
+            => AlignUp(Math.Max(_options.SpillSlotSize, SizeOfStorage(type)), _options.SpillSlotAlignment);
 
         private static bool RequiresPhysicalParallelCopy(
             LirParallelCopy copy,
@@ -1096,8 +1272,13 @@ namespace Cnidaria.C
             return AlignUp(Math.Max(_options.SpillSlotSize, size), _options.SpillSlotAlignment);
         }
 
+        private int SpillSlotAlignmentFor(LirVirtualRegister register)
+            => Math.Max(
+                _options.SpillSlotAlignment,
+                Math.Min(Math.Max(1, _target.AlignOf(register.Type)), _options.StackAlignment));
+
         private int SpillSlotSizeFor(LirVirtualRegister register)
-            => AlignUp(Math.Max(_options.SpillSlotSize, SizeOfStorage(register.Type)), _options.SpillSlotAlignment);
+            => AlignUp(Math.Max(_options.SpillSlotSize, SizeOfStorage(register.Type)), SpillSlotAlignmentFor(register));
 
         private int SizeOfStorage(QualifiedType type)
             => Math.Max(1, _target.SizeOf(type));
@@ -1111,6 +1292,23 @@ namespace Cnidaria.C
                 return value;
             var mask = alignment - 1;
             return checked((value + mask) & ~mask);
+        }
+
+        private readonly struct InlineAssemblySite
+        {
+            public int Position { get; }
+            public ImmutableHashSet<MachineRegister> ReservedRegisters { get; }
+            public ImmutableHashSet<MachineRegister> TouchedRegisters { get; }
+
+            public InlineAssemblySite(
+                int position,
+                ImmutableHashSet<MachineRegister> reservedRegisters,
+                ImmutableHashSet<MachineRegister> touchedRegisters)
+            {
+                Position = position;
+                ReservedRegisters = reservedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
+                TouchedRegisters = touchedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
+            }
         }
 
         private readonly struct BlockRange

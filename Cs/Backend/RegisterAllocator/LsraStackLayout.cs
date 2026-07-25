@@ -386,7 +386,11 @@ namespace Cnidaria.Cs
                         CollectOutgoingArgumentSlotsFromNode(nodes[i]);
                 }
 
-                for (int i = 0; i < _options.OutgoingArgumentSlotCount; i++)
+                int minimumSlotCount = _options.OutgoingArgumentSlotCount;
+                if (MethodMayCall())
+                    minimumSlotCount = Math.Max(minimumSlotCount, RegisterInfo.MinimumOutgoingArgumentSlots(Target));
+
+                for (int i = 0; i < minimumSlotCount; i++)
                     AddOutgoingArgumentSpec(i, RegisterClass.General, StorageForOutgoingArgumentSlot(RegisterClass.General, StorageForRegisterClass(RegisterClass.General)));
             }
 
@@ -457,7 +461,8 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException($"Frame alignment must be a power of two: {frameAlignment}.");
 
                 bool usesFramePointer = ShouldUseFramePointer();
-                bool saveReturnAddress = _options.SaveReturnAddressForLeafMethods || (_options.SaveReturnAddressForNonLeafMethods && MethodMayCall());
+                bool saveReturnAddress = RegisterInfo.ReturnAddress(Target) != MachineRegister.Invalid &&
+                    (_options.SaveReturnAddressForLeafMethods || (_options.SaveReturnAddressForNonLeafMethods && MethodMayCall()));
 
                 var calleeSaved = ImmutableArray.CreateBuilder<StackFrameSlot>();
                 int calleeSaveOffset = cursor;
@@ -500,12 +505,13 @@ namespace Cnidaria.Cs
                 int gcSpillOffset = cursor;
                 int gcRootSpillSlotCount = 0;
                 int gcSpillSize = 0;
-                bool hasGcSafePoint = Target.IsRiscV && MethodHasGcSafePoint();
-                int typeOperationScratchSize = Target.IsRiscV ? ComputeTypeOperationScratchSize() : 0;
-                if (Target.IsRiscV && (hasGcSafePoint || typeOperationScratchSize != 0))
+                bool supportsGcTransitionArea = Target.IsRiscV || Target.IsX86;
+                bool hasGcSafePoint = supportsGcTransitionArea && MethodHasGcSafePoint();
+                int typeOperationScratchSize = supportsGcTransitionArea ? ComputeTypeOperationScratchSize() : 0;
+                if (supportsGcTransitionArea && (hasGcSafePoint || typeOperationScratchSize != 0))
                 {
-                    int floatingArgumentSize = RegisterInfo.AbiFloatingRegisterSize(Target);
-                    cursor = AlignUp(cursor, Math.Max(Target.PointerSize, floatingArgumentSize));
+                    int transitionAlignment = Math.Max(Target.PointerSize, ComputeNewObjectArgumentSaveAlignment());
+                    cursor = AlignUp(cursor, transitionAlignment);
                     gcSpillOffset = cursor;
                     gcRootSpillSlotCount = hasGcSafePoint ? ComputeGcRootSpillSlotCount() : 0;
                     int gcRootSpillSize = checked(gcRootSpillSlotCount * Target.PointerSize);
@@ -520,17 +526,15 @@ namespace Cnidaria.Cs
 
                     if (MethodHasReferenceNewObject())
                     {
-                        gcSpillCursor = AlignUp(gcSpillCursor, Math.Max(Target.PointerSize, floatingArgumentSize));
-                        gcSpillCursor = checked(gcSpillCursor + 7 * Target.GeneralRegisterSize);
-                        gcSpillCursor = AlignUp(gcSpillCursor, Math.Max(1, floatingArgumentSize));
-                        gcSpillCursor = checked(gcSpillCursor + 8 * floatingArgumentSize);
+                        gcSpillCursor = AlignUp(gcSpillCursor, ComputeNewObjectArgumentSaveAlignment());
+                        gcSpillCursor = checked(gcSpillCursor + ComputeNewObjectArgumentSaveSize());
                     }
 
                     gcSpillSize = gcSpillCursor;
                     cursor = checked(cursor + gcSpillSize);
                 }
 
-                int frameSize = AlignUp(cursor, frameAlignment);
+                int frameSize = AlignFrameSize(cursor, frameAlignment);
 
                 return new StackFrameLayout(
                     frameSize,
@@ -561,6 +565,15 @@ namespace Cnidaria.Cs
             }
 
 
+            private int AlignFrameSize(int size, int alignment)
+            {
+                if (!Target.IsX86 || alignment <= Target.PointerSize || (size == 0 && !MethodMayCall()))
+                    return AlignUp(size, alignment);
+
+                int sizeWithReturnAddress = checked(size + Target.PointerSize);
+                return checked(AlignUp(sizeWithReturnAddress, alignment) - Target.PointerSize);
+            }
+
             private bool MethodHasGcSafePoint()
             {
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
@@ -571,15 +584,20 @@ namespace Cnidaria.Cs
                         GenTreeKind.GcPoll or
                         GenTreeKind.NewObject or
                         GenTreeKind.NewArray or
+                        GenTreeKind.NewDelegate or
+                        GenTreeKind.DelegateCombine or
+                        GenTreeKind.DelegateRemove or
                         GenTreeKind.Box)
                     {
                         return true;
                     }
-                    if (node.TreeKind == GenTreeKind.IndirectCall)
+                    if (node.TreeKind is GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                         return true;
                     if (node.TreeKind == GenTreeKind.Call &&
                         (node.Method?.HasInternalCall != true ||
-                        (Target.IsRiscV && node.Method is not null && RiscVRuntime.IsGcSafePointInternalCall(node.Method))))
+                        (node.Method is not null &&
+                         ((Target.IsRiscV && RiscVRuntime.IsGcSafePointInternalCall(node.Method)) ||
+                          (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(node.Method))))))
                     {
                         return true;
                     }
@@ -594,10 +612,13 @@ namespace Cnidaria.Cs
                 {
                     GenTree node = _method.LinearNodes[i];
                     RuntimeType? type = TypeOperationScratchType(node);
-                    if (type?.IsValueType != true)
-                        continue;
+                    if (type?.IsValueType == true)
+                        size = Math.Max(size, Math.Max(1, type.SizeOf));
 
-                    size = Math.Max(size, Math.Max(1, type.SizeOf));
+                    if (node.TreeKind == GenTreeKind.NewDelegate && node.Uses.Length != 0)
+                        size = Math.Max(size, Target.PointerSize);
+                    else if (node.TreeKind is GenTreeKind.DelegateCombine or GenTreeKind.DelegateRemove)
+                        size = Math.Max(size, checked(Target.PointerSize * 3));
                 }
 
                 return size == 0 ? 0 : AlignUp(size, ComputeTypeOperationScratchAlignment());
@@ -624,6 +645,52 @@ namespace Cnidaria.Cs
                     return _method.GenTreeMethod.GetValueInfo(node.RegisterUses[0]).Type ?? node.RuntimeType ?? node.Type;
 
                 return node.RuntimeType ?? node.Type;
+            }
+
+            private int ComputeNewObjectArgumentSaveAlignment()
+            {
+                int alignment = Target.PointerSize;
+                for (int i = 1; i < 32; i++)
+                {
+                    MachineRegister register = RegisterInfo.GetIntegerArgumentRegister(Target, i);
+                    if (register == MachineRegister.Invalid)
+                        break;
+                    alignment = Math.Max(alignment, RegisterInfo.RegisterSaveAlignment(Target, register));
+                }
+                for (int i = 0; i < 32; i++)
+                {
+                    MachineRegister register = RegisterInfo.GetFloatArgumentRegister(Target, i);
+                    if (register == MachineRegister.Invalid)
+                        break;
+                    alignment = Math.Max(alignment, RegisterInfo.RegisterSaveAlignment(Target, register));
+                }
+                return Math.Max(1, alignment);
+            }
+
+            private int ComputeNewObjectArgumentSaveSize()
+            {
+                int cursor = 0;
+                for (int i = 1; i < 32; i++)
+                {
+                    MachineRegister register = RegisterInfo.GetIntegerArgumentRegister(Target, i);
+                    if (register == MachineRegister.Invalid)
+                        break;
+                    int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                    int size = RegisterInfo.RegisterSaveSize(Target, register);
+                    cursor = AlignUp(cursor, alignment);
+                    cursor = checked(cursor + size);
+                }
+                for (int i = 0; i < 32; i++)
+                {
+                    MachineRegister register = RegisterInfo.GetFloatArgumentRegister(Target, i);
+                    if (register == MachineRegister.Invalid)
+                        break;
+                    int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                    int size = RegisterInfo.RegisterSaveSize(Target, register);
+                    cursor = AlignUp(cursor, alignment);
+                    cursor = checked(cursor + size);
+                }
+                return cursor;
             }
 
             private bool MethodHasReferenceNewObject()
@@ -721,7 +788,9 @@ namespace Cnidaria.Cs
 
             private bool ShouldUseFramePointer()
             {
-                if (Target.IsRiscV && (MethodHasGcSafePoint() || ComputeTypeOperationScratchSize() != 0))
+                if ((Target.IsRiscV || Target.IsX86) && MethodHasGcSafePoint())
+                    return true;
+                if ((Target.IsRiscV || Target.IsX86) && ComputeTypeOperationScratchSize() != 0)
                     return true;
 
                 if (_options.UseFramePointerForFunclets && _method.Funclets.Length > 1)
@@ -733,7 +802,7 @@ namespace Cnidaria.Cs
                 if (MethodHasDynamicStackAllocation())
                     return true;
 
-                if (UsesSpecificCalleeSavedRegister(MachineRegisters.FramePointer))
+                if (UsesSpecificCalleeSavedRegister(RegisterInfo.FramePointer(Target)))
                     return true;
 
                 return _options.SaveFramePointerWhenFrameIsUsed;
@@ -770,11 +839,11 @@ namespace Cnidaria.Cs
                 int index = 0;
 
                 if (saveReturnAddress)
-                    AllocateSavedRegisterSlot(slots, ref cursor, ref index, StackFrameSlotKind.ReturnAddress, MachineRegisters.ReturnAddress);
+                    AllocateSavedRegisterSlot(slots, ref cursor, ref index, StackFrameSlotKind.ReturnAddress, RegisterInfo.ReturnAddress(Target));
 
                 var used = new SortedSet<MachineRegister>();
                 if (forceFramePointerSave)
-                    used.Add(MachineRegisters.FramePointer);
+                    used.Add(RegisterInfo.FramePointer(Target));
                 if (_options.SaveUsedCalleeSavedRegisters)
                     CollectUsedCalleeSavedRegisters(used);
 
@@ -1049,7 +1118,7 @@ namespace Cnidaria.Cs
             {
                 int generalArgumentIndex = 0;
                 int floatArgumentIndex = 0;
-                int incomingStackArgumentIndex = 0;
+                int incomingStackArgumentIndex = RegisterInfo.MinimumOutgoingArgumentSlots(Target);
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                     _method.GenTreeMethod.RuntimeMethod,
                     _method.GenTreeMethod.ArgTypes.Length,
@@ -1241,7 +1310,7 @@ namespace Cnidaria.Cs
 
                 int generalArgumentIndex = 0;
                 int floatArgumentIndex = 0;
-                int incomingStackArgumentIndex = 0;
+                int incomingStackArgumentIndex = RegisterInfo.MinimumOutgoingArgumentSlots(Target);
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                     _method.GenTreeMethod.RuntimeMethod,
                     _method.GenTreeMethod.ArgTypes.Length,

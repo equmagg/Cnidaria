@@ -155,7 +155,7 @@ namespace Cnidaria.Cs
                     linearId: id);
             }
 
-            private static ImmutableArray<RegisterUnwindCode> BuildUnwindCodes(ImmutableArray<GenTree> nodes)
+            private ImmutableArray<RegisterUnwindCode> BuildUnwindCodes(ImmutableArray<GenTree> nodes)
             {
                 var result = ImmutableArray.CreateBuilder<RegisterUnwindCode>();
 
@@ -185,7 +185,7 @@ namespace Cnidaria.Cs
                 return result.ToImmutable();
             }
 
-            private static bool TryMapUnwindCode(GenTree node, out RegisterUnwindCode code)
+            private bool TryMapUnwindCode(GenTree node, out RegisterUnwindCode code)
             {
                 RegisterUnwindCodeKind kind;
                 MachineRegister register = MachineRegister.Invalid;
@@ -233,7 +233,7 @@ namespace Cnidaria.Cs
 
                     case FrameOperation.EstablishFramePointer:
                         kind = RegisterUnwindCodeKind.SetFramePointer;
-                        register = MachineRegisters.FramePointer;
+                        register = RegisterInfo.FramePointer(Target);
                         break;
 
                     default:
@@ -264,9 +264,9 @@ namespace Cnidaria.Cs
                         nodes.Count,
                         FrameOperation.EnterFuncletFrame,
                         _method.StackFrame.UsesFramePointer
-                            ? RegisterOperand.ForRegister(MachineRegisters.FramePointer)
-                            : RegisterOperand.ForRegister(MachineRegisters.StackPointer),
-                        ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.StackPointer)),
+                            ? RegisterOperand.ForRegister(RegisterInfo.FramePointer(Target))
+                            : RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target)),
+                        ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target))),
                         immediate: 0,
                         comment: "funclet prolog: attach to establisher frame"));
 
@@ -288,8 +288,8 @@ namespace Cnidaria.Cs
                         blockId,
                         nodes.Count,
                         FrameOperation.AllocateFrame,
-                        RegisterOperand.ForRegister(MachineRegisters.StackPointer),
-                        ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.StackPointer)),
+                        RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target)),
+                        ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target))),
                         frameSize,
                         "prolog: sp -= frameSize"));
                 }
@@ -316,8 +316,8 @@ namespace Cnidaria.Cs
                         blockId,
                         nodes.Count,
                         FrameOperation.EstablishFramePointer,
-                        RegisterOperand.ForRegister(MachineRegisters.FramePointer),
-                        ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.StackPointer)),
+                        RegisterOperand.ForRegister(RegisterInfo.FramePointer(Target)),
+                        ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target))),
                         immediate: 0,
                         comment: "prolog: fp = sp"));
                 }
@@ -412,16 +412,30 @@ namespace Cnidaria.Cs
                         checked(slot.Offset + offset),
                         chunk);
 
-                    nodes.Add(GenTreeLirFactory.Move(
-                        _nextNodeId++,
-                        blockId,
-                        nodes.Count,
-                        destination,
-                        RegisterOperand.ForRegister(MachineRegisters.Zero),
-                        destinationValue: null,
-                        sourceValue: null,
-                        comment: "prolog: zero GC home slot",
-                        moveFlags: MoveFlags.Internal));
+                    if (Target.IsX86)
+                    {
+                        nodes.Add(GenTreeLirFactory.DefaultValue(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            destination,
+                            type: null,
+                            stackKind: chunk == 8 ? GenStackKind.I8 : GenStackKind.I4,
+                            comment: "prolog: zero GC home slot"));
+                    }
+                    else
+                    {
+                        nodes.Add(GenTreeLirFactory.Move(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            destination,
+                            RegisterOperand.ForRegister(MachineRegisters.Zero),
+                            destinationValue: null,
+                            sourceValue: null,
+                            comment: "prolog: zero GC home slot",
+                            moveFlags: MoveFlags.Internal));
+                    }
 
                     offset += chunk;
                     remaining -= chunk;
@@ -471,7 +485,7 @@ namespace Cnidaria.Cs
 
                 int generalArgumentIndex = 0;
                 int floatArgumentIndex = 0;
-                int incomingStackArgumentIndex = 0;
+                int incomingStackArgumentIndex = RegisterInfo.MinimumOutgoingArgumentSlots(Target);
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(runtimeMethod, argTypes.Length, Target);
 
                 for (int i = 0; i < argTypes.Length; i++)
@@ -664,6 +678,21 @@ namespace Cnidaria.Cs
 
                 if (destination.IsMemoryOperand && source.IsMemoryOperand)
                 {
+                    if (Target.IsX86)
+                    {
+                        nodes.Add(GenTreeLirFactory.Move(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            destination,
+                            source,
+                            destinationValue: value,
+                            sourceValue: null,
+                            comment: "prolog: initialize initial SSA argument value",
+                            moveFlags: MoveFlags.AbiArgument | MoveFlags.Internal));
+                        return;
+                    }
+
                     var scratch = RegisterOperand.ForRegister(SelectInitialSsaArgumentCopyScratch(destination, source));
                     nodes.Add(GenTreeLirFactory.Move(
                         _nextNodeId++,
@@ -701,11 +730,11 @@ namespace Cnidaria.Cs
                     moveFlags: MoveFlags.AbiArgument | MoveFlags.Internal));
             }
 
-            private static MachineRegister SelectInitialSsaArgumentCopyScratch(RegisterOperand destination, RegisterOperand source)
+            private MachineRegister SelectInitialSsaArgumentCopyScratch(RegisterOperand destination, RegisterOperand source)
             {
                 if (destination.RegisterClass == RegisterClass.Float || source.RegisterClass == RegisterClass.Float)
-                    return MachineRegisters.FloatBackendScratch;
-                return MachineRegisters.BackendScratch;
+                    return RegisterInfo.ParallelCopyScratch(Target, RegisterClass.Float);
+                return RegisterInfo.ParallelCopyScratch(Target, RegisterClass.General);
             }
 
             private bool TryGetIncomingPromotedArgumentFieldOperand(
@@ -764,7 +793,7 @@ namespace Cnidaria.Cs
 
                 int generalArgumentIndex = 0;
                 int floatArgumentIndex = 0;
-                int incomingStackArgumentIndex = 0;
+                int incomingStackArgumentIndex = RegisterInfo.MinimumOutgoingArgumentSlots(Target);
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                     _method.GenTreeMethod.RuntimeMethod,
                     _method.GenTreeMethod.ArgTypes.Length,
@@ -939,7 +968,7 @@ namespace Cnidaria.Cs
             {
                 int generalArgumentIndex = 0;
                 int floatArgumentIndex = 0;
-                int incomingStackArgumentIndex = 0;
+                int incomingStackArgumentIndex = RegisterInfo.MinimumOutgoingArgumentSlots(Target);
                 int hiddenReturnBufferIndex = MachineAbi.HiddenReturnBufferInsertionIndex(
                     _method.GenTreeMethod.RuntimeMethod,
                     _method.GenTreeMethod.ArgTypes.Length,
@@ -1074,6 +1103,21 @@ namespace Cnidaria.Cs
 
                 if (destination.IsMemoryOperand && source.IsMemoryOperand)
                 {
+                    if (Target.IsX86 && actualSize <= Target.GeneralRegisterSize)
+                    {
+                        nodes.Add(GenTreeLirFactory.Move(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            destination,
+                            source,
+                            destinationValue: null,
+                            sourceValue: null,
+                            comment: "prolog: home incoming argument",
+                            moveFlags: MoveFlags.AbiArgument | MoveFlags.Internal));
+                        return;
+                    }
+
                     if (actualSize > Target.GeneralRegisterSize)
                     {
                         EmitIncomingArgumentHomeBlockStore(blockId, nodes, destination, source, actualSize);
@@ -1129,7 +1173,23 @@ namespace Cnidaria.Cs
                     int chunkSize = remaining >= 8 ? 8 : remaining >= 4 ? 4 : remaining >= 2 ? 2 : 1;
                     var chunkSource = SliceFrameOperand(source, offset, chunkSize);
                     var chunkDestination = SliceFrameOperand(destination, offset, chunkSize);
-                    var scratch = RegisterOperand.ForRegister(MachineRegisters.BackendScratch);
+                    if (Target.IsX86)
+                    {
+                        nodes.Add(GenTreeLirFactory.Move(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            chunkDestination,
+                            chunkSource,
+                            destinationValue: null,
+                            sourceValue: null,
+                            comment: "prolog: home incoming block argument",
+                            moveFlags: MoveFlags.AbiArgument | MoveFlags.Internal));
+                        offset = checked(offset + chunkSize);
+                        continue;
+                    }
+
+                    var scratch = RegisterOperand.ForRegister(RegisterInfo.ParallelCopyScratch(Target, RegisterClass.General));
 
                     nodes.Add(GenTreeLirFactory.Move(
                         _nextNodeId++,
@@ -1354,10 +1414,10 @@ namespace Cnidaria.Cs
                         blockId,
                         nodes.Count,
                         FrameOperation.LeaveFuncletFrame,
-                        RegisterOperand.ForRegister(MachineRegisters.StackPointer),
+                        RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target)),
                         _method.StackFrame.UsesFramePointer
-                            ? ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.FramePointer))
-                            : ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.StackPointer)),
+                            ? ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.FramePointer(Target)))
+                            : ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target))),
                         immediate: 0,
                         comment: "funclet epilog: detach from establisher frame"));
 
@@ -1378,8 +1438,8 @@ namespace Cnidaria.Cs
                         blockId,
                         nodes.Count,
                         FrameOperation.RestoreStackPointerFromFramePointer,
-                        RegisterOperand.ForRegister(MachineRegisters.StackPointer),
-                        ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.FramePointer)),
+                        RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target)),
+                        ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.FramePointer(Target))),
                         immediate: 0,
                         comment: "epilog: sp = fp"));
                 }
@@ -1406,8 +1466,8 @@ namespace Cnidaria.Cs
                         blockId,
                         nodes.Count,
                         FrameOperation.FreeFrame,
-                        RegisterOperand.ForRegister(MachineRegisters.StackPointer),
-                        ImmutableArray.Create(RegisterOperand.ForRegister(MachineRegisters.StackPointer)),
+                        RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target)),
+                        ImmutableArray.Create(RegisterOperand.ForRegister(RegisterInfo.StackPointer(Target))),
                         frameSize,
                         "epilog: sp += frameSize"));
                 }

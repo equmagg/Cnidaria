@@ -765,7 +765,7 @@ namespace Cnidaria.X86
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
-            if (target.Architecture is not TargetArchitectureKind.X86 and not TargetArchitectureKind.X64)
+            if (target.Architecture is not TargetArchitectureKind.I386 and not TargetArchitectureKind.X86_64)
                 throw new ArgumentException("Target architecture is not x86", nameof(target));
 
             return CreateFromDescriptor(target.Architecture, target.OperatingSystem, target.ArchitectureFeatures, target.Endianness);
@@ -775,7 +775,7 @@ namespace Cnidaria.X86
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
-            if (target.Architecture is not TargetArchitectureKind.X86 and not TargetArchitectureKind.X64)
+            if (target.Architecture is not TargetArchitectureKind.I386 and not TargetArchitectureKind.X86_64)
                 throw new ArgumentException("Target architecture is not x86", nameof(target));
 
             return CreateFromDescriptor(target.Architecture, target.OperatingSystem, target.ArchitectureFeatures, target.Endianness);
@@ -791,7 +791,7 @@ namespace Cnidaria.X86
             if ((features & TargetArchitectureFeatures.X86Avx2) != 0)
                 isa |= X86IsaFlags.Avx | X86IsaFlags.Avx2;
 
-            if (architecture == TargetArchitectureKind.X86)
+            if (architecture == TargetArchitectureKind.I386)
                 return new X86Target(32, X86AbiKind.Cdecl, isa, endianness, operatingSystem);
 
             return new X86Target(64, operatingSystem == OperatingSystemKind.Windows ? X86AbiKind.WindowsX64 : X86AbiKind.SysV64, isa | X86IsaFlags.Sse | X86IsaFlags.Sse2, endianness, operatingSystem);

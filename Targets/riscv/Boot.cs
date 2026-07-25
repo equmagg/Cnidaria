@@ -101,7 +101,7 @@ namespace Cnidaria.RiscV
         private static string ReadBootSource(string fileName)
         {
             var asm = typeof(Cnidaria.RiscV.RiscVZBoot).Assembly;
-            string resourceName = "Cnidaria.riscv.boot." + fileName;
+            string resourceName = "Cnidaria.Targets.riscv.boot." + fileName;
             using (var s = asm.GetManifestResourceStream(resourceName))
             {
                 if (s != null)
@@ -873,7 +873,7 @@ namespace Cnidaria.RiscV
         private static string ReadUserSource(string fileName)
         {
             var asm = typeof(RiscVUserland).Assembly;
-            string resourceName = "Cnidaria.riscv.os." + fileName;
+            string resourceName = "Cnidaria.Targets.riscv.os." + fileName;
             using var stream = asm.GetManifestResourceStream(resourceName);
             if (stream is null)
                 throw new FileNotFoundException($"User source not found: {fileName}");
@@ -910,7 +910,7 @@ namespace Cnidaria.RiscV
         private static string ReadKernelSource(string fileName)
         {
             var asm = typeof(RiscVKernel).Assembly;
-            string resourceName = "Cnidaria.riscv.os." + fileName;
+            string resourceName = "Cnidaria.Targets.riscv.os." + fileName;
             using (var s = asm.GetManifestResourceStream(resourceName))
             {
                 if (s != null)

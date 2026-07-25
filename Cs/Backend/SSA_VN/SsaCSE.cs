@@ -57,6 +57,7 @@ namespace Cnidaria.Cs
             public readonly ValueNumberPair NormalValue;
             public readonly List<Occurrence> Occurrences = new List<Occurrence>();
             public bool Selected;
+            public bool ForceCse;
             public bool LiveAcrossCall;
             public GenLocalDescriptor? TempDescriptor;
             public int Cost;
@@ -215,6 +216,8 @@ namespace Cnidaria.Cs
 
             private void LocateCandidates()
             {
+                SeedForcedCandidates();
+
                 for (int b = 0; b < _method.Blocks.Length; b++)
                 {
                     var block = _method.Blocks[b];
@@ -223,7 +226,7 @@ namespace Cnidaria.Cs
                     {
                         var item = block.TreeList[i];
                         var node = item.Tree.Source;
-                        if (node.Parent is null || !CanConsider(node))
+                        if (node.Parent is null || !SsaCseCandidatePolicy.CanConsider(node))
                             continue;
                         if (!_vn.TryGetTreeValue(node, out var pair))
                             continue;
@@ -237,9 +240,10 @@ namespace Cnidaria.Cs
                             conservativeNormal = liberalNormal;
 
                         var key = new CseKey(liberalNormal, node.StackKind, node.Type);
+                        bool forceCse = (node.Flags & GenTreeFlags.MakeCse) != 0;
                         if (!_candidateByKey.TryGetValue(key, out var candidate))
                         {
-                            if (_candidates.Count >= MaxCandidateCount)
+                            if (_candidates.Count >= MaxCandidateCount && !forceCse)
                                 continue;
 
                             candidate = new Candidate(
@@ -250,7 +254,9 @@ namespace Cnidaria.Cs
                             _candidates.Add(candidate);
                         }
 
-                        var exceptionSet = _vn.Store.VNExceptionSet(pair.Liberal);
+                        candidate.ForceCse |= forceCse;
+
+                        var exceptionSet = _vn.Store.VNExceptionSet(pair.Conservative);
                         var occurrence = new Occurrence(
                             candidate,
                             block,
@@ -261,6 +267,46 @@ namespace Cnidaria.Cs
                             blockWeight);
                         candidate.Occurrences.Add(occurrence);
                         _occurrenceByNode[node] = occurrence;
+                    }
+                }
+            }
+
+            private void SeedForcedCandidates()
+            {
+                for (int b = 0; b < _method.Blocks.Length; b++)
+                {
+                    var block = _method.Blocks[b];
+                    for (int i = 0; i < block.TreeList.Length; i++)
+                    {
+                        var node = block.TreeList[i].Tree.Source;
+                        if (node.Parent is null ||
+                            (node.Flags & GenTreeFlags.MakeCse) == 0 ||
+                            !SsaCseCandidatePolicy.CanConsider(node) ||
+                            !_vn.TryGetTreeValue(node, out var pair))
+                        {
+                            continue;
+                        }
+
+                        var liberalNormal = _vn.Store.VNNormalValue(pair.Liberal);
+                        if (!liberalNormal.IsValid || _vn.Store.TryGetConstant(liberalNormal, out _))
+                            continue;
+
+                        var conservativeNormal = _vn.Store.VNNormalValue(pair.Conservative);
+                        if (!conservativeNormal.IsValid)
+                            conservativeNormal = liberalNormal;
+
+                        var key = new CseKey(liberalNormal, node.StackKind, node.Type);
+                        if (!_candidateByKey.TryGetValue(key, out var candidate))
+                        {
+                            candidate = new Candidate(
+                                _candidates.Count + 1,
+                                key,
+                                new ValueNumberPair(liberalNormal, conservativeNormal));
+                            _candidateByKey.Add(key, candidate);
+                            _candidates.Add(candidate);
+                        }
+
+                        candidate.ForceCse = true;
                     }
                 }
             }
@@ -436,7 +482,7 @@ namespace Cnidaria.Cs
                     if (!AllDefinitionOccurrencesCanBeMaterialized(candidate))
                         continue;
 
-                    candidate.Cost = EstimateCost(candidate.Occurrences[0].Node);
+                    candidate.Cost = SsaCseCandidatePolicy.EstimateCost(candidate.Occurrences[0].Node);
                     if (!PassesProfitabilityCheck(candidate))
                         continue;
 
@@ -445,7 +491,10 @@ namespace Cnidaria.Cs
 
                 selectable.Sort(static (left, right) =>
                 {
-                    int c = right.Cost.CompareTo(left.Cost);
+                    int c = right.ForceCse.CompareTo(left.ForceCse);
+                    if (c != 0)
+                        return c;
+                    c = right.Cost.CompareTo(left.Cost);
                     if (c != 0)
                         return c;
                     c = right.WeightedUseCount.CompareTo(left.WeightedUseCount);
@@ -506,7 +555,11 @@ namespace Cnidaria.Cs
 
             private bool PassesProfitabilityCheck(Candidate candidate)
             {
-                if (candidate.Cost <= 1 || candidate.UseCount <= 0 || candidate.DefCount <= 0)
+                if (candidate.UseCount <= 0 || candidate.DefCount <= 0)
+                    return false;
+                if (candidate.ForceCse)
+                    return true;
+                if (candidate.Cost <= 1)
                     return false;
 
                 var representative = candidate.Occurrences[0].Node;
@@ -911,6 +964,7 @@ namespace Cnidaria.Cs
             private GenTree CreateStore(Candidate candidate, Occurrence occurrence)
             {
                 var temp = candidate.TempDescriptor!;
+                occurrence.Node.Flags &= ~GenTreeFlags.MakeCse;
                 var store = new GenTree(
                     _nextSyntheticTreeId++,
                     GenTreeKind.StoreTemp,
@@ -986,143 +1040,14 @@ namespace Cnidaria.Cs
             private static int EncodeCseDef(int index) => index << 1;
             private static int EncodeCseUse(int index) => (index << 1) | 1;
 
-            private static bool CanConsider(GenTree node)
-            {
-                if (!ProducesValue(node) || !CanMaterializeInTemp(node))
-                    return false;
-
-                if ((node.Flags & (GenTreeFlags.ContainsCall |
-                                   GenTreeFlags.SideEffect |
-                                   GenTreeFlags.MemoryWrite |
-                                   GenTreeFlags.LocalDef |
-                                   GenTreeFlags.AddressExposed |
-                                   GenTreeFlags.Allocation |
-                                   GenTreeFlags.ControlFlow |
-                                   GenTreeFlags.ExceptionFlow)) != 0)
-                    return false;
-
-                if (IsMemoryReadCandidate(node))
-                    return true;
-
-                if ((node.Flags & (GenTreeFlags.CanThrow |
-                                   GenTreeFlags.MemoryRead |
-                                   GenTreeFlags.GlobalRef |
-                                   GenTreeFlags.Indirect)) != 0)
-                    return false;
-
-                return node.Kind switch
-                {
-                    GenTreeKind.Unary => true,
-                    GenTreeKind.Binary => true,
-                    GenTreeKind.Conv => true,
-                    GenTreeKind.SizeOf => true,
-                    GenTreeKind.FieldAddr => true,
-                    GenTreeKind.StaticFieldAddr => true,
-                    GenTreeKind.StaticData => true,
-                    GenTreeKind.PointerElementAddr => true,
-                    GenTreeKind.PointerDiff => true,
-                    _ => false,
-                };
-            }
-
-            private static bool IsMemoryReadCandidate(GenTree node)
-            {
-                if (node.SsaMemoryUses.IsDefaultOrEmpty || !node.SsaMemoryDefinitions.IsDefaultOrEmpty)
-                    return false;
-                if ((node.Flags & GenTreeFlags.MemoryRead) == 0)
-                    return false;
-                if ((node.Flags & (GenTreeFlags.SideEffect |
-                                   GenTreeFlags.MemoryWrite |
-                                   GenTreeFlags.LocalDef |
-                                   GenTreeFlags.AddressExposed |
-                                   GenTreeFlags.Allocation |
-                                   GenTreeFlags.ControlFlow |
-                                   GenTreeFlags.ExceptionFlow)) != 0)
-                    return false;
-
-                return node.Kind switch
-                {
-                    GenTreeKind.Field => true,
-                    GenTreeKind.StaticField => true,
-                    GenTreeKind.LoadIndirect => true,
-                    GenTreeKind.ArrayElement => true,
-                    GenTreeKind.ArrayDataRef => true,
-                    _ => false,
-                };
-            }
-
-            private static bool CanMaterializeInTemp(GenTree node)
-            {
-                return node.StackKind is
-                    GenStackKind.I4 or
-                    GenStackKind.I8 or
-                    GenStackKind.R4 or
-                    GenStackKind.R8 or
-                    GenStackKind.NativeInt or
-                    GenStackKind.NativeUInt or
-                    GenStackKind.Ref or
-                    GenStackKind.Ptr;
-            }
-
-            private static bool ProducesValue(GenTree node)
-            {
-                if (node.StackKind == GenStackKind.Void)
-                    return false;
-
-                return node.Kind switch
-                {
-                    GenTreeKind.Nop => false,
-                    GenTreeKind.StoreIndirect => false,
-                    GenTreeKind.StoreLocal => false,
-                    GenTreeKind.StoreArg => false,
-                    GenTreeKind.StoreTemp => false,
-                    GenTreeKind.StoreField => false,
-                    GenTreeKind.StoreStaticField => false,
-                    GenTreeKind.StoreArrayElement => false,
-                    GenTreeKind.Eval => false,
-                    GenTreeKind.Branch => false,
-                    GenTreeKind.BranchTrue => false,
-                    GenTreeKind.BranchFalse => false,
-                    GenTreeKind.Return => false,
-                    GenTreeKind.Throw => false,
-                    GenTreeKind.Rethrow => false,
-                    GenTreeKind.EndFinally => false,
-                    _ => true,
-                };
-            }
-
-            private static int EstimateCost(GenTree node)
-            {
-                int cost = node.Kind switch
-                {
-                    GenTreeKind.Unary => 2,
-                    GenTreeKind.Binary => 3,
-                    GenTreeKind.Conv => 2,
-                    GenTreeKind.SizeOf => 1,
-                    GenTreeKind.Field => 4,
-                    GenTreeKind.StaticField => 4,
-                    GenTreeKind.LoadIndirect => 4,
-                    GenTreeKind.ArrayElement => 5,
-                    GenTreeKind.StaticFieldAddr => 2,
-                    GenTreeKind.FieldAddr => 2,
-                    GenTreeKind.ArrayDataRef => 4,
-                    GenTreeKind.StaticData => 1,
-                    GenTreeKind.PointerElementAddr => 3,
-                    GenTreeKind.PointerDiff => 3,
-                    _ => 1,
-                };
-
-                for (int i = 0; i < node.Operands.Length; i++)
-                    cost += Math.Max(1, EstimateCost(node.Operands[i]) / 2);
-                return cost;
-            }
-
             private static void RefreshFlags(GenTree node)
             {
                 for (int i = 0; i < node.Operands.Length; i++)
                     RefreshFlags(node.Operands[i]);
 
-                var flags = node.Flags;
+                var flags = node.Kind == GenTreeKind.Eval
+                    ? node.Flags & (GenTreeFlags.Prolog | GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse)
+                    : node.Flags;
                 for (int i = 0; i < node.Operands.Length; i++)
                     flags |= node.Operands[i].Flags & ~GenTreeFlags.AssertionProperties;
                 node.Flags = flags;

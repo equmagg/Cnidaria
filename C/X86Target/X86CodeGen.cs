@@ -8,6 +8,14 @@ using Cnidaria.X86;
 
 namespace Cnidaria.C
 {
+    public sealed class X86CodeGeneratorOptions
+    {
+        public static X86CodeGeneratorOptions Default => new X86CodeGeneratorOptions();
+
+        public bool EmitStartup { get; set; } = true;
+        public string EntryFunctionName { get; set; } = "main";
+    }
+
     public sealed class X86CodeGenerator
     {
         private const string TextSectionName = ".text";
@@ -19,6 +27,7 @@ namespace Cnidaria.C
         private readonly TargetInfo _target;
         private readonly X86Target _machineTarget;
         private readonly LSRAOptions _allocationOptions;
+        private readonly X86CodeGeneratorOptions _options;
         private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
         private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
@@ -33,23 +42,24 @@ namespace Cnidaria.C
         private TextSectionBuilder _text = null!;
         private int _nextLocalId;
 
-        private X86CodeGenerator(LirModule module, LSRAOptions? allocationOptions)
+        private X86CodeGenerator(LirModule module, LSRAOptions? allocationOptions, X86CodeGeneratorOptions? options)
         {
             _module = module ?? throw new ArgumentNullException(nameof(module));
             _target = module.SemanticModel.Compilation.Options.Target;
-            if (_target.Architecture is not TargetArchitectureKind.X86 and not TargetArchitectureKind.X64)
+            if (_target.Architecture is not TargetArchitectureKind.I386 and not TargetArchitectureKind.X86_64)
                 throw new NotSupportedException("x86 C backend requires X86 or X64 target.");
             _machineTarget = X86Target.FromTargetInfo(_target);
             _allocationOptions = ReserveCodeGenScratchRegisters(_target, allocationOptions ?? LSRAOptions.ForTarget(_target));
+            _options = options ?? X86CodeGeneratorOptions.Default;
         }
 
         private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options)
         {
             var reservedGeneral = target.Architecture switch
             {
-                TargetArchitectureKind.X86 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X4, MachineRegister.X5),
-                TargetArchitectureKind.X64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
-                TargetArchitectureKind.X64 => ImmutableHashSet.Create(MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
+                TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X4, MachineRegister.X5),
+                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
+                TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
                 _ => ImmutableHashSet<MachineRegister>.Empty,
             };
 
@@ -65,8 +75,11 @@ namespace Cnidaria.C
                 stackArgumentSlotSize: options.StackArgumentSlotSize);
         }
 
-        public static X86Program Generate(LirModule module, LSRAOptions? allocationOptions = null)
-            => new X86CodeGenerator(module, allocationOptions).Generate();
+        public static X86Program Generate(
+            LirModule module,
+            LSRAOptions? allocationOptions = null,
+            X86CodeGeneratorOptions? options = null)
+            => new X86CodeGenerator(module, allocationOptions, options).Generate();
 
         private X86Program Generate()
         {
@@ -76,14 +89,16 @@ namespace Cnidaria.C
             foreach (var function in _module.Functions)
                 EmitFunction(function);
 
-            var selectedEntry = _functionLabelsByName.TryGetValue("main", out var mainLabel)
-                ? mainLabel
+            var selectedEntry = _functionLabelsByName.TryGetValue(_options.EntryFunctionName, out var requestedEntry)
+                ? requestedEntry
                 : (_functionLabels.Values.FirstOrDefault() ?? string.Empty);
-            var entry = IsWindowsExecutableTarget
-                ? EmitWindowsRuntime(selectedEntry)
-                : IsLinuxExecutableTarget
-                    ? EmitLinuxRuntime(selectedEntry)
-                    : selectedEntry;
+            var entry = _options.EmitStartup
+                ? IsWindowsExecutableTarget
+                    ? EmitWindowsRuntime(selectedEntry)
+                    : IsLinuxExecutableTarget
+                        ? EmitLinuxRuntime(selectedEntry)
+                        : selectedEntry
+                : selectedEntry;
 
             AddSectionSymbols();
             var dataSections = ImmutableArray.CreateBuilder<X86DataSection>();
@@ -116,6 +131,8 @@ namespace Cnidaria.C
             AddExternalSymbol("__imp_HeapAlloc", X86ObjectSymbolKind.Object);
             AddExternalSymbol("__imp_HeapReAlloc", X86ObjectSymbolKind.Object);
             AddExternalSymbol("__imp_HeapFree", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_VirtualAlloc", X86ObjectSymbolKind.Object);
+            AddExternalSymbol("__imp_VirtualFree", X86ObjectSymbolKind.Object);
 
             return EmitWindowsStart(userEntryLabel);
         }
@@ -892,7 +909,8 @@ namespace Cnidaria.C
                 var namedOperands = new Dictionary<string, int>(StringComparer.Ordinal);
                 var labels = new List<string>();
                 var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
-                var outputFinalizers = new List<Action>();
+                var outputBindings = new List<X86AsmRegisterBinding>();
+                var inputBindings = new List<X86AsmRegisterBinding>();
                 var operandIndex = 0;
                 var copyIndex = 0;
 
@@ -914,7 +932,11 @@ namespace Cnidaria.C
                         if (copyIndex >= instruction.ParallelCopies.Length)
                             throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
                         var destination = instruction.ParallelCopies[copyIndex++].Destination;
-                        formatted = CreateX86AsmOutputOperand(output, destination, instruction, outputFinalizers);
+                        var binding = new X86AsmRegisterBinding(output, destination, null);
+                        outputBindings.Add(binding);
+                        formatted = new InlineAsmFormattedOperand(
+                            output.Name,
+                            modifier => X86Registers.Format(binding.Register, X86AsmRegisterSize(modifier, RegisterSize(binding.Type))));
                     }
 
                     AddAsmOperand(operands, namedOperands, formatted);
@@ -925,8 +947,25 @@ namespace Cnidaria.C
                     if (operandIndex >= instruction.Operands.Length)
                         throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
 
-                    var operand = instruction.Operands[operandIndex++];
-                    var formatted = CreateX86AsmInputOperand(input, operand, instruction);
+                    var value = instruction.Operands[operandIndex++];
+                    var storage = InlineAsmConstraints.PreferredStorage(input.Constraint, value.Type);
+                    InlineAsmFormattedOperand formatted;
+                    if (storage == InlineAsmOperandStorage.Memory)
+                    {
+                        formatted = new InlineAsmFormattedOperand(input.Name, modifier => FormatX86AsmMemoryOperand(value, instruction));
+                    }
+                    else if (storage == InlineAsmOperandStorage.Immediate)
+                    {
+                        formatted = new InlineAsmFormattedOperand(input.Name, modifier => FormatX86AsmImmediate(value, instruction));
+                    }
+                    else
+                    {
+                        var binding = new X86AsmRegisterBinding(input, null, value);
+                        inputBindings.Add(binding);
+                        formatted = new InlineAsmFormattedOperand(
+                            input.Name,
+                            modifier => X86Registers.Format(binding.Register, X86AsmRegisterSize(modifier, RegisterSize(binding.Type))));
+                    }
                     AddAsmOperand(operands, namedOperands, formatted);
                 }
 
@@ -943,6 +982,11 @@ namespace Cnidaria.C
                     labels.Add(text);
                 }
 
+                var clobbers = GetX86AsmClobbers(asmStatement, instruction);
+                ResolveX86AsmMatchingOperands(outputBindings, inputBindings, instruction);
+                AllocateX86AsmRegisters(outputBindings, inputBindings, clobbers, instruction);
+                EmitX86AsmInputMoves(outputBindings, inputBindings, clobbers, instruction);
+
                 var expanded = InlineAsmTemplateExpander.Expand(
                     asmStatement.Text,
                     operands,
@@ -952,8 +996,7 @@ namespace Cnidaria.C
                     _owner.CreateLocalLabel(_functionLabel + "_asm_id"));
                 EmitInlineAssemblyText(instruction, expanded);
 
-                foreach (var finalize in outputFinalizers)
-                    finalize();
+                EmitX86AsmOutputMoves(outputBindings, clobbers, instruction);
 
                 if (asmStatement.IsGoto && instruction.Target is not null)
                     EmitJump(instruction.Target);
@@ -966,50 +1009,550 @@ namespace Cnidaria.C
                 operands.Add(operand);
             }
 
-            private InlineAsmFormattedOperand CreateX86AsmOutputOperand(GimpleAsmOperand operand, LirVirtualRegister destination, LirInstruction instruction, List<Action> finalizers)
+            private void ResolveX86AsmMatchingOperands(
+                IReadOnlyList<X86AsmRegisterBinding> outputs,
+                IReadOnlyList<X86AsmRegisterBinding> inputs,
+                LirInstruction instruction)
             {
-                var size = RegisterSize(destination.Type);
-                var fixedRegister = TryGetX86ConstraintRegister(operand.Constraint, destination.Type);
-                if (fixedRegister.HasValue)
+                var namedOutputs = new Dictionary<string, X86AsmRegisterBinding>(StringComparer.Ordinal);
+                foreach (var output in outputs)
                 {
-                    if (operand.IsReadWrite)
-                        LoadX86AsmOperandInto(LirOperand.ForRegister(destination), fixedRegister.Value, instruction);
-                    finalizers.Add(() => StoreX86AsmOutput(destination, fixedRegister.Value));
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => X86Registers.Format(fixedRegister.Value, X86AsmRegisterSize(modifier, size)));
+                    if (output.Operand.Name is not null && !namedOutputs.ContainsKey(output.Operand.Name))
+                        namedOutputs.Add(output.Operand.Name, output);
                 }
 
-                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                    throw Unsupported(instruction, $"Invalid or unsupported x86 explicit register constraint '{operand.Constraint}'.");
+                foreach (var input in inputs)
+                {
+                    var matching = InlineAsmConstraints.MatchingOperand(input.Operand.Constraint);
+                    if (matching is null)
+                        continue;
 
-                var register = GetWritableRegister(destination, PreferredScratch(destination.Type));
-                finalizers.Add(() => StoreWritableRegisterIfSpilled(destination, register));
-                return new InlineAsmFormattedOperand(operand.Name, modifier => X86Registers.Format(register, X86AsmRegisterSize(modifier, size)));
+                    X86AsmRegisterBinding? output = null;
+                    if (int.TryParse(matching, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+                    {
+                        if ((uint)index < (uint)outputs.Count)
+                            output = outputs[index];
+                    }
+                    else
+                    {
+                        namedOutputs.TryGetValue(matching, out output);
+                    }
+
+                    if (output is null)
+                        throw Unsupported(instruction, $"Inline assembly matching constraint '{input.Operand.Constraint}' does not name a register output.");
+                    if (IsFloatType(input.Type) != IsFloatType(output.Type))
+                        throw Unsupported(instruction, "Inline assembly matching operands use incompatible register classes.");
+
+                    input.MatchingOutput = output;
+                }
             }
 
-            private InlineAsmFormattedOperand CreateX86AsmInputOperand(GimpleAsmOperand operand, LirOperand value, LirInstruction instruction)
+            private HashSet<X86Register> GetX86AsmClobbers(GimpleAsmStatement asmStatement, LirInstruction instruction)
             {
-                var storage = InlineAsmConstraints.PreferredStorage(operand.Constraint, value.Type);
-                if (storage == InlineAsmOperandStorage.Memory)
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatX86AsmMemoryOperand(value, instruction));
-                if (storage == InlineAsmOperandStorage.Immediate)
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatX86AsmImmediate(value, instruction));
-
-                var size = RegisterSize(value.Type);
-                var fixedRegister = TryGetX86ConstraintRegister(operand.Constraint, value.Type);
-                if (fixedRegister.HasValue)
+                var result = new HashSet<X86Register>();
+                foreach (var clobber in asmStatement.Clobbers)
                 {
-                    LoadX86AsmOperandInto(value, fixedRegister.Value, instruction);
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => X86Registers.Format(fixedRegister.Value, X86AsmRegisterSize(modifier, size)));
+                    if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
+                        string.Equals(clobber, "cc", StringComparison.Ordinal) ||
+                        string.Equals(clobber, "redzone", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (!TryParseX86ExplicitRegisterName(clobber, out var register) || !IsUsableX86ExplicitRegister(register))
+                        throw Unsupported(instruction, $"Invalid or unsupported x86 inline assembly clobber '{clobber}'.");
+                    if (register is X86Register.Rsp or X86Register.Rbp or X86Register.Rip)
+                        throw Unsupported(instruction, $"Inline assembly cannot clobber {clobber}.");
+                    result.Add(register);
+                }
+                return result;
+            }
+
+            private void AllocateX86AsmRegisters(
+                IReadOnlyList<X86AsmRegisterBinding> outputs,
+                IReadOnlyList<X86AsmRegisterBinding> inputs,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                var usedOutputs = new HashSet<X86Register>();
+                foreach (var output in outputs)
+                {
+                    var fixedRegister = TryGetX86ConstraintRegister(output.Operand.Constraint, output.Type);
+                    if (!fixedRegister.HasValue)
+                        continue;
+                    AssignX86AsmOutputRegister(output, fixedRegister.Value, usedOutputs, clobbers, instruction);
                 }
 
-                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                    throw Unsupported(instruction, $"Invalid or unsupported x86 explicit register constraint '{operand.Constraint}'.");
+                foreach (var output in outputs)
+                {
+                    if (output.Register != X86Register.Invalid)
+                        continue;
 
-                if (IsFloatType(value.Type))
-                    return new InlineAsmFormattedOperand(
-                        operand.Name, modifier => X86Registers.Format(LoadFloatingOperand(value, FpScratch1, instruction), X86AsmRegisterSize(modifier, size)));
+                    var candidates = GetX86AsmRegisterCandidates(output.Operand.Constraint, output.Type, instruction);
+                    var preferred = TryGetAllocatedX86Register(output.Output!, out var allocated) ? allocated : X86Register.Invalid;
+                    var selected = SelectX86AsmRegister(candidates, preferred, clobbers, usedOutputs, null);
+                    if (selected == X86Register.Invalid)
+                        throw Unsupported(instruction, $"Cannot satisfy inline assembly output constraint '{output.Operand.Constraint}'.");
+                    AssignX86AsmOutputRegister(output, selected, usedOutputs, clobbers, instruction);
+                }
 
-                return new InlineAsmFormattedOperand(operand.Name, modifier => FormatX86AsmRegisterOperand(value, instruction, X86AsmRegisterSize(modifier, size)));
+                var earlyClobbers = new HashSet<X86Register>();
+                var usedInputs = new Dictionary<X86Register, X86AsmRegisterBinding>();
+                foreach (var output in outputs)
+                {
+                    if (InlineAsmConstraints.IsEarlyClobber(output.Operand.Constraint))
+                        earlyClobbers.Add(output.Register);
+                    if (output.Operand.IsReadWrite)
+                        usedInputs[output.Register] = output;
+                }
+
+                foreach (var input in inputs)
+                {
+                    if (input.MatchingOutput is not null)
+                    {
+                        input.Register = input.MatchingOutput.Register;
+                        RegisterX86AsmInput(input, usedInputs, instruction, allowMatching: true);
+                        continue;
+                    }
+
+                    var fixedRegister = TryGetX86ConstraintRegister(input.Operand.Constraint, input.Type);
+                    if (!fixedRegister.HasValue)
+                        continue;
+                    AssignX86AsmInputRegister(input, fixedRegister.Value, usedInputs, earlyClobbers, clobbers, instruction);
+                }
+
+                foreach (var input in inputs)
+                {
+                    if (input.Register != X86Register.Invalid)
+                        continue;
+
+                    var candidates = GetX86AsmRegisterCandidates(input.Operand.Constraint, input.Type, instruction);
+                    var preferred = input.Input is not null && TryGetAllocatedX86Register(input.Input, out var allocated)
+                        ? allocated
+                        : X86Register.Invalid;
+                    var selected = SelectX86AsmRegister(candidates, preferred, clobbers, earlyClobbers, usedInputs.Keys);
+                    if (selected == X86Register.Invalid)
+                        throw Unsupported(instruction, $"Cannot satisfy inline assembly input constraint '{input.Operand.Constraint}'.");
+                    AssignX86AsmInputRegister(input, selected, usedInputs, earlyClobbers, clobbers, instruction);
+                }
+            }
+
+            private void AssignX86AsmOutputRegister(
+                X86AsmRegisterBinding output,
+                X86Register register,
+                HashSet<X86Register> usedOutputs,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                if (clobbers.Contains(register))
+                    throw Unsupported(instruction, $"Inline assembly output register {X86Registers.Format(register, _wordSize)} is also listed as clobbered.");
+                if (!usedOutputs.Add(register))
+                    throw Unsupported(instruction, $"Multiple inline assembly outputs require {X86Registers.Format(register, _wordSize)}.");
+                output.Register = register;
+            }
+
+            private void AssignX86AsmInputRegister(
+                X86AsmRegisterBinding input,
+                X86Register register,
+                Dictionary<X86Register, X86AsmRegisterBinding> usedInputs,
+                HashSet<X86Register> earlyClobbers,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                if (clobbers.Contains(register))
+                    throw Unsupported(instruction, $"Inline assembly input register {X86Registers.Format(register, _wordSize)} is also listed as clobbered.");
+                if (earlyClobbers.Contains(register))
+                    throw Unsupported(instruction, $"Inline assembly input overlaps early-clobber output register {X86Registers.Format(register, _wordSize)}.");
+                input.Register = register;
+                RegisterX86AsmInput(input, usedInputs, instruction, allowMatching: false);
+            }
+
+            private void RegisterX86AsmInput(
+                X86AsmRegisterBinding input,
+                Dictionary<X86Register, X86AsmRegisterBinding> usedInputs,
+                LirInstruction instruction,
+                bool allowMatching)
+            {
+                if (!usedInputs.TryGetValue(input.Register, out var existing))
+                {
+                    usedInputs.Add(input.Register, input);
+                    return;
+                }
+
+                if (allowMatching && (ReferenceEquals(existing, input.MatchingOutput) || ReferenceEquals(existing.MatchingOutput, input.MatchingOutput)))
+                    return;
+                if (SameX86AsmInputValue(existing, input))
+                    return;
+
+                throw Unsupported(instruction, $"Inline assembly inputs require incompatible values in {X86Registers.Format(input.Register, _wordSize)}.");
+            }
+
+            private bool SameX86AsmInputValue(X86AsmRegisterBinding left, X86AsmRegisterBinding right)
+            {
+                var leftValue = left.Input ?? (left.Output is null ? null : LirOperand.ForRegister(left.Output));
+                var rightValue = right.Input ?? (right.Output is null ? null : LirOperand.ForRegister(right.Output));
+                if (leftValue is null || rightValue is null)
+                    return false;
+                if (leftValue.Kind != rightValue.Kind)
+                    return false;
+                if (leftValue.Kind == LirOperandKind.Register)
+                    return ReferenceEquals(leftValue.Register, rightValue.Register);
+                if (leftValue.Kind == LirOperandKind.Immediate)
+                    return Equals(leftValue.Immediate, rightValue.Immediate) && leftValue.Type.Equals(rightValue.Type);
+                return ReferenceEquals(leftValue, rightValue);
+            }
+
+            private ImmutableArray<X86Register> GetX86AsmRegisterCandidates(string constraint, QualifiedType type, LirInstruction instruction)
+            {
+                var fixedRegister = TryGetX86ConstraintRegister(constraint, type);
+                if (fixedRegister.HasValue)
+                    return ImmutableArray.Create(fixedRegister.Value);
+                if (InlineAsmConstraints.HasExplicitRegister(constraint))
+                    throw Unsupported(instruction, $"Invalid or unsupported x86 explicit register constraint '{constraint}'.");
+
+                var source = IsFloatType(type)
+                    ? _owner._allocationOptions.VectorRegisters
+                    : _owner._allocationOptions.GeneralRegisters;
+                var builder = ImmutableArray.CreateBuilder<X86Register>();
+                foreach (var machineRegister in source)
+                {
+                    var register = ToX86Register(machineRegister, _owner._machineTarget);
+                    if (!IsUsableX86ExplicitRegister(register))
+                        continue;
+                    if (_owner._machineTarget.Is32Bit && InlineAsmConstraints.OperandConstraint(constraint).IndexOf('q') >= 0 && X86Registers.Index(register) >= 4)
+                        continue;
+                    if (!builder.Contains(register))
+                        builder.Add(register);
+                }
+                return builder.ToImmutable();
+            }
+
+            private static X86Register SelectX86AsmRegister(
+                ImmutableArray<X86Register> candidates,
+                X86Register preferred,
+                HashSet<X86Register> excluded0,
+                HashSet<X86Register> excluded1,
+                IEnumerable<X86Register>? excluded2)
+            {
+                var excluded = excluded2 is null ? null : new HashSet<X86Register>(excluded2);
+                if (preferred != X86Register.Invalid && candidates.Contains(preferred) &&
+                    !excluded0.Contains(preferred) && !excluded1.Contains(preferred) && (excluded is null || !excluded.Contains(preferred)))
+                {
+                    return preferred;
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    if (excluded0.Contains(candidate) || excluded1.Contains(candidate) || (excluded is not null && excluded.Contains(candidate)))
+                        continue;
+                    return candidate;
+                }
+                return X86Register.Invalid;
+            }
+
+            private bool TryGetAllocatedX86Register(LirVirtualRegister register, out X86Register physicalRegister)
+            {
+                var allocation = _allocation[register];
+                if (!allocation.IsSpilled)
+                {
+                    physicalRegister = ToX86Register(allocation.PhysicalRegister, _owner._machineTarget);
+                    return true;
+                }
+                physicalRegister = X86Register.Invalid;
+                return false;
+            }
+
+            private bool TryGetAllocatedX86Register(LirOperand operand, out X86Register physicalRegister)
+            {
+                if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+                    return TryGetAllocatedX86Register(operand.Register, out physicalRegister);
+                physicalRegister = X86Register.Invalid;
+                return false;
+            }
+
+            private void EmitX86AsmInputMoves(
+                IReadOnlyList<X86AsmRegisterBinding> outputs,
+                IReadOnlyList<X86AsmRegisterBinding> inputs,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                var moves = new List<X86AsmInputMove>();
+                foreach (var output in outputs)
+                {
+                    if (output.Operand.IsReadWrite && output.Output is not null)
+                        AddX86AsmInputMove(moves, output.Register, LirOperand.ForRegister(output.Output), output.Type, instruction);
+                }
+                foreach (var input in inputs)
+                {
+                    if (input.Input is not null)
+                        AddX86AsmInputMove(moves, input.Register, input.Input, input.Type, instruction);
+                }
+                EmitX86AsmParallelInputMoves(moves, clobbers, instruction);
+            }
+
+            private void AddX86AsmInputMove(
+                List<X86AsmInputMove> moves,
+                X86Register destination,
+                LirOperand source,
+                QualifiedType type,
+                LirInstruction instruction)
+            {
+                foreach (var existing in moves)
+                {
+                    if (existing.Destination != destination)
+                        continue;
+                    if (existing.SourceOperand is not null && source.Kind == LirOperandKind.Register &&
+                        existing.SourceOperand.Kind == LirOperandKind.Register &&
+                        ReferenceEquals(existing.SourceOperand.Register, source.Register))
+                    {
+                        return;
+                    }
+                    throw Unsupported(instruction, $"Inline assembly requires multiple values in {X86Registers.Format(destination, _wordSize)}.");
+                }
+
+                moves.Add(new X86AsmInputMove(destination, source, type));
+            }
+
+            private void EmitX86AsmParallelInputMoves(
+                List<X86AsmInputMove> moves,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                foreach (var move in moves)
+                {
+                    if (move.SourceOperand is not null && TryGetAllocatedX86Register(move.SourceOperand, out var sourceRegister))
+                    {
+                        move.SourceRegister = sourceRegister;
+                        move.SourceOperand = null;
+                    }
+                }
+
+                for (var i = moves.Count - 1; i >= 0; i--)
+                {
+                    if (moves[i].HasRegisterSource && moves[i].SourceRegister == moves[i].Destination)
+                        moves.RemoveAt(i);
+                }
+
+                while (moves.Count != 0)
+                {
+                    var emitted = false;
+                    for (var i = 0; i < moves.Count; i++)
+                    {
+                        var destination = moves[i].Destination;
+                        var isSource = false;
+                        foreach (var other in moves)
+                        {
+                            if (other.HasRegisterSource && other.SourceRegister == destination)
+                            {
+                                isSource = true;
+                                break;
+                            }
+                        }
+                        if (isSource)
+                            continue;
+
+                        EmitX86AsmInputMove(moves[i], instruction);
+                        moves.RemoveAt(i);
+                        emitted = true;
+                        break;
+                    }
+                    if (emitted)
+                        continue;
+
+                    var cycleMove = moves.FirstOrDefault(static move => move.HasRegisterSource);
+                    if (cycleMove is null)
+                        throw Unsupported(instruction, "Cannot resolve inline assembly input operands.");
+                    BreakX86AsmInputCycle(moves, cycleMove.SourceRegister, cycleMove.Type, clobbers, instruction);
+                }
+            }
+
+            private void BreakX86AsmInputCycle(
+                List<X86AsmInputMove> moves,
+                X86Register source,
+                QualifiedType type,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                var scratch = FindX86AsmCycleScratch(moves.Select(static move => move.Destination), moves.Where(static move => move.HasRegisterSource).Select(static move => move.SourceRegister), IsFloatType(type), clobbers);
+                if (scratch != X86Register.Invalid)
+                {
+                    MoveX86AsmRegister(scratch, source, type);
+                    foreach (var move in moves)
+                    {
+                        if (move.HasRegisterSource && move.SourceRegister == source)
+                            move.SourceRegister = scratch;
+                    }
+                    return;
+                }
+
+                var size = X86AsmTempSlotSize(type);
+                RequireX86AsmTempSize(size, instruction);
+                StoreX86AsmRegisterToTemp(source, type);
+                foreach (var move in moves)
+                {
+                    if (move.HasRegisterSource && move.SourceRegister == source)
+                    {
+                        move.SourceRegister = X86Register.Invalid;
+                        move.UsesTemp = true;
+                    }
+                }
+            }
+
+            private void EmitX86AsmInputMove(X86AsmInputMove move, LirInstruction instruction)
+            {
+                if (move.UsesTemp)
+                {
+                    LoadX86AsmTempInto(move.Destination, move.Type);
+                    return;
+                }
+                if (move.HasRegisterSource)
+                {
+                    MoveX86AsmRegister(move.Destination, move.SourceRegister, move.Type);
+                    return;
+                }
+                if (move.SourceOperand is null)
+                    throw Unsupported(instruction, "Inline assembly input move has no source.");
+                LoadX86AsmOperandInto(move.SourceOperand, move.Destination, instruction);
+            }
+
+            private void EmitX86AsmOutputMoves(
+                IReadOnlyList<X86AsmRegisterBinding> outputs,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                var moves = new List<X86AsmRegisterMove>();
+                foreach (var output in outputs)
+                {
+                    if (output.Output is null)
+                        continue;
+                    var allocation = _allocation[output.Output];
+                    if (allocation.IsSpilled)
+                    {
+                        if (IsFloatType(output.Type))
+                            EmitFloatingStore(Mem(X86Register.Rsp, allocation.StackOffset, FloatingStorageSize(output.Type)), output.Register, output.Type);
+                        else
+                            EmitStoreToStack(output.Register, allocation.StackOffset, Math.Min(RegisterSize(output.Type), SizeOfStorage(output.Type)));
+                        continue;
+                    }
+
+                    var destination = ToX86Register(allocation.PhysicalRegister, _owner._machineTarget);
+                    if (destination != output.Register)
+                        moves.Add(new X86AsmRegisterMove(destination, output.Register, output.Type));
+                }
+                EmitX86AsmParallelRegisterMoves(moves, clobbers, instruction);
+            }
+
+            private void EmitX86AsmParallelRegisterMoves(
+                List<X86AsmRegisterMove> moves,
+                HashSet<X86Register> clobbers,
+                LirInstruction instruction)
+            {
+                while (moves.Count != 0)
+                {
+                    var emitted = false;
+                    for (var i = 0; i < moves.Count; i++)
+                    {
+                        var destination = moves[i].Destination;
+                        if (moves.Any(move => move.Source == destination))
+                            continue;
+                        MoveX86AsmRegister(destination, moves[i].Source, moves[i].Type);
+                        moves.RemoveAt(i);
+                        emitted = true;
+                        break;
+                    }
+                    if (emitted)
+                        continue;
+
+                    var source = moves[0].Source;
+                    var type = moves[0].Type;
+                    var scratch = FindX86AsmCycleScratch(moves.Select(static move => move.Destination), moves.Select(static move => move.Source), IsFloatType(type), clobbers);
+                    if (scratch != X86Register.Invalid)
+                    {
+                        MoveX86AsmRegister(scratch, source, type);
+                        for (var i = 0; i < moves.Count; i++)
+                        {
+                            if (moves[i].Source == source)
+                                moves[i] = moves[i].WithSource(scratch);
+                        }
+                        continue;
+                    }
+
+                    var size = X86AsmTempSlotSize(type);
+                    RequireX86AsmTempSize(size, instruction);
+                    StoreX86AsmRegisterToTemp(source, type);
+                    var tempConsumers = new List<X86AsmRegisterMove>();
+                    for (var i = moves.Count - 1; i >= 0; i--)
+                    {
+                        if (moves[i].Source != source)
+                            continue;
+                        tempConsumers.Add(moves[i]);
+                        moves.RemoveAt(i);
+                    }
+                    EmitX86AsmParallelRegisterMoves(moves, clobbers, instruction);
+                    foreach (var move in tempConsumers)
+                        LoadX86AsmTempInto(move.Destination, move.Type);
+                }
+            }
+
+            private X86Register FindX86AsmCycleScratch(
+                IEnumerable<X86Register> destinations,
+                IEnumerable<X86Register> sources,
+                bool floating,
+                HashSet<X86Register> clobbers)
+            {
+                var used = new HashSet<X86Register>(destinations);
+                used.UnionWith(sources);
+                foreach (var clobber in clobbers)
+                {
+                    if (used.Contains(clobber))
+                        continue;
+                    if (floating != X86Registers.IsVector(clobber))
+                        continue;
+                    return clobber;
+                }
+                return X86Register.Invalid;
+            }
+
+            private void MoveX86AsmRegister(X86Register destination, X86Register source, QualifiedType type)
+            {
+                if (destination == source)
+                    return;
+                if (IsFloatType(type))
+                    EmitFloatingMove(destination, source, type);
+                else
+                    MoveRegister(destination, source, RegisterSize(type));
+            }
+
+            private void StoreX86AsmRegisterToTemp(X86Register source, QualifiedType type)
+            {
+                var destination = Mem(X86Register.Rsp, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
+                if (IsFloatType(type))
+                    EmitFloatingStore(destination.WithSize(FloatingStorageSize(type)), source, type);
+                else
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination, Reg(source, RegisterSize(type))));
+            }
+
+            private void LoadX86AsmTempInto(X86Register destination, QualifiedType type)
+            {
+                var source = Mem(X86Register.Rsp, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
+                if (IsFloatType(type))
+                    EmitFloatingLoad(destination, source.WithSize(FloatingStorageSize(type)), type);
+                else
+                    EmitLoadFromMemory(destination, source, IsSignedIntegerType(type));
+            }
+
+            private int X86AsmTempSlotSize(QualifiedType type)
+            {
+                var size = Math.Max(RegisterSize(type), SizeOfStorage(type));
+                return AlignUp(
+                    Math.Max(_owner._allocationOptions.SpillSlotSize, size),
+                    _owner._allocationOptions.SpillSlotAlignment);
+            }
+
+            private void RequireX86AsmTempSize(int required, LirInstruction instruction)
+            {
+                if (_allocation.Frame.ParallelCopyTempSize < required)
+                    throw Unsupported(instruction, "Inline assembly parallel-copy spill slot is too small.");
             }
 
             private void LoadX86AsmOperandInto(LirOperand operand, X86Register destination, LirInstruction instruction)
@@ -1022,19 +1565,6 @@ namespace Cnidaria.C
                 }
 
                 LoadOperandInto(operand, destination, instruction, RegisterSize(operand.Type));
-            }
-
-            private void StoreX86AsmOutput(LirVirtualRegister destination, X86Register source)
-            {
-                var writable = GetWritableRegister(destination, source);
-                if (writable != source)
-                {
-                    if (IsFloatType(destination.Type))
-                        EmitFloatingMove(writable, source, destination.Type);
-                    else
-                        MoveRegister(writable, source, RegisterSize(destination.Type));
-                }
-                StoreWritableRegisterIfSpilled(destination, writable);
             }
 
             private string FormatX86AsmRegisterOperand(LirOperand operand, LirInstruction instruction, int size)
@@ -1450,6 +1980,9 @@ namespace Cnidaria.C
                     return;
                 }
 
+                if (TryEmitSoftwareIntegerUnary(instruction))
+                    return;
+
                 var size = RegisterSize(instruction.Result.Type);
                 var dst = GetWritableRegister(instruction.Result, Scratch0);
                 LoadOperandInto(instruction.Operands[0], dst, instruction, size);
@@ -1475,6 +2008,607 @@ namespace Cnidaria.C
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
 
+            private bool TryEmitSoftwareIntegerUnary(LirInstruction instruction)
+            {
+                if (instruction.Result is null || instruction.Operands.Length != 1)
+                    return false;
+
+                var sourceWide = IsX86WideInteger(instruction.Operands[0].Type);
+                var resultWide = IsX86WideInteger(instruction.Result.Type);
+                if (!sourceWide && !resultWide)
+                    return false;
+
+                LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+                if (instruction.Operator == "!")
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Setcc(X86Condition.E, Reg(X86Register.Rax, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 1)));
+                    var destination = GetWritableRegister(instruction.Result, X86Register.Rax);
+                    MoveRegister(destination, X86Register.Rax, 4);
+                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    return true;
+                }
+
+                if (!resultWide)
+                    return false;
+
+                switch (instruction.Operator)
+                {
+                    case "+":
+                        break;
+                    case "-":
+                        Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rax, 4)));
+                        Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rdx, 4)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Imm(1)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
+                        break;
+                    case "~":
+                        Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rax, 4)));
+                        Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rdx, 4)));
+                        break;
+                    default:
+                        return false;
+                }
+
+                StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                return true;
+            }
+
+            private bool TryEmitSoftwareIntegerBinary(LirInstruction instruction)
+            {
+                if (instruction.Result is null || instruction.Operands.Length != 2)
+                    return false;
+                if (!IsX86WideInteger(instruction.Result.Type) &&
+                    !IsX86WideInteger(instruction.Operands[0].Type) &&
+                    !IsX86WideInteger(instruction.Operands[1].Type))
+                {
+                    return false;
+                }
+
+                if (instruction.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=")
+                {
+                    EmitWideIntegerComparison(instruction);
+                    return true;
+                }
+
+                if (!IsX86WideInteger(instruction.Result.Type))
+                    throw Unsupported(instruction, "Wide integer binary operation requires a wide integer result.");
+
+                switch (instruction.Operator)
+                {
+                    case "+":
+                        StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
+                        LoadWideIntegerOperand(instruction.Operands[1], X86Register.Rax, X86Register.Rdx, instruction);
+                        Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                        StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                        return true;
+                    case "-":
+                        StoreWideIntegerOperandToTemp(instruction.Operands[1], 0, instruction);
+                        LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+                        Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Sbb, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                        StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                        return true;
+                    case "&":
+                    case "|":
+                    case "^":
+                        StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
+                        LoadWideIntegerOperand(instruction.Operands[1], X86Register.Rax, X86Register.Rdx, instruction);
+                        var opcode = instruction.Operator == "&" ? X86InstrKind.And : instruction.Operator == "|" ? X86InstrKind.Or : X86InstrKind.Xor;
+                        Emit(X86Instruction.Binary(opcode, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                        Emit(X86Instruction.Binary(opcode, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                        StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                        return true;
+                    case "<<":
+                    case ">>":
+                        EmitWideIntegerShift(instruction);
+                        return true;
+                    case "*":
+                        EmitWideIntegerMultiply(instruction);
+                        return true;
+                    case "/":
+                    case "%":
+                        EmitWideIntegerDivide(instruction, instruction.Operator == "%");
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
+            private bool TryEmitSoftwareIntegerConvert(LirInstruction instruction)
+            {
+                if (instruction.Result is null || instruction.Operands.Length == 0)
+                    return false;
+
+                var source = instruction.Operands[0];
+                var sourceWide = IsX86WideInteger(source.Type);
+                var destinationWide = IsX86WideInteger(instruction.Result.Type);
+                if (!sourceWide && !destinationWide)
+                    return false;
+                if ((!IsIntegerLike(source.Type) && !IsPointerLike(source.Type)) ||
+                    (!IsIntegerLike(instruction.Result.Type) && !IsPointerLike(instruction.Result.Type)))
+                {
+                    return false;
+                }
+
+                if (destinationWide)
+                {
+                    LoadWideIntegerOperand(source, X86Register.Rax, X86Register.Rdx, instruction);
+                    StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                    return true;
+                }
+
+                LoadWideIntegerOperand(source, X86Register.Rax, X86Register.Rdx, instruction);
+                if (instruction.Result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Setcc(X86Condition.Ne, Reg(X86Register.Rax, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 1)));
+                }
+                else
+                {
+                    NormalizeIntegerRegister(X86Register.Rax, instruction.Result.Type);
+                }
+
+                var destination = GetWritableRegister(instruction.Result, X86Register.Rax);
+                MoveRegister(destination, X86Register.Rax, RegisterSize(instruction.Result.Type));
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                return true;
+            }
+
+            private void EmitWideIntegerShift(LirInstruction instruction)
+            {
+                StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
+                LoadWideIntegerLowWord(instruction.Operands[1], X86Register.Rcx, instruction);
+                Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(63)));
+
+                var large = _owner.CreateLocalLabel(_functionLabel + "_i64_shift_large");
+                var zero = _owner.CreateLocalLabel(_functionLabel + "_i64_shift_zero");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_shift_done");
+                Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rcx, 4), Reg(X86Register.Rcx, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(zero, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rcx, 4), Imm(32)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(large, 4, X86ObjectRelocationKind.Relative32)));
+
+                if (instruction.Operator == "<<")
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                    MoveRegister(X86Register.Rdx, X86Register.Rax, 4);
+                    Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(1, 0), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rcx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rcx, 4), Imm(32)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rcx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rcx, 4), Imm(32)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    MoveRegister(X86Register.Rdx, X86Register.Rax, 4);
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
+                }
+                else
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 4)));
+                    MoveRegister(X86Register.Rdx, X86Register.Rax, 4);
+                    Emit(X86Instruction.Binary(IsSignedIntegerType(instruction.Operands[0].Type) ? X86InstrKind.Sar : X86InstrKind.Shr,
+                        Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(1, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rcx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rcx, 4), Imm(32)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rcx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rcx, 4), Imm(32)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), WideTempMemory(1, 4)));
+                }
+
+                StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+
+                _owner._text.DefineLabel(large);
+                Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(31)));
+                if (instruction.Operator == "<<")
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), WideTempMemory(0, 0)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                }
+                else
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 4)));
+                    Emit(X86Instruction.Binary(IsSignedIntegerType(instruction.Operands[0].Type) ? X86InstrKind.Sar : X86InstrKind.Shr,
+                        Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 1)));
+                    if (IsSignedIntegerType(instruction.Operands[0].Type))
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(X86Register.Rdx, 4), Imm(31)));
+                    }
+                    else
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                    }
+                }
+                StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+
+                _owner._text.DefineLabel(zero);
+                LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+                StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitWideIntegerMultiply(LirInstruction instruction)
+            {
+                StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
+                StoreWideIntegerOperandToTemp(instruction.Operands[1], 1, instruction);
+                ZeroWideIntegerResult(instruction.Result!);
+
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_loop");
+                var skipAdd = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_skip");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_done");
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), WideTempMemory(1, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+
+                _owner._text.DefineLabel(loop);
+                Emit(X86Instruction.Binary(X86InstrKind.Test, WideTempMemory(1, 0), Imm(1)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(skipAdd, 4, X86ObjectRelocationKind.Relative32)));
+                LoadWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+
+                _owner._text.DefineLabel(skipAdd);
+                LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                StoreWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+
+                LoadWideIntegerTemp(1, X86Register.Rax, X86Register.Rdx);
+                MoveRegister(X86Register.Rcx, X86Register.Rdx, 4);
+                Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rcx, 4), Imm(31)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rax, 4), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rdx, 4), Imm(1)));
+                StoreWideIntegerTemp(1, X86Register.Rax, X86Register.Rdx);
+                MoveRegister(X86Register.Rcx, X86Register.Rax, 4);
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rcx, 4), Reg(X86Register.Rdx, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitWideIntegerDivide(LirInstruction instruction, bool wantRemainder)
+            {
+                StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
+                StoreWideIntegerOperandToTemp(instruction.Operands[1], 1, instruction);
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), WideTempMemory(1, 4)));
+                var divisorReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_ready");
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_div_loop");
+                var subtract = _owner.CreateLocalLabel(_functionLabel + "_i64_div_subtract");
+                var skipSubtract = _owner.CreateLocalLabel(_functionLabel + "_i64_div_skip");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_div_done");
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(divisorReady, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(new X86Instruction(X86InstrKind.Ud2));
+                ZeroWideIntegerResult(instruction.Result!);
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+                _owner._text.DefineLabel(divisorReady);
+
+                ZeroWideIntegerTemp(2);
+                ZeroWideIntegerTemp(3);
+                if (IsSignedIntegerType(instruction.Operands[0].Type))
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(X86Register.Rax, 4), Imm(31)));
+                    Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rax, 4), Imm(1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(3, 0), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), WideTempMemory(1, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(X86Register.Rdx, 4), Imm(31)));
+                    Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rdx, 4), Imm(1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(3, 4), Reg(X86Register.Rdx, 4)));
+                    EmitAbsoluteWideIntegerTemp(0);
+                    EmitAbsoluteWideIntegerTemp(1);
+                }
+
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), Imm(64)));
+                _owner._text.DefineLabel(loop);
+                LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                StoreWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+                LoadWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                StoreWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
+
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rdx, 4), WideTempMemory(1, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.A, X86Operand.SymbolOperand(subtract, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.B, X86Operand.SymbolOperand(skipSubtract, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.B, X86Operand.SymbolOperand(skipSubtract, 4, X86ObjectRelocationKind.Relative32)));
+
+                _owner._text.DefineLabel(subtract);
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Sbb, Reg(X86Register.Rdx, 4), WideTempMemory(1, 4)));
+                StoreWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Or, WideTempMemory(0, 0), Imm(1)));
+
+                _owner._text.DefineLabel(skipSubtract);
+                Emit(X86Instruction.Unary(X86InstrKind.Dec, Reg(X86Register.Rcx, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
+
+                if (wantRemainder)
+                {
+                    LoadWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
+                    StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                    if (IsSignedIntegerType(instruction.Operands[0].Type))
+                        EmitConditionalNegateWideResult(instruction.Result!, WideTempMemory(3, 0));
+                }
+                else
+                {
+                    LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
+                    StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                    if (IsSignedIntegerType(instruction.Operands[0].Type))
+                        EmitConditionalNegateWideResult(instruction.Result!, WideTempMemory(3, 4));
+                }
+
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitWideIntegerComparison(LirInstruction instruction)
+            {
+                StoreWideIntegerOperandToTemp(instruction.Operands[1], 0, instruction);
+                LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+
+                if (instruction.Operator is "==" or "!=")
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Setcc(instruction.Operator == "==" ? X86Condition.E : X86Condition.Ne, Reg(X86Register.Rax, 1)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 1)));
+                    StoreWideComparisonResult(instruction.Result!, X86Register.Rax);
+                    return;
+                }
+
+                var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_i64_cmp_true");
+                var falseLabel = _owner.CreateLocalLabel(_functionLabel + "_i64_cmp_false");
+                var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_i64_cmp_done");
+                var signed = IsSignedIntegerType(instruction.Operands[0].Type);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+
+                var highTrue = instruction.Operator switch
+                {
+                    "<" or "<=" => signed ? X86Condition.L : X86Condition.B,
+                    ">" or ">=" => signed ? X86Condition.G : X86Condition.A,
+                    _ => X86Condition.E,
+                };
+                var highFalse = instruction.Operator switch
+                {
+                    "<" or "<=" => signed ? X86Condition.G : X86Condition.A,
+                    ">" or ">=" => signed ? X86Condition.L : X86Condition.B,
+                    _ => X86Condition.E,
+                };
+                Emit(X86Instruction.ConditionalBranch(highTrue, X86Operand.SymbolOperand(trueLabel, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.ConditionalBranch(highFalse, X86Operand.SymbolOperand(falseLabel, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                var lowCondition = instruction.Operator switch
+                {
+                    "<" => X86Condition.B,
+                    "<=" => X86Condition.Be,
+                    ">" => X86Condition.A,
+                    ">=" => X86Condition.Ae,
+                    _ => X86Condition.E,
+                };
+                Emit(X86Instruction.ConditionalBranch(lowCondition, X86Operand.SymbolOperand(trueLabel, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(falseLabel, 4, X86ObjectRelocationKind.Relative32)));
+
+                _owner._text.DefineLabel(trueLabel);
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), Imm(1)));
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
+                _owner._text.DefineLabel(falseLabel);
+                Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                _owner._text.DefineLabel(doneLabel);
+                StoreWideComparisonResult(instruction.Result!, X86Register.Rax);
+            }
+
+            private void LoadWideIntegerOperand(LirOperand operand, X86Register low, X86Register high, LirInstruction instruction)
+            {
+                if (!IsX86WideInteger(operand.Type))
+                {
+                    LoadOperandInto(operand, low, instruction, 4);
+                    if (IsSignedIntegerType(operand.Type))
+                    {
+                        MoveRegister(high, low, 4);
+                        Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(high, 4), Imm(31)));
+                    }
+                    else
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(high, 4), Reg(high, 4)));
+                    }
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.Immediate)
+                {
+                    var value = unchecked((ulong)ConvertIntegerConstant(operand.Immediate));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(low, 4), Imm(unchecked((int)value))));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(high, 4), Imm(unchecked((int)(value >> 32)))));
+                    return;
+                }
+
+                if (operand.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(low, 4), Reg(low, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(high, 4), Reg(high, 4)));
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+                {
+                    var allocation = _allocation[operand.Register];
+                    if (!allocation.IsSpilled)
+                        throw Unsupported(instruction, "64-bit integer virtual register must be stack-backed on x86.");
+                    EmitLoadFromStack(low, allocation.StackOffset, 4, false);
+                    EmitLoadFromStack(high, allocation.StackOffset + 4, 4, false);
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.StackSlot && operand.StackSlot is not null)
+                {
+                    var offset = _allocation.Frame.StackSlotOffsets[operand.StackSlot];
+                    EmitLoadFromStack(low, offset, 4, false);
+                    EmitLoadFromStack(high, offset + 4, 4, false);
+                    return;
+                }
+
+                var address = MaterializeScalarStorageAddress(operand, X86Register.Rcx, instruction);
+                EmitLoadFromMemory(low, Mem(address, 0, 4), false);
+                EmitLoadFromMemory(high, Mem(address, 4, 4), false);
+            }
+
+            private void LoadWideIntegerLowWord(LirOperand operand, X86Register destination, LirInstruction instruction)
+            {
+                if (!IsX86WideInteger(operand.Type))
+                {
+                    LoadOperandInto(operand, destination, instruction, 4);
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.Immediate)
+                {
+                    var value = unchecked((ulong)ConvertIntegerConstant(operand.Immediate));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, 4), Imm(unchecked((int)value))));
+                    return;
+                }
+
+                if (operand.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(destination, 4), Reg(destination, 4)));
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+                {
+                    var allocation = _allocation[operand.Register];
+                    if (!allocation.IsSpilled)
+                        throw Unsupported(instruction, "64-bit integer virtual register must be stack-backed on x86.");
+                    EmitLoadFromStack(destination, allocation.StackOffset, 4, false);
+                    return;
+                }
+
+                if (operand.Kind == LirOperandKind.StackSlot && operand.StackSlot is not null)
+                {
+                    EmitLoadFromStack(destination, _allocation.Frame.StackSlotOffsets[operand.StackSlot], 4, false);
+                    return;
+                }
+
+                var addressScratch = destination == X86Register.Rax ? X86Register.Rdx : X86Register.Rax;
+                var address = MaterializeScalarStorageAddress(operand, addressScratch, instruction);
+                EmitLoadFromMemory(destination, Mem(address, 0, 4), false);
+            }
+
+            private void StoreWideIntegerOperandToTemp(LirOperand operand, int index, LirInstruction instruction)
+            {
+                LoadWideIntegerOperand(operand, X86Register.Rax, X86Register.Rdx, instruction);
+                StoreWideIntegerTemp(index, X86Register.Rax, X86Register.Rdx);
+            }
+
+            private void LoadWideIntegerTemp(int index, X86Register low, X86Register high)
+            {
+                EmitLoadFromMemory(low, WideTempMemory(index, 0), false);
+                EmitLoadFromMemory(high, WideTempMemory(index, 4), false);
+            }
+
+            private void StoreWideIntegerTemp(int index, X86Register low, X86Register high)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(index, 0), Reg(low, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(index, 4), Reg(high, 4)));
+            }
+
+            private void ZeroWideIntegerTemp(int index)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(index, 0), Imm(0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(index, 4), Imm(0)));
+            }
+
+            private X86Operand WideTempMemory(int index, int offset)
+                => Mem(X86Register.Rsp, checked(_allocation.Frame.FloatingImmediateTempOffset + index * 8 + offset), 4);
+
+            private X86Operand WideResultMemory(LirVirtualRegister result, int offset)
+            {
+                var allocation = _allocation[result];
+                if (!allocation.IsSpilled)
+                    throw new NotSupportedException("64-bit integer result must be stack-backed on x86.");
+                return Mem(X86Register.Rsp, checked(allocation.StackOffset + offset), 4);
+            }
+
+            private void LoadWideIntegerResult(LirVirtualRegister result, X86Register low, X86Register high)
+            {
+                EmitLoadFromMemory(low, WideResultMemory(result, 0), false);
+                EmitLoadFromMemory(high, WideResultMemory(result, 4), false);
+            }
+
+            private void StoreWideIntegerResult(LirVirtualRegister result, X86Register low, X86Register high)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideResultMemory(result, 0), Reg(low, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideResultMemory(result, 4), Reg(high, 4)));
+            }
+
+            private void ZeroWideIntegerResult(LirVirtualRegister result)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideResultMemory(result, 0), Imm(0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, WideResultMemory(result, 4), Imm(0)));
+            }
+
+            private void EmitAbsoluteWideIntegerTemp(int index)
+            {
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_abs_done");
+                LoadWideIntegerTemp(index, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ns, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rax, 4)));
+                Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rdx, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
+                StoreWideIntegerTemp(index, X86Register.Rax, X86Register.Rdx);
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitConditionalNegateWideResult(LirVirtualRegister result, X86Operand condition)
+            {
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_neg_done");
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, condition, Imm(0)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+                LoadWideIntegerResult(result, X86Register.Rax, X86Register.Rdx);
+                Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rax, 4)));
+                Emit(X86Instruction.Unary(X86InstrKind.Not, Reg(X86Register.Rdx, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
+                StoreWideIntegerResult(result, X86Register.Rax, X86Register.Rdx);
+                _owner._text.DefineLabel(done);
+            }
+
+            private void StoreWideComparisonResult(LirVirtualRegister result, X86Register source)
+            {
+                var destination = GetWritableRegister(result, source);
+                MoveRegister(destination, source, RegisterSize(result.Type));
+                StoreWritableRegisterIfSpilled(result, destination);
+            }
+
+            private bool IsX86WideInteger(QualifiedType type)
+                => _owner._target.Architecture == TargetArchitectureKind.I386 && IsIntegerLike(type) && SizeOfStorage(type) == 8;
+
             private void EmitBinary(LirInstruction instruction)
             {
                 if (instruction.Result is null || instruction.Operands.Length != 2)
@@ -1484,6 +2618,8 @@ namespace Cnidaria.C
                     EmitFloatingBinary(instruction);
                     return;
                 }
+                if (TryEmitSoftwareIntegerBinary(instruction))
+                    return;
                 if (RequiresBlockCopyStorage(instruction.Result.Type))
                     throw Unsupported(instruction, "Wide scalar or aggregate binary emission is not supported by X86CodeGenerator.");
 
@@ -2050,6 +3186,8 @@ namespace Cnidaria.C
                     EmitFloatingOrMixedConvert(instruction);
                     return;
                 }
+                if (TryEmitSoftwareIntegerConvert(instruction))
+                    return;
                 EmitValueCopy(instruction.Result, instruction.Operands[0], instruction);
             }
 
@@ -2076,6 +3214,15 @@ namespace Cnidaria.C
                 }
 
                 var size = SizeOfStorage(instruction.Result.Type);
+                if (IsX86WideInteger(instruction.Result.Type))
+                {
+                    var source = MaterializeAddress(instruction.Address, X86Register.Rcx, instruction);
+                    EmitLoadFromMemory(X86Register.Rax, Mem(source, 0, 4), false);
+                    EmitLoadFromMemory(X86Register.Rdx, Mem(source, 4, 4), false);
+                    StoreWideIntegerResult(instruction.Result, X86Register.Rax, X86Register.Rdx);
+                    return;
+                }
+
                 if (RequiresBlockCopyStorage(instruction.Result.Type))
                 {
                     var destination = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
@@ -2104,21 +3251,33 @@ namespace Cnidaria.C
                     return;
                 }
                 var size = SizeOfStorage(value.Type);
-                var destination = MaterializeAddress(instruction.Address, Scratch0, instruction);
-                if (RequiresBlockCopyStorage(value.Type))
+                if (IsX86WideInteger(value.Type))
                 {
-                    EmitOperandToMemory(value, RegMem(destination, size), size, instruction);
+                    var destination = MaterializeAddress(instruction.Address, X86Register.Rcx, instruction);
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(3, 0), Reg(destination, 4)));
+                    LoadWideIntegerOperand(value, X86Register.Rax, X86Register.Rdx, instruction);
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), WideTempMemory(3, 0)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rcx, 0, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rcx, 4, 4), Reg(X86Register.Rdx, 4)));
                     return;
                 }
-
-                var scalarSize = RegisterSize(value.Type);
-                var source = LoadOperandForRead(value, Scratch1, instruction, scalarSize);
-                if (source.Kind == X86OperandKind.Memory || (scalarSize == 8 && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol)))
                 {
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, scalarSize), source));
-                    source = Reg(Scratch1, scalarSize);
+                    var destination = MaterializeAddress(instruction.Address, Scratch0, instruction);
+                    if (RequiresBlockCopyStorage(value.Type))
+                    {
+                        EmitOperandToMemory(value, RegMem(destination, size), size, instruction);
+                        return;
+                    }
+
+                    var scalarSize = RegisterSize(value.Type);
+                    var source = LoadOperandForRead(value, Scratch1, instruction, scalarSize);
+                    if (source.Kind == X86OperandKind.Memory || (scalarSize == 8 && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol)))
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, scalarSize), source));
+                        source = Reg(Scratch1, scalarSize);
+                    }
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, RegMem(destination, scalarSize), source));
                 }
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, RegMem(destination, scalarSize), source));
             }
 
             private void EmitZeroMemory(LirInstruction instruction)
@@ -2312,6 +3471,59 @@ namespace Cnidaria.C
                     return;
                 }
                 throw Unsupported(instruction, "Unsupported hidden return buffer ABI location.");
+            }
+
+            private sealed class X86AsmRegisterBinding
+            {
+                public GimpleAsmOperand Operand { get; }
+                public LirVirtualRegister? Output { get; }
+                public LirOperand? Input { get; }
+                public QualifiedType Type => Output?.Type ?? Input!.Type;
+                public X86AsmRegisterBinding? MatchingOutput { get; set; }
+                public X86Register Register { get; set; }
+
+                public X86AsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input)
+                {
+                    Operand = operand ?? throw new ArgumentNullException(nameof(operand));
+                    Output = output;
+                    Input = input;
+                    Register = X86Register.Invalid;
+                }
+            }
+
+            private sealed class X86AsmInputMove
+            {
+                public X86Register Destination { get; }
+                public LirOperand? SourceOperand { get; set; }
+                public X86Register SourceRegister { get; set; }
+                public QualifiedType Type { get; }
+                public bool UsesTemp { get; set; }
+                public bool HasRegisterSource => SourceRegister != X86Register.Invalid;
+
+                public X86AsmInputMove(X86Register destination, LirOperand sourceOperand, QualifiedType type)
+                {
+                    Destination = destination;
+                    SourceOperand = sourceOperand ?? throw new ArgumentNullException(nameof(sourceOperand));
+                    SourceRegister = X86Register.Invalid;
+                    Type = type;
+                }
+            }
+
+            private readonly struct X86AsmRegisterMove
+            {
+                public X86Register Destination { get; }
+                public X86Register Source { get; }
+                public QualifiedType Type { get; }
+
+                public X86AsmRegisterMove(X86Register destination, X86Register source, QualifiedType type)
+                {
+                    Destination = destination;
+                    Source = source;
+                    Type = type;
+                }
+
+                public X86AsmRegisterMove WithSource(X86Register source)
+                    => new X86AsmRegisterMove(Destination, source, Type);
             }
 
             private readonly struct PendingCallArgumentSegment
@@ -2538,7 +3750,7 @@ namespace Cnidaria.C
 
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
-                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, Scratch0);
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, X86Register.Rcx);
                     foreach (var segment in value.Segments)
                     {
                         var reg = segment.ReturnRegisters.Length > 0
@@ -2712,6 +3924,15 @@ namespace Cnidaria.C
                     EmitJump(instruction.FalseTarget);
                     return;
                 }
+                if (IsX86WideInteger(condition.Type))
+                {
+                    LoadWideIntegerOperand(condition, X86Register.Rax, X86Register.Rdx, instruction);
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
+                    EmitJump(instruction.FalseTarget);
+                    return;
+                }
                 var size = RegisterSize(condition.Type);
                 var reg = LoadOperand(condition, Scratch0, instruction, size);
                 Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(reg, size), Reg(reg, size)));
@@ -2723,6 +3944,22 @@ namespace Cnidaria.C
             {
                 if (instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Switch expects selector operand.");
+                if (IsX86WideInteger(instruction.Operands[0].Type))
+                {
+                    LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+                    foreach (var switchCase in instruction.SwitchCases)
+                    {
+                        var next = _owner.CreateLocalLabel(_functionLabel + "_i64_switch_next");
+                        var value = unchecked((ulong)ImmediateToInt64(switchCase.Value));
+                        Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rdx, 4), Imm(unchecked((int)(value >> 32)))));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(next, 4, X86ObjectRelocationKind.Relative32)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), Imm(unchecked((int)value))));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(switchCase.Target)));
+                        _owner._text.DefineLabel(next);
+                    }
+                    EmitJump(instruction.Target);
+                    return;
+                }
                 var size = RegisterSize(instruction.Operands[0].Type);
                 var reg = LoadOperand(instruction.Operands[0], Scratch0, instruction, size);
                 foreach (var switchCase in instruction.SwitchCases)
@@ -2788,7 +4025,7 @@ namespace Cnidaria.C
 
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
-                    var source = MaterializeScalarStorageAddress(operand, Scratch0, instruction);
+                    var source = MaterializeScalarStorageAddress(operand, X86Register.Rcx, instruction);
                     for (var i = 0; i < value.Segments.Length; i++)
                     {
                         var segment = value.Segments[i];
@@ -2816,6 +4053,12 @@ namespace Cnidaria.C
                     var sourceReg = LoadFloatingOperand(source, writable, instruction);
                     EmitFloatingPrecisionMove(writable, sourceReg, source.Type, destination.Type);
                     StoreWritableRegisterIfSpilled(destination, writable);
+                    return;
+                }
+                if (IsX86WideInteger(destination.Type))
+                {
+                    LoadWideIntegerOperand(source, X86Register.Rax, X86Register.Rdx, instruction);
+                    StoreWideIntegerResult(destination, X86Register.Rax, X86Register.Rdx);
                     return;
                 }
                 if (RequiresBlockCopyStorage(destination.Type))
@@ -2850,6 +4093,14 @@ namespace Cnidaria.C
                     }
                     else
                         ZeroMemory(destination, size);
+                    return;
+                }
+
+                if (IsX86WideInteger(source.Type) && size >= 8)
+                {
+                    LoadWideIntegerOperand(source, X86Register.Rax, X86Register.Rdx, instruction);
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(4).WithDisplacement(destination.Displacement + 4), Reg(X86Register.Rdx, 4)));
                     return;
                 }
 
@@ -2903,6 +4154,12 @@ namespace Cnidaria.C
 
             private X86Register MaterializeScalarStorageAddress(LirOperand operand, X86Register scratch, LirInstruction instruction)
             {
+                if (IsX86WideInteger(operand.Type) && operand.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                {
+                    StoreWideIntegerOperandToTemp(operand, 0, instruction);
+                    Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.FloatingImmediateTempOffset, _wordSize)));
+                    return scratch;
+                }
                 if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
                     return MaterializeVirtualRegisterStorageAddress(operand.Register, scratch);
                 if (operand.Kind == LirOperandKind.StackSlot && operand.StackSlot is not null)
@@ -3138,6 +4395,7 @@ namespace Cnidaria.C
 
             private void EmitMemoryCopy(X86Operand source, X86Operand destination, int size)
             {
+                var scratch = SelectMemoryScratch(source, destination);
                 for (var offset = 0; offset < size;)
                 {
                     var chunk = Math.Min(_wordSize, size - offset);
@@ -3149,15 +4407,16 @@ namespace Cnidaria.C
                         chunk = 2;
                     else
                         chunk = 1;
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, chunk), source.WithSize(chunk).WithDisplacement(source.Displacement + offset)));
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(Scratch1, chunk)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(scratch, chunk), source.WithSize(chunk).WithDisplacement(source.Displacement + offset)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(scratch, chunk)));
                     offset += chunk;
                 }
             }
 
             private void ZeroMemory(X86Operand destination, int size)
             {
-                Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(Scratch1, 4), Reg(Scratch1, 4)));
+                var scratch = SelectMemoryScratch(destination, X86Operand.None);
+                Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(scratch, 4), Reg(scratch, 4)));
                 for (var offset = 0; offset < size;)
                 {
                     var chunk = Math.Min(_wordSize, size - offset);
@@ -3169,10 +4428,25 @@ namespace Cnidaria.C
                         chunk = 2;
                     else
                         chunk = 1;
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(Scratch1, chunk)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(scratch, chunk)));
                     offset += chunk;
                 }
             }
+
+            private X86Register SelectMemoryScratch(X86Operand first, X86Operand second)
+            {
+                if (!OperandUsesRegister(first, Scratch1) && !OperandUsesRegister(second, Scratch1))
+                    return Scratch1;
+                if (!OperandUsesRegister(first, Scratch0) && !OperandUsesRegister(second, Scratch0))
+                    return Scratch0;
+                if (!OperandUsesRegister(first, X86Register.Rcx) && !OperandUsesRegister(second, X86Register.Rcx))
+                    return X86Register.Rcx;
+                throw new NotSupportedException("No scratch register is available for memory copy emission.");
+            }
+
+            private static bool OperandUsesRegister(X86Operand operand, X86Register register)
+                => operand.Kind == X86OperandKind.Memory &&
+                   (operand.BaseRegister == register || operand.IndexRegister == register);
 
             private X86Operand SymbolAddressOperand(string symbol)
                 => X86Operand.SymbolOperand(symbol, _wordSize, _wordSize == 8 ? X86ObjectRelocationKind.Absolute64 : X86ObjectRelocationKind.Absolute32);

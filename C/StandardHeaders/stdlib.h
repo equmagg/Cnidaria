@@ -197,6 +197,22 @@ static void* __stdlib_linux_map(size_t length)
         : "={eax}"(result)
         : [arguments] "r"(arguments)
         : "ecx", "edx", "esi", "edi", "memory");
+#elif defined(__aarch64__)
+    result = 0;
+    __asm__ volatile(
+        "mov x8, #222\n"
+        "svc #0"
+        : "+{x0}"(result)
+        : [length] "{x1}"(length), [protection] "{x2}"(3), [flags] "{x3}"(34), [descriptor] "{x4}"(-1), [offset] "{x5}"(0)
+        : "x8", "memory");
+#elif defined(__arm__)
+    result = 0;
+    __asm__ volatile(
+        "mov r7, #192\n"
+        "svc #0"
+        : "+{r0}"(result)
+        : [length] "{r1}"(length), [protection] "{r2}"(3), [flags] "{r3}"(34), [descriptor] "{r4}"(-1), [offset] "{r5}"(0)
+        : "r7", "memory");
 #elif defined(__riscv)
     result = 0;
     __asm__ volatile(
@@ -234,6 +250,22 @@ static void __stdlib_linux_unmap(void* address, size_t length)
         : "={eax}"(result)
         : [address] "{ebx}"(address), [length] "{ecx}"(length)
         : "edx", "memory");
+#elif defined(__aarch64__)
+    long result = (long)address;
+    __asm__ volatile(
+        "mov x8, #215\n"
+        "svc #0"
+        : "+{x0}"(result)
+        : [length] "{x1}"(length)
+        : "x8", "memory");
+#elif defined(__arm__)
+    long result = (long)address;
+    __asm__ volatile(
+        "mov r7, #91\n"
+        "svc #0"
+        : "+{r0}"(result)
+        : [length] "{r1}"(length)
+        : "r7", "memory");
 #elif defined(__riscv)
     long result = (long)address;
     __asm__ volatile(

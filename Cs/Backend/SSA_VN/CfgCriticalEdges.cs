@@ -22,6 +22,76 @@ namespace Cnidaria.Cs
         public static GenTreeMethod SplitCriticalEdges(GenTreeMethod method)
             => SplitCriticalEdges(method, canSplitEdge: null);
 
+        public static GenTreeMethod CreateLoopPreheader(GenTreeMethod method, ControlFlowGraph cfg, CfgLoop loop)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (cfg is null)
+                throw new ArgumentNullException(nameof(cfg));
+            if (!loop.IsReducible || loop.IsCanonicalPreheader || loop.Header < 0 || (uint)loop.Header >= (uint)method.Blocks.Length)
+                return method;
+            if (loop.Entries.Length != 1 || loop.Entries[0] != loop.Header)
+                return method;
+            if (cfg.Blocks.Length != method.Blocks.Length)
+                return method;
+            for (int i = 0; i < method.Blocks.Length; i++)
+            {
+                if (method.Blocks[i].Id != i || cfg.Blocks[i].Id != i)
+                    return method;
+            }
+
+            var outsideEdges = new List<CfgEdge>();
+            var seenPredecessors = new HashSet<int>();
+            var predecessors = cfg.Blocks[loop.Header].Predecessors;
+            for (int i = 0; i < predecessors.Length; i++)
+            {
+                var edge = predecessors[i];
+                if (edge.Kind == CfgEdgeKind.Exception || loop.Contains(edge.FromBlockId))
+                    continue;
+                if ((uint)edge.FromBlockId >= (uint)method.Blocks.Length)
+                    return method;
+                if (seenPredecessors.Add(edge.FromBlockId))
+                    outsideEdges.Add(edge);
+            }
+
+            if (outsideEdges.Count == 0)
+                return method;
+
+            var header = method.Blocks[loop.Header];
+            var headerCfg = cfg.Blocks[loop.Header];
+            if (!headerCfg.TryRegionIndexes.IsDefaultOrEmpty || !headerCfg.HandlerRegionIndexes.IsDefaultOrEmpty)
+                return method;
+
+            int stackDepth = method.Blocks[outsideEdges[0].FromBlockId].ExitStackDepth;
+            if (stackDepth != header.EntryStackDepth)
+                return method;
+            for (int i = 1; i < outsideEdges.Count; i++)
+            {
+                if (method.Blocks[outsideEdges[i].FromBlockId].ExitStackDepth != stackDepth)
+                    return method;
+            }
+
+            int nextBlockId = method.Blocks.Length;
+            int nextTreeId = NextSyntheticTreeId(method);
+            int splitPc = FirstSyntheticPc(method);
+            var info = new SplitEdgeInfo(nextBlockId, splitPc);
+            var splitInfo = new Dictionary<(int from, int to), SplitEdgeInfo>(outsideEdges.Count);
+            for (int i = 0; i < outsideEdges.Count; i++)
+                splitInfo.Add((outsideEdges[i].FromBlockId, loop.Header), info);
+
+            var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length + 1);
+            for (int i = 0; i < method.Blocks.Length; i++)
+                blocks.Add(RewriteOriginalBlock(method.Blocks[i], splitInfo, ref nextTreeId));
+
+            blocks.Add(CreateSplitBlock(
+                info,
+                method.Blocks[outsideEdges[0].FromBlockId],
+                header,
+                ref nextTreeId));
+
+            return method.CloneWithBlocks(blocks.ToImmutable());
+        }
+
         public static GenTreeMethod SplitCriticalEdges(GenTreeMethod method, Func<CfgEdge, bool>? canSplitEdge)
         {
             if (method is null)

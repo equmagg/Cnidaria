@@ -272,7 +272,8 @@ namespace Cnidaria.Cs
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
             else if (MayClobberCallerSaved(source, _target))
-                flags |= _nonCallOperationsClobberCallerSavedRegisters
+                flags |= (_nonCallOperationsClobberCallerSavedRegisters ||
+                    (_target.IsX86 && source.Kind is GenTreeKind.AllocHGlobal or GenTreeKind.FreeHGlobal))
                     ? GenTreeLinearFlags.CallerSavedKill
                     : GenTreeLinearFlags.CallerSavedRegistersPreserved;
 
@@ -688,6 +689,9 @@ namespace Cnidaria.Cs
                 _ => 0,
             };
 
+            if (_target.IsX86 && IsIntegerDivRem(source, result, _target))
+                count++;
+
             if ((memoryAccess.Flags & LinearMemoryAccessFlags.RequiresWriteBarrier) != 0)
                 count++;
 
@@ -695,6 +699,20 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Node {source.Id} requires too many internal general registers.");
 
             return (byte)count;
+        }
+
+        private static bool IsIntegerDivRem(GenTree source, GenTree? result, TargetInfo target)
+        {
+            if (source.Kind != GenTreeKind.Binary ||
+                source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+            {
+                return false;
+            }
+
+            var stackKind = result?.StackKind ?? source.StackKind;
+            if (target.Architecture == TargetArchitectureKind.I386 && stackKind == GenStackKind.I8)
+                return false;
+            return stackKind is not (GenStackKind.R4 or GenStackKind.R8);
         }
 
         private byte InternalFloatRegisterCount(GenTree source, GenTree? result)

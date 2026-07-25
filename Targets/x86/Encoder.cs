@@ -302,7 +302,7 @@ namespace Cnidaria.X86
                 EmitRexForModRm(writer, target, rexW, 0, destination, RequiresByteRex(destination));
                 writer.WriteByte(size == 1 ? (byte)0xC6 : (byte)0xC7);
                 EmitModRm(writer, 0, destination, target, nextIp, symbols);
-                WriteImmediate(writer, ResolveImmediate(source, symbols, nextIp), size == 8 ? 4 : size);
+                WriteImmediate(writer, ResolveImmediate(source, symbols, nextIp), size == 8 ? 4 : size, signExtended: size == 8);
                 return;
             }
 
@@ -387,7 +387,7 @@ namespace Cnidaria.X86
                 {
                     writer.WriteByte(size == 1 ? (byte)0x80 : (byte)0x81);
                     EmitModRm(writer, info.Group, destination, target, nextIp, symbols);
-                    WriteImmediate(writer, value, size == 8 ? 4 : size);
+                    WriteImmediate(writer, value, size == 8 ? 4 : size, signExtended: size == 8);
                 }
                 return;
             }
@@ -424,7 +424,7 @@ namespace Cnidaria.X86
                 EmitRexForModRm(writer, target, size == 8, 0, destination, RequiresByteRex(destination));
                 writer.WriteByte(size == 1 ? (byte)0xF6 : (byte)0xF7);
                 EmitModRm(writer, 0, destination, target, nextIp, symbols);
-                WriteImmediate(writer, ResolveImmediate(source, symbols, nextIp), size == 8 ? 4 : size);
+                WriteImmediate(writer, ResolveImmediate(source, symbols, nextIp), size == 8 ? 4 : size, signExtended: size == 8);
                 return;
             }
 
@@ -481,7 +481,7 @@ namespace Cnidaria.X86
                 if (!immediate.HasSymbol && FitsSignedByte(value))
                     writer.WriteInt8((sbyte)value);
                 else
-                    WriteImmediate(writer, value, size == 8 ? 4 : size);
+                    WriteImmediate(writer, value, size == 8 ? 4 : size, signExtended: size == 8);
                 return;
             }
 
@@ -1164,18 +1164,36 @@ namespace Cnidaria.X86
             throw new KeyNotFoundException($"Undefined x86 symbol: {symbol}");
         }
 
-        private static void WriteImmediate(X86InstructionWriter writer, long value, int size)
+        private static void WriteImmediate(X86InstructionWriter writer, long value, int size, bool signExtended = false)
         {
             switch (size)
             {
                 case 1:
-                    writer.WriteInt8((sbyte)value);
+                    if (value < sbyte.MinValue ||
+                        (!signExtended && value > byte.MaxValue) ||
+                        (signExtended && value > sbyte.MaxValue))
+                    {
+                        throw new OverflowException("Immediate does not fit 8 bits.");
+                    }
+                    writer.WriteInt8(unchecked((sbyte)value));
                     break;
                 case 2:
-                    writer.WriteInt16(checked((short)value));
+                    if (value < short.MinValue ||
+                        (!signExtended && value > ushort.MaxValue) ||
+                        (signExtended && value > short.MaxValue))
+                    {
+                        throw new OverflowException("Immediate does not fit 16 bits.");
+                    }
+                    writer.WriteInt16(unchecked((short)value));
                     break;
                 case 4:
-                    writer.WriteInt32(checked((int)value));
+                    if (value < int.MinValue ||
+                        (!signExtended && value > uint.MaxValue) ||
+                        (signExtended && value > int.MaxValue))
+                    {
+                        throw new OverflowException("Immediate does not fit 32 bits.");
+                    }
+                    writer.WriteInt32(unchecked((int)value));
                     break;
                 case 8:
                     writer.WriteInt64(value);

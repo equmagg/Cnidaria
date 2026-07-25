@@ -1303,8 +1303,11 @@ namespace Cnidaria.Cs
 
             private bool IsKnownNonZero(ValueNumber value, GenTree template, AssertionSet active)
             {
-                if (IsValueNumberKnownNonZero(value, template.StackKind))
+                if (IsValueNumberKnownNonZero(value, template.StackKind) ||
+                    IsKnownStackAllocationAddress(value, active))
+                {
                     return true;
+                }
 
                 if (TryGetKnownConstant(value, active, out var constant))
                 {
@@ -1372,6 +1375,96 @@ namespace Cnidaria.Cs
                     AssertionValue.ForValueNumber(value),
                     AssertionValue.Null,
                     active);
+            }
+
+            private bool IsKnownStackAllocationAddress(ValueNumber value, AssertionSet active)
+            {
+                if (_method.GenTreeMethod.Target.IsRegisterBytecode)
+                    return false;
+
+                value = _store.VNNormalValue(value);
+                long byteOffset = 0;
+
+                for (int depth = 0; depth < 32; depth++)
+                {
+                    if (!_store.TryGetEntry(value, out var entry))
+                        return false;
+
+                    if (entry.Function == ValueNumberFunction.SsaNormalize && entry.Args.Length >= 1)
+                    {
+                        value = _store.VNNormalValue(entry.Args[0]);
+                        continue;
+                    }
+
+                    if (entry.Function == ValueNumberFunction.PointerElementAddr)
+                    {
+                        if (entry.Args.Length != 3 ||
+                            !TryGetKnownIntegralConstant(entry.Args[1], active, out long index) ||
+                            !TryGetKnownIntegralConstant(entry.Args[2], active, out long elementSize) ||
+                            elementSize <= 0)
+                        {
+                            return false;
+                        }
+
+                        try
+                        {
+                            byteOffset = checked(byteOffset + checked(index * elementSize));
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+
+                        value = _store.VNNormalValue(entry.Args[0]);
+                        continue;
+                    }
+
+                    if (entry.Function != ValueNumberFunction.StackAlloc || entry.Args.Length != 2)
+                        return false;
+
+                    if (byteOffset == 0)
+                        return true;
+                    if (byteOffset < 0 ||
+                        !TryGetKnownIntegralConstant(entry.Args[1], active, out long allocationElementSize) ||
+                        allocationElementSize <= 0 ||
+                        !TryGetIntegralRange(entry.Args[0], active, out var countRange) ||
+                        countRange.Lower <= 0)
+                    {
+                        return false;
+                    }
+
+                    try
+                    {
+                        long minimumAllocationSize = checked(countRange.Lower * allocationElementSize);
+                        return byteOffset < minimumAllocationSize;
+                    }
+                    catch (OverflowException)
+                    {
+                        return false;
+                    }
+                }
+
+                return false;
+            }
+
+            private bool TryGetKnownIntegralConstant(ValueNumber value, AssertionSet active, out long result)
+            {
+                value = _store.VNNormalValue(value);
+                if (TryGetKnownConstant(value, active, out var constant))
+                {
+                    switch (constant.Kind)
+                    {
+                        case AssertionValueKind.ConstantInt32:
+                            result = unchecked((int)constant.Constant);
+                            return true;
+                        case AssertionValueKind.ConstantInt64:
+                            result = constant.Constant;
+                            return true;
+                    }
+                }
+
+                result = 0;
+                return false;
             }
 
             private bool IsValueNumberKnownNonZero(ValueNumber value, GenStackKind stackKind)

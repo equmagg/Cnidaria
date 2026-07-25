@@ -12,7 +12,6 @@
     shell_argv[0] = "/shell.elf";
     shell_argv[1] = (char*)NULL;
 
-    write_text("init: user space started\n");
     result = run_program(autorun_argv[0], autorun_argv);
     if (result < 0)
         write_text("init: autorun could not be started\n");

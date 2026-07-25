@@ -15,11 +15,14 @@ namespace Cnidaria.Cs
         public bool EnableDeadDefinitionsElimination { get; set; } = true;
         public bool EnableCopyPropagation { get; set; } = true;
         public bool EnableCommonSubexpressionElimination { get; set; } = true;
+        public bool EnableLoopInvariantCodeMotion { get; set; } = true;
         public bool EnableAssertionPropagation { get; set; } = true;
         public bool EnableRedundantBranchOptimization { get; set; } = true;
         public bool EnableBranchJumpThreading { get; set; } = true;
         public bool EnableDeadCodeElimination { get; set; } = true;
         public int MaxBranchOptimizationPasses { get; set; } = 4;
+        public int MaxLoopHoistsPerLoop { get; set; } = 16;
+        public int LoopHoistMinCost { get; set; } = 2;
         public int MaxIterations { get; set; } = 8;
     }
     internal static class SsaOptimizer
@@ -144,12 +147,28 @@ namespace Cnidaria.Cs
             public SsaMethod Run()
             {
                 var current = RunScalarOptimizationFixedPoint(_original);
+                bool hoistingChanged = false;
+
+                if (_options.EnableLoopInvariantCodeMotion && _options.EnableCommonSubexpressionElimination)
+                {
+                    var hoisting = SsaLoopHoister.OptimizeMethod(current, _options, _nextSyntheticTreeId);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, hoisting.NextSyntheticTreeId);
+                    hoistingChanged = hoisting.Changed;
+                    current = EnsureValueNumbers(hoisting.Method);
+                }
 
                 if (_options.EnableCommonSubexpressionElimination)
                 {
                     var cse = SsaCommonSubexpressionEliminator.OptimizeMethod(current, _options, _nextSyntheticTreeId);
                     _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, cse.NextSyntheticTreeId);
-                    current = EnsureValueNumbers(cse.Method);
+                    current = cse.Method;
+
+                    if (hoistingChanged && ContainsMakeCse(current))
+                        current = RemoveUnresolvedLoopHoists(current);
+
+                    current = cse.Changed || hoistingChanged
+                        ? RunScalarOptimizationFixedPoint(current)
+                        : EnsureValueNumbers(current);
                 }
 
                 if (_options.EnableAssertionPropagation)
@@ -161,6 +180,100 @@ namespace Cnidaria.Cs
                 }
 
                 return EnsureValueNumbers(current);
+            }
+
+            private static bool ContainsMakeCse(SsaMethod method)
+            {
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    var treeList = method.Blocks[b].TreeList;
+                    for (int i = 0; i < treeList.Length; i++)
+                    {
+                        if ((treeList[i].Tree.Source.Flags & GenTreeFlags.MakeCse) != 0)
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private SsaMethod RemoveUnresolvedLoopHoists(SsaMethod method)
+            {
+                var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.GenTreeMethod.Blocks.Length);
+                for (int b = 0; b < method.GenTreeMethod.Blocks.Length; b++)
+                {
+                    var oldBlock = method.GenTreeMethod.Blocks[b];
+                    var statements = ImmutableArray.CreateBuilder<GenTree>(oldBlock.Statements.Length);
+                    for (int s = 0; s < oldBlock.Statements.Length; s++)
+                    {
+                        var statement = oldBlock.Statements[s];
+                        if (statement.Kind == GenTreeKind.Eval && ContainsMakeCse(statement))
+                            continue;
+                        statements.Add(CloneClearingMakeCse(statement));
+                    }
+
+                    blocks.Add(new GenTreeBlock(
+                        oldBlock.Id,
+                        oldBlock.StartPc,
+                        oldBlock.EndPcExclusive,
+                        oldBlock.EntryStackDepth,
+                        oldBlock.ExitStackDepth,
+                        oldBlock.JumpKind,
+                        oldBlock.Flags,
+                        statements.ToImmutable(),
+                        oldBlock.SuccessorBlockIds,
+                        oldBlock.SuccessorPcs));
+                }
+
+                var rewritten = method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
+                return RebuildSsaAfterGenTreeRewrite(method, rewritten);
+            }
+
+            private static bool ContainsMakeCse(GenTree node)
+            {
+                if ((node.Flags & GenTreeFlags.MakeCse) != 0)
+                    return true;
+                for (int i = 0; i < node.Operands.Length; i++)
+                {
+                    if (ContainsMakeCse(node.Operands[i]))
+                        return true;
+                }
+                return false;
+            }
+
+            private static GenTree CloneClearingMakeCse(GenTree node)
+            {
+                ImmutableArray<GenTree> operands = ImmutableArray<GenTree>.Empty;
+                if (!node.Operands.IsDefaultOrEmpty)
+                {
+                    var builder = ImmutableArray.CreateBuilder<GenTree>(node.Operands.Length);
+                    for (int i = 0; i < node.Operands.Length; i++)
+                        builder.Add(CloneClearingMakeCse(node.Operands[i]));
+                    operands = builder.ToImmutable();
+                }
+
+                var clone = new GenTree(
+                    node.Id,
+                    node.Kind,
+                    node.Pc,
+                    node.SourceOp,
+                    node.Type,
+                    node.StackKind,
+                    node.Flags & ~GenTreeFlags.MakeCse,
+                    operands,
+                    int32: node.Int32,
+                    int64: node.Int64,
+                    text: node.Text,
+                    runtimeType: node.RuntimeType,
+                    field: node.Field,
+                    method: node.Method,
+                    convKind: node.ConvKind,
+                    convFlags: node.ConvFlags,
+                    targetPc: node.TargetPc,
+                    targetBlockId: node.TargetBlockId);
+                clone.LocalDescriptor = node.LocalDescriptor;
+                clone.CseNumber = node.CseNumber;
+                return clone;
             }
 
             private SsaMethod RunScalarOptimizationFixedPoint(SsaMethod method)
@@ -4707,6 +4820,145 @@ namespace Cnidaria.Cs
                         Visit(tree.Operands[i]);
                 }
             }
+        }
+    }
+
+    internal static class SsaCseCandidatePolicy
+    {
+        public static bool CanConsider(GenTree node)
+        {
+            if (!ProducesValue(node) || !CanMaterializeInTemp(node))
+                return false;
+
+            if ((node.Flags & (GenTreeFlags.ContainsCall |
+                               GenTreeFlags.SideEffect |
+                               GenTreeFlags.MemoryWrite |
+                               GenTreeFlags.LocalDef |
+                               GenTreeFlags.AddressExposed |
+                               GenTreeFlags.Allocation |
+                               GenTreeFlags.ControlFlow |
+                               GenTreeFlags.ExceptionFlow |
+                               GenTreeFlags.Ordered)) != 0)
+            {
+                return false;
+            }
+
+            if (IsMemoryReadCandidate(node))
+                return true;
+
+            if ((node.Flags & (GenTreeFlags.MemoryRead |
+                               GenTreeFlags.GlobalRef |
+                               GenTreeFlags.Indirect)) != 0)
+            {
+                return false;
+            }
+
+            return node.Kind switch
+            {
+                GenTreeKind.Unary => true,
+                GenTreeKind.Binary => true,
+                GenTreeKind.Conv => true,
+                GenTreeKind.SizeOf => true,
+                GenTreeKind.FieldAddr => true,
+                GenTreeKind.StaticFieldAddr => true,
+                GenTreeKind.StaticData => true,
+                GenTreeKind.PointerElementAddr => true,
+                GenTreeKind.PointerDiff => true,
+                _ => false,
+            };
+        }
+
+        public static bool CanMaterializeInTemp(GenTree node)
+            => node.StackKind is
+                GenStackKind.I4 or
+                GenStackKind.I8 or
+                GenStackKind.R4 or
+                GenStackKind.R8 or
+                GenStackKind.NativeInt or
+                GenStackKind.NativeUInt or
+                GenStackKind.Ref or
+                GenStackKind.Ptr;
+
+        public static int EstimateCost(GenTree node)
+        {
+            int cost = node.Kind switch
+            {
+                GenTreeKind.Unary => 2,
+                GenTreeKind.Binary => 3,
+                GenTreeKind.Conv => 2,
+                GenTreeKind.SizeOf => 1,
+                GenTreeKind.Field => 4,
+                GenTreeKind.StaticField => 4,
+                GenTreeKind.LoadIndirect => 4,
+                GenTreeKind.ArrayElement => 5,
+                GenTreeKind.StaticFieldAddr => 2,
+                GenTreeKind.FieldAddr => 2,
+                GenTreeKind.ArrayDataRef => 4,
+                GenTreeKind.StaticData => 1,
+                GenTreeKind.PointerElementAddr => 3,
+                GenTreeKind.PointerDiff => 3,
+                _ => 1,
+            };
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                cost += Math.Max(1, EstimateCost(node.Operands[i]) / 2);
+            return cost;
+        }
+
+        private static bool IsMemoryReadCandidate(GenTree node)
+        {
+            if (node.SsaMemoryUses.IsDefaultOrEmpty || !node.SsaMemoryDefinitions.IsDefaultOrEmpty)
+                return false;
+            if ((node.Flags & GenTreeFlags.MemoryRead) == 0)
+                return false;
+            if ((node.Flags & (GenTreeFlags.SideEffect |
+                               GenTreeFlags.MemoryWrite |
+                               GenTreeFlags.LocalDef |
+                               GenTreeFlags.AddressExposed |
+                               GenTreeFlags.Allocation |
+                               GenTreeFlags.ControlFlow |
+                               GenTreeFlags.ExceptionFlow |
+                               GenTreeFlags.Ordered)) != 0)
+            {
+                return false;
+            }
+
+            return node.Kind switch
+            {
+                GenTreeKind.Field => true,
+                GenTreeKind.StaticField => true,
+                GenTreeKind.LoadIndirect => true,
+                GenTreeKind.ArrayElement => true,
+                GenTreeKind.ArrayDataRef => true,
+                _ => false,
+            };
+        }
+
+        private static bool ProducesValue(GenTree node)
+        {
+            if (node.StackKind == GenStackKind.Void)
+                return false;
+
+            return node.Kind switch
+            {
+                GenTreeKind.Nop => false,
+                GenTreeKind.StoreIndirect => false,
+                GenTreeKind.StoreLocal => false,
+                GenTreeKind.StoreArg => false,
+                GenTreeKind.StoreTemp => false,
+                GenTreeKind.StoreField => false,
+                GenTreeKind.StoreStaticField => false,
+                GenTreeKind.StoreArrayElement => false,
+                GenTreeKind.Eval => false,
+                GenTreeKind.Branch => false,
+                GenTreeKind.BranchTrue => false,
+                GenTreeKind.BranchFalse => false,
+                GenTreeKind.Return => false,
+                GenTreeKind.Throw => false,
+                GenTreeKind.Rethrow => false,
+                GenTreeKind.EndFinally => false,
+                _ => true,
+            };
         }
     }
 }

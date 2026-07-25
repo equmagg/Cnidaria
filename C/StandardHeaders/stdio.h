@@ -71,6 +71,72 @@ static void __printf(const char* text)
     : [handle] "{eax}"(handle), [text] "{ecx}"(text), [length] "{edx}"(length), [written] "m"(written)
         : "eax", "ecx", "edx", "memory");
 }
+#elif defined(_WIN32) && defined(__aarch64__)
+static void __printf(const char* text)
+{
+    unsigned int length = 0;
+    unsigned int written = 0;
+    void* handle = (void*)(long)-11;
+
+    while (text[length] != 0)
+        length = length + 1;
+
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_GetStdHandle\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(handle)
+        :
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "mov x4, #0\n"
+        "ldr x16, __imp_WriteFile\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "+{x0}"(handle)
+        : [text] "{x1}"(text), [length] "{x2}"(length), [written] "{x3}"(&written)
+        : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+}
+#elif defined(_WIN32) && defined(__arm__)
+static void __printf(const char* text)
+{
+    unsigned int length = 0;
+    unsigned int written = 0;
+    void* handle = (void*)(long)-11;
+
+    while (text[length] != 0)
+        length = length + 1;
+
+    __asm__ volatile(
+        "push {r4, lr}\n"
+        "ldr r12, __imp_GetStdHandle\n"
+        "blx r12\n"
+        "pop {r4, lr}"
+        : "+{r0}"(handle)
+        :
+        : "r1", "r2", "r3", "r12", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+
+    __asm__ volatile(
+        "push {lr}\n"
+        "mov r12, #0\n"
+        "push {r12}\n"
+        "ldr r12, __imp_WriteFile\n"
+        "blx r12\n"
+        "add sp, sp, #4\n"
+        "pop {lr}"
+        : "+{r0}"(handle)
+        : [text] "{r1}"(text), [length] "{r2}"(length), [written] "{r3}"(&written)
+        : "r12", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+}
 #elif defined(__linux__) && defined(__x86_64__)
 static void __printf(const char* text)
 {
@@ -104,6 +170,38 @@ static void __printf(const char* text)
         :
     : [text] "{ecx}"(text), [length] "{edx}"(length)
         : "eax", "ecx", "edx", "memory");
+}
+#elif defined(__linux__) && defined(__aarch64__)
+static void __printf(const char* text)
+{
+    unsigned long length = 0;
+
+    while (text[length] != 0)
+        length = length + 1;
+
+    __asm__ volatile(
+        "mov x8, #64\n"
+        "mov x0, #1\n"
+        "svc #0"
+        :
+    : [text] "{x1}"(text), [length] "{x2}"(length)
+        : "x0", "x8", "memory");
+}
+#elif defined(__linux__) && defined(__arm__)
+static void __printf(const char* text)
+{
+    unsigned long length = 0;
+
+    while (text[length] != 0)
+        length = length + 1;
+
+    __asm__ volatile(
+        "mov r7, #4\n"
+        "mov r0, #1\n"
+        "svc #0"
+        :
+    : [text] "{r1}"(text), [length] "{r2}"(length)
+        : "r0", "r7", "memory");
 }
 #elif defined(__linux__) && defined(__riscv)
 static void __printf(const char* text)
@@ -817,5 +915,64 @@ int printf(const char* format, ...)
     va_end(ap);
     return count;
 }
+
+
+// for testing purposes only:
+#if defined(__linux__) && defined(__x86_64__)
+static void shutdown(void)
+{
+    __asm__ volatile(
+        "mov eax, 169\n"
+        "syscall"
+        :
+    : [magic1] "{rdi}"(0xfee1deadu), [magic2] "{rsi}"(0x28121969u), [cmd] "{rdx}"(0x4321fedcu), [arg] "{r10}"((void*)0)
+        : "rax", "rcx", "r11", "memory");
+}
+#elif defined(__linux__) && defined(__i386__)
+static void shutdown(void)
+{
+    __asm__ volatile(
+        "push ebx\n"
+        "mov eax, 88\n"
+        ".byte 0xcd, 0x80\n"
+        "pop ebx"
+        :
+    : [magic1] "{ebx}"(0xfee1deadu), [magic2] "{ecx}"(0x28121969u), [cmd] "{edx}"(0x4321fedcu), [arg] "{esi}"((void*)0)
+        : "eax", "memory");
+}
+#elif defined(__linux__) && defined(__aarch64__)
+static void shutdown(void)
+{
+    __asm__ volatile(
+        "mov x8, #142\n"
+        "svc #0"
+        :
+    : [magic1] "{x0}"(0xfee1deadu), [magic2] "{x1}"(0x28121969u), [cmd] "{x2}"(0x4321fedcu), [arg] "{x3}"((void*)0)
+        : "x8", "memory");
+}
+#elif defined(__linux__) && defined(__arm__)
+static void shutdown(void)
+{
+    __asm__ volatile(
+        "mov r7, #88\n"
+        "svc #0"
+        :
+    : [magic1] "{r0}"(0xfee1deadu), [magic2] "{r1}"(0x28121969u), [cmd] "{r2}"(0x4321fedcu), [arg] "{r3}"((void*)0)
+        : "r7", "memory");
+}
+#elif defined(__linux__) && defined(__riscv)
+static void shutdown(void)
+{
+    __asm__ volatile(
+        "addi a7, zero, 142\n"
+        "ecall"
+        :
+    : [magic1] "{a0}"(0xfee1deadu), [magic2] "{a1}"(0x28121969u), [cmd] "{a2}"(0x4321fedcu), [arg] "{a3}"((void*)0)
+        : "a7", "memory");
+}
+#elif defined(__linux__)
+void shutdown(void);
+#endif
+
 
 #endif

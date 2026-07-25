@@ -38,7 +38,7 @@ namespace Cnidaria.Cs
                 int usePosition = layout.NodePositions[node.LinearId];
                 int defPosition = usePosition + 1;
 
-                AddInternalRegisterRefPositions(result, node, usePosition);
+                AddInternalRegisterRefPositions(result, node, usePosition, target);
 
                 if (node.LinearKind is GenTreeLinearKind.Copy or GenTreeLinearKind.PhiCopy)
                 {
@@ -78,7 +78,19 @@ namespace Cnidaria.Cs
                 }
 
                 if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
-                    AddRegisterKills(result, node, usePosition, RegisterInfo.CallerSavedScalarRegisters(target));
+                {
+                    AddRegisterKillMask(result, node, usePosition, MachineRegisters.MaskOf(RegisterInfo.CallerSavedScalarRegisters(target)));
+                }
+                else if (X86IntegerDivRem(node, target))
+                {
+                    AddRegisterKillMask(
+                        result,
+                        node,
+                        usePosition,
+                        MachineRegisters.MaskOf(RegisterInfo.AccumulatorRegister(target)) |
+                        MachineRegisters.MaskOf(RegisterInfo.DataRegister(target)));
+                }
+
             }
 
             AddInitialArgumentFixedRefPositions(result, method, layout, target);
@@ -232,13 +244,7 @@ namespace Cnidaria.Cs
         }
 
         private static MachineRegister GetMaybeArgumentRegister(TargetInfo target, RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
-        {
-            if (registerClass == RegisterClass.Float)
-                return RegisterInfo.GetFloatArgumentRegister(target, floatIndex++);
-            if (registerClass == RegisterClass.General)
-                return RegisterInfo.GetIntegerArgumentRegister(target, generalIndex++);
-            return MachineRegister.Invalid;
-        }
+            => MachineAbi.ConsumeArgumentRegister(target, registerClass, ref generalIndex, ref floatIndex);
 
         private static GenStackKind StackKindForAbi(RuntimeType? type)
             => MachineAbi.StackKindForType(type);
@@ -380,6 +386,11 @@ namespace Cnidaria.Cs
                     continue;
                 }
 
+                MachineRegister fixedRegister = X86FixedUseRegister(method.Target, node, operandIndex, info.RegisterClass);
+                if (fixedRegister != MachineRegister.Invalid)
+                    flags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
+
+                ulong registerMask = X86UseRegisterMask(method.Target, node, operandIndex, info.RegisterClass);
                 result.Add(new LinearRefPosition(
                     node.LinearId,
                     usePosition,
@@ -387,8 +398,9 @@ namespace Cnidaria.Cs
                     LinearRefPositionKind.Use,
                     value,
                     info.RegisterClass,
-                    MachineRegister.Invalid,
-                    flags));
+                    fixedRegister,
+                    flags,
+                    registerMask));
             }
 
             if (node.RegisterResult is not null)
@@ -417,6 +429,11 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                MachineRegister fixedRegister = X86FixedDefinitionRegister(method.Target, node, info.RegisterClass);
+                if (fixedRegister != MachineRegister.Invalid)
+                    flags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
+
+                ulong registerMask = X86DefinitionRegisterMask(method.Target, node, info.RegisterClass);
                 result.Add(new LinearRefPosition(
                     node.LinearId,
                     defPosition,
@@ -424,9 +441,88 @@ namespace Cnidaria.Cs
                     LinearRefPositionKind.Def,
                     value,
                     info.RegisterClass,
-                    MachineRegister.Invalid,
-                    flags));
+                    fixedRegister,
+                    flags,
+                    registerMask));
             }
+        }
+
+        private static MachineRegister X86FixedUseRegister(
+            TargetInfo target,
+            GenTree node,
+            int operandIndex,
+            RegisterClass registerClass)
+        {
+            if (!target.IsX86 || registerClass != RegisterClass.General || node.Kind != GenTreeKind.Binary)
+                return MachineRegister.Invalid;
+
+            if (operandIndex == 1 && node.SourceOp is BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un)
+                return RegisterInfo.CountRegister(target);
+
+            if (operandIndex == 0 && X86IntegerDivRem(node, target))
+                return RegisterInfo.AccumulatorRegister(target);
+
+            return MachineRegister.Invalid;
+        }
+
+        private static ulong X86UseRegisterMask(
+            TargetInfo target,
+            GenTree node,
+            int operandIndex,
+            RegisterClass registerClass)
+        {
+            if (target.Architecture != TargetArchitectureKind.I386 ||
+                registerClass != RegisterClass.General ||
+                !node.LinearMemoryAccess.Writes ||
+                !node.LinearMemoryAccess.HasValueOperand(operandIndex) ||
+                node.LinearMemoryAccess.Size != 1)
+            {
+                return 0;
+            }
+
+            return RegisterInfo.ByteAddressableRegisterMask(target);
+        }
+
+        private static MachineRegister X86FixedDefinitionRegister(
+            TargetInfo target,
+            GenTree node,
+            RegisterClass registerClass)
+        {
+            if (!target.IsX86 || registerClass != RegisterClass.General || !X86IntegerDivRem(node, target))
+                return MachineRegister.Invalid;
+
+            return node.SourceOp is BytecodeOp.Rem or BytecodeOp.Rem_Un
+                ? RegisterInfo.DataRegister(target)
+                : RegisterInfo.AccumulatorRegister(target);
+        }
+
+        private static ulong X86DefinitionRegisterMask(
+            TargetInfo target,
+            GenTree node,
+            RegisterClass registerClass)
+        {
+            if (target.Architecture != TargetArchitectureKind.I386 ||
+                registerClass != RegisterClass.General ||
+                node.Kind != GenTreeKind.Binary ||
+                node.SourceOp is not (BytecodeOp.Ceq or BytecodeOp.Cgt or BytecodeOp.Cgt_Un or BytecodeOp.Clt or BytecodeOp.Clt_Un))
+            {
+                return 0;
+            }
+
+            return RegisterInfo.ByteAddressableRegisterMask(target);
+        }
+
+        private static bool X86IntegerDivRem(GenTree node, TargetInfo target)
+        {
+            if (!target.IsX86 || node.Kind != GenTreeKind.Binary ||
+                node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+            {
+                return false;
+            }
+
+            if (target.Architecture == TargetArchitectureKind.I386 && node.StackKind == GenStackKind.I8)
+                return false;
+            return node.StackKind is not (GenStackKind.R4 or GenStackKind.R8);
         }
 
         private static LirOperandFlags GetOperandFlags(GenTree node, int registerUseIndex)
@@ -728,7 +824,7 @@ namespace Cnidaria.Cs
                     LinearRefPositionKind.Use,
                     indirectTarget,
                     RegisterClass.General,
-                    MachineRegisters.TreeScratch3,
+                    RegisterInfo.IndirectCallTargetRegister(target),
                     flags));
             }
 
@@ -892,7 +988,8 @@ namespace Cnidaria.Cs
         private static void AddInternalRegisterRefPositions(
             ImmutableArray<LinearRefPosition>.Builder result,
             GenTree node,
-            int position)
+            int position,
+            TargetInfo target)
         {
             if (node.LinearLowering.InternalGeneralRegisters != 0)
             {
@@ -905,7 +1002,11 @@ namespace Cnidaria.Cs
                     RegisterClass.General,
                     MachineRegister.Invalid,
                     LinearRefPositionFlags.Internal | LinearRefPositionFlags.RequiresRegister,
-                    MachineRegisters.DefaultMaskForClass(RegisterClass.General),
+                    X86IntegerDivRem(node, target)
+                        ? MachineRegisters.DefaultMaskForClass(RegisterClass.General) &
+                            ~MachineRegisters.MaskOf(RegisterInfo.AccumulatorRegister(target)) &
+                            ~MachineRegisters.MaskOf(RegisterInfo.DataRegister(target))
+                        : MachineRegisters.DefaultMaskForClass(RegisterClass.General),
                     node.LinearLowering.InternalGeneralRegisters));
             }
 
@@ -925,13 +1026,12 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void AddRegisterKills(
+        private static void AddRegisterKillMask(
             ImmutableArray<LinearRefPosition>.Builder result,
             GenTree node,
             int position,
-            ImmutableArray<MachineRegister> registers)
+            ulong killMask)
         {
-            ulong killMask = MachineRegisters.MaskOf(registers);
             if (killMask == 0)
                 return;
 

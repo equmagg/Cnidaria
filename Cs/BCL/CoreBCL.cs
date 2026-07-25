@@ -10169,11 +10169,37 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static void Write(object value) { _Write(value.ToString()); }
 
         public unsafe static void WriteLine() { uint nl = '\n'; _Write((char*)&nl); }
-        public unsafe static void WriteLine(sbyte value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
-        public unsafe static void WriteLine(byte value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
-        public unsafe static void WriteLine(short value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
-        public unsafe static void WriteLine(ushort value) { Write((int)value); uint nl = '\n'; _Write((char*)&nl); }
-        public unsafe static void WriteLine(int value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
+        public unsafe static void WriteLine(sbyte value) { WriteLine((int)value); }
+        public unsafe static void WriteLine(byte value) { WriteLine((int)value); }
+        public unsafe static void WriteLine(short value) { WriteLine((int)value); }
+        public unsafe static void WriteLine(ushort value) { WriteLine((int)value); }
+        public unsafe static void WriteLine(int value)
+        {
+            char* p = stackalloc char[13] + 11;
+            *(p + 1) = '\0';
+            *p = '\n';
+            if (value == unchecked((int)0x80000000)) //int.MinValue
+            {
+                //-2147483648
+                _Write((char*)(stackalloc char[] { '-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\n', '\0' }));
+                return;
+            }
+            bool negative = value < 0;
+            if (negative)
+                value = -value;
+
+            do
+            {
+                int digit = value % 10;
+                value /= 10;
+                *--p = (char)('0' + digit);
+            }
+            while (value != 0);
+            if (negative)
+                *--p = '-';
+
+            _Write(p);
+        }
         public unsafe static void WriteLine(uint value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
         public unsafe static void WriteLine(long value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
         public unsafe static void WriteLine(ulong value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
@@ -10257,18 +10283,19 @@ namespace System.Runtime.InteropServices
         public static unsafe IntPtr AllocHGlobal(nint cb) => IntPtr.Zero;
         [Intrinsic]
         public static unsafe void FreeHGlobal(IntPtr hglobal) { }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static unsafe void LinuxRequestShutdown() { throw new PlatformNotSupportedException(); }
     }
     public static unsafe class MemoryMarshal
     {
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
         public static ref T GetArrayDataReference<T>(T[] array)
         {
             throw new NotSupportedException();
         }
 
         [Intrinsic]
-        [MethodImpl(MethodImplOptions.NoInlining)]
         public static unsafe ref byte GetArrayDataReference(Array array)
         {
             //return ref Unsafe.AddByteOffset(ref Unsafe.As<RawData>(array).Data, 
@@ -10410,6 +10437,25 @@ namespace System.Runtime.InteropServices
         public bool PreserveSig = true;
         public bool ThrowOnUnmappableChar;
     }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct, Inherited = false)]
+    public sealed class StructLayoutAttribute : Attribute
+    {
+        public StructLayoutAttribute(LayoutKind layoutKind)
+        {
+            Value = layoutKind;
+        }
+
+        public StructLayoutAttribute(short layoutKind)
+        {
+            Value = (LayoutKind)layoutKind;
+        }
+
+        public LayoutKind Value { get; }
+
+        public int Pack;
+        public int Size;
+        public CharSet CharSet;
+    }
     public enum CallingConvention
     {
         Winapi = 1,
@@ -10424,6 +10470,12 @@ namespace System.Runtime.InteropServices
         Ansi = 2,        // Strings should be marshalled as ANSI 1 byte chars.
         Unicode = 3,     // Strings should be marshalled as Unicode 2 byte chars.
         Auto = 4,        // Marshal Strings in the right way for the target system.
+    }
+    public enum LayoutKind
+    {
+        Sequential = 0,
+        Explicit = 2,
+        Auto = 3,
     }
 }
 namespace System.Runtime.CompilerServices

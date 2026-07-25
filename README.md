@@ -1,12 +1,12 @@
 # Cnidaria
 ![build](https://img.shields.io/badge/build-passing-brightgreen) ![dotnet](https://img.shields.io/badge/.NET-10.0-blue)
 
-Cnidaria the **interpreter** and compiler for primarily **C#** and multiple other languages (currently C).
+Cnidaria is the crossplatform compiler and interpreter for primarily **C#** and multiple other languages (currently C).
 
 It is *THE solution to use modern C# as an embedded/scripting language*. Be it DSL, in-game scripting or remote code execution.
 While it strives to cover almost all of C# syntax and be very close in semantics, it is primarily designed for small, fast and reasonably simple embedded scripts. 
 As such, is does not follow CoreCLR behaviour one to one.
-Cnidaria has no access to host resources by default, providing, along with strict execution limits, a level of safety by design.
+Cnidaria has no access to host resources by default, providing, along with strict execution limits, a level of safety by design. X86 target intentionally bypasses that for raw native execution speed.
 
 ---
 
@@ -22,6 +22,9 @@ You can get acquainted with the standart library here.
 ---
 
 ## Hello World
+
+Targeting internal VM
+
 ```cs
 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
 
@@ -32,10 +35,47 @@ Console.WriteLine(output);
 
 ```
 
+Targeting native x86
+
+```cs
+string source = """
+Console.WriteLine("Hello World!");
+"""
+var (x64Exe, x64Diags) = Cnidaria.Cs.CSharp.CompileToX86(source, TargetInfo.X64Windows);
+foreach(var diag in x64Diags) { Console.WriteLine(diag.GetMessage(source)); }
+File.WriteAllBytes(Path.Combine(AppContext.BaseDirectory, "CsExe.exe"), x64Exe?.ToExecutableBytes() ?? throw new NullReferenceException());
+```
+
+Targeting RISC-V Emulator
+
+```cs
+string source = """
+Console.WriteLine("Hello World!");
+System.Runtime.InteropServices.Marshal.LinuxRequestShutdown(); // stop the emulator
+"""
+var (program, diags) = Cnidaria.Cs.CSharp.CompileToRiscV(source, TargetInfo.RVA23Linux);
+foreach(var diag in diags) { Console.WriteLine(diag.GetMessage(source)); }
+var layout = Cnidaria.RiscV.RiscVZBootLayout.Default;
+var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfig
+{
+    RamBase = 0x80000000UL,
+    RamSize = 128 * 1024 * 1024,
+    ResetVector = layout.Zs2LoadAddress,
+    BlockDeviceBase = layout.BlockDeviceBase,
+    BlockDeviceSize = layout.RequiredBootChainStorageSize
+});
+
+Cnidaria.RiscV.RiscVZBoot.LoadDefaultBootChain(machine, layout, autorunSource: program?.ToLinuxExecutableBytes());
+var result = machine.Run(instructionLimit: ulong.MaxValue);
+while (machine.Uart.TryReadOutput(out byte b))
+    Console.Write((char)b);
+Console.WriteLine($"\nstop={result.StopReason} pc=0x{machine.ProgramCounter:x16} mode={machine.PrivilegeMode} steps={result.Steps} time={t.Elapsed}");
+```
+
 ## Pipeline
 We roughly follow Roslyn/RyuJiT(ILC) compilation phases.
 Stack-based bytecode, being an IL analogue, can be directly interpreted for minimal startup time.
-For more complex and performant scripts you can sacrifice some compilation time for all the serious optimizations and performance, targeting either low level register bytecode, which is better suited for VM execution, or a native target like RISC-V. Compilation to x86_64 binary is possible, but it does not have an emulator and hence loses any security considerations.
+For more complex and performant scripts you can sacrifice some compilation time for all the serious optimizations and performance, targeting either low level register bytecode, which is better suited for VM execution, or a native target like x86 or RISC-V. x86 does not have an emulator and hence loses any security considerations.
  
 Source code -> stack bytecode path mimics Roslyn pipeline
 ```
@@ -54,19 +94,20 @@ LSRA (register allocation) > target specific CodeGen > target > execution
 ```
 SSA/VN-based optimizations we currently implement in order:
 
-- Constant folding
-- Assertion propagation
-- Constant/fact propagation
 - Copy propagation
-- Redundant Branch Optimization
-- Common Subexpression Elimination
+- Constant/fact propagation
+- Constant folding
 - Dead Code Elimination
+- Redundant Branch Optimization
+- Loop Invariant Code Motion
+- Common Subexpression Elimination
+- Assertion propagation
 - Strength reduction
 
 ---
 
 # С
-For C we avoid stack-based VM entirely and map it to C# Register VM, which is low level enough to host C without issues, allowing for future interop.
+For C we support x86, ARM and RISC-V targets, as well as a Bytecode VM. For internal VM we avoid stack-based VM entirely and map it to C# Register VM, which is low level enough to host C without issues, allowing for limited interop.
 C compilation steps go as follows
 ```
 Preprocessor+Lexer > Token stream
@@ -145,6 +186,7 @@ var code = """
 int main()
 {
     printf("Hello World!\n");
+    shutdown(); // stop the emulator
     return 0;
 }
 """;
@@ -169,7 +211,7 @@ var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfi
 });
 
 Cnidaria.RiscV.RiscVZBoot.LoadDefaultBootChain(machine, layout, autorunSource: program.ToLinuxExecutableBytes());
-var result = machine.Run(10_000_000);
+var result = machine.Run(instructionLimit: 10_000_000);
 while (machine.Uart.TryReadOutput(out byte b))
     Console.Write((char)b);
 Console.WriteLine($"\nstop={result.StopReason} pc=0x{machine.ProgramCounter:x16} mode={machine.PrivilegeMode} steps={result.Steps}");

@@ -12,8 +12,8 @@ namespace Cnidaria
         RegisterBytecode64,
         RiscV32,
         RiscV64,
-        X86,
-        X64,
+        I386,
+        X86_64,
         Arm32,
         Arm64
     }
@@ -84,6 +84,15 @@ namespace Cnidaria
         X30 = 30,
         X31 = 31,
 
+        Eax = X0,
+        Ecx = X1,
+        Edx = X2,
+        Ebx = X3,
+        Esi = X4,
+        Edi = X5,
+        Esp = X6,
+        Ebp = X7,
+
         F0 = 32,
         F1 = 33,
         F2 = 34,
@@ -116,6 +125,23 @@ namespace Cnidaria
         F29 = 61,
         F30 = 62,
         F31 = 63,
+
+        Xmm0 = F0,
+        Xmm1 = F1,
+        Xmm2 = F2,
+        Xmm3 = F3,
+        Xmm4 = F4,
+        Xmm5 = F5,
+        Xmm6 = F6,
+        Xmm7 = F7,
+        Xmm8 = F8,
+        Xmm9 = F9,
+        Xmm10 = F10,
+        Xmm11 = F11,
+        Xmm12 = F12,
+        Xmm13 = F13,
+        Xmm14 = F14,
+        Xmm15 = F15,
 
         V0 = 64,
         V1 = 65,
@@ -544,8 +570,8 @@ namespace Cnidaria
         {
             return registerClass switch
             {
-                RegisterClass.General => MaskOf(DefaultAllocatableGprs),
-                RegisterClass.Float => MaskOf(DefaultAllocatableFprs),
+                RegisterClass.General => 0x00000000FFFFFFFFUL,
+                RegisterClass.Float => 0xFFFFFFFF00000000UL,
                 RegisterClass.Vector => 0,
                 _ => 0,
             };

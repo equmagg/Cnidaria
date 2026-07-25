@@ -30,6 +30,13 @@ namespace Cnidaria.C
         private static readonly MachineRegister GpScratch1 = MachineRegister.X6;
         private static readonly MachineRegister GpScratch2 = MachineRegister.X7;
         private static readonly MachineRegister GpScratch3 = MachineRegister.X28;
+        private static readonly MachineRegister GpScratch4 = MachineRegister.X29;
+        private static readonly MachineRegister GpScratch5 = MachineRegister.X30;
+        private static readonly MachineRegister GpScratch6 = MachineRegister.X31;
+        private static readonly MachineRegister GpScratch7 = MachineRegister.X13;
+        private static readonly MachineRegister GpScratch8 = MachineRegister.X10;
+        private static readonly MachineRegister GpScratch9 = MachineRegister.X11;
+        private static readonly MachineRegister GpScratch10 = MachineRegister.X12;
         private static readonly MachineRegister GpVectorConfigScratch = MachineRegister.X29;
         private static readonly MachineRegister FpScratch0 = MachineRegister.F0;
         private static readonly MachineRegister FpScratch1 = MachineRegister.F1;
@@ -502,7 +509,6 @@ namespace Cnidaria.C
             private readonly int _riscVVarArgsSaveAreaOffset;
             private readonly int _riscVVarArgsSaveAreaSize;
             private readonly int _totalFrameSize;
-            private AbiCursor _parameters;
 
             public FunctionEmissionContext(
                 RiscVCodeGenerator owner,
@@ -614,7 +620,6 @@ namespace Cnidaria.C
                 if (location.Kind == AbiLocationKind.Register)
                 {
                     StoreRegister(location.Register, Sp, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
-                    _parameters = cursor;
                     return;
                 }
 
@@ -622,7 +627,6 @@ namespace Cnidaria.C
                 {
                     LoadFromMemory(GpScratch0, Sp, IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, signed: false);
                     StoreRegister(GpScratch0, Sp, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
-                    _parameters = cursor;
                 }
             }
 
@@ -894,12 +898,31 @@ namespace Cnidaria.C
                 if (instruction.Result is null)
                     return;
 
-                var type = instruction.Result.Type;
+                var parameterIndex = FindParameterIndex(instruction.Operator);
+                if (parameterIndex < 0)
+                    throw Unsupported(instruction, "Cannot map parameter to function signature.");
+
+                var functionType = _function.Symbol?.FunctionType;
+                if (functionType is null)
+                    throw Unsupported(instruction, "Parameter instruction requires function type.");
+
+                var cursor = new AbiCursor();
+                if (_allocation.Frame.HasHiddenReturnBuffer)
+                    _ = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+
+                for (var i = 0; i < parameterIndex; i++)
+                {
+                    var precedingParameter = functionType.Parameters[i];
+                    var precedingValue = CAbi.ClassifyValue(_owner._target, precedingParameter.Type, isReturn: false, isVariadicUnnamedArgument: false);
+                    _ = CAbi.AssignArgumentLocation(precedingValue, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                }
+
+                var type = functionType.Parameters[parameterIndex].Type;
                 var value = CAbi.ClassifyValue(_owner._target, type, isReturn: false, isVariadicUnnamedArgument: false);
 
                 if (value.PassingKind == AbiPassingKind.Indirect)
                 {
-                    var loc = CAbi.AssignArgumentLocation(value, ref _parameters, _owner._allocationOptions.StackArgumentSlotSize);
+                    var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                     if (loc.Kind == AbiLocationKind.Register)
                     {
@@ -928,7 +951,7 @@ namespace Cnidaria.C
                     for (var i = 0; i < value.Segments.Length; i++)
                     {
                         var segment = value.Segments[i];
-                        var loc = CAbi.AssignSegmentArgumentLocation(segment, ref _parameters, _owner._allocationOptions.StackArgumentSlotSize);
+                        var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                         if (loc.Kind == AbiLocationKind.Register)
                         {
                             StoreRawBitsToAddress(loc.Register, destinationAddress, segment.Offset, segment.Size);
@@ -948,14 +971,14 @@ namespace Cnidaria.C
 
                 if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(type))
                 {
-                    var loc = CAbi.AssignArgumentLocation(value, ref _parameters, _owner._allocationOptions.StackArgumentSlotSize);
+                    var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                     AddImmediate(GpScratch1, Sp, IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)));
                     CopyMemory(destinationAddress, GpScratch1, value.Size);
                     return;
                 }
 
-                var scalarLocation = CAbi.AssignArgumentLocation(value, ref _parameters, _owner._allocationOptions.StackArgumentSlotSize);
+                var scalarLocation = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                 var destination = GetWritableRegister(instruction.Result, PreferredScratch(type, GpScratch0, FpScratch0, VecScratch0));
                 if (scalarLocation.Kind == AbiLocationKind.Register)
                 {
@@ -973,6 +996,21 @@ namespace Cnidaria.C
                 }
 
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private int FindParameterIndex(string name)
+            {
+                var functionType = _function.Symbol?.FunctionType;
+                if (functionType is null)
+                    return -1;
+
+                for (var i = 0; i < functionType.Parameters.Length; i++)
+                {
+                    if (string.Equals(functionType.Parameters[i].Name, name, StringComparison.Ordinal))
+                        return i;
+                }
+
+                return -1;
             }
 
             private void EmitCopyLike(LirInstruction instruction)
@@ -1161,9 +1199,218 @@ namespace Cnidaria.C
                         Emit(RVInstruction.R(opcode, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch3)));
                         StoreWideIntegerResult(instruction.Result, GpScratch0, GpScratch1);
                         return true;
+                    case "<<":
+                    case ">>":
+                        EmitWideIntegerShift(instruction);
+                        return true;
+                    case "*":
+                        EmitWideIntegerMultiply(instruction);
+                        return true;
+                    case "/":
+                    case "%":
+                        EmitWideIntegerDivide(instruction, instruction.Operator == "%");
+                        return true;
                     default:
                         return false;
                 }
+            }
+
+            private void EmitWideIntegerShift(LirInstruction instruction)
+            {
+                LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+                LoadWideIntegerLowWord(instruction.Operands[1], GpScratch2, instruction);
+                EmitImm(RVInstrKind.Andi, GpScratch2, GpScratch2, 63);
+
+                var largeShift = _owner.CreateLocalLabel(_functionLabel + "_i64_shift_large");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_shift_done");
+                EmitBranch(RVInstrKind.Beq, GpScratch2, MachineRegister.X0, done);
+                EmitImm(RVInstrKind.Andi, GpScratch3, GpScratch2, 32);
+                EmitBranch(RVInstrKind.Bne, GpScratch3, MachineRegister.X0, largeShift);
+
+                LoadImmediate(GpScratch3, 32);
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch3), ToRegister(GpScratch3), ToRegister(GpScratch2)));
+                if (instruction.Operator == "<<")
+                {
+                    MoveRegister(GpScratch4, GpScratch0);
+                    Emit(RVInstruction.R(RVInstrKind.Srl, ToRegister(GpScratch4), ToRegister(GpScratch4), ToRegister(GpScratch3)));
+                    Emit(RVInstruction.R(RVInstrKind.Sll, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                    Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch4)));
+                    Emit(RVInstruction.R(RVInstrKind.Sll, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+                }
+                else
+                {
+                    MoveRegister(GpScratch4, GpScratch1);
+                    Emit(RVInstruction.R(RVInstrKind.Sll, ToRegister(GpScratch4), ToRegister(GpScratch4), ToRegister(GpScratch3)));
+                    Emit(RVInstruction.R(RVInstrKind.Srl, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+                    Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch4)));
+                    Emit(RVInstruction.R(IsSignedIntegerType(instruction.Operands[0].Type) ? RVInstrKind.Sra : RVInstrKind.Srl,
+                        ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                }
+                EmitJump(done);
+
+                _owner._text.DefineLabel(largeShift);
+                EmitImm(RVInstrKind.Andi, GpScratch2, GpScratch2, 31);
+                if (instruction.Operator == "<<")
+                {
+                    Emit(RVInstruction.R(RVInstrKind.Sll, ToRegister(GpScratch1), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+                    MoveRegister(GpScratch0, MachineRegister.X0);
+                }
+                else if (IsSignedIntegerType(instruction.Operands[0].Type))
+                {
+                    Emit(RVInstruction.R(RVInstrKind.Sra, ToRegister(GpScratch0), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                    EmitShiftImmediate(RVInstrKind.Srai, GpScratch1, GpScratch1, 31);
+                }
+                else
+                {
+                    Emit(RVInstruction.R(RVInstrKind.Srl, ToRegister(GpScratch0), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                    MoveRegister(GpScratch1, MachineRegister.X0);
+                }
+
+                _owner._text.DefineLabel(done);
+                StoreWideIntegerResult(instruction.Result!, GpScratch0, GpScratch1);
+            }
+
+            private void EmitWideIntegerMultiply(LirInstruction instruction)
+            {
+                LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+                LoadWideIntegerOperand(instruction.Operands[1], GpScratch2, GpScratch3, instruction);
+                MoveRegister(GpScratch4, MachineRegister.X0);
+                MoveRegister(GpScratch5, MachineRegister.X0);
+
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_loop");
+                var skipAdd = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_skip");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_done");
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch6), ToRegister(GpScratch2), ToRegister(GpScratch3)));
+                EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, done);
+
+                _owner._text.DefineLabel(loop);
+                EmitImm(RVInstrKind.Andi, GpScratch6, GpScratch2, 1);
+                EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, skipAdd);
+                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch6), ToRegister(GpScratch4), ToRegister(GpScratch0)));
+                Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch4), ToRegister(GpScratch6), ToRegister(GpScratch4)));
+                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch1)));
+                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch4)));
+                MoveRegister(GpScratch4, GpScratch6);
+
+                _owner._text.DefineLabel(skipAdd);
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch6, GpScratch0, 31);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch0, GpScratch0, 1);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch1, GpScratch1, 1);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch6)));
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch6, GpScratch3, 31);
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch2, GpScratch2, 1);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch2), ToRegister(GpScratch2), ToRegister(GpScratch6)));
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch3, GpScratch3, 1);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch6), ToRegister(GpScratch2), ToRegister(GpScratch3)));
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
+
+                _owner._text.DefineLabel(done);
+                StoreWideIntegerResult(instruction.Result!, GpScratch4, GpScratch5);
+            }
+
+            private void EmitWideIntegerDivide(LirInstruction instruction, bool wantRemainder)
+            {
+                LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+                LoadWideIntegerOperand(instruction.Operands[1], GpScratch2, GpScratch3, instruction);
+
+                var divisorReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_divisor_ready");
+                var dividendReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_dividend_ready");
+                var divisorAbsReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_divisor_abs_ready");
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_div_loop");
+                var subtract = _owner.CreateLocalLabel(_functionLabel + "_i64_div_subtract");
+                var skipSubtract = _owner.CreateLocalLabel(_functionLabel + "_i64_div_skip_subtract");
+                var quotientSignReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_quotient_sign_ready");
+                var remainderSignReady = _owner.CreateLocalLabel(_functionLabel + "_i64_div_remainder_sign_ready");
+                var zeroResult = _owner.CreateLocalLabel(_functionLabel + "_i64_div_zero");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_div_done");
+
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch7), ToRegister(GpScratch2), ToRegister(GpScratch3)));
+                EmitBranch(RVInstrKind.Bne, GpScratch7, MachineRegister.X0, divisorReady);
+                Emit(new RVInstruction(RVInstrKind.Ebreak));
+                EmitJump(zeroResult);
+
+                _owner._text.DefineLabel(divisorReady);
+                if (IsSignedIntegerType(instruction.Operands[0].Type))
+                {
+                    EmitShiftImmediate(RVInstrKind.Srai, GpScratch9, GpScratch1, 31);
+                    MoveRegister(GpScratch10, GpScratch9);
+                    EmitShiftImmediate(RVInstrKind.Srai, GpScratch7, GpScratch3, 31);
+                    Emit(RVInstruction.R(RVInstrKind.Xor, ToRegister(GpScratch9), ToRegister(GpScratch9), ToRegister(GpScratch7)));
+                    EmitBranch(RVInstrKind.Bge, GpScratch1, MachineRegister.X0, dividendReady);
+                    Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch8), RVRegister.X0, ToRegister(GpScratch0)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), RVRegister.X0, ToRegister(GpScratch0)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), RVRegister.X0, ToRegister(GpScratch1)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch8)));
+                    _owner._text.DefineLabel(dividendReady);
+                    EmitBranch(RVInstrKind.Bge, GpScratch3, MachineRegister.X0, divisorAbsReady);
+                    Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch8), RVRegister.X0, ToRegister(GpScratch2)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch2), RVRegister.X0, ToRegister(GpScratch2)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch3), RVRegister.X0, ToRegister(GpScratch3)));
+                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch3), ToRegister(GpScratch3), ToRegister(GpScratch8)));
+                    _owner._text.DefineLabel(divisorAbsReady);
+                }
+                else
+                {
+                    MoveRegister(GpScratch9, MachineRegister.X0);
+                    MoveRegister(GpScratch10, MachineRegister.X0);
+                }
+
+                MoveRegister(GpScratch4, MachineRegister.X0);
+                MoveRegister(GpScratch5, MachineRegister.X0);
+                LoadImmediate(GpScratch6, 64);
+
+                _owner._text.DefineLabel(loop);
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch7, GpScratch1, 31);
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch8, GpScratch0, 31);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch0, GpScratch0, 1);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch1, GpScratch1, 1);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch8)));
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch8, GpScratch4, 31);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch4, GpScratch4, 1);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch5, GpScratch5, 1);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch8)));
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch4), ToRegister(GpScratch4), ToRegister(GpScratch7)));
+                EmitBranch(RVInstrKind.Bltu, GpScratch5, GpScratch3, skipSubtract);
+                EmitBranch(RVInstrKind.Bltu, GpScratch3, GpScratch5, subtract);
+                EmitBranch(RVInstrKind.Bltu, GpScratch4, GpScratch2, skipSubtract);
+
+                _owner._text.DefineLabel(subtract);
+                MoveRegister(GpScratch7, GpScratch4);
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch4), ToRegister(GpScratch4), ToRegister(GpScratch2)));
+                Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch7), ToRegister(GpScratch7), ToRegister(GpScratch2)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch3)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch7)));
+                EmitImm(RVInstrKind.Ori, GpScratch0, GpScratch0, 1);
+
+                _owner._text.DefineLabel(skipSubtract);
+                EmitImm(RVInstrKind.Addi, GpScratch6, GpScratch6, -1);
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
+
+                EmitBranch(RVInstrKind.Beq, GpScratch9, MachineRegister.X0, quotientSignReady);
+                Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch7), RVRegister.X0, ToRegister(GpScratch0)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), RVRegister.X0, ToRegister(GpScratch0)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), RVRegister.X0, ToRegister(GpScratch1)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch7)));
+                _owner._text.DefineLabel(quotientSignReady);
+
+                EmitBranch(RVInstrKind.Beq, GpScratch10, MachineRegister.X0, remainderSignReady);
+                Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch7), RVRegister.X0, ToRegister(GpScratch4)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch4), RVRegister.X0, ToRegister(GpScratch4)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch5), RVRegister.X0, ToRegister(GpScratch5)));
+                Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch7)));
+                _owner._text.DefineLabel(remainderSignReady);
+
+                if (wantRemainder)
+                    StoreWideIntegerResult(instruction.Result!, GpScratch4, GpScratch5);
+                else
+                    StoreWideIntegerResult(instruction.Result!, GpScratch0, GpScratch1);
+                EmitJump(done);
+
+                _owner._text.DefineLabel(zeroResult);
+                MoveRegister(GpScratch0, MachineRegister.X0);
+                MoveRegister(GpScratch1, MachineRegister.X0);
+                StoreWideIntegerResult(instruction.Result!, GpScratch0, GpScratch1);
+                _owner._text.DefineLabel(done);
             }
 
             private void EmitWideIntegerRelation(LirInstruction instruction)
@@ -1355,7 +1602,7 @@ namespace Cnidaria.C
                         EmitFloatingR(IsFloat32(operandType) ? RVInstrKind.FsgnjnS : RVInstrKind.FsgnjnD, destination, source, source);
                         break;
                     default:
-                        throw Unsupported(instruction, "Unsupported floating-point unary operator '" + instruction.Operator + "'.");
+                        throw Unsupported(instruction, $"Unsupported floating-point unary operator '{instruction.Operator}'.");
                 }
 
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
@@ -1376,8 +1623,11 @@ namespace Cnidaria.C
                 if (TryEmitSoftwareIntegerBinary(instruction))
                     return;
 
-                if (RequiresSoftwareScalar(instruction.Result.Type) || RequiresSoftwareScalar(instruction.Operands[0].Type) || RequiresSoftwareScalar(instruction.Operands[1].Type))
-                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type), "Binary operation for scalar wider than one machine register is not implemented yet.");
+                if (RequiresSoftwareScalar(instruction.Result.Type)
+                    || RequiresSoftwareScalar(instruction.Operands[0].Type)
+                    || RequiresSoftwareScalar(instruction.Operands[1].Type))
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Result.Type),
+                        "Binary operation for scalar wider than one machine register is not implemented yet.");
 
                 if (TryEmitPointerBinary(instruction))
                     return;
@@ -1421,7 +1671,7 @@ namespace Cnidaria.C
                     return;
                 }
 
-                throw Unsupported(instruction, "Unsupported floating-point binary operator '" + op + "'.");
+                throw Unsupported(instruction, $"Unsupported floating-point binary operator '{op}'.");
             }
 
             private QualifiedType SelectFloatingOperationType(QualifiedType left, QualifiedType right, QualifiedType result)
@@ -1577,20 +1827,29 @@ namespace Cnidaria.C
                     case "+": Emit(RVInstruction.R(wordOp ? RVInstrKind.Addw : RVInstrKind.Add, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "-": Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "*": RequireM(instruction); Emit(RVInstruction.R(wordOp ? RVInstrKind.Mulw : RVInstrKind.Mul, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
-                    case "/": RequireM(instruction); Emit(RVInstruction.R(signed ? (wordOp ? RVInstrKind.Divw : RVInstrKind.Div) : (wordOp ? RVInstrKind.Divuw : RVInstrKind.Divu), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
-                    case "%": RequireM(instruction); Emit(RVInstruction.R(signed ? (wordOp ? RVInstrKind.Remw : RVInstrKind.Rem) : (wordOp ? RVInstrKind.Remuw : RVInstrKind.Remu), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
+                    case "/":
+                        RequireM(instruction); Emit(RVInstruction.R(signed
+                        ? (wordOp ? RVInstrKind.Divw : RVInstrKind.Div)
+                        : (wordOp ? RVInstrKind.Divuw : RVInstrKind.Divu), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
+                    case "%":
+                        RequireM(instruction); Emit(RVInstruction.R(signed
+                        ? (wordOp ? RVInstrKind.Remw : RVInstrKind.Rem)
+                        : (wordOp ? RVInstrKind.Remuw : RVInstrKind.Remu), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "&": Emit(RVInstruction.R(RVInstrKind.And, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "|": Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "^": Emit(RVInstruction.R(RVInstrKind.Xor, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "<<": Emit(RVInstruction.R(wordOp ? RVInstrKind.Sllw : RVInstrKind.Sll, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
-                    case ">>": Emit(RVInstruction.R(signed ? (wordOp ? RVInstrKind.Sraw : RVInstrKind.Sra) : (wordOp ? RVInstrKind.Srlw : RVInstrKind.Srl), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
+                    case ">>":
+                        Emit(RVInstruction.R(signed
+                        ? (wordOp ? RVInstrKind.Sraw : RVInstrKind.Sra)
+                        : (wordOp ? RVInstrKind.Srlw : RVInstrKind.Srl), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "==": EmitEquality(dst, left, right, equal: true); return;
                     case "!=": EmitEquality(dst, left, right, equal: false); return;
                     case "<": EmitLessThan(dst, left, right, signed); return;
                     case ">": EmitLessThan(dst, right, left, signed); return;
                     case "<=": EmitLessThan(dst, right, left, signed); EmitImm(RVInstrKind.Xori, dst, dst, 1); return;
                     case ">=": EmitLessThan(dst, left, right, signed); EmitImm(RVInstrKind.Xori, dst, dst, 1); return;
-                    default: throw Unsupported(instruction, "Unsupported binary operator '" + instruction.Operator + "'.");
+                    default: throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
                 }
             }
 
@@ -1628,7 +1887,8 @@ namespace Cnidaria.C
                     return;
 
                 if (RequiresSoftwareScalar(instruction.Result.Type) || RequiresSoftwareScalar(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type), "Scalar conversion wider than one machine register is not implemented yet.");
+                    throw HelperRequired(instruction, SelectConversionHelper(instruction.Operands[0].Type, instruction.Result.Type),
+                        "Scalar conversion wider than one machine register is not implemented yet.");
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0);
                 var src = LoadOperand(instruction.Operands[0], GpScratch1);
@@ -1660,7 +1920,8 @@ namespace Cnidaria.C
                 if ((IsIntegerLike(srcType) || IsPointerLike(srcType)) && IsFloatType(dstType))
                 {
                     if (RequiresSoftwareScalar(srcType))
-                        throw HelperRequired(instruction, SelectConversionHelper(srcType, dstType), "Integer-to-floating conversion from scalar wider than one machine register is not implemented yet.");
+                        throw HelperRequired(instruction, SelectConversionHelper(srcType, dstType),
+                            "Integer-to-floating conversion from scalar wider than one machine register is not implemented yet.");
                     var dst = GetWritableRegister(instruction.Result, FpScratch0);
                     var src = LoadOperand(instruction.Operands[0], GpScratch1);
                     EmitIntegerToFloat(dst, src, srcType, dstType, instruction);
@@ -1671,7 +1932,8 @@ namespace Cnidaria.C
                 if (IsFloatType(srcType) && (IsIntegerLike(dstType) || IsPointerLike(dstType)))
                 {
                     if (RequiresSoftwareScalar(dstType))
-                        throw HelperRequired(instruction, SelectConversionHelper(srcType, dstType), "Floating-to-integer conversion to scalar wider than one machine register is not implemented yet.");
+                        throw HelperRequired(instruction, SelectConversionHelper(srcType, dstType),
+                            "Floating-to-integer conversion to scalar wider than one machine register is not implemented yet.");
                     var dst = GetWritableRegister(instruction.Result, GpScratch0);
                     var src = LoadOperand(instruction.Operands[0], FpScratch1);
                     EmitFloatToInteger(dst, src, srcType, dstType, instruction);
@@ -1714,7 +1976,8 @@ namespace Cnidaria.C
                     throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "long double conversion requires a runtime helper.");
 
                 if (sourceSize > _owner._target.RegisterSize)
-                    throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "Integer-to-floating conversion from scalar wider than one machine register is not implemented yet.");
+                    throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType),
+                        "Integer-to-floating conversion from scalar wider than one machine register is not implemented yet.");
                 EmitFloatingConvertFromInteger(opcode, destination, source);
             }
 
@@ -1732,7 +1995,8 @@ namespace Cnidaria.C
                     throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "long double conversion requires a runtime helper.");
 
                 if (destinationSize > _owner._target.RegisterSize)
-                    throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "Floating-to-integer conversion to scalar wider than one machine register is not implemented yet.");
+                    throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType),
+                        "Floating-to-integer conversion to scalar wider than one machine register is not implemented yet.");
                 EmitFloatingConvertToInteger(opcode, destination, source);
             }
 
@@ -1836,7 +2100,6 @@ namespace Cnidaria.C
                     return;
 
                 MarshalCallArguments(instruction, 1);
-                PrepareVariadicCall(instruction);
                 var callee = instruction.Operands[0];
                 if (TryResolveDirectCallLabel(callee, out var label))
                 {
@@ -1862,7 +2125,7 @@ namespace Cnidaria.C
                 var function = (FunctionSymbol)instruction.Operands[0].Symbol!;
                 var name = function.Name.Substring("__riscv_".Length);
                 if (!TryGetRiscVVectorElementWidth(name, out var elementWidth))
-                    throw Unsupported(instruction, "Cannot determine the vector element width for intrinsic '" + function.Name + "'.");
+                    throw Unsupported(instruction, $"Cannot determine the vector element width for intrinsic '{function.Name}'.");
 
                 if (name.StartsWith("vsetvlmax_", StringComparison.Ordinal))
                 {
@@ -1890,7 +2153,7 @@ namespace Cnidaria.C
                 var firstSeparator = name.IndexOf('_');
                 var secondSeparator = firstSeparator < 0 ? -1 : name.IndexOf('_', firstSeparator + 1);
                 if (firstSeparator <= 0 || secondSeparator <= firstSeparator + 1)
-                    throw Unsupported(instruction, "Invalid RISC-V vector intrinsic name '" + function.Name + "'.");
+                    throw Unsupported(instruction, $"Invalid RISC-V vector intrinsic name '{function.Name}'.");
 
                 var mnemonic = name.Substring(0, firstSeparator);
                 var form = name.Substring(firstSeparator + 1, secondSeparator - firstSeparator - 1);
@@ -1945,7 +2208,7 @@ namespace Cnidaria.C
                 else if (form == "vx")
                     second = LoadVectorIntegerScalarOperand(instruction.Operands[2], GpScratch0, instruction);
                 else
-                    throw Unsupported(instruction, "Unsupported vector intrinsic operand form '" + form + "'.");
+                    throw Unsupported(instruction, $"Unsupported vector intrinsic operand form '{form}'.");
                 var vl = LoadOperand(instruction.Operands[3], GpScratch1);
 
                 EmitVectorConfiguration(MachineRegister.X0, vl, elementWidth);
@@ -1974,7 +2237,7 @@ namespace Cnidaria.C
                 else if (form == "vx")
                     vs1 = LoadVectorIntegerScalarOperand(instruction.Operands[2], GpScratch0, instruction);
                 else
-                    throw Unsupported(instruction, "Unsupported vector accumulator operand form '" + form + "'.");
+                    throw Unsupported(instruction, $"Unsupported vector accumulator operand form '{form}'.");
                 var vs2 = LoadOperand(instruction.Operands[3], VecScratch3);
                 var vl = LoadOperand(instruction.Operands[4], GpScratch1);
 
@@ -2169,7 +2432,7 @@ namespace Cnidaria.C
                     "vsub_vx" => RVInstrKind.VsubVx,
                     "vxor_vv" => RVInstrKind.VxorVv,
                     "vxor_vx" => RVInstrKind.VxorVx,
-                    _ => throw new NotSupportedException("Unsupported RISC-V vector intrinsic opcode '" + key + "'."),
+                    _ => throw new NotSupportedException($"Unsupported vector intrinsic opcode '{key}'."),
                 };
 
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
@@ -2178,43 +2441,6 @@ namespace Cnidaria.C
                 MarshalHiddenReturnBufferArgument(instruction, ref cursor);
                 for (var i = startOperand; i < instruction.Operands.Length; i++)
                     MarshalCallArgument(instruction, instruction.Operands[i], ref cursor, i - startOperand);
-            }
-
-            private void PrepareVariadicCall(LirInstruction instruction)
-            {
-            }
-
-            private void StoreVariadicHomeValue(LirInstruction instruction, LirOperand operand, int offset, int homeSlotSize)
-            {
-                if (IsAggregateType(operand.Type))
-                {
-                    var size = SizeOf(operand.Type);
-                    if (size > homeSlotSize)
-                        throw Unsupported(instruction, "Aggregate variadic argument does not fit the configured va_list home slot.");
-                    MaterializeOperandStorageAddress(operand, GpScratch0, instruction);
-                    AddImmediate(GpScratch1, Sp, offset);
-                    CopyMemory(GpScratch1, GpScratch0, size);
-                    return;
-                }
-
-                if (RequiresStackBackedScalar(operand.Type))
-                {
-                    var size = SizeOf(operand.Type);
-                    if (size > homeSlotSize)
-                        throw Unsupported(instruction, "Variadic scalar argument does not fit the configured va_list home slot.");
-                    var sourceAddress = MaterializeScalarStorageAddress(operand, GpScratch0, instruction);
-                    AddImmediate(GpScratch1, Sp, offset);
-                    CopyMemory(GpScratch1, sourceAddress, size);
-                    return;
-                }
-
-                {
-                    var source = LoadOperand(operand, UsesHardwareFloating(operand.Type) ? FpScratch0 : GpScratch0);
-                    var size = Math.Min(SizeOfRegisterType(operand.Type), SizeOf(operand.Type));
-                    if (size > homeSlotSize)
-                        throw Unsupported(instruction, "Variadic scalar argument does not fit the configured va_list home slot.");
-                    StoreToMemory(source, Sp, offset, size);
-                }
             }
 
             private void MarshalHiddenReturnBufferArgument(LirInstruction instruction, ref AbiCursor cursor)
@@ -2510,6 +2736,24 @@ namespace Cnidaria.C
             {
                 if (instruction.Operands.Length != 1)
                     throw Unsupported(instruction, "Switch expects one key operand.");
+                if (IsRv32WideInteger(instruction.Operands[0].Type))
+                {
+                    LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+                    foreach (var @case in instruction.SwitchCases)
+                    {
+                        var next = _owner.CreateLocalLabel(_functionLabel + "_i64_switch_next");
+                        var value = unchecked((ulong)ImmediateToInt64(@case.Value));
+                        LoadImmediate(GpScratch2, unchecked((int)value));
+                        LoadImmediate(GpScratch3, unchecked((int)(value >> 32)));
+                        EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, next);
+                        EmitBranch(RVInstrKind.Beq, GpScratch0, GpScratch2, LabelOf(@case.Target));
+                        _owner._text.DefineLabel(next);
+                    }
+
+                    if (!IsFallthroughTarget(instruction.Target))
+                        EmitJump(LabelOf(instruction.Target));
+                    return;
+                }
                 if (RequiresStackBackedScalar(instruction.Operands[0].Type))
                     throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Operands[0].Type), "Switch on scalar wider than one machine register is not implemented yet.");
 
@@ -2952,7 +3196,7 @@ namespace Cnidaria.C
                         if (operand.StackSlot is null)
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
                         AddImmediate(destination, Sp, offset);
                         return;
                     case LirOperandKind.Address:
@@ -2968,7 +3212,7 @@ namespace Cnidaria.C
                         }
                         break;
                 }
-                throw Unsupported(instruction, "Cannot materialize storage address for operand kind " + operand.Kind + ".");
+                throw Unsupported(instruction, $"Cannot materialize storage address for operand kind {operand.Kind}.");
             }
 
             private MachineRegister MaterializeAnyStorageAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
@@ -2992,7 +3236,7 @@ namespace Cnidaria.C
                         if (operand.StackSlot is null)
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var stackOffset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
                         AddImmediate(destination, Sp, stackOffset);
                         return destination;
                     case LirOperandKind.Immediate:
@@ -3122,7 +3366,12 @@ namespace Cnidaria.C
 
                 if (location.Kind == AbiLocationKind.Stack)
                 {
-                    LoadFromMemory(destination, Sp, IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, signed: false);
+                    LoadFromMemory(
+                        destination,
+                        Sp,
+                        IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                        _owner._target.PointerSize,
+                        signed: false);
                     return;
                 }
 
@@ -3145,7 +3394,7 @@ namespace Cnidaria.C
                         if (address.StackSlot is null)
                             throw new InvalidOperationException("Stack slot address has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(address.StackSlot, out var slotOffset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + address.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {address.StackSlot.Name}.");
                         return new AddressParts(Sp, slotOffset);
                     case LirAddressKind.Symbol:
                         if (address.Symbol is null)
@@ -3273,7 +3522,7 @@ namespace Cnidaria.C
             private void LoadVectorFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size)
             {
                 if (size != TargetRegisterInfo.VectorRegisterSize(_owner._target))
-                    throw new NotSupportedException("RISC-V vector spills require one complete vector register.");
+                    throw new NotSupportedException("Vector spills require one complete vector register.");
                 var address = baseRegister;
                 if (offset != 0)
                 {
@@ -3287,7 +3536,7 @@ namespace Cnidaria.C
             private void StoreVectorToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size)
             {
                 if (size != TargetRegisterInfo.VectorRegisterSize(_owner._target))
-                    throw new NotSupportedException("RISC-V vector spills require one complete vector register.");
+                    throw new NotSupportedException("Vector spills require one complete vector register.");
                 var address = baseRegister;
                 if (offset != 0)
                 {
@@ -3716,7 +3965,8 @@ namespace Cnidaria.C
                 => CAbi.UsesHardwareFloatingRegister(_owner._target, type, isVariadicUnnamedArgument: false);
 
             private NotImplementedException HelperRequired(LirInstruction instruction, RiscVRuntimeHelperKind helper, string message)
-                => new NotImplementedException($"{message} Required helper: {helper}. Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal}.");
+                => new NotImplementedException(
+                    $"{message} Required helper: {helper}. Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal}.");
 
             private RiscVRuntimeHelperKind SelectScalarMoveHelper(QualifiedType type)
             {
@@ -3915,7 +4165,7 @@ namespace Cnidaria.C
                 var program = RiscVAssembler.Assemble(text ?? string.Empty, target);
                 var renamedLabels = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var label in program.Text.Labels.Keys)
-                    renamedLabels[label] = labelPrefix + "_" + SanitizeSymbolName(label);
+                    renamedLabels[label] = $"{labelPrefix}_{SanitizeSymbolName(label)}";
 
                 var labelsByOffset = new Dictionary<int, List<string>>();
                 foreach (var pair in program.Text.Labels)

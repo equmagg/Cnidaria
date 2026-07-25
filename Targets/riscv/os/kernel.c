@@ -58,7 +58,19 @@ typedef unsigned long usize;
 #define SYS_SCHED_YIELD 124ul
 #define SYS_RT_SIGACTION 134ul
 #define SYS_RT_SIGPROCMASK 135ul
+#define SYS_REBOOT 142ul
 #define SYS_UNAME 160ul
+#define LINUX_REBOOT_MAGIC1 0xfee1deadul
+#define LINUX_REBOOT_MAGIC2 0x28121969ul
+#define LINUX_REBOOT_MAGIC2A 0x05121996ul
+#define LINUX_REBOOT_MAGIC2B 0x16041998ul
+#define LINUX_REBOOT_MAGIC2C 0x20112000ul
+#define LINUX_REBOOT_CMD_RESTART 0x01234567ul
+#define LINUX_REBOOT_CMD_HALT 0xcdef0123ul
+#define LINUX_REBOOT_CMD_CAD_ON 0x89abcdeful
+#define LINUX_REBOOT_CMD_CAD_OFF 0x00000000ul
+#define LINUX_REBOOT_CMD_POWER_OFF 0x4321fedcul
+#define LINUX_REBOOT_CMD_RESTART2 0xa1b2c3d4ul
 #define SYS_GETPID 172ul
 #define SYS_GETPPID 173ul
 #define SYS_GETUID 174ul
@@ -3286,6 +3298,35 @@ static s64 sys_uname_impl(u64 user_pointer)
     return 0l;
 }
 
+static s64 sys_reboot_impl(u64 magic1, u64 magic2, u64 cmd)
+{
+    u32 magic2_32 = (u32)magic2;
+    u32 cmd_32 = (u32)cmd;
+
+    if ((u32)magic1 != (u32)LINUX_REBOOT_MAGIC1)
+        return -22l;
+    if (magic2_32 != (u32)LINUX_REBOOT_MAGIC2 && magic2_32 != (u32)LINUX_REBOOT_MAGIC2A &&
+        magic2_32 != (u32)LINUX_REBOOT_MAGIC2B && magic2_32 != (u32)LINUX_REBOOT_MAGIC2C)
+        return -22l;
+
+    if (cmd_32 == (u32)LINUX_REBOOT_CMD_CAD_ON || cmd_32 == (u32)LINUX_REBOOT_CMD_CAD_OFF)
+        return 0l;
+
+    if (cmd_32 == (u32)LINUX_REBOOT_CMD_POWER_OFF)
+    {
+        halt();
+    }
+    if (cmd_32 == (u32)LINUX_REBOOT_CMD_RESTART || cmd_32 == (u32)LINUX_REBOOT_CMD_RESTART2)
+    {
+        halt();
+    }
+    if (cmd_32 == (u32)LINUX_REBOOT_CMD_HALT)
+    {
+        halt();
+    }
+    return -22l;
+}
+
 static s64 sys_getcwd_impl(u64 user_buffer, u64 size)
 {
     char cwd[2];
@@ -3945,6 +3986,11 @@ void kernel_trap_dispatch(struct trap_frame* frame)
                 frame->x[10] = process_brk;
             return;
         }
+        if (nr == SYS_REBOOT)
+        {
+            frame->x[10] = (u64)sys_reboot_impl(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
         if (nr == SYS_EXIT || nr == SYS_EXIT_GROUP)
         {
             process_exit_current(frame, frame->x[10]);
@@ -3984,13 +4030,6 @@ void kernel_main(u64 hartid, void* fdt)
     struct exec_arguments arguments;
     u64 stack;
 
-    puts("Cnidaria kernel\n");
-    puts("kernel: hart ");
-    put_dec(hartid);
-    puts(" fdt ");
-    put_hex64((u64)fdt);
-    puts("\n");
-
     parse_fdt(fdt);
 #if __riscv_vector
     __asm__ volatile("csrrs zero, sstatus, %[vs]" : : [vs] "{t0}"(SSTATUS_VS) : "memory");
@@ -3998,14 +4037,6 @@ void kernel_main(u64 hartid, void* fdt)
     console_init();
     memory_manager_init();
     kernel_mmu_init();
-    puts("kernel: sv39 root ");
-    put_hex64(kernel_root_page_table);
-    puts("\n");
-    puts("kernel: virtio-blk ");
-    put_hex64(boot_device.virtio_blk_base);
-    puts(" uart=");
-    put_hex64(boot_device.uart_base);
-    puts("\n");
 
     if (!block_subsystem_init())
         panic("block subsystem init failed");
@@ -4032,13 +4063,6 @@ void kernel_main(u64 hartid, void* fdt)
     if (!build_user_stack(current_user_root_page_table, &image, &arguments, &stack))
         panic("user stack setup failed");
 
-    puts("kernel: entering user root=");
-    put_hex64(current_user_root_page_table);
-    puts(" entry=");
-    put_hex64(image.entry);
-    puts(" sp=");
-    put_hex64(stack);
-    puts("\n");
     current_task->root_page_table = current_user_root_page_table;
     current_task->brk = process_brk;
     current_task->brk_min = process_brk_min;
