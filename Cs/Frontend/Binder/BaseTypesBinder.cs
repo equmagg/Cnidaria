@@ -1,22 +1,21 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
 using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Binds base types, interfaces, and method overrides</summary>
     internal static class BaseTypeBinder
     {
+        // Discards semantic records created during declaration-level binding
         private sealed class NullRecorder : IBindingRecorder
         {
             public static readonly NullRecorder Instance = new();
             public void RecordBound(SyntaxNode syntax, BoundNode bound) { }
             public void RecordDeclared(SyntaxNode syntax, Symbol symbol) { }
         }
+        // Minimal semantic model for declaration-level type binding
         private sealed class SemanticModelStub : SemanticModel
         {
             public SemanticModelStub(Compilation c, SyntaxTree t)
@@ -36,6 +35,7 @@ namespace Cnidaria.Cs
             internal override BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default)
                 => throw new NotSupportedException();
         }
+        // Tracks a requested base class and its diagnostic location
         private readonly struct BaseClassInfo
         {
             public readonly NamedTypeSymbol BaseType;
@@ -46,6 +46,8 @@ namespace Cnidaria.Cs
                 Location = location;
             }
         }
+        /// <summary>Resolves declared inheritance and binds override targets</summary>
+        /// <remarks>Writes base types, interface sets, and overridden methods to source symbols</remarks>
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             var desiredBase = new Dictionary<SourceNamedTypeSymbol, BaseClassInfo>(
@@ -83,7 +85,7 @@ namespace Cnidaria.Cs
                         containingSymbol: typeSymbol,
                         recorder: NullRecorder.Instance);
 
-                    // Interfaces for class / struct / interface
+                    // Classes, structs, and interfaces may declare interfaces
                     var ifaces = ResolveDeclaredInterfaces(typeSymbol, baseList, binder, ctx, diagnostics);
                     if (!ifaces.IsDefaultOrEmpty)
                     {
@@ -97,7 +99,7 @@ namespace Cnidaria.Cs
                             set.Add(ifaces[i]);
                     }
 
-                    // Base class only for class
+                    // Only classes may declare a base class
                     if (typeSymbol.TypeKind == TypeKind.Class)
                     {
                         if (!TryResolveDeclaredBaseClass(typeSymbol, baseList, binder, ctx, diagnostics, out var baseClass))
@@ -161,6 +163,7 @@ namespace Cnidaria.Cs
             BindOverrides(compilation, trees, diagnostics);
         }
 
+        /// <summary>Reports non-interface entries after the selected base class</summary>
         private static void ValidateOnlyInterfacesInBaseList(
             SourceNamedTypeSymbol declaringType,
             BaseListSyntax baseList,
@@ -208,6 +211,7 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+        /// <summary>Resolves override declarations against the completed base type graph</summary>
         private static void BindOverrides(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             foreach (var tree in trees)
@@ -263,6 +267,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Finds the nearest matching virtual member and any sealed blocker</summary>
         private static MethodSymbol? FindOverridableInBaseChain(NamedTypeSymbol baseType, MethodSymbol overriding, out MethodSymbol? sealedCandidate)
         {
             sealedCandidate = null;
@@ -313,6 +318,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        /// <summary>Selects and validates the single declared base class</summary>
         private static bool TryResolveDeclaredBaseClass(
              SourceNamedTypeSymbol declaringType,
              BaseListSyntax baseList,
@@ -390,6 +396,7 @@ namespace Cnidaria.Cs
             }
             return true;
         }
+        /// <summary>Resolves, validates, and deduplicates declared interfaces</summary>
         private static ImmutableArray<NamedTypeSymbol> ResolveDeclaredInterfaces(
             SourceNamedTypeSymbol declaringType,
             BaseListSyntax? baseList,
@@ -431,6 +438,7 @@ namespace Cnidaria.Cs
             return result.ToImmutable();
         }
 
+        /// <summary>Checks a proposed base edge against resolved and pending base edges</summary>
         private static bool CreatesBaseTypeCycle(
              SourceNamedTypeSymbol start,
              NamedTypeSymbol baseCandidate,

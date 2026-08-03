@@ -31,25 +31,25 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            StandartLibrary32Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default32Bit);
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            StandartLibrary64Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default64Bit);
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
+            StandardLibrary32Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default32Bit);
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
+            StandardLibrary64Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default64Bit);
 
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-            StandartLibrary = TargetInfo.Default.PointerSize == 4 ? StandartLibrary32Bit : StandartLibrary64Bit;
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
+            StandardLibrary = TargetInfo.Default.PointerSize == 4 ? StandardLibrary32Bit : StandardLibrary64Bit;
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
             ExtendedLibrary32Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default32Bit);
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
             ExtendedLibrary64Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default64Bit);
-        public readonly static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+        public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
             ExtendedLibrary = TargetInfo.Default.PointerSize == 4 ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
         public readonly struct ExecutionContext
         {
             public readonly long InstructionsCount;
             public readonly TimeSpan TimeElapsed;
             public readonly TimeSpan BuildTime;
-            public readonly TimeSpan ComlilationTime;
+            public readonly TimeSpan CompilationTime;
             public readonly long StackMemoryUsed;
             public readonly long HeapMemoryUsed;
             public ExecutionContext(
@@ -65,7 +65,7 @@ namespace Cnidaria.Cs
                 StackMemoryUsed = stackMemoryUsed;
                 HeapMemoryUsed = heapMemoryUsed;
                 BuildTime = buildTime;
-                ComlilationTime = compilationTime;
+                CompilationTime = compilationTime;
             }
             public static ExecutionContext Empty => new ExecutionContext(-1, TimeSpan.MinValue, TimeSpan.MinValue, TimeSpan.MinValue, -1, -1);
         }
@@ -96,8 +96,8 @@ namespace Cnidaria.Cs
                 var tree = new SyntaxTree(root, "app");
                 var trees = ImmutableArray.Create(tree);
                 var refs = externalMeta != null
-                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, externalMeta })
-                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+                    ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, externalMeta })
+                    : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
 
                 var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
@@ -158,7 +158,7 @@ namespace Cnidaria.Cs
                 }
 
                 var domain = new Domain();
-                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
                 var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
                 var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
                 var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
@@ -240,7 +240,7 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(stVm.InctructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
+                    new ExecutionContext(stVm.InstructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -258,7 +258,7 @@ namespace Cnidaria.Cs
             string source, TargetInfo? target = null)
         {
             target ??= TargetInfo.X64Windows;
-            var standardLib = target.Is64Bit ? StandartLibrary64Bit : StandartLibrary32Bit;
+            var standardLib = target.Is64Bit ? StandardLibrary64Bit : StandardLibrary32Bit;
             var extendedLib = target.Is64Bit ? ExtendedLibrary64Bit : ExtendedLibrary32Bit;
             var diagnostics = new List<IDiagnostic>(extendedLib.diags);
 
@@ -329,11 +329,13 @@ namespace Cnidaria.Cs
         public static (Cnidaria.RiscV.RiscVProgram? program, List<IDiagnostic> diagnostics) CompileToRiscV(
             string source, TargetInfo? target = null)
         {
-            var diagnostics = new List<IDiagnostic>(ExtendedLibrary64Bit.diags);
+            target ??= TargetInfo.RVA23Linux;
+            var standardLib = target.Is64Bit ? StandardLibrary64Bit : StandardLibrary32Bit;
+            var extendedLib = target.Is64Bit ? ExtendedLibrary64Bit : ExtendedLibrary32Bit;
+            var diagnostics = new List<IDiagnostic>(extendedLib.diags);
 
             try
             {
-                target ??= TargetInfo.RVA23Linux;
 
                 var parser = new Parser(source, new LexerOptions { TargetPointerSize = target.PointerSize });
                 CompilationUnitSyntax root = parser.Parse();
@@ -341,8 +343,6 @@ namespace Cnidaria.Cs
                 AddDiagnostics(diagnostics, parser.Diagnostics);
                 if (HasErrors(diagnostics))
                     return (null, diagnostics);
-                var standardLib = target.Is64Bit ? StandartLibrary64Bit : StandartLibrary32Bit;
-                var extendedLib = target.Is64Bit ? ExtendedLibrary64Bit : ExtendedLibrary32Bit;
 
                 var tree = new SyntaxTree(root, "app");
                 var trees = ImmutableArray.Create(tree);
@@ -428,8 +428,8 @@ namespace Cnidaria.Cs
                 var tree = new SyntaxTree(root, "app");
                 var trees = ImmutableArray.Create(tree);
                 var refs = external != null
-                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+                    ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
 
                 var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
@@ -453,7 +453,7 @@ namespace Cnidaria.Cs
                 byte[] flatMd = FlatMetadataBuilder.Build(md);
                 IMetadataView appMeta = new FlatMetadataView(flatMd);
 
-                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
                 var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
                 var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
                 var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
@@ -593,7 +593,7 @@ namespace Cnidaria.Cs
                     external = (meta, externalFuncs);
                 }
 
-                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
                 var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
                 var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
                 var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
@@ -672,7 +672,7 @@ namespace Cnidaria.Cs
                 return (
                     sb.ToString(),
                     diagnostics,
-                    new ExecutionContext(regVm.InctructionsElapsed, sw.Elapsed, swBuild.Elapsed, swBuild.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+                    new ExecutionContext(regVm.InstructionsElapsed, sw.Elapsed, swBuild.Elapsed, swBuild.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -929,8 +929,8 @@ namespace Cnidaria.Cs
                 var tree = new SyntaxTree(root, "app");
                 var trees = ImmutableArray.Create(tree);
                 var refs = external != null
-                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+                    ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
 
                 var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
@@ -954,7 +954,7 @@ namespace Cnidaria.Cs
                 byte[] flatMd = FlatMetadataBuilder.Build(md);
                 IMetadataView appMeta = new FlatMetadataView(flatMd);
 
-                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
                 var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
                 var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
                 var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
@@ -1037,7 +1037,7 @@ namespace Cnidaria.Cs
                     sb.ToString(),
                     diagnostics,
                     new ExecutionContext(
-                        regVm.InctructionsElapsed, sw.Elapsed, swBuild.Elapsed, swCompile.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
+                        regVm.InstructionsElapsed, sw.Elapsed, swBuild.Elapsed, swCompile.Elapsed, regVm.StackPeakBytes, regVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -1088,8 +1088,8 @@ namespace Cnidaria.Cs
                 var tree = new SyntaxTree(root, "app");
                 var trees = ImmutableArray.Create(tree);
                 var refs = external != null
-                    ? new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                    : new MetadataReferenceSet(new[] { StandartLibrary.meta, ExtendedLibrary.meta });
+                    ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
+                    : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
 
                 var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
                 AddDiagnostics(diagnostics, declDiag);
@@ -1114,7 +1114,7 @@ namespace Cnidaria.Cs
                 IMetadataView appMeta = new FlatMetadataView(flatMd);
 
                 var domain = new Domain();
-                var stdModule = new RuntimeModule(StandartLibrary.meta.ModuleName, StandartLibrary.meta, StandartLibrary.funcs);
+                var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
                 var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
                 var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
                 var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
@@ -1197,7 +1197,7 @@ namespace Cnidaria.Cs
                     sb.ToString(),
                     diagnostics,
                     new ExecutionContext(
-                        stVm.InctructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
+                        stVm.InstructionsElapsed, sw.Elapsed, TimeSpan.MinValue, TimeSpan.MinValue, stVm.StackPeakBytes, stVm.HeapPeakBytes));
             }
             catch (Exception ex)
             {
@@ -1257,7 +1257,7 @@ namespace Cnidaria.Cs
             }
             var tree = new SyntaxTree(root, modulename);
             var trees = ImmutableArray.Create(new[] { tree });
-            var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandartLibrary.meta });
+            var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandardLibrary.meta });
             var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
             foreach (var diag in declDiag)
@@ -1309,7 +1309,7 @@ namespace Cnidaria.Cs
 
             var tree = new SyntaxTree(root, moduleName);
             var trees = ImmutableArray.Create(tree);
-            var refs = new MetadataReferenceSet(new[] { StandartLibrary.meta });
+            var refs = new MetadataReferenceSet(new[] { StandardLibrary.meta });
             var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
             foreach (var diag in declDiag)
@@ -1349,13 +1349,28 @@ namespace Cnidaria.Cs
 
             return (BytecodeSerializer.SerializeCompiledModule(flatMd, extFuncs), diags);
         }
-        internal static string GetCoreBCLSource()
+        private const string BclPrefix = "Cnidaria.Cs.BCL.";
+        public static string GetCoreBCLSource()
         {
-            return ReadEmbeddedText("Cnidaria.Cs.BCL.CoreBCL.cs");
+            StringBuilder sb = new();
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.InteropServices.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.CompilerServices.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Collections.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Buffers.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Globalization.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Text.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Numerics.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Reflection.cs"));
+            return sb.ToString();
         }
-        internal static string GetExtendedBCLSource()
+        public static string GetExtendedBCLSource()
         {
-            return ReadEmbeddedText("Cnidaria.Cs.BCL.ExtendedBCL.cs");
+            StringBuilder sb = new();
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Linq.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Drawing.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Diagnostics.cs"));
+            return sb.ToString();
         }
         private static string ReadEmbeddedText(string resourceName)
         {

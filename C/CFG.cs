@@ -6,6 +6,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    /// <summary>Identifies how control transfers along an edge</summary>
     public enum ControlFlowEdgeKind : byte
     {
         FallThrough,
@@ -18,6 +19,7 @@ namespace Cnidaria.C
         ImplicitExit,
     }
 
+    /// <summary>Identifies a structural problem found while building control flow</summary>
     public enum ControlFlowProblemKind : byte
     {
         DuplicateLabel,
@@ -25,11 +27,13 @@ namespace Cnidaria.C
         UnknownTerminator,
     }
 
+    /// <summary>Contains per-function control-flow graphs for a lowered tree</summary>
     public sealed class ControlFlowGraph
     {
         public SemanticModel SemanticModel { get; }
         public GimpleTree GimpleTree { get; }
         public ImmutableArray<ControlFlowFunction> Functions { get; }
+        /// <summary>Gets structural problems aggregated from all functions</summary>
         public ImmutableArray<ControlFlowProblem> Problems { get; }
 
         private ControlFlowGraph(
@@ -42,6 +46,7 @@ namespace Cnidaria.C
             Problems = Functions.SelectMany(static function => function.Problems).ToImmutableArray();
         }
 
+        /// <summary>Lowers and builds control flow for a semantic model</summary>
         public static ControlFlowGraph Build(SemanticModel semanticModel)
         {
             if (semanticModel is null)
@@ -50,6 +55,7 @@ namespace Cnidaria.C
             return Build(semanticModel.GetGimpleTree());
         }
 
+        /// <summary>Applies configured inlining then builds control flow</summary>
         public static ControlFlowGraph Build(GimpleTree gimpleTree)
         {
             if (gimpleTree is null)
@@ -69,6 +75,7 @@ namespace Cnidaria.C
             return new ControlFlowGraph(gimpleTree, functions.ToImmutable());
         }
 
+        /// <summary>Creates a graph whose tree and functions reflect member trimming</summary>
         internal ControlFlowGraph WithTrimmedMembers(
             GimpleTree gimpleTree,
             ImmutableArray<ControlFlowFunction> functions)
@@ -80,18 +87,26 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Models block connectivity and dominance for one function</summary>
+    /// <remarks>Blocks includes the synthetic exit block while RealBlocks contains only lowered blocks</remarks>
     public sealed class ControlFlowFunction
     {
         private readonly Dictionary<GimpleLabel, ControlFlowBlock> _blocksByLabel;
 
         public GimpleFunctionDefinition Function { get; }
         public FunctionSymbol? Symbol => Function.Symbol;
+        /// <summary>Gets the first lowered block</summary>
         public ControlFlowBlock Entry { get; }
+        /// <summary>Gets the synthetic function exit block</summary>
         public ControlFlowBlock Exit { get; }
+        /// <summary>Gets all blocks including the synthetic exit block</summary>
         public ImmutableArray<ControlFlowBlock> Blocks { get; }
+        /// <summary>Gets blocks backed by lowered basic blocks</summary>
         public ImmutableArray<ControlFlowBlock> RealBlocks { get; }
         public ImmutableArray<ControlFlowEdge> Edges { get; }
+        /// <summary>Gets reachable blocks in depth-first postorder</summary>
         public ImmutableArray<ControlFlowBlock> PostOrder { get; }
+        /// <summary>Gets reachable blocks in reverse postorder</summary>
         public ImmutableArray<ControlFlowBlock> ReversePostOrder { get; }
         public ImmutableArray<ControlFlowProblem> Problems { get; }
 
@@ -121,6 +136,7 @@ namespace Cnidaria.C
                 : new Dictionary<GimpleLabel, ControlFlowBlock>(blocksByLabel);
         }
 
+        /// <summary>Builds connectivity, reachability, and dominance for a function</summary>
         public static ControlFlowFunction Build(GimpleFunctionDefinition function)
         {
             if (function is null)
@@ -129,6 +145,8 @@ namespace Cnidaria.C
             return new Builder(function).Build();
         }
 
+        /// <summary>Gets the first block associated with a label</summary>
+        /// <remarks>Duplicate labels keep the first block as the jump target</remarks>
         public bool TryGetBlock(GimpleLabel label, out ControlFlowBlock? block)
         {
             if (label is null)
@@ -158,6 +176,7 @@ namespace Cnidaria.C
                 _function = function;
             }
 
+            /// <summary>Runs all graph construction phases</summary>
             public ControlFlowFunction Build()
             {
                 CreateBlocks();
@@ -183,6 +202,7 @@ namespace Cnidaria.C
                     _blocksByLabel);
             }
 
+            // Create one graph block per lowered block and append a synthetic exit
             private void CreateBlocks()
             {
                 for (var i = 0; i < _function.Blocks.Length; i++)
@@ -214,6 +234,7 @@ namespace Cnidaria.C
                 _successors.Add(_exit, new List<ControlFlowEdge>());
             }
 
+            // Derive outgoing edges from each final statement
             private void CreateEdges()
             {
                 for (var i = 0; i < _realBlocks.Count; i++)
@@ -317,6 +338,7 @@ namespace Cnidaria.C
                 _predecessors[target].Add(edge);
             }
 
+            // Freeze ordered edges and deduplicated neighboring blocks
             private void SealConnectivity()
             {
                 foreach (var block in _blocks)
@@ -331,6 +353,7 @@ namespace Cnidaria.C
                 }
             }
 
+            // Use an explicit depth-first search stack to avoid recursion on large functions
             private static ImmutableArray<ControlFlowBlock> ComputeReachabilityAndPostOrder(
                 ControlFlowBlock entry,
                 IEnumerable<ControlFlowBlock> blocks)
@@ -367,6 +390,7 @@ namespace Cnidaria.C
                 return postOrder.ToImmutableArray();
             }
 
+            // Solve immediate dominators over reachable blocks in reverse postorder
             private static void ComputeDominators(
                 ControlFlowBlock entry,
                 IEnumerable<ControlFlowBlock> blocks,
@@ -408,6 +432,7 @@ namespace Cnidaria.C
                     }
                 }
 
+                // Materialize the dominator tree and dominance frontier after convergence
                 var dominatorChildren = new Dictionary<ControlFlowBlock, List<ControlFlowBlock>>();
                 var dominanceFrontier = new Dictionary<ControlFlowBlock, HashSet<ControlFlowBlock>>();
                 foreach (var block in blocks)
@@ -428,6 +453,7 @@ namespace Cnidaria.C
                         dominatorChildren[immediateDominator].Add(block);
                 }
 
+                // A non-exit join contributes itself to each predecessor path up to its dominator
                 foreach (var block in reversePostOrder)
                 {
                     if (block.UniquePredecessors.Length < 2)
@@ -469,6 +495,7 @@ namespace Cnidaria.C
                 }
             }
 
+            // Find the nearest common ancestor in the current dominator relation
             private static ControlFlowBlock Intersect(
                 ControlFlowBlock first,
                 ControlFlowBlock second,
@@ -517,6 +544,7 @@ namespace Cnidaria.C
                 return builder.ToImmutable();
             }
 
+            /// <summary>Stores the next successor for iterative depth-first traversal</summary>
             private readonly struct SearchFrame
             {
                 public ControlFlowBlock Block { get; }
@@ -531,6 +559,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a basic block with graph and dominance metadata</summary>
     public sealed class ControlFlowBlock
     {
         private ImmutableArray<ControlFlowEdge> _predecessors;
@@ -543,16 +572,23 @@ namespace Cnidaria.C
         public int Ordinal { get; }
         public GimpleBasicBlock? GimpleBlock { get; }
         public bool IsExit { get; }
+        /// <summary>Gets whether the entry block can reach this block</summary>
         public bool IsReachable { get; private set; }
         public GimpleLabel? Label => GimpleBlock?.Label;
         public ImmutableArray<GimpleStatement> Statements => GimpleBlock?.Statements ?? ImmutableArray<GimpleStatement>.Empty;
+        /// <summary>Gets the final statement when it explicitly terminates the block</summary>
         public GimpleStatement? Terminator => Statements.Length != 0 && Statements[^1].IsTerminator ? Statements[^1] : null;
         public ImmutableArray<ControlFlowEdge> Predecessors => _predecessors;
         public ImmutableArray<ControlFlowEdge> Successors => _successors;
+        /// <summary>Gets predecessor blocks with parallel edges collapsed</summary>
         public ImmutableArray<ControlFlowBlock> UniquePredecessors => _uniquePredecessors;
+        /// <summary>Gets successor blocks with parallel edges collapsed</summary>
         public ImmutableArray<ControlFlowBlock> UniqueSuccessors => _uniqueSuccessors;
+        /// <summary>Gets the closest strict dominator or null for the entry and unreachable blocks</summary>
         public ControlFlowBlock? ImmediateDominator { get; private set; }
+        /// <summary>Gets children in the dominator tree ordered by block ordinal</summary>
         public ImmutableArray<ControlFlowBlock> DominatorChildren => _dominatorChildren;
+        /// <summary>Gets reachable join blocks in this block's dominance frontier</summary>
         public ImmutableArray<ControlFlowBlock> DominanceFrontier => _dominanceFrontier;
 
         internal ControlFlowBlock(int ordinal, GimpleBasicBlock? gimpleBlock, bool isExit)
@@ -571,6 +607,7 @@ namespace Cnidaria.C
             _dominanceFrontier = ImmutableArray<ControlFlowBlock>.Empty;
         }
 
+        /// <summary>Tests whether this block dominates another block</summary>
         public bool Dominates(ControlFlowBlock other)
         {
             if (other is null)
@@ -621,13 +658,16 @@ namespace Cnidaria.C
             => _dominanceFrontier = frontier.IsDefault ? ImmutableArray<ControlFlowBlock>.Empty : frontier;
     }
 
+    /// <summary>Represents one directed transfer between control-flow blocks</summary>
     public sealed class ControlFlowEdge
     {
         public int Ordinal { get; }
         public ControlFlowBlock Source { get; }
         public ControlFlowBlock Target { get; }
         public ControlFlowEdgeKind Kind { get; }
+        /// <summary>Gets the statement that produced the edge when one exists</summary>
         public GimpleStatement? Statement { get; }
+        /// <summary>Gets the case value carried by a switch-case edge</summary>
         public GimpleConstantValue? SwitchValue { get; }
 
         internal ControlFlowEdge(
@@ -657,6 +697,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Describes a recoverable structural problem in a function graph</summary>
     public sealed class ControlFlowProblem
     {
         public ControlFlowProblemKind Kind { get; }
@@ -682,6 +723,7 @@ namespace Cnidaria.C
         public override string ToString() => Message;
     }
 
+    /// <summary>Provides control-flow construction entry points</summary>
     public static class ControlFlowExtensions
     {
         public static ControlFlowGraph GetControlFlowGraph(this SemanticModel semanticModel)

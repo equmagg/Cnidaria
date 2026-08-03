@@ -109,6 +109,8 @@ namespace Cnidaria.Cs
         Field,
         StaticField,
         Indirect,
+        NullCheck,
+        ArrayLength,
         ArrayElement,
         ArrayData,
         StackAlloc,
@@ -272,8 +274,7 @@ namespace Cnidaria.Cs
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
             else if (MayClobberCallerSaved(source, _target))
-                flags |= (_nonCallOperationsClobberCallerSavedRegisters ||
-                    (_target.IsX86 && source.Kind is GenTreeKind.AllocHGlobal or GenTreeKind.FreeHGlobal))
+                flags |= _nonCallOperationsClobberCallerSavedRegisters
                     ? GenTreeLinearFlags.CallerSavedKill
                     : GenTreeLinearFlags.CallerSavedRegistersPreserved;
 
@@ -503,6 +504,14 @@ namespace Cnidaria.Cs
                             elementType: valueType, size: SizeOf(valueType, valueKind), alignment: AlignOf(valueType, valueKind));
                     }
 
+                case GenTreeKind.NullCheck:
+                    return new LinearMemoryAccess(LinearMemoryAccessKind.NullCheck, LinearMemoryAccessFlags.NullCheck,
+                        addressOperandIndex: 0, size: 1, alignment: 1);
+
+                case GenTreeKind.ArrayLength:
+                    return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayLength, LinearMemoryAccessFlags.Read
+                        | NullCheckFlag(source), addressOperandIndex: 0, size: 4, alignment: 4);
+
                 case GenTreeKind.ArrayElement:
                     return new LinearMemoryAccess(LinearMemoryAccessKind.ArrayElement, LinearMemoryAccessFlags.Read
                         | NullCheckFlag(source) | BoundsCheckFlag(source)
@@ -568,8 +577,6 @@ namespace Cnidaria.Cs
                 GenTreeKind.DelegateCombine or
                 GenTreeKind.DelegateRemove or
                 GenTreeKind.Box or
-                GenTreeKind.AllocHGlobal or
-                GenTreeKind.FreeHGlobal or
                 GenTreeKind.CastClass or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.Throw or
@@ -581,6 +588,13 @@ namespace Cnidaria.Cs
 
             if (source.Kind == GenTreeKind.Binary)
             {
+                if (target.IsRiscV &&
+                    source.SourceOp == BytecodeOp.Rem &&
+                    source.StackKind is GenStackKind.R4 or GenStackKind.R8)
+                {
+                    return true;
+                }
+
                 if (source.SourceOp is
                     BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
                     BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
@@ -598,8 +612,9 @@ namespace Cnidaria.Cs
 
             if (source.Kind is
                 GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or
-                GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or
-                GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
+                GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr or GenTreeKind.StoreStaticField or
+                GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or GenTreeKind.NullCheck or
+                GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
                 GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
             {
                 return true;
@@ -672,7 +687,7 @@ namespace Cnidaria.Cs
             int count = source.Kind == GenTreeKind.Box && IsStackHomeBoxSource(source) ? 1 : source.Kind switch
             {
                 GenTreeKind.ArrayElement => ArrayElementLoadGeneralScratchCount(result),
-                GenTreeKind.ArrayElementAddr => 1,
+                GenTreeKind.ArrayElementAddr => _target.IsRiscV ? 2 : 1,
                 GenTreeKind.StoreArrayElement => StoreArrayElementGeneralScratchCount(source),
                 GenTreeKind.PointerElementAddr => 1,
                 GenTreeKind.PointerDiff => 1,
@@ -789,14 +804,21 @@ namespace Cnidaria.Cs
         private int ArrayElementLoadGeneralScratchCount(GenTree? result)
         {
             int count = MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true);
-            if (count != 0)
-                return count;
+            if (count == 0 && result is not null)
+            {
+                var abi = MachineAbi.ClassifyStorageValue(result.Type, result.StackKind, _target);
+                if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                    count = 1;
+            }
 
-            if (result is null)
-                return 0;
+            if (_target.IsRiscV)
+            {
+                // Preserve array and index across the fixed t3-t6 scratch sequence used by
+                // the type check, bounds check and address calculation
+                count += 2;
+            }
 
-            var abi = MachineAbi.ClassifyStorageValue(result.Type, result.StackKind, _target);
-            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
+            return count;
         }
 
         private int MultiRegisterLoadGeneralScratchCount(GenTree? result, bool needsAddressScratch)
@@ -817,13 +839,28 @@ namespace Cnidaria.Cs
             var value = StoreArrayElementOperandValue(source);
 
             int count = MultiRegisterStoreGeneralScratchCount(value, needsAddressScratch: true);
-            if (count != 0)
-                return count;
-            if (value is null)
-                return 0;
+            AbiValueInfo abi = default;
+            if (value is not null)
+            {
+                abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
+                if (count == 0 && abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
+                    count = 1;
+            }
 
-            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
-            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
+            if (_target.IsRiscV)
+            {
+                // RISC-V array checks and address formation use the reserved t3-t6 scratch registers
+                // Post LSRA operand normalization may also place spilled array store operands in those registers
+                count += 2;
+                if (value is not null &&
+                    abi.PassingKind == AbiValuePassingKind.ScalarRegister &&
+                    abi.RegisterClass == RegisterClass.General)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
         private static GenTree? StoreArrayElementOperandValue(GenTree node)
         {

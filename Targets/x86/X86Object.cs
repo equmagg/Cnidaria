@@ -84,7 +84,7 @@ namespace Cnidaria.X86
                 if (string.IsNullOrEmpty(symbol.SectionName))
                     continue;
                 if (!sections.TryGetValue(symbol.SectionName, out var section))
-                    throw new InvalidOperationException("Symbol section does not exist: " + symbol.SectionName);
+                    throw new InvalidOperationException($"Symbol section does not exist: {symbol.SectionName}");
                 result[symbol.Name] = checked(section.Address + (ulong)symbol.Offset);
             }
 
@@ -194,7 +194,7 @@ namespace Cnidaria.X86
                     WriteUnsigned(image, imageOffset, checked((ulong)value), 8);
                     break;
                 default:
-                    throw new NotSupportedException("Unsupported x86 relocation: " + relocation.Kind);
+                    throw new NotSupportedException($"Unsupported relocation: {relocation.Kind}");
             }
         }
 
@@ -202,7 +202,7 @@ namespace Cnidaria.X86
         {
             if (symbols.TryGetValue(symbol, out var value))
                 return value;
-            throw new KeyNotFoundException("Undefined x86 symbol: " + symbol);
+            throw new KeyNotFoundException($"Undefined symbol: {symbol}");
         }
 
         private static int AlignUp(int value, int alignment)
@@ -237,7 +237,7 @@ namespace Cnidaria.X86
         }
     }
 
-    internal static class X86ObjectComposer
+    public static class X86ObjectComposer
     {
         public static X86Program Compose(X86Program primary, params X86Program[] libraries)
         {
@@ -253,7 +253,7 @@ namespace Cnidaria.X86
                 ValidateTargetCompatibility(primary.Target, inputs[i + 1].Target);
             }
 
-            var globalDefinitions = CollectGlobalDefinitions(inputs);
+            var globalDefinitions = ResolveGlobalDefinitions(inputs);
             var renames = BuildLocalRenameMaps(inputs);
             var textBases = new int[inputs.Length];
             var instructions = ImmutableArray.CreateBuilder<X86Instruction>();
@@ -345,6 +345,12 @@ namespace Cnidaria.X86
                         continue;
                     }
 
+                    if (symbol.Binding == X86ObjectSymbolBinding.Global &&
+                        !globalDefinitions.IsWinner(i, s, symbol.Name))
+                    {
+                        continue;
+                    }
+
                     int offset;
                     if (StringComparer.Ordinal.Equals(symbol.SectionName, ".text"))
                     {
@@ -363,7 +369,8 @@ namespace Cnidaria.X86
                         offset,
                         symbol.Size,
                         symbol.Binding,
-                        symbol.Kind));
+                        symbol.Kind,
+                        symbol.IsTentative));
                 }
             }
 
@@ -417,27 +424,114 @@ namespace Cnidaria.X86
                 ? operand.WithSymbol(Rename(renames, operand.Symbol), operand.RelocationKind, operand.Addend)
                 : operand;
 
-        private static HashSet<string> CollectGlobalDefinitions(IReadOnlyList<X86Program> inputs)
+        private static GlobalDefinitions ResolveGlobalDefinitions(IReadOnlyList<X86Program> inputs)
         {
-            var definitions = new HashSet<string>(StringComparer.Ordinal);
-            for (int i = 0; i < inputs.Count; i++)
+            var candidates = new Dictionary<string, List<GlobalDefinitionCandidate>>(StringComparer.Ordinal);
+            var externalKinds = new Dictionary<string, X86ObjectSymbolKind>(StringComparer.Ordinal);
+            for (var inputIndex = 0; inputIndex < inputs.Count; inputIndex++)
             {
-                var symbols = inputs[i].Symbols;
-                for (int s = 0; s < symbols.Length; s++)
+                var symbols = inputs[inputIndex].Symbols;
+                for (var symbolIndex = 0; symbolIndex < symbols.Length; symbolIndex++)
                 {
-                    var symbol = symbols[s];
-                    if (symbol.Binding != X86ObjectSymbolBinding.Global ||
-                        symbol.Kind == X86ObjectSymbolKind.Section ||
-                        string.IsNullOrEmpty(symbol.Name))
+                    var symbol = symbols[symbolIndex];
+                    if (symbol.Kind == X86ObjectSymbolKind.Section || string.IsNullOrEmpty(symbol.Name))
+                        continue;
+
+                    if (symbol.Binding == X86ObjectSymbolBinding.External)
                     {
+                        if (externalKinds.TryGetValue(symbol.Name, out var externalKind) && externalKind != symbol.Kind)
+                            throw new InvalidOperationException($"Conflicting external symbol kinds for '{symbol.Name}'.");
+                        externalKinds[symbol.Name] = symbol.Kind;
                         continue;
                     }
 
-                    if (!definitions.Add(symbol.Name))
-                        throw new InvalidOperationException($"Duplicate global symbol: {symbol.Name}");
+                    if (symbol.Binding != X86ObjectSymbolBinding.Global)
+                        continue;
+
+                    if (symbol.IsTentative && symbol.Kind != X86ObjectSymbolKind.Object)
+                        throw new InvalidOperationException($"Only object symbols can be tentative: {symbol.Name}");
+
+                    if (!candidates.TryGetValue(symbol.Name, out var definitions))
+                    {
+                        definitions = new List<GlobalDefinitionCandidate>();
+                        candidates.Add(symbol.Name, definitions);
+                    }
+                    definitions.Add(new GlobalDefinitionCandidate(inputIndex, symbolIndex, symbol));
                 }
             }
-            return definitions;
+
+            var winners = new Dictionary<string, GlobalDefinitionCandidate>(StringComparer.Ordinal);
+            foreach (var pair in candidates)
+            {
+                var definitions = pair.Value;
+                var expectedKind = definitions[0].Symbol.Kind;
+                for (var i = 1; i < definitions.Count; i++)
+                {
+                    if (definitions[i].Symbol.Kind != expectedKind)
+                        throw new InvalidOperationException($"Conflicting x86 symbol kinds for '{pair.Key}'.");
+                }
+
+                GlobalDefinitionCandidate? strong = null;
+                GlobalDefinitionCandidate? tentative = null;
+                foreach (var definition in definitions)
+                {
+                    if (!definition.Symbol.IsTentative)
+                    {
+                        if (strong.HasValue)
+                            throw new InvalidOperationException($"Duplicate global symbol: {pair.Key}");
+                        strong = definition;
+                        continue;
+                    }
+
+                    if (!tentative.HasValue || definition.Symbol.Size > tentative.Value.Symbol.Size)
+                        tentative = definition;
+                }
+
+                if (!strong.HasValue && !tentative.HasValue)
+                    throw new InvalidOperationException("Global symbol resolution produced no candidate.");
+
+                winners.Add(pair.Key, strong ?? tentative!.Value);
+            }
+
+            foreach (var external in externalKinds)
+            {
+                if (winners.TryGetValue(external.Key, out var definition) && definition.Symbol.Kind != external.Value)
+                    throw new InvalidOperationException($"Conflicting symbol kinds for '{external.Key}'.");
+            }
+
+            return new GlobalDefinitions(winners);
+        }
+
+        private readonly struct GlobalDefinitionCandidate
+        {
+            public int InputIndex { get; }
+            public int SymbolIndex { get; }
+            public X86ObjectSymbol Symbol { get; }
+
+            public GlobalDefinitionCandidate(int inputIndex, int symbolIndex, X86ObjectSymbol symbol)
+            {
+                InputIndex = inputIndex;
+                SymbolIndex = symbolIndex;
+                Symbol = symbol;
+            }
+        }
+
+        private sealed class GlobalDefinitions
+        {
+            private readonly Dictionary<string, GlobalDefinitionCandidate> _winners;
+
+            public GlobalDefinitions(Dictionary<string, GlobalDefinitionCandidate> winners)
+            {
+                _winners = winners;
+            }
+
+            public bool Contains(string name)
+                => _winners.ContainsKey(name);
+
+            public bool IsWinner(int inputIndex, int symbolIndex, string name)
+                => _winners.TryGetValue(name, out var winner) &&
+                   winner.InputIndex == inputIndex &&
+                   winner.SymbolIndex == symbolIndex;
         }
 
         private static Dictionary<string, string>[] BuildLocalRenameMaps(IReadOnlyList<X86Program> inputs)
@@ -464,7 +558,7 @@ namespace Cnidaria.X86
                     string candidate = baseName;
                     int suffix = 0;
                     while (!usedNames.Add(candidate))
-                        candidate = baseName + "_" + (++suffix).ToString();
+                        candidate = $"{baseName}_{(++suffix)}";
                     map.Add(name, candidate);
                 }
 

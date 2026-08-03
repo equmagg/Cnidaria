@@ -6,6 +6,7 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Identifies predefined types recognized by the type system</summary>
     public enum SpecialType : byte
     {
         None,
@@ -32,6 +33,7 @@ namespace Cnidaria.Cs
         System_UIntPtr,
         System_Exception,
     }
+    /// <summary>Identifies the semantic category of a conversion</summary>
     public enum ConversionKind : byte
     {
         None,
@@ -51,8 +53,11 @@ namespace Cnidaria.Cs
         ExplicitNullable,
         ImplicitStackAlloc,
     }
+    /// <summary>Identifies the declaration form or semantic category of a type</summary>
     public enum TypeKind : byte { Class, Struct, Interface, Enum, Delegate, Error, Dynamic, Unknown, FunctionPointer }
+    /// <summary>Specifies the severity of a diagnostic</summary>
     public enum DiagnosticSeverity : byte { Hidden, Info, Warning, Error }
+    /// <summary>Identifies the semantic category of a symbol</summary>
     public enum SymbolKind : byte
     {
         Assembly, Module,
@@ -67,6 +72,7 @@ namespace Cnidaria.Cs
         FunctionPointerType,
         Error
     }
+    /// <summary>Identifies the operation performed by a bound binary expression</summary>
     internal enum BoundBinaryOperatorKind : byte
     {
         StringConcatenation,
@@ -94,6 +100,7 @@ namespace Cnidaria.Cs
         RightShift,
         UnsignedRightShift,
     }
+    /// <summary>Identifies the operation performed by a bound unary expression</summary>
     internal enum BoundUnaryOperatorKind : byte
     {
         UnaryPlus,
@@ -101,6 +108,7 @@ namespace Cnidaria.Cs
         LogicalNot,
         BitwiseNot,
     }
+    /// <summary>Explains why symbol resolution did not select a unique usable symbol</summary>
     public enum CandidateReason : byte
     {
         None,
@@ -111,6 +119,8 @@ namespace Cnidaria.Cs
         Ambiguous,
 
     }
+    /// <summary>Describes a classified conversion and optional user-defined operator</summary>
+    /// <remarks>A default value represents no conversion</remarks>
     public readonly struct Conversion
     {
         public readonly ConversionKind Kind;
@@ -142,6 +152,7 @@ namespace Cnidaria.Cs
             UserDefinedIsImplicit = isImplicit;
         }
     }
+    /// <summary>Identifies a source span within a syntax tree</summary>
     public readonly struct Location
     {
         public readonly SyntaxTree SyntaxTree;
@@ -155,12 +166,14 @@ namespace Cnidaria.Cs
         public override string ToString() => $"{Span}";
         public string ToString(string sorce) => Span.ToString(sorce);
     }
+    /// <summary>Provides formatted diagnostic text and severity</summary>
     public interface IDiagnostic
     {
         public string GetMessage();
         public string GetMessage(string source);
         public DiagnosticSeverity GetSeverity();
     }
+    /// <summary>Represents one diagnostic associated with a source location</summary>
     public readonly struct Diagnostic : IDiagnostic
     {
         public readonly string Id;
@@ -182,6 +195,8 @@ namespace Cnidaria.Cs
         public DiagnosticSeverity GetSeverity() => this.Severity;
 
     }
+    /// <summary>Stores a value while distinguishing absence from the default value</summary>
+    /// <remarks>A default instance represents absence</remarks>
     public readonly struct Optional<T>
     {
         public readonly bool HasValue;
@@ -195,6 +210,7 @@ namespace Cnidaria.Cs
 
         public static Optional<T> None => default;
     }
+    /// <summary>Accumulates diagnostics before producing an immutable result</summary>
     public sealed class DiagnosticBag
     {
         private readonly List<Diagnostic> _items = new();
@@ -202,6 +218,7 @@ namespace Cnidaria.Cs
         public ImmutableArray<Diagnostic> ToImmutable() => _items.ToImmutableArray();
         public bool IsEmpty => _items.Count == 0;
     }
+    /// <summary>Pairs a parsed compilation unit with its source path</summary>
     public sealed class SyntaxTree
     {
         public CompilationUnitSyntax Root { get; }
@@ -213,8 +230,10 @@ namespace Cnidaria.Cs
             FilePath = filePath ?? "";
         }
     }
+    /// <summary>Interns and constructs type symbols for one compilation context</summary>
     public sealed class TypeManager
     {
+        /// <summary>Provides identity-based interning keys for function pointer types</summary>
         private readonly struct FunctionPointerTypeKey : IEquatable<FunctionPointerTypeKey>
         {
             public readonly FunctionPointerCallingConvention CallingConvention;
@@ -270,6 +289,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Provides identity-based interning keys for tuple types</summary>
         private readonly struct TupleTypeKey : IEquatable<TupleTypeKey>
         {
             public readonly ImmutableArray<TypeSymbol> Types;
@@ -315,6 +335,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Provides identity-based interning keys for substituted named types</summary>
         private readonly struct SubstitutedNamedTypeKey : IEquatable<SubstitutedNamedTypeKey>
         {
             public readonly NamedTypeSymbol Definition;
@@ -763,6 +784,7 @@ namespace Cnidaria.Cs
             return current;
         }
     }
+    /// <summary>Stores target-specific options used to create and emit a compilation</summary>
     public sealed class CompilationOptions
     {
         public TargetInfo Target { get; }
@@ -771,6 +793,7 @@ namespace Cnidaria.Cs
             Target = target ?? TargetInfo.Default;
         }
     }
+    /// <summary>Builds compilations from syntax trees and optional library providers</summary>
     public static class CompilationFactory
     {
         public static Compilation Create(ImmutableArray<SyntaxTree> trees, out ImmutableArray<Diagnostic> diagnostics)
@@ -844,6 +867,7 @@ namespace Cnidaria.Cs
             return compilation;
         }
     }
+    /// <summary>Owns symbols, binding state, and emission for a set of syntax trees</summary>
     public sealed class Compilation
     {
         private readonly ImmutableArray<SyntaxTree> _syntaxTrees;
@@ -897,6 +921,7 @@ namespace Cnidaria.Cs
             => _types.GetTupleType(elementTypes, elementNames);
         public ByRefTypeSymbol CreateByRefType(TypeSymbol elementType)
             => TypeManager.GetByRefType(elementType);
+        /// <summary>Creates a semantic query view for the given syntax tree</summary>
         public SemanticModel GetSemanticModel(SyntaxTree tree, bool ignoreAccessibility = false)
         {
             var key = (tree, ignoreAccessibility);
@@ -926,6 +951,7 @@ namespace Cnidaria.Cs
 
             return b.ToImmutable();
         }
+        /// <summary>Enumerates declarations that can own executable bodies</summary>
         public IEnumerable<SyntaxNode> EnumerateMethodBodyOwners(SyntaxTree tree)
         {
             Compilation c = this;
@@ -1071,7 +1097,7 @@ namespace Cnidaria.Cs
                     foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
                         EmitBody(body);
                 }
-                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(compilation, tree))
+                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
                 {
                     int ctorTok = tokens.GetMethodToken(ctor);
                     if (functions.ContainsKey(ctorTok))
@@ -1081,7 +1107,7 @@ namespace Cnidaria.Cs
                     var body = new BoundMethodBody(tree.Root, ctor, block);
                     EmitBody(body);
                 }
-                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(compilation, tree))
+                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(rootNs, tree))
                 {
                     int cctorTok = tokens.GetMethodToken(cctor);
                     if (functions.ContainsKey(cctorTok))
@@ -1194,8 +1220,7 @@ namespace Cnidaria.Cs
 
             return stmts.ToImmutable();
         }
-        private static IEnumerable<SynthesizedConstructorSymbol> EnumerateSynthesizedInstanceCtorsInTree(
-            Compilation compilation, SyntaxTree tree)
+        private static IEnumerable<SynthesizedConstructorSymbol> EnumerateSynthesizedInstanceCtorsInTree(NamespaceSymbol moduleGlobalNamespace, SyntaxTree tree)
         {
             static bool IsDeclaredInTree(SourceNamedTypeSymbol t, SyntaxTree tree)
             {
@@ -1237,7 +1262,7 @@ namespace Cnidaria.Cs
                     VisitNs(nss[i], tree, dst);
             }
             var list = new List<SourceNamedTypeSymbol>();
-            VisitNs(compilation.SourceGlobalNamespace, tree, list);
+            VisitNs(moduleGlobalNamespace, tree, list);
             for (int ti = 0; ti < list.Count; ti++)
             {
                 var members = list[ti].GetMembers();
@@ -1248,7 +1273,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        private static IEnumerable<MethodSymbol> EnumerateSynthesizedStaticCctorsInTree(Compilation compilation, SyntaxTree tree)
+        private static IEnumerable<MethodSymbol> EnumerateSynthesizedStaticCctorsInTree(NamespaceSymbol moduleGlobalNamespace, SyntaxTree tree)
         {
             static bool IsDeclaredInTree(SourceNamedTypeSymbol t, SyntaxTree tree)
             {
@@ -1283,7 +1308,7 @@ namespace Cnidaria.Cs
             }
 
             var list = new List<SourceNamedTypeSymbol>();
-            VisitNs(compilation.SourceGlobalNamespace, tree, list);
+            VisitNs(moduleGlobalNamespace, tree, list);
 
             for (int ti = 0; ti < list.Count; ti++)
             {
@@ -1302,13 +1327,15 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Captures namespaces, aliases, and static types visible in one scope</summary>
     internal sealed class Imports
     {
         public static readonly Imports Empty = new Imports(
          containers: ImmutableArray<Symbol>.Empty,
          aliases: ImmutableDictionary<string, AliasSymbol>.Empty.WithComparers(StringComparer.Ordinal),
          staticTypes: ImmutableArray<NamedTypeSymbol>.Empty);
-        public ImmutableArray<Symbol> Containers { get; } // NamespaceSymbol or NamedTypeSymbol
+        /// <summary>Imported namespaces and named types</summary>
+        public ImmutableArray<Symbol> Containers { get; }
         public ImmutableDictionary<string, AliasSymbol> Aliases { get; }
         public ImmutableArray<NamedTypeSymbol> StaticTypes { get; }
 
@@ -1325,6 +1352,7 @@ namespace Cnidaria.Cs
         public bool TryGetAlias(string name, out AliasSymbol? alias)
             => Aliases.TryGetValue(name, out alias);
     }
+    /// <summary>Maps source scopes and containing symbols to their visible imports</summary>
     internal sealed class ImportScopeMap
     {
         private readonly ImmutableArray<(TextSpan Span, Imports Imports)> _scopes;
@@ -1341,7 +1369,7 @@ namespace Cnidaria.Cs
 
         public Imports GetImportsForPosition(int position)
         {
-            // Select the smallest scope span containing the position
+            // Select the smallest scope containing the position
             Imports best = RootImports;
             int bestLen = int.MaxValue;
 
@@ -1384,6 +1412,7 @@ namespace Cnidaria.Cs
             return GetImportsForPosition(node.Span.Start);
         }
     }
+    /// <summary>Links a declaration to its syntax tree and syntax node</summary>
     public readonly struct SyntaxReference
     {
         public readonly SyntaxTree SyntaxTree;
@@ -1395,10 +1424,14 @@ namespace Cnidaria.Cs
             Node = node;
         }
     }
+    /// <summary>Reports the selected symbol and alternative resolution candidates</summary>
     public readonly struct SymbolInfo
     {
-        public readonly Symbol? Symbol; // chosen best symbol
+        /// <summary>Best symbol selected by resolution</summary>
+        public readonly Symbol? Symbol;
+        /// <summary>Alternative symbols considered by resolution</summary>
         public readonly ImmutableArray<Symbol> CandidateSymbols;
+        /// <summary>Reason no unique usable symbol was selected</summary>
         public readonly CandidateReason CandidateReason;
 
         public SymbolInfo(Symbol? symbol, ImmutableArray<Symbol> candidates, CandidateReason reason)
@@ -1411,9 +1444,11 @@ namespace Cnidaria.Cs
         public bool IsEmpty => Symbol is null && CandidateSymbols.IsDefaultOrEmpty;
         public static SymbolInfo None => new(null, ImmutableArray<Symbol>.Empty, CandidateReason.None);
     }
+    /// <summary>Reports an expression type before and after contextual conversion</summary>
     public readonly struct TypeInfo
     {
         public readonly TypeSymbol? Type;
+        /// <summary>Type after contextual conversion</summary>
         public readonly TypeSymbol? ConvertedType;
         public TypeInfo(TypeSymbol? type, TypeSymbol? convertedType)
         {
@@ -1425,6 +1460,7 @@ namespace Cnidaria.Cs
 
 
 
+    /// <summary>Provides semantic queries for one syntax tree</summary>
     public abstract class SemanticModel
     {
         public Compilation Compilation { get; }
@@ -1438,31 +1474,43 @@ namespace Cnidaria.Cs
             IgnoresAccessibility = ignoresAccessibility;
         }
 
+        /// <summary>Returns diagnostics produced while binding this syntax tree</summary>
         public abstract ImmutableArray<Diagnostic> GetDiagnostics(TextSpan? span = null, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the symbol declared by the given syntax node</summary>
         public abstract Symbol? GetDeclaredSymbol(SyntaxNode declaration, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns symbol resolution results for the given syntax node</summary>
         public abstract SymbolInfo GetSymbolInfo(SyntaxNode node, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the alias referenced by the given name</summary>
         public abstract Symbol? GetAliasInfo(NameSyntax nameSyntax, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the natural and converted types of an expression</summary>
         public abstract TypeInfo GetTypeInfo(ExpressionSyntax expr, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the compile-time value of an expression when available</summary>
         public abstract Optional<object> GetConstantValue(ExpressionSyntax expr, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the conversion applied to an expression</summary>
         public abstract Conversion GetConversion(ExpressionSyntax expr, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the symbol containing the source position</summary>
         public abstract Symbol? GetEnclosingSymbol(int position, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns symbols visible at the source position</summary>
         public abstract ImmutableArray<Symbol> LookupSymbols(int position, string? name = null, CancellationToken cancellationToken = default);
 
+        /// <summary>Returns the bound node associated with syntax</summary>
         internal abstract BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default);
     }
+    /// <summary>Records bound nodes and declarations associated with syntax</summary>
     public interface IBindingRecorder
     {
         void RecordBound(SyntaxNode syntax, BoundNode bound);
         void RecordDeclared(SyntaxNode syntax, Symbol symbol);
     }
+    /// <summary>Binds source on demand and caches semantic query results</summary>
     internal sealed class SourceSemanticModel : SemanticModel, IBindingRecorder
     {
         private readonly Dictionary<SyntaxNode, BoundNode> _boundNodeCache = new();
@@ -1627,7 +1675,7 @@ namespace Cnidaria.Cs
             var importScopeMap = ImportsBuilder.BuildImportScopeMap(Compilation, SyntaxTree, recorder, bag);
             var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: Compilation, importScopeMap: importScopeMap);
 
-            // Bind top level statements if present
+            // Bind top-level statements when present
             var entryPoint = Compilation.EntryPoint;
             var hasTopLevel = SyntaxTree.Root.Members.Any(m => m is GlobalStatementSyntax);
 
@@ -1668,7 +1716,7 @@ namespace Cnidaria.Cs
                 var root = new BoundCompilationUnit(SyntaxTree.Root, ImmutableArray<BoundStatement>.Empty);
                 recorder.RecordBound(SyntaxTree.Root, root);
             }
-            // Bind bodies of declared methods/ctors
+            // Bind bodies of declared methods and constructors
             if (Compilation.DeclaredSymbolsByTree.TryGetValue(SyntaxTree, out var declMap))
             {
                 foreach (var kv in declMap)
@@ -1828,7 +1876,7 @@ namespace Cnidaria.Cs
             if (!backingField.IsStatic)
             {
                 if (method.ContainingSymbol is not NamedTypeSymbol containingType)
-                    return; // should not happen
+                    return;
                 receiver = new BoundThisExpression(new ThisExpressionSyntax(default), containingType);
             }
             BoundMemberAccessExpression FieldAccess(bool isLValue)
@@ -1844,7 +1892,7 @@ namespace Cnidaria.Cs
                 var stmts = ImmutableArray.CreateBuilder<BoundStatement>(initialCapacity: 4);
                 if (propertySyntax.Initializer is not null && backingField.Type.IsReferenceType)
                 {
-                    // if (field != null) goto done;
+                    // Skip initialization when the backing field is already set
                     var boolType = Compilation.GetSpecialType(SpecialType.System_Boolean);
                     var fieldRead1 = FieldAccess(isLValue: false);
                     var nullLit = new BoundLiteralExpression(ownerSyntax, backingField.Type, null);
@@ -1858,7 +1906,7 @@ namespace Cnidaria.Cs
                     var done = LabelSymbol.CreateGenerated("<auto_prop_get_done>", method);
                     stmts.Add(new BoundConditionalGotoStatement(ownerSyntax, notNull, done, jumpIfTrue: true));
 
-                    // field = <init>;
+                    // Initialize the backing field on first access
                     var initExpr = binder.BindExpression(propertySyntax.Initializer.Value, ctx, diagnostics);
                     initExpr = binder.ApplyConversion(
                         exprSyntax: propertySyntax.Initializer.Value,
@@ -1881,7 +1929,7 @@ namespace Cnidaria.Cs
                 recorder.RecordBound(ownerSyntax, new BoundMethodBody(ownerSyntax, method, body));
                 return;
             }
-            // field = value;
+            // Store the setter value in the backing field
             if (method.Parameters.Length != 1)
                 return;
 
@@ -2109,6 +2157,7 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Builds lexical import scopes from using directives</summary>
     internal static class ImportsBuilder
     {
         public static ImportScopeMap BuildImportScopeMap(
@@ -2291,7 +2340,7 @@ namespace Cnidaria.Cs
 
             if (isGlobal && !includeGlobalDirectives)
             {
-                // Already processed at compilation level
+                // Global directives were processed at compilation scope
                 return;
             }
 
@@ -2309,6 +2358,9 @@ namespace Cnidaria.Cs
 
             var importedContainersSnapshot = containers.ToImmutable();
             var aliasesSnapshot = aliases.ToImmutable();
+
+            if (usingDirective.Name is null)
+                return;
 
             var target = ResolveNamespaceOrType(
                 compilation,
@@ -2359,7 +2411,7 @@ namespace Cnidaria.Cs
                     target: target,
                     locations: ImmutableArray.Create(new Location(tree, usingDirective.Alias.Span)));
 
-                // Inner alias hides outer alias of the same name
+                // A nested alias shadows the same name from an outer scope
                 aliases[aliasName] = aliasSym;
 
                 recorder?.RecordDeclared(usingDirective, aliasSym);
@@ -2496,6 +2548,7 @@ namespace Cnidaria.Cs
             }
             containers.Add(sym);
         }
+        /// <summary>Stores one qualified-name segment and its generic arity</summary>
         private readonly struct NamePart
         {
             public readonly string Name;
@@ -2546,6 +2599,7 @@ namespace Cnidaria.Cs
 
 
 
+    /// <summary>Describes the contextual state inherited by binders</summary>
     [Flags]
     public enum BinderFlags
     {
@@ -2559,6 +2613,7 @@ namespace Cnidaria.Cs
         CheckedContext = 1 << 6,
         UncheckedContext = 1 << 7,
     }
+    /// <summary>Identifies the runtime shape of a bound node</summary>
     public enum BoundNodeKind
     {
         CompilationUnit,
@@ -2644,6 +2699,7 @@ namespace Cnidaria.Cs
         FixedStatement,
         FixedInitializer,
     }
+    /// <summary>Carries compilation and recording state through binding operations</summary>
     public sealed class BindingContext
     {
         public Compilation Compilation { get; }

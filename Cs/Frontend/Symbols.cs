@@ -6,6 +6,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Specifies the calling convention of a function pointer type</summary>
     public enum FunctionPointerCallingConvention : byte
     {
         Managed,
@@ -16,6 +17,7 @@ namespace Cnidaria.Cs
         Fastcall
     }
 
+    /// <summary>Specifies by-reference behavior for a function pointer parameter or return</summary>
     public enum FunctionPointerRefKind : byte
     {
         None,
@@ -25,6 +27,7 @@ namespace Cnidaria.Cs
         RefReadOnly
     }
 
+    /// <summary>Describes one parameter in a function pointer signature</summary>
     public readonly struct FunctionPointerParameter
     {
         public TypeSymbol Type { get; }
@@ -36,6 +39,7 @@ namespace Cnidaria.Cs
             RefKind = refKind;
         }
     }
+    /// <summary>Identifies the declaration targeted by an attribute</summary>
     public enum AttributeApplicationTarget : byte
     {
         Default = 0,
@@ -56,6 +60,7 @@ namespace Cnidaria.Cs
         GenericParameter,
         Unknown
     }
+    /// <summary>Describes the declared accessibility of a symbol</summary>
     public enum Accessibility : byte
     {
         NotApplicable = 0,
@@ -66,6 +71,7 @@ namespace Cnidaria.Cs
         ProtectedAndInternal,  // private protected
         Public
     }
+    /// <summary>Pairs a compile-time value with its resolved type</summary>
     public readonly struct TypedConstant
     {
         public TypeSymbol Type { get; }
@@ -77,10 +83,12 @@ namespace Cnidaria.Cs
             Value = value;
         }
     }
+    /// <summary>Describes one named argument in an attribute application</summary>
     public readonly struct AttributeNamedArgumentData
     {
         public string Name { get; }
-        public Symbol Member { get; } // FieldSymbol or PropertySymbol
+        /// <summary>Target field or property</summary>
+        public Symbol Member { get; }
         public TypedConstant Value { get; }
 
         public AttributeNamedArgumentData(string name, Symbol member, TypedConstant value)
@@ -90,6 +98,7 @@ namespace Cnidaria.Cs
             Value = value;
         }
     }
+    /// <summary>Represents a bound attribute application</summary>
     public sealed class AttributeData
     {
         public NamedTypeSymbol AttributeClass { get; }
@@ -112,6 +121,7 @@ namespace Cnidaria.Cs
             Target = target;
         }
     }
+    /// <summary>Stores native import metadata for a method</summary>
     public sealed class DllImportData
     {
         public string ModuleName { get; }
@@ -146,6 +156,7 @@ namespace Cnidaria.Cs
             ThrowOnUnmappableCharacter = throwOnUnmappableCharacter;
         }
     }
+    /// <summary>Encodes native import metadata into serialized method flags</summary>
     internal static class PInvokeMetadataFlags
     {
         private const uint CharSetMask = 0x0000000F;
@@ -181,6 +192,7 @@ namespace Cnidaria.Cs
                 (flags & PreserveSig) != 0,
                 (flags & ThrowOnUnmappableCharacter) != 0);
     }
+    /// <summary>Defines serialized metadata bits shared by symbol readers and writers</summary>
     internal static class MetadataFlagBits
     {
         public const ushort NoInlining = 0x0008;
@@ -190,6 +202,7 @@ namespace Cnidaria.Cs
         public const ushort Extension = 0x8000;
         public const int CustomAttribute = 0x0C000000;
     }
+    /// <summary>Reads method behavior encoded by recognized attributes</summary>
     internal static class MethodAttributeFacts
     {
         public static ushort GetMethodImplFlags(MethodSymbol method)
@@ -412,8 +425,10 @@ namespace Cnidaria.Cs
     }
 
 
+    /// <summary>Recognizes inline-array types and extracts their element layout</summary>
     internal static class InlineArrayFacts
     {
+        /// <summary>Describes the resolved layout of an inline-array type</summary>
         internal readonly struct InlineArrayInfo
         {
             public NamedTypeSymbol Type { get; }
@@ -517,6 +532,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    /// <summary>Base abstraction for a named semantic entity</summary>
     public abstract class Symbol
     {
         public abstract SymbolKind Kind { get; }
@@ -529,6 +545,7 @@ namespace Cnidaria.Cs
         public virtual bool IsFromMetadata => false;
         public override string ToString() => $"{Kind} {Name}";
     }
+    /// <summary>Represents a namespace and its nested namespaces and types</summary>
     public abstract class NamespaceSymbol : Symbol
     {
         public sealed override SymbolKind Kind => SymbolKind.Namespace;
@@ -541,6 +558,7 @@ namespace Cnidaria.Cs
             => GetTypeMembers(name, arity: -1);
     }
 
+    /// <summary>Base abstraction for a resolved type</summary>
     public abstract class TypeSymbol : Symbol
     {
         public override SymbolKind Kind => SymbolKind.NamedType;
@@ -551,6 +569,7 @@ namespace Cnidaria.Cs
         public virtual TypeSymbol? BaseType => null;
         public virtual ImmutableArray<TypeSymbol> Interfaces => ImmutableArray<TypeSymbol>.Empty;
     }
+    /// <summary>Represents the typeless null literal during binding</summary>
     internal sealed class NullTypeSymbol : TypeSymbol
     {
         public static readonly NullTypeSymbol Instance = new();
@@ -565,6 +584,7 @@ namespace Cnidaria.Cs
 
         private NullTypeSymbol() { }
     }
+    /// <summary>Represents a default literal before target typing</summary>
     internal sealed class DefaultLiteralTypeSymbol : TypeSymbol
     {
         public static readonly DefaultLiteralTypeSymbol Instance = new();
@@ -579,6 +599,7 @@ namespace Cnidaria.Cs
 
         private DefaultLiteralTypeSymbol() { }
     }
+    /// <summary>Represents a lambda before target typing</summary>
     internal sealed class UnboundLambdaTypeSymbol : TypeSymbol
     {
         public static readonly UnboundLambdaTypeSymbol Instance = new();
@@ -593,6 +614,7 @@ namespace Cnidaria.Cs
 
         private UnboundLambdaTypeSymbol() { }
     }
+    /// <summary>Represents a method group before overload resolution completes</summary>
     internal sealed class UnboundMethodGroupTypeSymbol : TypeSymbol
     {
         public static readonly UnboundMethodGroupTypeSymbol Instance = new();
@@ -607,6 +629,7 @@ namespace Cnidaria.Cs
 
         private UnboundMethodGroupTypeSymbol() { }
     }
+    /// <summary>Represents a throw expression before its target type is applied</summary>
     internal sealed class ThrowTypeSymbol : TypeSymbol
     {
         public static readonly ThrowTypeSymbol Instance = new();
@@ -618,6 +641,7 @@ namespace Cnidaria.Cs
         public override bool IsValueType => false;
         private ThrowTypeSymbol() { }
     }
+    /// <summary>Represents a declared type with members and optional type parameters</summary>
     public abstract class NamedTypeSymbol : TypeSymbol
     {
         public abstract TypeKind TypeKind { get; }
@@ -639,6 +663,7 @@ namespace Cnidaria.Cs
                 return b.ToImmutable();
             }
         }
+        /// <summary>Definition before type or containing-type substitution</summary>
         public virtual NamedTypeSymbol OriginalDefinition => this;
         public virtual TypeSymbol? EnumUnderlyingType => null;
 
@@ -647,6 +672,7 @@ namespace Cnidaria.Cs
         public ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name)
             => GetTypeMembers(name, arity: -1);
     }
+    /// <summary>Describes special constraints applied to a type parameter</summary>
     [Flags]
     public enum GenericConstraintsFlags : byte
     {
@@ -657,6 +683,7 @@ namespace Cnidaria.Cs
         AllowsRefStruct = 1 << 3,
     }
 
+    /// <summary>Represents a type parameter declared by a type or method</summary>
     public sealed class TypeParameterSymbol : TypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.TypeParameter;
@@ -688,6 +715,7 @@ namespace Cnidaria.Cs
             return true;
         }
     }
+    /// <summary>Represents an array type with a fixed rank and element type</summary>
     public sealed class ArrayTypeSymbol : TypeSymbol
     {
         private readonly NamedTypeSymbol _arrayBase;
@@ -725,6 +753,7 @@ namespace Cnidaria.Cs
             _interfaces = interfaces.IsDefault ? ImmutableArray<TypeSymbol>.Empty : interfaces;
         }
     }
+    /// <summary>Represents an unmanaged pointer type</summary>
     public sealed class PointerTypeSymbol : TypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.PointerType;
@@ -737,6 +766,7 @@ namespace Cnidaria.Cs
         public PointerTypeSymbol(TypeSymbol pointedAtType)
             => PointedAtType = pointedAtType;
     }
+    /// <summary>Represents a function pointer signature</summary>
     public sealed class FunctionPointerTypeSymbol : TypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.FunctionPointerType;
@@ -814,6 +844,7 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Represents a managed by-reference type</summary>
     public sealed class ByRefTypeSymbol : TypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.ByRefType;
@@ -824,6 +855,7 @@ namespace Cnidaria.Cs
         public ByRefTypeSymbol(TypeSymbol elementType)
             => ElementType = elementType;
     }
+    /// <summary>Represents a tuple type with element types and optional names</summary>
     public sealed class TupleTypeSymbol : NamedTypeSymbol
     {
         private readonly TypeSymbol _baseType;
@@ -913,6 +945,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
             => ImmutableArray<NamedTypeSymbol>.Empty;
     }
+    /// <summary>Exposes one tuple element as a field symbol</summary>
     internal sealed class TupleElementFieldSymbol : FieldSymbol
     {
         public override string Name { get; }
@@ -934,6 +967,7 @@ namespace Cnidaria.Cs
             Type = elementType;
         }
     }
+    /// <summary>Represents an unresolved or invalid type while preserving binding progress</summary>
     public sealed class ErrorTypeSymbol : NamedTypeSymbol
     {
         public override SymbolKind Kind => SymbolKind.Error;
@@ -954,6 +988,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
             => ImmutableArray<NamedTypeSymbol>.Empty;
     }
+    /// <summary>Base abstraction for a field</summary>
     public abstract class FieldSymbol : Symbol
     {
         public sealed override SymbolKind Kind => SymbolKind.Field;
@@ -963,6 +998,7 @@ namespace Cnidaria.Cs
         public virtual bool IsReadOnly => false;
         public abstract Optional<object> ConstantValueOpt { get; }
     }
+    /// <summary>Base abstraction for a property or indexer</summary>
     public abstract class PropertySymbol : Symbol
     {
         public sealed override SymbolKind Kind => SymbolKind.Property;
@@ -972,9 +1008,11 @@ namespace Cnidaria.Cs
         public abstract bool HasSet { get; }
         public abstract MethodSymbol? GetMethod { get; }
         public abstract MethodSymbol? SetMethod { get; }
+        /// <summary>Interface member implemented explicitly by this property</summary>
         public virtual PropertySymbol? ExplicitInterfaceImplementation => null;
         public virtual ImmutableArray<ParameterSymbol> Parameters => ImmutableArray<ParameterSymbol>.Empty;
     }
+    /// <summary>Base abstraction for a method, constructor, operator, or accessor</summary>
     public abstract class MethodSymbol : Symbol
     {
         public sealed override SymbolKind Kind => SymbolKind.Method;
@@ -992,7 +1030,9 @@ namespace Cnidaria.Cs
         public virtual bool IsOverride => false;
         public virtual bool IsSealed => false;
         public virtual MethodSymbol? OverriddenMethod => null;
+        /// <summary>Definition before method type-argument substitution</summary>
         public virtual MethodSymbol OriginalDefinition => this;
+        /// <summary>Interface member implemented explicitly by this method</summary>
         public virtual MethodSymbol? ExplicitInterfaceImplementation => null;
         public virtual ImmutableArray<TypeSymbol> TypeArguments
         {
@@ -1016,6 +1056,7 @@ namespace Cnidaria.Cs
 
         public virtual bool IsRuntimeSpecialName => IsConstructor;
     }
+    /// <summary>Represents a constructor created during binding</summary>
     internal sealed class SynthesizedConstructorSymbol : MethodSymbol
     {
         public override string Name { get; }
@@ -1042,6 +1083,7 @@ namespace Cnidaria.Cs
             Parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
         }
     }
+    /// <summary>Represents storage created for an automatically implemented property</summary>
     internal sealed class SynthesizedBackingFieldSymbol : FieldSymbol
     {
         private TypeSymbol _type;
@@ -1072,6 +1114,7 @@ namespace Cnidaria.Cs
 
         internal void SetType(TypeSymbol type) => _type = type;
     }
+    /// <summary>Specifies parameter passing by value or by reference</summary>
     public enum ParameterRefKind : byte
     {
         None = 0,
@@ -1079,6 +1122,7 @@ namespace Cnidaria.Cs
         Out,
         In
     }
+    /// <summary>Represents a method, accessor, or lambda parameter</summary>
     public sealed class ParameterSymbol : Symbol
     {
         public override SymbolKind Kind => SymbolKind.Parameter;
@@ -1128,6 +1172,7 @@ namespace Cnidaria.Cs
             DefaultValueOpt = constantValueOpt;
         }
     }
+    /// <summary>Represents a local variable within an executable body</summary>
     public sealed class LocalSymbol : Symbol
     {
         public override SymbolKind Kind => SymbolKind.Local;
@@ -1138,6 +1183,7 @@ namespace Cnidaria.Cs
         public bool IsConst { get; }
         public bool IsByRef { get; }
         public bool IsReadOnly { get; }
+        public bool IsScoped { get; }
         public Optional<object> ConstantValueOpt { get; }
         public LocalSymbol(
             string name,
@@ -1147,6 +1193,7 @@ namespace Cnidaria.Cs
             bool isByRef = false,
             bool isConst = false,
             bool isReadOnly = false,
+            bool isScoped = false,
             Optional<object> constantValueOpt = default)
         {
             Name = name;
@@ -1157,9 +1204,11 @@ namespace Cnidaria.Cs
             IsByRef = isByRef;
             IsConst = isConst;
             IsReadOnly = isConst || isReadOnly;
+            IsScoped = isScoped;
             ConstantValueOpt = isConst ? constantValueOpt : Optional<object>.None;
         }
     }
+    /// <summary>Represents a source alias bound to a namespace or type</summary>
     public sealed class AliasSymbol : Symbol
     {
         public override SymbolKind Kind => SymbolKind.Alias;
@@ -1179,6 +1228,7 @@ namespace Cnidaria.Cs
 
 
 
+    /// <summary>Collects namespace declarations and members from source</summary>
     internal sealed class SourceNamespaceSymbol : NamespaceSymbol
     {
         private readonly Dictionary<string, SourceNamespaceSymbol> _namespaces = new(StringComparer.Ordinal);
@@ -1233,7 +1283,7 @@ namespace Cnidaria.Cs
                     ? list.ToImmutableArray()
                     : ImmutableArray<NamedTypeSymbol>.Empty;
 
-            // arity == -1 => any
+            // An arity of -1 matches any arity
             return _typesByName
                 .Where(kv => StringComparer.Ordinal.Equals(kv.Key.name, name))
                 .SelectMany(kv => kv.Value)
@@ -1253,6 +1303,7 @@ namespace Cnidaria.Cs
             return b.ToImmutable();
         }
     }
+    /// <summary>Represents a field declared in source</summary>
     internal sealed class SourceFieldSymbol : FieldSymbol
     {
         private TypeSymbol _type;
@@ -1316,6 +1367,7 @@ namespace Cnidaria.Cs
             _declRefs.Add(declarationRef);
         }
     }
+    /// <summary>Represents a property or indexer declared in source</summary>
     internal sealed class SourcePropertySymbol : PropertySymbol
     {
         private TypeSymbol _type;
@@ -1389,6 +1441,7 @@ namespace Cnidaria.Cs
 
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    /// <summary>Represents a named type declared in source</summary>
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
         private bool _isSealed;
@@ -1556,6 +1609,7 @@ namespace Cnidaria.Cs
 
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    /// <summary>Represents a local function declared within an executable body</summary>
     internal sealed class LocalFunctionSymbol : MethodSymbol
     {
         public override string Name { get; }
@@ -1575,6 +1629,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic { get; }
         public override bool IsConstructor => false;
         public override bool IsAsync { get; }
+        public override bool IsExtern { get; }
 
         private readonly SyntaxReference _declRef;
         public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => ImmutableArray.Create(_declRef);
@@ -1586,7 +1641,8 @@ namespace Cnidaria.Cs
             SyntaxTree tree,
             ImmutableArray<Location> locations,
             bool isStatic,
-            bool isAsync)
+            bool isAsync,
+            bool isExtern)
         {
             Name = name;
             ContainingSymbol = containing;
@@ -1597,6 +1653,7 @@ namespace Cnidaria.Cs
 
             IsStatic = isStatic;
             IsAsync = isAsync;
+            IsExtern = isExtern;
 
             _returnType = new ErrorTypeSymbol("error", containing: null, locations: ImmutableArray<Location>.Empty);
             _parameters = ImmutableArray<ParameterSymbol>.Empty;
@@ -1616,6 +1673,7 @@ namespace Cnidaria.Cs
                 : typeParameters;
         }
     }
+    /// <summary>Represents a method-like declaration from source</summary>
     internal sealed class SourceMethodSymbol : MethodSymbol
     {
         public override string Name { get; }
@@ -1708,6 +1766,7 @@ namespace Cnidaria.Cs
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
         public void AddDeclaration(SyntaxReference decl) => _declRefs.Add(decl);
     }
+    /// <summary>Rewrites types by applying a type-parameter substitution map</summary>
     internal static class TypeSubstituter
     {
         internal static TypeSymbol Substitute(TypeSymbol type, TypeManager types, ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
@@ -1809,6 +1868,7 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Projects a named type through substitutions from its containing type</summary>
     internal sealed class SubstitutedNamedTypeSymbol : NamedTypeSymbol
     {
         private readonly TypeManager _types;
@@ -1972,6 +2032,7 @@ namespace Cnidaria.Cs
             return b.ToImmutable();
         }
     }
+    /// <summary>Projects a field through its containing type substitutions</summary>
     internal sealed class SubstitutedFieldSymbol : FieldSymbol
     {
         private readonly FieldSymbol _original;
@@ -1996,6 +2057,7 @@ namespace Cnidaria.Cs
             _type = TypeSubstituter.Substitute(original.Type, types, map);
         }
     }
+    /// <summary>Projects a property through its containing type substitutions</summary>
     internal sealed class SubstitutedPropertySymbol : PropertySymbol
     {
         private readonly PropertySymbol _original;
@@ -2059,6 +2121,7 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Projects a method through its containing type substitutions</summary>
     internal sealed class SubstitutedMethodSymbol : MethodSymbol
     {
         private readonly MethodSymbol _original;
@@ -2162,6 +2225,7 @@ namespace Cnidaria.Cs
             _parameters = b.ToImmutable();
         }
     }
+    /// <summary>Represents a generic method with concrete type arguments</summary>
     internal sealed class ConstructedMethodSymbol : MethodSymbol
     {
         private readonly MethodSymbol _definition;
@@ -2225,6 +2289,7 @@ namespace Cnidaria.Cs
             _parameters = b.ToImmutable();
         }
     }
+    /// <summary>Provides a mutable namespace used to build synthetic symbol graphs</summary>
     internal sealed class SyntheticNamespaceSymbol : NamespaceSymbol
     {
         private readonly Dictionary<string, SyntheticNamespaceSymbol> _namespaces = new(StringComparer.Ordinal);
@@ -2286,6 +2351,7 @@ namespace Cnidaria.Cs
             return b.ToImmutable();
         }
     }
+    /// <summary>Represents a predefined type supplied by the core type system</summary>
     internal sealed class SpecialNamedTypeSymbol : NamedTypeSymbol
     {
         private bool _isSealed;
@@ -2344,6 +2410,8 @@ namespace Cnidaria.Cs
                 .ToImmutableArray();
         }
     }
+    /// <summary>Presents two namespace symbols as one combined namespace</summary>
+    /// <remarks>Both inputs are expected to describe the same namespace</remarks>
     internal sealed class MergedNamespaceSymbol : NamespaceSymbol
     {
         private readonly NamespaceSymbol _a;
@@ -2355,7 +2423,7 @@ namespace Cnidaria.Cs
             _b = b;
         }
 
-        public override string Name => _a.Name; //assume same
+        public override string Name => _a.Name;
         public override Symbol? ContainingSymbol => _a.ContainingSymbol;
         public override bool IsGlobalNamespace => _a.IsGlobalNamespace || _b.IsGlobalNamespace;
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -2386,6 +2454,7 @@ namespace Cnidaria.Cs
             return a.AddRange(b);
         }
     }
+    /// <summary>Represents a named or generated control-flow target</summary>
     public sealed class LabelSymbol : Symbol
     {
         public override SymbolKind Kind => SymbolKind.Label;
@@ -2423,6 +2492,7 @@ namespace Cnidaria.Cs
             return true;
         }
     }
+    /// <summary>Represents a method loaded from external metadata</summary>
     internal sealed class ExternalMethodSymbol : MethodSymbol
     {
         private readonly bool _isVirtual;
@@ -2498,6 +2568,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    /// <summary>Represents a field loaded from external metadata</summary>
     internal sealed class ExternalFieldSymbol : FieldSymbol
     {
         private readonly List<AttributeData> _attributes = new();
@@ -2531,6 +2602,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    /// <summary>Represents a property loaded from external metadata</summary>
     internal sealed class ExternalPropertySymbol : PropertySymbol
     {
         private readonly List<AttributeData> _attributes = new();
@@ -2577,6 +2649,7 @@ namespace Cnidaria.Cs
             => _explicitInterfaceImplementation = property ?? throw new ArgumentNullException(nameof(property));
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    /// <summary>Represents a method implemented by a recognized intrinsic operation</summary>
     internal sealed class IntrinsicMethodSymbol : MethodSymbol
     {
         public override string Name { get; }

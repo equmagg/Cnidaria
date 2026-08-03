@@ -6,12 +6,12 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Formats reachable bytecode functions with resolved metadata operands</summary>
     internal static class BytecodeDump
     {
+        /// <summary>Prints the entry function and every function reachable through direct calls</summary>
         public static void DumpReachable(
-            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
-            Cnidaria.Cs.RuntimeModule entryModule,
-            int entryMethodDefToken)
+            IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeModule entryModule, int entryMethodDefToken)
         {
             if (!entryModule.MethodsByDefToken.TryGetValue(entryMethodDefToken, out var entryFn))
                 throw new MissingMethodException(
@@ -54,7 +54,7 @@ namespace Cnidaria.Cs
                         }
                         catch (MissingMethodException)
                         {
-                            // ignore
+                            // Operand formatting must not prevent the dump
                         }
                     }
                 }
@@ -63,7 +63,7 @@ namespace Cnidaria.Cs
 
 
             }
-            void Enqueue(Cnidaria.Cs.RuntimeModule m, Cnidaria.Cs.BytecodeFunction f)
+            void Enqueue(RuntimeModule m, BytecodeFunction f)
             {
                 var key = (m.Name, f.MethodToken);
                 if (seen.Add(key))
@@ -71,10 +71,9 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Formats a human-readable annotation for metadata-bearing operands</summary>
         private static string FormatOperandComment(
-            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
-            Cnidaria.Cs.RuntimeModule currentModule,
-            Cnidaria.Cs.Instruction ins)
+            IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeModule currentModule, Instruction ins)
         {
             switch (ins.Op)
             {
@@ -122,10 +121,9 @@ namespace Cnidaria.Cs
                     return "";
             }
         }
-        private static (Cnidaria.Cs.RuntimeModule targetModule, Cnidaria.Cs.BytecodeFunction fn) ResolveCallWithModule(
-            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
-            Cnidaria.Cs.RuntimeModule caller,
-            int methodToken)
+        /// <summary>Resolves a call token to its defining module and bytecode body</summary>
+        private static (RuntimeModule targetModule, BytecodeFunction fn) ResolveCallWithModule(
+            IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeModule caller, int methodToken)
         {
             int table = MetadataToken.Table(methodToken);
             int rid = MetadataToken.Rid(methodToken);
@@ -179,6 +177,7 @@ namespace Cnidaria.Cs
             return (targetModule, fn2);
         }
 
+        /// <summary>Resolves the owner of a member reference across type token forms</summary>
         private static (string asm, string ns, string name) ResolveMemberRefClass(Cnidaria.Cs.IRuntimeMetadataModule caller, int classToken)
         {
             int table = MetadataToken.Table(classToken);
@@ -203,9 +202,10 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"MemberRef.Class token not supported: 0x{classToken:X8}");
         }
+        /// <summary>Finds a unique method definition matching a member reference signature</summary>
         private static bool TryResolveMethodDefByCompatibleSignature(
-            Cnidaria.Cs.IRuntimeMetadataModule memberRefModule,
-            Cnidaria.Cs.IRuntimeMetadataModule targetModule,
+            IRuntimeMetadataModule memberRefModule,
+            IRuntimeMetadataModule targetModule,
             int ownerTypeDefToken,
             string methodName,
             int memberRefSigBlob,
@@ -238,6 +238,7 @@ namespace Cnidaria.Cs
 
             return false;
         }
+        /// <summary>Compares method signatures across independent metadata modules</summary>
         private static bool IsSignatureCompatible(
             Cnidaria.Cs.IRuntimeMetadataModule defModule,
             int defSigBlob,
@@ -279,6 +280,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        /// <summary>Compares one encoded signature type and advances both readers</summary>
         private static bool MatchType(
             Cnidaria.Cs.IRuntimeMetadataModule defModule,
             ref SigReader def,
@@ -402,6 +404,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        /// <summary>Consumes the remainder of one encoded signature type</summary>
         private static void SkipType(SigElementType et, ref SigReader r)
         {
             switch (et)
@@ -458,6 +461,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Resolves a type reference through its resolution scope</summary>
         private static (string asm, string ns, string name) ResolveTypeRefFullName(Cnidaria.Cs.IRuntimeMetadataModule caller, int typeRefRid)
         {
             var tr = caller.Md.GetTypeRef(typeRefRid);
@@ -507,6 +511,7 @@ namespace Cnidaria.Cs
 
             return (ns, name);
         }
+        /// <summary>Extracts the named owner represented by a type specification</summary>
         private static (string asm, string ns, string name) ResolveTypeSpecOwner(Cnidaria.Cs.IRuntimeMetadataModule caller, ref SigReader sr)
         {
             var et = (SigElementType)sr.ReadByte();
@@ -530,6 +535,7 @@ namespace Cnidaria.Cs
             throw new NotSupportedException($"Unsupported TypeSpec as MemberRef owner: {et}");
         }
 
+        /// <summary>Resolves a type definition, reference, or specification to a qualified name</summary>
         private static (string asm, string ns, string name) ResolveTypeTokenFullName(Cnidaria.Cs.IRuntimeMetadataModule caller, int tok)
         {
             int table = MetadataToken.Table(tok);
@@ -567,6 +573,7 @@ namespace Cnidaria.Cs
                 _ => throw new InvalidOperationException("Bad TypeDefOrRef coded index")
             };
         }
+        /// <summary>Formats method definition and member reference tokens</summary>
         private static string FormatMethodToken(Cnidaria.Cs.IRuntimeMetadataModule caller, int methodToken)
         {
             int table = MetadataToken.Table(methodToken);
@@ -616,6 +623,7 @@ namespace Cnidaria.Cs
             return 0;
         }
 
+        /// <summary>Formats type tokens including nested and constructed types</summary>
         private static string FormatTypeToken(Cnidaria.Cs.IRuntimeMetadataModule ctx, int typeToken)
         {
             int table = MetadataToken.Table(typeToken);
@@ -655,6 +663,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Formats field definition and member reference tokens</summary>
         private static string FormatFieldToken(Cnidaria.Cs.IRuntimeMetadataModule caller, int fieldToken)
         {
             int table = MetadataToken.Table(fieldToken);
@@ -689,10 +698,10 @@ namespace Cnidaria.Cs
             if (!string.IsNullOrEmpty(ns))
                 return $"{ns}.{name}";
 
-            // Namespace for nested is empty by design
+            // Nested type rows carry their namespace on the outermost type
             if (TryGetEnclosingTypeRid(md, typeDefRid, out int encRid))
             {
-                // Build chain outer to inner
+                // Build the nested name from outermost to innermost
                 var names = new List<string>();
                 int cur = typeDefRid;
                 names.Add(md.GetString(md.GetTypeDef(cur).Name));
@@ -713,6 +722,7 @@ namespace Cnidaria.Cs
             return name;
         }
 
+        /// <summary>Finds the enclosing type row for a nested type</summary>
         private static bool TryGetEnclosingTypeRid(IMetadataView md, int nestedRid, out int enclosingRid)
         {
             for (int i = 0; i < md.GetRowCount(MetadataTableKind.NestedClass); i++)
@@ -731,19 +741,29 @@ namespace Cnidaria.Cs
         private static string FormatTypeName(string ns, string name)
             => string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
     }
+    /// <summary>Formats bound trees as a deterministic text hierarchy</summary>
     public static class BoundTreePrinter
     {
+        /// <summary>Controls optional metadata included in bound tree output</summary>
         public sealed class Options
         {
+            /// <summary>Includes the originating syntax kind</summary>
             public bool IncludeSyntaxKind { get; init; } = true;
+            /// <summary>Includes the originating source span</summary>
             public bool IncludeSyntaxSpan { get; init; } = false;
+            /// <summary>Includes expression and symbol types</summary>
             public bool IncludeTypes { get; init; } = true;
+            /// <summary>Includes compile-time constant values</summary>
             public bool IncludeConstants { get; init; } = true;
+            /// <summary>Includes bound conversion classifications</summary>
             public bool IncludeConversionKind { get; init; } = false;
+            /// <summary>Includes error state for invalid nodes</summary>
             public bool IncludeHasErrors { get; init; } = true;
+            /// <summary>Includes intrinsic binding details</summary>
             public bool IncludeIntrinsicInfo { get; init; } = false;
         }
 
+        /// <summary>Formats a bound tree into a string</summary>
         public static string Print(BoundNode node, Options? options = null)
         {
             options ??= new Options();
@@ -753,10 +773,12 @@ namespace Cnidaria.Cs
             return sb.ToString();
         }
 
+        /// <summary>Writes a formatted bound tree to standard output</summary>
         public static void PrintToConsole(BoundNode node, Options? options = null)
         {
             Console.WriteLine(Print(node, options));
         }
+        /// <summary>Finds Program.Main inside namespace declarations</summary>
         public static MethodDeclarationSyntax? FindMain(CompilationUnitSyntax cu)
         {
             foreach (var m in cu.Members)
@@ -779,6 +801,7 @@ namespace Cnidaria.Cs
 
             return null;
         }
+        /// <summary>Maintains tree prefix state while formatting nodes recursively</summary>
         private sealed class Writer
         {
             private readonly StringBuilder _sb;
@@ -795,6 +818,7 @@ namespace Cnidaria.Cs
                 WriteNodeCore(node, edgeLabel: null, isLast: true, isRoot: true);
             }
 
+            /// <summary>Writes one node and recursively emits its labeled children</summary>
             private void WriteNodeCore(BoundNode? node, string? edgeLabel, bool isLast, bool isRoot)
             {
                 if (!isRoot)
@@ -816,7 +840,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                // Header line
+                // Write node metadata before descending into children
                 var title = GetTitle(node);
                 _sb.Append(title);
                 _sb.Append(FormatMeta(node));
@@ -833,7 +857,7 @@ namespace Cnidaria.Cs
 
                 _sb.AppendLine();
 
-                // Children
+                // Child order follows source and evaluation order
                 var children = GetChildren(node);
                 if (children.Length == 0)
                     return;
@@ -944,6 +968,7 @@ namespace Cnidaria.Cs
                     _ => node.GetType().Name
                 };
             }
+            /// <summary>Pairs a child node with the edge label shown by the printer</summary>
             private readonly struct Child
             {
                 public readonly string Label;
@@ -956,6 +981,7 @@ namespace Cnidaria.Cs
                 }
             }
 
+            /// <summary>Projects each bound node kind into its structural child edges</summary>
             private static Child[] GetChildren(BoundNode node)
             {
                 switch (node)
@@ -1245,6 +1271,7 @@ namespace Cnidaria.Cs
                 }
             }
 
+            /// <summary>Formats syntax and error metadata shared by all nodes</summary>
             private string FormatMeta(BoundNode node)
             {
                 var parts = new List<string>(4);
@@ -1278,6 +1305,7 @@ namespace Cnidaria.Cs
                     _ => s.ToString() ?? s.GetType().Name
                 };
             }
+            /// <summary>Formats type, constant, conversion, and intrinsic expression metadata</summary>
             private string FormatExprExtras(BoundExpression expr)
             {
                 var parts = new List<string>(2);
@@ -1294,6 +1322,7 @@ namespace Cnidaria.Cs
                 return "  [" + string.Join(", ", parts) + "]";
             }
 
+            /// <summary>Formats compact node-specific data shown on the header line</summary>
             private string FormatInline(BoundNode node)
             {
                 switch (node)

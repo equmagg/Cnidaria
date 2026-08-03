@@ -972,7 +972,7 @@ namespace Cnidaria.Cs
                     occurrence.Node.SourceOp,
                     temp.Type,
                     temp.StackKind,
-                    (occurrence.Node.Flags & ~GenTreeFlags.AssertionProperties) |
+                    (occurrence.Node.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit)) |
                     GenTreeFlags.SideEffect |
                     GenTreeFlags.LocalDef |
                     GenTreeFlags.Ordered,
@@ -1049,7 +1049,7 @@ namespace Cnidaria.Cs
                     ? node.Flags & (GenTreeFlags.Prolog | GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse)
                     : node.Flags;
                 for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags & ~GenTreeFlags.AssertionProperties;
+                    flags |= node.Operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
                 node.Flags = flags;
             }
 

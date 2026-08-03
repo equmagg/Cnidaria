@@ -1,14 +1,10 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Type syntax, blocks, constructor initializers, and conversion application
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundExpression BindThis(ThisExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -96,6 +92,7 @@ namespace Cnidaria.Cs
 
             return new BoundBaseExpression(node, containingType, baseType);
         }
+        /// <summary>Binds type syntax through the nearest type binder</summary>
         public override TypeSymbol BindType(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics)
         {
             if (syntax is PointerTypeSyntax p)
@@ -150,6 +147,7 @@ namespace Cnidaria.Cs
 
             return new BoundBlockStatement(block, statements.ToImmutable());
         }
+        /// <summary>Binds an explicit or implicit base or this constructor initializer</summary>
         internal BoundStatement? BindConstructorInitializer(
             ConstructorDeclarationSyntax ctorSyntax,
             BindingContext context,
@@ -300,6 +298,7 @@ namespace Cnidaria.Cs
             context.Recorder.RecordBound(initSyntax, stmt);
             return stmt;
         }
+        /// <summary>Applies a classified conversion and lowers special target-typed forms</summary>
         internal BoundExpression ApplyConversion(
             ExpressionSyntax exprSyntax,
             BoundExpression expr,
@@ -341,7 +340,7 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, converted);
                 return converted;
             }
-            // Target typed method group
+            // Target-typed method group
             if (expr is BoundMethodGroupExpression methodGroup)
             {
                 var bound = BindMethodGroupConversion(methodGroup, targetType, diagnosticNode, context, diagnostics);
@@ -371,14 +370,14 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bad);
                 return bad;
             }
-            // Target typed lambda / anonymous method
+            // Target-typed anonymous function
             if (expr is BoundUnboundLambdaExpression unboundLambda)
             {
                 var bound = BindLambdaConversion(unboundLambda, targetType, diagnosticNode, context, diagnostics);
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
-            // Target typed new expression
+            // Target-typed object creation
             if (exprSyntax is ImplicitObjectCreationExpressionSyntax ioc)
             {
                 BoundExpression bound;
@@ -389,14 +388,14 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
-            // Target typed collection expression
+            // Target-typed collection expression
             if (exprSyntax is CollectionExpressionSyntax collectionSyntax && expr is BoundUnboundCollectionExpression unboundCollection)
             {
                 var bound = BindCollectionExpression(collectionSyntax, targetType, unboundCollection, context, diagnostics);
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
-            // Target typed default literal
+            // Target-typed default literal
             if (expr.Type is DefaultLiteralTypeSymbol)
             {
                 if (targetType.SpecialType == SpecialType.System_Void || targetType is ByRefTypeSymbol)
@@ -493,7 +492,7 @@ namespace Cnidaria.Cs
 
                 if (!ReferenceEquals(arg.Type, paramType))
                 {
-                    var pre = ClassifyConversion(arg, paramType); // static overload
+                    var pre = ClassifyConversion(arg, paramType); // Exclude recursive user-defined lookup
                     if (!pre.Exists || (requireImplicit && !pre.IsImplicit))
                     {
                         diagnostics.Add(new Diagnostic(
@@ -521,7 +520,7 @@ namespace Cnidaria.Cs
 
                 if (!ReferenceEquals(converted.Type, targetType))
                 {
-                    var post = ClassifyConversion(converted, targetType); // static overload
+                    var post = ClassifyConversion(converted, targetType); // Exclude recursive user-defined lookup
                     if (!post.Exists || (requireImplicit && !post.IsImplicit))
                     {
                         diagnostics.Add(new Diagnostic(
@@ -589,6 +588,15 @@ namespace Cnidaria.Cs
 
             var elementType = targetByRef.ElementType;
 
+            if (outVar.IsScoped && !elementType.IsRefLikeType && elementType is not ErrorTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SCOPED001",
+                    DiagnosticSeverity.Error,
+                    "The scoped modifier can only be used with ref locals or ref-like value types.",
+                    new Location(context.SemanticModel.SyntaxTree, outVar.Syntax.Span)));
+            }
+
             var local = new LocalSymbol(
                 name: outVar.Name,
                 containing: _containing,
@@ -596,7 +604,8 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, outVar.Designation.Span)),
                 isConst: false,
                 constantValueOpt: Optional<object>.None,
-                isByRef: false);
+                isByRef: false,
+                isScoped: outVar.IsScoped);
 
             _locals[outVar.Name] = local;
             context.Recorder.RecordDeclared(outVar.Designation, local);
@@ -655,6 +664,7 @@ namespace Cnidaria.Cs
                 sideEffects: ImmutableArray<BoundStatement>.Empty,
                 value: tempRef);
         }
+        // Nullable conversion lowering preserves source evaluation and HasValue branching
         private BoundExpression LowerNullableConversion(
             ExpressionSyntax exprSyntax,
             BoundExpression expr,
@@ -691,7 +701,7 @@ namespace Cnidaria.Cs
 
                 var srcVal = new BoundCallExpression(diagnosticNode, src, gv, ImmutableArray<BoundExpression>.Empty);
 
-                // convert underlying
+                // Convert the underlying value
                 var convertedUnderlying = ApplyConversion(
                     exprSyntax: exprSyntax,
                     expr: srcVal,

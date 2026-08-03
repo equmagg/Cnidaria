@@ -6,6 +6,7 @@ using System.Text;
 
 namespace Cnidaria.C
 {
+    ///<summary>Contains the translation unit, syntax diagnostics and final typedef state</summary>
     public sealed class ParseResult
     {
         public TranslationUnitSyntax Root { get; }
@@ -23,11 +24,13 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Base class for parsed source constructs</summary>
     public abstract class SyntaxNode
     {
         public abstract SyntaxKind Kind { get; }
     }
 
+    ///<summary>Represents the complete source file</summary>
     public sealed class TranslationUnitSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.TranslationUnit;
@@ -44,6 +47,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents declaration specifiers followed by init declarators</summary>
     public sealed class DeclarationSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.Declaration;
@@ -65,6 +69,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents declaration specifiers, a function declarator and its body</summary>
     public sealed class FunctionDefinitionSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.FunctionDefinition;
@@ -84,11 +89,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a static assertion with an optional message expression</summary>
     public sealed class StaticAssertDeclarationSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.StaticAssertDeclaration;
 
-        public SyntaxToken StaticAssertKeyword { get; }
+        public SyntaxToken StaticAssertKeyword { get; } // '_Static_assert' or 'static_assert'
         public SyntaxToken OpenParenToken { get; }
         public ExpressionSyntax Condition { get; }
         public SyntaxToken? CommaToken { get; }
@@ -115,6 +121,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a declarator with optional register binding and initializer</summary>
     public sealed class InitDeclaratorSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.InitDeclarator;
@@ -152,6 +159,7 @@ namespace Cnidaria.C
             : AsmSyntaxHelpers.ConcatenateStringLiterals(AsmRegisterNameTokens);
     }
 
+    ///<summary>Preserves the full declarator token sequence and its declared identifier</summary>
     public sealed class DeclaratorSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.Declarator;
@@ -168,10 +176,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Base class for expression and brace-delimited initializers</summary>
     public abstract class InitializerSyntax : SyntaxNode
     {
     }
 
+    ///<summary>Wraps an assignment expression used as an initializer</summary>
     public sealed class ExpressionInitializerSyntax : InitializerSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ExpressionInitializer;
@@ -184,6 +194,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a brace-delimited initializer list</summary>
     public sealed class InitializerListSyntax : InitializerSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.InitializerList;
@@ -205,6 +216,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents one initializer with optional designators, equals token and trailing comma</summary>
     public sealed class InitializerListItemSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.InitializerListItem;
@@ -229,10 +241,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Base class for field and array designators in an initializer list</summary>
     public abstract class DesignatorSyntax : SyntaxNode
     {
     }
 
+    ///<summary>Represents a '.field' initializer designator</summary>
     public sealed class FieldDesignatorSyntax : DesignatorSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.FieldDesignator;
@@ -247,6 +261,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a bracketed index initializer designator</summary>
     public sealed class ArrayDesignatorSyntax : DesignatorSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ArrayDesignator;
@@ -266,11 +281,13 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Base class for statement syntax</summary>
     public abstract class StatementSyntax : SyntaxNode
     {
 
     }
 
+    ///<summary>Represents a brace-delimited sequence of declarations and statements</summary>
     public sealed class CompoundStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.CompoundStatement;
@@ -289,6 +306,7 @@ namespace Cnidaria.C
             CloseBraceToken = closeBraceToken;
         }
     }
+    ///<summary>Represents an if statement with an optional else branch</summary>
     public sealed class IfStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.IfStatement;
@@ -320,6 +338,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a switch controlling expression and embedded statement</summary>
     public sealed class SwitchStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.SwitchStatement;
@@ -345,6 +364,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a pre-tested while loop</summary>
     public sealed class WhileStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.WhileStatement;
@@ -370,6 +390,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a post-tested do-while loop</summary>
     public sealed class DoStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.DoStatement;
@@ -401,6 +422,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a for loop with declaration or expression initializer, condition and increment</summary>
     public sealed class ForStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ForStatement;
@@ -438,6 +460,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a 'break;' statement</summary>
     public sealed class BreakStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.BreakStatement;
@@ -452,6 +475,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a 'continue;' statement</summary>
     public sealed class ContinueStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ContinueStatement;
@@ -466,6 +490,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a goto statement targeting an identifier label</summary>
     public sealed class GotoStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.GotoStatement;
@@ -485,6 +510,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents an identifier label followed by a statement</summary>
     public sealed class LabelStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.LabelStatement;
@@ -504,6 +530,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a case label and the following statement</summary>
     public sealed class CaseStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.CaseStatement;
@@ -526,6 +553,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a default label and the following statement</summary>
     public sealed class DefaultStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.DefaultStatement;
@@ -545,6 +573,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a return statement with an optional expression</summary>
     public sealed class ReturnStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ReturnStatement;
@@ -564,6 +593,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents an optional expression followed by a semicolon</summary>
     public sealed class ExpressionStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ExpressionStatement;
@@ -580,6 +610,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents one named or unnamed assembly operand with constraint and expression</summary>
     public sealed class AsmOperandSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.AsmOperand;
@@ -616,6 +647,7 @@ namespace Cnidaria.C
         public string Constraint => AsmSyntaxHelpers.ConcatenateStringLiterals(ConstraintLiteralTokens);
     }
 
+    ///<summary>Represents one assembly clobber name assembled from adjacent string literals</summary>
     public sealed class AsmClobberSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.AsmClobber;
@@ -632,6 +664,7 @@ namespace Cnidaria.C
         public string Text => AsmSyntaxHelpers.ConcatenateStringLiterals(StringLiteralTokens);
     }
 
+    ///<summary>Represents an extended assembly statement including operands, clobbers and goto labels</summary>
     public sealed class AsmStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.AsmStatement;
@@ -699,6 +732,7 @@ namespace Cnidaria.C
             => token.Kind == SyntaxKind.GotoKeyword || string.Equals(token.Text, "__goto__", StringComparison.Ordinal);
     }
 
+    ///<summary>Decodes and concatenates adjacent string literal tokens used by assembly syntax</summary>
     internal static class AsmSyntaxHelpers
     {
         public static string ConcatenateStringLiterals(ImmutableArray<SyntaxToken> tokens)
@@ -710,6 +744,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Preserves tokens skipped while recovering at file scope</summary>
     public sealed class SkippedExternalDeclarationSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.SkippedExternalDeclaration;
@@ -722,6 +757,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Preserves tokens skipped while recovering inside a statement</summary>
     public sealed class SkippedStatementSyntax : StatementSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.SkippedStatement;
@@ -734,10 +770,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Base class for expression syntax</summary>
     public abstract class ExpressionSyntax : SyntaxNode
     {
     }
 
+    ///<summary>Represents one literal token</summary>
     public sealed class LiteralExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.LiteralExpression;
@@ -750,6 +788,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents an identifier used as an expression</summary>
     public sealed class NameExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.NameExpression;
@@ -762,11 +801,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a prefix unary operator and its operand</summary>
     public sealed class UnaryExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.UnaryExpression;
 
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '+', '-', '!', '~', '*', '&', '++' or '--'
         public ExpressionSyntax Operand { get; }
 
         public UnaryExpressionSyntax(
@@ -778,11 +818,14 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a binary operator and its left and right operands</summary>
     public sealed class BinaryExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.BinaryExpression;
 
         public ExpressionSyntax Left { get; }
+        // ',', '||', '&&', '|', '^', '&', '==', '!=', '<', '<=', '>', '>='
+        // '<<', '>>', '+', '-', '*', '/' or '%'
         public SyntaxToken OperatorToken { get; }
         public ExpressionSyntax Right { get; }
 
@@ -797,11 +840,13 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents an assignment operator and its left and right operands</summary>
     public sealed class AssignmentExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.AssignmentExpression;
 
         public ExpressionSyntax Left { get; }
+        // '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=' or '>>='
         public SyntaxToken OperatorToken { get; }
         public ExpressionSyntax Right { get; }
 
@@ -816,6 +861,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents the ternary conditional expression</summary>
     public sealed class ConditionalExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ConditionalExpression;
@@ -841,6 +887,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a parenthesized type name followed by the expression being cast</summary>
     public sealed class CastExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.CastExpression;
@@ -863,11 +910,12 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a size or alignment query applied to a type name or expression</summary>
     public sealed class SizeofExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.SizeofExpression;
 
-        public SyntaxToken Keyword { get; }
+        public SyntaxToken Keyword { get; } // 'sizeof', 'alignof' or '_Alignof'
         public SyntaxToken? OpenParenToken { get; }
         public ImmutableArray<SyntaxToken> TypeNameTokens { get; }
         public SyntaxToken? CloseParenToken { get; }
@@ -888,6 +936,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents an expression enclosed in parentheses</summary>
     public sealed class ParenthesizedExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ParenthesizedExpression;
@@ -907,6 +956,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a parenthesized type name followed by a brace initializer</summary>
     public sealed class CompoundLiteralExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.CompoundLiteralExpression;
@@ -935,6 +985,7 @@ namespace Cnidaria.C
 
     }
 
+    ///<summary>Represents a generic selection with its controlling expression and associations</summary>
     public sealed class GenericSelectionExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.GenericSelectionExpression;
@@ -963,6 +1014,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents one type-name or default association in a generic selection</summary>
     public sealed class GenericAssociationSyntax : SyntaxNode
     {
         public override SyntaxKind Kind => SyntaxKind.GenericAssociation;
@@ -985,6 +1037,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a compound statement used as an expression</summary>
     public sealed class StatementExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.StatementExpression;
@@ -1004,6 +1057,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents invocation of an expression with arguments</summary>
     public sealed class CallExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.CallExpression;
@@ -1026,6 +1080,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents bracketed indexing on an expression</summary>
     public sealed class ElementAccessExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.ElementAccessExpression;
@@ -1048,12 +1103,13 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents member selection through '.' or '->'</summary>
     public sealed class MemberAccessExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.MemberAccessExpression;
 
         public ExpressionSyntax Expression { get; }
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '.' or '->'
         public SyntaxToken NameToken { get; }
 
         public MemberAccessExpressionSyntax(
@@ -1067,12 +1123,13 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Represents a postfix increment or decrement expression</summary>
     public sealed class PostfixUnaryExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.PostfixUnaryExpression;
 
         public ExpressionSyntax Expression { get; }
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '++' or '--'
 
         public PostfixUnaryExpressionSyntax(
             ExpressionSyntax expression,
@@ -1083,6 +1140,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Preserves the token that produced an expression recovery node</summary>
     public sealed class InvalidExpressionSyntax : ExpressionSyntax
     {
         public override SyntaxKind Kind => SyntaxKind.InvalidExpression;

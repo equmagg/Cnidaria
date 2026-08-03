@@ -6,6 +6,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    /// <summary>Identifies the semantic shape of a bound node</summary>
     public enum BoundNodeKind : ushort
     {
         TranslationUnit,
@@ -57,6 +58,7 @@ namespace Cnidaria.C
         ErrorExpression,
     }
 
+    /// <summary>Describes how an expression value may be used</summary>
     public enum BoundValueKind : byte
     {
         None,
@@ -66,6 +68,7 @@ namespace Cnidaria.C
         Error,
     }
 
+    /// <summary>Identifies the conversion represented by a bound conversion node</summary>
     public enum BoundConversionKind : byte
     {
         Identity,
@@ -77,10 +80,13 @@ namespace Cnidaria.C
         Error,
     }
 
+    /// <summary>CSharp bound tree root</summary>
+    /// <remarks>Contains a root translation unit, semantic model and its diagnostics</remarks>
     public sealed class BoundTree
     {
         public SemanticModel SemanticModel { get; }
         public BoundTranslationUnit Root { get; }
+        /// <summary>Diagnostics produced before and during binding</summary>
         public ImmutableArray<SemanticDiagnostic> Diagnostics { get; }
 
         public BoundTree(
@@ -95,12 +101,15 @@ namespace Cnidaria.C
                 : diagnostics;
         }
 
+        /// <summary>Creates a bound tree for the semantic model</summary>
         public static BoundTree Bind(SemanticModel semanticModel)
             => Binder.BindTree(semanticModel);
     }
 
+    /// <summary>Base class for typed semantic nodes</summary>
     public abstract class BoundNode
     {
+        /// <summary>Source syntax or null for synthesized recovery nodes</summary>
         public SyntaxNode? Syntax { get; }
 
         protected BoundNode(SyntaxNode? syntax)
@@ -111,6 +120,7 @@ namespace Cnidaria.C
         public abstract BoundNodeKind Kind { get; }
     }
 
+    /// <summary>Contains the bound top-level members of a source file</summary>
     public sealed class BoundTranslationUnit : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.TranslationUnit;
@@ -126,6 +136,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Associates a function symbol with its bound body</summary>
     public sealed class BoundFunctionDefinition : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.FunctionDefinition;
@@ -144,6 +155,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Contains declarators that share declaration specifiers</summary>
     public sealed class BoundDeclaration : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.Declaration;
@@ -164,11 +176,13 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Associates a declared symbol and type with an optional initializer</summary>
     public sealed class BoundDeclarator : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.Declarator;
 
         public Symbol? Symbol { get; }
+        /// <summary>Declared type after applying all declarator layers</summary>
         public QualifiedType Type { get; }
         public BoundInitializer? Initializer { get; }
 
@@ -185,8 +199,10 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for initializers bound against a target type</summary>
     public abstract class BoundInitializer : BoundNode
     {
+        /// <summary>Type being initialized</summary>
         public QualifiedType TargetType { get; }
 
         protected BoundInitializer(InitializerSyntax syntax, QualifiedType targetType)
@@ -196,6 +212,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents initialization from a single expression</summary>
     public sealed class BoundExpressionInitializer : BoundInitializer
     {
         public override BoundNodeKind Kind => BoundNodeKind.ExpressionInitializer;
@@ -212,6 +229,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents aggregate initialization from an ordered item list</summary>
     public sealed class BoundInitializerList : BoundInitializer
     {
         public override BoundNodeKind Kind => BoundNodeKind.InitializerList;
@@ -230,10 +248,12 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Pairs an initializer with its optional designator path</summary>
     public sealed class BoundInitializerListItem : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.InitializerListItem;
 
+        /// <summary>Field and element path relative to the enclosing initializer</summary>
         public ImmutableArray<DesignatorSyntax> Designators { get; }
         public BoundInitializer Initializer { get; }
 
@@ -247,6 +267,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a bound compile-time assertion</summary>
     public sealed class BoundStaticAssertDeclaration : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.StaticAssertDeclaration;
@@ -265,6 +286,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves unsupported syntax in the bound tree</summary>
     public sealed class BoundSkippedDeclaration : BoundNode
     {
         public override BoundNodeKind Kind => BoundNodeKind.SkippedDeclaration;
@@ -275,6 +297,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for bound statements</summary>
     public abstract class BoundStatement : BoundNode
     {
         protected BoundStatement(StatementSyntax? syntax)
@@ -283,10 +306,12 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Contains declarations and statements in lexical order</summary>
     public sealed class BoundCompoundStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.CompoundStatement;
 
+        /// <summary>Lexical scope associated with the statement</summary>
         public Scope? Scope { get; }
         public ImmutableArray<BoundNode> Members { get; }
 
@@ -301,6 +326,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents conditional control flow</summary>
     public sealed class BoundIfStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.IfStatement;
@@ -322,6 +348,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents multiway control flow over an integer expression</summary>
     public sealed class BoundSwitchStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.SwitchStatement;
@@ -340,6 +367,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a pre-test loop</summary>
     public sealed class BoundWhileStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.WhileStatement;
@@ -358,6 +386,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a post-test loop</summary>
     public sealed class BoundDoStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.DoStatement;
@@ -376,6 +405,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a loop with optional initializer condition and increment</summary>
     public sealed class BoundForStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.ForStatement;
@@ -384,6 +414,7 @@ namespace Cnidaria.C
         public BoundExpression? Condition { get; }
         public BoundExpression? Increment { get; }
         public BoundStatement Statement { get; }
+        /// <summary>Lexical scope associated with the statement</summary>
         public Scope? Scope { get; }
 
         public BoundForStatement(
@@ -403,6 +434,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents control transfer out of the nearest loop or switch</summary>
     public sealed class BoundBreakStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.BreakStatement;
@@ -413,6 +445,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents control transfer to the next loop iteration</summary>
     public sealed class BoundContinueStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.ContinueStatement;
@@ -423,6 +456,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents control transfer to a function-scoped label</summary>
     public sealed class BoundGotoStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.GotoStatement;
@@ -436,6 +470,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Associates a label symbol with its following statement</summary>
     public sealed class BoundLabelStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.LabelStatement;
@@ -454,6 +489,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Associates a case expression with its following statement</summary>
     public sealed class BoundCaseStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.CaseStatement;
@@ -472,6 +508,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents the fallback label of a switch statement</summary>
     public sealed class BoundDefaultStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.DefaultStatement;
@@ -487,6 +524,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents control transfer from the current function</summary>
     public sealed class BoundReturnStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.ReturnStatement;
@@ -505,6 +543,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an expression evaluated for its effects</summary>
     public sealed class BoundExpressionStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.ExpressionStatement;
@@ -520,12 +559,15 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Stores a bound inline assembly operand and its constraint</summary>
     public sealed class BoundAsmOperand
     {
         public AsmOperandSyntax Syntax { get; }
         public string? Name { get; }
+        /// <summary>Constraint text used during operand selection</summary>
         public string Constraint { get; }
         public BoundExpression Expression { get; }
+        /// <summary>Whether the operand is both an input and an output</summary>
         public bool IsReadWrite { get; }
 
         public BoundAsmOperand(AsmOperandSyntax syntax, string? name, string constraint, BoundExpression expression, bool isReadWrite)
@@ -538,17 +580,20 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Stores inline assembly data after binding</summary>
     public sealed class BoundAsmStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.AsmStatement;
 
         public string Text { get; }
+        /// <summary>Whether the statement must be retained and ordered as volatile</summary>
         public bool IsVolatile { get; }
         public bool IsInline { get; }
         public bool IsGoto { get; }
         public ImmutableArray<BoundAsmOperand> Outputs { get; }
         public ImmutableArray<BoundAsmOperand> Inputs { get; }
         public ImmutableArray<string> Clobbers { get; }
+        /// <summary>Resolved branch targets for an assembly goto statement</summary>
         public ImmutableArray<LabelSymbol> GotoLabels { get; }
 
         public BoundAsmStatement(
@@ -574,6 +619,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an empty expression statement</summary>
     public sealed class BoundEmptyStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.EmptyStatement;
@@ -584,6 +630,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a statement that failed to bind</summary>
     public sealed class BoundErrorStatement : BoundStatement
     {
         public override BoundNodeKind Kind => BoundNodeKind.ErrorStatement;
@@ -594,12 +641,17 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for typed expressions</summary>
     public abstract class BoundExpression : BoundNode
     {
+        /// <summary>Result type after binding and conversions</summary>
         public QualifiedType Type { get; }
+        /// <summary>Value category exposed to parent expressions</summary>
         public BoundValueKind ValueKind { get; }
+        /// <summary>Folded value when known during binding</summary>
         public object? ConstantValue { get; }
 
+        /// <summary>Whether the expression contains an error type or value category</summary>
         public bool HasErrors => Type.IsError || ValueKind == BoundValueKind.Error;
 
         protected BoundExpression(
@@ -615,6 +667,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a literal and its decoded constant value</summary>
     public sealed class BoundLiteralExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.LiteralExpression;
@@ -632,6 +685,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a reference to a resolved symbol</summary>
     public sealed class BoundNameExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.NameExpression;
@@ -642,13 +696,15 @@ namespace Cnidaria.C
             NameExpressionSyntax syntax,
             Symbol? symbol,
             QualifiedType type,
-            BoundValueKind valueKind)
-            : base(syntax, type, valueKind)
+            BoundValueKind valueKind,
+            object? constantValue = null)
+            : base(syntax, type, valueKind, constantValue)
         {
             Symbol = symbol;
         }
     }
 
+    /// <summary>Represents a prefix unary operation</summary>
     public sealed class BoundUnaryExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.UnaryExpression;
@@ -670,6 +726,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a postfix unary operation</summary>
     public sealed class BoundPostfixUnaryExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.PostfixUnaryExpression;
@@ -690,6 +747,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a binary operation after operand conversion</summary>
     public sealed class BoundBinaryExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.BinaryExpression;
@@ -713,6 +771,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an assignment expression</summary>
     public sealed class BoundAssignmentExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.AssignmentExpression;
@@ -735,6 +794,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents selection between two expression values</summary>
     public sealed class BoundConditionalExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.ConditionalExpression;
@@ -757,11 +817,13 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Makes an implicit or explicit value conversion visible in the tree</summary>
     public sealed class BoundConversionExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.ConversionExpression;
 
         public BoundExpression Expression { get; }
+        /// <summary>Semantic conversion performed by this node</summary>
         public BoundConversionKind ConversionKind { get; }
 
         public BoundConversionExpression(
@@ -777,6 +839,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a source-level cast</summary>
     public sealed class BoundCastExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.CastExpression;
@@ -793,11 +856,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a size query over an expression or type</summary>
     public sealed class BoundSizeofExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.SizeofExpression;
 
+        /// <summary>Bound operand when the query uses an expression</summary>
         public BoundExpression? Expression { get; }
+        /// <summary>Resolved operand type when the query uses a type name</summary>
         public QualifiedType? OperandType { get; }
 
         public BoundSizeofExpression(
@@ -813,6 +879,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves source parentheses while forwarding value semantics</summary>
     public sealed class BoundParenthesizedExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.ParenthesizedExpression;
@@ -828,6 +895,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an initialized unnamed object value</summary>
     public sealed class BoundCompoundLiteralExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.CompoundLiteralExpression;
@@ -844,12 +912,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Stores a generic selection and its chosen association</summary>
     public sealed class BoundGenericSelectionExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.GenericSelectionExpression;
 
         public BoundExpression ControlExpression { get; }
         public ImmutableArray<BoundExpression> AssociationExpressions { get; }
+        /// <summary>Chosen association or null when none were bound</summary>
         public BoundExpression? SelectedExpression { get; }
 
         public BoundGenericSelectionExpression(
@@ -868,6 +938,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a compound statement used as an expression</summary>
     public sealed class BoundStatementExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.StatementExpression;
@@ -885,12 +956,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents invocation of a callable expression</summary>
     public sealed class BoundCallExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.CallExpression;
 
         public BoundExpression Expression { get; }
         public ImmutableArray<BoundExpression> Arguments { get; }
+        /// <summary>Resolved callable signature or null after recovery</summary>
         public FunctionType? FunctionType { get; }
 
         public BoundCallExpression(
@@ -907,11 +980,13 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents indexed access through an array or pointer</summary>
     public sealed class BoundElementAccessExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.ElementAccessExpression;
 
         public BoundExpression Expression { get; }
+        /// <summary>Bound index or null when the source omitted an index</summary>
         public BoundExpression? Index { get; }
 
         public BoundElementAccessExpression(
@@ -926,6 +1001,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents direct or indirect field access</summary>
     public sealed class BoundMemberAccessExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.MemberAccessExpression;
@@ -933,6 +1009,7 @@ namespace Cnidaria.C
         public BoundExpression Expression { get; }
         public SyntaxToken OperatorToken { get; }
         public SyntaxToken NameToken { get; }
+        /// <summary>Resolved field or null when lookup fails</summary>
         public FieldSymbol? Field { get; }
 
         public BoundMemberAccessExpression(
@@ -952,6 +1029,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an expression that failed to bind</summary>
     public sealed class BoundErrorExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.ErrorExpression;

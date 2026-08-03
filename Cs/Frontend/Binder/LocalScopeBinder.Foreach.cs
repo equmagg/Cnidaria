@@ -1,22 +1,20 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Enumeration pattern resolution and foreach lowering
     internal sealed partial class LocalScopeBinder : Binder
     {
+        // Distinguishes absence of a pattern from an invalid discovered pattern
         private enum ForEachResolutionStatus : byte
         {
             NotApplicable,
             Success,
             Error
         }
+        // Captures the selected enumeration strategy and all members needed for lowering
         private readonly struct ForEachResolution
         {
             public readonly BoundForEachEnumeratorKind Kind;
@@ -114,6 +112,12 @@ namespace Cnidaria.Cs
             var elementType = foreachInfo.ElementType is ByRefTypeSymbol byRefElement
                 ? byRefElement.ElementType
                 : foreachInfo.ElementType;
+            var isScoped = node.Type is ScopedTypeSyntax;
+            TypeSyntax iterationTypeSyntax = node.Type is ScopedTypeSyntax scopedType ? scopedType.Type : node.Type;
+            var refTypeSyntax = iterationTypeSyntax as RefTypeSyntax;
+            var isRefIteration = refTypeSyntax is not null;
+            if (refTypeSyntax is not null)
+                iterationTypeSyntax = refTypeSyntax.Type;
 
             TypeSymbol iterationType;
             Conversion iterationConversion;
@@ -139,7 +143,7 @@ namespace Cnidaria.Cs
             }
             else
             {
-                iterationType = scope.BindType(node.Type, context, diagnostics);
+                iterationType = scope.BindType(iterationTypeSyntax, context, diagnostics);
 
                 var dummyElement = new BoundTypeOnlyExpression(node.Expression, elementType);
                 iterationConversion = scope.ClassifyConversion(dummyElement, iterationType, context);
@@ -154,12 +158,23 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (isScoped && !isRefIteration && !iterationType.IsRefLikeType && iterationType is not ErrorTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SCOPED001",
+                    DiagnosticSeverity.Error,
+                    "The scoped modifier can only be used with a ref local or a local of ref struct type.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
+            }
+
             var iterationLocal = new LocalSymbol(
                 name: name,
                 containing: _containing,
                 type: iterationType,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, node.Identifier.Span)),
-                isReadOnly: true);
+                isByRef: isRefIteration,
+                isReadOnly: !isRefIteration || refTypeSyntax!.ReadOnlyKeyword.Span.Length != 0,
+                isScoped: isScoped);
 
             scope.DeclareLocal(iterationLocal, node, context);
 
@@ -195,6 +210,7 @@ namespace Cnidaria.Cs
                 breakLabel: breakLabel,
                 continueLabel: continueLabel);
         }
+        // Resolution order follows built-in collections, instance pattern, interfaces, then extensions
         private bool TryResolveForEach(
             ForEachStatementSyntax node,
             BoundExpression collection,
@@ -515,6 +531,7 @@ namespace Cnidaria.Cs
 
             return ForEachResolutionStatus.Success;
         }
+        // An enumerator requires readable Current and parameterless Boolean MoveNext
         private bool TryValidateEnumeratorShape(
             SyntaxNode diagnosticNode,
             TypeSymbol enumeratorTypeSymbol,

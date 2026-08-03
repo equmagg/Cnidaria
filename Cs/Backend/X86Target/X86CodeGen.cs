@@ -7,7 +7,7 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class X86CodeGeneratorOptions
+    public sealed class X86CodeGeneratorOptions
     {
         public static X86CodeGeneratorOptions Default => new X86CodeGeneratorOptions();
 
@@ -1120,75 +1120,7 @@ namespace Cnidaria.Cs
 
             private void EnsureVirtualTable(RuntimeType type)
             {
-                if (type.Kind is not (RuntimeTypeKind.Class or
-                    RuntimeTypeKind.Interface or
-                    RuntimeTypeKind.Struct or
-                    RuntimeTypeKind.Enum or
-                    RuntimeTypeKind.Array))
-                {
-                    return;
-                }
-
-                if (type.VTable.Length != 0)
-                    return;
-
-                RuntimeType? baseType = type.BaseType;
-                if (baseType is not null)
-                {
-                    _program.TypeSystem?.EnsureConstructedMembers(baseType);
-                    EnsureVirtualTable(baseType);
-                }
-
-                RuntimeMethod[] baseVtable = baseType?.VTable ?? Array.Empty<RuntimeMethod>();
-                bool declaresVirtualMethod = false;
-                for (int i = 0; i < type.Methods.Length; i++)
-                {
-                    if (!type.Methods[i].IsStatic && type.Methods[i].IsVirtual)
-                    {
-                        declaresVirtualMethod = true;
-                        break;
-                    }
-                }
-
-                if (baseVtable.Length == 0 && !declaresVirtualMethod)
-                    return;
-
-                var vtable = new List<RuntimeMethod>(baseVtable.Length + 8);
-                vtable.AddRange(baseVtable);
-                for (int i = 0; i < type.Methods.Length; i++)
-                {
-                    RuntimeMethod method = type.Methods[i];
-                    if (method.IsStatic || !method.IsVirtual)
-                        continue;
-
-                    int slot = -1;
-                    if (baseType is not null && !method.IsNewSlot)
-                    {
-                        for (int candidateSlot = 0; candidateSlot < baseVtable.Length; candidateSlot++)
-                        {
-                            RuntimeMethod candidate = baseVtable[candidateSlot];
-                            if (StringComparer.Ordinal.Equals(candidate.Name, method.Name) &&
-                                SameRuntimeSignature(candidate, method))
-                            {
-                                slot = candidateSlot;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (slot >= 0)
-                    {
-                        method.VTableSlot = slot;
-                        vtable[slot] = method;
-                    }
-                    else
-                    {
-                        method.VTableSlot = vtable.Count;
-                        vtable.Add(method);
-                    }
-                }
-
-                type.VTable = vtable.ToArray();
+                _program.TypeSystem?.EnsureVirtualTable(type);
             }
 
             public string CreateInterfaceDispatchCell(RuntimeMethod declaredMethod)
@@ -1210,6 +1142,10 @@ namespace Cnidaria.Cs
             {
                 if (_virtualDispatchMetadataPrepared)
                     throw new InvalidOperationException("Virtual dispatch metadata was already finalized.");
+
+                RuntimeTypeSystem? typeSystem = _program.TypeSystem;
+                if (_interfaceDispatchCells.Count != 0 && typeSystem is null)
+                    throw new InvalidOperationException("Interface dispatch metadata requires a runtime type system.");
 
                 TypeDescriptorDraft[] descriptors = _typeDescriptors.Values.OrderBy(static d => d.Type.TypeId).ToArray();
                 for (int i = 0; i < descriptors.Length; i++)
@@ -1236,7 +1172,7 @@ namespace Cnidaria.Cs
                             continue;
                         }
 
-                        RuntimeMethod? target = ResolveInterfaceDispatchTarget(receiverType, cell.DeclaredMethod);
+                        RuntimeMethod? target = typeSystem!.ResolveVirtualMethod(cell.DeclaredMethod, receiverType);
                         if (target is null)
                             continue;
 
@@ -1379,216 +1315,6 @@ namespace Cnidaria.Cs
                     _text.ByteLength - start,
                     X86ObjectSymbolBinding.Local,
                     X86ObjectSymbolKind.Function));
-            }
-
-            private RuntimeMethod? ResolveInterfaceDispatchTarget(RuntimeType actual, RuntimeMethod declared)
-            {
-                if (!ImplementsInterface(actual, declared.DeclaringType))
-                    return null;
-
-                for (RuntimeType? type = actual; type is not null; type = type.BaseType)
-                {
-                    RuntimeMethod? explicitImpl = TryResolveExplicitInterfaceImpl(type, declared);
-                    if (explicitImpl is not null)
-                        return explicitImpl;
-                }
-
-                RuntimeMethod? implicitImpl = FindMostDerivedMethodByNameAndSig(actual, declared);
-                if (implicitImpl is not null)
-                    return implicitImpl;
-
-                return null;
-            }
-
-            private RuntimeMethod? TryResolveExplicitInterfaceImpl(RuntimeType implementationType, RuntimeMethod declared)
-            {
-                Dictionary<int, RuntimeMethod>? map = implementationType.ExplicitInterfaceMethodImpls;
-                if (map is null || map.Count == 0)
-                    return null;
-
-                if (map.TryGetValue(declared.MethodId, out RuntimeMethod? exact))
-                    return ProjectRuntimeMethodToOwner(implementationType, exact);
-
-                RuntimeTypeSystem? typeSystem = _program.TypeSystem;
-                if (typeSystem is null)
-                    return null;
-
-                foreach (KeyValuePair<int, RuntimeMethod> pair in map)
-                {
-                    RuntimeMethod interfaceMethod;
-                    try
-                    {
-                        interfaceMethod = typeSystem.GetMethodById(pair.Key);
-                    }
-                    catch (MissingMethodException)
-                    {
-                        continue;
-                    }
-
-                    if (SameInterfaceMethodIdentity(interfaceMethod, declared))
-                        return ProjectRuntimeMethodToOwner(implementationType, pair.Value);
-                }
-
-                return null;
-            }
-
-            private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
-            {
-                if (method.DeclaringType.TypeId == owner.TypeId)
-                    return method;
-
-                _program.TypeSystem?.EnsureConstructedMembers(owner);
-                RuntimeMethod[] methods = owner.Methods;
-                for (int i = 0; i < methods.Length; i++)
-                {
-                    RuntimeMethod candidate = methods[i];
-                    if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name) ||
-                        candidate.GenericArity != method.GenericArity ||
-                        candidate.IsStatic != method.IsStatic)
-                    {
-                        continue;
-                    }
-
-                    if (candidate.Body is not null && method.Body is not null && ReferenceEquals(candidate.Body, method.Body))
-                        return candidate;
-                    if (SameRuntimeSignature(candidate, method))
-                        return candidate;
-                }
-
-                return method;
-            }
-
-            private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
-            {
-                for (RuntimeType? type = actual; type is not null; type = type.BaseType)
-                {
-                    RuntimeMethod[] methods = type.Methods;
-                    for (int i = 0; i < methods.Length; i++)
-                    {
-                        RuntimeMethod candidate = methods[i];
-                        if (candidate.IsStatic ||
-                            candidate.IsPrivate ||
-                            !StringComparer.Ordinal.Equals(candidate.Name, declared.Name) ||
-                            !SameRuntimeSignature(candidate, declared))
-                        {
-                            continue;
-                        }
-
-                        return candidate;
-                    }
-                }
-
-                return null;
-            }
-
-            private static bool ImplementsInterface(RuntimeType type, RuntimeType target)
-            {
-                var seen = new HashSet<int>();
-                for (RuntimeType? current = type; current is not null; current = current.BaseType)
-                {
-                    RuntimeType[] interfaces = current.Interfaces;
-                    for (int i = 0; i < interfaces.Length; i++)
-                    {
-                        if (InterfaceDerivesFromOrEquals(interfaces[i], target, seen))
-                            return true;
-                    }
-                }
-                return false;
-            }
-
-            private static bool InterfaceDerivesFromOrEquals(RuntimeType current, RuntimeType target, HashSet<int> seen)
-            {
-                if (SameInterfaceType(current, target))
-                    return true;
-                if (!seen.Add(current.TypeId))
-                    return false;
-
-                RuntimeType[] interfaces = current.Interfaces;
-                for (int i = 0; i < interfaces.Length; i++)
-                {
-                    if (InterfaceDerivesFromOrEquals(interfaces[i], target, seen))
-                        return true;
-                }
-                return false;
-            }
-
-            private static bool SameInterfaceType(RuntimeType implemented, RuntimeType declared)
-            {
-                if (implemented.TypeId == declared.TypeId)
-                    return true;
-
-                RuntimeType? implementedDefinition = implemented.GenericTypeDefinition;
-                RuntimeType? declaredDefinition = declared.GenericTypeDefinition;
-                if (implementedDefinition is null || declaredDefinition is null ||
-                    implementedDefinition.TypeId != declaredDefinition.TypeId)
-                {
-                    return false;
-                }
-
-                RuntimeType[] implementedArguments = implemented.GenericTypeArguments;
-                RuntimeType[] declaredArguments = declared.GenericTypeArguments;
-                if (implementedArguments.Length != declaredArguments.Length)
-                    return false;
-                for (int i = 0; i < implementedArguments.Length; i++)
-                {
-                    if (!CompatibleInterfaceSignatureType(implementedArguments[i], declaredArguments[i]))
-                        return false;
-                }
-                return true;
-            }
-
-            private static bool SameInterfaceMethodIdentity(RuntimeMethod interfaceMethod, RuntimeMethod declared)
-            {
-                if (!StringComparer.Ordinal.Equals(interfaceMethod.Name, declared.Name) ||
-                    interfaceMethod.GenericArity != declared.GenericArity ||
-                    !SameRuntimeTypeDefinitionOrExact(interfaceMethod.DeclaringType, declared.DeclaringType) ||
-                    interfaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length ||
-                    !CompatibleInterfaceSignatureType(interfaceMethod.ReturnType, declared.ReturnType))
-                {
-                    return false;
-                }
-
-                for (int i = 0; i < interfaceMethod.ParameterTypes.Length; i++)
-                {
-                    if (!CompatibleInterfaceSignatureType(interfaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
-                        return false;
-                }
-                return true;
-            }
-
-            private static bool SameRuntimeSignature(RuntimeMethod left, RuntimeMethod right)
-            {
-                if (left.GenericArity != right.GenericArity ||
-                    left.ParameterTypes.Length != right.ParameterTypes.Length ||
-                    left.ReturnType.TypeId != right.ReturnType.TypeId)
-                {
-                    return false;
-                }
-
-                for (int i = 0; i < left.ParameterTypes.Length; i++)
-                {
-                    if (left.ParameterTypes[i].TypeId != right.ParameterTypes[i].TypeId)
-                        return false;
-                }
-                return true;
-            }
-
-            private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType left, RuntimeType right)
-            {
-                if (left.TypeId == right.TypeId)
-                    return true;
-                RuntimeType leftDefinition = left.GenericTypeDefinition ?? left;
-                RuntimeType rightDefinition = right.GenericTypeDefinition ?? right;
-                return leftDefinition.TypeId == rightDefinition.TypeId;
-            }
-
-            private static bool CompatibleInterfaceSignatureType(RuntimeType left, RuntimeType right)
-            {
-                if (left.TypeId == right.TypeId)
-                    return true;
-                if (left.Kind == RuntimeTypeKind.TypeParam || right.Kind == RuntimeTypeKind.TypeParam)
-                    return true;
-                return SameRuntimeTypeDefinitionOrExact(left, right);
             }
 
             public string GetStaticStorageLabel(RuntimeType type)
@@ -2700,7 +2426,7 @@ namespace Cnidaria.Cs
                                 throw Unsupported(node, "64-bit integer values are not supported by the minimal i386 backend");
                             if (node.TreeKind is GenTreeKind.NewDelegate or GenTreeKind.DelegateInvoke or GenTreeKind.DelegateCombine or GenTreeKind.DelegateRemove)
                                 throw Unsupported(node, "delegates are not supported by the minimal i386 backend");
-                            if (node.TreeKind is GenTreeKind.NewArray or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
+                            if (node.TreeKind is GenTreeKind.NewArray or GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
                                 throw Unsupported(node, "managed arrays are not supported by the minimal i386 backend");
                             if (node.TreeKind is GenTreeKind.CastClass or GenTreeKind.IsInst or GenTreeKind.Box or GenTreeKind.UnboxAny)
                                 throw Unsupported(node, "runtime type operations are not supported by the minimal i386 backend");
@@ -3390,6 +3116,12 @@ namespace Cnidaria.Cs
 
                 private void EmitReturn(GenTree node)
                 {
+                    if (node.Uses.Length != 0 && MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod, Target))
+                    {
+                        EmitHiddenReturnBufferCopy(node);
+                        return;
+                    }
+
                     if (_ehMethod is not null &&
                         (FuncletIndexForBlock(node.BlockId) != 0 || ReturnMustRunFinallyBeforeMethodExit(node.BlockId)))
                     {
@@ -3399,6 +3131,34 @@ namespace Cnidaria.Cs
 
                     EmitEhFramePop();
                     _owner.Emit(X86Instruction.Ret());
+                }
+
+                private void EmitHiddenReturnBufferCopy(GenTree node)
+                {
+                    if (node.Uses.Length != 1 || !node.Uses[0].IsFrameSlot)
+                        throw Unsupported(node, "hidden return-buffer copy requires one frame-resident source");
+
+                    int homeIndex = _method.ArgTypes.Length;
+                    if (!_method.StackFrame.TryGetArgumentSlot(homeIndex, out StackFrameSlot hiddenSlot))
+                        throw Unsupported(node, "hidden return-buffer home is missing from the finalized frame");
+
+                    RegisterOperand hiddenHome = RegisterOperand.ForFrameSlot(
+                        RegisterClass.General,
+                        hiddenSlot.Kind,
+                        _method.StackFrame.UsesFramePointer ? RegisterFrameBase.FramePointer : RegisterFrameBase.StackPointer,
+                        hiddenSlot.Index,
+                        hiddenSlot.Offset,
+                        hiddenSlot.Size);
+                    X86Register returnBuffer = ToX86Register(RegisterInfo.GetIntegerReturnRegister(Target, 0), Target);
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(returnBuffer, Target.PointerSize),
+                        FrameMemory(hiddenHome, Target.PointerSize)));
+                    EmitCopyFrameToAddress(
+                        node,
+                        returnBuffer,
+                        node.Uses[0],
+                        StorageSize(_method.RuntimeMethod.ReturnType, MachineAbi.StackKindForType(_method.RuntimeMethod.ReturnType)));
                 }
 
                 private void EmitReturnThroughEh(GenTree node)
@@ -3541,6 +3301,10 @@ namespace Cnidaria.Cs
                         case GenTreeKind.StoreStaticField:
                             EmitStaticField(node);
                             return;
+                        case GenTreeKind.NullCheck:
+                            EmitExplicitNullCheck(node);
+                            return;
+                        case GenTreeKind.ArrayLength:
                         case GenTreeKind.ArrayElement:
                         case GenTreeKind.ArrayElementAddr:
                         case GenTreeKind.StoreArrayElement:
@@ -3615,12 +3379,6 @@ namespace Cnidaria.Cs
                             return;
                         case GenTreeKind.StackAlloc:
                             EmitStackAlloc(node);
-                            return;
-                        case GenTreeKind.AllocHGlobal:
-                            EmitAllocHGlobal(node);
-                            return;
-                        case GenTreeKind.FreeHGlobal:
-                            EmitFreeHGlobal(node);
                             return;
                         case GenTreeKind.CastClass:
                             EmitRuntimeTypeCheck(node, throwOnFailure: true);
@@ -3746,52 +3504,6 @@ namespace Cnidaria.Cs
                     }
                     _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.FailFastSymbol));
                     EmitUnreachableTrap();
-                }
-
-                private void EmitAllocHGlobal(GenTree node)
-                {
-                    if (node.Uses.Length != 1 || node.Results.Length != 1)
-                        throw Unsupported(node, "AllocHGlobal requires one size operand and one result");
-
-                    X86Register size = ToX86Register(RequireUseRegister(node, 0), Target);
-                    X86Register result = ToX86Register(RequireResultRegister(node), Target);
-                    X86Register argument = RuntimeArgumentRegister(0);
-                    if (argument != size)
-                    {
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(argument, Target.PointerSize),
-                            Reg(size, Target.PointerSize)));
-                    }
-
-                    MarkEhCallSite(node, "alloc_hglobal");
-                    _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.AllocHGlobalSymbol));
-                    if (result != X86Register.Rax)
-                    {
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(result, Target.PointerSize),
-                            Reg(X86Register.Rax, Target.PointerSize)));
-                    }
-                }
-
-                private void EmitFreeHGlobal(GenTree node)
-                {
-                    if (node.Uses.Length != 1 || node.Results.Length != 0)
-                        throw Unsupported(node, "FreeHGlobal requires one pointer operand and no result");
-
-                    X86Register pointer = ToX86Register(RequireUseRegister(node, 0), Target);
-                    X86Register argument = RuntimeArgumentRegister(0);
-                    if (argument != pointer)
-                    {
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(argument, Target.PointerSize),
-                            Reg(pointer, Target.PointerSize)));
-                    }
-
-                    MarkEhCallSite(node, "free_hglobal");
-                    _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.FreeHGlobalSymbol));
                 }
 
                 private void EmitPointerElementAddress(GenTree node)
@@ -4024,6 +3736,39 @@ namespace Cnidaria.Cs
                     GenStackKind kind = node.LocalDescriptor?.StackKind ?? node.StackKind;
                     int size = StorageSize(type, kind);
 
+                    if (node.Results.Length > 1 || node.Uses.Length > 1)
+                    {
+                        if (isLoad && node.Uses.Length == 0)
+                        {
+                            EmitLocalLikeMultiLoad(node);
+                            return;
+                        }
+
+                        if (isStore && node.Results.Length == 0)
+                        {
+                            EmitLocalLikeMultiStore(node);
+                            return;
+                        }
+
+                        if (node.Results.Length == node.Uses.Length)
+                        {
+                            RuntimeType? valueType = LocalLikeLoadResultType(node) ?? LocalLikeStoreSourceType(node) ?? type;
+                            GenStackKind valueKind = !node.RegisterResults.IsDefaultOrEmpty
+                                ? LocalLikeLoadResultKind(node, valueType)
+                                : LocalLikeStoreSourceKind(node, valueType);
+                            var abi = MachineAbi.ClassifyStorageValue(valueType, valueKind, Target);
+                            var segments = MachineAbi.GetRegisterSegments(abi, Target);
+                            if (segments.Length != node.Results.Length)
+                                throw Unsupported(node, "multi-register local, argument, or temp fragment count does not match its storage ABI");
+
+                            for (int i = 0; i < segments.Length; i++)
+                                EmitMoveBetween(node.Results[i], node.Uses[i], segments[i].Size);
+                            return;
+                        }
+
+                        throw Unsupported(node, "multi-register local, argument, or temp shape has mismatched source and destination fragment counts");
+                    }
+
                     if (isLoad && node.Uses.Length == 0 && node.Results.Length == 1)
                     {
                         RegisterOperand home = FrameSlotForLocalLike(node, size, node.Results[0].RegisterClass);
@@ -4056,6 +3801,68 @@ namespace Cnidaria.Cs
                     throw Unsupported(node, "unsupported local, argument, or temp operand shape");
                 }
 
+                private void EmitLocalLikeMultiLoad(GenTree node)
+                {
+                    RuntimeType? valueType = LocalLikeLoadResultType(node);
+                    GenStackKind valueKind = LocalLikeLoadResultKind(node, valueType);
+                    RuntimeType? slotType = node.LocalDescriptor?.Type ?? node.RuntimeType ?? node.Type ?? valueType;
+                    GenStackKind slotKind = node.LocalDescriptor?.StackKind ?? node.StackKind;
+                    RegisterOperand slot = FrameSlotForLocalLike(node, StorageSize(slotType, slotKind), RegisterClass.General);
+                    var abi = MachineAbi.ClassifyStorageValue(valueType, valueKind, Target);
+                    var segments = MachineAbi.GetRegisterSegments(abi, Target);
+                    if (segments.Length != node.Results.Length)
+                        throw Unsupported(node, "multi-register local, argument, or temp load fragment count does not match result ABI");
+
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        AbiRegisterSegment segment = segments[i];
+                        RegisterOperand source = FrameSlotFragment(slot, segment);
+                        RegisterOperand destination = node.Results[i];
+                        if (destination.IsRegister)
+                        {
+                            EmitAggregateSegmentLoad(destination.Register, FrameBase(source), EffectiveFrameOffset(source), segment);
+                            continue;
+                        }
+                        if (destination.IsFrameSlot)
+                        {
+                            EmitMemoryToMemory(destination, source, segment.Size);
+                            continue;
+                        }
+                        throw Unsupported(node, "multi-register local, argument, or temp load destination is not addressable");
+                    }
+                }
+
+                private void EmitLocalLikeMultiStore(GenTree node)
+                {
+                    RuntimeType? valueType = LocalLikeStoreSourceType(node);
+                    GenStackKind valueKind = LocalLikeStoreSourceKind(node, valueType);
+                    RuntimeType? slotType = node.LocalDescriptor?.Type ?? node.RuntimeType ?? node.Type ?? valueType;
+                    GenStackKind slotKind = node.LocalDescriptor?.StackKind ?? node.StackKind;
+                    RegisterOperand slot = FrameSlotForLocalLike(node, StorageSize(slotType, slotKind), RegisterClass.General);
+                    var abi = MachineAbi.ClassifyStorageValue(valueType, valueKind, Target);
+                    var segments = MachineAbi.GetRegisterSegments(abi, Target);
+                    if (segments.Length != node.Uses.Length)
+                        throw Unsupported(node, "multi-register local, argument, or temp store fragment count does not match source ABI");
+
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        AbiRegisterSegment segment = segments[i];
+                        RegisterOperand destination = FrameSlotFragment(slot, segment);
+                        RegisterOperand source = node.Uses[i];
+                        if (source.IsRegister)
+                        {
+                            EmitAggregateSegmentStore(source.Register, FrameBase(destination), EffectiveFrameOffset(destination), segment);
+                            continue;
+                        }
+                        if (source.IsFrameSlot)
+                        {
+                            EmitMemoryToMemory(destination, source, segment.Size);
+                            continue;
+                        }
+                        throw Unsupported(node, "multi-register local, argument, or temp store source is not addressable");
+                    }
+                }
+
                 private void EmitAddressTree(GenTree node)
                 {
                     MachineRegister destination = RequireResultRegister(node);
@@ -4083,14 +3890,17 @@ namespace Cnidaria.Cs
                     RuntimeField field = node.Field ?? throw Unsupported(node, "Field node has no field metadata");
                     if (field.IsStatic)
                         throw Unsupported(node, "Instance field node references a static field");
-                    if (node.Uses.Length == 0 || !node.Uses[0].IsRegister)
+
+                    RuntimeType fieldType = field.FieldType;
+                    GenStackKind kind = MachineAbi.StackKindForType(fieldType);
+                    int instanceUseIndex = RequireCodegenUseIndexForOperand(node, 0, "field instance");
+                    if (!node.Uses[instanceUseIndex].IsRegister)
                         throw Unsupported(node, "Instance field operation has no instance register");
 
-                    X86Register instance = ToX86Register(node.Uses[0].Register, Target);
+                    X86Register instance = ToX86Register(node.Uses[instanceUseIndex].Register, Target);
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         EmitNullCheck(node, instance, "field");
 
-                    int size = FieldStorageSize(field.FieldType);
                     switch (node.TreeKind)
                     {
                         case GenTreeKind.FieldAddr:
@@ -4103,23 +3913,36 @@ namespace Cnidaria.Cs
                             return;
 
                         case GenTreeKind.Field:
-                            if (node.Results.Length != 1 || !node.Results[0].IsRegister)
-                                throw Unsupported(node, "Field load requires one register result");
-                            EmitScalarLoad(
-                                ToX86Register(node.Results[0].Register, Target),
-                                Mem(instance, field.Offset, size),
-                                field.FieldType,
-                                size);
-                            return;
+                            {
+                                X86Register address = SelectAddressScratch(node, instance);
+                                _owner.Emit(X86Instruction.Binary(
+                                    X86InstrKind.Lea,
+                                    Reg(address, Target.PointerSize),
+                                    Mem(instance, field.Offset, Target.PointerSize)));
+                                EmitValueFromAddress(node, fieldType, kind, address);
+                                return;
+                            }
 
                         case GenTreeKind.StoreField:
-                            if (node.Uses.Length != 2 || !node.Uses[1].IsRegister)
-                                throw Unsupported(node, "Field store requires instance and value registers");
-                            EmitScalarStore(
-                                Mem(instance, field.Offset, size),
-                                ToX86Register(node.Uses[1].Register, Target),
-                                size);
-                            return;
+                            {
+                                X86Register address = SelectAddressScratch(node, instance);
+                                _owner.Emit(X86Instruction.Binary(
+                                    X86InstrKind.Lea,
+                                    Reg(address, Target.PointerSize),
+                                    Mem(instance, field.Offset, Target.PointerSize)));
+                                if (IsContainedDefaultValue(node, 1))
+                                {
+                                    EmitZeroAddress(node, address, StorageSize(fieldType, kind));
+                                    return;
+                                }
+                                EmitValueToAddress(
+                                    node,
+                                    RequireCodegenUseIndexForOperand(node, 1, "field store value"),
+                                    fieldType,
+                                    kind,
+                                    address);
+                                return;
+                            }
 
                         default:
                             throw Unsupported(node, "Unsupported instance field operation");
@@ -4132,7 +3955,8 @@ namespace Cnidaria.Cs
                     if (!field.IsStatic)
                         throw Unsupported(node, "Static field node references an instance field");
 
-                    int size = FieldStorageSize(field.FieldType);
+                    RuntimeType fieldType = field.FieldType;
+                    GenStackKind kind = MachineAbi.StackKindForType(fieldType);
                     string storage = _owner.GetStaticStorageLabel(field.DeclaringType);
                     switch (node.TreeKind)
                     {
@@ -4146,31 +3970,54 @@ namespace Cnidaria.Cs
                             return;
 
                         case GenTreeKind.StaticField:
-                            if (node.Results.Length != 1 || !node.Results[0].IsRegister)
-                                throw Unsupported(node, "Static field load requires one register result");
-                            EmitScalarLoad(
-                                ToX86Register(node.Results[0].Register, Target),
-                                _owner.SymbolMemory(storage, field.Offset, size),
-                                field.FieldType,
-                                size);
-                            return;
+                            {
+                                X86Register address = SelectAddressScratch(node, X86Register.Invalid);
+                                _owner.EmitLea(address, storage, field.Offset);
+                                EmitValueFromAddress(node, fieldType, kind, address);
+                                return;
+                            }
 
                         case GenTreeKind.StoreStaticField:
-                            if (node.Uses.Length != 1 || !node.Uses[0].IsRegister)
-                                throw Unsupported(node, "Static field store requires one value register");
-                            EmitScalarStore(
-                                _owner.SymbolMemory(storage, field.Offset, size),
-                                ToX86Register(node.Uses[0].Register, Target),
-                                size);
-                            return;
+                            {
+                                X86Register address = SelectAddressScratch(node, X86Register.Invalid);
+                                _owner.EmitLea(address, storage, field.Offset);
+                                if (IsContainedDefaultValue(node, 0))
+                                {
+                                    EmitZeroAddress(node, address, StorageSize(fieldType, kind));
+                                    return;
+                                }
+                                EmitValueToAddress(
+                                    node,
+                                    RequireCodegenUseIndexForOperand(node, 0, "static field store value"),
+                                    fieldType,
+                                    kind,
+                                    address);
+                                return;
+                            }
 
                         default:
                             throw Unsupported(node, "Unsupported static field operation");
                     }
                 }
 
+                private void EmitExplicitNullCheck(GenTree node)
+                {
+                    if (node.Uses.Length != 1 || node.Results.Length != 0 || !node.Uses[0].IsRegister)
+                        throw Unsupported(node, "Null check requires one register use and no result");
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) != 0)
+                        return;
+
+                    EmitNullCheck(node, ToX86Register(node.Uses[0].Register, Target), "explicit_nullcheck");
+                }
+
                 private void EmitArray(GenTree node)
                 {
+                    if (node.TreeKind == GenTreeKind.ArrayLength)
+                    {
+                        EmitArrayLength(node);
+                        return;
+                    }
+
                     if (node.TreeKind == GenTreeKind.ArrayDataRef)
                     {
                         EmitArrayDataReference(node);
@@ -4197,6 +4044,26 @@ namespace Cnidaria.Cs
                         default:
                             throw Unsupported(node, "Unsupported array operation");
                     }
+                }
+
+                private void EmitArrayLength(GenTree node)
+                {
+                    if (node.Results.Length != 1 || !node.Results[0].IsRegister)
+                        throw Unsupported(node, "Array length requires one register result");
+
+                    int arrayUseIndex = RequireCodegenUseIndexForOperand(node, 0, "array length");
+                    if (!node.Uses[arrayUseIndex].IsRegister)
+                        throw Unsupported(node, "Array length requires a register array operand");
+
+                    X86Register array = ToX86Register(node.Uses[arrayUseIndex].Register, Target);
+                    X86Register result = ToX86Register(node.Results[0].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, array, "array_length");
+
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(result, 4),
+                        Mem(array, Target.ArrayLengthOffset, 4)));
                 }
 
                 private void EmitArrayDataReference(GenTree node)
@@ -4246,23 +4113,27 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Array element address requires one register result");
 
                     EmitArrayElementTypeCheck(node, elementType, requireExact: true);
-                    X86Operand address = ArrayElementMemory(node, elementType, nullChecked: true, size: 8);
-                    _owner.Emit(X86Instruction.Binary(
-                        X86InstrKind.Lea,
-                        Reg(ToX86Register(node.Results[0].Register, Target), 8),
-                        address));
+                    X86Register address = ToX86Register(node.Results[0].Register, Target);
+                    X86Register scaledIndex = SelectAddressScratch(node, address);
+                    ComputeArrayElementAddress(node, elementType, scaledIndex, address, nullChecked: true);
                 }
 
                 private void EmitArrayElementLoad(GenTree node, RuntimeType elementType)
                 {
+                    int size = ArrayElementSize(elementType);
+                    EmitArrayElementTypeCheck(node, elementType, requireExact: false);
+
+                    if (IsAggregate(elementType, MachineAbi.StackKindForType(elementType)) || size is not (1 or 2 or 4 or 8))
+                    {
+                        X86Register address = SelectAddressScratch(node, X86Register.Invalid);
+                        ComputeArrayElementAddress(node, elementType, address, address, nullChecked: true);
+                        EmitValueFromAddress(node, elementType, MachineAbi.StackKindForType(elementType), address);
+                        return;
+                    }
+
                     if (node.Results.Length != 1 || !node.Results[0].IsRegister)
                         throw Unsupported(node, "Array element load requires one register result");
 
-                    int size = ArrayElementSize(elementType);
-                    if (size is not (1 or 2 or 4 or 8))
-                        throw Unsupported(node, "x86 array element loads currently require scalar elements");
-
-                    EmitArrayElementTypeCheck(node, elementType, requireExact: false);
                     EmitScalarLoad(
                         ToX86Register(node.Results[0].Register, Target),
                         ArrayElementMemory(node, elementType, nullChecked: true, size: size),
@@ -4273,31 +4144,111 @@ namespace Cnidaria.Cs
                 private void EmitArrayElementStore(GenTree node, RuntimeType elementType)
                 {
                     int arrayUseIndex = RequireCodegenUseIndexForOperand(node, 0, "array-element store array");
-                    int valueUseIndex = RequireCodegenUseIndexForOperand(node, 2, "array-element store value");
-                    if (!node.Uses[arrayUseIndex].IsRegister || !node.Uses[valueUseIndex].IsRegister)
-                        throw Unsupported(node, "Array-element store requires register array and value operands");
+                    if (!node.Uses[arrayUseIndex].IsRegister)
+                        throw Unsupported(node, "Array-element store requires a register array operand");
 
                     int size = ArrayElementSize(elementType);
-                    if (size is not (1 or 2 or 4 or 8))
-                        throw Unsupported(node, "x86 array element stores currently require scalar elements");
-
                     X86Register array = ToX86Register(node.Uses[arrayUseIndex].Register, Target);
-                    X86Register value = ToX86Register(node.Uses[valueUseIndex].Register, Target);
                     EmitArrayElementTypeCheck(node, elementType, requireExact: false, arrayUseIndex: arrayUseIndex);
-                    X86Operand address = ArrayElementMemory(
+
+                    if (IsAggregate(elementType, MachineAbi.StackKindForType(elementType)) || size is not (1 or 2 or 4 or 8))
+                    {
+                        X86Register address = SelectAddressScratch(node, X86Register.Invalid);
+                        ComputeArrayElementAddress(node, elementType, address, address, arrayUseIndex, nullChecked: true);
+                        if (IsContainedDefaultValue(node, 2))
+                        {
+                            EmitZeroAddress(node, address, size);
+                            return;
+                        }
+                        EmitValueToAddress(
+                            node,
+                            RequireCodegenUseIndexForOperand(node, 2, "array-element store value"),
+                            elementType,
+                            MachineAbi.StackKindForType(elementType),
+                            address);
+                        return;
+                    }
+
+                    X86Operand addressOperand = ArrayElementMemory(
                         node,
                         elementType,
                         arrayUseIndex: arrayUseIndex,
                         nullChecked: true,
                         size: size);
+                    if (IsContainedDefaultValue(node, 2))
+                    {
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, addressOperand, Imm(0)));
+                        return;
+                    }
 
+                    int valueUseIndex = RequireCodegenUseIndexForOperand(node, 2, "array-element store value");
+                    if (!node.Uses[valueUseIndex].IsRegister)
+                        throw Unsupported(node, "Array-element scalar store requires a register value operand");
+
+                    X86Register value = ToX86Register(node.Uses[valueUseIndex].Register, Target);
                     if (elementType.IsReferenceType)
                         EmitArrayReferenceStoreCheck(node, array, value);
 
-                    EmitScalarStore(
-                        address,
-                        value,
-                        size);
+                    EmitScalarStore(addressOperand, value, size);
+                }
+
+                private void ComputeArrayElementAddress(
+                    GenTree node,
+                    RuntimeType elementType,
+                    X86Register scaledIndex,
+                    X86Register destination,
+                    int arrayUseIndex = -1,
+                    bool nullChecked = false)
+                {
+                    if (arrayUseIndex < 0)
+                        arrayUseIndex = RequireCodegenUseIndexForOperand(node, 0, "array operand");
+                    int indexUseIndex = RequireCodegenUseIndexForOperand(node, 1, "array index");
+                    if (!node.Uses[arrayUseIndex].IsRegister || !node.Uses[indexUseIndex].IsRegister)
+                        throw Unsupported(node, "Array element access requires register operands");
+
+                    X86Register array = ToX86Register(node.Uses[arrayUseIndex].Register, Target);
+                    X86Register index = ToX86Register(node.Uses[indexUseIndex].Register, Target);
+                    if (OperandStackKind(node, 1) != GenStackKind.I4)
+                        throw Unsupported(node, "x86 indexed array access currently requires an Int32 index");
+                    if (!nullChecked && (node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, array, "array");
+
+                    if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                    {
+                        string inRange = _owner.CreateLocalLabel($"{_methodLabel}_array_index_in_range_{node.LinearId}");
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Cmp,
+                            Reg(index, 4),
+                            Mem(array, Target.ArrayLengthOffset, 4)));
+                        _owner.Emit(X86Instruction.ConditionalBranch(
+                            X86Condition.B,
+                            X86Operand.SymbolOperand(inRange, 4, X86ObjectRelocationKind.Relative32)));
+                        EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
+                        _owner.DefineLabel(inRange);
+                    }
+
+                    int elementSize = ArrayElementSize(elementType);
+                    if (elementSize <= 0)
+                        throw Unsupported(node, "Array element size is not positive");
+                    if (scaledIndex != index)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scaledIndex, 4),
+                            Reg(index, 4)));
+                    }
+                    if (elementSize != 1)
+                    {
+                        _owner.Emit(X86Instruction.Ternary(
+                            X86InstrKind.Imul,
+                            Reg(scaledIndex, Target.PointerSize),
+                            Reg(scaledIndex, Target.PointerSize),
+                            Imm(elementSize)));
+                    }
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Lea,
+                        Reg(destination, Target.PointerSize),
+                        X86Operand.Memory(array, Target.ArrayDataOffset, Target.PointerSize, scaledIndex, 1)));
                 }
 
                 private X86Operand ArrayElementMemory(
@@ -4716,15 +4667,6 @@ namespace Cnidaria.Cs
                         Reg(source, size)));
                 }
 
-                private int FieldStorageSize(RuntimeType type)
-                {
-                    if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
-                        return Target.PointerSize;
-                    if (type.SizeOf is 1 or 2 or 4 or 8)
-                        return type.SizeOf;
-                    throw new NotSupportedException($"x86 field access does not support T{type.TypeId} with size {type.SizeOf}.");
-                }
-
                 private void EmitCall(GenTree node)
                 {
                     RuntimeMethod method = node.Method ?? throw Unsupported(node, "call has no runtime method");
@@ -4967,54 +4909,43 @@ namespace Cnidaria.Cs
                 private void EmitBox(GenTree node)
                 {
                     RuntimeType boxedType = BoxSourceRuntimeType(node);
+                    GenStackKind boxedKind = BoxSourceStackKind(node, boxedType);
                     if (node.Results.Length != 1 || !node.Results[0].IsRegister)
                         throw Unsupported(node, "Box requires one register result");
 
                     MachineRegister destination = node.Results[0].Register;
                     if (boxedType.IsReferenceType)
                     {
-                        MachineRegister source = RequireUseRegister(node, 0);
-                        EmitRegisterMove(destination, source, Target.PointerSize);
+                        if (IsContainedDefaultValue(node, 0))
+                            EmitZeroRegister(destination);
+                        else
+                            EmitRegisterMove(destination, RequireUseRegister(node, 0), Target.PointerSize);
                         return;
                     }
                     if (!boxedType.IsValueType)
                         throw Unsupported(node, "Box source must be a value type or reference type");
 
                     int size = Math.Max(1, boxedType.SizeOf);
-                    if (size is not (1 or 2 or 4 or 8))
-                        throw Unsupported(node, "x86 boxing currently requires a scalar value type");
                     if (TypeOperationScratchSize < size)
                         throw Unsupported(node, "Type-operation scratch area is smaller than the box source");
-                    if (node.Uses.Length != 1)
-                        throw Unsupported(node, "Box requires one source operand");
 
-                    RegisterOperand sourceOperand = node.Uses[0];
-                    if (sourceOperand.IsRegister)
-                    {
-                        EmitScalarStore(
-                            Mem(X86Register.Rbp, TypeOperationScratchOffset, size),
-                            ToX86Register(sourceOperand.Register, Target),
-                            size);
-                    }
-                    else if (sourceOperand.IsFrameSlot)
-                    {
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(X86Register.R10, size),
-                            FrameMemory(sourceOperand, size)));
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Mem(X86Register.Rbp, TypeOperationScratchOffset, size),
-                            Reg(X86Register.R10, size)));
-                    }
+                    X86Register scratchAddress = SelectAddressScratch(node, X86Register.Rbp);
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Lea,
+                        Reg(scratchAddress, Target.PointerSize),
+                        Mem(X86Register.Rbp, TypeOperationScratchOffset, Target.PointerSize)));
+                    if (IsContainedDefaultValue(node, 0))
+                        EmitZeroAddress(node, scratchAddress, size);
                     else
-                    {
-                        throw Unsupported(node, "Box source is not addressable");
-                    }
+                        EmitValueToAddress(
+                            node,
+                            RequireCodegenUseIndexForOperand(node, 0, "box source"),
+                            boxedType,
+                            boxedKind,
+                            scratchAddress);
 
                     RuntimeType allocationType = boxedType;
                     int sourceOffset = 0;
-                    int copySize = size;
                     string done = _owner.CreateLocalLabel($"{_methodLabel}_box_done");
                     if (TryGetNullableInfo(boxedType, out RuntimeType underlyingType, out RuntimeField hasValueField, out RuntimeField valueField))
                     {
@@ -5032,9 +4963,6 @@ namespace Cnidaria.Cs
                         _owner.DefineLabel(hasValue);
                         allocationType = underlyingType;
                         sourceOffset = valueField.Offset;
-                        copySize = Math.Max(1, underlyingType.SizeOf);
-                        if (copySize is not (1 or 2 or 4 or 8))
-                            throw Unsupported(node, "nullable boxing requires a scalar underlying type");
                     }
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
@@ -5044,14 +4972,12 @@ namespace Cnidaria.Cs
                     _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.NewFastSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
-                    _owner.Emit(X86Instruction.Binary(
-                        X86InstrKind.Mov,
-                        Reg(X86Register.R10, copySize),
-                        Mem(X86Register.Rbp, checked(TypeOperationScratchOffset + sourceOffset), copySize)));
-                    _owner.Emit(X86Instruction.Binary(
-                        X86InstrKind.Mov,
-                        Mem(X86Register.Rax, Target.ManagedObjectHeaderSize, copySize),
-                        Reg(X86Register.R10, copySize)));
+                    EmitCopyAddressToAddress(
+                        X86Register.Rax,
+                        Target.ManagedObjectHeaderSize,
+                        X86Register.Rbp,
+                        checked(TypeOperationScratchOffset + sourceOffset),
+                        Math.Max(1, allocationType.SizeOf));
                     EmitRegisterMove(destination, MachineRegister.X0, Target.PointerSize);
                     _owner.DefineLabel(done);
                 }
@@ -5065,6 +4991,13 @@ namespace Cnidaria.Cs
                             return type;
                     }
                     return RequireRuntimeType(node);
+                }
+
+                private GenStackKind BoxSourceStackKind(GenTree node, RuntimeType boxedType)
+                {
+                    if (!node.RegisterUses.IsDefaultOrEmpty)
+                        return _method.GetValueInfo(node.RegisterUses[0]).StackKind;
+                    return MachineAbi.StackKindForType(boxedType);
                 }
 
                 private static bool TryGetNullableInfo(
@@ -6817,33 +6750,672 @@ namespace Cnidaria.Cs
                     return _owner.SymbolMemory(label, 0, size);
                 }
 
-                private void EmitIndirect(GenTree node)
+                private void EmitValueFromAddress(
+                    GenTree node,
+                    RuntimeType? type,
+                    GenStackKind kind,
+                    X86Register address)
                 {
-                    int size = StorageSize(node.RuntimeType ?? node.Type, node.StackKind);
-                    if (node.TreeKind == GenTreeKind.LoadIndirect)
+                    var abi = MachineAbi.ClassifyStorageValue(type, kind, Target);
+                    var segments = MachineAbi.GetRegisterSegments(abi, Target);
+
+                    if (node.Results.Length == 0)
+                        return;
+
+                    if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
-                        MachineRegister address = RequireUseRegister(node, 0);
-                        MachineRegister destination = RequireResultRegister(node);
-                        X86Register addressRegister = ToX86Register(address, Target);
-                        if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
-                            EmitNullCheck(node, addressRegister, "indirect_load");
-                        EmitScalarLoad(
-                            ToX86Register(destination, Target),
-                            Mem(addressRegister, 0, size),
-                            node.RuntimeType ?? node.Type,
-                            size);
+                        address = PreserveAggregateAddress(node, address);
+                        EmitMultiRegisterLoadFromAddress(node, address, segments);
                         return;
                     }
 
-                    if (node.Uses.Length != 2 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
-                        throw Unsupported(node, "indirect store requires address and value registers");
-                    X86Register destinationRegister = ToX86Register(node.Uses[0].Register, Target);
+                    if (node.Results.Length != 1)
+                        throw Unsupported(node, "load result count does not match its storage ABI");
+
+                    RegisterOperand result = node.Results[0];
+                    if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ||
+                        (IsAggregate(type, kind) && result.IsFrameSlot))
+                    {
+                        if (!result.IsFrameSlot)
+                            throw Unsupported(node, "stack-resident load has no frame result");
+                        EmitCopyAddressToFrame(node, result, address, StorageSize(type, kind));
+                        return;
+                    }
+
+                    if (result.IsRegister)
+                    {
+                        if (IsAggregate(type, kind) && segments.Length == 1)
+                            EmitAggregateSegmentLoad(result.Register, address, segments[0]);
+                        else
+                            EmitScalarLoad(ToX86Register(result.Register, Target), Mem(address, 0, StorageSize(type, kind)), type, StorageSize(type, kind));
+                        return;
+                    }
+
+                    if (result.IsFrameSlot)
+                    {
+                        int size = segments.Length == 1 ? segments[0].Size : StorageSize(type, kind);
+                        RegisterClass registerClass = segments.Length == 1 ? segments[0].RegisterClass : result.RegisterClass;
+                        X86Register scratch = SelectValueScratch(node, registerClass, address);
+                        if (IsAggregate(type, kind) && segments.Length == 1)
+                            EmitAggregateSegmentLoad(scratch, address, segments[0]);
+                        else
+                            EmitScalarLoad(scratch, Mem(address, 0, size), type, size);
+                        EmitFrameRegisterStore(result, scratch, registerClass, size);
+                        return;
+                    }
+
+                    throw Unsupported(node, "load result is not addressable");
+                }
+
+                private void EmitValueToAddress(
+                    GenTree node,
+                    int firstUseIndex,
+                    RuntimeType type,
+                    GenStackKind kind,
+                    X86Register address)
+                {
+                    var abi = MachineAbi.ClassifyStorageValue(type, kind, Target);
+                    var segments = MachineAbi.GetRegisterSegments(abi, Target);
+
+                    if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                    {
+                        address = PreserveAggregateAddress(node, address);
+                        EmitMultiRegisterStoreToAddress(node, firstUseIndex, address, segments);
+                        return;
+                    }
+
+                    if ((uint)firstUseIndex >= (uint)node.Uses.Length)
+                        throw Unsupported(node, "store has no value operand");
+
+                    RegisterOperand source = node.Uses[firstUseIndex];
+                    if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ||
+                        (IsAggregate(type, kind) && source.IsFrameSlot))
+                    {
+                        if (!source.IsFrameSlot)
+                            throw Unsupported(node, "stack-resident store value has no addressable home");
+                        EmitCopyFrameToAddress(node, address, source, StorageSize(type, kind));
+                        return;
+                    }
+
+                    if (source.IsRegister)
+                    {
+                        if (IsAggregate(type, kind) && segments.Length == 1)
+                            EmitAggregateSegmentStore(source.Register, address, segments[0]);
+                        else
+                            EmitScalarStore(Mem(address, 0, StorageSize(type, kind)), ToX86Register(source.Register, Target), StorageSize(type, kind));
+                        return;
+                    }
+
+                    if (source.IsFrameSlot)
+                    {
+                        int size = segments.Length == 1 ? segments[0].Size : StorageSize(type, kind);
+                        RegisterClass registerClass = segments.Length == 1 ? segments[0].RegisterClass : source.RegisterClass;
+                        X86Register scratch = SelectValueScratch(node, registerClass, address);
+                        EmitFrameRegisterLoad(scratch, source, registerClass, size);
+                        if (IsAggregate(type, kind) && segments.Length == 1)
+                            EmitAggregateSegmentStore(scratch, address, segments[0]);
+                        else
+                            EmitScalarStore(Mem(address, 0, size), scratch, size);
+                        return;
+                    }
+
+                    throw Unsupported(node, "store value is not addressable");
+                }
+
+                private void EmitMultiRegisterLoadFromAddress(
+                    GenTree node,
+                    X86Register address,
+                    ImmutableArray<AbiRegisterSegment> segments)
+                {
+                    if (segments.Length <= 1 || node.Results.Length != segments.Length)
+                        throw Unsupported(node, "multi-register load result count does not match ABI storage segments");
+
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        AbiRegisterSegment segment = segments[i];
+                        RegisterOperand destination = node.Results[i];
+                        if (destination.IsRegister)
+                        {
+                            EmitAggregateSegmentLoad(destination.Register, address, segment);
+                            continue;
+                        }
+
+                        if (destination.IsFrameSlot)
+                        {
+                            X86Register scratch = SelectValueScratch(node, segment.RegisterClass, address);
+                            EmitAggregateSegmentLoad(scratch, address, segment);
+                            EmitFrameRegisterStore(destination, scratch, segment.RegisterClass, segment.Size);
+                            continue;
+                        }
+
+                        throw Unsupported(node, "multi-register load fragment has no destination");
+                    }
+                }
+
+                private void EmitMultiRegisterStoreToAddress(
+                    GenTree node,
+                    int firstUseIndex,
+                    X86Register address,
+                    ImmutableArray<AbiRegisterSegment> segments)
+                {
+                    if (segments.Length <= 1 || firstUseIndex + segments.Length > node.Uses.Length)
+                        throw Unsupported(node, "multi-register store source count does not match ABI storage segments");
+
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        AbiRegisterSegment segment = segments[i];
+                        RegisterOperand source = node.Uses[firstUseIndex + i];
+                        if (source.IsRegister)
+                        {
+                            EmitAggregateSegmentStore(source.Register, address, segment);
+                            continue;
+                        }
+
+                        if (source.IsFrameSlot)
+                        {
+                            X86Register scratch = SelectValueScratch(node, segment.RegisterClass, address);
+                            EmitFrameRegisterLoad(scratch, source, segment.RegisterClass, segment.Size);
+                            EmitAggregateSegmentStore(scratch, address, segment);
+                            continue;
+                        }
+
+                        throw Unsupported(node, "multi-register store fragment has no source");
+                    }
+                }
+
+                private void EmitAggregateSegmentLoad(
+                    MachineRegister destination,
+                    X86Register baseRegister,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentLoad(ToX86Register(destination, Target), baseRegister, segment);
+
+                private void EmitAggregateSegmentLoad(
+                    MachineRegister destination,
+                    X86Register baseRegister,
+                    int offset,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentLoad(ToX86Register(destination, Target), baseRegister, offset, segment);
+
+                private void EmitAggregateSegmentLoad(
+                    X86Register destination,
+                    X86Register baseRegister,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentLoad(destination, baseRegister, segment.Offset, segment);
+
+                private void EmitAggregateSegmentLoad(
+                    X86Register destination,
+                    X86Register baseRegister,
+                    int offset,
+                    AbiRegisterSegment segment)
+                {
+                    if (segment.RegisterClass == RegisterClass.Float)
+                    {
+                        if (!X86Registers.IsVector(destination))
+                            throw new InvalidOperationException("Aggregate load destination register class does not match its ABI segment.");
+                        if (segment.Size is not (4 or 8))
+                            throw new NotSupportedException($"Unsupported x86 floating-point ABI fragment load size {segment.Size}.");
+                        _owner.Emit(X86Instruction.Binary(
+                            segment.Size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd,
+                            Reg(destination, segment.Size),
+                            Mem(baseRegister, offset, segment.Size)));
+                        return;
+                    }
+
+                    if (X86Registers.IsVector(destination))
+                        throw new InvalidOperationException("Aggregate load destination register class does not match its ABI segment.");
+                    EmitIntegerFragmentLoad(destination, baseRegister, offset, segment.Size);
+                }
+
+                private void EmitAggregateSegmentStore(
+                    MachineRegister source,
+                    X86Register baseRegister,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentStore(ToX86Register(source, Target), baseRegister, segment);
+
+                private void EmitAggregateSegmentStore(
+                    MachineRegister source,
+                    X86Register baseRegister,
+                    int offset,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentStore(ToX86Register(source, Target), baseRegister, offset, segment);
+
+                private void EmitAggregateSegmentStore(
+                    X86Register source,
+                    X86Register baseRegister,
+                    AbiRegisterSegment segment)
+                    => EmitAggregateSegmentStore(source, baseRegister, segment.Offset, segment);
+
+                private void EmitAggregateSegmentStore(
+                    X86Register source,
+                    X86Register baseRegister,
+                    int offset,
+                    AbiRegisterSegment segment)
+                {
+                    if (segment.RegisterClass == RegisterClass.Float)
+                    {
+                        if (!X86Registers.IsVector(source))
+                            throw new InvalidOperationException("Aggregate store source register class does not match its ABI segment.");
+                        if (segment.Size is not (4 or 8))
+                            throw new NotSupportedException($"Unsupported x86 floating-point ABI fragment store size {segment.Size}.");
+                        _owner.Emit(X86Instruction.Binary(
+                            segment.Size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd,
+                            Mem(baseRegister, offset, segment.Size),
+                            Reg(source, segment.Size)));
+                        return;
+                    }
+
+                    if (X86Registers.IsVector(source))
+                        throw new InvalidOperationException("Aggregate store source register class does not match its ABI segment.");
+                    EmitIntegerFragmentStore(source, baseRegister, offset, segment.Size);
+                }
+
+                private void EmitIntegerFragmentLoad(
+                    X86Register destination,
+                    X86Register baseRegister,
+                    int offset,
+                    int size)
+                {
+                    if (size <= 0 || size > Target.GeneralRegisterSize)
+                        throw new NotSupportedException($"Unsupported x86 integer fragment load size {size}.");
+
+                    if (size == 1 || size == 2)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Movzx,
+                            Reg(destination, 4),
+                            Mem(baseRegister, offset, size)));
+                        return;
+                    }
+                    if (size == 4 || size == 8)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(destination, size),
+                            Mem(baseRegister, offset, size)));
+                        return;
+                    }
+
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(destination, 4), Reg(destination, 4)));
+                    for (int i = size - 1; i >= 0; i--)
+                    {
+                        if (i != size - 1)
+                        {
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Shl,
+                                Reg(destination, Target.GeneralRegisterSize),
+                                Imm(8)));
+                        }
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(destination, 1),
+                            Mem(baseRegister, checked(offset + i), 1)));
+                    }
+                }
+
+                private void EmitIntegerFragmentStore(
+                    X86Register source,
+                    X86Register baseRegister,
+                    int offset,
+                    int size)
+                {
+                    if (size <= 0 || size > Target.GeneralRegisterSize)
+                        throw new NotSupportedException($"Unsupported x86 integer fragment store size {size}.");
+
+                    if (size is 1 or 2 or 4 or 8)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(baseRegister, offset, size),
+                            Reg(source, size)));
+                        return;
+                    }
+
+                    for (int i = 0; i < size; i++)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(baseRegister, checked(offset + i), 1),
+                            Reg(source, 1)));
+                        if (i != size - 1)
+                        {
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Ror,
+                                Reg(source, Target.GeneralRegisterSize),
+                                Imm(8)));
+                        }
+                    }
+                    if (size > 1)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Rol,
+                            Reg(source, Target.GeneralRegisterSize),
+                            Imm((size - 1) * 8)));
+                    }
+                }
+
+                private void EmitCopyAddressToFrame(
+                    GenTree node,
+                    RegisterOperand destination,
+                    X86Register sourceAddress,
+                    int size)
+                {
+                    if (!destination.IsFrameSlot)
+                        throw Unsupported(node, "block-copy destination is not a frame slot");
+                    if (size < 0)
+                        throw Unsupported(node, "block-copy size is negative");
+
+                    X86Register scratch = SelectValueScratch(node, RegisterClass.General, sourceAddress);
+                    int destinationOffset = EffectiveFrameOffset(destination);
+                    X86Register destinationBase = FrameBase(destination);
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = BlockCopyChunk(size - offset);
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scratch, chunk),
+                            Mem(sourceAddress, offset, chunk)));
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(destinationBase, checked(destinationOffset + offset), chunk),
+                            Reg(scratch, chunk)));
+                        offset += chunk;
+                    }
+                }
+
+                private void EmitCopyFrameToAddress(
+                    GenTree node,
+                    X86Register destinationAddress,
+                    RegisterOperand source,
+                    int size)
+                {
+                    if (!source.IsFrameSlot)
+                        throw Unsupported(node, "block-copy source is not a frame slot");
+                    if (size < 0)
+                        throw Unsupported(node, "block-copy size is negative");
+
+                    X86Register scratch = SelectValueScratch(node, RegisterClass.General, destinationAddress);
+                    int sourceOffset = EffectiveFrameOffset(source);
+                    X86Register sourceBase = FrameBase(source);
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = BlockCopyChunk(size - offset);
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scratch, chunk),
+                            Mem(sourceBase, checked(sourceOffset + offset), chunk)));
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(destinationAddress, offset, chunk),
+                            Reg(scratch, chunk)));
+                        offset += chunk;
+                    }
+                }
+
+                private void EmitCopyAddressToAddress(
+                    X86Register destinationBase,
+                    int destinationOffset,
+                    X86Register sourceBase,
+                    int sourceOffset,
+                    int size)
+                {
+                    if (size < 0)
+                        throw new InvalidOperationException("Block-copy size is negative.");
+                    if (size == 0 || (destinationBase == sourceBase && destinationOffset == sourceOffset))
+                        return;
+
+                    X86Register scratch = X86Register.Invalid;
+                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    {
+                        if (candidate != destinationBase && candidate != sourceBase)
+                        {
+                            scratch = candidate;
+                            break;
+                        }
+                    }
+                    if (scratch == X86Register.Invalid)
+                        throw new InvalidOperationException("No x86 block-copy scratch register is available.");
+
+                    bool copyBackward = destinationBase == sourceBase &&
+                        destinationOffset > sourceOffset &&
+                        destinationOffset < checked(sourceOffset + size);
+                    if (copyBackward)
+                    {
+                        for (int offset = size; offset > 0;)
+                        {
+                            int chunk = BlockCopyChunk(offset);
+                            offset -= chunk;
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Mov,
+                                Reg(scratch, chunk),
+                                Mem(sourceBase, checked(sourceOffset + offset), chunk)));
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Mov,
+                                Mem(destinationBase, checked(destinationOffset + offset), chunk),
+                                Reg(scratch, chunk)));
+                        }
+                        return;
+                    }
+
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = BlockCopyChunk(size - offset);
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scratch, chunk),
+                            Mem(sourceBase, checked(sourceOffset + offset), chunk)));
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(destinationBase, checked(destinationOffset + offset), chunk),
+                            Reg(scratch, chunk)));
+                        offset += chunk;
+                    }
+                }
+
+                private void EmitZeroAddress(GenTree node, X86Register address, int size)
+                {
+                    if (size < 0)
+                        throw Unsupported(node, "zero-initialization size is negative");
+                    for (int offset = 0; offset < size; offset++)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(address, offset, 1),
+                            Imm(0)));
+                    }
+                }
+
+                private void EmitFrameRegisterLoad(
+                    X86Register destination,
+                    RegisterOperand source,
+                    RegisterClass registerClass,
+                    int size)
+                {
+                    if (registerClass == RegisterClass.General)
+                    {
+                        EmitIntegerFragmentLoad(destination, FrameBase(source), EffectiveFrameOffset(source), size);
+                        return;
+                    }
+
+                    X86InstrKind opcode = size switch
+                    {
+                        4 => X86InstrKind.Movss,
+                        8 => X86InstrKind.Movsd,
+                        _ => throw new NotSupportedException($"Unsupported x86 frame fragment load class {registerClass} with size {size}.")
+                    };
+                    _owner.Emit(X86Instruction.Binary(opcode, Reg(destination, size), FrameMemory(source, size)));
+                }
+
+                private void EmitFrameRegisterStore(
+                    RegisterOperand destination,
+                    X86Register source,
+                    RegisterClass registerClass,
+                    int size)
+                {
+                    if (registerClass == RegisterClass.General)
+                    {
+                        EmitIntegerFragmentStore(source, FrameBase(destination), EffectiveFrameOffset(destination), size);
+                        return;
+                    }
+
+                    X86InstrKind opcode = size switch
+                    {
+                        4 => X86InstrKind.Movss,
+                        8 => X86InstrKind.Movsd,
+                        _ => throw new NotSupportedException($"Unsupported x86 frame fragment store class {registerClass} with size {size}.")
+                    };
+                    _owner.Emit(X86Instruction.Binary(opcode, FrameMemory(destination, size), Reg(source, size)));
+                }
+
+                private X86Register PreserveAggregateAddress(GenTree node, X86Register address)
+                {
+                    if (!TryGetInternalRegister(node, RegisterClass.General, 0, out MachineRegister scratchRegister))
+                        return address;
+
+                    X86Register scratch = ToX86Register(scratchRegister, Target);
+                    if (scratch != address)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scratch, Target.PointerSize),
+                            Reg(address, Target.PointerSize)));
+                    }
+                    return scratch;
+                }
+
+                private X86Register SelectAddressScratch(GenTree node, X86Register avoid)
+                {
+                    if (TryGetInternalRegister(node, RegisterClass.General, 0, out MachineRegister allocated))
+                        return ToX86Register(allocated, Target);
+
+                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    {
+                        if (candidate != avoid && !NodeUsesRegister(node, candidate))
+                            return candidate;
+                    }
+                    throw Unsupported(node, "no address scratch register is available");
+                }
+
+                private X86Register SelectValueScratch(GenTree node, RegisterClass registerClass, X86Register avoid)
+                {
+                    int index = registerClass == RegisterClass.General ? 1 : 0;
+                    if (TryGetInternalRegister(node, registerClass, index, out MachineRegister allocated))
+                        return ToX86Register(allocated, Target);
+                    if (registerClass == RegisterClass.General &&
+                        TryGetInternalRegister(node, registerClass, 0, out allocated) &&
+                        ToX86Register(allocated, Target) != avoid)
+                    {
+                        return ToX86Register(allocated, Target);
+                    }
+
+                    if (registerClass == RegisterClass.Float)
+                    {
+                        ReadOnlySpan<X86Register> floatScratchCandidates =
+                            [X86Register.Xmm5, X86Register.Xmm4, X86Register.Xmm3, X86Register.Xmm2, X86Register.Xmm1, X86Register.Xmm0];
+                        for (int i = 0; i < floatScratchCandidates.Length; i++)
+                        {
+                            if (!NodeUsesRegister(node, floatScratchCandidates[i]))
+                                return floatScratchCandidates[i];
+                        }
+                        throw Unsupported(node, "no floating-point scratch register is available");
+                    }
+
+                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    {
+                        if (candidate != avoid && !NodeUsesRegister(node, candidate))
+                            return candidate;
+                    }
+                    throw Unsupported(node, "no value scratch register is available");
+                }
+
+                private ReadOnlySpan<X86Register> GeneralScratchCandidates() =>
+                    Target.Architecture == TargetArchitectureKind.I386
+                        ? [X86Register.Rdx, X86Register.Rcx, X86Register.Rax]
+                        : [
+                            X86Register.R11,
+                            X86Register.R10,
+                            X86Register.Rax,
+                            X86Register.Rcx,
+                            X86Register.Rdx
+                        ];
+
+
+                private static bool TryGetInternalRegister(GenTree node, RegisterClass registerClass, int index, out MachineRegister result)
+                {
+                    int seen = 0;
+                    for (int i = 0; i < node.InternalRegisters.Length; i++)
+                    {
+                        GenTreeInternalRegister register = node.InternalRegisters[i];
+                        if (register.RegisterClass != registerClass)
+                            continue;
+                        if (seen++ == index)
+                        {
+                            result = register.Register;
+                            return true;
+                        }
+                    }
+
+                    result = MachineRegister.Invalid;
+                    return false;
+                }
+
+                private bool NodeUsesRegister(GenTree node, X86Register register)
+                {
+                    for (int i = 0; i < node.Results.Length; i++)
+                    {
+                        RegisterOperand operand = node.Results[i];
+                        if (operand.IsRegister && ToX86Register(operand.Register, Target) == register)
+                            return true;
+                    }
+                    for (int i = 0; i < node.Uses.Length; i++)
+                    {
+                        RegisterOperand operand = node.Uses[i];
+                        if (operand.IsRegister && ToX86Register(operand.Register, Target) == register)
+                            return true;
+                    }
+                    return false;
+                }
+
+                private int BlockCopyChunk(int remaining)
+                {
+                    if (Target.GeneralRegisterSize >= 8 && remaining >= 8)
+                        return 8;
+                    if (remaining >= 4)
+                        return 4;
+                    if (remaining >= 2)
+                        return 2;
+                    return 1;
+                }
+
+                private void EmitIndirect(GenTree node)
+                {
+                    RuntimeType? type = node.RuntimeType ?? node.Type;
+                    GenStackKind kind = node.StackKind;
+                    int addressUseIndex = RequireCodegenUseIndexForOperand(node, 0, "indirect address");
+                    if (!node.Uses[addressUseIndex].IsRegister)
+                        throw Unsupported(node, "indirect operation requires a register address");
+
+                    X86Register address = ToX86Register(node.Uses[addressUseIndex].Register, Target);
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
-                        EmitNullCheck(node, destinationRegister, "indirect_store");
-                    EmitScalarStore(
-                        Mem(destinationRegister, 0, size),
-                        ToX86Register(node.Uses[1].Register, Target),
-                        size);
+                        EmitNullCheck(node, address, node.TreeKind == GenTreeKind.LoadIndirect ? "indirect_load" : "indirect_store");
+
+                    if (node.TreeKind == GenTreeKind.LoadIndirect)
+                    {
+                        EmitValueFromAddress(node, type, kind, address);
+                        return;
+                    }
+
+                    if (IsContainedDefaultValue(node, 1))
+                    {
+                        EmitZeroAddress(node, address, StorageSize(type, kind));
+                        return;
+                    }
+
+                    EmitValueToAddress(
+                        node,
+                        RequireCodegenUseIndexForOperand(node, 1, "indirect store value"),
+                        type ?? throw Unsupported(node, "indirect store has no runtime type"),
+                        kind,
+                        address);
                 }
 
                 private void EmitNullCheck(GenTree node, X86Register value, string suffix)
@@ -6981,21 +7553,39 @@ namespace Cnidaria.Cs
 
                 private void EmitDefaultValue(GenTree node)
                 {
-                    RuntimeType? type = node.RuntimeType ?? node.Type;
-                    int size = StorageSize(type, node.StackKind);
-                    if (node.Results.Length == 1 && node.Results[0].IsRegister)
-                    {
-                        EmitZeroRegister(node.Results[0].Register);
-                        return;
-                    }
-                    if (node.Results.Length == 1 && node.Results[0].IsFrameSlot)
-                    {
-                        ZeroFrame(node.Results[0], size);
-                        return;
-                    }
                     if (node.Results.Length == 0)
                         return;
-                    throw Unsupported(node, "unsupported default-value result");
+
+                    RuntimeType? type = node.RuntimeType ?? node.Type;
+                    GenStackKind kind = node.StackKind;
+                    if (node.Results.Length > 1)
+                    {
+                        var abi = MachineAbi.ClassifyStorageValue(type, kind, Target);
+                        var segments = MachineAbi.GetRegisterSegments(abi, Target);
+                        if (segments.Length != node.Results.Length)
+                            throw Unsupported(node, "default value fragment count does not match its storage ABI");
+
+                        for (int i = 0; i < segments.Length; i++)
+                            EmitZeroOperand(node, node.Results[i], segments[i].Size);
+                        return;
+                    }
+
+                    EmitZeroOperand(node, node.Results[0], StorageSize(type, kind));
+                }
+
+                private void EmitZeroOperand(GenTree node, RegisterOperand destination, int size)
+                {
+                    if (destination.IsRegister)
+                    {
+                        EmitZeroRegister(destination.Register);
+                        return;
+                    }
+                    if (destination.IsFrameSlot)
+                    {
+                        ZeroFrame(destination, size);
+                        return;
+                    }
+                    throw Unsupported(node, "default-value destination is not addressable");
                 }
 
                 private void EmitMoveBetween(RegisterOperand destination, RegisterOperand source, int size)
@@ -7064,18 +7654,21 @@ namespace Cnidaria.Cs
                         return;
                     }
 
+                    int moveSize = destinationClass == RegisterClass.General && size is not (1 or 2 or 4 or 8)
+                        ? (size <= 4 ? 4 : Target.GeneralRegisterSize)
+                        : size;
                     X86InstrKind opcode = destinationClass switch
                     {
                         RegisterClass.General => X86InstrKind.Mov,
-                        RegisterClass.Float when size == 4 => X86InstrKind.Movss,
-                        RegisterClass.Float when size == 8 => X86InstrKind.Movsd,
-                        RegisterClass.Float when size == 16 => X86InstrKind.Movdqu,
+                        RegisterClass.Float when moveSize == 4 => X86InstrKind.Movss,
+                        RegisterClass.Float when moveSize == 8 => X86InstrKind.Movsd,
+                        RegisterClass.Float when moveSize == 16 => X86InstrKind.Movdqu,
                         _ => throw new NotSupportedException($"Unsupported register move class {destinationClass} with size {size}.")
                     };
                     _owner.Emit(X86Instruction.Binary(
                         opcode,
-                        Reg(ToX86Register(destination, Target), size),
-                        Reg(ToX86Register(source, Target), size)));
+                        Reg(ToX86Register(destination, Target), moveSize),
+                        Reg(ToX86Register(source, Target), moveSize)));
                 }
 
                 private void EmitLoad(MachineRegister destination, RegisterOperand source, int size)
@@ -7084,6 +7677,16 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException($"Load source is not a finalized frame slot: {source}.");
 
                     RegisterClass registerClass = MachineRegisters.GetClass(destination);
+                    if (registerClass == RegisterClass.General && size is not (1 or 2 or 4 or 8))
+                    {
+                        EmitIntegerFragmentLoad(
+                            ToX86Register(destination, Target),
+                            FrameBase(source),
+                            EffectiveFrameOffset(source),
+                            size);
+                        return;
+                    }
+
                     X86InstrKind opcode = registerClass switch
                     {
                         RegisterClass.General => X86InstrKind.Mov,
@@ -7104,6 +7707,16 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException($"Store destination is not a finalized frame slot: {destination}.");
 
                     RegisterClass registerClass = MachineRegisters.GetClass(source);
+                    if (registerClass == RegisterClass.General && size is not (1 or 2 or 4 or 8))
+                    {
+                        EmitIntegerFragmentStore(
+                            ToX86Register(source, Target),
+                            FrameBase(destination),
+                            EffectiveFrameOffset(destination),
+                            size);
+                        return;
+                    }
+
                     X86InstrKind opcode = registerClass switch
                     {
                         RegisterClass.General => X86InstrKind.Mov,
@@ -7122,22 +7735,53 @@ namespace Cnidaria.Cs
                 {
                     if (!destination.IsFrameSlot || !source.IsFrameSlot)
                         throw new InvalidOperationException("Memory move operands must be finalized frame slots.");
-                    if (size == 16)
+                    if (size < 0)
+                        throw new InvalidOperationException("Memory move size is negative.");
+                    if (size == 0 || destination.Equals(source))
+                        return;
+
+                    X86Register scratch = Target.Architecture == TargetArchitectureKind.I386
+                        ? X86Register.Rax
+                        : X86Register.R10;
+                    X86Register destinationBase = FrameBase(destination);
+                    X86Register sourceBase = FrameBase(source);
+                    int destinationOffset = EffectiveFrameOffset(destination);
+                    int sourceOffset = EffectiveFrameOffset(source);
+                    bool copyBackward = destinationBase == sourceBase &&
+                        destinationOffset > sourceOffset &&
+                        destinationOffset < checked(sourceOffset + size);
+
+                    if (copyBackward)
                     {
-                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R10, 8), FrameMemory(source, 8)));
-                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, FrameMemory(destination, 8), Reg(X86Register.R10, 8)));
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(X86Register.R10, 8),
-                            FrameMemory(source, 8).WithDisplacement(checked(EffectiveFrameOffset(source) + 8))));
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            FrameMemory(destination, 8).WithDisplacement(checked(EffectiveFrameOffset(destination) + 8)),
-                            Reg(X86Register.R10, 8)));
+                        for (int offset = size; offset > 0;)
+                        {
+                            int chunk = BlockCopyChunk(offset);
+                            offset -= chunk;
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Mov,
+                                Reg(scratch, chunk),
+                                Mem(sourceBase, checked(sourceOffset + offset), chunk)));
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Mov,
+                                Mem(destinationBase, checked(destinationOffset + offset), chunk),
+                                Reg(scratch, chunk)));
+                        }
                         return;
                     }
-                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R10, size), FrameMemory(source, size)));
-                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, FrameMemory(destination, size), Reg(X86Register.R10, size)));
+
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = BlockCopyChunk(size - offset);
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scratch, chunk),
+                            Mem(sourceBase, checked(sourceOffset + offset), chunk)));
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(destinationBase, checked(destinationOffset + offset), chunk),
+                            Reg(scratch, chunk)));
+                        offset += chunk;
+                    }
                 }
 
                 private void EmitLoadAddress(MachineRegister destination, RegisterOperand source)
@@ -7351,6 +7995,74 @@ namespace Cnidaria.Cs
                     return 1;
                 }
 
+                private static bool IsContainedDefaultValue(GenTree node, int operandIndex)
+                {
+                    if ((uint)operandIndex >= (uint)node.Operands.Length)
+                        return false;
+                    if (node.OperandFlags.IsDefaultOrEmpty || operandIndex >= node.OperandFlags.Length ||
+                        (node.OperandFlags[operandIndex] & LirOperandFlags.Contained) == 0)
+                    {
+                        return false;
+                    }
+                    return node.Operands[operandIndex].Kind == GenTreeKind.DefaultValue;
+                }
+
+                private RuntimeType? LocalLikeLoadResultType(GenTree node)
+                {
+                    if (!node.RegisterResults.IsDefaultOrEmpty)
+                    {
+                        RuntimeType? type = _method.GetValueInfo(node.RegisterResults[0]).Type;
+                        if (type is not null)
+                            return type;
+                    }
+                    return node.RuntimeType ?? node.Type ?? node.LocalDescriptor?.Type;
+                }
+
+                private GenStackKind LocalLikeLoadResultKind(GenTree node, RuntimeType? type)
+                {
+                    if (!node.RegisterResults.IsDefaultOrEmpty)
+                        return _method.GetValueInfo(node.RegisterResults[0]).StackKind;
+                    return type is not null ? MachineAbi.StackKindForType(type) : node.StackKind;
+                }
+
+                private RuntimeType? LocalLikeStoreSourceType(GenTree node)
+                {
+                    if (!node.RegisterUses.IsDefaultOrEmpty)
+                    {
+                        RuntimeType? type = _method.GetValueInfo(node.RegisterUses[0]).Type;
+                        if (type is not null)
+                            return type;
+                    }
+                    return OperandType(node, 0) ?? node.RuntimeType ?? node.Type ?? node.LocalDescriptor?.Type;
+                }
+
+                private GenStackKind LocalLikeStoreSourceKind(GenTree node, RuntimeType? type)
+                {
+                    if (!node.RegisterUses.IsDefaultOrEmpty)
+                        return _method.GetValueInfo(node.RegisterUses[0]).StackKind;
+                    return type is not null ? MachineAbi.StackKindForType(type) : OperandStackKind(node, 0);
+                }
+
+                private static RegisterOperand FrameSlotFragment(RegisterOperand slot, AbiRegisterSegment segment)
+                {
+                    if (!slot.IsFrameSlot)
+                        throw new InvalidOperationException($"ABI fragment source is not a finalized frame slot: {slot}.");
+                    return RegisterOperand.ForFrameSlot(
+                        segment.RegisterClass,
+                        slot.FrameSlotKind,
+                        slot.FrameBase,
+                        slot.FrameSlotIndex,
+                        checked(slot.FrameOffset + segment.Offset),
+                        segment.Size,
+                        slot.IsAddress);
+                }
+
+                private static bool IsAggregate(RuntimeType? type, GenStackKind kind)
+                    => kind == GenStackKind.Value ||
+                       (type is not null && type.IsValueType &&
+                        type.PrimitiveKind == RuntimePrimitiveKind.None &&
+                        type.Kind != RuntimeTypeKind.Enum);
+
                 private RuntimeType? OperandType(GenTree node, int operandIndex)
                 {
                     if (TryGetCodegenUseIndexForOperand(node, operandIndex, out int useIndex) &&
@@ -7403,8 +8115,8 @@ namespace Cnidaria.Cs
 
                 private int StorageSize(RuntimeType? type, GenStackKind kind, RegisterOperand destination, RegisterOperand source)
                 {
-                    int explicitSize = destination.FrameSlotSize > 0 ? destination.FrameSlotSize : source.FrameSlotSize;
-                    return explicitSize > 0 ? Math.Min(8, explicitSize) : StorageSize(type, kind);
+                    int explicitSize = Math.Max(destination.FrameSlotSize, source.FrameSlotSize);
+                    return explicitSize > 0 ? explicitSize : StorageSize(type, kind);
                 }
 
                 private int StorageSize(RuntimeType? type, GenStackKind kind)
@@ -7423,7 +8135,7 @@ namespace Cnidaria.Cs
                     {
                         if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                             return Target.PointerSize;
-                        if (type.SizeOf is 1 or 2 or 4 or 8)
+                        if (type.SizeOf > 0)
                             return type.SizeOf;
                     }
                     return Target.PointerSize;

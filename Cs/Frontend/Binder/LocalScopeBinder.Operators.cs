@@ -4,6 +4,7 @@ using System.Collections.Immutable;
 
 namespace Cnidaria.Cs
 {
+    // Built-in and user-defined operator binding with constant folding
     internal sealed partial class LocalScopeBinder : Binder
     {
         private static ImmutableArray<string> GetUnaryOperatorMetadataNames(BoundUnaryOperatorKind op, bool isChecked)
@@ -139,7 +140,7 @@ namespace Cnidaria.Cs
                 return new BoundUnaryExpression(node, opKind, boolType, operand, cv, isChecked: false);
             }
 
-            // numeric / integral
+            // Apply numeric promotion for arithmetic and bitwise unary operators
             var promotedType = GetUnaryPromotionType(
                 context.Compilation, context.SemanticModel.SyntaxTree, opKind, operand.Type, node, diagnostics);
             if (promotedType is null)
@@ -200,6 +201,7 @@ namespace Cnidaria.Cs
                 context: context,
                 diagnostics: diagnostics);
         }
+        // Preserve postfix values and evaluate writable targets exactly once
         private BoundExpression BindIncrementOrDecrementCore(
             ExpressionSyntax operatorSyntax,
             ExpressionSyntax operandSyntax,
@@ -609,6 +611,7 @@ namespace Cnidaria.Cs
             }
             return Optional<object>.None;
         }
+        // Bind short-circuit operators separately because they affect flowing pattern locals
         private BoundExpression BindBinary(BinaryExpressionSyntax bin, BindingContext context, DiagnosticBag diagnostics)
         {
             if (bin.Kind == SyntaxKind.AsExpression)
@@ -625,7 +628,7 @@ namespace Cnidaria.Cs
 
             switch (bin.Kind)
             {
-                // arithmetic numeric
+                // Arithmetic operators
                 case SyntaxKind.AddExpression:
                 case SyntaxKind.SubtractExpression:
                 case SyntaxKind.MultiplyExpression:
@@ -633,36 +636,36 @@ namespace Cnidaria.Cs
                 case SyntaxKind.ModuloExpression:
                     return BindNumericBinary(bin, left, right, context, diagnostics);
 
-                // bitwise & | ^ (bool or integral)
+                // Bitwise operators accept Boolean or integral operands
                 case SyntaxKind.BitwiseAndExpression:
                 case SyntaxKind.BitwiseOrExpression:
                 case SyntaxKind.ExclusiveOrExpression:
                     return BindBitwiseBinary(bin, left, right, context, diagnostics);
 
-                // conditional logical && ||
+                // Conditional logical operators
                 case SyntaxKind.LogicalAndExpression:
                 case SyntaxKind.LogicalOrExpression:
                     return BindConditionalLogicalBinary(bin, context, diagnostics);
 
-                // equality
+                // Equality operators
                 case SyntaxKind.EqualsExpression:
                 case SyntaxKind.NotEqualsExpression:
                     return BindEqualityBinary(bin, left, right, context, diagnostics);
 
-                // relational
+                // Relational operators
                 case SyntaxKind.LessThanExpression:
                 case SyntaxKind.LessThanOrEqualExpression:
                 case SyntaxKind.GreaterThanExpression:
                 case SyntaxKind.GreaterThanOrEqualExpression:
                     return BindRelationalBinary(bin, left, right, context, diagnostics);
 
-                // shifts
+                // Shift operators
                 case SyntaxKind.LeftShiftExpression:
                 case SyntaxKind.RightShiftExpression:
                 case SyntaxKind.UnsignedRightShiftExpression:
                     return BindShiftBinary(bin, left, right, context, diagnostics);
 
-                // coalesing
+                // Null coalescing
                 case SyntaxKind.CoalesceExpression:
                     return BindNullCoalescing(bin, left, right, context, diagnostics);
 
@@ -826,7 +829,7 @@ namespace Cnidaria.Cs
             {
                 return ptrArith;
             }
-            // enum subtraction
+            // Enum subtraction
             if (op == BoundBinaryOperatorKind.Subtract &&
                 IsEnumType(left.Type) &&
                 ReferenceEquals(left.Type, right.Type))
@@ -905,7 +908,7 @@ namespace Cnidaria.Cs
                 return new BoundBinaryExpression(bin, op, boolType, left, right, cv);
             }
 
-            // enum op enum
+            // Enum operator with two enum operands
             if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
             {
                 var underlying = GetEnumUnderlyingTypeOrDefault(ctx.Compilation, left.Type);
@@ -913,7 +916,7 @@ namespace Cnidaria.Cs
                 return new BoundBinaryExpression(bin, op, left.Type, left, right, constValue);
             }
 
-            // integral only
+            // Integral operands only
             if (!IsIntegral(left.Type.SpecialType) || !IsIntegral(right.Type.SpecialType))
             {
                 diagnostics.Add(new Diagnostic("CN_BIT000", DiagnosticSeverity.Error,
@@ -1002,7 +1005,7 @@ namespace Cnidaria.Cs
                 var cv = FoldBooleanBinaryConstant(op, left, right);
                 return new BoundBinaryExpression(bin, op, boolType, left, right, cv);
             }
-            // enum == 0 / enum != 0
+            // Enum comparison with zero
             if (IsEnumType(left.Type) && !IsEnumType(right.Type))
             {
                 var conv = ClassifyConversion(right, left.Type);
@@ -1045,14 +1048,14 @@ namespace Cnidaria.Cs
                     }
                 }
             }
-            // enum == enum
+            // Enum equality
             if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
             {
                 var cv = FoldBooleanBinaryConstant(op, left, right);
                 return new BoundBinaryExpression(bin, op, boolType, left, right, cv);
             }
 
-            // bool == bool
+            // Boolean equality
             if (left.Type.SpecialType == SpecialType.System_Boolean && right.Type.SpecialType == SpecialType.System_Boolean)
             {
                 var cv = FoldBooleanBinaryConstant(op, left, right);
@@ -1065,7 +1068,7 @@ namespace Cnidaria.Cs
             if (TryBindTypeParameterNullEquality(left, right, bin, ctx, diagnostics, out var tl, out var tr))
                 return new BoundBinaryExpression(bin, op, boolType, tl, tr, Optional<object>.None);
 
-            // reference equality
+            // Reference equality
             {
                 if (TryBindReferenceEquality(left, right, bin, ctx, diagnostics, out var l2, out var r2))
                     return new BoundBinaryExpression(bin, op, boolType, l2, r2, Optional<object>.None);
@@ -1198,7 +1201,7 @@ namespace Cnidaria.Cs
             bool IsNullLiteral(BoundExpression e) => e.Type is NullTypeSymbol ||
                 (e.ConstantValueOpt.HasValue && e.ConstantValueOpt.Value is null);
 
-            // null == ref
+            // Null and reference equality
             if (IsNullLiteral(left) && right.Type.IsReferenceType)
             {
                 leftOut = ApplyConversion((ExpressionSyntax)
@@ -1218,7 +1221,7 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(left.Type, right.Type))
                 return true;
 
-            // allow implicit reference conversion either way
+            // Accept an implicit reference conversion in either direction
             if (HasImplicitReferenceConversion(left.Type, right.Type))
             {
                 leftOut = ApplyConversion((ExpressionSyntax)
@@ -1329,7 +1332,7 @@ namespace Cnidaria.Cs
 
             left = ApplyConversion(bin.Left, left, leftPromoted, bin, ctx, diagnostics, requireImplicit: true);
 
-            // right converted to int
+            // Convert the shift count to int
             var intType = ctx.Compilation.GetSpecialType(SpecialType.System_Int32);
             right = ApplyConversion(bin.Right, right, intType, bin, ctx, diagnostics, requireImplicit: true);
 
@@ -1759,6 +1762,7 @@ namespace Cnidaria.Cs
 
             return compilation.GetSpecialType(SpecialType.System_Int32);
         }
+        // Null coalescing stabilizes the left operand before selecting nullable or reference lowering
         private BoundExpression BindNullCoalescing(
            BinaryExpressionSyntax bin,
            BoundExpression left,
@@ -1773,12 +1777,12 @@ namespace Cnidaria.Cs
             var compilation = ctx.Compilation;
             var boolType = compilation.GetSpecialType(SpecialType.System_Boolean);
 
-            // Evaluate lhs once
+            // Evaluate the left operand once
             var tmp = NewTemp("$coalesce_tmp", left.Type);
             var tmpDecl = new BoundLocalDeclarationStatement(bin, tmp, left);
             var tmpExpr = new BoundLocalExpression(bin, tmp);
 
-            // Nullable<T> case
+            // Nullable value lowering
             if (TryGetSystemNullableInfo(left.Type, out var leftNullable, out var underlying))
             {
                 var hasValueGet = FindNullableHasValueGetter(leftNullable);
@@ -1829,7 +1833,7 @@ namespace Cnidaria.Cs
                         sideEffects: ImmutableArray.Create<BoundStatement>(tmpDecl),
                         value: value);
                 }
-                var lhsValue = new BoundCallExpression(bin, tmpExpr, gv, ImmutableArray<BoundExpression>.Empty); // underlying
+                var lhsValue = new BoundCallExpression(bin, tmpExpr, gv, ImmutableArray<BoundExpression>.Empty); // Extract the underlying value
 
                 var resultType2 = ClassifyConditionalResultType(
                     compilation,
@@ -1878,7 +1882,7 @@ namespace Cnidaria.Cs
                     sideEffects: ImmutableArray.Create<BoundStatement>(tmpDecl),
                     value: value2);
             }
-            // Reference type case
+            // Reference type lowering
             if (!left.Type.IsReferenceType && left.Type is not NullTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
@@ -2016,6 +2020,7 @@ namespace Cnidaria.Cs
             CollectPatternLocalsWhenFalse(condition, builder);
             return builder.ToImmutable();
         }
+        // Pattern locals enter scope only on the control-flow branch where they are assigned
         private LocalScopeBinder CreateFlowScopeBinderForTrue(BoundExpression condition)
         {
             var locals = GetPatternLocalsWhenTrue(condition);
@@ -2118,15 +2123,15 @@ namespace Cnidaria.Cs
             if (t1 is ThrowTypeSymbol) return t2;
             if (t2 is ThrowTypeSymbol) return t1;
 
-            // null + ref => ref
+            // Null with a reference operand selects the reference type
             if (t1 is NullTypeSymbol && t2.IsReferenceType) return t2;
             if (t2 is NullTypeSymbol && t1.IsReferenceType) return t1;
 
-            // numeric => use binary numeric promotions
+            // Numeric operands use binary numeric promotion
             if (IsNumeric(t1.SpecialType) && IsNumeric(t2.SpecialType))
                 return GetBinaryNumericPromotionType(compilation, tree, t1, t2, diagNode, diagnostics);
 
-            // reference
+            // Reference operands
             if (t1.IsReferenceType && t2.IsReferenceType)
             {
                 if (HasImplicitReferenceConversion(t2, t1)) return t1;
@@ -2189,7 +2194,7 @@ namespace Cnidaria.Cs
             object? rv,
             out bool result)
         {
-            // null == null / null != null
+            // Null equality
             if (lv is null || rv is null)
             {
                 result = op switch
@@ -2202,7 +2207,7 @@ namespace Cnidaria.Cs
                 return op is BoundBinaryOperatorKind.Equals or BoundBinaryOperatorKind.NotEquals;
             }
 
-            // bool
+            // Boolean constants
             if (lv is bool b1 && rv is bool b2)
             {
                 result = op switch
@@ -2214,7 +2219,7 @@ namespace Cnidaria.Cs
                 return op is BoundBinaryOperatorKind.Equals or BoundBinaryOperatorKind.NotEquals;
             }
 
-            // string
+            // String constants
             if (lv is string s1 && rv is string s2)
             {
                 result = op switch
@@ -2226,7 +2231,7 @@ namespace Cnidaria.Cs
                 return op is BoundBinaryOperatorKind.Equals or BoundBinaryOperatorKind.NotEquals;
             }
 
-            // float/double
+            // Floating-point constants
             if (lv is float f1 && rv is float f2)
             {
                 result = op switch
@@ -2266,7 +2271,7 @@ namespace Cnidaria.Cs
                     or BoundBinaryOperatorKind.GreaterThanOrEqual;
             }
 
-            // Integral / decimal / char
+            // Integral, decimal, and character constants
             if (lv is sbyte i8a && rv is sbyte i8b) return TryFoldOrdered(op, i8a.CompareTo(i8b), out result);
             if (lv is byte u8a && rv is byte u8b) return TryFoldOrdered(op, u8a.CompareTo(u8b), out result);
             if (lv is short i16a && rv is short i16b) return TryFoldOrdered(op, i16a.CompareTo(i16b), out result);
@@ -2301,6 +2306,7 @@ namespace Cnidaria.Cs
                 or BoundBinaryOperatorKind.GreaterThan
                 or BoundBinaryOperatorKind.GreaterThanOrEqual;
         }
+        // Constant folding mirrors checked overflow behavior selected during binding
         private static Optional<object> FoldBinaryConstant(
             BoundBinaryOperatorKind op,
             TypeSymbol type,

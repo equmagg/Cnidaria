@@ -46,6 +46,9 @@ namespace Cnidaria.RiscV
         public string FormatText(RiscVAssemblyWriterOptions? options = null)
             => RiscVDisassembler.Disassemble(this, options);
 
+        public RiscVProgram Link(params RiscVProgram[] objects)
+            => RiscVObjectComposer.Compose(this, objects);
+
         public RVLinkedImage LinkFlat(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
             => RVObjectLinker.LinkFlat(this, imageBase, externalSymbols);
 
@@ -134,6 +137,7 @@ namespace Cnidaria.RiscV
         public int Size { get; }
         public RVObjectSymbolBinding Binding { get; }
         public RVObjectSymbolKind Kind { get; }
+        public bool IsTentative { get; }
 
         public RVObjectSymbol(
             string name,
@@ -141,7 +145,8 @@ namespace Cnidaria.RiscV
             int offset,
             int size,
             RVObjectSymbolBinding binding,
-            RVObjectSymbolKind kind)
+            RVObjectSymbolKind kind,
+            bool isTentative = false)
         {
             Name = name ?? string.Empty;
             SectionName = sectionName ?? string.Empty;
@@ -149,6 +154,7 @@ namespace Cnidaria.RiscV
             Size = Math.Max(0, size);
             Binding = binding;
             Kind = kind;
+            IsTentative = isTentative;
         }
     }
 
@@ -1038,7 +1044,7 @@ namespace Cnidaria.RiscV
             => (Isa & flags) == flags;
 
         public override string ToString()
-            => XLen == 64 ? "rv64" + FormatIsaSuffix() : "rv32" + FormatIsaSuffix();
+            => XLen == 64 ? $"rv64{FormatIsaSuffix()}" : $"rv32{FormatIsaSuffix()}";
 
         private string FormatIsaSuffix()
         {
@@ -1186,15 +1192,15 @@ namespace Cnidaria.RiscV
             if (IsInteger(register))
             {
                 int index = IntegerIndex(register);
-                return abiName ? IntegerAbiNames[index] : "x" + index.ToString(CultureInfo.InvariantCulture);
+                return abiName ? IntegerAbiNames[index] : $"x{index}";
             }
             if (IsFloat(register))
             {
                 int index = FloatIndex(register);
-                return abiName ? FloatAbiNames[index] : "f" + index.ToString(CultureInfo.InvariantCulture);
+                return abiName ? FloatAbiNames[index] : $"f{index}";
             }
             if (IsVector(register))
-                return "v" + VectorIndex(register).ToString(CultureInfo.InvariantCulture);
+                return $"v{VectorIndex(register)}";
             throw new ArgumentOutOfRangeException(nameof(register));
         }
 
@@ -1212,7 +1218,7 @@ namespace Cnidaria.RiscV
         {
             if (TryParse(text, out var register))
                 return register;
-            throw new FormatException("Invalid RISC-V register: " + text);
+            throw new FormatException($"Invalid register: {text}");
         }
 
         private static Dictionary<string, RVRegister> CreateNameMap()
@@ -1220,11 +1226,11 @@ namespace Cnidaria.RiscV
             var map = new Dictionary<string, RVRegister>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < 32; i++)
             {
-                map["x" + i.ToString(CultureInfo.InvariantCulture)] = (RVRegister)i;
+                map[$"x{i}"] = (RVRegister)i;
                 map[IntegerAbiNames[i]] = (RVRegister)i;
-                map["f" + i.ToString(CultureInfo.InvariantCulture)] = (RVRegister)(i + 32);
+                map[$"f{i}"] = (RVRegister)(i + 32);
                 map[FloatAbiNames[i]] = (RVRegister)(i + 32);
-                map["v" + i.ToString(CultureInfo.InvariantCulture)] = (RVRegister)(i + 64);
+                map[$"v{i}"] = (RVRegister)(i + 64);
             }
             map["fp"] = RVRegister.X8;
             return map;
@@ -1287,7 +1293,7 @@ namespace Cnidaria.RiscV
         {
             if (TryParse(text, out int csr))
                 return csr;
-            throw new FormatException("Invalid RISC-V CSR: " + text);
+            throw new FormatException($"Invalid CSR: {text}");
         }
 
         public static string Format(int csr)
@@ -1318,7 +1324,7 @@ namespace Cnidaria.RiscV
                 return name;
             if (TryFormatIndexedCsr(csr, 0x31C, 0, 3, "mstateen", "h", out name))
                 return name;
-            return "0x" + csr.ToString("X", CultureInfo.InvariantCulture).ToLowerInvariant();
+            return $"0x{csr:X8}";
         }
 
         private static Dictionary<string, int> CreateNameMap()
@@ -1610,7 +1616,7 @@ namespace Cnidaria.RiscV
             if (string.IsNullOrWhiteSpace(label))
                 throw new ArgumentException("RISC-V label must not be empty", nameof(label));
             if (_labels.ContainsKey(label))
-                throw new ArgumentException("Duplicate RISC-V label: " + label, nameof(label));
+                throw new ArgumentException($"Duplicate label: {label}", nameof(label));
             _labels.Add(label, Position);
         }
 

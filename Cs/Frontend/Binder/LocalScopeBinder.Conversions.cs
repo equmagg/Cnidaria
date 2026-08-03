@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Conversion classification and user-defined conversion lookup
     internal sealed partial class LocalScopeBinder : Binder
     {
         private Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, BindingContext context)
@@ -49,6 +45,7 @@ namespace Cnidaria.Cs
                 return standard;
             return ClassifyUserDefinedConversion(expr, target, context);
         }
+        // User-defined candidates are collected from both source and destination types
         private Conversion ClassifyUserDefinedConversion(BoundExpression expr, TypeSymbol target, BindingContext context)
         {
             if (expr.Type is not NamedTypeSymbol && target is not NamedTypeSymbol)
@@ -102,12 +99,12 @@ namespace Cnidaria.Cs
                 int score = 0;
                 score += ConversionScore(srcToParam.Kind);
                 score += ConversionScore(retToTarget.Kind);
-                score += overallImplicit ? 0 : 10; // prefer implicit applicability
+                score += overallImplicit ? 0 : 10; // Prefer implicit applicability
 
                 if (IsCheckedOverflowContext &&
                     string.Equals(m.Name, $"{OperatorPrefix}CheckedExplicit", StringComparison.Ordinal))
                 {
-                    score -= 1; // prefer checked explicit in checked context
+                    score -= 1; // Prefer checked explicit operators in checked contexts
                 }
 
                 if (score < bestScore)
@@ -154,6 +151,7 @@ namespace Cnidaria.Cs
                     $"{OperatorPrefix}Implicit",
                     $"{OperatorPrefix}Explicit");
         }
+        /// <summary>Compares semantic type identity including constructed and composite types</summary>
         public static bool AreSameType(TypeSymbol? a, TypeSymbol? b)
         {
             if (ReferenceEquals(a, b))
@@ -294,6 +292,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        /// <summary>Classifies built-in conversions without context-dependent user-defined lookup</summary>
         internal static Conversion ClassifyConversion(BoundExpression expr, TypeSymbol target, TargetInfo? targetInfo = null)
         {
             targetInfo ??= TargetInfo.Default;
@@ -312,7 +311,7 @@ namespace Cnidaria.Cs
             if (expr is BoundThrowExpression || expr.Type is ThrowTypeSymbol)
                 return new Conversion(ConversionKind.Identity);
 
-            // default literal
+            // Default literal
             if (expr.Type is DefaultLiteralTypeSymbol)
             {
                 if (target.SpecialType == SpecialType.System_Void || target is ByRefTypeSymbol)
@@ -320,7 +319,7 @@ namespace Cnidaria.Cs
 
                 return new Conversion(ConversionKind.Identity);
             }
-            // null literal
+            // Null literal
             if (expr.Type is NullTypeSymbol)
             {
                 if (target.IsReferenceType || target is PointerTypeSymbol or FunctionPointerTypeSymbol)
@@ -354,7 +353,7 @@ namespace Cnidaria.Cs
                 && (target.IsReferenceType || target is PointerTypeSymbol or FunctionPointerTypeSymbol))
                 return new Conversion(ConversionKind.NullLiteral);
 
-            // pointer conversions
+            // Pointer conversions
             if (target is PointerTypeSymbol && TryImplicitConstantZeroPointerConversion(expr))
                 return new Conversion(ConversionKind.ImplicitConstant);
             if (target is FunctionPointerTypeSymbol && TryImplicitConstantZeroPointerConversion(expr))
@@ -363,11 +362,11 @@ namespace Cnidaria.Cs
             {
                 bool toVoid = toPtr.PointedAtType.SpecialType == SpecialType.System_Void;
 
-                // implicit
+                // Pointer to void is implicit
                 if (toVoid)
                     return new Conversion(ConversionKind.ImplicitNumeric);
 
-                // explicit
+                // Other pointer conversions are explicit
                 return new Conversion(ConversionKind.ExplicitNumeric);
             }
             if (target is PointerTypeSymbol &&
@@ -407,7 +406,7 @@ namespace Cnidaria.Cs
             if (expr.Type is FunctionPointerTypeSymbol || target is FunctionPointerTypeSymbol)
                 return new Conversion(ConversionKind.None);
 
-            // tuple conversions
+            // Tuple conversions
             if (expr.Type is TupleTypeSymbol fromTuple && target is TupleTypeSymbol toTuple)
             {
                 if (fromTuple.ElementTypes.Length != toTuple.ElementTypes.Length)
@@ -442,7 +441,7 @@ namespace Cnidaria.Cs
             bool exprHasRefLike = RefLikeRestrictionFacts.ContainsRefLike(expr.Type);
             bool targetHasRefLike = RefLikeRestrictionFacts.ContainsRefLike(target);
 
-            // type parameter conversions
+            // Type parameter conversions
             if (target is TypeParameterSymbol targetTp)
             {
                 if ((targetTp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0)
@@ -472,7 +471,7 @@ namespace Cnidaria.Cs
             if (HasExplicitUnboxingConversion(expr.Type, target))
                 return new Conversion(ConversionKind.Unboxing);
 
-            // enum conversions
+            // Enum conversions
             bool exprIsEnum = IsEnumType(expr.Type);
             bool targetIsEnum = IsEnumType(target);
 
@@ -504,7 +503,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            // numeric conversions
+            // Numeric conversions
             if (IsNumeric(expr.Type.SpecialType) && IsNumeric(target.SpecialType))
             {
                 if (IsImplicitNumeric(expr.Type.SpecialType, target.SpecialType))
@@ -516,7 +515,7 @@ namespace Cnidaria.Cs
                 return new Conversion(ConversionKind.ExplicitNumeric);
             }
 
-            // reference conversions
+            // Reference conversions
             if (HasImplicitReferenceConversion(expr.Type, target))
                 return new Conversion(ConversionKind.ImplicitReference);
 
@@ -614,7 +613,7 @@ namespace Cnidaria.Cs
                 if (!TryToDecimal(expr.ConstantValueOpt.Value!, out var value))
                     return false;
 
-                // must be integral
+                // Constant numeric conversion requires an integral value
                 if (value != decimal.Truncate(value))
                     return false;
 
@@ -733,19 +732,19 @@ namespace Cnidaria.Cs
             if (!destination.IsReferenceType)
                 return false;
 
-            // to object
+            // Boxing to object
             if (destination.SpecialType == SpecialType.System_Object)
                 return true;
 
-            // struct to ValueType
+            // Boxing a struct to ValueType
             if (destination.SpecialType == SpecialType.System_ValueType)
                 return !IsEnumType(source);
 
-            // enum to System.Enum
+            // Boxing an enum to System.Enum
             if (destination.SpecialType == SpecialType.System_Enum)
                 return IsEnumType(source);
 
-            // to any implemented interface
+            // Boxing to an implemented interface
             if (IsInterfaceType(destination) && ImplementsInterface(source, destination))
                 return true;
 
@@ -762,7 +761,7 @@ namespace Cnidaria.Cs
             if (!source.IsReferenceType)
                 return false;
 
-            // object/valueType/enum/interface to valuetype
+            // Unboxing from object, ValueType, Enum, or an interface
             if (source.SpecialType is SpecialType.System_Object
                 or SpecialType.System_ValueType
                 or SpecialType.System_Enum)
@@ -781,15 +780,15 @@ namespace Cnidaria.Cs
             if (AreSameType(source, destination))
                 return true;
 
-            // class/interface/delegate to base class
+            // Reference conversion to a base class
             if (IsBaseTypeOf(destination, source))
                 return true;
 
-            // reference type to implemented interface
+            // Reference conversion to an implemented interface
             if (IsInterfaceType(destination) && ImplementsInterface(source, destination))
                 return true;
 
-            // interface to object
+            // Interface reference conversion to object
             if (IsInterfaceType(source) && destination.SpecialType == SpecialType.System_Object)
                 return true;
 
@@ -819,7 +818,7 @@ namespace Cnidaria.Cs
             if (HasImplicitReferenceConversion(source, destination))
                 return true;
 
-            // Normal downcast
+            // Reference downcast
             if (IsBaseTypeOf(source, destination))
                 return true;
 

@@ -2,13 +2,10 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Collection expressions and collection initializer lowering
     internal sealed partial class LocalScopeBinder : Binder
     {
         private bool CanBindTargetTypedCollectionExpression(
@@ -125,6 +122,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        // Select lowering from the target type before binding element conversions
         private BoundExpression BindCollectionExpression(
             CollectionExpressionSyntax node,
             TypeSymbol targetType,
@@ -496,6 +494,7 @@ namespace Cnidaria.Cs
                 elementType,
                 converted.ToImmutable());
         }
+        // Preallocate list storage and fill its exposed span without repeated Add calls
         private BoundExpression BindCollectionExpressionAsListSpecialCase(
             CollectionExpressionSyntax node,
             NamedTypeSymbol targetType,
@@ -846,6 +845,7 @@ namespace Cnidaria.Cs
 
             return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), tempExpr);
         }
+        // Spreads require a two-phase array length calculation and copy sequence
         private BoundExpression BindCollectionExpressionAsArray(
             CollectionExpressionSyntax node,
             ArrayTypeSymbol arrayType,
@@ -1176,6 +1176,7 @@ namespace Cnidaria.Cs
             copyMethod = null!;
             return false;
         }
+        // Resolve instance and extension Add candidates using normal overload rules
         private bool TryResolveCollectionInitializerAddCall(
             ExpressionSyntax elementSyntax,
             NamedTypeSymbol receiverType,

@@ -997,7 +997,7 @@ namespace Cnidaria.Cs
             if (node.WritesMemory && defs == SsaMemoryKindSet.None)
                 defs = defs.Add(SsaMemoryKind.GcHeap);
 
-            if (node.ReadsMemory && uses == SsaMemoryKindSet.None)
+            if (node.ReadsMemory && uses == SsaMemoryKindSet.None && node.Kind != GenTreeKind.ArrayLength)
                 uses = uses.Add(SsaMemoryKind.GcHeap);
 
             return new MemoryEffects(uses, defs);

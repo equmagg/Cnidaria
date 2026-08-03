@@ -743,7 +743,7 @@ namespace Cnidaria.Cs
                                 BytecodeOp.Pop,
                                 null,
                                 GenStackKind.Void,
-                                clone.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse),
+                                clone.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse | GenTreeFlags.ExplicitInit),
                                 ImmutableArray.Create(clone));
                             statements.Add(eval);
                         }
@@ -820,7 +820,8 @@ namespace Cnidaria.Cs
                     GenTreeFlags.VarUseAsg |
                     GenTreeFlags.VarDeath |
                     GenTreeFlags.Prolog |
-                    GenTreeFlags.MakeCse);
+                    GenTreeFlags.MakeCse |
+                    GenTreeFlags.ExplicitInit);
                 if (isRoot)
                     flags |= GenTreeFlags.MakeCse;
 

@@ -156,7 +156,6 @@ namespace Cnidaria.Cs
             }
         }
 
-        public long InctructionsElapsed => _instructionsElapsed;
         public long InstructionsElapsed => _instructionsElapsed;
         public int StackPeakBytes => (_stackEnd - _stackLowWatermark) + (_frameStackPeakTop - _stackBase);
         public int HeapPeakBytes => _heapPeakAbs - _heapBase;

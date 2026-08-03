@@ -2,13 +2,10 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Names, member access, conditional access, and inline array indexing
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundExpression BindTupleExpression(TupleExpressionSyntax te, BindingContext context, DiagnosticBag diagnostics)
@@ -117,6 +114,7 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+        // Bind writable storage separately from its optional read expression
         private LValue BindLValue(
             ExpressionSyntax node,
             BindingContext context,
@@ -497,7 +495,7 @@ namespace Cnidaria.Cs
             if (field is null && prop is null)
                 return false;
 
-            // field
+            // Bind the selected field
             if (field is not null)
             {
 
@@ -539,7 +537,7 @@ namespace Cnidaria.Cs
                 result = new BoundMemberAccessExpression(id, receiver, field, fieldValueType, isLValue: canWriteField, constantValueOpt: cv);
                 return true;
             }
-            // property
+            // Bind the selected property
             if (!prop!.IsStatic && inStaticContext)
             {
                 diagnostics.Add(new Diagnostic("CN_MEMACC021", DiagnosticSeverity.Error,
@@ -662,6 +660,7 @@ namespace Cnidaria.Cs
             return new BoundRefExpression(node, byRefType, operand);
         }
 
+        // Address-of accepts static method groups or assignable unmanaged storage in an unsafe context
         private BoundExpression BindAddressOf(
             PrefixUnaryExpressionSyntax node, BoundExpression operand, BindingContext context, DiagnosticBag diagnostics)
         {
@@ -739,6 +738,7 @@ namespace Cnidaria.Cs
             return new BoundAddressOfExpression(node, ptrType, operand);
         }
 
+        // Function pointer conversion requires matching reference kinds and compatible signature types
         private bool TryResolveFunctionPointerMethodGroup(
             BoundFunctionPointerMethodGroupExpression expression,
             FunctionPointerTypeSymbol targetType,
@@ -1095,6 +1095,7 @@ namespace Cnidaria.Cs
                 diagnosticNode: assignment);
         }
 
+        // Evaluate the receiver once and merge null and non-null result paths
         private BoundExpression BindConditionalAccessCore(
             SyntaxNode syntax,
             BoundExpression receiver,
@@ -1781,6 +1782,7 @@ namespace Cnidaria.Cs
                 isLValue: canWriteProperty || allowCtorAutoPropWrite);
         }
 
+        // Inline array access lowers through synthesized by-reference element helpers
         private BoundExpression BindInlineArrayElementAccess(
             ExpressionSyntax syntax,
             BoundExpression receiver,

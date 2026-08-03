@@ -1,12 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 
 namespace Cnidaria.C
 {
 
+    /// <summary>Identifies the storage class of a declaration</summary>
     public enum StorageClass : byte
     {
         None,
@@ -19,6 +21,7 @@ namespace Cnidaria.C
     }
 
     [Flags]
+    /// <summary>Flags that alter function declaration semantics</summary>
     public enum FunctionSpecifiers : byte
     {
         None = 0,
@@ -27,6 +30,7 @@ namespace Cnidaria.C
     }
 
 
+    /// <summary>Normalized declaration specifiers shared by all declarators in a declaration</summary>
     internal readonly struct DeclarationSpecifiers
     {
         public QualifiedType BaseType { get; }
@@ -48,6 +52,7 @@ namespace Cnidaria.C
             FunctionSpecifiers = functionSpecifiers;
         }
     }
+    /// <summary>Builds scopes and symbol maps before expression binding</summary>
     internal sealed class DeclarationCollector
     {
         private readonly Compilation _compilation;
@@ -62,11 +67,13 @@ namespace Cnidaria.C
             _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
         }
 
+        /// <summary>Collects symbols scopes and early diagnostics</summary>
         public static SemanticState Collect(Compilation compilation)
         {
             var collector = new DeclarationCollector(compilation);
             var globalScope = new Scope(parent: null, declaringSyntax: null);
 
+            // Declarations from all trees share one global scope
             foreach (var tree in compilation.SyntaxTrees)
                 collector.CollectTranslationUnit(tree.Root, globalScope);
 
@@ -113,6 +120,7 @@ namespace Cnidaria.C
             _scopes[functionDefinition] = scope;
 
             var specifiers = DeclarationTypeParser.ParseSpecifiers(functionDefinition.Specifiers, scope, _types);
+            CollectEnumConstants(functionDefinition.Specifiers, scope);
             var type = DeclaratorTypeBuilder.Build(functionDefinition.Declarator, specifiers.BaseType, _types, scope);
 
             if (functionDefinition.Declarator.Identifier is null)
@@ -132,6 +140,7 @@ namespace Cnidaria.C
             _declaredSymbols[functionDefinition] = symbol;
             _declaredSymbols[functionDefinition.Declarator] = symbol;
 
+            // Parameters and the body share the function scope
             var functionScope = new Scope(scope, functionDefinition);
             DeclareParameters(symbol.FunctionType, functionScope);
             _scopes[functionDefinition.Body] = functionScope;
@@ -188,6 +197,7 @@ namespace Cnidaria.C
             _scopes[declaration] = scope;
 
             var specifiers = DeclarationTypeParser.ParseSpecifiers(declaration.Specifiers, scope, _types);
+            CollectEnumConstants(declaration.Specifiers, scope);
 
             if (declaration.Declarators.Length == 0)
                 return;
@@ -200,6 +210,254 @@ namespace Cnidaria.C
             {
                 _declaredSymbols[declaration] = singleSymbol;
             }
+        }
+
+        private void CollectEnumConstants(ImmutableArray<SyntaxToken> specifierTokens, Scope scope)
+        {
+            for (var i = 0; i < specifierTokens.Length; i++)
+            {
+                if (specifierTokens[i].Kind != SyntaxKind.EnumKeyword)
+                    continue;
+
+                var openBraceIndex = -1;
+                for (var j = i + 1; j < specifierTokens.Length; j++)
+                {
+                    if (specifierTokens[j].Kind == SyntaxKind.OpenBraceToken)
+                    {
+                        openBraceIndex = j;
+                        break;
+                    }
+                }
+
+                if (openBraceIndex < 0 ||
+                    !TryReadEnumBody(specifierTokens, openBraceIndex, out var bodyTokens, out var closeBraceIndex))
+                {
+                    continue;
+                }
+
+                CollectEnumBody(bodyTokens, scope);
+                i = closeBraceIndex;
+            }
+        }
+
+        private void CollectEnumBody(ImmutableArray<SyntaxToken> bodyTokens, Scope scope)
+        {
+            long nextValue = 0;
+
+            foreach (var enumeratorTokens in SplitEnumMembers(bodyTokens))
+            {
+                if (enumeratorTokens.IsDefaultOrEmpty)
+                    continue;
+
+                var nameToken = enumeratorTokens[0];
+                if (nameToken.Kind is not SyntaxKind.IdentifierToken and not SyntaxKind.TypedefNameToken)
+                    continue;
+
+                var value = nextValue;
+                var equalsIndex = -1;
+                for (var i = 1; i < enumeratorTokens.Length; i++)
+                {
+                    if (enumeratorTokens[i].Kind == SyntaxKind.EqualsToken)
+                    {
+                        equalsIndex = i;
+                        break;
+                    }
+                }
+
+                if (equalsIndex >= 0 &&
+                    !TryEvaluateEnumeratorValue(enumeratorTokens, equalsIndex + 1, scope, out value))
+                {
+                    _diagnostics.Add(SemanticDiagnostic.Error(
+                        "Enumerator value for '" + nameToken.Text + "' is not a supported integer constant expression.",
+                        nameToken.Span));
+                }
+
+                DeclareOrdinary(scope, new EnumConstantSymbol(
+                    nameToken.Text,
+                    _types.Builtin(BuiltinTypeKind.Int),
+                    value,
+                    declaringSyntax: null));
+
+                nextValue = unchecked(value + 1);
+            }
+        }
+
+        private static bool TryReadEnumBody(
+            ImmutableArray<SyntaxToken> tokens,
+            int openBraceIndex,
+            out ImmutableArray<SyntaxToken> bodyTokens,
+            out int closeBraceIndex)
+        {
+            var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
+            var depth = 0;
+
+            for (var i = openBraceIndex + 1; i < tokens.Length; i++)
+            {
+                var token = tokens[i];
+                if (token.Kind == SyntaxKind.CloseBraceToken && depth == 0)
+                {
+                    bodyTokens = builder.ToImmutable();
+                    closeBraceIndex = i;
+                    return true;
+                }
+
+                builder.Add(token);
+
+                if (token.Kind == SyntaxKind.OpenBraceToken)
+                    depth++;
+                else if (token.Kind == SyntaxKind.CloseBraceToken && depth > 0)
+                    depth--;
+            }
+
+            bodyTokens = ImmutableArray<SyntaxToken>.Empty;
+            closeBraceIndex = -1;
+            return false;
+        }
+
+        private static IEnumerable<ImmutableArray<SyntaxToken>> SplitEnumMembers(
+            ImmutableArray<SyntaxToken> tokens)
+        {
+            var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
+            var depth = 0;
+
+            foreach (var token in tokens)
+            {
+                if (token.Kind == SyntaxKind.CommaToken && depth == 0)
+                {
+                    yield return builder.ToImmutable();
+                    builder.Clear();
+                    continue;
+                }
+
+                builder.Add(token);
+
+                if (token.Kind is SyntaxKind.OpenParenToken or SyntaxKind.OpenBracketToken or SyntaxKind.OpenBraceToken)
+                    depth++;
+                else if (depth > 0 &&
+                         (token.Kind is SyntaxKind.CloseParenToken or SyntaxKind.CloseBracketToken or SyntaxKind.CloseBraceToken))
+                    depth--;
+            }
+
+            if (builder.Count > 0)
+                yield return builder.ToImmutable();
+        }
+
+        private static bool TryEvaluateEnumeratorValue(
+            ImmutableArray<SyntaxToken> tokens,
+            int startIndex,
+            Scope scope,
+            out long value)
+        {
+            var endIndex = tokens.Length;
+            while (startIndex < endIndex &&
+                   tokens[startIndex].Kind == SyntaxKind.OpenParenToken &&
+                   tokens[endIndex - 1].Kind == SyntaxKind.CloseParenToken)
+            {
+                startIndex++;
+                endIndex--;
+            }
+
+            if (endIndex - startIndex == 1)
+                return TryEvaluateEnumeratorAtom(tokens[startIndex], scope, out value);
+
+            if (endIndex - startIndex == 2 &&
+                TryEvaluateEnumeratorAtom(tokens[startIndex + 1], scope, out var operand))
+            {
+                switch (tokens[startIndex].Kind)
+                {
+                    case SyntaxKind.PlusToken:
+                        value = operand;
+                        return true;
+                    case SyntaxKind.MinusToken:
+                        value = unchecked(-operand);
+                        return true;
+                    case SyntaxKind.TildeToken:
+                        value = ~operand;
+                        return true;
+                    case SyntaxKind.BangToken:
+                        value = operand == 0 ? 1 : 0;
+                        return true;
+                }
+            }
+
+            value = 0;
+            return false;
+        }
+
+        private static bool TryEvaluateEnumeratorAtom(
+            SyntaxToken token,
+            Scope scope,
+            out long value)
+        {
+            if (token.Kind == SyntaxKind.IntegerLiteralToken)
+                return TryParseEnumIntegerLiteral(token.Text, out value);
+
+            if (token.Kind is SyntaxKind.CharacterLiteralToken or
+                SyntaxKind.WideCharacterLiteralToken or
+                SyntaxKind.Utf8CharacterLiteralToken or
+                SyntaxKind.Utf16CharacterLiteralToken or
+                SyntaxKind.Utf32CharacterLiteralToken)
+            {
+                try
+                {
+                    value = Convert.ToInt64(token.Value, CultureInfo.InvariantCulture);
+                    return true;
+                }
+                catch (Exception exception) when (exception is FormatException or InvalidCastException or OverflowException)
+                {
+                    value = 0;
+                    return false;
+                }
+            }
+
+            if ((token.Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken) &&
+                scope.LookupOrdinary(token.Text) is EnumConstantSymbol enumConstant)
+            {
+                value = enumConstant.Value;
+                return true;
+            }
+
+            value = 0;
+            return false;
+        }
+
+        private static bool TryParseEnumIntegerLiteral(string text, out long value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+
+            var normalized = text.Replace("'", string.Empty);
+            var end = normalized.Length;
+            while (end > 0 && normalized[end - 1] is 'u' or 'U' or 'l' or 'L')
+                end--;
+
+            normalized = normalized.Substring(0, end);
+            if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return long.TryParse(normalized.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
+
+            if (normalized.Length > 1 && normalized[0] == '0')
+            {
+                try
+                {
+                    foreach (var character in normalized.Substring(1))
+                    {
+                        if (character < '0' || character > '7')
+                            return false;
+
+                        value = checked(value * 8 + character - '0');
+                    }
+
+                    return true;
+                }
+                catch (OverflowException)
+                {
+                    value = 0;
+                    return false;
+                }
+            }
+
+            return long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
         }
 
         private void CollectInitDeclarator(
@@ -217,6 +475,7 @@ namespace Cnidaria.C
 
             var name = identifier.Value.Text;
             var declaredType = DeclaratorTypeBuilder.Build(initDeclarator.Declarator, specifiers.BaseType, _types, scope);
+            // String initializers complete an otherwise unspecified array bound
             declaredType = CompleteArrayTypeFromInitializer(declaredType, initDeclarator.Initializer);
 
             Symbol symbol;
@@ -572,6 +831,7 @@ namespace Cnidaria.C
             }
         }
     }
+    /// <summary>Resolves declaration specifier tokens to a normalized base type</summary>
     internal sealed class DeclarationTypeParser
     {
         private readonly ImmutableArray<SyntaxToken> _tokens;
@@ -588,6 +848,7 @@ namespace Cnidaria.C
             _types = types;
         }
 
+        /// <summary>Parses storage class type qualifiers and function specifiers</summary>
         public static DeclarationSpecifiers ParseSpecifiers(
             ImmutableArray<SyntaxToken> tokens,
             Scope scope,
@@ -614,6 +875,7 @@ namespace Cnidaria.C
             var sawFloat = false;
             var sawDouble = false;
             QualifiedType? namedBaseType = null;
+            // Tokens inside a tag body belong to field declarations
             var braceDepth = 0;
 
             for (var i = 0; i < _tokens.Length; i++)
@@ -799,6 +1061,7 @@ namespace Cnidaria.C
             if (string.IsNullOrEmpty(name))
                 name = "<anonymous@" + _tokens[keywordIndex].Position.ToString() + ">";
 
+            // Reuse a compatible tag so declarations and definitions share identity
             var existing = _scope.LookupTag(name);
             if (existing is null || existing.TagKind != tagKind)
             {
@@ -934,8 +1197,10 @@ namespace Cnidaria.C
             return BuiltinTypeKind.Int;
         }
     }
+    /// <summary>Builds field symbols from a structure or union body</summary>
     internal static class StructUnionFieldParser
     {
+        /// <summary>Parses fields in declaration order</summary>
         public static ImmutableArray<FieldSymbol> ParseFields(
             ImmutableArray<SyntaxToken> bodyTokens,
             Scope scope,
@@ -972,6 +1237,7 @@ namespace Cnidaria.C
 
             if (declaratorTokens.Length == 0)
             {
+                // Unnamed aggregates participate in recursive member lookup
                 AddAnonymousAggregateField(specifiers.BaseType, containingTag, fields);
                 return;
             }
@@ -1118,6 +1384,7 @@ namespace Cnidaria.C
 
             foreach (var token in tokens)
             {
+                // Field widths and default initializers do not affect the declared type
                 if ((token.Kind == SyntaxKind.ColonToken || token.Kind == SyntaxKind.EqualsToken) &&
                     parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
                 {
@@ -1279,8 +1546,10 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Combines a base type with pointer array and function declarator layers</summary>
     internal static class DeclaratorTypeBuilder
     {
+        /// <summary>Constructs the declared type from its base type and declarator</summary>
         public static QualifiedType Build(
             DeclaratorSyntax declarator,
             QualifiedType baseType,
@@ -1294,10 +1563,12 @@ namespace Cnidaria.C
 
             var parser = new DeclaratorParser(declarator.Tokens, types, scope ?? new Scope(parent: null, declaringSyntax: null));
             var node = parser.ParseDeclarator();
+            // Applying inward nodes preserves declarator precedence
             return node.Apply(baseType, types);
         }
     }
 
+    /// <summary>Parses declarator tokens into a type construction tree</summary>
     internal sealed class DeclaratorParser
     {
         private readonly ImmutableArray<SyntaxToken> _tokens;
@@ -1312,8 +1583,10 @@ namespace Cnidaria.C
             _scope = scope ?? throw new ArgumentNullException(nameof(scope));
         }
 
+        /// <summary>Parses a complete or abstract declarator</summary>
         public DeclaratorNode ParseDeclarator()
         {
+            // Prefix pointers wrap the recursively parsed declarator
             if (Current.Kind == SyntaxKind.StarToken)
             {
                 NextToken();
@@ -1353,6 +1626,7 @@ namespace Cnidaria.C
                 node = new MissingDeclaratorNode();
             }
 
+            // Postfix layers are applied from left to right
             while (true)
             {
                 if (Current.Kind == SyntaxKind.OpenBracketToken)
@@ -1417,6 +1691,7 @@ namespace Cnidaria.C
             return evaluator.TryEvaluate(out var value) && value >= 0 ? value : null;
         }
 
+        /// <summary>Evaluates the integer-only subset accepted for fixed array bounds</summary>
         private sealed class ArrayLengthExpressionEvaluator
         {
             private readonly ImmutableArray<SyntaxToken> _tokens;
@@ -1427,6 +1702,7 @@ namespace Cnidaria.C
                 _tokens = tokens;
             }
 
+            /// <summary>Evaluates the full token sequence without overflow</summary>
             public bool TryEvaluate(out long value)
             {
                 value = 0;
@@ -1691,6 +1967,7 @@ namespace Cnidaria.C
             out bool hasPrototype,
             out bool isVariadic)
         {
+            // Identifier lists without declaration specifiers do not form a prototype
             hasPrototype = LooksLikePrototype(tokens);
             isVariadic = tokens.Any(static t => t.Kind == SyntaxKind.EllipsisToken);
 
@@ -1734,6 +2011,7 @@ namespace Cnidaria.C
 
         private QualifiedType AdjustParameterType(QualifiedType type)
         {
+            // Parameter arrays and functions are adjusted to pointer types
             if (type.Type is ArrayType array)
                 return new QualifiedType(_types.PointerTo(array.ElementType), type.Qualifiers);
 
@@ -1967,11 +2245,13 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Applies one declarator layer to a base type</summary>
     internal abstract class DeclaratorNode
     {
         public abstract QualifiedType Apply(QualifiedType baseType, TypeCatalog types);
     }
 
+    /// <summary>Terminates a declarator at its identifier</summary>
     internal sealed class IdentifierDeclaratorNode : DeclaratorNode
     {
         public SyntaxToken Identifier { get; }
@@ -1985,12 +2265,14 @@ namespace Cnidaria.C
             => baseType;
     }
 
+    /// <summary>Terminates a malformed or abstract declarator without changing its type</summary>
     internal sealed class MissingDeclaratorNode : DeclaratorNode
     {
         public override QualifiedType Apply(QualifiedType baseType, TypeCatalog types)
             => baseType;
     }
 
+    /// <summary>Adds a qualified pointer layer</summary>
     internal sealed class PointerDeclaratorNode : DeclaratorNode
     {
         private readonly DeclaratorNode _inner;
@@ -2009,6 +2291,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Adds an array layer with an optional fixed bound</summary>
     internal sealed class ArrayDeclaratorNode : DeclaratorNode
     {
         private readonly DeclaratorNode _inner;
@@ -2027,6 +2310,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Adds a function layer with prototype and variadic metadata</summary>
     internal sealed class FunctionDeclaratorNode : DeclaratorNode
     {
         private readonly DeclaratorNode _inner;

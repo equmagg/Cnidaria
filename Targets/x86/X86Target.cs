@@ -46,6 +46,9 @@ namespace Cnidaria.X86
         public string FormatText(X86AssemblyWriterOptions? options = null)
             => X86Disassembler.Disassemble(this, options);
 
+        public X86Program Link(params X86Program[] objects)
+            => X86ObjectComposer.Compose(this, objects);
+
         public X86LinkedImage LinkFlat(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
             => X86ObjectLinker.LinkFlat(this, imageBase, externalSymbols);
 
@@ -126,6 +129,7 @@ namespace Cnidaria.X86
         public int Size { get; }
         public X86ObjectSymbolBinding Binding { get; }
         public X86ObjectSymbolKind Kind { get; }
+        public bool IsTentative { get; }
 
         public X86ObjectSymbol(
             string name,
@@ -133,7 +137,8 @@ namespace Cnidaria.X86
             int offset,
             int size,
             X86ObjectSymbolBinding binding,
-            X86ObjectSymbolKind kind)
+            X86ObjectSymbolKind kind,
+            bool isTentative = false)
         {
             Name = name ?? string.Empty;
             SectionName = sectionName ?? string.Empty;
@@ -141,6 +146,7 @@ namespace Cnidaria.X86
             Size = Math.Max(0, size);
             Binding = binding;
             Kind = kind;
+            IsTentative = isTentative;
         }
     }
 
@@ -735,7 +741,7 @@ namespace Cnidaria.X86
             if (string.IsNullOrWhiteSpace(label))
                 throw new ArgumentException("x86 label must not be empty", nameof(label));
             if (_labels.ContainsKey(label))
-                throw new ArgumentException("Duplicate x86 label: " + label, nameof(label));
+                throw new ArgumentException($"Duplicate label: {label}", nameof(label));
             _labels.Add(label, Position);
         }
 
@@ -934,9 +940,9 @@ namespace Cnidaria.X86
             if (register == X86Register.Rip)
                 return "rip";
             if (IsXmm(register))
-                return "xmm" + Index(register).ToString(CultureInfo.InvariantCulture);
+                return $"xmm{Index(register)}";
             if (IsYmm(register))
-                return "ymm" + Index(register).ToString(CultureInfo.InvariantCulture);
+                return $"ymm{Index(register)}";
             if (!IsGeneral(register))
                 throw new ArgumentOutOfRangeException(nameof(register));
 
@@ -976,7 +982,7 @@ namespace Cnidaria.X86
         {
             if (TryParse(text, out var register, out size))
                 return register;
-            throw new FormatException("Invalid x86 register: " + text);
+            throw new FormatException($"Invalid register: {text}");
         }
 
         private static Dictionary<string, X86RegisterName> CreateNameMap()
@@ -991,8 +997,8 @@ namespace Cnidaria.X86
             }
             for (var i = 0; i < 16; i++)
             {
-                Add(map, "xmm" + i.ToString(CultureInfo.InvariantCulture), (X86Register)((int)X86Register.Xmm0 + i), 16);
-                Add(map, "ymm" + i.ToString(CultureInfo.InvariantCulture), (X86Register)((int)X86Register.Ymm0 + i), 32);
+                Add(map, $"xmm{i}", (X86Register)((int)X86Register.Xmm0 + i), 16);
+                Add(map, $"ymm{i}", (X86Register)((int)X86Register.Ymm0 + i), 32);
             }
             Add(map, "rip", X86Register.Rip, 8);
             return map;
@@ -1041,7 +1047,7 @@ namespace Cnidaria.X86
                 throw new ArgumentNullException(nameof(mnemonic));
             if (ByMnemonic.TryGetValue(mnemonic.Trim().ToLowerInvariant(), out var opcode))
                 return opcode;
-            throw new FormatException("Unknown x86 mnemonic: " + mnemonic);
+            throw new FormatException($"Unknown mnemonic: {mnemonic}");
         }
 
         public static bool TryGetOpcode(string mnemonic, out X86InstrKind opcode)
@@ -1455,7 +1461,7 @@ namespace Cnidaria.X86
         {
             if (TryParse(text, out var condition))
                 return condition;
-            throw new FormatException("Invalid x86 condition: " + text);
+            throw new FormatException($"Invalid condition: {text}");
         }
 
         public static bool TryParseConditionalMnemonic(string mnemonic, string prefix, out X86Condition condition)

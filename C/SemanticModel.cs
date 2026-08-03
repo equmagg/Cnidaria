@@ -6,6 +6,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    /// <summary>Describes a semantic diagnostic and its source span</summary>
     public readonly struct SemanticDiagnostic : IDiagnostic
     {
         public DiagnosticSeverity Severity { get; }
@@ -20,18 +21,24 @@ namespace Cnidaria.C
             Position = position;
         }
 
+        /// <summary>Formats the diagnostic with its source location</summary>
         public string GetMessage(string source) => _message + $" {Position.ToString(source)}";
 
+        /// <summary>Creates an error diagnostic</summary>
         public static SemanticDiagnostic Error(string message, TextSpan position)
             => new SemanticDiagnostic(DiagnosticSeverity.Error, message, position);
 
+        /// <summary>Creates a warning diagnostic</summary>
         public static SemanticDiagnostic Warning(string message, TextSpan position)
             => new SemanticDiagnostic(DiagnosticSeverity.Warning, message, position);
 
+        /// <summary>Creates an informational diagnostic</summary>
         public static SemanticDiagnostic MessageInfo(string message, TextSpan position)
             => new SemanticDiagnostic(DiagnosticSeverity.Message, message, position);
     }
 
+    /// <summary>C syntax tree root</summary>
+    /// <remarks>Owns source text, and the parsed translation unit</remarks>
     public sealed class SyntaxTree
     {
         public string Text { get; }
@@ -50,6 +57,7 @@ namespace Cnidaria.C
             ParseResult = parseResult ?? throw new ArgumentNullException(nameof(parseResult));
         }
 
+        /// <summary>Parses source text</summary>
         public static SyntaxTree ParseText(string text, PreprocessorOptions? options = null)
         {
             var effectiveOptions = options ?? PreprocessorOptions.CreateDefault();
@@ -57,6 +65,7 @@ namespace Cnidaria.C
             return new SyntaxTree(text, effectiveOptions, parseResult);
         }
 
+        /// <summary>Parses source text with an in-memory include environment</summary>
         public static SyntaxTree ParseSource(
             string text,
             string? filePath = null,
@@ -79,6 +88,8 @@ namespace Cnidaria.C
             return ParseText(text, effectiveOptions);
         }
     }
+
+    /// <summary>Groups target and whole-compilation transformation options</summary>
     public sealed class CompilationOptions
     {
         public TargetInfo Target { get; }
@@ -95,6 +106,8 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an immutable set of syntax trees compiled for one target</summary>
+    /// <remarks>Declaration collection is lazy and shared by all semantic models from this instance</remarks>
     public sealed class Compilation
     {
         private readonly Lazy<SemanticState> _semanticState;
@@ -117,16 +130,23 @@ namespace Cnidaria.C
                 isThreadSafe: true);
         }
 
+        /// <summary>Gets the lazily collected declaration state</summary>
         internal SemanticState SemanticState => _semanticState.Value;
 
+        /// <summary>Gets the translation-unit scope shared by all syntax trees</summary>
         public Scope GlobalScope => SemanticState.GlobalScope;
 
+        /// <summary>Gets diagnostics produced while collecting declarations</summary>
         public ImmutableArray<SemanticDiagnostic> SemanticDiagnostics
             => SemanticState.Diagnostics;
+
+        /// <summary>Creates a single-source compilation for the selected target</summary>
         public static Compilation Create(
             string text,
             TargetInfo? target)
             => Create(text, null, new CompilationOptions(target));
+
+        /// <summary>Creates a single-source compilation</summary>
         public static Compilation Create(
             string text,
             string? assemblyName = null,
@@ -141,6 +161,7 @@ namespace Cnidaria.C
                 options);
         }
 
+        /// <summary>Creates a single-source compilation with an in-memory include environment</summary>
         public static Compilation CreateFromSource(
             string text,
             string? filePath = null,
@@ -171,6 +192,7 @@ namespace Cnidaria.C
                 options);
         }
 
+        /// <summary>Creates a compilation from pre-parsed syntax trees</summary>
         public static Compilation Create(
             IEnumerable<SyntaxTree> syntaxTrees,
             string? assemblyName = null,
@@ -185,6 +207,7 @@ namespace Cnidaria.C
                 options ?? new CompilationOptions());
         }
 
+        /// <summary>Creates a compilation with additional syntax trees</summary>
         public Compilation AddSyntaxTrees(params SyntaxTree[] syntaxTrees)
         {
             if (syntaxTrees is null)
@@ -196,6 +219,7 @@ namespace Cnidaria.C
                 Options);
         }
 
+        /// <summary>Creates a semantic view for a syntax tree in this compilation</summary>
         public SemanticModel GetSemanticModel(SyntaxTree syntaxTree)
         {
             if (syntaxTree is null)
@@ -207,6 +231,8 @@ namespace Cnidaria.C
             return new SemanticModel(this, syntaxTree);
         }
 
+        /// <summary>Collects syntax, declaration, and binding diagnostics</summary>
+        /// <remarks>Binding diagnostics are appended after the declaration diagnostics already present in each bound tree</remarks>
         public ImmutableArray<IDiagnostic> GetDiagnostics()
         {
             var builder = ImmutableArray.CreateBuilder<IDiagnostic>();
@@ -232,6 +258,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Provides semantic queries and lowering entry points for one syntax tree</summary>
     public sealed class SemanticModel
     {
         private readonly Compilation _compilation;
@@ -246,8 +273,14 @@ namespace Cnidaria.C
         public Compilation Compilation => _compilation;
         public SyntaxTree SyntaxTree => _syntaxTree;
         public TranslationUnitSyntax Root => _syntaxTree.Root;
+
+        /// <summary>Binds the syntax tree into a typed semantic tree</summary>
         public BoundTree GetBoundTree() => Binder.BindTree(this);
+
+        /// <summary>Lowers the bound tree into explicit control-flow form</summary>
         public GimpleTree GetGimpleTree() => GimpleTree.Lower(this);
+
+        /// <summary>Gets the symbol introduced by a declaration syntax node</summary>
         public Symbol? GetDeclaredSymbol(SyntaxNode node)
         {
             if (node is null)
@@ -256,6 +289,7 @@ namespace Cnidaria.C
             return _compilation.SemanticState.GetDeclaredSymbol(node);
         }
 
+        /// <summary>Gets the symbol referenced by an expression</summary>
         public Symbol? GetSymbolInfo(ExpressionSyntax expression)
         {
             if (expression is null)
@@ -264,6 +298,7 @@ namespace Cnidaria.C
             return _compilation.SemanticState.GetReferencedSymbol(expression);
         }
 
+        /// <summary>Gets the lexical scope associated with a syntax node</summary>
         public Scope? GetScope(SyntaxNode node)
         {
             if (node is null)
@@ -272,6 +307,7 @@ namespace Cnidaria.C
             return _compilation.SemanticState.GetScope(node);
         }
 
+        /// <summary>Looks up an ordinary identifier from the scope of a syntax node</summary>
         public Symbol? LookupOrdinaryName(string name, SyntaxNode context)
         {
             if (name is null)
@@ -282,6 +318,7 @@ namespace Cnidaria.C
             return GetScope(context)?.LookupOrdinary(name);
         }
 
+        /// <summary>Looks up a tag name from the scope of a syntax node</summary>
         public TagSymbol? LookupTag(string name, SyntaxNode context)
         {
             if (name is null)
@@ -293,6 +330,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Stores declaration, reference, and scope maps shared by semantic models</summary>
     internal sealed class SemanticState
     {
         private readonly Dictionary<SyntaxNode, Symbol> _declaredSymbols = new();
@@ -333,9 +371,11 @@ namespace Cnidaria.C
             => _scopes.TryGetValue(node, out var scope) ? scope : null;
     }
 
+    /// <summary>Describes the target-dependent signedness of plain char</summary>
     public enum CharSignedness : byte { Signed, Unsigned, ImplementationDefined }
 
 
+    /// <summary>Defines the size and alignment of a primitive target type</summary>
     public readonly struct PrimitiveLayout
     {
         public int Size { get; }
@@ -353,6 +393,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Defines target data layout, architecture, operating system, and features</summary>
     public sealed class TargetInfo
     {
         public static TargetInfo RegisterBytecode32 { get; } = CreateRegisterBytecode(pointerSize: 4);
@@ -361,7 +402,7 @@ namespace Cnidaria.C
         public static TargetInfo RiscV64 { get; } = ForArchitecture(TargetArchitectureKind.RiscV64);
         public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.I386);
         public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X86_64);
-        public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32, OperatingSystemKind.None, 
+        public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32, OperatingSystemKind.None,
             TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 | TargetArchitectureFeatures.ArmNeon);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
         public static TargetInfo Arm64Linux { get; } = ForArchitecture(TargetArchitectureKind.Arm64, OperatingSystemKind.Linux);
@@ -371,6 +412,8 @@ namespace Cnidaria.C
         public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux);
         public static TargetInfo Default => RegisterBytecode32;
 
+        /// <summary>Creates the canonical data model for an architecture and operating system</summary>
+        /// <remarks>Mandatory baseline features are added before the target layout is created</remarks>
         public static TargetInfo ForArchitecture(
             TargetArchitectureKind architecture,
             OperatingSystemKind operatingSystem = OperatingSystemKind.None,
@@ -379,10 +422,10 @@ namespace Cnidaria.C
             if (architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64)
                 features |= TargetArchitectureFeatures.X86Sse2;
             if (architecture == TargetArchitectureKind.Arm64)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32
                     | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture == TargetArchitectureKind.Arm32 && operatingSystem == OperatingSystemKind.Windows)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32
                     | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVM | TargetArchitectureFeatures.RiscVF | TargetArchitectureFeatures.RiscVA;
@@ -431,8 +474,12 @@ namespace Cnidaria.C
         public bool IsRiscV => Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;
         public bool IsX86 => Architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64;
         public bool IsArm => Architecture is TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
+
+        /// <summary>Tests whether every requested architecture feature is enabled</summary>
         public bool HasFeature(TargetArchitectureFeatures feature)
             => (ArchitectureFeatures & feature) == feature;
+
+        /// <summary>Creates an explicit target data layout</summary>
         public TargetInfo(
             int pointerSize,
             int pointerAlignment,
@@ -465,10 +512,10 @@ namespace Cnidaria.C
             if (architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64)
                 features |= TargetArchitectureFeatures.X86Sse2;
             if (architecture == TargetArchitectureKind.Arm64)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32
                     | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture == TargetArchitectureKind.Arm32 && operatingSystem == OperatingSystemKind.Windows)
-                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32 
+                features |= TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32
                     | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat;
             if (architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64)
                 features |= TargetArchitectureFeatures.RiscVM;
@@ -494,6 +541,8 @@ namespace Cnidaria.C
         }
 
 
+        /// <summary>Creates a target description with the supplied feature set</summary>
+        /// <remarks>The supplied set replaces optional features while the constructor restores mandatory baselines</remarks>
         public TargetInfo WithFeatures(TargetArchitectureFeatures features)
             => new TargetInfo(
                 PointerSize,
@@ -660,12 +709,16 @@ namespace Cnidaria.C
                 operatingSystem: OperatingSystemKind.Windows,
                  features: features);
 
+        /// <summary>Gets the storage size of a qualified type in bytes</summary>
         public int SizeOf(QualifiedType type)
             => SizeOf(type.Type);
 
+        /// <summary>Gets the required alignment of a qualified type in bytes</summary>
         public int AlignOf(QualifiedType type)
             => AlignOf(type.Type);
 
+        /// <summary>Gets the storage size of a type in bytes</summary>
+        /// <remarks>Incomplete arrays, functions, and incomplete tags have size zero</remarks>
         public int SizeOf(CType type)
         {
             if (type is null)
@@ -705,6 +758,8 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Gets the required alignment of a type in bytes</summary>
+        /// <remarks>Error and function types use alignment one to keep recovery paths total</remarks>
         public int AlignOf(CType type)
         {
             if (type is null)
@@ -831,6 +886,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies qualifiers applied to a type occurrence</summary>
     [Flags]
     public enum TypeQualifiers : byte
     {
@@ -841,6 +897,7 @@ namespace Cnidaria.C
         Atomic = 8
     }
 
+    /// <summary>Identifies the semantic category of a type</summary>
     public enum TypeKind : byte
     {
         Error,
@@ -854,6 +911,7 @@ namespace Cnidaria.C
         Vector
     }
 
+    /// <summary>Identifies a built-in scalar or void type</summary>
     public enum BuiltinTypeKind : byte
     {
         Void,
@@ -874,6 +932,7 @@ namespace Cnidaria.C
         LongDouble
     }
 
+    /// <summary>Pairs a semantic type with qualifiers applied at this occurrence</summary>
     public readonly struct QualifiedType
     {
         public CType Type { get; }
@@ -885,8 +944,10 @@ namespace Cnidaria.C
             Qualifiers = qualifiers;
         }
 
+        /// <summary>Gets whether the type represents semantic recovery</summary>
         public bool IsError => Type is CErrorType;
 
+        /// <summary>Formats the type and its qualifiers for diagnostics</summary>
         public string ToDisplayString()
         {
             if (Qualifiers == TypeQualifiers.None)
@@ -899,6 +960,7 @@ namespace Cnidaria.C
             => ToDisplayString();
     }
 
+    /// <summary>Base class for semantic types</summary>
     public abstract class CType
     {
         public abstract TypeKind Kind { get; }
@@ -908,6 +970,7 @@ namespace Cnidaria.C
             => ToDisplayString();
     }
 
+    /// <summary>Represents an invalid or unresolved type while preserving tree shape</summary>
     public sealed class CErrorType : CType
     {
         public static CErrorType Instance { get; } = new CErrorType();
@@ -922,6 +985,7 @@ namespace Cnidaria.C
             => "<error-type>";
     }
 
+    /// <summary>Represents a built-in scalar or void type</summary>
     public sealed class BuiltinType : CType
     {
         public BuiltinTypeKind BuiltinKind { get; }
@@ -975,6 +1039,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies a supported scalable vector built-in type</summary>
     public enum RVVectorTypeKind : byte
     {
         Bool64,
@@ -993,6 +1058,7 @@ namespace Cnidaria.C
         Float64M1
     }
 
+    /// <summary>Describes a scalable vector built-in and its element properties</summary>
     public sealed class RVVectorType : CType
     {
         public RVVectorTypeKind VectorKind { get; }
@@ -1030,6 +1096,7 @@ namespace Cnidaria.C
         public override string ToDisplayString()
             => BuiltinName;
 
+        /// <summary>Maps a vector built-in name to its semantic kind</summary>
         public static bool TryParseBuiltinName(string name, out RVVectorTypeKind kind)
         {
             kind = name switch
@@ -1058,6 +1125,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a pointer to a qualified type</summary>
     public sealed class PointerType : CType
     {
         public QualifiedType PointeeType { get; }
@@ -1073,6 +1141,8 @@ namespace Cnidaria.C
             => PointeeType.ToDisplayString() + "*";
     }
 
+    /// <summary>Represents an array with an optional constant length</summary>
+    /// <remarks>A null length denotes an incomplete array type</remarks>
     public sealed class ArrayType : CType
     {
         public QualifiedType ElementType { get; }
@@ -1090,6 +1160,8 @@ namespace Cnidaria.C
             => ElementType.ToDisplayString() + "[" + (Length.HasValue ? Length.Value.ToString() : string.Empty) + "]";
     }
 
+    /// <summary>Represents a function signature</summary>
+    /// <remarks>Parameter types are meaningful only when a prototype is present</remarks>
     public sealed class FunctionType : CType
     {
         public QualifiedType ReturnType { get; }
@@ -1124,8 +1196,10 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies the declaration category of a tag symbol</summary>
     public enum TagKind : byte { Struct, Union, Enum }
 
+    /// <summary>Represents a struct, union, or enum through its tag symbol</summary>
     public sealed class TagType : CType
     {
         public TagSymbol Symbol { get; }
@@ -1155,6 +1229,7 @@ namespace Cnidaria.C
             => Symbol.TagKind.ToString().ToLowerInvariant() + " " + Symbol.Name;
     }
 
+    /// <summary>Represents an enum through its tag symbol</summary>
     public sealed class EnumType : CType
     {
         public TagSymbol Symbol { get; }
@@ -1170,6 +1245,7 @@ namespace Cnidaria.C
             => "enum " + Symbol.Name;
     }
 
+    /// <summary>Provides canonical built-in types and factories for composite types</summary>
     public sealed class TypeCatalog
     {
         public static TypeCatalog Instance { get; } = new TypeCatalog();
@@ -1208,12 +1284,15 @@ namespace Cnidaria.C
 
         private TypeCatalog() { }
 
+        /// <summary>Creates a pointer type</summary>
         public PointerType PointerTo(QualifiedType pointee)
             => new PointerType(pointee);
 
+        /// <summary>Creates a complete or incomplete array type</summary>
         public ArrayType ArrayOf(QualifiedType elementType, long? length)
             => new ArrayType(elementType, length);
 
+        /// <summary>Creates a function type</summary>
         public FunctionType FunctionReturning(
             QualifiedType returnType,
             ImmutableArray<ParameterSymbol> parameters,
@@ -1223,6 +1302,7 @@ namespace Cnidaria.C
             return new FunctionType(returnType, parameters, hasPrototype, isVariadic);
         }
 
+        /// <summary>Gets a qualified canonical built-in type</summary>
         public QualifiedType Builtin(BuiltinTypeKind kind, TypeQualifiers qualifiers = TypeQualifiers.None)
         {
             switch (kind)
@@ -1264,6 +1344,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Gets a qualified canonical vector built-in type</summary>
         public QualifiedType RiscVVector(RVVectorTypeKind kind, TypeQualifiers qualifiers = TypeQualifiers.None)
         {
             var type = kind switch
@@ -1289,6 +1370,7 @@ namespace Cnidaria.C
     }
 
 
+    /// <summary>Stores ordinary identifiers, tags, and labels for one lexical scope</summary>
     public sealed class Scope
     {
         private readonly Dictionary<string, Symbol> _ordinarySymbols = new(StringComparer.Ordinal);
@@ -1308,6 +1390,7 @@ namespace Cnidaria.C
         public IEnumerable<TagSymbol> Tags => _tagSymbols.Values;
         public IEnumerable<LabelSymbol> Labels => _labelSymbols.Values;
 
+        /// <summary>Adds an ordinary symbol when the current scope has no matching name</summary>
         public bool TryDeclareOrdinary(Symbol symbol, out Symbol? existing)
         {
             if (symbol is null)
@@ -1320,6 +1403,7 @@ namespace Cnidaria.C
             return true;
         }
 
+        /// <summary>Replaces the ordinary symbol associated with its name in this scope</summary>
         public void ReplaceOrdinary(Symbol symbol)
         {
             if (symbol is null)
@@ -1328,6 +1412,7 @@ namespace Cnidaria.C
             _ordinarySymbols[symbol.Name] = symbol;
         }
 
+        /// <summary>Adds a tag when the current scope has no matching name</summary>
         public bool TryDeclareTag(TagSymbol symbol, out TagSymbol? existing)
         {
             if (symbol is null)
@@ -1340,6 +1425,7 @@ namespace Cnidaria.C
             return true;
         }
 
+        /// <summary>Adds a label when the current scope has no matching name</summary>
         public bool TryDeclareLabel(LabelSymbol symbol, out LabelSymbol? existing)
         {
             if (symbol is null)
@@ -1352,6 +1438,7 @@ namespace Cnidaria.C
             return true;
         }
 
+        /// <summary>Looks up an ordinary identifier through the parent chain</summary>
         public Symbol? LookupOrdinary(string name)
         {
             for (var scope = this; scope is not null; scope = scope.Parent)
@@ -1363,6 +1450,7 @@ namespace Cnidaria.C
             return null;
         }
 
+        /// <summary>Looks up a tag through the parent chain</summary>
         public TagSymbol? LookupTag(string name)
         {
             for (var scope = this; scope is not null; scope = scope.Parent)
@@ -1374,6 +1462,7 @@ namespace Cnidaria.C
             return null;
         }
 
+        /// <summary>Looks up a label through the parent chain</summary>
         public LabelSymbol? LookupLabel(string name)
         {
             for (var scope = this; scope is not null; scope = scope.Parent)

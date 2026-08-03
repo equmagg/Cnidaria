@@ -47,6 +47,7 @@ namespace Cnidaria.C
         private static readonly MachineRegister VecScratch3 = MachineRegister.V31;
 
         private readonly LirModule _module;
+        private readonly FileScopeLinkageMap _fileScopeLinkage;
         private readonly TargetInfo _target;
         private readonly RVTarget _machineTarget;
         private readonly LSRAOptions _allocationOptions;
@@ -54,6 +55,7 @@ namespace Cnidaria.C
         private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
         private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
+        private readonly Dictionary<string, string> _dataLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _stringLabels = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
         private readonly List<RVObjectSymbol> _symbols = new List<RVObjectSymbol>();
@@ -69,6 +71,7 @@ namespace Cnidaria.C
             RiscVCodeGeneratorOptions? options)
         {
             _module = module ?? throw new ArgumentNullException(nameof(module));
+            _fileScopeLinkage = FileScopeLinkageMap.Create(_module.SemanticModel);
             _target = module.SemanticModel.Compilation.Options.Target;
             if (_target.Architecture is not TargetArchitectureKind.RiscV32 and not TargetArchitectureKind.RiscV64)
                 throw new NotSupportedException("RISC-V C backend requires RiscV32 or RiscV64 target.");
@@ -159,11 +162,12 @@ namespace Cnidaria.C
                 var symbol = function.Symbol;
                 if (symbol is null || _functionLabels.ContainsKey(symbol))
                     continue;
+                if (_functionLabelsByName.ContainsKey(symbol.Name))
+                    throw new InvalidOperationException($"Duplicate definition of function '{symbol.Name}'.");
 
                 var label = CreateUniqueGlobalLabel(symbol.Name);
                 _functionLabels.Add(symbol, label);
-                if (!_functionLabelsByName.ContainsKey(symbol.Name))
-                    _functionLabelsByName.Add(symbol.Name, label);
+                _functionLabelsByName.Add(symbol.Name, label);
             }
         }
 
@@ -177,6 +181,8 @@ namespace Cnidaria.C
 
         private void EmitGlobalStorage()
         {
+            var groups = new Dictionary<string, List<LirGlobal>>(StringComparer.Ordinal);
+            var order = new List<string>();
             foreach (var global in _module.Globals)
             {
                 if (global.Symbol is null ||
@@ -188,36 +194,95 @@ namespace Cnidaria.C
                     continue;
                 }
 
-                if (global.StorageClass == StorageClass.Extern)
+                if (!groups.TryGetValue(global.Symbol.Name, out var declarations))
                 {
-                    AddExternalObjectSymbol(global.Symbol);
+                    declarations = new List<LirGlobal>();
+                    groups.Add(global.Symbol.Name, declarations);
+                    order.Add(global.Symbol.Name);
+                }
+                declarations.Add(global);
+            }
+
+            foreach (var name in order)
+            {
+                var declarations = groups[name];
+                var internalLinkage = _fileScopeLinkage.IsInternal(declarations[0].Symbol!);
+                LirGlobal? strongDefinition = null;
+                LirGlobal? tentativeDefinition = null;
+                var tentativeSize = -1;
+
+                foreach (var declaration in declarations)
+                {
+                    if (declaration.Initializer is not null)
+                    {
+                        if (strongDefinition is not null)
+                            throw new InvalidOperationException($"Duplicate definition of global object '{name}'.");
+                        strongDefinition = declaration;
+                        continue;
+                    }
+
+                    if (declaration.StorageClass == StorageClass.Extern)
+                        continue;
+
+                    var size = GetGlobalStorageSize(declaration.Type);
+                    if (tentativeDefinition is null || size > tentativeSize)
+                    {
+                        tentativeDefinition = declaration;
+                        tentativeSize = size;
+                    }
+                }
+
+                var definition = strongDefinition ?? tentativeDefinition;
+                if (definition is null)
+                {
+                    if (internalLinkage)
+                        throw new InvalidOperationException($"Undefined internal object '{name}'.");
+                    AddExternalObjectSymbol(declarations[0].Symbol!);
                     continue;
                 }
 
-                var size = Math.Max(1, _target.SizeOf(global.Type));
-                var alignment = Math.Max(1, _target.AlignOf(global.Type));
-                var label = CreateUniqueGlobalLabel(global.Symbol.Name);
-                _dataLabels[global.Symbol] = label;
-                var binding = global.StorageClass == StorageClass.Static ? RVObjectSymbolBinding.Local : RVObjectSymbolBinding.Global;
-
-                if (global.Initializer is null)
+                var label = CreateUniqueGlobalLabel(name);
+                _dataLabelsByName.Add(name, label);
+                foreach (var declaration in declarations)
                 {
-                    var offset = _bss.Allocate(size, alignment);
-                    _bss.DefineSymbol(label, offset, size, binding, _symbols);
-                    continue;
+                    if (declaration.Symbol is not null)
+                        _dataLabels[declaration.Symbol] = label;
                 }
 
-                var section = IsReadOnlyGlobal(global) ? _rodata : _data;
-                var symbolOffset = section.Align(alignment);
-                section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
-                var bytes = EmitInitializer(section, global.Type, global.Initializer, size);
-                if (bytes < size)
-                    section.EmitZero(size - bytes);
+                {
+                    var size = GetGlobalStorageSize(definition.Type);
+                    var alignment = Math.Max(1, _target.AlignOf(definition.Type));
+                    var binding = internalLinkage ? RVObjectSymbolBinding.Local : RVObjectSymbolBinding.Global;
+                    if (strongDefinition is null)
+                    {
+                        var offset = _bss.Allocate(size, alignment);
+                        _bss.DefineSymbol(
+                            label,
+                            offset,
+                            size,
+                            binding,
+                            _symbols,
+                            isTentative: !internalLinkage);
+                        continue;
+                    }
+
+                    var section = IsReadOnlyGlobal(definition) ? _rodata : _data;
+                    var symbolOffset = section.Align(alignment);
+                    section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
+                    var bytes = EmitInitializer(section, definition.Type, definition.Initializer!, size);
+                    if (bytes < size)
+                        section.EmitZero(size - bytes);
+                }
             }
         }
 
+        private int GetGlobalStorageSize(QualifiedType type)
+            => type.Type is ArrayType { Length: null } incompleteArray
+                ? Math.Max(1, _target.SizeOf(incompleteArray.ElementType))
+                : Math.Max(1, _target.SizeOf(type));
+
         private static bool IsReadOnlyGlobal(LirGlobal global)
-            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0 && global.StorageClass != StorageClass.Extern;
+            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0;
 
         private void AddExternalObjectSymbol(Symbol symbol)
         {
@@ -335,10 +400,14 @@ namespace Cnidaria.C
                     return functionLabel;
                 if (_functionLabelsByName.TryGetValue(function.Name, out functionLabel))
                     return functionLabel;
+                if (_fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
                 return CreateExternalLabel(function.Name);
             }
 
             if (_dataLabels.TryGetValue(symbol, out var dataLabel))
+                return dataLabel;
+            if (_dataLabelsByName.TryGetValue(symbol.Name, out dataLabel))
                 return dataLabel;
 
             return CreateExternalLabel(symbol.Name);
@@ -352,7 +421,7 @@ namespace Cnidaria.C
             var allocation = LinearScanRegisterAllocator.Allocate(function, _target, _allocationOptions);
             var blockLabels = new Dictionary<LirBlock, string>();
             foreach (var block in function.Blocks)
-                blockLabels.Add(block, CreateLocalLabel(label + "_" + block.Name));
+                blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
 
             var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
             var startOffset = _text.ByteLength;
@@ -361,7 +430,7 @@ namespace Cnidaria.C
             context.EmitBlocks();
             context.EmitTrap();
             var size = _text.ByteLength - startOffset;
-            var binding = function.Symbol.StorageClass == StorageClass.Static ? RVObjectSymbolBinding.Local : RVObjectSymbolBinding.Global;
+            var binding = _fileScopeLinkage.IsInternal(function.Symbol) ? RVObjectSymbolBinding.Local : RVObjectSymbolBinding.Global;
             _symbols.Add(new RVObjectSymbol(label, TextSectionName, startOffset, size, binding, RVObjectSymbolKind.Function));
         }
 
@@ -373,7 +442,7 @@ namespace Cnidaria.C
             var candidate = baseName;
             var suffix = 0;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++suffix).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++suffix)}";
             return candidate;
         }
 
@@ -385,10 +454,10 @@ namespace Cnidaria.C
 
         private string CreateLocalLabel(string prefix)
         {
-            var baseName = ".L" + SanitizeSymbolName(prefix);
+            var baseName = $".L{SanitizeSymbolName(prefix)}";
             var candidate = baseName;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++_nextLocalId).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++_nextLocalId)}";
             return candidate;
         }
 
@@ -451,12 +520,14 @@ namespace Cnidaria.C
         {
             if (type.Type is EnumType)
                 return true;
-            return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short or BuiltinTypeKind.Int or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
+            return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short 
+                or BuiltinTypeKind.Int or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
         }
 
         private static bool IsUnsignedIntegerType(QualifiedType type)
         {
-            return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
+            return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar 
+                or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
         }
 
         private static bool IsIntegerLike(QualifiedType type)
@@ -864,7 +935,7 @@ namespace Cnidaria.C
                 }
 
                 var register = LoadOperand(operand, GpScratch0);
-                return "0(" + RVRegisters.Format(ToRegister(register)) + ")";
+                return $"0({RVRegisters.Format(ToRegister(register))})";
             }
 
             private string FormatRiscVAsmImmediate(LirOperand operand)
@@ -1108,7 +1179,7 @@ namespace Cnidaria.C
                         EmitImm(RVInstrKind.Sltiu, dst, src, 1);
                         break;
                     default:
-                        throw Unsupported(instruction, "Unsupported unary operator '" + instruction.Operator + "'.");
+                        throw Unsupported(instruction, $"Unsupported unary operator '{instruction.Operator}'.");
                 }
 
                 NormalizeIntegerRegister(dst, instruction.Result.Type);
@@ -2184,7 +2255,7 @@ namespace Cnidaria.C
                     return true;
                 }
 
-                var opcode = VectorIntrinsicOpcode(mnemonic + "_" + form);
+                var opcode = VectorIntrinsicOpcode($"{mnemonic}_{form}");
                 var accumulator = mnemonic is "vmadd" or "vnmsub" or "vmacc" or "vnmsac";
                 if (accumulator)
                     EmitVectorAccumulatorIntrinsic(instruction, opcode, form, elementWidth);
@@ -2614,6 +2685,8 @@ namespace Cnidaria.C
                     return true;
                 if (_owner._functionLabelsByName.TryGetValue(function.Name, out label!))
                     return true;
+                if (_owner._fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
 
                 label = _owner.CreateExternalLabel(function.Name);
                 _owner._symbols.Add(new RVObjectSymbol(label, string.Empty, 0, 0, RVObjectSymbolBinding.External, RVObjectSymbolKind.Function));
@@ -3099,7 +3172,7 @@ namespace Cnidaria.C
                         if (operand.StackSlot is null)
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
                         if (IsRiscVVectorType(operand.Type) && !IsVectorRegister(preferred))
                             preferred = VecScratch0;
                         else if (UsesHardwareFloating(operand.Type) && !IsFloatRegister(preferred))
@@ -3132,14 +3205,14 @@ namespace Cnidaria.C
                             MoveRegister(preferred, MachineRegister.X0);
                         return preferred;
                     default:
-                        throw new NotSupportedException("Cannot load LIR operand kind " + operand.Kind + " into a register.");
+                        throw new NotSupportedException($"Cannot load LIR operand kind {operand.Kind} into a register.");
                 }
             }
 
             private MachineRegister LoadVirtualRegister(LirVirtualRegister register, MachineRegister preferred)
             {
                 if (IsAggregateType(register.Type) || RequiresStackBackedScalar(register.Type))
-                    throw new NotSupportedException("Virtual register " + register.Name + " cannot be loaded as a single scalar register.");
+                    throw new NotSupportedException($"Virtual register {register.Name} cannot be loaded as a single scalar register.");
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return alloc.PhysicalRegister;
@@ -3155,7 +3228,7 @@ namespace Cnidaria.C
             private MachineRegister GetWritableRegister(LirVirtualRegister register, MachineRegister scratch)
             {
                 if (IsAggregateType(register.Type) || RequiresStackBackedScalar(register.Type))
-                    throw new NotSupportedException("Virtual register " + register.Name + " must be accessed through its storage address.");
+                    throw new NotSupportedException($"Virtual register {register.Name} must be accessed through its storage address.");
                 var alloc = _allocation[register];
                 if (alloc.IsSpilled && IsRiscVVectorType(register.Type) && !IsVectorRegister(scratch))
                     scratch = VecScratch0;
@@ -3167,7 +3240,7 @@ namespace Cnidaria.C
             private void StoreWritableRegisterIfSpilled(LirVirtualRegister register, MachineRegister source)
             {
                 if (IsAggregateType(register.Type) || RequiresStackBackedScalar(register.Type))
-                    throw new NotSupportedException("Virtual register " + register.Name + " must be stored with a block copy.");
+                    throw new NotSupportedException($"Virtual register {register.Name} must be stored with a block copy.");
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
                     return;
@@ -3178,7 +3251,7 @@ namespace Cnidaria.C
             {
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
-                    throw new NotSupportedException("Virtual register " + register.Name + " must be stack-backed.");
+                    throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
                 AddImmediate(destination, Sp, alloc.StackOffset);
                 return destination;
             }
@@ -3427,7 +3500,7 @@ namespace Cnidaria.C
                         var fieldBase = BuildAddress(address.BaseAddress, scratchBase, scratchIndex);
                         return new AddressParts(fieldBase.BaseRegister, checked(fieldBase.Offset + address.Displacement));
                     default:
-                        throw new NotSupportedException("Unsupported LIR address kind " + address.Kind + ".");
+                        throw new NotSupportedException($"Unsupported LIR address kind {address.Kind}.");
                 }
             }
 
@@ -4311,8 +4384,14 @@ namespace Cnidaria.C
                 return offset;
             }
 
-            public void DefineSymbol(string name, int offset, int size, RVObjectSymbolBinding binding, List<RVObjectSymbol> symbols)
-                => symbols.Add(new RVObjectSymbol(name, Name, offset, size, binding, RVObjectSymbolKind.Object));
+            public void DefineSymbol(
+                string name,
+                int offset,
+                int size,
+                RVObjectSymbolBinding binding,
+                List<RVObjectSymbol> symbols,
+                bool isTentative = false)
+                => symbols.Add(new RVObjectSymbol(name, Name, offset, size, binding, RVObjectSymbolKind.Object, isTentative));
 
             public RVDataSection ToSection()
                 => new RVDataSection(Name, RVObjectSectionKind.Bss, Alignment, ImmutableArray<byte>.Empty, ByteLength, ImmutableArray<RVObjectRelocation>.Empty);

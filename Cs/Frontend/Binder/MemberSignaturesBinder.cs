@@ -1,22 +1,21 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
 using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Binds member signatures, constants, optional defaults, and enum values</summary>
     internal static class MemberSignatureBinder
     {
+        // Discards semantic records created during signature binding
         private sealed class NullRecorder : IBindingRecorder
         {
             public static readonly NullRecorder Instance = new();
             public void RecordBound(SyntaxNode syntax, BoundNode bound) { }
             public void RecordDeclared(SyntaxNode syntax, Symbol symbol) { }
         }
+        // Minimal semantic model for declaration-level expression binding
         private sealed class SemanticModelStub : SemanticModel
         {
             public SemanticModelStub(Compilation c, SyntaxTree t)
@@ -41,6 +40,8 @@ namespace Cnidaria.Cs
             internal override BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default)
                 => throw new NotSupportedException();
         }
+        /// <summary>Binds all declared member types and deferred constant values</summary>
+        /// <remarks>Constant fields and optional defaults are evaluated after signature types are available</remarks>
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             var pendingConstFields = new List<PendingConstField>();
@@ -259,6 +260,7 @@ namespace Cnidaria.Cs
         }
 
 
+        /// <summary>Binds the synthesized delegate Invoke signature and optional defaults</summary>
         private static void BindDelegateSignature(
             Compilation compilation,
             SyntaxTree tree,
@@ -318,6 +320,7 @@ namespace Cnidaria.Cs
 
 
 
+        // Deferred constant field initializer with its binding context
         private readonly struct PendingConstField
         {
             public readonly SyntaxTree Tree;
@@ -340,6 +343,7 @@ namespace Cnidaria.Cs
                 StubModel = stubModel;
             }
         }
+        // Deferred optional parameter default with its binding context
         private readonly struct PendingOptionalParameter
         {
             public readonly SyntaxTree Tree;
@@ -365,6 +369,7 @@ namespace Cnidaria.Cs
                 StubModel = stubModel;
             }
         }
+        // Iterate until constant dependencies stop producing progress
         private static void BindPendingConstFields(
             Compilation compilation,
             List<PendingConstField> pendingConstFields,
@@ -452,6 +457,7 @@ namespace Cnidaria.Cs
             constantValueOpt = init.ConstantValueOpt;
             return true;
         }
+        // Optional defaults bind after constant fields have reached their final values
         private static void BindPendingOptionalParameters(
     Compilation compilation,
     List<PendingOptionalParameter> pending,
@@ -533,7 +539,7 @@ namespace Cnidaria.Cs
         }
         private static bool CanContainRefLikeField(FieldSymbol field)
         {
-            // Allowed only as instance field of a ref struct
+            // Ref-like fields are limited to instance fields of ref structs
             return field.ContainingSymbol is NamedTypeSymbol owner &&
                    owner.IsRefLikeType &&
                    !field.IsStatic;
@@ -548,7 +554,7 @@ namespace Cnidaria.Cs
             if (fieldType is ErrorTypeSymbol)
                 return;
 
-            // ref fields are only valid in instance fields of ref struct
+            // By-reference fields require an instance field in a ref struct
             if (fieldType is ByRefTypeSymbol && !CanContainRefLikeField(field))
             {
                 diagnostics.Add(new Diagnostic(
@@ -559,7 +565,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            // ref fields are only valid in instance fields of ref struct
+            // Ref-like field types require an instance field in a ref struct
             if (RefLikeRestrictionFacts.ContainsRefLike(fieldType) && !CanContainRefLikeField(field))
             {
                 diagnostics.Add(new Diagnostic(
@@ -569,7 +575,7 @@ namespace Cnidaria.Cs
                     new Location(tree, diagnosticNode.Span)));
             }
 
-            // instance fields of a readonly struct must be readonly
+            // Instance fields of a readonly struct must be readonly
             if (field.ContainingSymbol is NamedTypeSymbol ownerType &&
                 ownerType.IsReadOnlyStruct &&
                 !field.IsStatic &&
@@ -608,6 +614,7 @@ namespace Cnidaria.Cs
 
             return ctx.Compilation.CreateByRefType(baseType);
         }
+        // Enum underlying types must be known before member constants are converted
         private static void BindEnumUnderlyingTypesForTree(
             Compilation compilation,
             SyntaxTree tree,
@@ -663,6 +670,7 @@ namespace Cnidaria.Cs
                 enumType.SetEnumUnderlyingType(underlying);
             }
         }
+        // Implicit enum values advance from the previous successfully converted value
         private static void BindEnumMembersForTree(
             Compilation compilation,
             SyntaxTree tree,
@@ -879,6 +887,7 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Discards binding records for declaration-only passes</summary>
     internal sealed class NullRecorder : IBindingRecorder
     {
         public static readonly NullRecorder Instance = new();

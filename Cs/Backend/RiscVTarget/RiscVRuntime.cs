@@ -23,6 +23,8 @@ namespace Cnidaria.Cs
         public const string ArrayGetLengthSymbol = "RhpArrayGetLength";
         public const string ArrayClearSymbol = "RhpArrayClear";
         public const string ArrayCopySymbol = "RhpArrayCopy";
+        public const string FloatingRemainderSingleSymbol = "RhpFmodF";
+        public const string FloatingRemainderDoubleSymbol = "RhpFmod";
         public const string NewStringFromCharSymbol = "RhpNewStringFromChar";
         public const string NewStringFromUtf16Symbol = "RhpNewStringFromUtf16";
         public const string NewStringFromCharArraySymbol = "RhpNewStringFromCharArray";
@@ -71,11 +73,13 @@ namespace Cnidaria.Cs
             if (IsSystemType(method.DeclaringType, "Array"))
             {
                 if (method.HasThis &&
+                    !method.IsStatic &&
+                    method.ParameterTypes.Length == 0 &&
+                    method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
                     StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                    method.ParameterTypes.Length == 0)
-                {
+                    StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                    StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array"))
                     return ArrayGetLengthSymbol;
-                }
 
                 if (method.IsStatic &&
                     StringComparer.Ordinal.Equals(method.Name, "ClearInternal") &&
@@ -133,6 +137,26 @@ namespace Cnidaria.Cs
                     return ConsoleWriteStringSymbol;
                 if (IsReadOnlyCharSpan(parameter))
                     return ConsoleWriteUtf16Symbol;
+            }
+
+            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime.InteropServices") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Marshal") &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 1 &&
+                IsSystemType(method.ParameterTypes[0], "IntPtr"))
+            {
+                if (StringComparer.Ordinal.Equals(method.Name, "AllocHGlobal") &&
+                    IsSystemType(method.ReturnType, "IntPtr"))
+                {
+                    return AllocHGlobalSymbol;
+                }
+
+                if (StringComparer.Ordinal.Equals(method.Name, "FreeHGlobal") &&
+                    IsVoid(method.ReturnType))
+                {
+                    return FreeHGlobalSymbol;
+                }
             }
 
             throw new MissingMethodException(

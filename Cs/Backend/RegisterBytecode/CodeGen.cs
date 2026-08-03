@@ -1261,6 +1261,10 @@ namespace Cnidaria.Cs
                     case GenTreeKind.StoreIndirect:
                         EmitIndirect(instruction, source);
                         return;
+                    case GenTreeKind.NullCheck:
+                        EmitExplicitNullCheck(instruction);
+                        return;
+                    case GenTreeKind.ArrayLength:
                     case GenTreeKind.ArrayElement:
                     case GenTreeKind.ArrayElementAddr:
                     case GenTreeKind.StoreArrayElement:
@@ -3278,8 +3282,33 @@ namespace Cnidaria.Cs
 
             }
 
+            private void EmitExplicitNullCheck(GenTree instruction)
+            {
+                if (instruction.Uses.Length != 1 || instruction.Results.Length != 0 || !instruction.Uses[0].IsRegister)
+                    throw Unsupported(instruction, "Null check requires one register use and no result");
+                if ((instruction.Flags & GenTreeFlags.NullCheckEliminated) != 0)
+                    return;
+
+                byte register = RegisterVmIsa.EncodeRegister(instruction.Uses[0].Register);
+                _asm.Emit(new InstrDesc(
+                    Op.NullCheck,
+                    rd: register,
+                    rs1: register,
+                    aux: Aux.Instruction(InstructionFlags.MayThrow)));
+            }
+
             private void EmitArray(GenTree instruction, GenTree source)
             {
+                if (instruction.TreeKind == GenTreeKind.ArrayLength)
+                {
+                    _asm.Emit(new InstrDesc(
+                        Op.LdLen,
+                        RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                        aux: Aux.Instruction(InstructionFlags.MayThrow | NullCheckFlags(instruction))));
+                    return;
+                }
+
                 var elem = source.RuntimeType ?? source.Type ?? (source.Operands.Length != 0 ? source.Operands[0].Type?.ElementType : null);
                 int elemTypeLayout = -1;
                 if (instruction.TreeKind != GenTreeKind.ArrayDataRef)

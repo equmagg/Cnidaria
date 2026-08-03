@@ -903,7 +903,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal static class RiscVKernel
+    public static class RiscVKernel
     {
         public static string DefaultKernelSource => ReadKernelSource("kernel.c");
         public static readonly byte[] DefaultKernel = BuildDefaultKernelImage();

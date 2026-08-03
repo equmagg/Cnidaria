@@ -24,6 +24,7 @@ namespace Cnidaria.C
         private const string BssSectionName = ".bss";
 
         private readonly LirModule _module;
+        private readonly FileScopeLinkageMap _fileScopeLinkage;
         private readonly TargetInfo _target;
         private readonly X86Target _machineTarget;
         private readonly LSRAOptions _allocationOptions;
@@ -31,6 +32,7 @@ namespace Cnidaria.C
         private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
         private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
+        private readonly Dictionary<string, string> _dataLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _stringLabels = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _floatingLiteralLabels = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
@@ -45,6 +47,7 @@ namespace Cnidaria.C
         private X86CodeGenerator(LirModule module, LSRAOptions? allocationOptions, X86CodeGeneratorOptions? options)
         {
             _module = module ?? throw new ArgumentNullException(nameof(module));
+            _fileScopeLinkage = FileScopeLinkageMap.Create(_module.SemanticModel);
             _target = module.SemanticModel.Compilation.Options.Target;
             if (_target.Architecture is not TargetArchitectureKind.I386 and not TargetArchitectureKind.X86_64)
                 throw new NotSupportedException("x86 C backend requires X86 or X64 target.");
@@ -220,7 +223,7 @@ namespace Cnidaria.C
 
         private X86Operand ImportPointerOperand(string name)
         {
-            var symbol = "__imp_" + name;
+            var symbol = $"__imp_{name}";
             return _machineTarget.Is64Bit
                 ? X86Operand.RipRelative(symbol, 0, 8)
                 : X86Operand.Memory(X86Register.Invalid, 0, 4, X86Register.Invalid, 1, symbol, X86ObjectRelocationKind.Absolute32);
@@ -246,11 +249,12 @@ namespace Cnidaria.C
                 var symbol = function.Symbol;
                 if (symbol is null || _functionLabels.ContainsKey(symbol))
                     continue;
+                if (_functionLabelsByName.ContainsKey(symbol.Name))
+                    throw new InvalidOperationException($"Duplicate definition of function '{symbol.Name}'.");
 
                 var label = CreateUniqueGlobalLabel(symbol.Name);
                 _functionLabels.Add(symbol, label);
-                if (!_functionLabelsByName.ContainsKey(symbol.Name))
-                    _functionLabelsByName.Add(symbol.Name, label);
+                _functionLabelsByName.Add(symbol.Name, label);
             }
         }
 
@@ -264,39 +268,108 @@ namespace Cnidaria.C
 
         private void EmitGlobalStorage()
         {
+            var groups = new Dictionary<string, List<LirGlobal>>(StringComparer.Ordinal);
+            var order = new List<string>();
             foreach (var global in _module.Globals)
             {
-                if (global.Symbol is null || global.StorageClass == StorageClass.Extern)
+                if (global.Symbol is null ||
+                    global.StorageClass == StorageClass.Typedef ||
+                    global.Symbol is TypeAliasSymbol ||
+                    global.Symbol is FunctionSymbol ||
+                    global.Type.Type is FunctionType)
                 {
-                    if (global.Symbol is not null)
-                        AddExternalObjectSymbol(global.Symbol);
                     continue;
                 }
 
-                var size = Math.Max(1, _target.SizeOf(global.Type));
-                var alignment = Math.Max(1, _target.AlignOf(global.Type));
-                var label = CreateUniqueGlobalLabel(global.Symbol.Name);
-                _dataLabels[global.Symbol] = label;
-                var binding = global.StorageClass == StorageClass.Static ? X86ObjectSymbolBinding.Local : X86ObjectSymbolBinding.Global;
-
-                if (global.Initializer is null)
+                if (!groups.TryGetValue(global.Symbol.Name, out var declarations))
                 {
-                    var offset = _bss.Allocate(size, alignment);
-                    _bss.DefineSymbol(label, offset, size, binding, _symbols);
+                    declarations = new List<LirGlobal>();
+                    groups.Add(global.Symbol.Name, declarations);
+                    order.Add(global.Symbol.Name);
+                }
+                declarations.Add(global);
+            }
+
+            foreach (var name in order)
+            {
+                var declarations = groups[name];
+                var internalLinkage = _fileScopeLinkage.IsInternal(declarations[0].Symbol!);
+                LirGlobal? strongDefinition = null;
+                LirGlobal? tentativeDefinition = null;
+                var tentativeSize = -1;
+
+                foreach (var declaration in declarations)
+                {
+                    if (declaration.Initializer is not null)
+                    {
+                        if (strongDefinition is not null)
+                            throw new InvalidOperationException($"Duplicate definition of global object '{name}'.");
+                        strongDefinition = declaration;
+                        continue;
+                    }
+
+                    if (declaration.StorageClass == StorageClass.Extern)
+                        continue;
+
+                    var size = GetGlobalStorageSize(declaration.Type);
+                    if (tentativeDefinition is null || size > tentativeSize)
+                    {
+                        tentativeDefinition = declaration;
+                        tentativeSize = size;
+                    }
+                }
+
+                var definition = strongDefinition ?? tentativeDefinition;
+                if (definition is null)
+                {
+                    if (internalLinkage)
+                        throw new InvalidOperationException($"Undefined internal object '{name}'.");
+                    AddExternalObjectSymbol(declarations[0].Symbol!);
                     continue;
                 }
 
-                var section = IsReadOnlyGlobal(global) ? _rodata : _data;
-                var symbolOffset = section.Align(alignment);
-                section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
-                var bytes = EmitInitializer(section, global.Type, global.Initializer, size);
-                if (bytes < size)
-                    section.EmitZero(size - bytes);
+                var label = CreateUniqueGlobalLabel(name);
+                _dataLabelsByName.Add(name, label);
+                foreach (var declaration in declarations)
+                {
+                    if (declaration.Symbol is not null)
+                        _dataLabels[declaration.Symbol] = label;
+                }
+
+                {
+                    var size = GetGlobalStorageSize(definition.Type);
+                    var alignment = Math.Max(1, _target.AlignOf(definition.Type));
+                    var binding = internalLinkage ? X86ObjectSymbolBinding.Local : X86ObjectSymbolBinding.Global;
+                    if (strongDefinition is null)
+                    {
+                        var offset = _bss.Allocate(size, alignment);
+                        _bss.DefineSymbol(
+                            label,
+                            offset,
+                            size,
+                            binding,
+                            _symbols,
+                            isTentative: !internalLinkage);
+                        continue;
+                    }
+
+                    var section = IsReadOnlyGlobal(definition) ? _rodata : _data;
+                    var symbolOffset = section.Align(alignment);
+                    section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
+                    var bytes = EmitInitializer(section, definition.Type, definition.Initializer!, size);
+                    if (bytes < size)
+                        section.EmitZero(size - bytes);
+                }
             }
         }
 
+        private int GetGlobalStorageSize(QualifiedType type)
+            => type.Type is ArrayType { Length: null } incompleteArray
+                ? Math.Max(1, _target.SizeOf(incompleteArray.ElementType))
+                : Math.Max(1, _target.SizeOf(type));
+
         private static bool IsReadOnlyGlobal(LirGlobal global)
-            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0 && global.StorageClass != StorageClass.Extern;
+            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0;
 
         private void AddExternalObjectSymbol(Symbol symbol)
             => AddExternalSymbol(symbol.Name, X86ObjectSymbolKind.Object);
@@ -420,11 +493,15 @@ namespace Cnidaria.C
                     return functionLabel;
                 if (_functionLabelsByName.TryGetValue(function.Name, out functionLabel))
                     return functionLabel;
+                if (_fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
                 AddExternalFunctionSymbol(function);
                 return CreateExternalLabel(function.Name);
             }
 
             if (_dataLabels.TryGetValue(symbol, out var dataLabel))
+                return dataLabel;
+            if (_dataLabelsByName.TryGetValue(symbol.Name, out dataLabel))
                 return dataLabel;
 
             AddExternalObjectSymbol(symbol);
@@ -439,7 +516,7 @@ namespace Cnidaria.C
             var allocation = LinearScanRegisterAllocator.Allocate(function, _target, _allocationOptions);
             var blockLabels = new Dictionary<LirBlock, string>();
             foreach (var block in function.Blocks)
-                blockLabels.Add(block, CreateLocalLabel(label + "_" + block.Name));
+                blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
 
             var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
             var startOffset = _text.ByteLength;
@@ -448,7 +525,7 @@ namespace Cnidaria.C
             context.EmitBlocks();
             context.EmitEpilogue();
             var size = _text.ByteLength - startOffset;
-            var binding = function.Symbol.StorageClass == StorageClass.Static ? X86ObjectSymbolBinding.Local : X86ObjectSymbolBinding.Global;
+            var binding = _fileScopeLinkage.IsInternal(function.Symbol) ? X86ObjectSymbolBinding.Local : X86ObjectSymbolBinding.Global;
             _symbols.Add(new X86ObjectSymbol(label, TextSectionName, startOffset, size, binding, X86ObjectSymbolKind.Function));
         }
 
@@ -460,7 +537,7 @@ namespace Cnidaria.C
             var candidate = baseName;
             var suffix = 0;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++suffix).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++suffix)}";
             return candidate;
         }
 
@@ -475,7 +552,7 @@ namespace Cnidaria.C
             var baseName = ".L" + SanitizeSymbolName(prefix);
             var candidate = baseName;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++_nextLocalId).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++_nextLocalId)}";
             return candidate;
         }
 
@@ -500,14 +577,14 @@ namespace Cnidaria.C
             {
                 var bytes = BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture));
                 var bits = BitConverter.ToUInt32(bytes, 0);
-                return CreateReadOnlyBytesLiteral("fp32:" + bits.ToString("X8", CultureInfo.InvariantCulture), bytes, 4, "fp32");
+                return CreateReadOnlyBytesLiteral($"fp32:{bits:X8}", bytes, 4, "fp32");
             }
 
             if (IsFloat64(type))
             {
                 var bytes = BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture));
                 var bits = BitConverter.ToUInt64(bytes, 0);
-                return CreateReadOnlyBytesLiteral("fp64:" + bits.ToString("X16", CultureInfo.InvariantCulture), bytes, 8, "fp64");
+                return CreateReadOnlyBytesLiteral($"fp64:{bits:X16}", bytes, 8, "fp64");
             }
 
             throw new NotSupportedException("x86 backend does not support long double literals.");
@@ -518,11 +595,11 @@ namespace Cnidaria.C
             if (IsFloat32(type))
             {
                 var narrowed = unchecked((uint)bits);
-                return CreateReadOnlyBytesLiteral("fp32bits:" + narrowed.ToString("X8", CultureInfo.InvariantCulture), BitConverter.GetBytes(narrowed), 4, "fp32bits");
+                return CreateReadOnlyBytesLiteral($"fp32bits:{narrowed:X8}", BitConverter.GetBytes(narrowed), 4, "fp32bits");
             }
 
             if (IsFloat64(type))
-                return CreateReadOnlyBytesLiteral("fp64bits:" + bits.ToString("X16", CultureInfo.InvariantCulture), BitConverter.GetBytes(bits), 8, "fp64bits");
+                return CreateReadOnlyBytesLiteral($"fp64bits:{bits:X16}", BitConverter.GetBytes(bits), 8, "fp64bits");
 
             throw new NotSupportedException("x86 backend does not support long double literals.");
         }
@@ -738,7 +815,7 @@ namespace Cnidaria.C
             private X86Operand SavedRegisterStackSlot(MachineRegister register)
             {
                 if (!_allocation.Frame.SavedRegisterOffsets.TryGetValue(register, out var offset))
-                    throw new InvalidOperationException("Missing saved-register stack slot for " + register + ".");
+                    throw new InvalidOperationException($"Missing saved-register stack slot for {register}.");
 
                 return Mem(X86Register.Rsp, offset, 16);
             }
@@ -1118,7 +1195,7 @@ namespace Cnidaria.C
                     var fixedRegister = TryGetX86ConstraintRegister(input.Operand.Constraint, input.Type);
                     if (!fixedRegister.HasValue)
                         continue;
-                    AssignX86AsmInputRegister(input, fixedRegister.Value, usedInputs, earlyClobbers, clobbers, instruction);
+                    AssignX86AsmInputRegister(input, fixedRegister.Value, usedInputs, earlyClobbers, instruction);
                 }
 
                 foreach (var input in inputs)
@@ -1133,7 +1210,7 @@ namespace Cnidaria.C
                     var selected = SelectX86AsmRegister(candidates, preferred, clobbers, earlyClobbers, usedInputs.Keys);
                     if (selected == X86Register.Invalid)
                         throw Unsupported(instruction, $"Cannot satisfy inline assembly input constraint '{input.Operand.Constraint}'.");
-                    AssignX86AsmInputRegister(input, selected, usedInputs, earlyClobbers, clobbers, instruction);
+                    AssignX86AsmInputRegister(input, selected, usedInputs, earlyClobbers, instruction);
                 }
             }
 
@@ -1156,11 +1233,8 @@ namespace Cnidaria.C
                 X86Register register,
                 Dictionary<X86Register, X86AsmRegisterBinding> usedInputs,
                 HashSet<X86Register> earlyClobbers,
-                HashSet<X86Register> clobbers,
                 LirInstruction instruction)
             {
-                if (clobbers.Contains(register))
-                    throw Unsupported(instruction, $"Inline assembly input register {X86Registers.Format(register, _wordSize)} is also listed as clobbered.");
                 if (earlyClobbers.Contains(register))
                     throw Unsupported(instruction, $"Inline assembly input overlaps early-clobber output register {X86Registers.Format(register, _wordSize)}.");
                 input.Register = register;
@@ -1615,10 +1689,10 @@ namespace Cnidaria.C
             {
                 var stackPointer = X86Registers.Format(X86Register.Rsp, _wordSize);
                 if (offset == 0)
-                    return "[" + stackPointer + "]";
+                    return $"[{stackPointer}]";
                 return offset < 0
-                    ? "[" + stackPointer + " - " + (-offset).ToString(CultureInfo.InvariantCulture) + "]"
-                    : "[" + stackPointer + " + " + offset.ToString(CultureInfo.InvariantCulture) + "]";
+                    ? $"[{stackPointer} - {(-offset)}]"
+                    : $"[{stackPointer} + {offset}]";
             }
 
             private string FormatX86AsmImmediate(LirOperand operand, LirInstruction instruction)
@@ -4227,7 +4301,7 @@ namespace Cnidaria.C
                             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(scratch, _wordSize), Imm(address.Displacement)));
                         return scratch;
                     default:
-                        throw Unsupported(instruction, "Unsupported LIR address kind: " + address.Kind + ".");
+                        throw Unsupported(instruction, $"Unsupported LIR address kind: {address.Kind}.");
                 }
             }
 
@@ -4280,7 +4354,7 @@ namespace Cnidaria.C
                     case LirOperandKind.None:
                         return Imm(0);
                     default:
-                        throw Unsupported(instruction, "Unsupported operand kind: " + operand.Kind + ".");
+                        throw Unsupported(instruction, $"Unsupported operand kind: {operand.Kind}.");
                 }
             }
 
@@ -4579,7 +4653,7 @@ namespace Cnidaria.C
                     MachineRegister.X3 => X86Register.Rbx,
                     MachineRegister.X4 => X86Register.Rsi,
                     MachineRegister.X5 => X86Register.Rdi,
-                    _ => throw new NotSupportedException("Unsupported i386 machine register: " + register + "."),
+                    _ => throw new NotSupportedException($"Unsupported i386 machine register: {register}."),
                 };
             }
 
@@ -4601,7 +4675,7 @@ namespace Cnidaria.C
                     MachineRegister.X12 => X86Register.R13,
                     MachineRegister.X13 => X86Register.R14,
                     MachineRegister.X14 => X86Register.R15,
-                    _ => throw new NotSupportedException("Unsupported Windows x64 machine register: " + register + "."),
+                    _ => throw new NotSupportedException($"Unsupported Windows x64 machine register: {register}."),
                 };
             }
 
@@ -4621,7 +4695,7 @@ namespace Cnidaria.C
                 MachineRegister.X12 => X86Register.R13,
                 MachineRegister.X13 => X86Register.R14,
                 MachineRegister.X14 => X86Register.R15,
-                _ => throw new NotSupportedException("Unsupported SysV x64 machine register: " + register + "."),
+                _ => throw new NotSupportedException($"Unsupported SysV x64 machine register: {register}."),
             };
         }
 
@@ -4797,8 +4871,14 @@ namespace Cnidaria.C
                 return offset;
             }
 
-            public void DefineSymbol(string name, int offset, int size, X86ObjectSymbolBinding binding, List<X86ObjectSymbol> symbols)
-                => symbols.Add(new X86ObjectSymbol(name, Name, offset, size, binding, X86ObjectSymbolKind.Object));
+            public void DefineSymbol(
+                string name,
+                int offset,
+                int size,
+                X86ObjectSymbolBinding binding,
+                List<X86ObjectSymbol> symbols,
+                bool isTentative = false)
+                => symbols.Add(new X86ObjectSymbol(name, Name, offset, size, binding, X86ObjectSymbolKind.Object, isTentative));
 
             public X86DataSection ToSection()
                 => new X86DataSection(Name, X86ObjectSectionKind.Bss, Alignment, ImmutableArray<byte>.Empty, ByteLength, ImmutableArray<X86ObjectRelocation>.Empty);

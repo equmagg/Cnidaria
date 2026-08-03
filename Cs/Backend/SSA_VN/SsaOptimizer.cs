@@ -4,7 +4,7 @@ using System.Collections.Immutable;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class SsaOptimizationOptions
+    public sealed class SsaOptimizationOptions
     {
         public static SsaOptimizationOptions Default => new SsaOptimizationOptions();
         public static SsaOptimizationOptions DefaultWithoutValidation => new SsaOptimizationOptions { Validate = false };
@@ -12,7 +12,7 @@ namespace Cnidaria.Cs
         public bool Validate { get; set; } = true;
         public bool EnableConstantPropagation { get; set; } = true;
         public bool EnableConstantFolding { get; set; } = true;
-        public bool EnableDeadDefinitionsElimination { get; set; } = true;
+        public bool EnableDeadStoreRemoval { get; set; } = true;
         public bool EnableCopyPropagation { get; set; } = true;
         public bool EnableCommonSubexpressionElimination { get; set; } = true;
         public bool EnableLoopInvariantCodeMotion { get; set; } = true;
@@ -23,7 +23,7 @@ namespace Cnidaria.Cs
         public int MaxBranchOptimizationPasses { get; set; } = 4;
         public int MaxLoopHoistsPerLoop { get; set; } = 16;
         public int LoopHoistMinCost { get; set; } = 2;
-        public int MaxIterations { get; set; } = 8;
+        public int MaxScalarCleanupPasses { get; set; } = 8;
     }
     internal static class SsaOptimizer
     {
@@ -33,8 +33,6 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(method));
 
             options ??= SsaOptimizationOptions.Default;
-            if (options.MaxIterations <= 0)
-                return method;
 
             var optimizer = new MethodOptimizer(method, options);
             var result = optimizer.Run();
@@ -146,7 +144,7 @@ namespace Cnidaria.Cs
 
             public SsaMethod Run()
             {
-                var current = RunScalarOptimizationFixedPoint(_original);
+                var current = EnsureValueNumbers(_original);
                 bool hoistingChanged = false;
 
                 if (_options.EnableLoopInvariantCodeMotion && _options.EnableCommonSubexpressionElimination)
@@ -157,6 +155,19 @@ namespace Cnidaria.Cs
                     current = EnsureValueNumbers(hoisting.Method);
                 }
 
+                if (_options.EnableCopyPropagation)
+                    current = RunCopyPropagation(current);
+
+                if ((_options.EnableRedundantBranchOptimization ||
+                     _options.EnableBranchJumpThreading ||
+                     _options.EnableDeadCodeElimination) &&
+                    _options.MaxBranchOptimizationPasses > 0)
+                {
+                    var flow = OptimizeRedundantBranches(current);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, flow.NextSyntheticTreeId);
+                    current = flow.Method;
+                }
+
                 if (_options.EnableCommonSubexpressionElimination)
                 {
                     var cse = SsaCommonSubexpressionEliminator.OptimizeMethod(current, _options, _nextSyntheticTreeId);
@@ -165,18 +176,34 @@ namespace Cnidaria.Cs
 
                     if (hoistingChanged && ContainsMakeCse(current))
                         current = RemoveUnresolvedLoopHoists(current);
-
-                    current = cse.Changed || hoistingChanged
-                        ? RunScalarOptimizationFixedPoint(current)
-                        : EnsureValueNumbers(current);
                 }
 
+                bool assertionPropagationChanged = false;
                 if (_options.EnableAssertionPropagation)
                 {
                     var assertions = SsaAssertionPropagator.OptimizeMethod(current, _nextSyntheticTreeId);
                     _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, assertions.NextSyntheticTreeId);
-                    if (assertions.Changed)
-                        current = RunScalarOptimizationFixedPoint(WithBlocks(current, assertions.Blocks));
+                    assertionPropagationChanged = assertions.Changed;
+                    if (assertionPropagationChanged)
+                        current = WithBlocks(current, assertions.Blocks);
+                }
+
+                bool scalarCleanupChanged = false;
+                if (_options.EnableConstantPropagation ||
+                    _options.EnableConstantFolding)
+                {
+                    current = RunScalarCleanupFixedPoint(current, out scalarCleanupChanged);
+                }
+
+                if ((assertionPropagationChanged || scalarCleanupChanged) &&
+                    (_options.EnableRedundantBranchOptimization ||
+                     _options.EnableBranchJumpThreading ||
+                     _options.EnableDeadCodeElimination) &&
+                    _options.MaxBranchOptimizationPasses > 0)
+                {
+                    var flow = OptimizeRedundantBranches(current);
+                    _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, flow.NextSyntheticTreeId);
+                    current = flow.Method;
                 }
 
                 return EnsureValueNumbers(current);
@@ -276,66 +303,41 @@ namespace Cnidaria.Cs
                 return clone;
             }
 
-            private SsaMethod RunScalarOptimizationFixedPoint(SsaMethod method)
+            private SsaMethod RunCopyPropagation(SsaMethod method)
             {
-                var current = EnsureValueNumbers(method);
+                method = EnsureValueNumbers(method);
+                var pointLiveness = SsaLocalLiveness.Build(method);
+                var copyPropagation = CopyPropagate(method, pointLiveness);
+                return copyPropagation.Changed
+                    ? EnsureValueNumbers(WithBlocks(method, copyPropagation.Blocks))
+                    : method;
+            }
 
-                for (int iteration = 0; iteration < _options.MaxIterations; iteration++)
+            private SsaMethod RunScalarCleanupFixedPoint(SsaMethod method, out bool changed)
+            {
+                changed = false;
+                var current = EnsureValueNumbers(method);
+                int maxPasses = Math.Max(0, _options.MaxScalarCleanupPasses);
+
+                for (int pass = 0; pass < maxPasses; pass++)
                 {
                     current = EnsureValueNumbers(current);
-
                     var pointLiveness = SsaLocalLiveness.Build(current);
-                    OptimizationResult copyProp = _options.EnableCopyPropagation
-                        ? CopyPropagate(current, pointLiveness)
-                        : new OptimizationResult(current.Blocks, changed: false);
-
-                    var afterCopyProp = copyProp.Changed
-                        ? EnsureValueNumbers(WithBlocks(current, copyProp.Blocks))
+                    var facts = ComputeFacts(current);
+                    var rewrite = Rewrite(current, facts, pointLiveness);
+                    var afterRewrite = rewrite.Changed
+                        ? WithBlocks(current, rewrite.Blocks)
                         : current;
 
-                    pointLiveness = SsaLocalLiveness.Build(afterCopyProp);
-                    var facts = ComputeFacts(afterCopyProp);
-                    var rewrite = Rewrite(afterCopyProp, facts, pointLiveness);
-                    var afterRewrite = rewrite.Changed
-                        ? WithBlocks(afterCopyProp, rewrite.Blocks)
-                        : afterCopyProp;
+                    if (!rewrite.Changed)
+                        return EnsureValueNumbers(afterRewrite);
 
-                    OptimizationResult dce = _options.EnableDeadDefinitionsElimination
-                        ? EliminateDeadDefinitions(afterRewrite)
-                        : new OptimizationResult(afterRewrite.Blocks, changed: false);
-
-                    var next = dce.Changed
-                        ? WithBlocks(afterRewrite, dce.Blocks)
-                        : afterRewrite;
-                    bool changed = copyProp.Changed || rewrite.Changed || dce.Changed;
-
-                    if ((_options.EnableRedundantBranchOptimization || _options.EnableBranchJumpThreading || _options.EnableDeadCodeElimination) &&
-                        _options.MaxBranchOptimizationPasses > 0)
-                    {
-                        next = EnsureValueNumbers(next);
-                        var flow = OptimizeRedundantBranches(next);
-                        _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, flow.NextSyntheticTreeId);
-                        if (flow.Changed)
-                        {
-                            current = flow.Method;
-                            continue;
-                        }
-
-                        next = flow.Method;
-                    }
-
-                    if (!changed)
-                    {
-                        current = EnsureValueNumbers(next);
-                        break;
-                    }
-
-                    current = EnsureValueNumbers(next);
+                    changed = true;
+                    current = afterRewrite;
                 }
 
                 return EnsureValueNumbers(current);
             }
-
 
 
 
@@ -384,17 +386,7 @@ namespace Cnidaria.Cs
             }
 
             private SsaMethod RebuildSsaAfterFlowRewrite(SsaMethod previous, GenTreeMethod rewritten)
-            {
-                bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
-                var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
-                rewritten.AttachFlowGraph(cfg);
-
-                var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
-                rewritten.AttachHirLiveness(liveness);
-
-                var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
-                return EnsureValueNumbers(rebuilt);
-            }
+                => RebuildSsaAfterGenTreeRewrite(previous, rewritten);
 
             private static bool HasExceptionEdges(ControlFlowGraph cfg)
             {
@@ -2461,7 +2453,7 @@ namespace Cnidaria.Cs
                         BytecodeOp.Pop,
                         null,
                         GenStackKind.Void,
-                        operand.Flags & ~GenTreeFlags.AssertionProperties,
+                        operand.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit),
                         ImmutableArray.Create(operand));
 
                 private GenTree CloneTreeWithTarget(GenTree tree, int targetBlockId)
@@ -3420,9 +3412,6 @@ namespace Cnidaria.Cs
                        leftVn == rightVn;
             }
 
-            private static bool IsGcOrManagedPointerKind(GenStackKind stackKind)
-                => stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null;
-
             private static bool CanReplaceWithConstant(GenTree template, ConstValue constant)
             {
                 if (template.CanThrow)
@@ -3699,211 +3688,6 @@ namespace Cnidaria.Cs
                     CollectReplacementLocalUses(tree.Operands[i], slots);
             }
 
-            private OptimizationResult EliminateDeadDefinitions(SsaMethod method)
-            {
-                var live = ComputeLiveValues(method);
-                bool changed = false;
-                var blocks = ImmutableArray.CreateBuilder<SsaBlock>(method.Blocks.Length);
-
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var block = method.Blocks[b];
-                    var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
-                    phis.AddRange(block.Phis);
-
-                    var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
-                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
-                    for (int s = 0; s < block.Statements.Length; s++)
-                    {
-                        var statement = block.Statements[s];
-                        var oldTreeList = block.StatementTreeLists[s];
-                        if (statement.StoreTarget.HasValue && !live.Contains(statement.StoreTarget.Value))
-                        {
-                            if (MustPreserveDeadStore(statement.StoreTarget.Value))
-                            {
-                                statements.Add(statement);
-                                statementTreeLists.Add(oldTreeList);
-                                continue;
-                            }
-
-                            var sideEffects = ExtractSideEffects(statement);
-                            if (sideEffects is not null)
-                            {
-                                statements.Add(sideEffects);
-                                statementTreeLists.Add(ProjectReachableTreeList(sideEffects, oldTreeList.Add(sideEffects)));
-                            }
-                            changed = true;
-                            continue;
-                        }
-
-                        if (!statement.StoreTarget.HasValue && !HasObservableEffect(statement))
-                        {
-                            changed = true;
-                            continue;
-                        }
-
-                        statements.Add(statement);
-                        statementTreeLists.Add(oldTreeList);
-                    }
-
-                    blocks.Add(new SsaBlock(
-                        block.CfgBlock,
-                        phis.ToImmutable(),
-                        statements.ToImmutable(),
-                        block.MemoryPhis,
-                        block.MemoryIn,
-                        block.MemoryOut,
-                        statementTreeLists: statementTreeLists.ToImmutable()));
-                }
-
-                return new OptimizationResult(blocks.ToImmutable(), changed);
-            }
-
-            private bool MustPreserveDeadStore(SsaValueName target)
-            {
-                if (!_slotInfos.TryGetValue(target.Slot, out var info))
-                    return true;
-
-                if (IsGcOrManagedPointerKind(info.StackKind))
-                    return true;
-
-                var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, _target);
-                return abi.ContainsGcPointers;
-            }
-
-            private HashSet<SsaValueName> ComputeLiveValues(SsaMethod method)
-            {
-                var phiDefs = new Dictionary<SsaValueName, SsaPhi>();
-                var storeDefs = new Dictionary<SsaValueName, SsaTree>();
-
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var block = method.Blocks[b];
-                    for (int p = 0; p < block.Phis.Length; p++)
-                        phiDefs[block.Phis[p].Target] = block.Phis[p];
-                    for (int s = 0; s < block.Statements.Length; s++)
-                        CollectStoreDefinitions(block.Statements[s], storeDefs);
-                }
-
-                var useDefByDef = new Dictionary<SsaValueName, SsaValueName>();
-                for (int i = 0; i < method.ValueDefinitions.Length; i++)
-                {
-                    var descriptor = method.ValueDefinitions[i].Descriptor;
-                    if (descriptor.HasUseDefSsaNum)
-                        useDefByDef[descriptor.Name] = new SsaValueName(descriptor.BaseLocal, descriptor.UseDefSsaNumber);
-                }
-
-                var live = new HashSet<SsaValueName>();
-                var work = new Queue<SsaValueName>();
-
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var statements = method.Blocks[b].Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                    {
-                        var statement = statements[s];
-                        if (statement.StoreTarget.HasValue)
-                        {
-                            if (StoreRhsHasObservableEffect(statement))
-                                MarkUses(statement, live, work, includeStoreTarget: false);
-                        }
-                        else if (HasObservableEffect(statement))
-                        {
-                            MarkUses(statement, live, work, includeStoreTarget: false);
-                        }
-                    }
-                }
-
-                while (work.Count != 0)
-                {
-                    var value = work.Dequeue();
-                    if (storeDefs.TryGetValue(value, out var store))
-                    {
-                        if (useDefByDef.TryGetValue(value, out var useDef))
-                            MarkValue(useDef, live, work);
-                        MarkUses(store, live, work, includeStoreTarget: false);
-                        continue;
-                    }
-
-                    if (phiDefs.TryGetValue(value, out var phi))
-                    {
-                        for (int i = 0; i < phi.Inputs.Length; i++)
-                            MarkValue(phi.Inputs[i].Value, live, work);
-                    }
-                }
-
-                return live;
-            }
-
-            private void CollectStoreDefinitions(SsaTree tree, Dictionary<SsaValueName, SsaTree> storeDefs)
-            {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectStoreDefinitions(tree.Operands[i], storeDefs);
-
-                if (tree.StoreTarget.HasValue)
-                    storeDefs[tree.StoreTarget.Value] = tree;
-            }
-
-            private void MarkUses(SsaTree tree, HashSet<SsaValueName> live, Queue<SsaValueName> work, bool includeStoreTarget)
-            {
-                if (tree.Value.HasValue)
-                    MarkValue(tree.Value.Value, live, work);
-
-                if (tree.LocalFieldBaseValue.HasValue)
-                    MarkValue(tree.LocalFieldBaseValue.Value, live, work);
-
-                if (includeStoreTarget && tree.StoreTarget.HasValue)
-                    MarkValue(tree.StoreTarget.Value, live, work);
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    MarkUses(tree.Operands[i], live, work, includeStoreTarget: true);
-            }
-
-            private static void MarkValue(SsaValueName value, HashSet<SsaValueName> live, Queue<SsaValueName> work)
-            {
-                if (live.Add(value))
-                    work.Enqueue(value);
-            }
-
-            private SsaTree? ExtractSideEffects(SsaTree deadStore)
-            {
-                if (deadStore.Operands.Length == 0)
-                    return null;
-
-                if (deadStore.Operands.Length == 1)
-                {
-                    var operand = deadStore.Operands[0];
-                    if (!HasObservableEffect(operand))
-                        return null;
-
-                    var evalSource = CreateEvalTree(deadStore.Source, ImmutableArray.Create(operand));
-                    return new SsaTree(evalSource, ImmutableArray.Create(operand));
-                }
-
-                var sideEffects = ImmutableArray.CreateBuilder<SsaTree>(deadStore.Operands.Length);
-                for (int i = 0; i < deadStore.Operands.Length; i++)
-                {
-                    if (HasObservableEffect(deadStore.Operands[i]))
-                        sideEffects.Add(deadStore.Operands[i]);
-                }
-
-                if (sideEffects.Count == 0)
-                    return null;
-
-                var operands = sideEffects.ToImmutable();
-                return new SsaTree(CreateEvalTree(deadStore.Source, operands), operands);
-            }
-
-            private bool StoreRhsHasObservableEffect(SsaTree tree)
-            {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                {
-                    if (HasObservableEffect(tree.Operands[i]))
-                        return true;
-                }
-                return false;
-            }
-
             private bool HasObservableEffect(SsaTree tree)
             {
                 if (tree.HasMemoryEffects)
@@ -3942,6 +3726,17 @@ namespace Cnidaria.Cs
                               GenTreeFlags.Ordered)) != 0)
                     return true;
 
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (HasObservableEffect(tree.Operands[i]))
+                        return true;
+                }
+
+                return false;
+            }
+
+            private bool StoreRhsHasObservableEffect(SsaTree tree)
+            {
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
                     if (HasObservableEffect(tree.Operands[i]))
@@ -4276,27 +4071,6 @@ namespace Cnidaria.Cs
                         operands: ImmutableArray<GenTree>.Empty),
                     _ => throw new InvalidOperationException("Unknown SSA constant kind."),
                 };
-            }
-
-            private GenTree CreateEvalTree(GenTree template, ImmutableArray<SsaTree> operands)
-            {
-                var genOperands = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
-                GenTreeFlags flags = GenTreeFlags.None;
-                for (int i = 0; i < operands.Length; i++)
-                {
-                    genOperands.Add(operands[i].Source);
-                    flags |= operands[i].Source.Flags & ~GenTreeFlags.AssertionProperties;
-                }
-
-                return new GenTree(
-                    _nextSyntheticTreeId++,
-                    GenTreeKind.Eval,
-                    template.Pc,
-                    BytecodeOp.Pop,
-                    type: null,
-                    stackKind: GenStackKind.Void,
-                    flags: flags,
-                    operands: genOperands.ToImmutable());
             }
 
             private static bool TryGetSourceConstant(GenTree source, out ConstValue constant)
@@ -4757,6 +4531,8 @@ namespace Cnidaria.Cs
 
             private SsaMethod RebuildSsaAfterGenTreeRewrite(SsaMethod previous, GenTreeMethod rewritten)
             {
+                NormalizeTreeFlags(rewritten);
+
                 bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
                 var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
                 rewritten.AttachFlowGraph(cfg);
@@ -4766,6 +4542,16 @@ namespace Cnidaria.Cs
 
                 var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
                 return EnsureValueNumbers(rebuilt);
+            }
+
+            private static void NormalizeTreeFlags(GenTreeMethod method)
+            {
+                for (int b = 0; b < method.Blocks.Length; b++)
+                {
+                    var statements = method.Blocks[b].Statements;
+                    for (int s = 0; s < statements.Length; s++)
+                        GenTreeMorpher.NormalizeTreeFlags(statements[s], method.Target);
+                }
             }
 
             private static ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(ImmutableArray<GenTreeBlock> originalBlocks, ImmutableArray<SsaBlock> ssaBlocks)
@@ -4890,6 +4676,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Field => 4,
                 GenTreeKind.StaticField => 4,
                 GenTreeKind.LoadIndirect => 4,
+                GenTreeKind.ArrayLength => 2,
                 GenTreeKind.ArrayElement => 5,
                 GenTreeKind.StaticFieldAddr => 2,
                 GenTreeKind.FieldAddr => 2,
@@ -4907,7 +4694,9 @@ namespace Cnidaria.Cs
 
         private static bool IsMemoryReadCandidate(GenTree node)
         {
-            if (node.SsaMemoryUses.IsDefaultOrEmpty || !node.SsaMemoryDefinitions.IsDefaultOrEmpty)
+            if (!node.SsaMemoryDefinitions.IsDefaultOrEmpty)
+                return false;
+            if (node.Kind != GenTreeKind.ArrayLength && node.SsaMemoryUses.IsDefaultOrEmpty)
                 return false;
             if ((node.Flags & GenTreeFlags.MemoryRead) == 0)
                 return false;
@@ -4928,6 +4717,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Field => true,
                 GenTreeKind.StaticField => true,
                 GenTreeKind.LoadIndirect => true,
+                GenTreeKind.ArrayLength => true,
                 GenTreeKind.ArrayElement => true,
                 GenTreeKind.ArrayDataRef => true,
                 _ => false,

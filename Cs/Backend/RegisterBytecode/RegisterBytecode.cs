@@ -600,8 +600,6 @@ namespace Cnidaria.Cs
         ByRefToPtr = 775,
         PtrToByRef = 776,
         StaticData = 777,
-        AllocHGlobal = 778,
-        FreeHGlobal = 779,
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = RegisterVmIsa.InstructionSize)]
@@ -1392,10 +1390,10 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (inst.Op == Op.LdArrayDataAddr)
+            if (inst.Op is Op.LdLen or Op.LdArrayDataAddr)
             {
                 if (((InstructionFlags)inst.Aux & ~(InstructionFlags.MayThrow | InstructionFlags.NoNullCheck)) != 0)
-                    throw new InvalidOperationException($"Invalid array-data instruction flags at PC {pc}");
+                    throw new InvalidOperationException($"Invalid array metadata instruction flags at PC {pc}");
                 return;
             }
 
@@ -1822,11 +1820,7 @@ namespace Cnidaria.Cs
                 case Op.StaticData:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
                     return;
-                case Op.FreeHGlobal:
-                    RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
-                    return;
                 case Op.StackAlloc:
-                case Op.AllocHGlobal:
                 case Op.ByRefToPtr:
                 case Op.PtrToByRef:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
@@ -2245,9 +2239,16 @@ namespace Cnidaria.Cs
             if (_vTables.Count != 0)
                 return;
 
+            RuntimeTypeSystem? typeSystem = _rts;
+            if (_interfaceDispatchMethods.Count != 0 && typeSystem is null)
+                throw new InvalidOperationException("Interface dispatch table construction requires a runtime type system.");
+
             int classSlotCount = 0;
             for (int i = 0; i < _typeLayoutTypes.Count; i++)
+            {
+                typeSystem?.EnsureVirtualTable(_typeLayoutTypes[i]);
                 classSlotCount = Math.Max(classSlotCount, Math.Max(0, _typeLayoutTypes[i].VTable.Length));
+            }
 
             for (int i = 0; i < _interfaceDispatchMethods.Count; i++)
             {
@@ -2283,22 +2284,14 @@ namespace Cnidaria.Cs
                     else
                     {
                         RuntimeMethod declared = _interfaceDispatchMethods[slot - classSlotCount];
-                        target = ResolveInterfaceDispatchTarget(type, declared);
+                        target = typeSystem!.ResolveVirtualMethod(declared, type);
                     }
 
                     int targetPc = -1;
                     if (target is not null)
                     {
                         if (methodEntryPcById.TryGetValue(target.MethodId, out int pc))
-                        {
                             targetPc = pc;
-                        }
-                        else
-                        {
-                            RuntimeMethod projected = ProjectRuntimeMethodToOwner(type, target);
-                            if (methodEntryPcById.TryGetValue(projected.MethodId, out pc))
-                                targetPc = pc;
-                        }
                     }
 
                     _vTables.Add(new VTableSlotRecord(targetPc));
@@ -2329,217 +2322,6 @@ namespace Cnidaria.Cs
             if (_interfaceDispatchSlotByMethodId.TryGetValue(declaredMethodId, out int slot) && slot >= 0)
                 return slot;
             throw new InvalidOperationException($"Unresolved interface dispatch slot for M{declaredMethodId}.");
-        }
-
-        private RuntimeMethod? ResolveInterfaceDispatchTarget(RuntimeType actual, RuntimeMethod declared)
-        {
-            if (actual is null || declared is null)
-                return null;
-
-            if (!CanBeVirtualTarget(actual, declared.DeclaringType))
-                return null;
-
-            for (RuntimeType? t = actual; t is not null; t = t.BaseType)
-            {
-                RuntimeMethod? explicitImpl = TryResolveExplicitInterfaceImpl(t, declared);
-                if (explicitImpl is not null)
-                    return explicitImpl;
-            }
-
-            RuntimeMethod? implicitImpl = FindMostDerivedMethodByNameAndSig(actual, declared);
-            if (implicitImpl is not null)
-                return implicitImpl;
-
-            return null;
-        }
-
-        private RuntimeMethod? TryResolveExplicitInterfaceImpl(RuntimeType implementationType, RuntimeMethod declared)
-        {
-            var map = implementationType.ExplicitInterfaceMethodImpls;
-            if (map is null || map.Count == 0)
-                return null;
-
-            if (map.TryGetValue(declared.MethodId, out RuntimeMethod? exact))
-                return ProjectRuntimeMethodToOwner(implementationType, exact);
-
-            foreach (var kv in map)
-            {
-                RuntimeMethod ifaceMethod;
-                try
-                {
-                    if (_rts is null)
-                        return null;
-                    ifaceMethod = _rts.GetMethodById(kv.Key);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (SameInterfaceMethodIdentity(ifaceMethod, declared))
-                    return ProjectRuntimeMethodToOwner(implementationType, kv.Value);
-            }
-
-            return null;
-        }
-
-        private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
-        {
-            if (method.DeclaringType.TypeId == owner.TypeId)
-                return method;
-
-            _rts?.EnsureConstructedMembers(owner);
-
-            RuntimeMethod[] methods = owner.Methods;
-            for (int i = 0; i < methods.Length; i++)
-            {
-                RuntimeMethod candidate = methods[i];
-                if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name))
-                    continue;
-                if (candidate.GenericArity != method.GenericArity)
-                    continue;
-                if (candidate.IsStatic != method.IsStatic)
-                    continue;
-                if (candidate.Body is not null && method.Body is not null && ReferenceEquals(candidate.Body, method.Body))
-                    return candidate;
-                if (SameSigRuntime(candidate, method))
-                    return candidate;
-            }
-
-            return method;
-        }
-
-        private static bool CanBeVirtualTarget(RuntimeType candidateOwner, RuntimeType declaredOwner)
-        {
-            if (ReferenceEquals(candidateOwner, declaredOwner) || candidateOwner.TypeId == declaredOwner.TypeId)
-                return true;
-
-            if (declaredOwner.Kind == RuntimeTypeKind.Interface)
-            {
-                for (RuntimeType? t = candidateOwner; t is not null; t = t.BaseType)
-                {
-                    RuntimeType[] interfaces = t.Interfaces;
-                    for (int i = 0; i < interfaces.Length; i++)
-                    {
-                        if (SameInterfaceType(interfaces[i], declaredOwner))
-                            return true;
-                    }
-                }
-                return false;
-            }
-
-            for (RuntimeType? t = candidateOwner.BaseType; t is not null; t = t.BaseType)
-            {
-                if (ReferenceEquals(t, declaredOwner) || t.TypeId == declaredOwner.TypeId)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private static bool SameInterfaceType(RuntimeType implemented, RuntimeType declared)
-        {
-            if (implemented.TypeId == declared.TypeId)
-                return true;
-
-            RuntimeType? implementedDef = implemented.GenericTypeDefinition;
-            RuntimeType? declaredDef = declared.GenericTypeDefinition;
-
-            if (implementedDef is null || declaredDef is null)
-                return false;
-
-            if (implementedDef.TypeId != declaredDef.TypeId)
-                return false;
-
-            RuntimeType[] implementedArgs = implemented.GenericTypeArguments;
-            RuntimeType[] declaredArgs = declared.GenericTypeArguments;
-
-            if (implementedArgs.Length != declaredArgs.Length)
-                return false;
-
-            for (int i = 0; i < implementedArgs.Length; i++)
-            {
-                if (!CompatibleInterfaceSignatureType(implementedArgs[i], declaredArgs[i]))
-                    return false;
-            }
-
-            return true;
-        }
-
-        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType actual, RuntimeMethod declared)
-        {
-            for (RuntimeType? cur = actual; cur is not null; cur = cur.BaseType)
-            {
-                RuntimeMethod[] methods = cur.Methods;
-                for (int i = 0; i < methods.Length; i++)
-                {
-                    RuntimeMethod m = methods[i];
-                    if (m.IsStatic)
-                        continue;
-                    if (m.IsPrivate)
-                        continue;
-                    if (!StringComparer.Ordinal.Equals(m.Name, declared.Name))
-                        continue;
-                    if (SameSigRuntime(m, declared))
-                        return m;
-                }
-            }
-
-            return null;
-        }
-
-        private static bool SameInterfaceMethodIdentity(RuntimeMethod ifaceMethod, RuntimeMethod declared)
-        {
-            if (!StringComparer.Ordinal.Equals(ifaceMethod.Name, declared.Name))
-                return false;
-            if (ifaceMethod.GenericArity != declared.GenericArity)
-                return false;
-            if (!SameRuntimeTypeDefinitionOrExact(ifaceMethod.DeclaringType, declared.DeclaringType))
-                return false;
-            if (ifaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length)
-                return false;
-            if (!CompatibleInterfaceSignatureType(ifaceMethod.ReturnType, declared.ReturnType))
-                return false;
-            for (int i = 0; i < ifaceMethod.ParameterTypes.Length; i++)
-            {
-                if (!CompatibleInterfaceSignatureType(ifaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
-                    return false;
-            }
-            return true;
-        }
-
-        private static bool SameSigRuntime(RuntimeMethod a, RuntimeMethod b)
-        {
-            if (a.GenericArity != b.GenericArity)
-                return false;
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length)
-                return false;
-            if (a.ReturnType.TypeId != b.ReturnType.TypeId)
-                return false;
-            for (int i = 0; i < a.ParameterTypes.Length; i++)
-            {
-                if (a.ParameterTypes[i].TypeId != b.ParameterTypes[i].TypeId)
-                    return false;
-            }
-            return true;
-        }
-
-        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-            RuntimeType ad = a.GenericTypeDefinition ?? a;
-            RuntimeType bd = b.GenericTypeDefinition ?? b;
-            return ad.TypeId == bd.TypeId;
-        }
-
-        private static bool CompatibleInterfaceSignatureType(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-            if (a.Kind == RuntimeTypeKind.TypeParam || b.Kind == RuntimeTypeKind.TypeParam)
-                return true;
-            return SameRuntimeTypeDefinitionOrExact(a, b);
         }
 
         private RuntimeType GetLogicalArgumentTypeForAbi(RuntimeMethod method, int logicalIndex)
@@ -3239,7 +3021,7 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal sealed class ImagePrintOptions
+    public sealed class ImagePrintOptions
     {
         public static ImagePrintOptions Default { get; } = new ImagePrintOptions();
 
@@ -3250,7 +3032,7 @@ namespace Cnidaria.Cs
         public int MaxBlobBytes { get; set; } = 128;
     }
 
-    internal static class ImagePrinter
+    public static class ImagePrinter
     {
         public static string Print(CodeImage image, ImagePrintOptions? options = null)
         {
@@ -3761,12 +3543,6 @@ namespace Cnidaria.Cs
             if (inst.Op == Op.StackAlloc)
                 return $"{FormatRegister(inst.Rd)}, count={FormatRegister(inst.Rs1)}, elemSize={inst.Imm}";
 
-            if (inst.Op == Op.AllocHGlobal)
-                return FormatRegister(inst.Rd) + ", byteCount=" + FormatRegister(inst.Rs1);
-
-            if (inst.Op == Op.FreeHGlobal)
-                return FormatRegister(inst.Rs1);
-
             if (IsPointerOp(inst.Op))
                 return FormatPointerOperands(inst);
 
@@ -4078,12 +3854,11 @@ namespace Cnidaria.Cs
         private static bool IsInternalDirectCall(Op op)
             => IsOpInRange(op, Op.CallInternalVoid, Op.CallInternalValue);
 
-
         private static bool IsIndirectCall(Op op)
             => IsOpInRange(op, Op.CallIndirectVoid, Op.CallIndirectValue);
 
         private static bool IsPointerOp(Op op)
-            => IsOpInRange(op, Op.StackAlloc, Op.FreeHGlobal);
+            => IsOpInRange(op, Op.StackAlloc, Op.StaticData);
 
         private static bool IsTwoOperandBranch(Op op)
             => op is not (Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef);

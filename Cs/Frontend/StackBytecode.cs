@@ -2,13 +2,11 @@
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Reflection;
-using System.Runtime.CompilerServices;
-using System.Text;
 
 namespace Cnidaria.Cs
 {
 
+    /// <summary>Controls overflow and signedness semantics for numeric conversion</summary>
     [Flags]
     internal enum NumericConvFlags : byte
     {
@@ -16,6 +14,7 @@ namespace Cnidaria.Cs
         Checked = 1 << 0,
         SourceUnsigned = 1 << 1,
     }
+    /// <summary>Identifies the primitive shape produced by an indirect load</summary>
     internal enum IndirLoadKind : byte
     {
         I1,
@@ -27,10 +26,11 @@ namespace Cnidaria.Cs
         I8,
         Ref,
     }
+    /// <summary>Defines the instruction set of the stack bytecode format</summary>
     public enum BytecodeOp : byte
     {
         Nop,
-        // Stack / constants
+        // Stack and constants
         Pop,
         Dup,
         Ldnull,
@@ -41,7 +41,7 @@ namespace Cnidaria.Cs
         Ldstr,          // operand0: UserString token
         DefaultValue,   // operand0: Type token
 
-        // Locals / args
+        // Locals and arguments
         Ldloc,
         Stloc,
         Ldloca,
@@ -51,7 +51,7 @@ namespace Cnidaria.Cs
         Ldarga,
 
         Ldthis,
-        // Arithmetic / bitwise / compare
+        // Arithmetic, bitwise operations, and comparisons
         Add,
         Add_Ovf,
         Add_Ovf_Un,
@@ -82,9 +82,9 @@ namespace Cnidaria.Cs
         Cgt,
         Cgt_Un,
 
-        // Calls / object
-        Call,   // operand0: method token, operand1: argCountWithThisPacked
-        CallVirt, // operand0: method token, operand1: argCountWithThisPacked
+        // Calls and objects
+        Call,   // operand0: method token, operand1: low 15 bits argument count, bit 15 receiver flag
+        CallVirt, // operand0: method token, operand1: low 15 bits argument count, bit 15 receiver flag
         Newobj, // operand0: ctor token, operand1: argCount
 
         Ldfld,   // operand0: field token, stack: obj -> value
@@ -95,7 +95,7 @@ namespace Cnidaria.Cs
         Ldflda,  // operand0: field token, stack: obj -> byref
         Ldsflda, // operand0: field token, stack: -> byref
 
-        // Conversions / runtime type ops
+        // Conversions and runtime type operations
         Conv,       // operand0: NumericConvKind, operand1: NumericConvFlags
         CastClass,  // operand0: type token
         Box,        // operand0: type token
@@ -117,8 +117,6 @@ namespace Cnidaria.Cs
         // Pointers
         StaticData,  // operand0: static data blob offset, operand1: byte length, stack: -> unmanaged ptr
         StackAlloc,  // operand0: elementSize
-        AllocHGlobal,  // stack: byteCount/native int -> unmanaged ptr
-        FreeHGlobal,   // stack: unmanaged ptr ->
         PtrElemAddr, // operand0: elementSize
         PtrToByRef,  // stack: ptr -> byref
         // Typed indirect
@@ -136,7 +134,7 @@ namespace Cnidaria.Cs
         PtrDiff, // operand0: elementSize, stack: ptrA, ptrB -> nint
         Isinst, // operand0: type token, stack: obj -> obj
 
-        // Delegates / closures
+        // Delegates and closures
         NewClosureCell, // operand0: value type token, stack: initialValue -> cell
         LdClosureCell,  // operand0: value type token, stack: cell -> value
         StClosureCell,  // operand0: value type token, stack: cell,value ->
@@ -148,7 +146,7 @@ namespace Cnidaria.Cs
         DelegateRemove,  // stack: delegate?,delegate? -> delegate?
         DelegateInvoke, // operand0: delegate Invoke method token, operand1: argCount, stack: delegate,args -> return?
 
-        // MD Arrays
+        // Multidimensional arrays
         NewMdarr,   // operand0: array Type token, operand1: rank, stack: lengths... -> arrayref
         LdelemMd,   // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> value
         LdelemaMd,  // operand0: array Type token, operand1: rank, stack: arrayref, indices... -> byref
@@ -159,6 +157,7 @@ namespace Cnidaria.Cs
         FnPtrToPtr,
         PtrToFnPtr,
     }
+    /// <summary>Identifies the destination representation of a numeric conversion</summary>
     internal enum NumericConvKind : byte
     {
         I1,
@@ -176,15 +175,23 @@ namespace Cnidaria.Cs
         NativeInt,
         NativeUInt
     }
+    /// <summary>Stack bytecode operation with operands and explicit stack effects</summary>
     public readonly struct Instruction
     {
+        /// <summary>Operation to execute</summary>
         public readonly BytecodeOp Op;
+        /// <summary>Primary operation-specific operand</summary>
         public readonly int Operand0;
+        /// <summary>Secondary operation-specific operand</summary>
         public readonly int Operand1;
+        /// <summary>Wide operation-specific operand</summary>
         public readonly long Operand2;
+        /// <summary>Number of stack values consumed</summary>
         public readonly short Pop;
+        /// <summary>Number of stack values produced</summary>
         public readonly short Push;
 
+        /// <summary>Creates an instruction with explicit operands and stack effects</summary>
         public Instruction(BytecodeOp op, int operand0, int operand1, long operand2, short pop, short push)
         {
             Op = op;
@@ -197,19 +204,28 @@ namespace Cnidaria.Cs
 
         public override string ToString() => $"{Op} {Operand0} {Operand1} {Operand2}";
     }
+    /// <summary>Identifies an unresolved bytecode branch target</summary>
     internal readonly struct BcLabel
     {
         public readonly int Id;
         public BcLabel(int id) => Id = id;
         public override string ToString() => $"L{Id}";
     }
+    /// <summary>Describes one protected region and its handler range</summary>
+    /// <remarks>A zero catch type token denotes catch-all and a negative token denotes finally</remarks>
     public readonly struct ExceptionHandler
     {
+        /// <summary>Inclusive start of the protected instruction range</summary>
         public readonly int TryStartPc;
+        /// <summary>Exclusive end of the protected instruction range</summary>
         public readonly int TryEndPc;
+        /// <summary>Inclusive start of the handler instruction range</summary>
         public readonly int HandlerStartPc;
+        /// <summary>Exclusive end of the handler instruction range</summary>
         public readonly int HandlerEndPc;
-        public readonly int CatchTypeToken; // 0 catch all
+        /// <summary>Catch type token or the sentinel identifying handler kind</summary>
+        public readonly int CatchTypeToken;
+        /// <summary>Creates an exception handler from protected and handler instruction ranges</summary>
         public ExceptionHandler(int tryStartPc, int tryEndPc, int handlerStartPc, int handlerEndPc, int catchTypeToken)
         {
             TryStartPc = tryStartPc;
@@ -219,8 +235,10 @@ namespace Cnidaria.Cs
             CatchTypeToken = catchTypeToken;
         }
     }
-    internal sealed class BytecodeBuilder
+    /// <summary>Builds instructions, labels, fixups, and method static data</summary>
+    public sealed class BytecodeBuilder
     {
+        /// <summary>Finds the entry point method token in a loaded runtime module</summary>
         public static int FindEntryPointMethodDef(RuntimeModule module)
         {
             if (module is null)
@@ -228,6 +246,7 @@ namespace Cnidaria.Cs
 
             return FindEntryPointMethodDef(module.Md);
         }
+        /// <summary>Finds the entry point method token in metadata</summary>
         public static int FindEntryPointMethodDef(IMetadataView metadata)
         {
             if (metadata is null)
@@ -238,6 +257,7 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException("Entry point not found in module metadata.");
         }
+        /// <summary>Tries the generated top-level entry point before a compatible static Main</summary>
         public static bool TryFindEntryPointMethodDef(IMetadataView metadata, out int methodDefToken)
         {
             if (metadata is null)
@@ -293,25 +313,26 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        /// <summary>Checks the supported static entry point signature shapes</summary>
         private static bool IsStaticMainSignature(ReadOnlySpan<byte> sig)
         {
             var r = new SigReader(sig);
             byte cc = r.ReadByte();
 
-            // Must be static (no HASTHIS)
+            // Entry point signatures cannot carry an instance receiver
             if ((cc & 0x20) != 0)
                 return false;
 
             // Reject generic mains
             if ((cc & 0x10) != 0)
             {
-                r.ReadCompressedUInt(); // generic arity
+                r.ReadCompressedUInt(); // Consume generic arity
                 return false;
             }
 
             uint paramCount = r.ReadCompressedUInt();
 
-            // ret: void
+            // Return type must be void
             if ((SigElementType)r.ReadByte() != SigElementType.VOID)
                 return false;
 
@@ -338,6 +359,7 @@ namespace Cnidaria.Cs
 
         public int Count => _insns.Count;
         public ImmutableArray<byte> StaticDataBlob => _staticDataBlob.ToImmutableArray();
+        /// <summary>Appends bytes to method static data and returns their starting offset</summary>
         public int AddStaticData(ReadOnlySpan<byte> bytes)
         {
             int offset = _staticDataBlob.Count;
@@ -345,14 +367,16 @@ namespace Cnidaria.Cs
                 _staticDataBlob.Add(bytes[i]);
             return offset;
         }
-        public BcLabel DefineLabel()
+        /// <summary>Creates an unmarked branch label</summary>
+        internal BcLabel DefineLabel()
         {
             var id = _labelToPc.Count;
             _labelToPc.Add(-1);
             return new BcLabel(id);
         }
 
-        public void MarkLabel(BcLabel label)
+        /// <summary>Binds a label to the current instruction position</summary>
+        internal void MarkLabel(BcLabel label)
         {
             if ((uint)label.Id >= (uint)_labelToPc.Count)
                 throw new ArgumentOutOfRangeException(nameof(label));
@@ -363,11 +387,13 @@ namespace Cnidaria.Cs
             _labelToPc[label.Id] = _insns.Count;
         }
 
+        /// <summary>Appends an instruction with explicit stack effects</summary>
         public void Emit(BytecodeOp op, int operand0 = 0, int operand1 = 0, long operand2 = 0, short pop = 0, short push = 0)
         {
             _insns.Add(new Instruction(op, operand0, operand1, operand2, pop, push));
         }
-        public void EmitBranch(BytecodeOp op, BcLabel target, short pop)
+        /// <summary>Appends a branch whose target is resolved during baking</summary>
+        internal void EmitBranch(BytecodeOp op, BcLabel target, short pop)
         {
             if (op is not (BytecodeOp.Br or BytecodeOp.Leave or BytecodeOp.Brtrue or BytecodeOp.Brfalse))
                 throw new ArgumentOutOfRangeException(nameof(op));
@@ -387,9 +413,10 @@ namespace Cnidaria.Cs
             op = _insns[_insns.Count - 1].Op;
             return true;
         }
+        /// <summary>Validates labels, applies branch fixups, and freezes the instruction stream</summary>
         public ImmutableArray<Instruction> Bake(out ImmutableArray<int> labelToPc)
         {
-            // Validate labels
+            // Every defined label must be bound before fixups are applied
             for (int i = 0; i < _labelToPc.Count; i++)
             {
                 if (_labelToPc[i] < 0)
@@ -408,15 +435,23 @@ namespace Cnidaria.Cs
             return baked.ToImmutableArray();
         }
     }
+    /// <summary>An immutable bytecode body and execution metadata of one method</summary>
     public sealed class BytecodeFunction
     {
+        /// <summary>Gets the defining method token</summary>
         public int MethodToken { get; }
+        /// <summary>Gets local storage type tokens in slot order</summary>
         public ImmutableArray<int> LocalTypeTokens { get; }
+        /// <summary>Gets the baked instruction stream</summary>
         public ImmutableArray<Instruction> Instructions { get; }
+        /// <summary>Gets protected regions and handlers</summary>
         public ImmutableArray<ExceptionHandler> ExceptionHandlers { get; }
+        /// <summary>Gets immutable data embedded by this method</summary>
         public ImmutableArray<byte> StaticDataBlob { get; }
+        /// <summary>Gets the maximum evaluation stack height</summary>
         public int MaxStack { get; }
 
+        /// <summary>Creates an immutable bytecode function</summary>
         public BytecodeFunction(int methodToken,
             ImmutableArray<int> localTypeTokens,
             ImmutableArray<Instruction> instructions,
@@ -432,6 +467,7 @@ namespace Cnidaria.Cs
             StaticDataBlob = staticDataBlob.IsDefault ? ImmutableArray<byte>.Empty : staticDataBlob;
         }
     }
+    /// <summary>Groups the requested method body with nested methods emitted on demand</summary>
     internal sealed class BytecodeEmitResult
     {
         public BytecodeFunction Entry { get; }
@@ -443,8 +479,10 @@ namespace Cnidaria.Cs
             AdditionalMethods = additionalMethods;
         }
     }
+    /// <summary>Converts a lowered bound method body into stack bytecode</summary>
     internal static class BytecodeEmitter
     {
+        /// <summary>Emits the root method and any nested method bodies it references</summary>
         public static BytecodeEmitResult Emit(BoundMethodBody loweredBody, ITokenProvider tokens, TargetInfo? target = null)
         {
             if (loweredBody is null) throw new ArgumentNullException(nameof(loweredBody));
@@ -454,6 +492,7 @@ namespace Cnidaria.Cs
             var entry = module.EmitRoot(loweredBody);
             return new BytecodeEmitResult(entry, module.BakeAdditionalMethods());
         }
+        /// <summary>Coordinates token access and deduplicated nested method emission</summary>
         private sealed class EmitterModule
         {
             private readonly ITokenProvider _tokens;
@@ -472,6 +511,7 @@ namespace Cnidaria.Cs
                 => Compile(body, addToAdditional: false);
             public BytecodeFunction EmitNonRoot(BoundMethodBody body)
                 => Compile(body, addToAdditional: true);
+            /// <summary>Compiles one method and optionally records it as an additional body</summary>
             private BytecodeFunction Compile(BoundMethodBody body, bool addToAdditional)
             {
                 if (_compiled.TryGetValue(body.Method, out var existing))
@@ -489,13 +529,16 @@ namespace Cnidaria.Cs
             public ImmutableArray<BytecodeFunction> BakeAdditionalMethods()
                 => _additional.ToImmutableArray();
         }
+        /// <summary>Selects value-producing or side-effect-only emission</summary>
         private enum EmitMode : byte
         {
             Discard,
             Value
         }
+        /// <summary>Emits one method while tracking locals, labels, handlers, and stack effects</summary>
         private sealed class Emitter
         {
+            /// <summary>Stores label-based handler bounds until branch fixups are resolved</summary>
             private readonly struct ExceptionHandlerSpec
             {
                 public readonly BcLabel TryStart;
@@ -525,6 +568,7 @@ namespace Cnidaria.Cs
             private readonly List<ExceptionHandlerSpec> _ehSpecs = new();
             private int _spillId;
 
+            /// <summary>Detects whether a lambda requires a closure target</summary>
             private sealed class LambdaCaptureDetector : BoundTreeRewriter
             {
                 private readonly HashSet<Symbol> _owned = new(ReferenceEqualityComparer<Symbol>.Instance);
@@ -581,7 +625,7 @@ namespace Cnidaria.Cs
             {
                 var map = new Dictionary<ParameterSymbol, int>(ReferenceEqualityComparer<ParameterSymbol>.Instance);
 
-                int start = method.IsStatic ? 0 : 1; // arg0 reserved for 'this'
+                int start = method.IsStatic ? 0 : 1; // Instance methods reserve argument zero for this
                 var ps = method.Parameters;
                 for (int i = 0; i < ps.Length; i++)
                     map[ps[i]] = start + i;
@@ -589,6 +633,7 @@ namespace Cnidaria.Cs
                 return map;
             }
 
+            /// <summary>Emits and validates a complete bytecode function</summary>
             public BytecodeFunction Emit(BoundMethodBody body)
             {
                 CollectLabels(body.Body);
@@ -610,6 +655,7 @@ namespace Cnidaria.Cs
                 int methodToken = _tokens.GetMethodToken(_method);
                 return new BytecodeFunction(methodToken, localTypeTokens.ToImmutable(), instructions, maxStack, exceptionHandlers, _il.StaticDataBlob);
             }
+            /// <summary>Converts label-based handler specifications to instruction ranges</summary>
             private ImmutableArray<ExceptionHandler> BakeExceptionHandlers(ImmutableArray<int> labelToPc)
             {
                 if (_ehSpecs.Count == 0)
@@ -658,6 +704,7 @@ namespace Cnidaria.Cs
                 _il.Emit(BytecodeOp.Ret, pop: 1, push: 0);
             }
 
+            /// <summary>Predeclares labels so backward and forward branches share one mapping</summary>
             private void CollectLabels(BoundStatement s)
             {
                 switch (s)
@@ -672,7 +719,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case BoundLocalFunctionStatement lfs:
-                        // Labels inside local function bodies are independent
+                        // Nested method labels belong to a separate instruction stream
                         break;
 
                     default:
@@ -749,6 +796,7 @@ namespace Cnidaria.Cs
             {
                 return receiver.IsLValue || receiver is BoundThisExpression;
             }
+            /// <summary>Emits one lowered statement without leaving a value on the stack</summary>
             private void EmitStatement(BoundStatement s)
             {
                 switch (s)
@@ -812,6 +860,7 @@ namespace Cnidaria.Cs
                 EmitExpression(ts.ExpressionOpt, EmitMode.Value);
                 _il.Emit(BytecodeOp.Throw, pop: 1, push: 0);
             }
+            /// <summary>Emits protected regions, catches, finally flow, and handler metadata</summary>
             private void EmitTry(BoundTryStatement t)
             {
                 bool hasCatches = !t.CatchBlocks.IsDefaultOrEmpty;
@@ -1024,6 +1073,7 @@ namespace Cnidaria.Cs
                     _il.EmitBranch(BytecodeOp.Brfalse, label, pop: 1);
             }
 
+            /// <summary>Dispatches expression emission according to the requested result mode</summary>
             private void EmitExpression(BoundExpression e, EmitMode mode)
             {
                 switch (e)
@@ -1185,6 +1235,7 @@ namespace Cnidaria.Cs
                         throw new NotSupportedException($"Expression '{e.GetType().Name}' is not supported by bytecode emitter.");
                 }
             }
+            /// <summary>Emits a constant using the storage representation of its type</summary>
             private void EmitConstantValue(TypeSymbol type, object? value, EmitMode mode)
             {
                 if (mode == EmitMode.Discard)
@@ -1465,7 +1516,7 @@ namespace Cnidaria.Cs
                 switch (un.OperatorKind)
                 {
                     case BoundUnaryOperatorKind.UnaryPlus:
-                        // No-op
+                        // Operand representation already matches the target
                         return;
 
                     case BoundUnaryOperatorKind.UnaryMinus:
@@ -1700,7 +1751,7 @@ namespace Cnidaria.Cs
                 else
                     _il.EmitBranch(BytecodeOp.Brtrue, lFalse, pop: 1);
 
-                // Both operands satisfied condition
+                // Both operands satisfy the short-circuit condition
                 _il.Emit(BytecodeOp.Ldc_I4, operand0: bin.OperatorKind == BoundBinaryOperatorKind.LogicalAnd ? 1 : 0, pop: 0, push: 1);
 
                 _il.EmitBranch(BytecodeOp.Br, lEnd, pop: 0);
@@ -1726,6 +1777,7 @@ namespace Cnidaria.Cs
 
                 _il.MarkLabel(lEnd);
             }
+            /// <summary>Emits assignment while preserving the assigned value when required</summary>
             private void EmitAssignment(BoundAssignmentExpression assignment, EmitMode mode)
             {
                 if (assignment.HasErrors || assignment.Left.HasErrors || assignment.Right.HasErrors)
@@ -1929,6 +1981,7 @@ namespace Cnidaria.Cs
                     _il.Emit(BytecodeOp.Ldloc, operand0: spill, pop: 0, push: 1);
                 }
             }
+            /// <summary>Emits vector or multidimensional array allocation and initialization</summary>
             private void EmitArrayCreation(BoundArrayCreationExpression ac, EmitMode mode)
             {
                 if (ac.Type is not ArrayTypeSymbol at)
@@ -2039,6 +2092,7 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            /// <summary>Emits the lambda body and creates an open or closed delegate</summary>
             private void EmitLambda(BoundLambdaExpression lambda, EmitMode mode)
             {
                 if (mode == EmitMode.Discard)
@@ -2116,6 +2170,7 @@ namespace Cnidaria.Cs
                    && StringComparer.Ordinal.Equals(call.Method.Name, "Invoke")
                    && call.Method.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Delegate };
 
+            /// <summary>Emits delegate invocation with receiver and arguments in call order</summary>
             private void EmitDelegateInvoke(BoundCallExpression call, EmitMode mode)
             {
                 if (call.ReceiverOpt is null)
@@ -2177,6 +2232,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
+            /// <summary>Emits direct, virtual, interface, intrinsic, and by-ref-return calls</summary>
             private void EmitCall(BoundCallExpression call, EmitMode mode)
             {
                 if (TryEmitIntrinsic(call, mode))
@@ -2244,7 +2300,7 @@ namespace Cnidaria.Cs
 
                         if (recvIsValueType)
                         {
-                            // If method is declared on reference type
+                            // Methods declared on reference types receive an object reference
                             bool methodDeclaredOnRefType =
                                 call.Method.ContainingSymbol is NamedTypeSymbol declType && declType.IsReferenceType;
 
@@ -2260,7 +2316,7 @@ namespace Cnidaria.Cs
                             }
                             else
                             {
-                                // Method declared on the value type itself
+                                // Methods declared on the value type receive its managed address
                                 thisIsManagedByRef = true;
 
                                 if (!IsAddressableValueTypeReceiver(recv))
@@ -2278,7 +2334,7 @@ namespace Cnidaria.Cs
                         }
                         else
                         {
-                            // reference type receiver
+                            // Reference type receiver
                             EmitExpression(recv, EmitMode.Value);
                         }
                     }
@@ -2350,6 +2406,7 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard && push != 0)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            /// <summary>Emits recognized intrinsics without a call</summary>
             private bool TryEmitIntrinsic(BoundCallExpression call, EmitMode mode)
             {
                 var def = call.Method.OriginalDefinition;
@@ -2550,34 +2607,6 @@ namespace Cnidaria.Cs
                     }
                     return false;
                 }
-                if (containingType.Name == "Marshal" && IsInNamespace(containingType, "System", "Runtime", "InteropServices"))
-                {
-                    var ps = call.Method.Parameters;
-
-                    // Marshal.AllocHGlobal(nint)
-                    if (def.Name == "AllocHGlobal" &&
-                        ps.Length == 1 &&
-                        ps[0].Type.SpecialType == SpecialType.System_IntPtr)
-                    {
-                        EmitExpression(call.Arguments[0], EmitMode.Value);
-                        _il.Emit(BytecodeOp.AllocHGlobal, pop: 1, push: 1);
-
-                        if (mode == EmitMode.Discard)
-                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
-
-                        return true;
-                    }
-
-                    // Marshal.FreeHGlobal(IntPtr)
-                    if (def.Name == "FreeHGlobal" &&
-                        ps.Length == 1 &&
-                        ps[0].Type.SpecialType == SpecialType.System_IntPtr)
-                    {
-                        EmitExpression(call.Arguments[0], EmitMode.Value);
-                        _il.Emit(BytecodeOp.FreeHGlobal, pop: 1, push: 0);
-                        return true;
-                    }
-                }
                 // MemoryMarshal
                 if (containingType.Name == "MemoryMarshal" && IsInNamespace(containingType, "System", "Runtime", "InteropServices"))
                 {
@@ -2615,16 +2644,17 @@ namespace Cnidaria.Cs
                 return s is null
                     || (s is NamespaceSymbol g && (g.IsGlobalNamespace || string.IsNullOrEmpty(g.Name)));
             }
+            /// <summary>Emits reference allocation or value type construction</summary>
             private void EmitObjectCreation(BoundObjectCreationExpression obj, EmitMode mode)
             {
                 if (mode == EmitMode.Discard)
                 {
-                    // Still must allocate/run ctor if it has side effects
+                    // Preserve allocation and constructor side effects when the result is unused
                 }
 
                 if (obj.ConstructorOpt is null)
                 {
-                    // Struct default construction
+                    // Value types without a constructor use their default value
                     EmitDefaultValue(obj.Type);
                     if (mode == EmitMode.Discard && !IsVoid(obj.Type))
                         _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
@@ -2666,6 +2696,7 @@ namespace Cnidaria.Cs
                 underlying = null!;
                 return false;
             }
+            /// <summary>Emits reference and nullable type tests for the as operator</summary>
             private void EmitAs(BoundAsExpression @as, EmitMode mode)
             {
                 if (mode == EmitMode.Discard)
@@ -2674,7 +2705,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                // Evaluate operand
+                // Evaluate the source once
                 EmitExpression(@as.Operand, EmitMode.Value);
 
                 if (@as.Operand.Type.IsValueType)
@@ -2722,6 +2753,7 @@ namespace Cnidaria.Cs
                 _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
                 _il.Emit(BytecodeOp.Ceq, pop: 2, push: 1);
             }
+            /// <summary>Emits type, null, and constant pattern tests</summary>
             private void EmitIsPattern(BoundIsPatternExpression isPattern, EmitMode mode)
             {
                 switch (isPattern.PatternKind)
@@ -2818,6 +2850,7 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            /// <summary>Emits numeric, reference, boxing, unboxing, pointer, and identity conversions</summary>
             private void EmitConversion(BoundConversionExpression conv, EmitMode mode)
             {
                 if (conv.Conversion.Kind == ConversionKind.NullLiteral)
@@ -2909,6 +2942,7 @@ namespace Cnidaria.Cs
                     default: return false;
                 }
             }
+            /// <summary>Selects numeric conversion kind and signedness flags from source and target types</summary>
             private void EmitNumericConv(TypeSymbol sourceType, TypeSymbol targetType, bool isChecked)
             {
                 var targetSpecial = targetType is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum
@@ -2947,7 +2981,7 @@ namespace Cnidaria.Cs
 
             private void EmitSequence(BoundSequenceExpression seq, EmitMode mode)
             {
-                // Ensure locals exist in the local sig
+                // Sequence locals must appear in the method local signature
                 for (int i = 0; i < seq.Locals.Length; i++)
                     GetOrCreateLocal(seq.Locals[i]);
 
@@ -3019,6 +3053,7 @@ namespace Cnidaria.Cs
                 _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(pea.Type), pop: 1, push: 1);
             }
 
+            /// <summary>Allocates stack storage and writes initializer elements in order</summary>
             private void EmitStackAlloc(BoundStackAllocArrayCreationExpression sa, EmitMode mode)
             {
                 // count -> StackAlloc(elementSize)
@@ -3043,6 +3078,7 @@ namespace Cnidaria.Cs
                 if (mode == EmitMode.Discard)
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
             }
+            /// <summary>Appends immutable bytes and emits a pointer to their method-local storage</summary>
             private void EmitStaticData(BoundStaticDataExpression node, EmitMode mode)
             {
                 if (mode == EmitMode.Discard)
@@ -3111,6 +3147,7 @@ namespace Cnidaria.Cs
                         throw new NotSupportedException("Unsupported static data element type: " + type.Name);
                 }
             }
+            /// <summary>Emits the stable address of a supported assignable expression</summary>
             private void EmitLoadAddressOfLValue(BoundExpression lvalue)
             {
                 switch (lvalue)
@@ -3297,8 +3334,10 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Computes stack height by propagating explicit effects through control flow</summary>
         private static class StackAnalyzer
         {
+            /// <summary>Validates stack joins and returns the maximum reachable stack height</summary>
             public static int ComputeMaxStack(ImmutableArray<Instruction> insns, int entryPc, ImmutableArray<int> additionalEntryPcs)
             {
                 if (insns.IsDefaultOrEmpty)

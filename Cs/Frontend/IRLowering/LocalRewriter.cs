@@ -7,6 +7,8 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Guards recursive tree traversal against stack exhaustion</summary>
+    /// <remarks>Checks are amortized and a failed check retries the rewrite on a fresh thread stack</remarks>
     internal sealed class StackGuard
     {
         private const int MaxUncheckedRecursionDepth = 128;
@@ -22,6 +24,7 @@ namespace Cnidaria.Cs
             RuntimeHelpers.EnsureSufficientExecutionStack();
         }
 
+        /// <summary>Runs a rewrite on a fresh thread stack</summary>
         public T RunOnEmptyStack<T>(Func<T> action)
         {
             if (action is null) throw new ArgumentNullException(nameof(action));
@@ -45,6 +48,7 @@ namespace Cnidaria.Cs
             return result!;
         }
     }
+    /// <summary>Adds stack exhaustion recovery to recursive bound tree rewrites</summary>
     internal abstract class BoundTreeRewriterWithStackGuard : BoundTreeRewriter
     {
         private readonly StackGuard _stackGuard = new StackGuard();
@@ -77,8 +81,10 @@ namespace Cnidaria.Cs
             return base.RewriteExpression(node);
         }
     }
+    /// <summary>Recursively rewrites bound trees</summary>
     internal abstract class BoundTreeRewriter
     {
+        /// <summary>Dispatches a bound node to its statement, expression, body, or unit rewriter</summary>
         public virtual BoundNode RewriteNode(BoundNode node)
         {
             if (node is null) throw new ArgumentNullException(nameof(node));
@@ -292,6 +298,7 @@ namespace Cnidaria.Cs
 
             return node;
         }
+        /// <summary>Restores block shape when a nested rewrite returns a statement list</summary>
         private static BoundBlockStatement EnsureBlockStatement(BoundBlockStatement original, BoundStatement rewritten)
         {
             if (rewritten is BoundBlockStatement block)
@@ -962,6 +969,7 @@ namespace Cnidaria.Cs
             return node;
         }
 
+        /// <summary>Rewrites a statement array without allocating when every element is unchanged</summary>
         protected ImmutableArray<BoundStatement> RewriteStatements(ImmutableArray<BoundStatement> statements, out bool changed)
         {
             changed = false;
@@ -980,6 +988,7 @@ namespace Cnidaria.Cs
             return changed ? builder.ToImmutable() : statements;
         }
 
+        /// <summary>Rewrites an expression array without allocating when every element is unchanged</summary>
         protected ImmutableArray<BoundExpression> RewriteExpressions(ImmutableArray<BoundExpression> expressions, out bool changed)
         {
             changed = false;

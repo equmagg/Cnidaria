@@ -6,10 +6,11 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
+using System.Xml.Linq;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class CodeGeneratorOptions
+    public sealed class CodeGeneratorOptions
     {
         public static CodeGeneratorOptions Default { get; } = new CodeGeneratorOptions();
 
@@ -18,7 +19,7 @@ namespace Cnidaria.Cs
         public bool EmitUnwindInfo { get; set; } = true;
         public bool VerifyImage { get; set; } = true;
     }
-    internal sealed class BackendOptions
+    public sealed class BackendOptions
     {
         public static BackendOptions Default { get; } = new BackendOptions();
 
@@ -36,16 +37,16 @@ namespace Cnidaria.Cs
         public CodeGeneratorOptions CodeGeneratorOptions { get; set; } = CodeGeneratorOptions.Default;
         public TargetInfo? Target { get; set; }
     }
-    internal sealed class BackendResult
+    public sealed class BackendResult
     {
-        public GenTreeProgram HirProgram { get; }
-        public SsaProgram? SsaProgram { get; }
-        public GenTreeProgram RationalizedProgram { get; }
-        public GenTreeProgram LoweredProgram { get; }
-        public GenTreeProgram RegisterAllocatedProgram { get; }
+        internal GenTreeProgram HirProgram { get; }
+        internal SsaProgram? SsaProgram { get; }
+        internal GenTreeProgram RationalizedProgram { get; }
+        internal GenTreeProgram LoweredProgram { get; }
+        internal GenTreeProgram RegisterAllocatedProgram { get; }
         public CodeImage Image { get; }
 
-        public BackendResult(
+        internal BackendResult(
             GenTreeProgram hirProgram,
             SsaProgram? ssaProgram,
             GenTreeProgram rationalizedProgram,
@@ -83,7 +84,7 @@ namespace Cnidaria.Cs
             RegisterAllocatedProgram = registerAllocatedProgram ?? throw new ArgumentNullException(nameof(registerAllocatedProgram));
         }
     }
-    internal static class BackendPipeline
+    public static class BackendPipeline
     {
         public static BackendResult CompileProgram(GenTreeProgram program, BackendOptions? options = null)
         {
@@ -107,7 +108,7 @@ namespace Cnidaria.Cs
                 image);
         }
 
-        public static BackendResult CompileMethod(GenTreeMethod method, BackendOptions? options = null)
+        internal static BackendResult CompileMethod(GenTreeMethod method, BackendOptions? options = null)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
@@ -142,7 +143,7 @@ namespace Cnidaria.Cs
                 lowered.RegisterAllocatedProgram, codeGeneratorOptions, lowered.RegisterAllocatedProgram.Target);
         }
 
-        public static X86Program CompileX86Method(
+        internal static X86Program CompileX86Method(
             GenTreeMethod method,
             BackendOptions? options = null,
             X86CodeGeneratorOptions? codeGeneratorOptions = null)
@@ -174,7 +175,7 @@ namespace Cnidaria.Cs
                 lowered.RegisterAllocatedProgram.Target);
         }
 
-        public static RiscVProgram CompileRiscVMethod(
+        internal static RiscVProgram CompileRiscVMethod(
             GenTreeMethod method,
             BackendOptions? options = null,
             RiscVCodeGeneratorOptions? codeGeneratorOptions = null)
@@ -281,15 +282,25 @@ namespace Cnidaria.Cs
                     hirMethod.HirLiveness,
                     validate: options.ValidateSsa);
 
+                ssaMethod = SsaEarlyPropagator.OptimizeMethod(ssaMethod, validate: options.ValidateSsa);
+                ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod, validate: options.ValidateSsa);
+
                 if (options.OptimizeSsa)
                 {
                     ssaMethod = SsaOptimizer.OptimizeMethod(ssaMethod, options.SsaOptimizationOptions);
+
+                    if (options.SsaOptimizationOptions.EnableDeadStoreRemoval)
+                    {
+                        var deadStores = SsaDeadStoreRemoval.Run(ssaMethod, validate: options.ValidateSsa);
+                        if (deadStores.Changed)
+                            ssaMethod = RebuildSsaAfterVnBasedDeadStoreRemoval(ssaMethod, deadStores.Method, options.ValidateSsa);
+                    }
+
                     hirMethod = ssaMethod.GenTreeMethod;
                     hirMethod.AttachSsa(ssaMethod, optimized: true);
                 }
                 else
                 {
-                    ssaMethod = SsaValueNumbering.BuildMethod(ssaMethod, validate: options.ValidateSsa);
                     hirMethod = ssaMethod.GenTreeMethod;
                     hirMethod.AttachSsa(ssaMethod, optimized: false);
                 }
@@ -302,6 +313,37 @@ namespace Cnidaria.Cs
             rationalizedMethod = GenTreeLinearIrRationalizer.RationalizeMethod(hirMethod, ssaMethod, lirOptions);
             loweredMethod = GenTreeLinearLowerer.LowerMethod(rationalizedMethod, lirOptions);
             return LinearScanRegisterAllocator.AllocateMethod(loweredMethod, options.RegisterAllocatorOptions);
+        }
+
+        private static SsaMethod RebuildSsaAfterVnBasedDeadStoreRemoval(
+            SsaMethod previous,
+            GenTreeMethod rewritten,
+            bool validate)
+        {
+            bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
+            var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
+            rewritten.AttachFlowGraph(cfg);
+
+            var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
+            rewritten.AttachHirLiveness(liveness);
+
+            var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate);
+            return SsaValueNumbering.BuildMethod(rebuilt, validate);
+        }
+
+        private static bool HasExceptionEdges(ControlFlowGraph cfg)
+        {
+            for (int b = 0; b < cfg.Blocks.Length; b++)
+            {
+                var successors = cfg.Blocks[b].Successors;
+                for (int s = 0; s < successors.Length; s++)
+                {
+                    if (successors[s].Kind == CfgEdgeKind.Exception)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
@@ -599,12 +641,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.StaticData:
                 case GenTreeKind.StackAlloc:
-                case GenTreeKind.AllocHGlobal:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
-                    break;
-
-                case GenTreeKind.FreeHGlobal:
-                    flags |= GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.Field:
@@ -620,6 +657,18 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.LoadIndirect:
+                    flags |= GenTreeFlags.MemoryRead;
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.NullCheck:
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.Ordered;
+                    break;
+
+                case GenTreeKind.ArrayLength:
                     flags |= GenTreeFlags.MemoryRead;
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         flags |= GenTreeFlags.CanThrow;
@@ -742,7 +791,7 @@ namespace Cnidaria.Cs
             {
                 var statements = method.Blocks[b].Statements;
                 for (int s = 0; s < statements.Length; s++)
-                    MarkAddressExposed(statements[s]);
+                    MarkAddressExposed(statements[s], parent: null, operandIndex: -1);
             }
 
             SealDescriptors(method.ArgDescriptors);
@@ -787,11 +836,6 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static void MarkAddressExposed(GenTree node)
-        {
-            MarkAddressExposed(node, parent: null, operandIndex: -1);
-        }
-
         private static void MarkAddressExposed(GenTree node, GenTree? parent, int operandIndex)
         {
             if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _))
@@ -817,9 +861,9 @@ namespace Cnidaria.Cs
                 if (descriptor is not null)
                     descriptor.MarkPromotedStructParent();
 
-                GenTreeFlags flags = GenTreeFlags.None;
+                GenTreeFlags flags = node.Flags & GenTreeFlags.ExplicitInit;
                 for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags & ~GenTreeFlags.AssertionProperties;
+                    flags |= node.Operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
 
                 flags |= GenTreeFlags.Indirect;
                 if (localFieldAccess.IsUse || localFieldAccess.IsPartialDefinition)
@@ -882,6 +926,25 @@ namespace Cnidaria.Cs
                 node.LocalDescriptor is { AddressExposed: false } &&
                 (expectedParent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(expectedParent, operandIndex)))
                 throw new InvalidOperationException($"HIR address-exposed local was not marked: {node}.");
+
+            if (node.Kind == GenTreeKind.NullCheck)
+            {
+                if (node.Operands.Length != 1 ||
+                    node.StackKind != GenStackKind.Void ||
+                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null))
+                {
+                    throw new InvalidOperationException($"Malformed HIR null check in B{blockId}: {node}.");
+                }
+            }
+            else if (node.Kind == GenTreeKind.ArrayLength)
+            {
+                if (node.Operands.Length != 1 ||
+                    node.StackKind != GenStackKind.I4 ||
+                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null))
+                {
+                    throw new InvalidOperationException($"Malformed HIR array length in B{blockId}: {node}.");
+                }
+            }
 
             for (int i = 0; i < node.Operands.Length; i++)
                 VerifyTree(node.Operands[i], node, blockId, i);

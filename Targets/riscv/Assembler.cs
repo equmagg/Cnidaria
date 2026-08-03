@@ -87,7 +87,7 @@ namespace Cnidaria.RiscV
         }
     }
 
-    internal static class RiscVAssembler
+    public static class RiscVAssembler
     {
         public static RiscVProgram Assemble(string text, RVTarget target)
             => RiscVAssemblyParser.Parse(text, target, null);
@@ -102,7 +102,7 @@ namespace Cnidaria.RiscV
             => Assemble(text, target, settings);
     }
 
-    internal static class RiscVDisassembler
+    public static class RiscVDisassembler
     {
         public static string Disassemble(RiscVProgram obj, RiscVAssemblyWriterOptions? options = null)
             => RiscVAssemblyWriter.Write(obj, options);

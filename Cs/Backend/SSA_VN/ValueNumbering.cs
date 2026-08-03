@@ -2482,6 +2482,8 @@ namespace Cnidaria.Cs
                     case GenTreeKind.StoreArg:
                     case GenTreeKind.StoreTemp:
                         return StoreUnpromotedLocal(node, operands, ref byrefExposed, blockId, statementIndex);
+                    case GenTreeKind.ArrayLength:
+                        return ArrayLength(node, operands);
                     case GenTreeKind.ArrayElement:
                         return LoadArrayElement(node, operands, heap, blockId, statementIndex);
                     case GenTreeKind.StoreArrayElement:
@@ -3160,19 +3162,22 @@ namespace Cnidaria.Cs
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
+            private ValueNumberPair ArrayLength(GenTree node, ImmutableArray<ValueNumberPair> operands)
+            {
+                if (operands.Length != 1)
+                    return ValueNumberPair.Same(_store.VNForStableUnique(node.Id, node.StackKind, node.Type, ValueNumberFunction.MemOpaque, ImmutableArray<ValueNumber>.Empty));
+
+                ValueNumber liberalArray = OperandNormal(operands, 0, ValueNumberCategory.Liberal);
+                ValueNumber conservativeArray = OperandNormal(operands, 0, ValueNumberCategory.Conservative);
+                ValueNumber liberalLength = _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, liberalArray);
+                ValueNumber conservativeLength = conservativeArray == liberalArray
+                    ? liberalLength
+                    : _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, conservativeArray);
+                return new ValueNumberPair(liberalLength, conservativeLength);
+            }
+
             private ValueNumberPair Call(GenTree node, ImmutableArray<ValueNumberPair> operands, ref ValueNumber heap, ref ValueNumber byrefExposed, int blockId)
             {
-                if (IsArrayLengthGetter(node) && operands.Length != 0)
-                {
-                    ValueNumber liberalArray = OperandNormal(operands, 0, ValueNumberCategory.Liberal);
-                    ValueNumber conservativeArray = OperandNormal(operands, 0, ValueNumberCategory.Conservative);
-                    ValueNumber liberalLength = _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, liberalArray);
-                    ValueNumber conservativeLength = conservativeArray == liberalArray
-                        ? liberalLength
-                        : _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, conservativeArray);
-                    return new ValueNumberPair(liberalLength, conservativeLength);
-                }
-
                 var args = ArgsFromPairs(operands);
                 if (node.Method is not null)
                     args = args.Add(_store.VNForMethod(node.Method));
@@ -3180,19 +3185,6 @@ namespace Cnidaria.Cs
                 ValueNumberFunction func = node.Kind == GenTreeKind.VirtualCall ? ValueNumberFunction.VirtualCall : ValueNumberFunction.Call;
                 ValueNumber liberal = _store.VNForStableUnique(node.Id, node.StackKind, node.Type, func, args);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
-            }
-
-            private static bool IsArrayLengthGetter(GenTree node)
-            {
-                RuntimeMethod? method = node.Method;
-                return method is not null &&
-                       method.HasThis &&
-                       !method.IsStatic &&
-                       method.ParameterTypes.Length == 0 &&
-                       method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
-                       StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                       StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
-                       StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array");
             }
 
             private ValueNumberPair LocalAddress(GenTree node, int blockId)
@@ -3350,6 +3342,11 @@ namespace Cnidaria.Cs
                         }
                         break;
 
+                    case GenTreeKind.NullCheck:
+                        if (operands.Length != 0)
+                            result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
+                        break;
+
                     case GenTreeKind.Field:
                     case GenTreeKind.FieldAddr:
                     case GenTreeKind.StoreField:
@@ -3376,6 +3373,7 @@ namespace Cnidaria.Cs
                         }
                         break;
 
+                    case GenTreeKind.ArrayLength:
                     case GenTreeKind.ArrayDataRef:
                         if (operands.Length != 0)
                             result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
@@ -3404,10 +3402,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case GenTreeKind.Call:
-                        if (IsArrayLengthGetter(node) && operands.Length != 0)
-                            result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
-                        else
-                            result = AddHelperOpaqueException(result, node);
+                        result = AddHelperOpaqueException(result, node);
                         break;
 
                     case GenTreeKind.ClassInit:

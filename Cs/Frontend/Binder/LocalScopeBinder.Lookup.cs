@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Lexical lookup, imported members, and local function predeclaration
     internal sealed partial class LocalScopeBinder : Binder
     {
         private static bool TryGetBoolConstant(BoundExpression expr, out bool value)
@@ -351,6 +347,7 @@ namespace Cnidaria.Cs
 
             return b.Count == 0 ? ImmutableArray<MethodSymbol>.Empty : b.ToImmutable();
         }
+        /// <summary>Returns visible locals, parameters, local functions, and parent symbols</summary>
         public override ImmutableArray<Symbol> LookupSymbols(int position, string? name = null)
         {
             var builder = ImmutableArray.CreateBuilder<Symbol>();
@@ -373,6 +370,7 @@ namespace Cnidaria.Cs
 
             return builder.ToImmutable();
         }
+        /// <summary>Declares local functions before binding sibling statements</summary>
         internal void PredeclareLocalFunctionsInStatementList(
             ImmutableArray<StatementSyntax> statements,
             BindingContext context,
@@ -394,6 +392,7 @@ namespace Cnidaria.Cs
                     DeclareLocalFunction(lf, context, diagnostics);
             }
         }
+        // Target-typed stack allocation lowers through the span pointer constructor
         private BoundExpression LowerStackAllocToSpanCreation(
             ExpressionSyntax exprSyntax,
             BoundStackAllocArrayCreationExpression sa,
@@ -509,6 +508,7 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+        // Local function signatures are bound during predeclaration
         private LocalFunctionSymbol DeclareLocalFunction(
             LocalFunctionStatementSyntax lf,
             BindingContext context,
@@ -554,9 +554,30 @@ namespace Cnidaria.Cs
                 (_containing is MethodSymbol containingMethod && containingMethod.IsStatic);
             var isAsync = HasModifier(lf.Modifiers, SyntaxKind.AsyncKeyword);
             var isUnsafe = HasModifier(lf.Modifiers, SyntaxKind.UnsafeKeyword);
+            var isExtern = HasModifier(lf.Modifiers, SyntaxKind.ExternKeyword);
+            var hasExplicitStatic = HasModifier(lf.Modifiers, SyntaxKind.StaticKeyword);
+
+            if (isExtern && !hasExplicitStatic)
+            {
+                diagnostics.Add(new Diagnostic("CN_LFUNC008", DiagnosticSeverity.Error,
+                    "An extern local function must be declared static.",
+                    new Location(tree, lf.Identifier.Span)));
+            }
+            if (isExtern && isAsync)
+            {
+                diagnostics.Add(new Diagnostic("CN_LFUNC009", DiagnosticSeverity.Error,
+                    "A local function cannot be both async and extern.",
+                    new Location(tree, lf.Span)));
+            }
+            if (isExtern && lf.TypeParameterList is not null)
+            {
+                diagnostics.Add(new Diagnostic("CN_LFUNC010", DiagnosticSeverity.Error,
+                    "An extern local function cannot be generic.",
+                    new Location(tree, lf.TypeParameterList.Span)));
+            }
 
             var locations = ImmutableArray.Create(new Location(tree, lf.Identifier.Span));
-            var sym = new LocalFunctionSymbol(name, _containing, lf, tree, locations, isStatic, isAsync);
+            var sym = new LocalFunctionSymbol(name, _containing, lf, tree, locations, isStatic, isAsync, isExtern);
             var typeParameters = DeclareLocalFunctionTypeParameters(lf, sym, tree, context, diagnostics);
             sym.SetTypeParameters(typeParameters);
             GenericConstraintBinder.BindOwnerConstraintClauses(

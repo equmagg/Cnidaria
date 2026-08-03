@@ -364,7 +364,7 @@ namespace Cnidaria.Cs
 
         private int _exceptionTranslationDepth;
         private long _instructionLimit = 0;
-        public long InctructionsElapsed => _instructionLimit - _fuel;
+        public long InstructionsElapsed => _instructionLimit - _fuel;
 
 
         private readonly List<FreeBlock> _freeBlocks = new();
@@ -5804,60 +5804,15 @@ namespace Cnidaria.Cs
         }
         private RuntimeMethod ResolveVirtualDispatch(RuntimeType receiverType, RuntimeMethod declared)
         {
-            if (receiverType is null) throw new ArgumentNullException(nameof(receiverType));
-            if (declared is null) throw new ArgumentNullException(nameof(declared));
+            if (receiverType is null)
+                throw new ArgumentNullException(nameof(receiverType));
+            if (declared is null)
+                throw new ArgumentNullException(nameof(declared));
 
-            if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
-            {
-                for (var t = receiverType; t != null; t = t.BaseType)
-                {
-                    var map = t.ExplicitInterfaceMethodImpls;
-                    if (map is not null && map.TryGetValue(declared.MethodId, out var explicitImpl))
-                        return explicitImpl;
-                }
-
-                var m = FindMostDerivedMethodByNameAndSig(receiverType, declared);
-                if (m is null)
-                    throw new MissingMethodException(
-                        $"Interface method not implemented: {declared.DeclaringType.Namespace}." +
-                        $"{declared.DeclaringType.Name}.{declared.Name}");
-                return m;
-            }
-            // Class virtual dispatch
-            int slot = declared.VTableSlot;
-            if (slot >= 0 && (uint)slot < (uint)receiverType.VTable.Length)
-                return receiverType.VTable[slot];
-
-            // Fallback
-            return FindMostDerivedMethodByNameAndSig(receiverType, declared) ?? declared;
-        }
-        private static RuntimeMethod? FindMostDerivedMethodByNameAndSig(RuntimeType receiverType, RuntimeMethod declared)
-        {
-            for (var t = receiverType; t != null; t = t.BaseType)
-            {
-                var ms = t.Methods;
-                for (int i = 0; i < ms.Length; i++)
-                {
-                    var cand = ms[i];
-                    if (cand.IsStatic) continue;
-                    if (cand.IsPrivate) continue;
-                    if (!StringComparer.Ordinal.Equals(cand.Name, declared.Name)) continue;
-                    if (!SameSig(cand, declared)) continue;
-                    return cand;
-                }
-            }
-
-            return null;
-
-            static bool SameSig(RuntimeMethod a, RuntimeMethod b)
-            {
-                if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
-                if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
-                if (a.GenericArity != b.GenericArity) return false;
-                for (int i = 0; i < a.ParameterTypes.Length; i++)
-                    if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
-                return true;
-            }
+            return _rts.ResolveVirtualMethod(declared, receiverType) ??
+                throw new MissingMethodException(
+                    $"Virtual method not implemented: {declared.DeclaringType.Namespace}." +
+                    $"{declared.DeclaringType.Name}.{declared.Name}");
         }
         private RuntimeMethod ResolveRuntimeMethodOrThrow(RuntimeModule mod, int methodToken)
             => ResolveRuntimeMethodOrThrow(mod, methodToken, methodContext: null);

@@ -69,6 +69,7 @@ namespace Cnidaria.Cs
         StaticField,
         StaticFieldAddr,
 
+        NullCheck,
         LoadIndirect,
         StoreIndirect,
         StoreLocal,
@@ -78,6 +79,7 @@ namespace Cnidaria.Cs
         StoreStaticField,
 
         NewArray,
+        ArrayLength,
         ArrayElement,
         ArrayElementAddr,
         StoreArrayElement,
@@ -85,8 +87,6 @@ namespace Cnidaria.Cs
 
         StaticData,
         StackAlloc,
-        AllocHGlobal,
-        FreeHGlobal,
         PointerElementAddr,
         PointerToByRef,
         PointerDiff,
@@ -152,6 +152,7 @@ namespace Cnidaria.Cs
         DivModNoByZero = 1u << 20,
         DivModNoOverflow = 1u << 21,
         MakeCse = 1u << 22,
+        ExplicitInit = 1u << 23,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal enum GenTreeBlockJumpKind : byte

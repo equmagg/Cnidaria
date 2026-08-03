@@ -1,7 +1,7 @@
 # Cnidaria
 ![build](https://img.shields.io/badge/build-passing-brightgreen) ![dotnet](https://img.shields.io/badge/.NET-10.0-blue)
 
-Cnidaria is the crossplatform compiler and interpreter for primarily **C#** and multiple other languages (currently C).
+Cnidaria is the crossplatform compiler and interpreter for primarily **C#** and multiple other languages (currently C and Python).
 
 It is *THE solution to use modern C# as an embedded/scripting language*. Be it DSL, in-game scripting or remote code execution.
 While it strives to cover almost all of C# syntax and be very close in semantics, it is primarily designed for small, fast and reasonably simple embedded scripts. 
@@ -16,8 +16,7 @@ Basic Class Library is being ported from the ground up and has no access for hos
 Any vm-host interations must be explicitly declared by the host by attaching a library and declaring InternalCall implementations.
 
 You can get acquainted with the standart library here.
-[Standart library](./Cs/BCL/CoreBCL.cs)
-[Extended library](./Cs/BCL/ExtendedBCL.cs)
+[Standart library](./Cs/BCL/)
 
 ---
 
@@ -88,20 +87,22 @@ Bytecode Emiter > stack-based bytecode > stack-based VM
 
 stack bytecode -> register bytecode path mimics RyuJiT pipeline
 ```
-stack-based bytecode > Import/Morph/Inline/Physical Promotion > GenTree HIR
+stack-based bytecode > Import/Morph(Devirt+Inline+Physical Promotion) > GenTree HIR
 CFG/SSA anotation > VN-based SSA optimization > rationalization > LIR
 LSRA (register allocation) > target specific CodeGen > target > execution
 ```
 SSA/VN-based optimizations we currently implement in order:
 
-- Copy propagation
-- Constant/fact propagation
-- Constant folding
-- Dead Code Elimination
-- Redundant Branch Optimization
+- Early propagation
+- Value Numbering
 - Loop Invariant Code Motion
+- Copy propagation
+- Redundant Branch Optimization
 - Common Subexpression Elimination
 - Assertion propagation
+- Constant/fact propagation
+- Constant folding
+- Dead Store Elimination
 - Strength reduction
 
 ---
@@ -130,21 +131,15 @@ var code = """
 int main()
 {
     printf("Hello World!\n");
-    return 0;
 }
 """;
-var compilation = Cnidaria.C.Compilation.Create(code); 
-foreach(var diag in compilation.GetDiagnostics())
-{
-    Console.WriteLine(diag.Message);
-}
-var cfg = Cnidaria.C.ControlFlowGraph.Build(compilation.GetSemanticModel(compilation.SyntaxTrees[0]));
-var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-var lir = Cnidaria.C.LirModule.Lower(ssa);
-var program = Cnidaria.C.RegisterBytecodeCodeGenerator.Generate(lir);
-var cRuntime = program.CreateSyntheticRuntime();
+StaticLinkResult<RegisterBytecodeProgram> linked = StaticLinker.LinkRegisterBytecode(
+    [new SourceFile("main.c", code)], new StaticLinkerOptions(CTargetInfo.RegisterBytecode32));
+foreach (var diagnostic in linked.Diagnostics) { Console.WriteLine(diagnostic); }
+var program = linked.Program ?? throw new InvalidOperationException("The linker returned no program.");
+var runtime = program.CreateSyntheticRuntime();
 byte[] cMem = GC.AllocateUninitializedArray<byte>(64 * 1024);
-var cVm = new RegisterBasedVm(cMem, staticEnd: 4 * 1024, stackEnd: 32 * 1024, cRuntime.RuntimeTypes, cRuntime.Modules, program.Image, textWriter: Console.Out);
+var cVm = new RegisterBasedVm(cMem, staticEnd: 4 * 1024, stackEnd: 32 * 1024, runtime.RuntimeTypes, runtime.Modules, program.Image, textWriter: Console.Out);
 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
 var limits = new Cnidaria.Cs.ExecutionLimits
 {
@@ -152,7 +147,7 @@ var limits = new Cnidaria.Cs.ExecutionLimits
     MaxInstructions = 1_000_000_000,
     TokenCheckPeriod = 256,
 };
-cVm.Execute(cRuntime.EntryPc, cts.Token, limits, ReadOnlySpan<VmValue>.Empty);
+cVm.Execute(runtime.EntryPc, cts.Token, limits, ReadOnlySpan<VmValue>.Empty);
 ```
 
 Targeting x86-64 Windows .exe
@@ -163,19 +158,13 @@ var code = """
 int main()
 {
     printf("Hello World!\n");
-    return 0;
 }
 """;
-var comp = Cnidaria.C.Compilation.Create(code, Cnidaria.C.TargetInfo.X64Windows);
-foreach(var diag in comp.GetDiagnostics())
-{
-    Console.WriteLine(diag.Message);
-}
-var cfg = Cnidaria.C.ControlFlowGraph.Build(comp.GetSemanticModel(comp.SyntaxTrees[0]));
-var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-var lir = Cnidaria.C.LirModule.Lower(ssa);
-Cnidaria.X86.X86Program xProgram = Cnidaria.C.X86CodeGenerator.Generate(lir);
-File.WriteAllBytes(Path.Combine(AppContext.BaseDirectory, "CExecutable.exe"), xProgram.ToWindowsExecutableBytes());
+var linked = Cnidaria.C.StaticLinker.LinkX86([new Cnidaria.C.SourceFile("main.c", code)],
+    new Cnidaria.C.StaticLinkerOptions(Cnidaria.C.TargetInfo.X64Windows));
+foreach (var diagnostic in linked.Diagnostics) { Console.WriteLine(diagnostic); }
+var program = linked.Program ?? throw new InvalidOperationException("The linker returned no program.");
+File.WriteAllBytes(Path.Combine(AppContext.BaseDirectory, "CExecutable.exe"), program.ToWindowsExecutableBytes());
 ```
 
 Targeting RISC-V emulator
@@ -187,18 +176,12 @@ int main()
 {
     printf("Hello World!\n");
     shutdown(); // stop the emulator
-    return 0;
 }
 """;
-var comp = Cnidaria.C.Compilation.Create(code, Cnidaria.C.TargetInfo.RV64GLinux); 
-foreach(var diag in comp.GetDiagnostics())
-{
-    Console.WriteLine(diag.Message);
-}
-var cfg = Cnidaria.C.ControlFlowGraph.Build(comp.GetSemanticModel(comp.SyntaxTrees[0]));
-var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-var lir = Cnidaria.C.LirModule.Lower(ssa);
-var program = Cnidaria.C.RiscVCodeGenerator.Generate(lir);
+StaticLinkResult<RiscVProgram> linked = StaticLinker.LinkRiscV(
+    [new SourceFile("main.c", code)], new StaticLinkerOptions(CTargetInfo.RV64GLinux));
+foreach (var diagnostic in linked.Diagnostics) { Console.WriteLine(diagnostic); }
+var program = linked.Program ?? throw new InvalidOperationException("The linker returned no program.");
 
 var layout = new Cnidaria.RiscV.RiscVZBootLayout();
 var machine = new Cnidaria.RiscV.RiscVEmulator(new Cnidaria.RiscV.RVMachineConfig
@@ -215,4 +198,64 @@ var result = machine.Run(instructionLimit: 10_000_000);
 while (machine.Uart.TryReadOutput(out byte b))
     Console.Write((char)b);
 Console.WriteLine($"\nstop={result.StopReason} pc=0x{machine.ProgramCounter:x16} mode={machine.PrivilegeMode} steps={result.Steps}");
+```
+
+Targeting ARM
+
+```cs
+var code = """
+#include <stdio.h>
+int main()
+{
+    printf("Hello World!\n");
+}
+""";
+var linked = Cnidaria.C.StaticLinker.LinkArm([new Cnidaria.C.SourceFile("main.c", code)],
+    new Cnidaria.C.StaticLinkerOptions(Cnidaria.C.TargetInfo.Arm64Windows));
+foreach (var diagnostic in linked.Diagnostics) { Console.WriteLine(diagnostic); }
+var program = linked.Program ?? throw new InvalidOperationException("The linker returned no program.");
+File.WriteAllBytes(Path.Combine(AppContext.BaseDirectory, "CExecutable.exe"), program.ToWindowsExecutableBytes());
+```
+
+# Python
+
+### Python Hello World
+
+```cs
+var code = """
+print("Hello World")
+""";
+var emitResult = Cnidaria.Python.PythonEmitter.Emit(str,
+    new Cnidaria.Python.EmitOptions
+    {
+        FileName = $"<main>",
+        ModuleName = "__main__",
+        OptimizationLevel = 1,
+    });
+if (!emitResult.Success || emitResult.CodeObject is null)
+{
+    foreach (var diagnostic in emitResult.Diagnostics)
+    {
+        Console.WriteLine($"{diagnostic.Severity} {diagnostic.Code} [{diagnostic.Span.Start}..{diagnostic.Span.End}]: {diagnostic.Message}");
+    }
+}
+var memory = GC.AllocateUninitializedArray<byte>(128 * 1024);
+using var output = new StringWriter();
+var vmResult = Cnidaria.Python.PythonVirtualMachine.Execute(
+    emitResult.CodeObject,
+    memory,
+    output,
+    Cnidaria.Python.PythonModuleCatalog.Empty,
+    new Cnidaria.Python.ExecutionLimits
+    {
+        MaxInstructions = 10_000_000,
+        MaxCallDepth = 128,
+        MaxIntegerBits = 16_384,
+        MaxOutputBytes = 4 * 1024,
+        CancellationCheckPeriod = 256,
+        TimeLimit = TimeSpan.FromSeconds(3)
+    });
+if (!vmResult.Success) 
+    Console.WriteLine($"VM stopped with {vmResult.StopReason}: {vmResult.DiagnosticMessage ?? "<none>"}");
+Console.WriteLine(output.ToString());
 ```

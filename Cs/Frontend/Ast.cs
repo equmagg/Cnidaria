@@ -1,11 +1,11 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Text;
 
 namespace Cnidaria.Cs
 {
 
+    ///<summary>Builds source spans</summary>
     internal static class NodeSpan
     {
         public static TextSpan Combine(TextSpan first, TextSpan second)
@@ -49,6 +49,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Base class for source-backed syntax</summary>
     public abstract class SyntaxNode
     {
         public SyntaxKind Kind { get; }
@@ -61,6 +62,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Stores one element of an interleaved node and separator sequence</summary>
     public readonly struct SyntaxNodeOrToken
     {
         private readonly SyntaxNode? _node;
@@ -89,6 +91,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Stores an ordered node sequence without separators</summary>
     public readonly struct SyntaxList<T> : IEnumerable<T> where T : SyntaxNode
     {
         private readonly T[] _items;
@@ -107,6 +110,7 @@ namespace Cnidaria.Cs
         public T[] ToArray() => _items;
     }
 
+    ///<summary>Stores nodes and separator tokens in source order</summary>
     public readonly struct SeparatedSyntaxList<T> : IEnumerable<T> where T : SyntaxNode
     {
         private readonly SyntaxNodeOrToken[] _nodesAndSeparators;
@@ -165,6 +169,7 @@ namespace Cnidaria.Cs
 
         IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
+    ///<summary>Stores an ordered token sequence</summary>
     public readonly struct SyntaxTokenList : IEnumerable<SyntaxToken>
     {
         private readonly SyntaxToken[] _tokens;
@@ -183,20 +188,24 @@ namespace Cnidaria.Cs
     }
 
     // abstract nodes
+    ///<summary>Base class for syntax that can be bound as an expression</summary>
     public abstract class ExpressionSyntax : SyntaxNode
     {
         protected ExpressionSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Base class for executable statement syntax</summary>
     public abstract class StatementSyntax : SyntaxNode
     {
         protected StatementSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Base class for text and interpolation segments inside an interpolated string</summary>
     public abstract class InterpolatedStringContentSyntax : SyntaxNode
     {
         protected InterpolatedStringContentSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
+    ///<summary>Base class for declarations allowed in a compilation unit, namespace or type</summary>
     public abstract class MemberDeclarationSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
@@ -207,15 +216,18 @@ namespace Cnidaria.Cs
             AttributeLists = attributeLists;
         }
     }
+    ///<summary>Base class for expression and spread elements in a collection expression</summary>
     public abstract class CollectionElementSyntax : SyntaxNode
     {
         protected CollectionElementSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
+    ///<summary>Base class for entries in a type base list</summary>
     public abstract class BaseTypeSyntax : SyntaxNode
     {
         public abstract TypeSyntax Type { get; }
         protected BaseTypeSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
+    ///<summary>Represents a base type without primary constructor arguments</summary>
     public sealed class SimpleBaseTypeSyntax : BaseTypeSyntax
     {
         public override TypeSyntax Type { get; }
@@ -226,6 +238,7 @@ namespace Cnidaria.Cs
             Type = type;
         }
     }
+    ///<summary>Represents the colon-prefixed base type and interface list</summary>
     public sealed class BaseListSyntax : SyntaxNode
     {
         public SyntaxToken ColonToken { get; }
@@ -240,6 +253,7 @@ namespace Cnidaria.Cs
             Types = types;
         }
     }
+    ///<summary>Represents an expression body introduced by '=>'</summary>
     public sealed class ArrowExpressionClauseSyntax : SyntaxNode
     {
         public SyntaxToken ArrowToken { get; }
@@ -252,21 +266,25 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Base class for syntax interpreted as a type</summary>
     public abstract class TypeSyntax : ExpressionSyntax
     {
         protected TypeSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Base class for qualified and simple names</summary>
     public abstract class NameSyntax : TypeSyntax
     {
         protected NameSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Base class for identifier and generic names</summary>
     public abstract class SimpleNameSyntax : NameSyntax
     {
         protected SimpleNameSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
     // base nodes
+    ///<summary>Represents the complete source file including directives, members and end-of-file token</summary>
     public sealed class CompilationUnitSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
@@ -297,6 +315,7 @@ namespace Cnidaria.Cs
             EndOfFileToken = endOfFileToken;
         }
     }
+    ///<summary>Represents an 'extern alias name;' directive</summary>
     public sealed class ExternAliasDirectiveSyntax : SyntaxNode
     {
         public SyntaxToken ExternKeyword { get; }
@@ -313,6 +332,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents the 'name =' prefix used by aliases and named attribute arguments</summary>
     public sealed class NameEqualsSyntax : SyntaxNode
     {
         public IdentifierNameSyntax Name { get; }
@@ -325,21 +345,25 @@ namespace Cnidaria.Cs
             EqualsToken = equalsToken;
         }
     }
+    ///<summary>Represents a using directive with optional 'global', 'static', 'unsafe' or alias syntax</summary>
     public sealed class UsingDirectiveSyntax : SyntaxNode
     {
         public SyntaxToken GlobalKeyword { get; } // optional
         public SyntaxToken UsingKeyword { get; }
         public SyntaxToken StaticKeyword { get; } // optional
+        public SyntaxToken UnsafeKeyword { get; } // optional
         public NameEqualsSyntax? Alias { get; }   // optional
-        public NameSyntax Name { get; }
+        public TypeSyntax NamespaceOrType { get; }
+        public NameSyntax? Name => NamespaceOrType as NameSyntax;
         public SyntaxToken SemicolonToken { get; }
 
         public UsingDirectiveSyntax(
             SyntaxToken globalKeyword,
             SyntaxToken usingKeyword,
             SyntaxToken staticKeyword,
+            SyntaxToken unsafeKeyword,
             NameEqualsSyntax? alias,
-            NameSyntax name,
+            TypeSyntax namespaceOrType,
             SyntaxToken semicolonToken)
             : base(SyntaxKind.UsingDirective,
                    NodeSpan.FromNonNull(
@@ -350,11 +374,13 @@ namespace Cnidaria.Cs
             GlobalKeyword = globalKeyword;
             UsingKeyword = usingKeyword;
             StaticKeyword = staticKeyword;
+            UnsafeKeyword = unsafeKeyword;
             Alias = alias;
-            Name = name;
+            NamespaceOrType = namespaceOrType;
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Wraps a top-level statement as a compilation unit member</summary>
     public sealed class GlobalStatementSyntax : MemberDeclarationSyntax
     {
         public StatementSyntax Statement { get; }
@@ -369,6 +395,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a brace-delimited statement list</summary>
     public sealed class BlockSyntax : StatementSyntax
     {
         public SyntaxToken OpenBraceToken { get; }
@@ -384,6 +411,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents an expression followed by ';'</summary>
     public sealed class ExpressionStatementSyntax : StatementSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -399,6 +427,7 @@ namespace Cnidaria.Cs
 
 
     // type nodes
+    ///<summary>Represents a single identifier used as a name</summary>
     public sealed class IdentifierNameSyntax : SimpleNameSyntax
     {
         public SyntaxToken Identifier { get; }
@@ -410,6 +439,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a dotted name such as 'A.B'</summary>
     public sealed class QualifiedNameSyntax : NameSyntax
     {
         public NameSyntax Left { get; }
@@ -424,6 +454,25 @@ namespace Cnidaria.Cs
             Right = right;
         }
     }
+    ///<summary>Represents an alias-qualified name such as 'global::System'</summary>
+    public sealed class AliasQualifiedNameSyntax : NameSyntax
+    {
+        public IdentifierNameSyntax Alias { get; }
+        public SyntaxToken ColonColonToken { get; }
+        public SimpleNameSyntax Name { get; }
+
+        public AliasQualifiedNameSyntax(
+            IdentifierNameSyntax alias,
+            SyntaxToken colonColonToken,
+            SimpleNameSyntax name)
+            : base(SyntaxKind.AliasQualifiedName, NodeSpan.From(alias.Span, name.Span))
+        {
+            Alias = alias;
+            ColonColonToken = colonColonToken;
+            Name = name;
+        }
+    }
+    ///<summary>Represents the interface name and trailing dot in an explicit member declaration</summary>
     public sealed class ExplicitInterfaceSpecifierSyntax : SyntaxNode
     {
         public NameSyntax Name { get; }
@@ -436,6 +485,7 @@ namespace Cnidaria.Cs
             DotToken = dotToken;
         }
     }
+    ///<summary>Represents a type keyword such as 'int', 'string' or 'void'</summary>
     public sealed class PredefinedTypeSyntax : TypeSyntax
     {
         public SyntaxToken Keyword { get; }
@@ -446,6 +496,7 @@ namespace Cnidaria.Cs
             Keyword = keyword;
         }
     }
+    ///<summary>Represents 'ref T' or 'ref readonly T'</summary>
     public sealed class RefTypeSyntax : TypeSyntax
     {
         public SyntaxToken RefKeyword { get; }
@@ -460,6 +511,20 @@ namespace Cnidaria.Cs
             Type = type;
         }
     }
+    ///<summary>Represents 'scoped T'</summary>
+    public sealed class ScopedTypeSyntax : TypeSyntax
+    {
+        public SyntaxToken ScopedKeyword { get; }
+        public TypeSyntax Type { get; }
+
+        public ScopedTypeSyntax(SyntaxToken scopedKeyword, TypeSyntax type)
+            : base(SyntaxKind.ScopedType, NodeSpan.From(scopedKeyword.Span, type.Span))
+        {
+            ScopedKeyword = scopedKeyword;
+            Type = type;
+        }
+    }
+    ///<summary>Represents the pointer type 'T*'</summary>
     public sealed class PointerTypeSyntax : TypeSyntax
     {
         public TypeSyntax ElementType { get; }
@@ -472,6 +537,7 @@ namespace Cnidaria.Cs
             AsteriskToken = asteriskToken;
         }
     }
+    ///<summary>Represents a function pointer type beginning with delegate and an asterisk</summary>
     public sealed class FunctionPointerTypeSyntax : TypeSyntax
     {
         public SyntaxToken DelegateKeyword { get; }
@@ -494,6 +560,7 @@ namespace Cnidaria.Cs
             ParameterList = parameterList;
         }
     }
+    ///<summary>Represents the angle-bracketed parameter types and final return type of a function pointer</summary>
     public sealed class FunctionPointerParameterListSyntax : SyntaxNode
     {
         public SyntaxToken LessThanToken { get; }
@@ -511,6 +578,7 @@ namespace Cnidaria.Cs
             GreaterThanToken = greaterThanToken;
         }
     }
+    ///<summary>Represents one function pointer parameter or its final return type</summary>
     public sealed class FunctionPointerParameterSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
@@ -533,6 +601,7 @@ namespace Cnidaria.Cs
             Type = type;
         }
     }
+    ///<summary>Represents the optional 'managed' or 'unmanaged[...]' calling convention</summary>
     public sealed class FunctionPointerCallingConventionSyntax : SyntaxNode
     {
         public SyntaxToken ManagedOrUnmanagedKeyword { get; }
@@ -549,6 +618,7 @@ namespace Cnidaria.Cs
             UnmanagedCallingConventionList = unmanagedCallingConventionList;
         }
     }
+    ///<summary>Represents the bracketed unmanaged calling convention identifiers</summary>
     public sealed class FunctionPointerUnmanagedCallingConventionListSyntax : SyntaxNode
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -566,6 +636,7 @@ namespace Cnidaria.Cs
             CloseBracketToken = closeBracketToken;
         }
     }
+    ///<summary>Represents one unmanaged calling convention identifier</summary>
     public sealed class FunctionPointerUnmanagedCallingConventionSyntax : SyntaxNode
     {
         public SyntaxToken Name { get; }
@@ -576,6 +647,7 @@ namespace Cnidaria.Cs
             Name = name;
         }
     }
+    ///<summary>Represents 'T?' when parsed as a type</summary>
     public sealed class NullableTypeSyntax : TypeSyntax
     {
         public TypeSyntax ElementType { get; }
@@ -588,6 +660,7 @@ namespace Cnidaria.Cs
             QuestionToken = questionToken;
         }
     }
+    ///<summary>Represents a parenthesized tuple type</summary>
     public sealed class TupleTypeSyntax : TypeSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -605,6 +678,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents one tuple type element with an optional name</summary>
     public sealed class TupleElementSyntax : SyntaxNode
     {
         public TypeSyntax Type { get; }
@@ -622,10 +696,12 @@ namespace Cnidaria.Cs
         }
     }
     // =pattern nodes=
+    ///<summary>Base class for syntax accepted in pattern positions</summary>
     public abstract class PatternSyntax : SyntaxNode
     {
         protected PatternSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
+    ///<summary>Represents an expression matched by value</summary>
     public sealed class ConstantPatternSyntax : PatternSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -636,6 +712,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a type test with a variable designation</summary>
     public sealed class DeclarationPatternSyntax : PatternSyntax
     {
         public TypeSyntax Type { get; }
@@ -648,6 +725,7 @@ namespace Cnidaria.Cs
             Designation = designation;
         }
     }
+    ///<summary>Represents 'var' followed by a variable designation</summary>
     public sealed class VarPatternSyntax : PatternSyntax
     {
         public SyntaxToken VarKeyword { get; }
@@ -660,6 +738,7 @@ namespace Cnidaria.Cs
             Designation = designation;
         }
     }
+    ///<summary>Represents a pattern that tests only the input type</summary>
     public sealed class TypePatternSyntax : PatternSyntax
     {
         public TypeSyntax Type { get; }
@@ -670,9 +749,10 @@ namespace Cnidaria.Cs
             Type = type;
         }
     }
+    ///<summary>Represents a relational operator followed by a constant expression</summary>
     public sealed class RelationalPatternSyntax : PatternSyntax
     {
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '<', '<=', '>' or '>='
         public ExpressionSyntax Expression { get; }
 
         public RelationalPatternSyntax(SyntaxToken operatorToken, ExpressionSyntax expression)
@@ -682,10 +762,11 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents two patterns joined by 'and' or 'or'</summary>
     public sealed class BinaryPatternSyntax : PatternSyntax
     {
         public PatternSyntax Left { get; }
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // 'and' or 'or'
         public PatternSyntax Right { get; }
 
         public BinaryPatternSyntax(SyntaxKind kind, PatternSyntax left, SyntaxToken operatorToken, PatternSyntax right)
@@ -696,9 +777,10 @@ namespace Cnidaria.Cs
             Right = right;
         }
     }
+    ///<summary>Represents a pattern prefixed by 'not'</summary>
     public sealed class UnaryPatternSyntax : PatternSyntax
     {
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // 'not'
         public PatternSyntax Pattern { get; }
 
         public UnaryPatternSyntax(SyntaxKind kind, SyntaxToken operatorToken, PatternSyntax pattern)
@@ -708,6 +790,50 @@ namespace Cnidaria.Cs
             Pattern = pattern;
         }
     }
+    ///<summary>Represents a bracket-delimited list pattern with an optional designation</summary>
+    public sealed class ListPatternSyntax : PatternSyntax
+    {
+        public SyntaxToken OpenBracketToken { get; }
+        public SeparatedSyntaxList<PatternSyntax> Patterns { get; }
+        public SyntaxToken CloseBracketToken { get; }
+        public VariableDesignationSyntax? Designation { get; }
+
+        public ListPatternSyntax(
+            SyntaxToken openBracketToken,
+            SeparatedSyntaxList<PatternSyntax> patterns,
+            SyntaxToken closeBracketToken,
+            VariableDesignationSyntax? designation)
+            : base(
+                  SyntaxKind.ListPattern,
+                  NodeSpan.FromNonNull(
+                      openBracketToken.Span,
+                      closeBracketToken.Span,
+                      designation?.Span))
+        {
+            OpenBracketToken = openBracketToken;
+            Patterns = patterns;
+            CloseBracketToken = closeBracketToken;
+            Designation = designation;
+        }
+    }
+    ///<summary>Represents a slice pattern beginning with '..'</summary>
+    public sealed class SlicePatternSyntax : PatternSyntax
+    {
+        public SyntaxToken DotDotToken { get; }
+        public PatternSyntax? Pattern { get; }
+
+        public SlicePatternSyntax(SyntaxToken dotDotToken, PatternSyntax? pattern)
+            : base(
+                  SyntaxKind.SlicePattern,
+                  pattern is null
+                      ? dotDotToken.Span
+                      : NodeSpan.From(dotDotToken.Span, pattern.Span))
+        {
+            DotDotToken = dotDotToken;
+            Pattern = pattern;
+        }
+    }
+    ///<summary>Represents a parenthesized pattern</summary>
     public sealed class ParenthesizedPatternSyntax : PatternSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -722,6 +848,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents the discard pattern '_'</summary>
     public sealed class DiscardPatternSyntax : PatternSyntax
     {
         public SyntaxToken UnderscoreToken { get; }
@@ -732,6 +859,84 @@ namespace Cnidaria.Cs
             UnderscoreToken = underscoreToken;
         }
     }
+    ///<summary>Represents a recursive pattern with optional type, positional clause, property clause and designation</summary>
+    public sealed class RecursivePatternSyntax : PatternSyntax
+    {
+        public TypeSyntax? Type { get; }
+        public PositionalPatternClauseSyntax? PositionalPatternClause { get; }
+        public PropertyPatternClauseSyntax? PropertyPatternClause { get; }
+        public VariableDesignationSyntax? Designation { get; }
+
+        public RecursivePatternSyntax(
+            TypeSyntax? type,
+            PositionalPatternClauseSyntax? positionalPatternClause,
+            PropertyPatternClauseSyntax? propertyPatternClause,
+            VariableDesignationSyntax? designation)
+            : base(
+                  SyntaxKind.RecursivePattern,
+                  NodeSpan.FromNonNull(
+                      type?.Span,
+                      positionalPatternClause?.Span,
+                      propertyPatternClause?.Span,
+                      designation?.Span))
+        {
+            Type = type;
+            PositionalPatternClause = positionalPatternClause;
+            PropertyPatternClause = propertyPatternClause;
+            Designation = designation;
+        }
+    }
+    ///<summary>Represents a parenthesized positional subpattern list</summary>
+    public sealed class PositionalPatternClauseSyntax : SyntaxNode
+    {
+        public SyntaxToken OpenParenToken { get; }
+        public SeparatedSyntaxList<SubpatternSyntax> Subpatterns { get; }
+        public SyntaxToken CloseParenToken { get; }
+
+        public PositionalPatternClauseSyntax(
+            SyntaxToken openParenToken,
+            SeparatedSyntaxList<SubpatternSyntax> subpatterns,
+            SyntaxToken closeParenToken)
+            : base(SyntaxKind.PositionalPatternClause, NodeSpan.From(openParenToken.Span, closeParenToken.Span))
+        {
+            OpenParenToken = openParenToken;
+            Subpatterns = subpatterns;
+            CloseParenToken = closeParenToken;
+        }
+    }
+    ///<summary>Represents a brace-delimited property subpattern list</summary>
+    public sealed class PropertyPatternClauseSyntax : SyntaxNode
+    {
+        public SyntaxToken OpenBraceToken { get; }
+        public SeparatedSyntaxList<SubpatternSyntax> Subpatterns { get; }
+        public SyntaxToken CloseBraceToken { get; }
+
+        public PropertyPatternClauseSyntax(
+            SyntaxToken openBraceToken,
+            SeparatedSyntaxList<SubpatternSyntax> subpatterns,
+            SyntaxToken closeBraceToken)
+            : base(SyntaxKind.PropertyPatternClause, NodeSpan.From(openBraceToken.Span, closeBraceToken.Span))
+        {
+            OpenBraceToken = openBraceToken;
+            Subpatterns = subpatterns;
+            CloseBraceToken = closeBraceToken;
+        }
+    }
+    ///<summary>Represents one positional or property subpattern</summary>
+    public sealed class SubpatternSyntax : SyntaxNode
+    {
+        public BaseExpressionColonSyntax? ExpressionColon { get; }
+        public NameColonSyntax? NameColon => ExpressionColon as NameColonSyntax;
+        public PatternSyntax Pattern { get; }
+
+        public SubpatternSyntax(BaseExpressionColonSyntax? expressionColon, PatternSyntax pattern)
+            : base(SyntaxKind.Subpattern, NodeSpan.FromNonNull(expressionColon?.Span, pattern.Span))
+        {
+            ExpressionColon = expressionColon;
+            Pattern = pattern;
+        }
+    }
+    ///<summary>Represents a 'when' guard attached to a switch label or arm</summary>
     public sealed class WhenClauseSyntax : SyntaxNode
     {
         public SyntaxToken WhenKeyword { get; }
@@ -745,6 +950,7 @@ namespace Cnidaria.Cs
         }
     }
     // =statement nodes=
+    ///<summary>Represents a bracketed attribute list with an optional target</summary>
     public sealed class AttributeListSyntax : SyntaxNode
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -765,6 +971,7 @@ namespace Cnidaria.Cs
             CloseBracketToken = closeBracketToken;
         }
     }
+    ///<summary>Represents an attribute target such as 'assembly:' or 'return:'</summary>
     public sealed class AttributeTargetSpecifierSyntax : SyntaxNode
     {
         public SyntaxToken Identifier { get; }
@@ -777,6 +984,7 @@ namespace Cnidaria.Cs
             ColonToken = colonToken;
         }
     }
+    ///<summary>Represents an attribute name with optional arguments</summary>
     public sealed class AttributeSyntax : SyntaxNode
     {
         public NameSyntax Name { get; }
@@ -789,6 +997,7 @@ namespace Cnidaria.Cs
             ArgumentList = argumentList;
         }
     }
+    ///<summary>Represents the parenthesized argument list of an attribute</summary>
     public sealed class AttributeArgumentListSyntax : SyntaxNode
     {
         public SyntaxToken OpenParenToken { get; }
@@ -807,6 +1016,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents an attribute argument with an optional 'name =' or 'name:' prefix</summary>
     public sealed class AttributeArgumentSyntax : SyntaxNode
     {
         public NameEqualsSyntax? NameEquals { get; }
@@ -821,6 +1031,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a switch statement with brace-delimited sections</summary>
     public sealed class SwitchStatementSyntax : StatementSyntax
     {
         public SyntaxToken SwitchKeyword { get; }
@@ -851,6 +1062,7 @@ namespace Cnidaria.Cs
             CloseBraceToken = closeBraceToken;
         }
     }
+    ///<summary>Groups one or more switch labels with their statements</summary>
     public sealed class SwitchSectionSyntax : SyntaxNode
     {
         public SyntaxList<SwitchLabelSyntax> Labels { get; }
@@ -879,11 +1091,13 @@ namespace Cnidaria.Cs
             return new TextSpan(0, 0);
         }
     }
+    ///<summary>Base class for case, pattern case and default labels</summary>
     public abstract class SwitchLabelSyntax : SyntaxNode
     {
         protected SwitchLabelSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Represents a 'case expression:' label</summary>
     public sealed class CaseSwitchLabelSyntax : SwitchLabelSyntax
     {
         public SyntaxToken CaseKeyword { get; }
@@ -898,6 +1112,7 @@ namespace Cnidaria.Cs
             ColonToken = colonToken;
         }
     }
+    ///<summary>Represents a 'case pattern' label with an optional 'when' guard</summary>
     public sealed class CasePatternSwitchLabelSyntax : SwitchLabelSyntax
     {
         public SyntaxToken CaseKeyword { get; }
@@ -918,6 +1133,7 @@ namespace Cnidaria.Cs
             ColonToken = colonToken;
         }
     }
+    ///<summary>Represents a 'default:' switch label</summary>
     public sealed class DefaultSwitchLabelSyntax : SwitchLabelSyntax
     {
         public SyntaxToken DefaultKeyword { get; }
@@ -930,6 +1146,7 @@ namespace Cnidaria.Cs
             ColonToken = colonToken;
         }
     }
+    ///<summary>Represents a switch expression applied to a governing expression</summary>
     public sealed class SwitchExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax GoverningExpression { get; }
@@ -953,6 +1170,26 @@ namespace Cnidaria.Cs
             CloseBraceToken = closeBraceToken;
         }
     }
+
+    ///<summary>Represents a non-destructive mutation expression introduced by contextual 'with'</summary>
+    public sealed class WithExpressionSyntax : ExpressionSyntax
+    {
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken WithKeyword { get; }
+        public InitializerExpressionSyntax Initializer { get; }
+
+        public WithExpressionSyntax(
+            ExpressionSyntax expression,
+            SyntaxToken withKeyword,
+            InitializerExpressionSyntax initializer)
+            : base(SyntaxKind.WithExpression, NodeSpan.From(expression.Span, initializer.Span))
+        {
+            Expression = expression;
+            WithKeyword = withKeyword;
+            Initializer = initializer;
+        }
+    }
+    ///<summary>Represents one switch expression arm with a pattern, optional guard and '=>' result</summary>
     public sealed class SwitchExpressionArmSyntax : SyntaxNode
     {
         public PatternSyntax Pattern { get; }
@@ -974,6 +1211,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a method-like declaration scoped to a block</summary>
     public sealed class LocalFunctionStatementSyntax : StatementSyntax
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
@@ -1019,6 +1257,7 @@ namespace Cnidaria.Cs
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents the empty statement ';'</summary>
     public sealed class EmptyStatementSyntax : StatementSyntax
     {
         public SyntaxToken SemicolonToken { get; }
@@ -1029,6 +1268,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a 'try' block followed by catch clauses or a finally clause</summary>
     public sealed class TryStatementSyntax : StatementSyntax
     {
         public SyntaxToken TryKeyword { get; }
@@ -1054,6 +1294,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a catch clause with optional declaration and filter</summary>
     public sealed class CatchClauseSyntax : SyntaxNode
     {
         public SyntaxToken CatchKeyword { get; }
@@ -1075,6 +1316,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the exception type and optional identifier in a catch clause</summary>
     public sealed class CatchDeclarationSyntax : SyntaxNode
     {
         public SyntaxToken OpenParenToken { get; }
@@ -1096,6 +1338,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a parenthesized 'when' filter on a catch clause</summary>
     public sealed class CatchFilterClauseSyntax : SyntaxNode
     {
         public SyntaxToken WhenKeyword { get; }
@@ -1116,6 +1359,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a 'finally' block</summary>
     public sealed class FinallyClauseSyntax : SyntaxNode
     {
         public SyntaxToken FinallyKeyword { get; }
@@ -1128,10 +1372,11 @@ namespace Cnidaria.Cs
             Block = block;
         }
     }
+    ///<summary>Represents 'goto label', 'goto case' or 'goto default'</summary>
     public sealed class GotoStatementSyntax : StatementSyntax
     {
         public SyntaxToken GotoKeyword { get; }
-        public SyntaxToken CaseOrDefaultKeyword { get; } // optional
+        public SyntaxToken CaseOrDefaultKeyword { get; } // 'case', 'default' or absent
         public ExpressionSyntax? Expression { get; }
         public SyntaxToken SemicolonToken { get; }
 
@@ -1150,6 +1395,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents an identifier label followed by a statement</summary>
     public sealed class LabeledStatementSyntax : StatementSyntax
     {
         public SyntaxToken Identifier { get; }
@@ -1164,6 +1410,7 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents a return statement with an optional value</summary>
     public sealed class ReturnStatementSyntax : StatementSyntax
     {
         public SyntaxToken ReturnKeyword { get; }
@@ -1178,6 +1425,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a 'break;' statement</summary>
     public sealed class BreakStatementSyntax : StatementSyntax
     {
         public SyntaxToken BreakKeyword { get; }
@@ -1191,6 +1439,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a 'continue;' statement</summary>
     public sealed class ContinueStatementSyntax : StatementSyntax
     {
         public SyntaxToken ContinueKeyword { get; }
@@ -1203,6 +1452,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a throw statement or expressionless rethrow</summary>
     public sealed class ThrowStatementSyntax : StatementSyntax
     {
         public SyntaxToken ThrowKeyword { get; }
@@ -1217,6 +1467,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a post-tested do-while loop</summary>
     public sealed class DoStatementSyntax : StatementSyntax
     {
         public SyntaxToken DoKeyword { get; }
@@ -1246,6 +1497,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a pre-tested while loop</summary>
     public sealed class WhileStatementSyntax : StatementSyntax
     {
         public SyntaxToken WhileKeyword { get; }
@@ -1270,6 +1522,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a for loop with declaration or expression initializers, condition and incrementors</summary>
     public sealed class ForStatementSyntax : StatementSyntax
     {
         public SyntaxToken ForKeyword { get; }
@@ -1310,6 +1563,7 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents a foreach loop with a typed identifier iteration variable</summary>
     public sealed class ForEachStatementSyntax : StatementSyntax
     {
         public SyntaxToken AwaitKeyword { get; } // optional
@@ -1348,6 +1602,7 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents a foreach loop with a deconstruction or expression iteration variable</summary>
     public sealed class ForEachVariableStatementSyntax : StatementSyntax
     {
         public SyntaxToken AwaitKeyword { get; } // optional
@@ -1383,6 +1638,7 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents a resource scope using either a declaration or expression</summary>
     public sealed class UsingStatementSyntax : StatementSyntax
     {
         public SyntaxToken AwaitKeyword { get; } // optional
@@ -1415,6 +1671,7 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents an 'unsafe' block</summary>
     public sealed class UnsafeStatementSyntax : StatementSyntax
     {
         public SyntaxToken UnsafeKeyword { get; }
@@ -1428,6 +1685,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a 'fixed' declaration and its embedded statement</summary>
     public sealed class FixedStatementSyntax : StatementSyntax
     {
         public SyntaxToken FixedKeyword { get; }
@@ -1451,9 +1709,34 @@ namespace Cnidaria.Cs
             Statement = statement;
         }
     }
+    ///<summary>Represents a lock statement</summary>
+    public sealed class LockStatementSyntax : StatementSyntax
+    {
+        public SyntaxToken LockKeyword { get; }
+        public SyntaxToken OpenParenToken { get; }
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken CloseParenToken { get; }
+        public StatementSyntax Statement { get; }
+
+        public LockStatementSyntax(
+            SyntaxToken lockKeyword,
+            SyntaxToken openParenToken,
+            ExpressionSyntax expression,
+            SyntaxToken closeParenToken,
+            StatementSyntax statement)
+            : base(SyntaxKind.LockStatement, NodeSpan.From(lockKeyword.Span, statement.Span))
+        {
+            LockKeyword = lockKeyword;
+            OpenParenToken = openParenToken;
+            Expression = expression;
+            CloseParenToken = closeParenToken;
+            Statement = statement;
+        }
+    }
+    ///<summary>Represents a 'checked' or 'unchecked' block</summary>
     public sealed class CheckedStatementSyntax : StatementSyntax
     {
-        public SyntaxToken Keyword { get; }
+        public SyntaxToken Keyword { get; } // 'checked' or 'unchecked'
         public BlockSyntax Block { get; }
 
         public CheckedStatementSyntax(SyntaxKind kind, SyntaxToken keyword, BlockSyntax block)
@@ -1463,6 +1746,7 @@ namespace Cnidaria.Cs
             Block = block;
         }
     }
+    ///<summary>Represents a local declaration including 'using' and 'await using' forms</summary>
     public sealed class LocalDeclarationStatementSyntax : StatementSyntax
     {
         public SyntaxToken AwaitKeyword { get; } // optional
@@ -1493,10 +1777,11 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents 'yield return' or 'yield break'</summary>
     public sealed class YieldStatementSyntax : StatementSyntax
     {
         public SyntaxToken YieldKeyword { get; }
-        public SyntaxToken ReturnOrBreakKeyword { get; }
+        public SyntaxToken ReturnOrBreakKeyword { get; } // 'return' or 'break'
         public ExpressionSyntax? Expression { get; }
         public SyntaxToken SemicolonToken { get; }
 
@@ -1515,6 +1800,7 @@ namespace Cnidaria.Cs
         }
     }
     // variable declaration
+    ///<summary>Represents an initializer introduced by '='</summary>
     public sealed class EqualsValueClauseSyntax : SyntaxNode
     {
         public SyntaxToken EqualsToken { get; }
@@ -1528,6 +1814,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents one declared variable with optional brackets and initializer</summary>
     public sealed class VariableDeclaratorSyntax : SyntaxNode
     {
         public SyntaxToken Identifier { get; }
@@ -1544,6 +1831,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a type followed by one or more variable declarators</summary>
     public sealed class VariableDeclarationSyntax : SyntaxNode
     {
         public TypeSyntax Type { get; }
@@ -1560,6 +1848,7 @@ namespace Cnidaria.Cs
         }
     }
     // members
+    ///<summary>Base class for block-scoped and file-scoped namespace declarations</summary>
     public abstract class BaseNamespaceDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxToken NamespaceKeyword { get; }
@@ -1586,6 +1875,7 @@ namespace Cnidaria.Cs
             Members = members;
         }
     }
+    ///<summary>Represents a namespace declaration terminated by ';'</summary>
     public sealed class FileScopedNamespaceDeclarationSyntax : BaseNamespaceDeclarationSyntax
     {
         public SyntaxToken SemicolonToken { get; }
@@ -1611,6 +1901,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a brace-delimited namespace declaration</summary>
     public sealed class NamespaceDeclarationSyntax : BaseNamespaceDeclarationSyntax
     {
         public SyntaxToken OpenBraceToken { get; }
@@ -1642,6 +1933,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a comma-separated type argument list in angle brackets</summary>
     public sealed class TypeArgumentListSyntax : SyntaxNode
     {
         public SyntaxToken LessThanToken { get; }
@@ -1656,10 +1948,39 @@ namespace Cnidaria.Cs
             GreaterThanToken = greaterThanToken;
         }
     }
+    ///<summary>Represents an omitted argument in an unbound generic name</summary>
+    public sealed class OmittedTypeArgumentSyntax : TypeSyntax
+    {
+        public SyntaxToken OmittedTypeArgumentToken { get; }
+
+        public OmittedTypeArgumentSyntax(SyntaxToken omittedTypeArgumentToken)
+            : base(SyntaxKind.OmittedTypeArgument, omittedTypeArgumentToken.Span)
+        {
+            OmittedTypeArgumentToken = omittedTypeArgumentToken;
+        }
+    }
+    ///<summary>Represents an identifier followed by type arguments</summary>
     public sealed class GenericNameSyntax : SimpleNameSyntax
     {
         public SyntaxToken Identifier { get; }
         public TypeArgumentListSyntax TypeArgumentList { get; }
+        public bool IsUnboundGenericName
+        {
+            get
+            {
+                var arguments = TypeArgumentList.Arguments;
+                if (arguments.Count == 0)
+                    return false;
+
+                for (int i = 0; i < arguments.Count; i++)
+                {
+                    if (arguments[i] is not OmittedTypeArgumentSyntax)
+                        return false;
+                }
+
+                return true;
+            }
+        }
 
         public GenericNameSyntax(SyntaxToken identifier, TypeArgumentListSyntax typeArgumentList)
             : base(SyntaxKind.GenericName, NodeSpan.From(identifier.Span, typeArgumentList.Span))
@@ -1668,6 +1989,7 @@ namespace Cnidaria.Cs
             TypeArgumentList = typeArgumentList;
         }
     }
+    ///<summary>Base class for type declarations with a brace-delimited body</summary>
     public abstract class BaseTypeDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -1697,6 +2019,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a delegate type declaration</summary>
     public sealed class DelegateDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -1740,34 +2063,76 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
-    public sealed class AnonymousMethodExpressionSyntax : ExpressionSyntax
+    ///<summary>Base class for lambda expressions and anonymous methods</summary>
+    public abstract class AnonymousFunctionExpressionSyntax : ExpressionSyntax
     {
-        public SyntaxToken AsyncKeyword { get; } // optional
+        public SyntaxTokenList Modifiers { get; }
+        public abstract BlockSyntax? Block { get; }
+        public abstract ExpressionSyntax? ExpressionBody { get; }
+        public SyntaxNode Body => (SyntaxNode?)Block ?? ExpressionBody!;
+
+        public SyntaxToken AsyncKeyword
+        {
+            get
+            {
+                for (int i = 0; i < Modifiers.Count; i++)
+                {
+                    var modifier = Modifiers[i];
+                    if (modifier.Kind == SyntaxKind.AsyncKeyword ||
+                        (modifier.Kind == SyntaxKind.IdentifierToken && modifier.ContextualKind == SyntaxKind.AsyncKeyword))
+                    {
+                        return modifier;
+                    }
+                }
+
+                return default;
+            }
+        }
+
+        protected AnonymousFunctionExpressionSyntax(
+            SyntaxKind kind,
+            SyntaxTokenList modifiers,
+            TextSpan span)
+            : base(kind, span)
+        {
+            Modifiers = modifiers;
+        }
+    }
+    ///<summary>Represents an anonymous method introduced by 'delegate'</summary>
+    public sealed class AnonymousMethodExpressionSyntax : AnonymousFunctionExpressionSyntax
+    {
         public SyntaxToken DelegateKeyword { get; }
         public ParameterListSyntax? ParameterList { get; }
-        public BlockSyntax Block { get; }
+        public override BlockSyntax Block { get; }
+        public override ExpressionSyntax? ExpressionBody => null;
 
         public AnonymousMethodExpressionSyntax(
-            SyntaxToken asyncKeyword,
+            SyntaxTokenList modifiers,
             SyntaxToken delegateKeyword,
             ParameterListSyntax? parameterList,
             BlockSyntax block)
             : base(
                 SyntaxKind.AnonymousMethodExpression,
+                modifiers,
                 NodeSpan.FromNonNull(
-                    asyncKeyword.Span.Length != 0 ? asyncKeyword.Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     delegateKeyword.Span,
                     parameterList?.Span,
                     block.Span))
         {
-            AsyncKeyword = asyncKeyword;
             DelegateKeyword = delegateKeyword;
             ParameterList = parameterList;
             Block = block;
         }
     }
+    ///<summary>Base class for class, struct, interface, record and extension declarations</summary>
     public abstract class TypeDeclarationSyntax : BaseTypeDeclarationSyntax
     {
+        public abstract SyntaxToken Keyword { get; }
+        public abstract TypeParameterListSyntax? TypeParameterList { get; }
+        public abstract ParameterListSyntax? ParameterList { get; }
+        public abstract SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+
         protected TypeDeclarationSyntax(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxKind kind,
@@ -1782,6 +2147,54 @@ namespace Cnidaria.Cs
         {
         }
     }
+    ///<summary>Represents an extension block declaration</summary>
+    public sealed class ExtensionBlockDeclarationSyntax : TypeDeclarationSyntax
+    {
+        public override SyntaxToken Keyword { get; }
+        public override TypeParameterListSyntax? TypeParameterList { get; }
+        public override ParameterListSyntax? ParameterList { get; }
+        public BaseListSyntax? BaseList => null;
+        public override SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+
+        public ExtensionBlockDeclarationSyntax(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            SyntaxToken extensionKeyword,
+            TypeParameterListSyntax? typeParameterList,
+            ParameterListSyntax? parameterList,
+            SyntaxList<TypeParameterConstraintClauseSyntax> constraintClauses,
+            SyntaxToken openBraceToken,
+            SyntaxList<MemberDeclarationSyntax> members,
+            SyntaxToken closeBraceToken,
+            SyntaxToken semicolonToken)
+            : base(
+                attributeLists,
+                SyntaxKind.ExtensionBlockDeclaration,
+                modifiers,
+                identifier: default,
+                openBraceToken,
+                members,
+                closeBraceToken,
+                semicolonToken,
+                NodeSpan.FromNonNull(
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    extensionKeyword.Span,
+                    typeParameterList?.Span,
+                    parameterList?.Span,
+                    constraintClauses.Count > 0 ? constraintClauses[constraintClauses.Count - 1].Span : (TextSpan?)null,
+                    openBraceToken.Span.Length != 0 ? openBraceToken.Span : (TextSpan?)null,
+                    semicolonToken.Span.Length != 0
+                        ? semicolonToken.Span
+                        : closeBraceToken.Span.Length != 0 ? closeBraceToken.Span : (TextSpan?)null))
+        {
+            Keyword = extensionKeyword;
+            TypeParameterList = typeParameterList;
+            ParameterList = parameterList;
+            ConstraintClauses = constraintClauses;
+        }
+    }
+    ///<summary>Represents a 'where T:' constraint clause</summary>
     public sealed class TypeParameterConstraintClauseSyntax : SyntaxNode
     {
         public SyntaxToken WhereKeyword { get; }
@@ -1806,6 +2219,7 @@ namespace Cnidaria.Cs
             Constraints = constraints;
         }
     }
+    ///<summary>Base class for constraints on a type parameter</summary>
     public abstract class TypeParameterConstraintSyntax : SyntaxNode
     {
         protected TypeParameterConstraintSyntax(SyntaxKind kind, TextSpan span)
@@ -1813,9 +2227,10 @@ namespace Cnidaria.Cs
         {
         }
     }
+    ///<summary>Represents a 'class', 'class?' or 'struct' constraint</summary>
     public sealed class ClassOrStructConstraintSyntax : TypeParameterConstraintSyntax
     {
-        public SyntaxToken ClassOrStructKeyword { get; }
+        public SyntaxToken ClassOrStructKeyword { get; } // 'class' or 'struct'
         public SyntaxToken QuestionToken { get; } // optional
 
         public ClassOrStructConstraintSyntax(
@@ -1833,6 +2248,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents an 'allows' anti-constraint clause</summary>
     public sealed class AllowsConstraintClauseSyntax : TypeParameterConstraintSyntax
     {
         public SyntaxToken AllowsKeyword { get; }
@@ -1852,6 +2268,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Base class for constraints following 'allows'</summary>
     public abstract class AllowsConstraintSyntax : SyntaxNode
     {
         protected AllowsConstraintSyntax(SyntaxKind kind, TextSpan span)
@@ -1860,6 +2277,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the 'ref struct' anti-constraint</summary>
     public sealed class RefStructConstraintSyntax : AllowsConstraintSyntax
     {
         public SyntaxToken RefKeyword { get; }
@@ -1874,6 +2292,7 @@ namespace Cnidaria.Cs
             StructKeyword = structKeyword;
         }
     }
+    ///<summary>Represents a type used as a generic parameter constraint</summary>
     public sealed class TypeConstraintSyntax : TypeParameterConstraintSyntax
     {
         public TypeSyntax Type { get; }
@@ -1884,6 +2303,7 @@ namespace Cnidaria.Cs
             Type = type;
         }
     }
+    ///<summary>Represents the 'new()' generic parameter constraint</summary>
     public sealed class ConstructorConstraintSyntax : TypeParameterConstraintSyntax
     {
         public SyntaxToken NewKeyword { get; }
@@ -1901,6 +2321,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents the 'default' constraint on an override or explicit implementation</summary>
     public sealed class DefaultConstraintSyntax : TypeParameterConstraintSyntax
     {
         public SyntaxToken DefaultKeyword { get; }
@@ -1911,18 +2332,21 @@ namespace Cnidaria.Cs
             DefaultKeyword = defaultKeyword;
         }
     }
+    ///<summary>Represents a class header, optional bases and constraints, and member body</summary>
     public sealed class ClassDeclarationSyntax : TypeDeclarationSyntax
     {
-        public SyntaxToken Keyword { get; }
-        public TypeParameterListSyntax? TypeParameterList { get; }
+        public override SyntaxToken Keyword { get; }
+        public override TypeParameterListSyntax? TypeParameterList { get; }
+        public override ParameterListSyntax? ParameterList { get; }
         public BaseListSyntax? BaseList { get; }
-        public SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+        public override SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
         public ClassDeclarationSyntax(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             SyntaxToken classKeyword,
             SyntaxToken identifier,
             TypeParameterListSyntax? typeParameterList,
+            ParameterListSyntax? parameterList,
             BaseListSyntax? baseList,
             SyntaxList<TypeParameterConstraintClauseSyntax> constraintClauses,
             SyntaxToken openBraceToken,
@@ -1946,22 +2370,26 @@ namespace Cnidaria.Cs
         {
             Keyword = classKeyword;
             TypeParameterList = typeParameterList;
+            ParameterList = parameterList;
             BaseList = baseList;
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents a struct header, optional interfaces and constraints, and member body</summary>
     public sealed class StructDeclarationSyntax : TypeDeclarationSyntax
     {
-        public SyntaxToken Keyword { get; }
-        public TypeParameterListSyntax? TypeParameterList { get; }
+        public override SyntaxToken Keyword { get; }
+        public override TypeParameterListSyntax? TypeParameterList { get; }
+        public override ParameterListSyntax? ParameterList { get; }
         public BaseListSyntax? BaseList { get; }
-        public SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+        public override SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
         public StructDeclarationSyntax(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             SyntaxToken structKeyword,
             SyntaxToken identifier,
             TypeParameterListSyntax? typeParameterList,
+            ParameterListSyntax? parameterList,
             BaseListSyntax? baseList,
             SyntaxList<TypeParameterConstraintClauseSyntax> constraintClauses,
             SyntaxToken openBraceToken,
@@ -1985,22 +2413,26 @@ namespace Cnidaria.Cs
         {
             Keyword = structKeyword;
             TypeParameterList = typeParameterList;
+            ParameterList = parameterList;
             BaseList = baseList;
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents an interface header, optional bases and constraints, and member body</summary>
     public sealed class InterfaceDeclarationSyntax : TypeDeclarationSyntax
     {
-        public SyntaxToken Keyword { get; }
-        public TypeParameterListSyntax? TypeParameterList { get; }
+        public override SyntaxToken Keyword { get; }
+        public override TypeParameterListSyntax? TypeParameterList { get; }
+        public override ParameterListSyntax? ParameterList { get; }
         public BaseListSyntax? BaseList { get; }
-        public SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+        public override SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
         public InterfaceDeclarationSyntax(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             SyntaxToken interfaceKeyword,
             SyntaxToken identifier,
             TypeParameterListSyntax? typeParameterList,
+            ParameterListSyntax? parameterList,
             BaseListSyntax? baseList,
             SyntaxList<TypeParameterConstraintClauseSyntax> constraintClauses,
             SyntaxToken openBraceToken,
@@ -2024,18 +2456,20 @@ namespace Cnidaria.Cs
         {
             Keyword = interfaceKeyword;
             TypeParameterList = typeParameterList;
+            ParameterList = parameterList;
             BaseList = baseList;
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents a record header with optional kind, primary parameters, bases, constraints and body</summary>
     public sealed class RecordDeclarationSyntax : TypeDeclarationSyntax
     {
-        public SyntaxToken Keyword { get; }
-        public SyntaxToken ClassOrStructKeyword { get; } // optional
-        public TypeParameterListSyntax? TypeParameterList { get; }
-        public ParameterListSyntax? ParameterList { get; }
+        public override SyntaxToken Keyword { get; } // 'record'
+        public SyntaxToken ClassOrStructKeyword { get; } // 'class', 'struct' or absent
+        public override TypeParameterListSyntax? TypeParameterList { get; }
+        public override ParameterListSyntax? ParameterList { get; }
         public BaseListSyntax? BaseList { get; }
-        public SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
+        public override SyntaxList<TypeParameterConstraintClauseSyntax> ConstraintClauses { get; }
 
         public RecordDeclarationSyntax(
             SyntaxKind kind,
@@ -2081,6 +2515,7 @@ namespace Cnidaria.Cs
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents one enum member with an optional constant value</summary>
     public sealed class EnumMemberDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxToken Identifier { get; }
@@ -2095,6 +2530,7 @@ namespace Cnidaria.Cs
             EqualsValue = equalsValue;
         }
     }
+    ///<summary>Represents an enum declaration and its comma-separated members</summary>
     public sealed class EnumDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2136,6 +2572,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a comma-separated type parameter list in angle brackets</summary>
     public sealed class TypeParameterListSyntax : SyntaxNode
     {
         public SyntaxToken LessThanToken { get; }
@@ -2153,10 +2590,11 @@ namespace Cnidaria.Cs
             GreaterThanToken = greaterThanToken;
         }
     }
+    ///<summary>Represents one type parameter with optional attributes and variance</summary>
     public sealed class TypeParameterSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
-        public SyntaxToken VarianceKeyword { get; } // optional
+        public SyntaxToken VarianceKeyword { get; } // 'in', 'out' or absent
         public SyntaxToken Identifier { get; }
 
         public TypeParameterSyntax(SyntaxList<AttributeListSyntax> attributeLists, SyntaxToken varianceKeyword, SyntaxToken identifier)
@@ -2170,6 +2608,7 @@ namespace Cnidaria.Cs
             Identifier = identifier;
         }
     }
+    ///<summary>Represents one parameter with optional attributes, modifiers, type and default value</summary>
     public sealed class ParameterSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
@@ -2190,7 +2629,7 @@ namespace Cnidaria.Cs
                     attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                     modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     type?.Span,
-                    identifier.Span,
+                    identifier.Kind != SyntaxKind.None ? identifier.Span : (TextSpan?)null,
                     @default?.Span))
         {
             AttributeLists = attributeLists;
@@ -2201,6 +2640,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a comma-separated parameter list in parentheses</summary>
     public sealed class ParameterListSyntax : SyntaxNode
     {
         public SyntaxToken OpenParenToken { get; }
@@ -2215,6 +2655,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents an indexer parameter list in brackets</summary>
     public sealed class BracketedParameterListSyntax : SyntaxNode
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -2232,6 +2673,7 @@ namespace Cnidaria.Cs
             CloseBracketToken = closeBracketToken;
         }
     }
+    ///<summary>Represents a method declaration with block, expression or semicolon body</summary>
     public sealed class MethodDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2280,12 +2722,17 @@ namespace Cnidaria.Cs
             ConstraintClauses = constraintClauses;
         }
     }
+    ///<summary>Represents an overloaded operator declaration</summary>
     public sealed class OperatorDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
         public TypeSyntax ReturnType { get; }
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
         public SyntaxToken OperatorKeyword { get; }
         public SyntaxToken CheckedKeyword { get; } // optional
+        // '+', '-', '!', '~', '++', '--', 'true', 'false', '*', '/', '%', '&', '|', '^'
+        // '<<', '>>', '>>>', '==', '!=', '<', '>', '<=', '>='
+        // '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=' or '>>>='
         public SyntaxToken OperatorToken { get; }
         public ParameterListSyntax ParameterList { get; }
 
@@ -2297,6 +2744,7 @@ namespace Cnidaria.Cs
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             TypeSyntax returnType,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
             SyntaxToken operatorKeyword,
             SyntaxToken checkedKeyword,
             SyntaxToken operatorToken,
@@ -2311,10 +2759,12 @@ namespace Cnidaria.Cs
                     attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                     modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     returnType.Span,
+                    explicitInterfaceSpecifier?.Span,
                     (body != null ? body.Span : (expressionBody != null ? expressionBody.Span : semicolonToken.Span))))
         {
             Modifiers = modifiers;
             ReturnType = returnType;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
             OperatorKeyword = operatorKeyword;
             CheckedKeyword = checkedKeyword;
             OperatorToken = operatorToken;
@@ -2324,10 +2774,12 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents an implicit or explicit conversion operator declaration</summary>
     public sealed class ConversionOperatorDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
-        public SyntaxToken ImplicitOrExplicitKeyword { get; }
+        public SyntaxToken ImplicitOrExplicitKeyword { get; } // 'implicit' or 'explicit'
+        public ExplicitInterfaceSpecifierSyntax? ExplicitInterfaceSpecifier { get; }
         public SyntaxToken OperatorKeyword { get; }
         public SyntaxToken CheckedKeyword { get; } // optional
         public TypeSyntax Type { get; }
@@ -2341,6 +2793,7 @@ namespace Cnidaria.Cs
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
             SyntaxToken implicitOrExplicitKeyword,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
             SyntaxToken operatorKeyword,
             SyntaxToken checkedKeyword,
             TypeSyntax type,
@@ -2355,10 +2808,12 @@ namespace Cnidaria.Cs
                     attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
                     modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     implicitOrExplicitKeyword.Span,
+                    explicitInterfaceSpecifier?.Span,
                     (body != null ? body.Span : (expressionBody != null ? expressionBody.Span : semicolonToken.Span))))
         {
             Modifiers = modifiers;
             ImplicitOrExplicitKeyword = implicitOrExplicitKeyword;
+            ExplicitInterfaceSpecifier = explicitInterfaceSpecifier;
             OperatorKeyword = operatorKeyword;
             CheckedKeyword = checkedKeyword;
             Type = type;
@@ -2368,10 +2823,11 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a constructor initializer targeting 'this' or 'base'</summary>
     public sealed class ConstructorInitializerSyntax : SyntaxNode
     {
         public SyntaxToken ColonToken { get; }
-        public SyntaxToken ThisOrBaseKeyword { get; }
+        public SyntaxToken ThisOrBaseKeyword { get; } // 'this' or 'base'
         public ArgumentListSyntax ArgumentList { get; }
 
         public ConstructorInitializerSyntax(
@@ -2386,6 +2842,7 @@ namespace Cnidaria.Cs
             ArgumentList = argumentList;
         }
     }
+    ///<summary>Represents an instance or static constructor declaration</summary>
     public sealed class ConstructorDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2424,6 +2881,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a destructor declaration</summary>
     public sealed class DestructorDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2463,6 +2921,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a base type followed by primary constructor arguments</summary>
     public sealed class PrimaryConstructorBaseTypeSyntax : BaseTypeSyntax
     {
         public override TypeSyntax Type { get; }
@@ -2475,6 +2934,7 @@ namespace Cnidaria.Cs
             ArgumentList = argumentList;
         }
     }
+    ///<summary>Represents field modifiers, variable declaration and terminating semicolon</summary>
     public sealed class FieldDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2500,6 +2960,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a field-like event declaration</summary>
     public sealed class EventFieldDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -2529,6 +2990,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents an if statement with an optional else clause</summary>
     public sealed class IfStatementSyntax : StatementSyntax
     {
         public SyntaxToken IfKeyword { get; }
@@ -2558,6 +3020,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the 'else' branch of an if statement</summary>
     public sealed class ElseClauseSyntax : SyntaxNode
     {
         public SyntaxToken ElseKeyword { get; }
@@ -2572,6 +3035,269 @@ namespace Cnidaria.Cs
     }
 
     // =expression nodes=
+    ///<summary>Base class for clauses in a query body</summary>
+    public abstract class QueryClauseSyntax : SyntaxNode
+    {
+        protected QueryClauseSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
+    }
+
+    ///<summary>Base class for the terminal select or group clause of a query body</summary>
+    public abstract class SelectOrGroupClauseSyntax : SyntaxNode
+    {
+        protected SelectOrGroupClauseSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
+    }
+
+    ///<summary>Represents a query expression beginning with a from clause</summary>
+    public sealed class QueryExpressionSyntax : ExpressionSyntax
+    {
+        public FromClauseSyntax FromClause { get; }
+        public QueryBodySyntax Body { get; }
+
+        public QueryExpressionSyntax(FromClauseSyntax fromClause, QueryBodySyntax body)
+            : base(SyntaxKind.QueryExpression, NodeSpan.From(fromClause.Span, body.Span))
+        {
+            FromClause = fromClause;
+            Body = body;
+        }
+    }
+
+    ///<summary>Represents the clauses, terminal clause and optional continuation of a query</summary>
+    public sealed class QueryBodySyntax : SyntaxNode
+    {
+        public SyntaxList<QueryClauseSyntax> Clauses { get; }
+        public SelectOrGroupClauseSyntax SelectOrGroup { get; }
+        public QueryContinuationSyntax? Continuation { get; }
+
+        public QueryBodySyntax(
+            SyntaxList<QueryClauseSyntax> clauses,
+            SelectOrGroupClauseSyntax selectOrGroup,
+            QueryContinuationSyntax? continuation)
+            : base(
+                SyntaxKind.QueryBody,
+                NodeSpan.From(
+                    clauses.Count > 0 ? clauses[0].Span : selectOrGroup.Span,
+                    continuation?.Span ?? selectOrGroup.Span))
+        {
+            Clauses = clauses;
+            SelectOrGroup = selectOrGroup;
+            Continuation = continuation;
+        }
+    }
+
+    ///<summary>Represents a from clause</summary>
+    public sealed class FromClauseSyntax : QueryClauseSyntax
+    {
+        public SyntaxToken FromKeyword { get; }
+        public TypeSyntax? Type { get; }
+        public SyntaxToken Identifier { get; }
+        public SyntaxToken InKeyword { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public FromClauseSyntax(
+            SyntaxToken fromKeyword,
+            TypeSyntax? type,
+            SyntaxToken identifier,
+            SyntaxToken inKeyword,
+            ExpressionSyntax expression)
+            : base(SyntaxKind.FromClause, NodeSpan.From(fromKeyword.Span, expression.Span))
+        {
+            FromKeyword = fromKeyword;
+            Type = type;
+            Identifier = identifier;
+            InKeyword = inKeyword;
+            Expression = expression;
+        }
+    }
+
+    ///<summary>Represents a let clause</summary>
+    public sealed class LetClauseSyntax : QueryClauseSyntax
+    {
+        public SyntaxToken LetKeyword { get; }
+        public SyntaxToken Identifier { get; }
+        public SyntaxToken EqualsToken { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public LetClauseSyntax(
+            SyntaxToken letKeyword,
+            SyntaxToken identifier,
+            SyntaxToken equalsToken,
+            ExpressionSyntax expression)
+            : base(SyntaxKind.LetClause, NodeSpan.From(letKeyword.Span, expression.Span))
+        {
+            LetKeyword = letKeyword;
+            Identifier = identifier;
+            EqualsToken = equalsToken;
+            Expression = expression;
+        }
+    }
+
+    ///<summary>Represents a join clause</summary>
+    public sealed class JoinClauseSyntax : QueryClauseSyntax
+    {
+        public SyntaxToken JoinKeyword { get; }
+        public TypeSyntax? Type { get; }
+        public SyntaxToken Identifier { get; }
+        public SyntaxToken InKeyword { get; }
+        public ExpressionSyntax InExpression { get; }
+        public SyntaxToken OnKeyword { get; }
+        public ExpressionSyntax LeftExpression { get; }
+        public SyntaxToken EqualsKeyword { get; }
+        public ExpressionSyntax RightExpression { get; }
+        public JoinIntoClauseSyntax? Into { get; }
+
+        public JoinClauseSyntax(
+            SyntaxToken joinKeyword,
+            TypeSyntax? type,
+            SyntaxToken identifier,
+            SyntaxToken inKeyword,
+            ExpressionSyntax inExpression,
+            SyntaxToken onKeyword,
+            ExpressionSyntax leftExpression,
+            SyntaxToken equalsKeyword,
+            ExpressionSyntax rightExpression,
+            JoinIntoClauseSyntax? into)
+            : base(
+                SyntaxKind.JoinClause,
+                NodeSpan.From(joinKeyword.Span, into?.Span ?? rightExpression.Span))
+        {
+            JoinKeyword = joinKeyword;
+            Type = type;
+            Identifier = identifier;
+            InKeyword = inKeyword;
+            InExpression = inExpression;
+            OnKeyword = onKeyword;
+            LeftExpression = leftExpression;
+            EqualsKeyword = equalsKeyword;
+            RightExpression = rightExpression;
+            Into = into;
+        }
+    }
+
+    ///<summary>Represents the optional into part of a join clause</summary>
+    public sealed class JoinIntoClauseSyntax : SyntaxNode
+    {
+        public SyntaxToken IntoKeyword { get; }
+        public SyntaxToken Identifier { get; }
+
+        public JoinIntoClauseSyntax(SyntaxToken intoKeyword, SyntaxToken identifier)
+            : base(SyntaxKind.JoinIntoClause, NodeSpan.From(intoKeyword.Span, identifier.Span))
+        {
+            IntoKeyword = intoKeyword;
+            Identifier = identifier;
+        }
+    }
+
+    ///<summary>Represents a where clause</summary>
+    public sealed class WhereClauseSyntax : QueryClauseSyntax
+    {
+        public SyntaxToken WhereKeyword { get; }
+        public ExpressionSyntax Condition { get; }
+
+        public WhereClauseSyntax(SyntaxToken whereKeyword, ExpressionSyntax condition)
+            : base(SyntaxKind.WhereClause, NodeSpan.From(whereKeyword.Span, condition.Span))
+        {
+            WhereKeyword = whereKeyword;
+            Condition = condition;
+        }
+    }
+
+    ///<summary>Represents an orderby clause</summary>
+    public sealed class OrderByClauseSyntax : QueryClauseSyntax
+    {
+        public SyntaxToken OrderByKeyword { get; }
+        public SeparatedSyntaxList<OrderingSyntax> Orderings { get; }
+
+        public OrderByClauseSyntax(
+            SyntaxToken orderByKeyword,
+            SeparatedSyntaxList<OrderingSyntax> orderings)
+            : base(
+                SyntaxKind.OrderByClause,
+                orderings.Count > 0
+                    ? NodeSpan.From(orderByKeyword.Span, orderings[orderings.Count - 1].Span)
+                    : orderByKeyword.Span)
+        {
+            OrderByKeyword = orderByKeyword;
+            Orderings = orderings;
+        }
+    }
+
+    ///<summary>Represents one ordering expression and its optional direction</summary>
+    public sealed class OrderingSyntax : SyntaxNode
+    {
+        public ExpressionSyntax Expression { get; }
+        public SyntaxToken AscendingOrDescendingKeyword { get; }
+
+        public OrderingSyntax(
+            SyntaxKind kind,
+            ExpressionSyntax expression,
+            SyntaxToken ascendingOrDescendingKeyword)
+            : base(
+                kind,
+                ascendingOrDescendingKeyword.Kind != SyntaxKind.None
+                    ? NodeSpan.From(expression.Span, ascendingOrDescendingKeyword.Span)
+                    : expression.Span)
+        {
+            Expression = expression;
+            AscendingOrDescendingKeyword = ascendingOrDescendingKeyword;
+        }
+    }
+
+    ///<summary>Represents a select clause</summary>
+    public sealed class SelectClauseSyntax : SelectOrGroupClauseSyntax
+    {
+        public SyntaxToken SelectKeyword { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public SelectClauseSyntax(SyntaxToken selectKeyword, ExpressionSyntax expression)
+            : base(SyntaxKind.SelectClause, NodeSpan.From(selectKeyword.Span, expression.Span))
+        {
+            SelectKeyword = selectKeyword;
+            Expression = expression;
+        }
+    }
+
+    ///<summary>Represents a group clause</summary>
+    public sealed class GroupClauseSyntax : SelectOrGroupClauseSyntax
+    {
+        public SyntaxToken GroupKeyword { get; }
+        public ExpressionSyntax GroupExpression { get; }
+        public SyntaxToken ByKeyword { get; }
+        public ExpressionSyntax ByExpression { get; }
+
+        public GroupClauseSyntax(
+            SyntaxToken groupKeyword,
+            ExpressionSyntax groupExpression,
+            SyntaxToken byKeyword,
+            ExpressionSyntax byExpression)
+            : base(SyntaxKind.GroupClause, NodeSpan.From(groupKeyword.Span, byExpression.Span))
+        {
+            GroupKeyword = groupKeyword;
+            GroupExpression = groupExpression;
+            ByKeyword = byKeyword;
+            ByExpression = byExpression;
+        }
+    }
+
+    ///<summary>Represents an into continuation and its following query body</summary>
+    public sealed class QueryContinuationSyntax : SyntaxNode
+    {
+        public SyntaxToken IntoKeyword { get; }
+        public SyntaxToken Identifier { get; }
+        public QueryBodySyntax Body { get; }
+
+        public QueryContinuationSyntax(
+            SyntaxToken intoKeyword,
+            SyntaxToken identifier,
+            QueryBodySyntax body)
+            : base(SyntaxKind.QueryContinuation, NodeSpan.From(intoKeyword.Span, body.Span))
+        {
+            IntoKeyword = intoKeyword;
+            Identifier = identifier;
+            Body = body;
+        }
+    }
+
+    ///<summary>Represents an interpolated string and its ordered content segments</summary>
     public sealed class InterpolatedStringExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken StringStartToken { get; }
@@ -2589,6 +3315,7 @@ namespace Cnidaria.Cs
             StringEndToken = stringEndToken;
         }
     }
+    ///<summary>Represents a raw text segment inside an interpolated string</summary>
     public sealed class InterpolatedStringTextSyntax : InterpolatedStringContentSyntax
     {
         public SyntaxToken TextToken { get; }
@@ -2599,6 +3326,7 @@ namespace Cnidaria.Cs
             TextToken = textToken;
         }
     }
+    ///<summary>Represents an interpolation with optional alignment and format clauses</summary>
     public sealed class InterpolationSyntax : InterpolatedStringContentSyntax
     {
         public SyntaxToken OpenBraceToken { get; }
@@ -2622,6 +3350,7 @@ namespace Cnidaria.Cs
             CloseBraceToken = closeBraceToken;
         }
     }
+    ///<summary>Represents the comma-prefixed alignment expression of an interpolation</summary>
     public sealed class InterpolationAlignmentClauseSyntax : SyntaxNode
     {
         public SyntaxToken CommaToken { get; }
@@ -2634,6 +3363,7 @@ namespace Cnidaria.Cs
             Value = value;
         }
     }
+    ///<summary>Represents the colon-prefixed format text of an interpolation</summary>
     public sealed class InterpolationFormatClauseSyntax : SyntaxNode
     {
         public SyntaxToken ColonToken { get; }
@@ -2646,6 +3376,7 @@ namespace Cnidaria.Cs
             FormatStringToken = formatStringToken;
         }
     }
+    ///<summary>Represents an expression enclosed in parentheses</summary>
     public sealed class ParenthesizedExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -2660,6 +3391,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a tuple expression as a parenthesized argument sequence</summary>
     public sealed class TupleExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -2677,6 +3409,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Wraps a regular expression element in a collection expression</summary>
     public sealed class ExpressionElementSyntax : CollectionElementSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -2687,6 +3420,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a collection element introduced by '..'</summary>
     public sealed class SpreadElementSyntax : CollectionElementSyntax
     {
         public SyntaxToken DotDotToken { get; }
@@ -2699,6 +3433,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a bracketed collection expression</summary>
     public sealed class CollectionExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -2716,6 +3451,7 @@ namespace Cnidaria.Cs
             CloseBracketToken = closeBracketToken;
         }
     }
+    ///<summary>Represents a 'typeof(T)' expression</summary>
     public sealed class TypeOfExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken TypeOfKeyword { get; }
@@ -2736,6 +3472,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a 'sizeof(T)' expression</summary>
     public sealed class SizeOfExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken SizeOfKeyword { get; }
@@ -2756,6 +3493,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a typed 'default(T)' expression</summary>
     public sealed class DefaultExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken DefaultKeyword { get; }
@@ -2776,9 +3514,10 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a 'checked' or 'unchecked' expression</summary>
     public sealed class CheckedExpressionSyntax : ExpressionSyntax
     {
-        public SyntaxToken Keyword { get; }
+        public SyntaxToken Keyword { get; } // 'checked' or 'unchecked'
         public SyntaxToken OpenParenToken { get; }
         public ExpressionSyntax Expression { get; }
         public SyntaxToken CloseParenToken { get; }
@@ -2797,9 +3536,10 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a prefix operator applied before its operand</summary>
     public sealed class PrefixUnaryExpressionSyntax : ExpressionSyntax
     {
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '+', '-', '!', '~', '++', '--', '^', '&' or '*'
         public ExpressionSyntax Operand { get; }
 
         public PrefixUnaryExpressionSyntax(SyntaxKind kind, SyntaxToken operatorToken, ExpressionSyntax operand)
@@ -2809,6 +3549,7 @@ namespace Cnidaria.Cs
             Operand = operand;
         }
     }
+    ///<summary>Represents a parenthesized type cast followed by its operand</summary>
     public sealed class CastExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -2825,11 +3566,13 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Base class for variable names, discards and nested deconstruction designations</summary>
     public abstract class VariableDesignationSyntax : SyntaxNode
     {
         protected VariableDesignationSyntax(SyntaxKind kind, TextSpan span) : base(kind, span) { }
     }
 
+    ///<summary>Represents one identifier introduced by a pattern or declaration expression</summary>
     public sealed class SingleVariableDesignationSyntax : VariableDesignationSyntax
     {
         public SyntaxToken Identifier { get; }
@@ -2840,6 +3583,7 @@ namespace Cnidaria.Cs
             Identifier = identifier;
         }
     }
+    ///<summary>Represents the 'this' expression</summary>
     public sealed class ThisExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken ThisKeyword { get; }
@@ -2850,6 +3594,7 @@ namespace Cnidaria.Cs
             ThisKeyword = thisKeyword;
         }
     }
+    ///<summary>Represents the discard designation '_'</summary>
     public sealed class DiscardDesignationSyntax : VariableDesignationSyntax
     {
         public SyntaxToken UnderscoreToken { get; }
@@ -2860,6 +3605,7 @@ namespace Cnidaria.Cs
             UnderscoreToken = underscoreToken;
         }
     }
+    ///<summary>Represents a nested comma-separated deconstruction designation</summary>
     public sealed class ParenthesizedVariableDesignationSyntax : VariableDesignationSyntax
     {
         public SyntaxToken OpenParenToken { get; }
@@ -2876,6 +3622,7 @@ namespace Cnidaria.Cs
             CloseParenToken = closeParenToken;
         }
     }
+    ///<summary>Represents a type and variable designation used in an expression position</summary>
     public sealed class DeclarationExpressionSyntax : ExpressionSyntax
     {
         public TypeSyntax Type { get; }
@@ -2888,6 +3635,7 @@ namespace Cnidaria.Cs
             Designation = designation;
         }
     }
+    ///<summary>Represents the 'base' expression</summary>
     public sealed class BaseExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken BaseKeyword { get; }
@@ -2899,6 +3647,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a literal, null, true, false or default value</summary>
     public sealed class LiteralExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken LiteralToken { get; }
@@ -2910,6 +3659,19 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the contextual 'field' expression</summary>
+    public sealed class FieldExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken Token { get; }
+
+        public FieldExpressionSyntax(SyntaxToken token)
+            : base(SyntaxKind.FieldExpression, token.Span)
+        {
+            Token = token;
+        }
+    }
+
+    ///<summary>Represents an expression prefixed by contextual 'await'</summary>
     public sealed class AwaitExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken AwaitKeyword { get; } // contextual token
@@ -2922,6 +3684,7 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents an expression prefixed by 'throw'</summary>
     public sealed class ThrowExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken ThrowKeyword { get; }
@@ -2934,10 +3697,11 @@ namespace Cnidaria.Cs
             Expression = expression;
         }
     }
+    ///<summary>Represents a postfix operator applied after its operand</summary>
     public sealed class PostfixUnaryExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Operand { get; }
-        public SyntaxToken OperatorToken { get; }
+        public SyntaxToken OperatorToken { get; } // '++' or '--'
 
         public PostfixUnaryExpressionSyntax(SyntaxKind kind, ExpressionSyntax operand, SyntaxToken operatorToken)
             : base(kind, NodeSpan.From(operand.Span, operatorToken.Span))
@@ -2947,9 +3711,12 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a binary operator and its left and right operands</summary>
     public sealed class BinaryExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Left { get; }
+        // '*', '/', '%', '+', '-', '<<', '>>', '>>>', '<', '<=', '>', '>='
+        // 'is', 'as', '==', '!=', '&', '^', '|', '&&', '||' or '??'
         public SyntaxToken OperatorToken { get; }
         public ExpressionSyntax Right { get; }
 
@@ -2961,6 +3728,7 @@ namespace Cnidaria.Cs
             Right = right;
         }
     }
+    ///<summary>Represents an expression matched by 'is pattern'</summary>
     public sealed class IsPatternExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -2975,10 +3743,12 @@ namespace Cnidaria.Cs
             Pattern = pattern;
         }
     }
+    ///<summary>Represents an assignment operator and its left and right operands</summary>
     public sealed class AssignmentExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Left { get; }
-        public SyntaxToken OperatorToken { get; } // '='
+        // '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=' or '??='
+        public SyntaxToken OperatorToken { get; }
         public ExpressionSyntax Right { get; }
 
         public AssignmentExpressionSyntax(SyntaxKind kind, ExpressionSyntax left, SyntaxToken operatorToken, ExpressionSyntax right)
@@ -2990,6 +3760,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the ternary conditional expression</summary>
     public sealed class ConditionalExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Condition { get; }
@@ -3010,6 +3781,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a '..' range with either operand optionally omitted</summary>
     public sealed class RangeExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax? LeftOperand { get; }
@@ -3026,6 +3798,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents member selection through '.' or '->'</summary>
     public sealed class MemberAccessExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -3041,6 +3814,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents conditional access introduced by '?' before a binding expression</summary>
     public sealed class ConditionalAccessExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -3056,6 +3830,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents the '.name' binding used after conditional access</summary>
     public sealed class MemberBindingExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OperatorToken { get; } // '.'
@@ -3069,23 +3844,49 @@ namespace Cnidaria.Cs
         }
     }
 
-    public sealed class NameColonSyntax : SyntaxNode
+    ///<summary>Base class for an expression followed by ':'</summary>
+    public abstract class BaseExpressionColonSyntax : SyntaxNode
     {
-        public IdentifierNameSyntax Name { get; }
+        public abstract ExpressionSyntax Expression { get; }
         public SyntaxToken ColonToken { get; }
 
-        public NameColonSyntax(IdentifierNameSyntax name, SyntaxToken colonToken)
-            : base(SyntaxKind.NameColon, NodeSpan.From(name.Span, colonToken.Span))
+        protected BaseExpressionColonSyntax(SyntaxKind kind, SyntaxToken colonToken, TextSpan span)
+            : base(kind, span)
         {
-            Name = name;
             ColonToken = colonToken;
         }
     }
 
+    ///<summary>Represents the 'name:' prefix of a named argument or subpattern</summary>
+    public sealed class NameColonSyntax : BaseExpressionColonSyntax
+    {
+        public IdentifierNameSyntax Name { get; }
+        public override ExpressionSyntax Expression => Name;
+
+        public NameColonSyntax(IdentifierNameSyntax name, SyntaxToken colonToken)
+            : base(SyntaxKind.NameColon, colonToken, NodeSpan.From(name.Span, colonToken.Span))
+        {
+            Name = name;
+        }
+    }
+
+    ///<summary>Represents an expression followed by ':' in an extended property pattern</summary>
+    public sealed class ExpressionColonSyntax : BaseExpressionColonSyntax
+    {
+        public override ExpressionSyntax Expression { get; }
+
+        public ExpressionColonSyntax(ExpressionSyntax expression, SyntaxToken colonToken)
+            : base(SyntaxKind.ExpressionColon, colonToken, NodeSpan.From(expression.Span, colonToken.Span))
+        {
+            Expression = expression;
+        }
+    }
+
+    ///<summary>Represents an argument with optional name and ref-kind modifier</summary>
     public sealed class ArgumentSyntax : SyntaxNode
     {
         public NameColonSyntax? NameColon { get; }
-        public SyntaxToken? RefKindKeyword { get; }
+        public SyntaxToken? RefKindKeyword { get; } // 'ref', 'out', 'in' or absent
         public ExpressionSyntax Expression { get; }
 
         public ArgumentSyntax(NameColonSyntax? nameColon, SyntaxToken? refKindKeyword, ExpressionSyntax expression)
@@ -3097,6 +3898,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a comma-separated argument list in parentheses</summary>
     public sealed class ArgumentListSyntax : SyntaxNode
     {
         public SyntaxToken OpenParenToken { get; }
@@ -3112,6 +3914,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents a comma-separated argument list in brackets</summary>
     public sealed class BracketedArgumentListSyntax : SyntaxNode
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -3127,6 +3930,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents invocation of an expression with arguments</summary>
     public sealed class InvocationExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -3140,6 +3944,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents indexed access on an expression</summary>
     public sealed class ElementAccessExpressionSyntax : ExpressionSyntax
     {
         public ExpressionSyntax Expression { get; }
@@ -3153,6 +3958,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents bracketed element access without a receiver in an initializer</summary>
     public sealed class ImplicitElementAccessSyntax : ExpressionSyntax
     {
         public BracketedArgumentListSyntax ArgumentList { get; }
@@ -3163,6 +3969,7 @@ namespace Cnidaria.Cs
             ArgumentList = argumentList;
         }
     }
+    ///<summary>Represents bracketed element binding after conditional access</summary>
     public sealed class ElementBindingExpressionSyntax : ExpressionSyntax
     {
         public BracketedArgumentListSyntax ArgumentList { get; }
@@ -3173,6 +3980,7 @@ namespace Cnidaria.Cs
             ArgumentList = argumentList;
         }
     }
+    ///<summary>Represents an omitted array dimension between separators</summary>
     public sealed class OmittedArraySizeExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OmittedArraySizeExpressionToken { get; }
@@ -3184,6 +3992,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents one bracketed array rank and its optional dimension sizes</summary>
     public sealed class ArrayRankSpecifierSyntax : SyntaxNode
     {
         public SyntaxToken OpenBracketToken { get; }
@@ -3199,6 +4008,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents an element type followed by one or more array rank specifiers</summary>
     public sealed class ArrayTypeSyntax : TypeSyntax
     {
         public TypeSyntax ElementType { get; }
@@ -3214,6 +4024,7 @@ namespace Cnidaria.Cs
             RankSpecifiers = rankSpecifiers;
         }
     }
+    ///<summary>Represents a brace-delimited object, collection, array or complex element initializer</summary>
     public sealed class InitializerExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken OpenBraceToken { get; }
@@ -3228,6 +4039,45 @@ namespace Cnidaria.Cs
             CloseBraceToken = closeBraceToken;
         }
     }
+
+    ///<summary>Represents one member declarator in an anonymous object creation expression</summary>
+    public sealed class AnonymousObjectMemberDeclaratorSyntax : SyntaxNode
+    {
+        public NameEqualsSyntax? NameEquals { get; }
+        public ExpressionSyntax Expression { get; }
+
+        public AnonymousObjectMemberDeclaratorSyntax(NameEqualsSyntax? nameEquals, ExpressionSyntax expression)
+            : base(
+                SyntaxKind.AnonymousObjectMemberDeclarator,
+                NodeSpan.FromNonNull(nameEquals?.Span, expression.Span))
+        {
+            NameEquals = nameEquals;
+            Expression = expression;
+        }
+    }
+
+    ///<summary>Represents anonymous object creation introduced by 'new'</summary>
+    public sealed class AnonymousObjectCreationExpressionSyntax : ExpressionSyntax
+    {
+        public SyntaxToken NewKeyword { get; }
+        public SyntaxToken OpenBraceToken { get; }
+        public SeparatedSyntaxList<AnonymousObjectMemberDeclaratorSyntax> Initializers { get; }
+        public SyntaxToken CloseBraceToken { get; }
+
+        public AnonymousObjectCreationExpressionSyntax(
+            SyntaxToken newKeyword,
+            SyntaxToken openBraceToken,
+            SeparatedSyntaxList<AnonymousObjectMemberDeclaratorSyntax> initializers,
+            SyntaxToken closeBraceToken)
+            : base(SyntaxKind.AnonymousObjectCreationExpression, NodeSpan.From(newKeyword.Span, closeBraceToken.Span))
+        {
+            NewKeyword = newKeyword;
+            OpenBraceToken = openBraceToken;
+            Initializers = initializers;
+            CloseBraceToken = closeBraceToken;
+        }
+    }
+    ///<summary>Represents explicit array creation with optional initializer</summary>
     public sealed class ArrayCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken NewKeyword { get; }
@@ -3247,6 +4097,7 @@ namespace Cnidaria.Cs
             Initializer = initializer;
         }
     }
+    ///<summary>Represents implicitly typed array creation with a required initializer</summary>
     public sealed class ImplicitArrayCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken NewKeyword { get; }
@@ -3272,6 +4123,7 @@ namespace Cnidaria.Cs
             Initializer = initializer;
         }
     }
+    ///<summary>Represents target-typed object creation with optional initializer</summary>
     public sealed class ImplicitObjectCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken NewKeyword { get; }
@@ -3290,6 +4142,7 @@ namespace Cnidaria.Cs
             Initializer = initializer;
         }
     }
+    ///<summary>Represents stack allocation with an explicit element or array type</summary>
     public sealed class StackAllocArrayCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken StackAllocKeyword { get; }
@@ -3310,6 +4163,7 @@ namespace Cnidaria.Cs
         }
     }
 
+    ///<summary>Represents implicitly typed stack allocation with an initializer</summary>
     public sealed class ImplicitStackAllocArrayCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken StackAllocKeyword { get; }
@@ -3332,6 +4186,7 @@ namespace Cnidaria.Cs
             Initializer = initializer;
         }
     }
+    ///<summary>Represents object creation with an explicit type and optional arguments or initializer</summary>
     public sealed class ObjectCreationExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken NewKeyword { get; }
@@ -3353,6 +4208,7 @@ namespace Cnidaria.Cs
             Initializer = initializer;
         }
     }
+    ///<summary>Represents the brace-delimited accessor list of a property, event or indexer</summary>
     public sealed class AccessorListSyntax : SyntaxNode
     {
         public SyntaxToken OpenBraceToken { get; }
@@ -3367,11 +4223,12 @@ namespace Cnidaria.Cs
             CloseBraceToken = closeBraceToken;
         }
     }
+    ///<summary>Represents one get, set, init, add or remove accessor</summary>
     public sealed class AccessorDeclarationSyntax : SyntaxNode
     {
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
         public SyntaxTokenList Modifiers { get; }
-        public SyntaxToken Keyword { get; }
+        public SyntaxToken Keyword { get; } // 'get', 'set', 'init', 'add' or 'remove'
         public BlockSyntax? Body { get; }
         public ArrowExpressionClauseSyntax? ExpressionBody { get; }
         public SyntaxToken SemicolonToken { get; }
@@ -3401,6 +4258,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents a property with accessors or an expression body and optional initializer</summary>
     public sealed class PropertyDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -3444,6 +4302,7 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
+    ///<summary>Represents an event declaration with explicit accessors</summary>
     public sealed class EventDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -3481,6 +4340,7 @@ namespace Cnidaria.Cs
             AccessorList = accessorList;
         }
     }
+    ///<summary>Represents an indexer with accessors or an expression body</summary>
     public sealed class IndexerDeclarationSyntax : MemberDeclarationSyntax
     {
         public SyntaxTokenList Modifiers { get; }
@@ -3523,47 +4383,51 @@ namespace Cnidaria.Cs
             SemicolonToken = semicolonToken;
         }
     }
-    public abstract class LambdaExpressionSyntax : ExpressionSyntax
+    ///<summary>Base class for simple and parenthesized lambda expressions</summary>
+    public abstract class LambdaExpressionSyntax : AnonymousFunctionExpressionSyntax
     {
-        public SyntaxToken StaticKeyword { get; } // optional
-        public SyntaxToken AsyncKeyword { get; } // optional
+        private readonly SyntaxNode _body;
+
+        public SyntaxList<AttributeListSyntax> AttributeLists { get; }
         public SyntaxToken ArrowToken { get; }
-        public SyntaxNode Body { get; } // BlockSyntax or ExpressionSyntax
+        public override BlockSyntax? Block => _body as BlockSyntax;
+        public override ExpressionSyntax? ExpressionBody => _body as ExpressionSyntax;
 
         protected LambdaExpressionSyntax(
             SyntaxKind kind,
-            SyntaxToken staticKeyword,
-            SyntaxToken asyncKeyword,
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
             SyntaxToken arrowToken,
             SyntaxNode body,
             TextSpan span)
-            : base(kind, span)
+            : base(kind, modifiers, span)
         {
-            StaticKeyword = staticKeyword;
-            AsyncKeyword = asyncKeyword;
+            AttributeLists = attributeLists;
             ArrowToken = arrowToken;
-            Body = body;
+            _body = body;
         }
     }
 
+    ///<summary>Represents a lambda with one unparenthesized parameter</summary>
     public sealed class SimpleLambdaExpressionSyntax : LambdaExpressionSyntax
     {
         public ParameterSyntax Parameter { get; }
 
         public SimpleLambdaExpressionSyntax(
-            SyntaxToken staticKeyword,
-            SyntaxToken asyncKeyword,
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
             ParameterSyntax parameter,
             SyntaxToken arrowToken,
             SyntaxNode body)
             : base(
                 SyntaxKind.SimpleLambdaExpression,
-                staticKeyword,
-                asyncKeyword,
+                attributeLists,
+                modifiers,
                 arrowToken,
                 body,
                 NodeSpan.FromNonNull(
-                    asyncKeyword.Span.Length != 0 ? asyncKeyword.Span : (TextSpan?)null,
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
                     parameter.Span,
                     arrowToken.Span,
                     body.Span))
@@ -3571,31 +4435,38 @@ namespace Cnidaria.Cs
             Parameter = parameter;
         }
     }
+    ///<summary>Represents a lambda with a parenthesized parameter list</summary>
     public sealed class ParenthesizedLambdaExpressionSyntax : LambdaExpressionSyntax
     {
+        public TypeSyntax? ReturnType { get; }
         public ParameterListSyntax ParameterList { get; }
 
         public ParenthesizedLambdaExpressionSyntax(
-            SyntaxToken staticKeyword,
-            SyntaxToken asyncKeyword,
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers,
+            TypeSyntax? returnType,
             ParameterListSyntax parameterList,
             SyntaxToken arrowToken,
             SyntaxNode body)
             : base(
                 SyntaxKind.ParenthesizedLambdaExpression,
-                staticKeyword,
-                asyncKeyword,
+                attributeLists,
+                modifiers,
                 arrowToken,
                 body,
                 NodeSpan.FromNonNull(
-                    asyncKeyword.Span.Length != 0 ? asyncKeyword.Span : (TextSpan?)null,
+                    attributeLists.Count > 0 ? attributeLists[0].Span : (TextSpan?)null,
+                    modifiers.Count > 0 ? modifiers[0].Span : (TextSpan?)null,
+                    returnType?.Span,
                     parameterList.Span,
                     arrowToken.Span,
                     body.Span))
         {
+            ReturnType = returnType;
             ParameterList = parameterList;
         }
     }
+    ///<summary>Represents an expression prefixed by 'ref'</summary>
     public sealed class RefExpressionSyntax : ExpressionSyntax
     {
         public SyntaxToken RefKeyword { get; }

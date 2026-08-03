@@ -9,7 +9,10 @@ using System.Runtime.InteropServices;
 
 namespace Cnidaria.C
 {
+    // Diagnostics and lexical primitives
+
     public enum DiagnosticSeverity : byte { Error, Warning, Message };
+    ///<summary>Describes a source diagnostic</summary>
     public interface IDiagnostic
     {
         DiagnosticSeverity Severity { get; }
@@ -17,6 +20,7 @@ namespace Cnidaria.C
         TextSpan Position { get; }
         string GetMessage(string source);
     }
+    ///<summary>Stores a diagnostic and its source span</summary>
     public readonly struct SyntaxDiagnostic : IDiagnostic
     {
         public DiagnosticSeverity Severity { get; }
@@ -35,7 +39,7 @@ namespace Cnidaria.C
         {
         }
 
-        public string GetMessage(string source) => _message + $" {Position.ToString(source)}";
+        public string GetMessage(string source) => $"{_message} {Position.ToString(source)}";
 
         public static SyntaxDiagnostic Error(string message, TextSpan position)
             => new SyntaxDiagnostic(DiagnosticSeverity.Error, message, position);
@@ -46,6 +50,7 @@ namespace Cnidaria.C
         public static SyntaxDiagnostic MessageInfo(string message, TextSpan position)
             => new SyntaxDiagnostic(DiagnosticSeverity.Message, message, position);
     }
+    ///<summary>Represents a source range</summary>
     public readonly struct TextSpan
     {
         public readonly int Start;
@@ -112,6 +117,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Stores trivia text with its source position</summary>
     public readonly struct SyntaxTrivia
     {
         public readonly SyntaxKind Kind;
@@ -126,6 +132,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Stores a token, decoded value and surrounding trivia</summary>
     public struct SyntaxToken
     {
         public readonly SyntaxKind Kind;
@@ -153,6 +160,8 @@ namespace Cnidaria.C
             TrailingTrivia = trailingTrivia;
         }
     }
+
+    // Classification output
 
     public enum SyntaxColor : byte
     {
@@ -195,6 +204,7 @@ namespace Cnidaria.C
         public static bool operator ==(ColorSpan left, ColorSpan right) => left.Equals(right);
         public static bool operator !=(ColorSpan left, ColorSpan right) => !left.Equals(right);
     }
+    ///<summary>Tracks ordinary identifiers and typedef names by lexical scope</summary>
     public sealed class TypeNameTable
     {
         private readonly Stack<Dictionary<string, bool>> _scopes = new();
@@ -204,11 +214,13 @@ namespace Cnidaria.C
             _scopes.Push(new Dictionary<string, bool>(StringComparer.Ordinal));
         }
 
+        ///<summary>Pushes an empty identifier scope</summary>
         public void BeginScope()
         {
             _scopes.Push(new Dictionary<string, bool>(StringComparer.Ordinal));
         }
 
+        ///<summary>Pops the current identifier scope</summary>
         public void EndScope()
         {
             if (_scopes.Count == 1)
@@ -217,11 +229,13 @@ namespace Cnidaria.C
             _scopes.Pop();
         }
 
+        ///<summary>Declares a typedef name in the current scope</summary>
         public void DeclareTypedef(string name)
         {
             Declare(name, isTypedefName: true);
         }
 
+        ///<summary>Declares an ordinary identifier that can hide a typedef name</summary>
         public void DeclareOrdinaryIdentifier(string name)
         {
             Declare(name, isTypedefName: false);
@@ -235,6 +249,7 @@ namespace Cnidaria.C
             _scopes.Peek()[name] = isTypedefName;
         }
 
+        ///<summary>Tests the visible declaration of an identifier</summary>
         public bool IsTypeName(string name)
         {
             if (RVVectorType.TryParseBuiltinName(name, out _))
@@ -250,6 +265,9 @@ namespace Cnidaria.C
         }
     }
 
+    // Preprocessor configuration and include resolution
+
+    ///<summary>Defines target-dependent predefined macros</summary>
     public sealed class PreprocessorEnvironment
     {
         public string OperatingSystem { get; }
@@ -274,6 +292,7 @@ namespace Cnidaria.C
                     ? new Dictionary<string, string>(StringComparer.Ordinal)
                     : new Dictionary<string, string>(extraPredefinedMacros, StringComparer.Ordinal));
         }
+        ///<summary>Creates predefined macros from target properties</summary>
         public static PreprocessorEnvironment ForTarget(
             TargetInfo target, IReadOnlyDictionary<string, string>? extraPredefinedMacros = null)
         {
@@ -501,6 +520,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Describes an include request and its search context</summary>
     public sealed class IncludeDirective
     {
         public string Name { get; }
@@ -521,6 +541,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Stores resolved include text and path</summary>
     public readonly struct IncludeFile
     {
         public readonly string Path { get; }
@@ -534,11 +555,13 @@ namespace Cnidaria.C
         public bool Exists => !string.IsNullOrEmpty(Path);
     }
 
+    ///<summary>Resolves include directives to source text</summary>
     public interface IIncludeResolver
     {
         bool TryResolveInclude(IncludeDirective directive, out IncludeFile file);
     }
 
+    ///<summary>Rejects every include request</summary>
     public sealed class NullIncludeResolver : IIncludeResolver
     {
         public static readonly NullIncludeResolver Instance = new();
@@ -554,6 +577,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Queries include resolvers in declaration order</summary>
     public sealed class CompositeIncludeResolver : IIncludeResolver
     {
         private readonly ImmutableArray<IIncludeResolver> _resolvers;
@@ -587,6 +611,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Loads includes from configured filesystem roots</summary>
     public sealed class FileSystemIncludeResolver : IIncludeResolver
     {
         private readonly int _maxBytes;
@@ -628,6 +653,7 @@ namespace Cnidaria.C
             }
         }
 
+        // Canonical paths prevent include names from escaping their search root
         private bool TryReadUnderRoot(string root, string relativeName, out IncludeFile file)
         {
             file = default;
@@ -705,6 +731,7 @@ namespace Cnidaria.C
                RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
     }
 
+    ///<summary>Resolves normalized virtual paths from memory</summary>
     public sealed class InMemoryIncludeResolver : IIncludeResolver
     {
         private readonly Dictionary<string, IncludeFile> _files = new(StringComparer.Ordinal);
@@ -810,6 +837,7 @@ namespace Cnidaria.C
         }
     }
 
+    ///<summary>Controls predefined macros, includes and lexer resource limits</summary>
     public sealed class PreprocessorOptions
     {
         public string? FilePath { get; }
@@ -926,6 +954,8 @@ namespace Cnidaria.C
             return new CompositeIncludeResolver(resolvers);
         }
     }
+
+    // Keyword and punctuator lookup
 
     public static class SyntaxFacts
     {
@@ -1124,6 +1154,7 @@ namespace Cnidaria.C
             s_punctuatorKinds.Keys.Max(static text => text.Length);
     }
 
+    ///<summary>Produces preprocessed tokens while preserving source trivia</summary>
     public sealed class Lexer
     {
         private sealed class MacroInfo
@@ -1239,6 +1270,7 @@ namespace Cnidaria.C
 
         public string? CurrentFilePath => _filePath;
 
+        ///<summary>Defines or replaces an object-like macro</summary>
         public void DefineObjectMacro(string name, string replacementText = "1")
         {
             if (string.IsNullOrWhiteSpace(name))
@@ -1260,6 +1292,7 @@ namespace Cnidaria.C
                 replacementText: replacementText);
         }
 
+        ///<summary>Removes a macro definition</summary>
         public bool UndefineMacro(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
@@ -1268,8 +1301,11 @@ namespace Cnidaria.C
             return _macros.Remove(name);
         }
 
+        ///<summary>Tests whether a macro is currently defined</summary>
         public bool IsMacroDefined(string name)
             => name is not null && _macros.ContainsKey(name);
+
+        // Input stack and include expansion
 
         private bool PushInput(string text, string? filePath)
         {
@@ -1328,6 +1364,7 @@ namespace Cnidaria.C
             return true;
         }
 
+        ///<summary>Returns the next active token after preprocessing</summary>
         public SyntaxToken NextToken()
         {
             while (true)
@@ -1369,6 +1406,8 @@ namespace Cnidaria.C
 
         private bool IsCurrentlyActive
             => _conditionalStack.Count == 0 || _conditionalStack.Peek().IsActive;
+
+        // Macro expansion
 
         private bool TryExpandMacro(SyntaxToken token)
         {
@@ -1827,6 +1866,7 @@ namespace Cnidaria.C
                 builder.Length--;
         }
 
+        // Stringification collapses preprocessing whitespace before escaping
         private static string StringifyMacroArgument(string text)
         {
             var normalized = CollapseMacroArgumentWhitespace(text.Trim());
@@ -2014,6 +2054,8 @@ namespace Cnidaria.C
                 maxMacroExpansionDepth: _options.MaxMacroExpansionDepth,
                 maxMacroExpansionTokens: _options.MaxMacroExpansionTokens,
                 includeStandardHeaders: false);
+
+        // Token scanning
 
         private SyntaxToken LexToken(ImmutableArray<SyntaxTrivia> leadingTrivia)
         {
@@ -2611,6 +2653,8 @@ namespace Cnidaria.C
             return MakeBadToken(leadingTrivia);
         }
 
+        // Trivia and preprocessor directives
+
         private ImmutableArray<SyntaxTrivia> ReadTrivia(bool leading)
         {
             var trivia = ImmutableArray.CreateBuilder<SyntaxTrivia>();
@@ -3198,6 +3242,8 @@ namespace Cnidaria.C
                 _macros.Remove(name);
         }
 
+        // Conditional compilation state
+
         private long EvaluateIfExpression(string text)
         {
             var parser = new IfExpressionParser(text, _macros, HasInclude);
@@ -3279,6 +3325,8 @@ namespace Cnidaria.C
             _conditionalStack.Pop();
         }
 
+        // Diagnostics and token construction
+
         private void Report(DiagnosticSeverity severity, int start, int length, string message)
         {
             if (start < 0)
@@ -3346,6 +3394,8 @@ namespace Cnidaria.C
         }
 
         private char Current => Peek(0);
+
+        // Character input helpers
 
         private char Peek(int offset)
         {
@@ -3596,6 +3646,7 @@ namespace Cnidaria.C
             return builder.ToString();
         }
 
+        // Parses integer constant expressions used by conditional directives
         private sealed class IfExpressionParser
         {
             private readonly string _text;

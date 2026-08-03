@@ -4,7 +4,7 @@ using System.Collections.Immutable;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class PhysicalPromotionOptions
+    public sealed class PhysicalPromotionOptions
     {
         public static PhysicalPromotionOptions Default { get; } = new PhysicalPromotionOptions();
 
@@ -576,7 +576,8 @@ namespace Cnidaria.Cs
                     sourceOp,
                     descriptor.Type,
                     descriptor.StackKind,
-                    GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered,
+                    GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered |
+                    (template.Flags & GenTreeFlags.ExplicitInit),
                     ImmutableArray.Create(value),
                     int32: descriptor.Index,
                     runtimeType: descriptor.Type);

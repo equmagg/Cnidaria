@@ -25,6 +25,7 @@ namespace Cnidaria.C
         private const string BssSectionName = ".bss";
 
         private readonly LirModule _module;
+        private readonly FileScopeLinkageMap _fileScopeLinkage;
         private readonly TargetInfo _target;
         private readonly ArmTarget _machineTarget;
         private readonly LSRAOptions _allocationOptions;
@@ -32,6 +33,7 @@ namespace Cnidaria.C
         private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
         private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
+        private readonly Dictionary<string, string> _dataLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _stringLabels = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _externalLabels = new HashSet<string>(StringComparer.Ordinal);
@@ -46,6 +48,7 @@ namespace Cnidaria.C
         private ArmCodeGenerator(LirModule module, LSRAOptions? allocationOptions, ArmCodeGeneratorOptions? options)
         {
             _module = module ?? throw new ArgumentNullException(nameof(module));
+            _fileScopeLinkage = FileScopeLinkageMap.Create(_module.SemanticModel);
             _target = module.SemanticModel.Compilation.Options.Target;
             if (_target.Architecture is not TargetArchitectureKind.Arm32 and not TargetArchitectureKind.Arm64)
                 throw new NotSupportedException("ARM C backend requires Arm32 or Arm64 target.");
@@ -227,11 +230,12 @@ namespace Cnidaria.C
                 var symbol = function.Symbol;
                 if (symbol is null || _functionLabels.ContainsKey(symbol))
                     continue;
+                if (_functionLabelsByName.ContainsKey(symbol.Name))
+                    throw new InvalidOperationException($"Duplicate definition of function '{symbol.Name}'.");
 
                 var label = CreateUniqueGlobalLabel(symbol.Name);
                 _functionLabels.Add(symbol, label);
-                if (!_functionLabelsByName.ContainsKey(symbol.Name))
-                    _functionLabelsByName.Add(symbol.Name, label);
+                _functionLabelsByName.Add(symbol.Name, label);
             }
         }
 
@@ -246,6 +250,8 @@ namespace Cnidaria.C
 
         private void EmitGlobalStorage()
         {
+            var groups = new Dictionary<string, List<LirGlobal>>(StringComparer.Ordinal);
+            var order = new List<string>();
             foreach (var global in _module.Globals)
             {
                 if (global.Symbol is null ||
@@ -257,36 +263,96 @@ namespace Cnidaria.C
                     continue;
                 }
 
-                if (global.StorageClass == StorageClass.Extern)
+                if (!groups.TryGetValue(global.Symbol.Name, out var declarations))
                 {
-                    AddExternalObjectSymbol(global.Symbol);
+                    declarations = new List<LirGlobal>();
+                    groups.Add(global.Symbol.Name, declarations);
+                    order.Add(global.Symbol.Name);
+                }
+                declarations.Add(global);
+            }
+
+            foreach (var name in order)
+            {
+                var declarations = groups[name];
+                var internalLinkage = _fileScopeLinkage.IsInternal(declarations[0].Symbol!);
+                LirGlobal? strongDefinition = null;
+                LirGlobal? tentativeDefinition = null;
+                var tentativeSize = -1;
+
+                foreach (var declaration in declarations)
+                {
+                    if (declaration.Initializer is not null)
+                    {
+                        if (strongDefinition is not null)
+                            throw new InvalidOperationException($"Duplicate definition of global object '{name}'.");
+                        strongDefinition = declaration;
+                        continue;
+                    }
+
+                    if (declaration.StorageClass == StorageClass.Extern)
+                        continue;
+
+                    var size = GetGlobalStorageSize(declaration.Type);
+                    if (tentativeDefinition is null || size > tentativeSize)
+                    {
+                        tentativeDefinition = declaration;
+                        tentativeSize = size;
+                    }
+                }
+
+                var definition = strongDefinition ?? tentativeDefinition;
+                if (definition is null)
+                {
+                    if (internalLinkage)
+                        throw new InvalidOperationException($"Undefined internal object '{name}'.");
+                    AddExternalObjectSymbol(declarations[0].Symbol!);
                     continue;
                 }
 
-                var size = Math.Max(1, _target.SizeOf(global.Type));
-                var alignment = Math.Max(1, _target.AlignOf(global.Type));
-                var label = CreateUniqueGlobalLabel(global.Symbol.Name);
-                _dataLabels[global.Symbol] = label;
-                var binding = global.StorageClass == StorageClass.Static ? ArmObjectSymbolBinding.Local : ArmObjectSymbolBinding.Global;
-
-                if (global.Initializer is null)
+                var label = CreateUniqueGlobalLabel(name);
+                _dataLabelsByName.Add(name, label);
+                foreach (var declaration in declarations)
                 {
-                    var offset = _bss.Allocate(size, alignment);
-                    _bss.DefineSymbol(label, offset, size, binding, _symbols);
-                    continue;
+                    if (declaration.Symbol is not null)
+                        _dataLabels[declaration.Symbol] = label;
                 }
 
-                var section = IsReadOnlyGlobal(global) ? _rodata : _data;
-                var symbolOffset = section.Align(alignment);
-                section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
-                var bytes = EmitInitializer(section, global.Type, global.Initializer, size);
-                if (bytes < size)
-                    section.EmitZero(size - bytes);
+                {
+                    var size = GetGlobalStorageSize(definition.Type);
+                    var alignment = Math.Max(1, _target.AlignOf(definition.Type));
+                    var binding = internalLinkage ? ArmObjectSymbolBinding.Local : ArmObjectSymbolBinding.Global;
+                    if (strongDefinition is null)
+                    {
+                        var offset = _bss.Allocate(size, alignment);
+                        _bss.DefineSymbol(
+                            label,
+                            offset,
+                            size,
+                            binding,
+                            _symbols,
+                            isTentative: !internalLinkage);
+                        continue;
+                    }
+
+                    var section = IsReadOnlyGlobal(definition) ? _rodata : _data;
+                    var symbolOffset = section.Align(alignment);
+                    section.DefineSymbol(label, symbolOffset, size, binding, _symbols);
+                    var bytes = EmitInitializer(section, definition.Type, definition.Initializer!, size);
+                    if (bytes < size)
+                        section.EmitZero(size - bytes);
+
+                }
             }
         }
 
+        private int GetGlobalStorageSize(QualifiedType type)
+            => type.Type is ArrayType { Length: null } incompleteArray
+                ? Math.Max(1, _target.SizeOf(incompleteArray.ElementType))
+                : Math.Max(1, _target.SizeOf(type));
+
         private static bool IsReadOnlyGlobal(LirGlobal global)
-            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0 && global.StorageClass != StorageClass.Extern;
+            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0;
 
         private void AddExternalObjectSymbol(Symbol symbol)
             => AddExternalSymbol(CreateExternalLabel(symbol.Name), ArmObjectSymbolKind.Object);
@@ -422,11 +488,15 @@ namespace Cnidaria.C
                     return functionLabel;
                 if (_functionLabelsByName.TryGetValue(function.Name, out functionLabel))
                     return functionLabel;
+                if (_fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
                 AddExternalFunctionSymbol(function);
                 return CreateExternalLabel(function.Name);
             }
 
             if (_dataLabels.TryGetValue(symbol, out var dataLabel))
+                return dataLabel;
+            if (_dataLabelsByName.TryGetValue(symbol.Name, out dataLabel))
                 return dataLabel;
 
             AddExternalObjectSymbol(symbol);
@@ -441,7 +511,7 @@ namespace Cnidaria.C
             var allocation = LinearScanRegisterAllocator.Allocate(function, _target, _allocationOptions);
             var blockLabels = new Dictionary<LirBlock, string>();
             foreach (var block in function.Blocks)
-                blockLabels.Add(block, CreateLocalLabel(label + "_" + block.Name));
+                blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
 
             var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
             var startOffset = _text.ByteLength;
@@ -450,7 +520,7 @@ namespace Cnidaria.C
             context.EmitBlocks();
             context.EmitTrap();
             var size = _text.ByteLength - startOffset;
-            var binding = function.Symbol.StorageClass == StorageClass.Static ? ArmObjectSymbolBinding.Local : ArmObjectSymbolBinding.Global;
+            var binding = _fileScopeLinkage.IsInternal(function.Symbol) ? ArmObjectSymbolBinding.Local : ArmObjectSymbolBinding.Global;
             _symbols.Add(new ArmObjectSymbol(label, TextSectionName, startOffset, size, binding, ArmObjectSymbolKind.Function));
         }
 
@@ -462,7 +532,7 @@ namespace Cnidaria.C
             var candidate = baseName;
             var suffix = 0;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++suffix).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++suffix)}";
             return candidate;
         }
 
@@ -474,10 +544,10 @@ namespace Cnidaria.C
 
         private string CreateLocalLabel(string prefix)
         {
-            var baseName = ".L" + SanitizeSymbolName(prefix);
+            var baseName = $".L{SanitizeSymbolName(prefix)}";
             var candidate = baseName;
             while (!_usedLabels.Add(candidate))
-                candidate = baseName + "_" + (++_nextLocalId).ToString(CultureInfo.InvariantCulture);
+                candidate = $"{baseName}_{(++_nextLocalId)}";
             return candidate;
         }
 
@@ -538,9 +608,9 @@ namespace Cnidaria.C
                     if (!first && part == 0)
                         continue;
                     Emit(ArmInstruction.Ternary(
-                        first ? ArmInstrKind.Movz : ArmInstrKind.Movk, 
-                        Reg(destination, size), 
-                        ArmOperand.ImmediateOperand(part), 
+                        first ? ArmInstrKind.Movz : ArmInstrKind.Movk,
+                        Reg(destination, size),
+                        ArmOperand.ImmediateOperand(part),
                         ArmOperand.ImmediateOperand(shift)));
                     first = false;
                 }
@@ -578,9 +648,9 @@ namespace Cnidaria.C
                 {
                     var part = Math.Min(remaining, 4095);
                     Emit(ArmInstruction.Ternary(
-                        immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add, 
-                        Reg(destination, size), 
-                        Reg(currentSource, size), 
+                        immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                        Reg(destination, size),
+                        Reg(currentSource, size),
                         ArmOperand.ImmediateOperand(part)));
                     currentSource = destination;
                     remaining -= part;
@@ -591,9 +661,9 @@ namespace Cnidaria.C
             if (_machineTarget.Is64Bit && magnitude <= 4095)
             {
                 Emit(ArmInstruction.Ternary(
-                    immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add, 
-                    Reg(destination, size), 
-                    Reg(source, size), 
+                    immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                    Reg(destination, size),
+                    Reg(source, size),
                     ArmOperand.ImmediateOperand(magnitude)));
                 return;
             }
@@ -601,9 +671,9 @@ namespace Cnidaria.C
             if (!_machineTarget.Is64Bit && magnitude <= 255)
             {
                 Emit(ArmInstruction.Ternary(
-                    immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add, 
-                    Reg(destination, size), 
-                    Reg(source, size), 
+                    immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                    Reg(destination, size),
+                    Reg(source, size),
                     ArmOperand.ImmediateOperand(magnitude)));
                 return;
             }
@@ -611,8 +681,8 @@ namespace Cnidaria.C
             var scratch = _machineTarget.Is64Bit ? ArmRegister.X17 : ArmRegister.R12;
             EmitLoadImmediate(scratch, magnitude, size);
             Emit(ArmInstruction.Ternary(
-                immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add, 
-                Reg(destination, size), 
+                immediate < 0 ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                Reg(destination, size),
                 Reg(source, size),
                 Reg(scratch, size)));
         }
@@ -666,7 +736,7 @@ namespace Cnidaria.C
         }
 
         private static bool IsUnsignedIntegerType(QualifiedType type)
-            => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar 
+            => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar
             or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
 
         private static bool IsIntegerLike(QualifiedType type)
@@ -911,9 +981,9 @@ namespace Cnidaria.C
                     MoveRegister(destination, location.Register, RegisterSize(type));
                 else if (location.Kind == AbiLocationKind.Stack)
                     LoadFromMemory(
-                        destination, 
-                        IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), 
-                        SizeOf(type), 
+                        destination,
+                        IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                        SizeOf(type),
                         IsSignedIntegerType(type));
                 else
                     throw Unsupported(instruction, "Invalid parameter ABI location.");
@@ -1046,21 +1116,21 @@ namespace Cnidaria.C
                         break;
                     case "/":
                         Emit(ArmInstruction.Ternary(
-                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv, 
-                            Reg(ToArm(destination), size), 
-                            Reg(ToArm(Scratch1), size), 
+                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv,
+                            Reg(ToArm(destination), size),
+                            Reg(ToArm(Scratch1), size),
                             Reg(ToArm(Scratch2), size)));
                         break;
                     case "%":
                         Emit(ArmInstruction.Ternary(
-                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv, 
-                            Reg(ToArm(Scratch3), size), 
-                            Reg(ToArm(Scratch1), size), 
+                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv,
+                            Reg(ToArm(Scratch3), size),
+                            Reg(ToArm(Scratch1), size),
                             Reg(ToArm(Scratch2), size)));
-                        Emit(ArmInstruction.Quaternary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Msub : ArmInstrKind.Mls, 
-                            Reg(ToArm(destination), size), 
-                            Reg(ToArm(Scratch3), size), 
-                            Reg(ToArm(Scratch2), size), 
+                        Emit(ArmInstruction.Quaternary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Msub : ArmInstrKind.Mls,
+                            Reg(ToArm(destination), size),
+                            Reg(ToArm(Scratch3), size),
+                            Reg(ToArm(Scratch2), size),
                             Reg(ToArm(Scratch1), size)));
                         break;
                     case "&":
@@ -1077,9 +1147,9 @@ namespace Cnidaria.C
                         break;
                     case ">>":
                         Emit(ArmInstruction.Ternary(
-                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Asr : ArmInstrKind.Lsr, 
-                            Reg(ToArm(destination), size), 
-                            Reg(ToArm(Scratch1), size), 
+                            IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Asr : ArmInstrKind.Lsr,
+                            Reg(ToArm(destination), size),
+                            Reg(ToArm(Scratch1), size),
                             Reg(ToArm(Scratch2), size)));
                         break;
                     case "==":
@@ -1089,11 +1159,11 @@ namespace Cnidaria.C
                     case ">":
                     case ">=":
                         EmitComparisonResult(
-                            destination, 
-                            Scratch1, 
-                            Scratch2, 
-                            SelectCondition(instruction.Operator, IsSignedIntegerType(instruction.Operands[0].Type)), 
-                            size, 
+                            destination,
+                            Scratch1,
+                            Scratch2,
+                            SelectCondition(instruction.Operator, IsSignedIntegerType(instruction.Operands[0].Type)),
+                            size,
                             rightIsZero: false);
                         break;
                     case "&&":
@@ -1313,8 +1383,8 @@ namespace Cnidaria.C
                     var operand = instruction.Operands[i];
                     RequireScalar(operand.Type, instruction);
                     var argumentIndex = i - startOperand;
-                    var isVariadicUnnamed = instruction.CallSignature is not null 
-                        && instruction.CallSignature.IsVariadic 
+                    var isVariadicUnnamed = instruction.CallSignature is not null
+                        && instruction.CallSignature.IsVariadic
                         && argumentIndex >= instruction.CallSignature.Parameters.Length;
                     var value = CAbi.ClassifyValue(_owner._target, operand.Type, false, isVariadicUnnamed);
                     if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 || value.Segments[0].RegisterClass != AbiRegisterClass.General)
@@ -1339,8 +1409,8 @@ namespace Cnidaria.C
                         MoveRegister(item.Location.Register, Scratch0, item.RegisterSize);
                     else if (item.Location.Kind == AbiLocationKind.Stack)
                         StoreToMemory(
-                            Scratch0, 
-                            _allocation.Frame.OutgoingArgumentAreaOffset + item.Location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), 
+                            Scratch0,
+                            _allocation.Frame.OutgoingArgumentAreaOffset + item.Location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
                             Math.Min(item.ValueSize, item.RegisterSize));
                     else
                         throw Unsupported(instruction, "Invalid call argument ABI location.");
@@ -1373,7 +1443,10 @@ namespace Cnidaria.C
                     return false;
                 }
 
-                label = "__imp_" + _owner.CreateExternalLabel(function.Name);
+                if (_owner._fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
+
+                label = $"__imp_{_owner.CreateExternalLabel(function.Name)}";
                 return true;
             }
 
@@ -1387,6 +1460,8 @@ namespace Cnidaria.C
                     return true;
                 if (_owner._functionLabelsByName.TryGetValue(function.Name, out label!))
                     return true;
+                if (_owner._fileScopeLinkage.IsInternal(function))
+                    throw new InvalidOperationException($"Undefined internal function '{function.Name}'.");
 
                 label = _owner.CreateExternalLabel(function.Name);
                 _owner.AddExternalFunctionSymbol(function);
@@ -1437,8 +1512,8 @@ namespace Cnidaria.C
 
                 EmitEpilogue();
                 Emit(ArmInstruction.Unary(
-                    _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx, 
-                    Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, 
+                    _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
+                    Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr,
                     _owner._target.PointerSize)));
             }
 
@@ -1555,7 +1630,7 @@ namespace Cnidaria.C
                         if (operand.StackSlot is null)
                             throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                         if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
-                            throw new InvalidOperationException("Missing stack slot offset for " + operand.StackSlot.Name + ".");
+                            throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
                         LoadFromMemory(preferred, offset, SizeOf(operand.Type), IsSignedIntegerType(operand.Type));
                         NormalizeIntegerRegister(preferred, operand.Type);
                         return preferred;
@@ -1575,7 +1650,7 @@ namespace Cnidaria.C
                         LoadImmediate(preferred, 0, RegisterSize(operand.Type));
                         return preferred;
                     default:
-                        throw new NotSupportedException("Cannot load LIR operand kind " + operand.Kind + " into a register.");
+                        throw new NotSupportedException($"Cannot load LIR operand kind {operand.Kind} into a register.");
                 }
             }
 
@@ -1651,10 +1726,10 @@ namespace Cnidaria.C
                         }
                         Emit(ArmInstruction.Ternary(
                             ArmInstrKind.Add,
-                            Reg(ToArm(scratchBase), _owner._target.PointerSize), 
-                            Reg(ToArm(elementBase.BaseRegister), 
-                            _owner._target.PointerSize), 
-                            Reg(ToArm(scratchIndex), 
+                            Reg(ToArm(scratchBase), _owner._target.PointerSize),
+                            Reg(ToArm(elementBase.BaseRegister),
+                            _owner._target.PointerSize),
+                            Reg(ToArm(scratchIndex),
                             _owner._target.PointerSize)));
                         return new AddressParts(scratchBase, 0);
                     default:
@@ -1669,22 +1744,22 @@ namespace Cnidaria.C
                 if (IsPowerOfTwo(scale))
                 {
                     Emit(ArmInstruction.Ternary(
-                        ArmInstrKind.Lsl, 
-                        Reg(ToArm(index), 
-                        _owner._target.PointerSize), 
-                        Reg(ToArm(index), 
-                        _owner._target.PointerSize), 
+                        ArmInstrKind.Lsl,
+                        Reg(ToArm(index),
+                        _owner._target.PointerSize),
+                        Reg(ToArm(index),
+                        _owner._target.PointerSize),
                         ArmOperand.ImmediateOperand(Log2(scale))));
                     return;
                 }
                 LoadImmediate(scratch, scale, _owner._target.PointerSize);
                 Emit(ArmInstruction.Ternary(
-                    ArmInstrKind.Mul, 
-                    Reg(ToArm(index), 
-                    _owner._target.PointerSize), 
-                    Reg(ToArm(index), 
+                    ArmInstrKind.Mul,
+                    Reg(ToArm(index),
                     _owner._target.PointerSize),
-                    Reg(ToArm(scratch), 
+                    Reg(ToArm(index),
+                    _owner._target.PointerSize),
+                    Reg(ToArm(scratch),
                     _owner._target.PointerSize)));
             }
 
@@ -1905,18 +1980,18 @@ namespace Cnidaria.C
                     return;
                 var shift = registerBits - valueBits;
                 Emit(ArmInstruction.Ternary(
-                    ArmInstrKind.Lsl, 
-                    Reg(ToArm(register), 
-                    _owner._target.RegisterSize), 
-                    Reg(ToArm(register), 
-                    _owner._target.RegisterSize), 
+                    ArmInstrKind.Lsl,
+                    Reg(ToArm(register),
+                    _owner._target.RegisterSize),
+                    Reg(ToArm(register),
+                    _owner._target.RegisterSize),
                     ArmOperand.ImmediateOperand(shift)));
                 Emit(ArmInstruction.Ternary(
-                    IsUnsignedIntegerType(type) ? ArmInstrKind.Lsr : ArmInstrKind.Asr, 
-                    Reg(ToArm(register), 
-                    _owner._target.RegisterSize), 
-                    Reg(ToArm(register), 
-                    _owner._target.RegisterSize), 
+                    IsUnsignedIntegerType(type) ? ArmInstrKind.Lsr : ArmInstrKind.Asr,
+                    Reg(ToArm(register),
+                    _owner._target.RegisterSize),
+                    Reg(ToArm(register),
+                    _owner._target.RegisterSize),
                     ArmOperand.ImmediateOperand(shift)));
             }
 
@@ -1928,9 +2003,9 @@ namespace Cnidaria.C
                 var offset = _owner._text.ByteLength;
                 Emit(ArmInstruction.Branch(ArmInstrKind.B, label));
                 _owner._text.AddRelocation(
-                    offset, 
-                    label, 
-                    0, 
+                    offset,
+                    label,
+                    0,
                     _owner._machineTarget.Is64Bit ? ArmObjectRelocationKind.AArch64Branch26 : ArmObjectRelocationKind.ArmBranch24);
             }
 
@@ -1940,8 +2015,8 @@ namespace Cnidaria.C
                 Emit(ArmInstruction.Branch(ArmInstrKind.B, label, condition));
                 _owner._text.AddRelocation(
                     offset,
-                    label, 
-                    0, 
+                    label,
+                    0,
                     _owner._machineTarget.Is64Bit ? ArmObjectRelocationKind.AArch64ConditionalBranch19 : ArmObjectRelocationKind.ArmBranch24);
             }
 
@@ -2204,8 +2279,14 @@ namespace Cnidaria.C
                 return offset;
             }
 
-            public void DefineSymbol(string name, int offset, int size, ArmObjectSymbolBinding binding, List<ArmObjectSymbol> symbols)
-                => symbols.Add(new ArmObjectSymbol(name, Name, offset, size, binding, ArmObjectSymbolKind.Object));
+            public void DefineSymbol(
+                string name,
+                int offset,
+                int size,
+                ArmObjectSymbolBinding binding,
+                List<ArmObjectSymbol> symbols,
+                bool isTentative = false)
+                => symbols.Add(new ArmObjectSymbol(name, Name, offset, size, binding, ArmObjectSymbolKind.Object, isTentative));
 
             public ArmDataSection ToSection()
                 => new ArmDataSection(Name, ArmObjectSectionKind.Bss, Alignment, ImmutableArray<byte>.Empty, ByteLength, ImmutableArray<ArmObjectRelocation>.Empty);

@@ -724,6 +724,12 @@ namespace Cnidaria.Cs
 
         private static void VerifyAssertionProperties(SsaMethod method, GenTree node)
         {
+            if ((node.Kind is GenTreeKind.NullCheck or GenTreeKind.ArrayLength) &&
+                (!node.SsaMemoryUses.IsDefaultOrEmpty || !node.SsaMemoryDefinitions.IsDefaultOrEmpty))
+            {
+                throw new InvalidOperationException($"SSA node has invalid heap-memory dependence: {node}.");
+            }
+
             GenTreeFlags divModFlags = node.Flags & (GenTreeFlags.DivModNoByZero | GenTreeFlags.DivModNoOverflow);
             if (divModFlags == 0)
                 return;

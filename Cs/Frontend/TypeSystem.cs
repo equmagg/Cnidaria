@@ -9,7 +9,7 @@ namespace Cnidaria.Cs
     {
         public string Name { get; }
         public IMetadataView Md { get; }
-        public Dictionary<int, Cnidaria.Cs.BytecodeFunction> MethodsByDefToken { get; }
+        public IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> MethodsByDefToken { get; }
 
         public Dictionary<(string ns, string name), int> TypeDefByFullName { get; } = new();
 
@@ -18,7 +18,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, string> _sigKeyCache = new();
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
-        public RuntimeModule(string name, IMetadataView md, Dictionary<int, Cnidaria.Cs.BytecodeFunction> methodsByDefToken)
+        public RuntimeModule(string name, IMetadataView md, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> methodsByDefToken)
         {
             Name = name;
             Md = md ?? throw new ArgumentNullException(nameof(md));
@@ -305,7 +305,7 @@ namespace Cnidaria.Cs
             throw new InvalidOperationException("Bad compressed uint.");
         }
     }
-    sealed class Domain
+    public sealed class Domain
     {
         private readonly Dictionary<string, RuntimeModule> _modulesByName = new(StringComparer.Ordinal);
 
@@ -1243,13 +1243,11 @@ namespace Cnidaria.Cs
 
                 resolved = BindMethodToReceiver(resolved, methodContext.DeclaringType);
 
-                if (ctxOwnerArgs.Length != 0 &&
-                    resolved.DeclaringType.GenericTypeDefinition is null &&
-                    TypeUsesOwnerTypeParameters(resolved.DeclaringType))
+                RuntimeType substitutedOwner = SubstituteRuntimeType(resolved.DeclaringType, ctxOwnerArgs, ctxMethodArgs);
+                if (!ReferenceEquals(substitutedOwner, resolved.DeclaringType))
                 {
-                    var constructedOwner = GetOrCreateGenericInstanceType(resolved.DeclaringType, ctxOwnerArgs);
-                    EnsureConstructedMembers(constructedOwner);
-                    resolved = BindMethodToReceiver(resolved, constructedOwner);
+                    EnsureConstructedMembers(substitutedOwner);
+                    resolved = BindMethodToReceiver(resolved, substitutedOwner);
                 }
 
                 if (ctxMethodArgs.Length != 0 &&
@@ -1688,7 +1686,10 @@ namespace Cnidaria.Cs
             if (_namedTypes.TryGetValue((asm, ns, name), out var existing))
                 return existing;
 
-            var t = new RuntimeType(_nextTypeId++, kind, asm, ns, name);
+            var t = new RuntimeType(_nextTypeId++, kind, asm, ns, name)
+            {
+                IsFinal = kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer
+            };
             if (kind == RuntimeTypeKind.Class && SystemObject is not null && !(ns == "System" && name == "Object"))
                 t.BaseType = SystemObject;
             t.SizeOf = Target.PointerSize;
@@ -1763,9 +1764,12 @@ namespace Cnidaria.Cs
 
                     RuntimeTypeKind kind = InferKindFromTypeDef(m, td);
 
+                    var typeAttributes = (System.Reflection.TypeAttributes)td.Flags;
                     var rt = new RuntimeType(_nextTypeId++, kind, asm: m.Name, ns: ns, name: name)
                     {
-                        IsBeforeFieldInit = (((System.Reflection.TypeAttributes)td.Flags & System.Reflection.TypeAttributes.BeforeFieldInit) != 0)
+                        IsBeforeFieldInit = (typeAttributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0,
+                        IsFinal = kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum ||
+                            (typeAttributes & System.Reflection.TypeAttributes.Sealed) != 0
                     };
                     _typeCache[(m.Name, tok)] = rt;
                     _namedTypes[(m.Name, ns, name)] = rt;
@@ -2105,6 +2109,545 @@ namespace Cnidaria.Cs
 
             return method;
         }
+        internal RuntimeMethod? ResolveVirtualMethod(RuntimeMethod declaredMethod, RuntimeType objectType)
+        {
+            if (declaredMethod is null) throw new ArgumentNullException(nameof(declaredMethod));
+            if (objectType is null) throw new ArgumentNullException(nameof(objectType));
+            if (objectType.Kind == RuntimeTypeKind.Interface ||
+                (!objectType.IsReferenceType && !objectType.IsValueType))
+            {
+                return null;
+            }
+
+            EnsureConstructedMembers(objectType);
+            EnsureVirtualTable(objectType);
+
+            RuntimeMethod dispatchDeclaration = declaredMethod.GenericMethodDefinition ?? declaredMethod;
+            RuntimeType[] methodArguments = declaredMethod.MethodGenericArguments;
+
+            RuntimeMethod? target;
+            if (dispatchDeclaration.DeclaringType.Kind == RuntimeTypeKind.Interface)
+            {
+                target = ResolveInterfaceDispatchTarget(objectType, dispatchDeclaration);
+            }
+            else
+            {
+                if (!IsClassAssignableTo(objectType, dispatchDeclaration.DeclaringType))
+                    return null;
+
+                RuntimeMethod boundDeclaration = BindMethodToReceiver(dispatchDeclaration, objectType);
+                if (!boundDeclaration.IsVirtual)
+                    target = boundDeclaration;
+                else
+                    target = ResolveClassVirtualDispatchTarget(objectType, boundDeclaration, dispatchDeclaration);
+            }
+
+            return CloseDispatchTarget(target, methodArguments);
+        }
+
+        private RuntimeMethod? ResolveClassVirtualDispatchTarget(
+            RuntimeType objectType,
+            RuntimeMethod boundDeclaration,
+            RuntimeMethod originalDeclaration)
+        {
+            int slot = boundDeclaration.VTableSlot;
+            if (slot < 0)
+                slot = originalDeclaration.VTableSlot;
+            if ((uint)slot >= (uint)objectType.VTable.Length)
+                return null;
+            return objectType.VTable[slot];
+        }
+
+        private RuntimeMethod? CloseDispatchTarget(RuntimeMethod? target, RuntimeType[] methodArguments)
+        {
+            if (target is null || target.IsAbstract)
+                return null;
+
+            if (methodArguments.Length == 0)
+                return target;
+
+            RuntimeMethod genericTarget = target.GenericMethodDefinition ?? target;
+            if (genericTarget.GenericArity != methodArguments.Length)
+                return null;
+
+            RuntimeType[] existingArguments = target.MethodGenericArguments;
+            if (existingArguments.Length == methodArguments.Length)
+            {
+                bool same = true;
+                for (int i = 0; i < existingArguments.Length; i++)
+                {
+                    if (existingArguments[i].TypeId != methodArguments[i].TypeId)
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+
+                if (same)
+                    return target;
+            }
+
+            return GetOrCreateConstructedMethod(genericTarget, methodArguments);
+        }
+
+        internal bool IsAssignableTo(RuntimeType actualType, RuntimeType targetType)
+        {
+            if (actualType is null)
+                throw new ArgumentNullException(nameof(actualType));
+            if (targetType is null)
+                throw new ArgumentNullException(nameof(targetType));
+
+            EnsureConstructedMembers(actualType);
+            EnsureConstructedMembers(targetType);
+
+            if (targetType.Kind == RuntimeTypeKind.Interface)
+                return FindInterfaceImplementationAnchor(actualType, targetType) is not null;
+
+            return IsClassAssignableTo(actualType, targetType);
+        }
+
+        private static bool IsClassAssignableTo(RuntimeType actualType, RuntimeType declaredType)
+        {
+            for (RuntimeType? current = actualType; current is not null; current = current.BaseType)
+            {
+                if (SameDispatchType(current, declaredType, allowOpenDefinition: true))
+                    return true;
+            }
+            return false;
+        }
+
+        private RuntimeMethod? ResolveInterfaceDispatchTarget(RuntimeType actualType, RuntimeMethod declaredMethod)
+        {
+            RuntimeType? implementationAnchor = FindInterfaceImplementationAnchor(actualType, declaredMethod.DeclaringType);
+            if (implementationAnchor is null)
+                return null;
+
+            for (RuntimeType? type = actualType; type is not null; type = type.BaseType)
+            {
+                EnsureConstructedMembers(type);
+                RuntimeMethod? explicitImplementation = TryResolveExplicitInterfaceImpl(type, declaredMethod);
+                if (explicitImplementation is not null)
+                    return ResolveInterfaceImplementationOverride(actualType, explicitImplementation);
+
+                if (type.TypeId == implementationAnchor.TypeId)
+                    break;
+            }
+
+            RuntimeMethod? implicitImplementation = FindImplicitInterfaceImplementation(
+                implementationAnchor,
+                declaredMethod);
+            if (implicitImplementation is not null)
+                return ResolveInterfaceImplementationOverride(actualType, implicitImplementation);
+
+            if (implementationAnchor.BaseType is not null)
+            {
+                RuntimeMethod? inheritedImplementation = ResolveInterfaceDispatchTarget(
+                    implementationAnchor.BaseType,
+                    declaredMethod);
+                if (inheritedImplementation is not null)
+                    return ResolveInterfaceImplementationOverride(actualType, inheritedImplementation);
+            }
+
+            return ResolveDefaultInterfaceDispatchTarget(actualType, declaredMethod);
+        }
+
+        private RuntimeMethod? ResolveDefaultInterfaceDispatchTarget(
+            RuntimeType actualType,
+            RuntimeMethod declaredMethod)
+        {
+            var interfaces = new Dictionary<int, RuntimeType>();
+            for (RuntimeType? type = actualType; type is not null; type = type.BaseType)
+            {
+                EnsureConstructedMembers(type);
+                RuntimeType[] directInterfaces = type.Interfaces;
+                for (int i = 0; i < directInterfaces.Length; i++)
+                    CollectInterfaceClosure(directInterfaces[i], interfaces);
+            }
+
+            var candidates = new List<KeyValuePair<RuntimeType, RuntimeMethod>>();
+            foreach (RuntimeType interfaceType in interfaces.Values)
+            {
+                if (!InterfaceDerivesFromOrEquals(
+                    interfaceType,
+                    declaredMethod.DeclaringType,
+                    new HashSet<int>()))
+                {
+                    continue;
+                }
+
+                RuntimeMethod? implementation = TryResolveExplicitInterfaceImpl(interfaceType, declaredMethod);
+                if (implementation is null && SameInterfaceType(interfaceType, declaredMethod.DeclaringType))
+                    implementation = BindMethodToReceiver(declaredMethod, interfaceType);
+
+                if (implementation is not null)
+                    candidates.Add(new KeyValuePair<RuntimeType, RuntimeMethod>(interfaceType, implementation));
+            }
+
+            RuntimeType? selectedOwner = null;
+            RuntimeMethod? selectedMethod = null;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                RuntimeType candidateOwner = candidates[i].Key;
+                bool mostSpecific = true;
+                for (int j = 0; j < candidates.Count; j++)
+                {
+                    if (i == j)
+                        continue;
+
+                    RuntimeType otherOwner = candidates[j].Key;
+                    if (!InterfaceDerivesFromOrEquals(candidateOwner, otherOwner, new HashSet<int>()))
+                    {
+                        mostSpecific = false;
+                        break;
+                    }
+                }
+
+                if (!mostSpecific)
+                    continue;
+
+                RuntimeMethod candidateMethod = candidates[i].Value;
+                if (selectedMethod is null)
+                {
+                    selectedOwner = candidateOwner;
+                    selectedMethod = candidateMethod;
+                    continue;
+                }
+
+                if (selectedOwner!.TypeId != candidateOwner.TypeId ||
+                    selectedMethod.MethodId != candidateMethod.MethodId)
+                {
+                    return null;
+                }
+            }
+
+            return selectedMethod;
+        }
+
+        private void CollectInterfaceClosure(
+            RuntimeType interfaceType,
+            Dictionary<int, RuntimeType> interfaces)
+        {
+            if (!interfaces.TryAdd(interfaceType.TypeId, interfaceType))
+                return;
+
+            EnsureConstructedMembers(interfaceType);
+            RuntimeType[] bases = interfaceType.Interfaces;
+            for (int i = 0; i < bases.Length; i++)
+                CollectInterfaceClosure(bases[i], interfaces);
+        }
+
+        private RuntimeType? FindInterfaceImplementationAnchor(RuntimeType actualType, RuntimeType targetInterface)
+        {
+            for (RuntimeType? current = actualType; current is not null; current = current.BaseType)
+            {
+                EnsureConstructedMembers(current);
+                RuntimeType[] interfaces = current.Interfaces;
+                var seen = new HashSet<int>();
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    if (InterfaceDerivesFromOrEquals(interfaces[i], targetInterface, seen))
+                        return current;
+                }
+            }
+
+            return null;
+        }
+
+        private RuntimeMethod? TryResolveExplicitInterfaceImpl(RuntimeType implementationType, RuntimeMethod declaredMethod)
+        {
+            Dictionary<int, RuntimeMethod>? map = implementationType.MethodImpls;
+            if (map is null || map.Count == 0)
+                return null;
+
+            if (map.TryGetValue(declaredMethod.MethodId, out RuntimeMethod? exact))
+                return ProjectRuntimeMethodToOwner(implementationType, exact);
+
+            RuntimeMethod? matchedImplementation = null;
+            foreach (KeyValuePair<int, RuntimeMethod> pair in map.OrderBy(static pair => pair.Key))
+            {
+                if (!_methodById.TryGetValue(pair.Key, out RuntimeMethod? interfaceMethod))
+                    continue;
+
+                interfaceMethod = BindMethodToReceiver(interfaceMethod, declaredMethod.DeclaringType);
+                if (!SameInterfaceMethodIdentity(interfaceMethod, declaredMethod))
+                    continue;
+
+                RuntimeMethod implementation = ProjectRuntimeMethodToOwner(implementationType, pair.Value);
+                if (matchedImplementation is not null &&
+                    !SameDispatchMethod(matchedImplementation, implementation))
+                {
+                    throw new TypeLoadException(
+                        $"Conflicting MethodImpl bodies implement " +
+                        $"'{declaredMethod.DeclaringType.Namespace}.{declaredMethod.DeclaringType.Name}.{declaredMethod.Name}' " +
+                        $"on '{implementationType.Namespace}.{implementationType.Name}'.");
+                }
+
+                matchedImplementation = implementation;
+            }
+
+            return matchedImplementation;
+        }
+
+        private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
+        {
+            RuntimeMethod methodDefinition = method.GenericMethodDefinition ?? method;
+            if (methodDefinition.DeclaringType.TypeId == owner.TypeId)
+                return methodDefinition;
+
+            EnsureConstructedMembers(owner);
+
+            RuntimeType sourceOwner = methodDefinition.DeclaringType;
+            RuntimeType sourceDefinition = sourceOwner.GenericTypeDefinition ?? sourceOwner;
+            RuntimeType ownerDefinition = owner.GenericTypeDefinition ?? owner;
+
+            if (sourceDefinition.TypeId == ownerDefinition.TypeId)
+            {
+                EnsureConstructedMembers(sourceOwner);
+                RuntimeMethod[] sourceMethods = sourceOwner.Methods;
+                RuntimeMethod[] ownerMethods = owner.Methods;
+                int count = Math.Min(sourceMethods.Length, ownerMethods.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    RuntimeMethod sourceMethod = sourceMethods[i];
+                    if (sourceMethod.MethodId == methodDefinition.MethodId ||
+                        (sourceMethod.Body is not null &&
+                         methodDefinition.Body is not null &&
+                         ReferenceEquals(sourceMethod.Body, methodDefinition.Body) &&
+                         StringComparer.Ordinal.Equals(sourceMethod.Name, methodDefinition.Name)))
+                    {
+                        return ownerMethods[i];
+                    }
+                }
+            }
+
+            RuntimeMethod[] methods = owner.Methods;
+            for (int i = 0; i < methods.Length; i++)
+            {
+                RuntimeMethod candidate = methods[i];
+                if (!StringComparer.Ordinal.Equals(candidate.Name, methodDefinition.Name) ||
+                    candidate.GenericArity != methodDefinition.GenericArity ||
+                    candidate.IsStatic != methodDefinition.IsStatic)
+                {
+                    continue;
+                }
+
+                if (candidate.Body is not null &&
+                    methodDefinition.Body is not null &&
+                    ReferenceEquals(candidate.Body, methodDefinition.Body))
+                {
+                    return candidate;
+                }
+
+                if (SameRuntimeSignature(candidate, methodDefinition))
+                    return candidate;
+            }
+
+            return methodDefinition;
+        }
+
+        private RuntimeMethod? FindImplicitInterfaceImplementation(
+            RuntimeType implementationAnchor,
+            RuntimeMethod declaredMethod)
+        {
+            for (RuntimeType? type = implementationAnchor; type is not null; type = type.BaseType)
+            {
+                EnsureConstructedMembers(type);
+                RuntimeMethod[] methods = type.Methods;
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    RuntimeMethod candidate = methods[i];
+                    if (candidate.IsStatic ||
+                        !candidate.IsPublic ||
+                        !StringComparer.Ordinal.Equals(candidate.Name, declaredMethod.Name) ||
+                        !SameRuntimeSignature(candidate, declaredMethod))
+                    {
+                        continue;
+                    }
+
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static RuntimeMethod? ResolveInterfaceImplementationOverride(
+            RuntimeType actualType,
+            RuntimeMethod implementation)
+        {
+            if (!implementation.IsVirtual)
+                return implementation;
+
+            int slot = implementation.VTableSlot;
+            if ((uint)slot >= (uint)actualType.VTable.Length)
+                return implementation;
+
+            return actualType.VTable[slot];
+        }
+
+        private bool InterfaceDerivesFromOrEquals(RuntimeType current, RuntimeType target, HashSet<int> seen)
+        {
+            if (SameInterfaceType(current, target))
+                return true;
+            if (!seen.Add(current.TypeId))
+                return false;
+
+            EnsureConstructedMembers(current);
+            RuntimeType[] interfaces = current.Interfaces;
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                if (InterfaceDerivesFromOrEquals(interfaces[i], target, seen))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool SameRuntimeSignature(RuntimeMethod left, RuntimeMethod right)
+        {
+            if (left.GenericArity != right.GenericArity ||
+                left.ParameterTypes.Length != right.ParameterTypes.Length ||
+                !SameSignatureType(left.ReturnType, right.ReturnType))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < left.ParameterTypes.Length; i++)
+            {
+                if (!SameSignatureType(left.ParameterTypes[i], right.ParameterTypes[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool SameInterfaceMethodIdentity(RuntimeMethod interfaceMethod, RuntimeMethod declaredMethod)
+        {
+            RuntimeMethod interfaceDefinition = interfaceMethod.GenericMethodDefinition ?? interfaceMethod;
+            RuntimeMethod declaredDefinition = declaredMethod.GenericMethodDefinition ?? declaredMethod;
+
+            if (!StringComparer.Ordinal.Equals(interfaceDefinition.Name, declaredDefinition.Name) ||
+                interfaceDefinition.GenericArity != declaredDefinition.GenericArity ||
+                !SameRuntimeTypeDefinitionOrExact(interfaceDefinition.DeclaringType, declaredDefinition.DeclaringType) ||
+                !SameRuntimeSignature(interfaceDefinition, declaredDefinition))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool SameInterfaceType(RuntimeType implemented, RuntimeType declared)
+            => SameDispatchType(implemented, declared, allowOpenDefinition: true);
+
+        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType left, RuntimeType right)
+        {
+            if (left.TypeId == right.TypeId)
+                return true;
+
+            RuntimeType leftDefinition = left.GenericTypeDefinition ?? left;
+            RuntimeType rightDefinition = right.GenericTypeDefinition ?? right;
+            return leftDefinition.TypeId == rightDefinition.TypeId &&
+                (left.GenericTypeDefinition is null || right.GenericTypeDefinition is null);
+        }
+
+        private static bool SameSignatureType(RuntimeType left, RuntimeType right)
+        {
+            if (left.TypeId == right.TypeId)
+                return true;
+
+            if (left.Kind != right.Kind)
+                return false;
+
+            if (left.Kind == RuntimeTypeKind.TypeParam)
+            {
+                return left.IsMethodGenericParameter == right.IsMethodGenericParameter &&
+                    left.GenericParameterOrdinal == right.GenericParameterOrdinal;
+            }
+
+            if (left.Kind is RuntimeTypeKind.Array or RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef)
+            {
+                if (left.Kind == RuntimeTypeKind.Array &&
+                    (left.ArrayRank != right.ArrayRank || left.IsSzArray != right.IsSzArray))
+                {
+                    return false;
+                }
+
+                return left.ElementType is not null &&
+                    right.ElementType is not null &&
+                    SameSignatureType(left.ElementType, right.ElementType);
+            }
+
+            if (left.Kind == RuntimeTypeKind.FunctionPointer)
+            {
+                if (left.FunctionPointerCallingConvention != right.FunctionPointerCallingConvention ||
+                    left.FunctionPointerReturnByRef != right.FunctionPointerReturnByRef ||
+                    left.FunctionPointerReturnType is null ||
+                    right.FunctionPointerReturnType is null ||
+                    !SameSignatureType(left.FunctionPointerReturnType, right.FunctionPointerReturnType) ||
+                    left.FunctionPointerParameterTypes.Length != right.FunctionPointerParameterTypes.Length ||
+                    left.FunctionPointerParameterByRef.Length != right.FunctionPointerParameterByRef.Length)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < left.FunctionPointerParameterTypes.Length; i++)
+                {
+                    if (left.FunctionPointerParameterByRef[i] != right.FunctionPointerParameterByRef[i] ||
+                        !SameSignatureType(left.FunctionPointerParameterTypes[i], right.FunctionPointerParameterTypes[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            RuntimeType leftDefinition = left.GenericTypeDefinition ?? left;
+            RuntimeType rightDefinition = right.GenericTypeDefinition ?? right;
+            if (leftDefinition.TypeId != rightDefinition.TypeId)
+                return false;
+
+            RuntimeType[] leftArguments = left.GenericTypeArguments;
+            RuntimeType[] rightArguments = right.GenericTypeArguments;
+            if (leftArguments.Length != rightArguments.Length)
+                return false;
+
+            for (int i = 0; i < leftArguments.Length; i++)
+            {
+                if (!SameSignatureType(leftArguments[i], rightArguments[i]))
+                    return false;
+            }
+
+            return leftArguments.Length != 0;
+        }
+
+        private static bool SameDispatchType(RuntimeType left, RuntimeType right, bool allowOpenDefinition)
+        {
+            if (left.TypeId == right.TypeId)
+                return true;
+
+            RuntimeType leftDefinition = left.GenericTypeDefinition ?? left;
+            RuntimeType rightDefinition = right.GenericTypeDefinition ?? right;
+            if (leftDefinition.TypeId != rightDefinition.TypeId)
+                return false;
+
+            bool leftOpen = left.GenericTypeDefinition is null;
+            bool rightOpen = right.GenericTypeDefinition is null;
+            if (leftOpen || rightOpen)
+                return allowOpenDefinition;
+
+            RuntimeType[] leftArguments = left.GenericTypeArguments;
+            RuntimeType[] rightArguments = right.GenericTypeArguments;
+            if (leftArguments.Length != rightArguments.Length)
+                return false;
+
+            for (int i = 0; i < leftArguments.Length; i++)
+            {
+                if (!SameDispatchType(leftArguments[i], rightArguments[i], allowOpenDefinition: false))
+                    return false;
+            }
+            return true;
+        }
+
         private static int AlignUp(int value, int align)
         {
             int mask = align - 1;
@@ -2458,11 +3001,36 @@ namespace Cnidaria.Cs
                     var body = ResolveMethod(m, row.BodyMethodToken);
                     var decl = ResolveMethod(m, row.DeclarationMethodToken);
 
-                    owner.ExplicitInterfaceMethodImpls ??= new Dictionary<int, RuntimeMethod>();
-                    owner.ExplicitInterfaceMethodImpls[decl.MethodId] = body;
+                    owner.MethodImpls ??= new Dictionary<int, RuntimeMethod>();
+                    owner.MethodImpls[decl.MethodId] = body;
+                    ProjectMethodImplToExistingConstructedTypes(owner, decl.MethodId, body);
                 }
             }
         }
+
+        private void ProjectMethodImplToExistingConstructedTypes(
+            RuntimeType genericDefinition,
+            int declarationMethodId,
+            RuntimeMethod body)
+        {
+            RuntimeType[] constructedTypes = _constructedTypes.Values.ToArray();
+            for (int i = 0; i < constructedTypes.Length; i++)
+            {
+                RuntimeType constructedType = constructedTypes[i];
+                if (!ReferenceEquals(constructedType.GenericTypeDefinition, genericDefinition) ||
+                    !constructedType.ConstructedMembersInitialized)
+                {
+                    continue;
+                }
+
+                RuntimeMethod projectedBody = BindMethodToReceiver(body, constructedType);
+                constructedType.MethodImpls ??= new Dictionary<int, RuntimeMethod>();
+                constructedType.MethodImpls[declarationMethodId] = projectedBody;
+                constructedType.VTable = Array.Empty<RuntimeMethod>();
+                constructedType.VTableBuildState = 0;
+            }
+        }
+
         private void IndexWellKnownCoreTypes()
         {
             SystemObject = FindRequired("std", "System", "Object");
@@ -2696,74 +3264,191 @@ namespace Cnidaria.Cs
         }
         private void BuildAllVTables()
         {
-            var types = _typeCache.Values.ToArray();
-            Array.Sort(types, (a, b) => GetDepth(a).CompareTo(GetDepth(b)));
-
-            foreach (var t in types)
-                BuildVTableForType(t);
+            foreach (RuntimeType type in _typeCache.Values)
+                EnsureVirtualTable(type);
         }
 
-        private static int GetDepth(RuntimeType t)
+        internal void EnsureVirtualTable(RuntimeType type)
         {
-            int d = 0;
-            for (var cur = t.BaseType; cur != null; cur = cur.BaseType) d++;
-            return d;
-        }
+            if (type is null)
+                throw new ArgumentNullException(nameof(type));
 
-        private void BuildVTableForType(RuntimeType t)
-        {
-            var baseVt = t.BaseType?.VTable ?? Array.Empty<RuntimeMethod>();
-            var vt = new List<RuntimeMethod>(baseVt.Length + 8);
-            vt.AddRange(baseVt);
-
-            // assign base slots already exist
-            for (int i = 0; i < t.Methods.Length; i++)
+            if (type.Kind is not (RuntimeTypeKind.Class or
+                RuntimeTypeKind.Interface or
+                RuntimeTypeKind.Struct or
+                RuntimeTypeKind.Enum or
+                RuntimeTypeKind.Array))
             {
-                var m = t.Methods[i];
+                return;
+            }
 
-                if (m.IsStatic) continue;
-                if (!m.IsVirtual) continue;
+            if (type.VTableBuildState == 2)
+                return;
+            if (type.VTableBuildState == 1)
+                throw new TypeLoadException($"Circular virtual method table inheritance involving '{type.Namespace}.{type.Name}'.");
 
-                int slot = -1;
-
-                if (t.BaseType != null && !m.IsNewSlot)
+            EnsureConstructedMembers(type);
+            type.VTableBuildState = 1;
+            try
+            {
+                if (type.BaseType is not null)
                 {
-                    slot = FindOverrideSlot(baseVt, m);
+                    EnsureConstructedMembers(type.BaseType);
+                    EnsureVirtualTable(type.BaseType);
                 }
 
-                if (slot >= 0)
+                BuildVTableForType(type);
+                type.VTableBuildState = 2;
+            }
+            catch
+            {
+                type.VTable = Array.Empty<RuntimeMethod>();
+                type.VTableBuildState = 0;
+                throw;
+            }
+        }
+
+        private void BuildVTableForType(RuntimeType type)
+        {
+            RuntimeMethod[] baseVtable = type.BaseType?.VTable ?? Array.Empty<RuntimeMethod>();
+            var vtable = new List<RuntimeMethod>(baseVtable.Length + 8);
+            vtable.AddRange(baseVtable);
+
+            RuntimeMethod[] methods = type.Methods;
+            for (int i = 0; i < methods.Length; i++)
+                methods[i].VTableSlot = -1;
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                RuntimeMethod method = methods[i];
+                if (method.IsStatic || !method.IsVirtual)
+                    continue;
+
+                RuntimeMethod? overriddenMethod = null;
+                if (type.BaseType is not null && !method.IsNewSlot)
+                    overriddenMethod = FindOverriddenVirtualMethod(type.BaseType, method);
+
+                if (overriddenMethod is null)
                 {
-                    m.VTableSlot = slot;
-                    vt[slot] = m;
+                    method.VTableSlot = vtable.Count;
+                    vtable.Add(method);
+                    continue;
                 }
-                else
+
+                int slot = overriddenMethod.VTableSlot;
+                if ((uint)slot >= (uint)vtable.Count)
                 {
-                    m.VTableSlot = vt.Count;
-                    vt.Add(m);
+                    throw new TypeLoadException(
+                        $"Method '{type.Namespace}.{type.Name}.{method.Name}' has no inherited virtual slot.");
+                }
+
+                RuntimeMethod currentTarget = vtable[slot];
+                if (overriddenMethod.IsFinal || currentTarget.IsFinal)
+                {
+                    RuntimeMethod finalMethod = currentTarget.IsFinal ? currentTarget : overriddenMethod;
+                    throw new TypeLoadException(
+                        $"Method '{type.Namespace}.{type.Name}.{method.Name}' overrides final method " +
+                        $"'{finalMethod.DeclaringType.Namespace}.{finalMethod.DeclaringType.Name}.{finalMethod.Name}'.");
+                }
+
+                vtable[slot] = method;
+                for (int aliasSlot = 0; aliasSlot < baseVtable.Length; aliasSlot++)
+                {
+                    if (aliasSlot != slot && SameDispatchMethod(baseVtable[aliasSlot], overriddenMethod))
+                        vtable[aliasSlot] = method;
+                }
+                method.VTableSlot = slot;
+            }
+
+            ApplyClassMethodImpls(type, vtable);
+            type.VTable = vtable.ToArray();
+        }
+
+        private RuntimeMethod? FindOverriddenVirtualMethod(RuntimeType baseType, RuntimeMethod method)
+        {
+            for (RuntimeType? current = baseType; current is not null; current = current.BaseType)
+            {
+                EnsureConstructedMembers(current);
+                RuntimeMethod[] methods = current.Methods;
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    RuntimeMethod candidate = methods[i];
+                    if (candidate.IsStatic || !candidate.IsVirtual || candidate.IsPrivate ||
+                        !StringComparer.Ordinal.Equals(candidate.Name, method.Name) ||
+                        !SameRuntimeSignature(candidate, method))
+                    {
+                        continue;
+                    }
+
+                    return candidate;
                 }
             }
-            t.VTable = vt.ToArray();
+
+            return null;
         }
-        private static int FindOverrideSlot(RuntimeMethod[] baseVt, RuntimeMethod candidate)
+
+        private static bool SameDispatchMethod(RuntimeMethod left, RuntimeMethod right)
         {
-            for (int i = 0; i < baseVt.Length; i++)
+            if (left.MethodId == right.MethodId)
+                return true;
+
+            RuntimeMethod leftDefinition = left.GenericMethodDefinition ?? left;
+            RuntimeMethod rightDefinition = right.GenericMethodDefinition ?? right;
+            return leftDefinition.MethodId == rightDefinition.MethodId;
+        }
+
+        private void ApplyClassMethodImpls(RuntimeType type, List<RuntimeMethod> vtable)
+        {
+            Dictionary<int, RuntimeMethod>? methodImpls = type.MethodImpls;
+            if (methodImpls is null || methodImpls.Count == 0)
+                return;
+
+            var appliedBodiesBySlot = new Dictionary<int, RuntimeMethod>();
+            foreach (KeyValuePair<int, RuntimeMethod> pair in methodImpls.OrderBy(static pair => pair.Key))
             {
-                var bm = baseVt[i];
-                if (bm.Name != candidate.Name) continue;
-                if (!SameSig(bm, candidate)) continue;
-                return i;
+                if (!_methodById.TryGetValue(pair.Key, out RuntimeMethod? declaration))
+                    continue;
+
+                RuntimeMethod declarationDefinition = declaration.GenericMethodDefinition ?? declaration;
+                if (declarationDefinition.DeclaringType.Kind == RuntimeTypeKind.Interface ||
+                    !declarationDefinition.IsVirtual)
+                {
+                    continue;
+                }
+
+                RuntimeMethod boundDeclaration = BindMethodToReceiver(declarationDefinition, type);
+                int slot = boundDeclaration.VTableSlot;
+                if ((uint)slot >= (uint)vtable.Count)
+                {
+                    throw new TypeLoadException(
+                        $"MethodImpl declaration '{declarationDefinition.DeclaringType.Namespace}." +
+                        $"{declarationDefinition.DeclaringType.Name}.{declarationDefinition.Name}' has no virtual slot.");
+                }
+
+                RuntimeMethod currentTarget = vtable[slot];
+                RuntimeMethod body = ProjectRuntimeMethodToOwner(type, pair.Value);
+                if (appliedBodiesBySlot.TryGetValue(slot, out RuntimeMethod? appliedBody) &&
+                    !SameDispatchMethod(appliedBody, body))
+                {
+                    throw new TypeLoadException(
+                        $"Conflicting MethodImpl bodies target virtual slot {slot} on " +
+                        $"'{type.Namespace}.{type.Name}'.");
+                }
+
+                if (!SameDispatchMethod(currentTarget, body) &&
+                    (declarationDefinition.IsFinal || currentTarget.IsFinal))
+                {
+                    RuntimeMethod finalMethod = currentTarget.IsFinal ? currentTarget : declarationDefinition;
+                    throw new TypeLoadException(
+                        $"MethodImpl on '{type.Namespace}.{type.Name}' overrides final method " +
+                        $"'{finalMethod.DeclaringType.Namespace}.{finalMethod.DeclaringType.Name}.{finalMethod.Name}'.");
+                }
+
+                appliedBodiesBySlot[slot] = body;
+                vtable[slot] = body;
             }
-            return -1;
         }
-        private static bool SameSig(RuntimeMethod a, RuntimeMethod b)
-        {
-            if (!ReferenceEquals(a.ReturnType, b.ReturnType)) return false;
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length) return false;
-            if (a.GenericArity != b.GenericArity) return false;
-            for (int i = 0; i < a.ParameterTypes.Length; i++)
-                if (!ReferenceEquals(a.ParameterTypes[i], b.ParameterTypes[i])) return false;
-            return true;
-        }
+
         internal RuntimeType ResolveType(RuntimeModule contextModule, int typeToken)
         {
             int table = MetadataToken.Table(typeToken);
@@ -3043,6 +3728,7 @@ namespace Cnidaria.Cs
             t.ElementType = elem;
             t.ArrayRank = rank;
             t.IsSzArray = isSzArray;
+            t.IsFinal = true;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -3110,6 +3796,7 @@ namespace Cnidaria.Cs
             t.GenericTypeDefinition = genericDef;
             t.GenericTypeArguments = args;
             t.IsBeforeFieldInit = genericDef.IsBeforeFieldInit;
+            t.IsFinal = genericDef.IsFinal;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -3127,8 +3814,9 @@ namespace Cnidaria.Cs
                 bool staleInstanceFields = genericDef.InstanceFields.Length != 0 && t.InstanceFields.Length == 0;
                 bool staleStaticFields = genericDef.StaticFields.Length != 0 && t.StaticFields.Length == 0;
                 bool staleMethods = genericDef.Methods.Length != 0 && t.Methods.Length == 0;
+                bool staleInterfaces = genericDef.Interfaces.Length != 0 && t.Interfaces.Length == 0;
 
-                if (!staleInstanceFields && !staleStaticFields && !staleMethods)
+                if (!staleInstanceFields && !staleStaticFields && !staleMethods && !staleInterfaces)
                     return;
             }
             t.ConstructedMembersInitialized = true;
@@ -3141,6 +3829,14 @@ namespace Cnidaria.Cs
             t.BaseType = genericDef.BaseType is null
                 ? null
                 : SubstituteRuntimeType(genericDef.BaseType, typeArgs);
+
+            if (genericDef.Interfaces.Length != 0)
+            {
+                var interfaces = new RuntimeType[genericDef.Interfaces.Length];
+                for (int i = 0; i < interfaces.Length; i++)
+                    interfaces[i] = SubstituteRuntimeType(genericDef.Interfaces[i], typeArgs);
+                t.Interfaces = interfaces;
+            }
 
             if (genericDef.InstanceFields.Length != 0 || genericDef.StaticFields.Length != 0)
             {
@@ -3204,11 +3900,19 @@ namespace Cnidaria.Cs
                 t.Methods = methods;
             }
 
+            if (genericDef.MethodImpls is not null)
+            {
+                var map = new Dictionary<int, RuntimeMethod>(genericDef.MethodImpls.Count);
+                foreach (KeyValuePair<int, RuntimeMethod> pair in genericDef.MethodImpls)
+                    map[pair.Key] = BindMethodToReceiver(pair.Value, t);
+                t.MethodImpls = map;
+            }
+
             if (t.BaseType is not null)
                 EnsureConstructedMembers(t.BaseType);
 
-            if (t.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Interface)
-                BuildVTableForType(t);
+            t.VTable = Array.Empty<RuntimeMethod>();
+            t.VTableBuildState = 0;
         }
         internal RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
         {
@@ -3471,6 +4175,7 @@ namespace Cnidaria.Cs
         public string Name { get; }
         public RuntimePrimitiveKind PrimitiveKind { get; internal set; }
         public bool IsBeforeFieldInit { get; internal set; }
+        public bool IsFinal { get; internal set; }
 
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer);
@@ -3503,7 +4208,8 @@ namespace Cnidaria.Cs
         public RuntimeField[] StaticFields { get; internal set; } = Array.Empty<RuntimeField>();
         public RuntimeMethod[] Methods { get; internal set; } = Array.Empty<RuntimeMethod>();
         public RuntimeMethod[] VTable { get; internal set; } = Array.Empty<RuntimeMethod>();
-        public Dictionary<int, RuntimeMethod>? ExplicitInterfaceMethodImpls { get; internal set; }
+        internal byte VTableBuildState { get; set; }
+        public Dictionary<int, RuntimeMethod>? MethodImpls { get; internal set; }
         public RuntimeType(int typeId, RuntimeTypeKind kind, string asm, string ns, string name)
         {
             TypeId = typeId;
@@ -3511,6 +4217,10 @@ namespace Cnidaria.Cs
             AssemblyName = asm;
             Namespace = ns;
             Name = name;
+        }
+        public override string ToString()
+        {
+            return $"{Namespace}.{Name}";
         }
     }
     internal sealed class RuntimeField
@@ -3530,6 +4240,7 @@ namespace Cnidaria.Cs
             IsStatic = isStatic;
         }
     }
+
     public sealed class RuntimeMethod
     {
         public int MethodId { get; }
@@ -3542,6 +4253,7 @@ namespace Cnidaria.Cs
         public bool IsStatic { get; }
         public bool IsNewSlot { get; }
         public bool IsFinal { get; }
+        public bool IsAbstract => (((System.Reflection.MethodAttributes)Flags) & System.Reflection.MethodAttributes.Abstract) != 0;
         public ushort Flags { get; }
         public ushort ImplFlags { get; }
         public bool IsExtern => (ImplFlags & MetadataFlagBits.Extern) != 0 ||

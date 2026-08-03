@@ -438,20 +438,18 @@ namespace Cnidaria.Cs
                 {
                     switch (tree.Kind)
                     {
+                        case GenTreeKind.NullCheck:
                         case GenTreeKind.Field:
                         case GenTreeKind.FieldAddr:
                         case GenTreeKind.StoreField:
                         case GenTreeKind.VirtualCall:
                         case GenTreeKind.DelegateInvoke:
+                        case GenTreeKind.ArrayLength:
                         case GenTreeKind.ArrayElement:
                         case GenTreeKind.ArrayElementAddr:
                         case GenTreeKind.StoreArrayElement:
                         case GenTreeKind.ArrayDataRef:
                             AddNonNullAfter(tree, 0);
-                            break;
-                        case GenTreeKind.Call:
-                            if (IsArrayLengthGetter(tree.Source))
-                                AddNonNullAfter(tree, 0);
                             break;
                         case GenTreeKind.LoadIndirect:
                         case GenTreeKind.StoreIndirect:
@@ -492,19 +490,6 @@ namespace Cnidaria.Cs
                 {
                     AddGeneratedAfter(tree.Source, nonNegative);
                 }
-            }
-
-            private static bool IsArrayLengthGetter(GenTree tree)
-            {
-                RuntimeMethod? method = tree.Method;
-                return method is not null &&
-                       method.HasThis &&
-                       !method.IsStatic &&
-                       method.ParameterTypes.Length == 0 &&
-                       method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
-                       StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                       StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
-                       StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array");
             }
 
             private void AddNonNullAfter(SsaTree tree, int operandIndex)
@@ -1114,8 +1099,8 @@ namespace Cnidaria.Cs
 
                 GenTreeFlags flags = candidate.Source.Flags;
                 BytecodeOp sourceOp = candidate.Source.SourceOp;
-                if (candidate.Kind is GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or GenTreeKind.VirtualCall or
-                    GenTreeKind.DelegateInvoke or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
+                if (candidate.Kind is GenTreeKind.NullCheck or GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or GenTreeKind.VirtualCall or
+                    GenTreeKind.DelegateInvoke or GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
                     GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
                 {
                     if (original.Operands.Length != 0 &&

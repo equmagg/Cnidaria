@@ -299,6 +299,14 @@ namespace Cnidaria.Cs
                     sb.Append("newarr ").Append(TypeName(source.RuntimeType)).Append(' ');
                     AppendUses(sb, node);
                     return;
+                case GenTreeKind.NullCheck:
+                    sb.Append("nullcheck ");
+                    AppendUses(sb, node);
+                    return;
+                case GenTreeKind.ArrayLength:
+                    sb.Append("arr_length ");
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.ArrayElement:
                 case GenTreeKind.ArrayElementAddr:
                     sb.Append(source.Kind == GenTreeKind.ArrayElementAddr ? "arr_addr " : "arr_elem ");
@@ -317,14 +325,6 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.StackAlloc:
                     sb.Append("stackalloc elemSize=").Append(source.Int32).Append(' ');
-                    AppendUses(sb, node);
-                    return;
-                case GenTreeKind.AllocHGlobal:
-                    sb.Append("alloc_hglobal ");
-                    AppendUses(sb, node);
-                    return;
-                case GenTreeKind.FreeHGlobal:
-                    sb.Append("free_hglobal ");
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.PointerElementAddr:

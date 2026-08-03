@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -10,7 +9,7 @@ namespace Cnidaria.Cs
     {
         None = 0,
 
-        // Structural
+        // Structural contexts
         CompilationUnit = 1 << 0,
         NamespaceMembers = 1 << 1,
         TypeMembers = 1 << 2,
@@ -18,10 +17,12 @@ namespace Cnidaria.Cs
         Expression = 1 << 4,
         Type = 1 << 5,
 
-        // Feature flags
+        // Feature contexts
         Async = 1 << 16,
         Iterator = 1 << 17,
         Unsafe = 1 << 18,
+        Query = 1 << 19,
+        FieldExpression = 1 << 20,
 
     }
     internal enum ModifierContext
@@ -33,6 +34,8 @@ namespace Cnidaria.Cs
         Accessor,
         Parameter,
     }
+
+    // Tracks nested grammar and feature contexts
     internal sealed class ParseContextStack
     {
         private ParseContext _combined;
@@ -96,8 +99,11 @@ namespace Cnidaria.Cs
             public void Dispose() => _owner?.PopTo(_depth);
         }
     }
+
+    ///<summary>Builds a syntax tree from a token stream</summary>
     public sealed class Parser
     {
+        // Captures every mutable component used by speculative parsing
         private readonly struct ResetPoint
         {
             public readonly SlidingTokenWindow.TokenWindowMark TokenMark;
@@ -126,15 +132,19 @@ namespace Cnidaria.Cs
             var lexer = new Lexer(text, lexerOptions ?? new LexerOptions());
             _tokens = new SlidingTokenWindow(lexer);
         }
+
+        ///<summary>Parses the complete source text</summary>
         public CompilationUnitSyntax Parse()
         {
             using var __ = _ctx.Push(ParseContext.CompilationUnit);
             return ParseCompilationUnit();
         }
 
-        // helpers
+        // Speculation, token matching and recovery
         private ResetPoint GetResetPoint()
             => new ResetPoint(_tokens.MarkState(), _ctx.Mark(), _diagnostics.Count);
+
+        // Probe always restores tokens, contexts and diagnostics
         private bool Probe(Func<bool> scan, ParseContext tempContext = ParseContext.None, bool requireProgress = true)
         {
             var rp = GetResetPoint();
@@ -150,6 +160,7 @@ namespace Cnidaria.Cs
 
             return ok;
         }
+        // Successful speculative parses keep their state while failed parses roll back
         private bool TryParse<T>(
             Func<T> parse,
             out T result,
@@ -202,7 +213,7 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == kind)
                 return _tokens.EatToken();
 
-            // missing token
+            // Missing tokens preserve tree shape without consuming input
             var pos = _tokens.Current.Span.Start;
             _diagnostics.Add(new SyntaxDiagnostic(pos, $"Expected token '{kind}', found '{_tokens.CurrentKind}'."));
             return CreateMissingToken(kind, pos);
@@ -264,6 +275,40 @@ namespace Cnidaria.Cs
         }
         private bool IsCurrentContextual(SyntaxKind contextualKind)
             => _tokens.Current.Kind == SyntaxKind.IdentifierToken && _tokens.Current.ContextualKind == contextualKind;
+        private bool IsCurrentQueryContextualKeywordInQuery()
+            => _ctx.Has(ParseContext.Query) && IsQueryContextualKeyword(_tokens.Current);
+        private static bool IsQueryContextualKeyword(SyntaxToken token)
+        {
+            if (token.Kind != SyntaxKind.IdentifierToken)
+                return false;
+
+            return token.ContextualKind switch
+            {
+                SyntaxKind.FromKeyword => true,
+                SyntaxKind.JoinKeyword => true,
+                SyntaxKind.IntoKeyword => true,
+                SyntaxKind.WhereKeyword => true,
+                SyntaxKind.OrderByKeyword => true,
+                SyntaxKind.GroupKeyword => true,
+                SyntaxKind.SelectKeyword => true,
+                SyntaxKind.LetKeyword => true,
+                SyntaxKind.OnKeyword => true,
+                SyntaxKind.EqualsKeyword => true,
+                SyntaxKind.AscendingKeyword => true,
+                SyntaxKind.DescendingKeyword => true,
+                SyntaxKind.ByKeyword => true,
+                _ => false
+            };
+        }
+        private SyntaxToken MatchIdentifierToken()
+        {
+            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken && !IsCurrentQueryContextualKeywordInQuery())
+                return _tokens.EatToken();
+
+            var pos = _tokens.Current.Span.Start;
+            _diagnostics.Add(new SyntaxDiagnostic(pos, $"Expected token '{SyntaxKind.IdentifierToken}', found '{_tokens.CurrentKind}'."));
+            return CreateMissingToken(SyntaxKind.IdentifierToken, pos);
+        }
         private static SyntaxToken CreateMissingToken(SyntaxKind kind, int position)
         {
             return new SyntaxToken(
@@ -286,6 +331,17 @@ namespace Cnidaria.Cs
                 leadingTrivia: Array.Empty<SyntaxTrivia>(),
                 trailingTrivia: Array.Empty<SyntaxTrivia>());
         }
+        private static SyntaxToken ConvertTokenKind(SyntaxToken token, SyntaxKind kind)
+        {
+            return new SyntaxToken(
+                kind,
+                kind,
+                token.Span,
+                token.ValueText,
+                token.Value,
+                token.LeadingTrivia,
+                token.TrailingTrivia);
+        }
         private IdentifierNameSyntax CreateMissingIdentifierName(int position)
         {
             var id = new SyntaxToken(
@@ -298,6 +354,8 @@ namespace Cnidaria.Cs
 
             return new IdentifierNameSyntax(id);
         }
+        // Compilation unit and member declarations
+
         private CompilationUnitSyntax ParseCompilationUnit()
         {
             var externs = new List<ExternAliasDirectiveSyntax>();
@@ -305,7 +363,7 @@ namespace Cnidaria.Cs
             var attributeLists = new List<AttributeListSyntax>();
             var members = new List<MemberDeclarationSyntax>();
 
-            while (_tokens.CurrentKind == SyntaxKind.ExternKeyword)
+            while (IsExternAliasDirectiveStart())
                 externs.Add(ParseExternAliasDirective());
 
             while (TryParseUsingDirective(out var u))
@@ -390,7 +448,7 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    // block namespace
+                    // Block namespace
                     if (seenFileScopedNamespace)
                     {
                         _diagnostics.Add(new SyntaxDiagnostic(
@@ -403,8 +461,14 @@ namespace Cnidaria.Cs
                 return ns;
             }
 
-            // type decl
+            // Type declaration
             var modifiers = ParseModifiers(ModifierContext.Type);
+
+            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword && IsDelegateDeclarationStart())
+            {
+                seenNonGlobalMember = true;
+                return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
+            }
 
             if (IsCurrentTypeDeclarationKeyword())
             {
@@ -445,6 +509,9 @@ namespace Cnidaria.Cs
             int diagStart = _diagnostics.Count;
 
             var modifiers = ParseModifiers(ModifierContext.Type);
+
+            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
+                return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
 
             if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
@@ -491,6 +558,7 @@ namespace Cnidaria.Cs
         private bool IsGlobalAttributeListStart()
         {
             // [assembly: ...] or [module: ...]
+            // Global attributes require an assembly or module target
             if (_tokens.CurrentKind != SyntaxKind.OpenBracketToken)
                 return false;
 
@@ -544,7 +612,7 @@ namespace Cnidaria.Cs
                 if (_tokens.CurrentKind == SyntaxKind.CommaToken)
                 {
                     list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
-                    if (_tokens.CurrentKind == closeKind) // allow trailing comma for recovery
+                    if (_tokens.CurrentKind == closeKind) // Accept a trailing comma during recovery
                         break;
                     continue;
                 }
@@ -605,14 +673,14 @@ namespace Cnidaria.Cs
             NameEqualsSyntax? nameEquals = null;
             NameColonSyntax? nameColon = null;
 
-            // name = expr
+            // Attribute property assignment
             if (_tokens.CurrentKind == SyntaxKind.IdentifierToken && _tokens.Peek(1).Kind == SyntaxKind.EqualsToken)
             {
                 var id = new IdentifierNameSyntax(_tokens.EatToken());
                 var eq = _tokens.EatToken();
                 nameEquals = new NameEqualsSyntax(id, eq);
             }
-            // name: expr
+            // Named attribute argument
             else if (_tokens.CurrentKind == SyntaxKind.IdentifierToken && _tokens.Peek(1).Kind == SyntaxKind.ColonToken)
             {
                 var id = new IdentifierNameSyntax(_tokens.EatToken());
@@ -623,7 +691,15 @@ namespace Cnidaria.Cs
             var expr = ParseExpression();
             return new AttributeArgumentSyntax(nameEquals, nameColon, expr);
         }
-        // directives
+        // Extern aliases and using directives
+        private bool IsExternAliasDirectiveStart()
+        {
+            if (_tokens.CurrentKind != SyntaxKind.ExternKeyword)
+                return false;
+
+            var next = _tokens.Peek(1);
+            return next.Kind == SyntaxKind.IdentifierToken && next.ContextualKind == SyntaxKind.AliasKeyword;
+        }
         private ExternAliasDirectiveSyntax ParseExternAliasDirective()
         {
             var externKeyword = MatchToken(SyntaxKind.ExternKeyword);
@@ -647,40 +723,49 @@ namespace Cnidaria.Cs
         private UsingDirectiveSyntax ParseUsingDirective()
         {
             // global?
-            var globalKeyword = EatOptionalContextualKeyword(SyntaxKind.GlobalKeyword);
+            var globalKeyword = TryEatContextualKeyword(SyntaxKind.GlobalKeyword, out var globalToken)
+                ? ConvertTokenKind(globalToken, SyntaxKind.GlobalKeyword)
+                : default;
 
+            // using?
             var usingKeyword = MatchToken(SyntaxKind.UsingKeyword);
 
             // static?
             var staticKeyword = EatOptionalToken(SyntaxKind.StaticKeyword);
 
-            // alias?
+            // unsafe?
+            var unsafeKeyword = EatOptionalToken(SyntaxKind.UnsafeKeyword);
+
             NameEqualsSyntax? alias = null;
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken && _tokens.Peek(1).Kind == SyntaxKind.EqualsToken)
             {
                 var id = new IdentifierNameSyntax(_tokens.EatToken());
                 var eq = _tokens.EatToken();
                 alias = new NameEqualsSyntax(id, eq);
-
-                if (_tokens.Current.Kind == SyntaxKind.StaticKeyword)
-                    _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start, "using alias with 'static' is not supported."));
             }
 
-            var name = ParseName();
+            TypeSyntax namespaceOrType = alias == null ? ParseName() : ParseType();
             var semi = MatchToken(SyntaxKind.SemicolonToken);
 
-            return new UsingDirectiveSyntax(globalKeyword, usingKeyword, staticKeyword, alias, name, semi);
+            return new UsingDirectiveSyntax(
+                globalKeyword,
+                usingKeyword,
+                staticKeyword,
+                unsafeKeyword,
+                alias,
+                namespaceOrType,
+                semi);
         }
 
 
-        // namespaces
+        // Namespace declarations
         private MemberDeclarationSyntax ParseNamespaceDeclaration(SyntaxList<AttributeListSyntax> attributeLists)
         {
             using var __ = _ctx.Push(ParseContext.NamespaceMembers);
             var nsKeyword = MatchToken(SyntaxKind.NamespaceKeyword);
             var name = ParseName();
 
-            // file scoped
+            // File-scoped namespace
             if (_tokens.CurrentKind == SyntaxKind.SemicolonToken)
             {
                 var semi = _tokens.EatToken();
@@ -689,7 +774,7 @@ namespace Cnidaria.Cs
                 var usings = new List<UsingDirectiveSyntax>();
                 var members = new List<MemberDeclarationSyntax>();
 
-                while (_tokens.CurrentKind == SyntaxKind.ExternKeyword)
+                while (IsExternAliasDirectiveStart())
                     externs.Add(ParseExternAliasDirective());
 
                 while (TryParseUsingDirective(out var u))
@@ -710,14 +795,14 @@ namespace Cnidaria.Cs
                     new SyntaxList<MemberDeclarationSyntax>(members.ToArray()));
             }
 
-            // block namespace
+            // Block namespace
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
             var externs2 = new List<ExternAliasDirectiveSyntax>();
             var usings2 = new List<UsingDirectiveSyntax>();
             var members2 = new List<MemberDeclarationSyntax>();
 
-            while (_tokens.CurrentKind == SyntaxKind.ExternKeyword)
+            while (IsExternAliasDirectiveStart())
                 externs2.Add(ParseExternAliasDirective());
 
 
@@ -747,10 +832,13 @@ namespace Cnidaria.Cs
                 close,
                 semi2);
         }
-        // type decl
+        // Type declarations
         private MemberDeclarationSyntax ParseTypeDeclarationAfterModifiers(
             SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
+            if (IsCurrentContextual(SyntaxKind.ExtensionKeyword))
+                return ParseExtensionBlockDeclaration(attributeLists, modifiers);
+
             if (IsCurrentContextual(SyntaxKind.RecordKeyword))
                 return ParseRecordDeclaration(attributeLists, modifiers);
 
@@ -763,6 +851,70 @@ namespace Cnidaria.Cs
                 _ => throw new InvalidOperationException($"Not a type declaration: {_tokens.CurrentKind}")
             };
         }
+        private ExtensionBlockDeclarationSyntax ParseExtensionBlockDeclaration(
+            SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
+        {
+            var extensionKeyword = MatchContextualKeyword(SyntaxKind.ExtensionKeyword);
+
+            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(
+                    _tokens.Current.Span.Start,
+                    "Extension declarations may not have a name."));
+                _tokens.EatToken();
+            }
+
+            TypeParameterListSyntax? typeParameterList = null;
+            if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
+                typeParameterList = ParseTypeParameterList();
+
+            var parameterList = ParseParameterList(identifierIsOptional: true, requireOneParameter: true);
+            var constraintClauses = ParseTypeParameterConstraintClauses();
+            var members = new List<MemberDeclarationSyntax>();
+
+            SyntaxToken openBraceToken;
+            SyntaxToken closeBraceToken;
+            SyntaxToken semicolonToken;
+
+            if (_tokens.CurrentKind == SyntaxKind.SemicolonToken)
+            {
+                semicolonToken = _tokens.EatToken();
+                openBraceToken = CreateMissingToken(SyntaxKind.OpenBraceToken, semicolonToken.Span.Start);
+                closeBraceToken = CreateMissingToken(SyntaxKind.CloseBraceToken, semicolonToken.Span.Start);
+            }
+            else
+            {
+                openBraceToken = MatchToken(SyntaxKind.OpenBraceToken);
+
+                using var __ = _ctx.Push(ParseContext.TypeMembers);
+
+                while (openBraceToken.Span.Length != 0 &&
+                       _tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                       _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+                {
+                    var start = _tokens.Position;
+                    members.Add(ParseClassMemberDeclaration(classNameToken: default));
+
+                    if (_tokens.Position == start && _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+                        EatAsSkippedToken("Parser made no progress in extension block member parsing.");
+                }
+
+                closeBraceToken = MatchToken(SyntaxKind.CloseBraceToken);
+                semicolonToken = EatOptionalToken(SyntaxKind.SemicolonToken);
+            }
+
+            return new ExtensionBlockDeclarationSyntax(
+                attributeLists,
+                modifiers,
+                extensionKeyword,
+                typeParameterList,
+                parameterList,
+                constraintClauses,
+                openBraceToken,
+                new SyntaxList<MemberDeclarationSyntax>(members.ToArray()),
+                closeBraceToken,
+                semicolonToken);
+        }
         private EnumDeclarationSyntax ParseEnumDeclaration(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
             if (modifiers.Count == 0)
@@ -773,7 +925,7 @@ namespace Cnidaria.Cs
 
             BaseListSyntax? baseList = null;
             if (_tokens.CurrentKind == SyntaxKind.ColonToken)
-                baseList = ParseBaseList(); // underlying type
+                baseList = ParseBaseList(allowPrimaryConstructorBaseType: false); // Enum underlying type
 
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
@@ -791,7 +943,7 @@ namespace Cnidaria.Cs
                 {
                     list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
 
-                    // allow trailing comma
+                    // Accept a trailing comma during recovery
                     if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
                         break;
 
@@ -844,9 +996,13 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
                 typeParams = ParseTypeParameterList();
 
+            ParameterListSyntax? parameterList = null;
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                parameterList = ParseParameterList();
+
             BaseListSyntax? baseList = null;
             if (_tokens.CurrentKind == SyntaxKind.ColonToken)
-                baseList = ParseBaseList();
+                baseList = ParseBaseList(allowPrimaryConstructorBaseType: true);
             var constraintClauses = ParseTypeParameterConstraintClauses();
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
@@ -872,6 +1028,7 @@ namespace Cnidaria.Cs
                 structKeyword,
                 id,
                 typeParams,
+                parameterList,
                 baseList,
                 constraintClauses,
                 open,
@@ -891,9 +1048,13 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
                 typeParams = ParseTypeParameterList();
 
+            ParameterListSyntax? parameterList = null;
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                parameterList = ParseParameterList();
+
             BaseListSyntax? baseList = null;
             if (_tokens.CurrentKind == SyntaxKind.ColonToken)
-                baseList = ParseBaseList();
+                baseList = ParseBaseList(allowPrimaryConstructorBaseType: true);
             var constraintClauses = ParseTypeParameterConstraintClauses();
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
@@ -920,6 +1081,7 @@ namespace Cnidaria.Cs
                 interfaceKeyword,
                 id,
                 typeParams,
+                parameterList,
                 baseList,
                 constraintClauses,
                 open,
@@ -1012,7 +1174,7 @@ namespace Cnidaria.Cs
                 close,
                 semi);
         }
-        //classes
+        // Type members
         private ClassDeclarationSyntax ParseClassDeclaration(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
             if (modifiers.Count == 0)
@@ -1025,9 +1187,13 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
                 typeParams = ParseTypeParameterList();
 
+            ParameterListSyntax? parameterList = null;
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                parameterList = ParseParameterList();
+
             BaseListSyntax? baseList = null;
             if (_tokens.CurrentKind == SyntaxKind.ColonToken)
-                baseList = ParseBaseList();
+                baseList = ParseBaseList(allowPrimaryConstructorBaseType: true);
 
             var constraintClauses = ParseTypeParameterConstraintClauses();
 
@@ -1056,6 +1222,7 @@ namespace Cnidaria.Cs
                 classKeyword,
                 id,
                 typeParams,
+                parameterList,
                 baseList,
                 constraintClauses,
                 open,
@@ -1076,6 +1243,10 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.EventKeyword)
                 return ParseEventDeclarationAfterModifiers(attrs, modifiers);
 
+            // fixed-size buffer field
+            if (_tokens.CurrentKind == SyntaxKind.FixedKeyword)
+                return ParseFixedSizeBufferDeclarationAfterModifiers(attrs, modifiers);
+
             // nested type
             if (IsCurrentTypeDeclarationKeyword())
                 return ParseTypeDeclarationAfterModifiers(attrs, modifiers);
@@ -1094,10 +1265,8 @@ namespace Cnidaria.Cs
                 var id2 = MatchToken(SyntaxKind.IdentifierToken);
                 return ParseConstructorDeclarationAfterHeader(attrs, modifiers, id2);
             }
-            // conversion operator
-            if ((_tokens.CurrentKind == SyntaxKind.ImplicitKeyword
-                || _tokens.CurrentKind == SyntaxKind.ExplicitKeyword) &&
-                _tokens.Peek(1).Kind == SyntaxKind.OperatorKeyword)
+            if (_tokens.CurrentKind == SyntaxKind.ImplicitKeyword ||
+                _tokens.CurrentKind == SyntaxKind.ExplicitKeyword)
             {
                 return ParseConversionOperatorDeclarationAfterModifiers(attrs, modifiers);
             }
@@ -1105,7 +1274,10 @@ namespace Cnidaria.Cs
             var type = ParseType();
 
             if (_tokens.CurrentKind == SyntaxKind.OperatorKeyword)
-                return ParseOperatorDeclarationAfterHeader(attrs, modifiers, type);
+                return ParseOperatorDeclarationAfterHeader(attrs, modifiers, type, explicitInterfaceSpecifier: null);
+
+            if (TryParseExplicitInterfaceSpecifierBeforeOperator(out var operatorExplicitInterface))
+                return ParseOperatorDeclarationAfterHeader(attrs, modifiers, type, operatorExplicitInterface);
 
             ExplicitInterfaceSpecifierSyntax? explicitInterface = null;
             SyntaxToken explicitMemberId = default;
@@ -1133,6 +1305,28 @@ namespace Cnidaria.Cs
 
             return ParseFieldDeclarationAfterHeader(attrs, modifiers, type, id);
         }
+        private FieldDeclarationSyntax ParseFixedSizeBufferDeclarationAfterModifiers(
+            SyntaxList<AttributeListSyntax> attributeLists,
+            SyntaxTokenList modifiers)
+        {
+            var fixedKeyword = MatchToken(SyntaxKind.FixedKeyword);
+            var modifierTokens = modifiers.ToArray();
+            Array.Resize(ref modifierTokens, modifierTokens.Length + 1);
+            modifierTokens[modifierTokens.Length - 1] = fixedKeyword;
+
+            var type = ParseType();
+            var firstIdentifier = MatchToken(SyntaxKind.IdentifierToken);
+            var variables = ParseVariableDeclarators(firstIdentifier, closeKind: SyntaxKind.SemicolonToken);
+            var declaration = new VariableDeclarationSyntax(type, variables);
+            var semicolonToken = MatchToken(SyntaxKind.SemicolonToken);
+
+            return new FieldDeclarationSyntax(
+                attributeLists,
+                new SyntaxTokenList(modifierTokens),
+                declaration,
+                semicolonToken);
+        }
+
         private MemberDeclarationSyntax ParseEventDeclarationAfterModifiers(SyntaxList<AttributeListSyntax> attributeLists, SyntaxTokenList modifiers)
         {
             var eventKeyword = MatchToken(SyntaxKind.EventKeyword);
@@ -1167,7 +1361,7 @@ namespace Cnidaria.Cs
                     accessorList);
             }
 
-            var vars = ParseVariableDeclarators(id, closeKind: SyntaxKind.SemicolonToken); 
+            var vars = ParseVariableDeclarators(id, closeKind: SyntaxKind.SemicolonToken);
             var decl = new VariableDeclarationSyntax(type, vars);
             var semi = MatchToken(SyntaxKind.SemicolonToken);
             return new EventFieldDeclarationSyntax(attributeLists, modifiers, eventKeyword, decl, semi);
@@ -1181,7 +1375,10 @@ namespace Cnidaria.Cs
         {
             if (_tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken)
             {
-                var exprBody = ParseArrowExpressionClause();
+                ArrowExpressionClauseSyntax exprBody;
+                using (var __ = _ctx.Push(ParseContext.FieldExpression))
+                    exprBody = ParseArrowExpressionClause();
+
                 var semi = MatchToken(SyntaxKind.SemicolonToken);
                 return new PropertyDeclarationSyntax(
                     attributeLists,
@@ -1194,10 +1391,10 @@ namespace Cnidaria.Cs
                     initializer: null,
                     semicolonToken: semi);
             }
-            var accessorList = ParseAccessorList();
+            var accessorList = ParseAccessorList(allowFieldExpression: true);
 
             EqualsValueClauseSyntax? init = null;
-            SyntaxToken semi2 = default; // optional
+            SyntaxToken semi2 = default; // Default when absent
 
             if (_tokens.CurrentKind == SyntaxKind.EqualsToken)
             {
@@ -1216,7 +1413,7 @@ namespace Cnidaria.Cs
                 initializer: init,
                 semicolonToken: semi2);
         }
-        private AccessorListSyntax ParseAccessorList()
+        private AccessorListSyntax ParseAccessorList(bool allowFieldExpression = false)
         {
             var open = MatchToken(SyntaxKind.OpenBraceToken);
 
@@ -1227,7 +1424,7 @@ namespace Cnidaria.Cs
             {
                 var start = _tokens.Position;
 
-                accessors.Add(ParseAccessorDeclaration());
+                accessors.Add(ParseAccessorDeclaration(allowFieldExpression));
 
                 if (_tokens.Position == start)
                 {
@@ -1240,8 +1437,10 @@ namespace Cnidaria.Cs
 
             return new AccessorListSyntax(open, new SyntaxList<AccessorDeclarationSyntax>(accessors.ToArray()), close);
         }
-        private AccessorDeclarationSyntax ParseAccessorDeclaration()
+        private AccessorDeclarationSyntax ParseAccessorDeclaration(bool allowFieldExpression)
         {
+            using var __ = _ctx.Push(allowFieldExpression ? ParseContext.FieldExpression : ParseContext.None);
+
             var attributeLists = ParseAttributeLists();
             var modifiers = ParseModifiers(ModifierContext.Accessor);
 
@@ -1354,7 +1553,8 @@ namespace Cnidaria.Cs
         private OperatorDeclarationSyntax ParseOperatorDeclarationAfterHeader(
             SyntaxList<AttributeListSyntax> attributeLists,
             SyntaxTokenList modifiers,
-            TypeSyntax returnType)
+            TypeSyntax returnType,
+            ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier)
         {
             var operatorKeyword = MatchToken(SyntaxKind.OperatorKeyword);
             var checkedKeyword = EatOptionalToken(SyntaxKind.CheckedKeyword);
@@ -1374,6 +1574,7 @@ namespace Cnidaria.Cs
                 attributeLists,
                 modifiers,
                 returnType,
+                explicitInterfaceSpecifier,
                 operatorKeyword,
                 checkedKeyword,
                 operatorToken,
@@ -1390,6 +1591,7 @@ namespace Cnidaria.Cs
         ? MatchToken(SyntaxKind.ImplicitKeyword)
         : MatchToken(SyntaxKind.ExplicitKeyword);
 
+            TryParseExplicitInterfaceSpecifierBeforeOperator(out var explicitInterfaceSpecifier);
             var operatorKeyword = MatchToken(SyntaxKind.OperatorKeyword);
             var checkedKeyword = EatOptionalToken(SyntaxKind.CheckedKeyword);
             var type = ParseType();
@@ -1408,6 +1610,7 @@ namespace Cnidaria.Cs
                 attributeLists,
                 modifiers,
                 implicitOrExplicitKeyword,
+                explicitInterfaceSpecifier,
                 operatorKeyword,
                 checkedKeyword,
                 type,
@@ -1415,6 +1618,40 @@ namespace Cnidaria.Cs
                 body,
                 exprBody,
                 semi);
+        }
+
+        private bool TryParseExplicitInterfaceSpecifierBeforeOperator(
+            out ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier)
+        {
+            explicitInterfaceSpecifier = null;
+
+            if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
+                return false;
+
+            var rp = GetResetPoint();
+            NameSyntax name = ParseAliasQualifiedName(ParseSimpleName);
+
+            while (_tokens.CurrentKind == SyntaxKind.DotToken)
+            {
+                var dot = _tokens.EatToken();
+                if (_tokens.CurrentKind == SyntaxKind.OperatorKeyword)
+                {
+                    explicitInterfaceSpecifier = new ExplicitInterfaceSpecifierSyntax(name, dot);
+                    return true;
+                }
+
+                if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
+                {
+                    Reset(rp);
+                    return false;
+                }
+
+                var right = ParseSimpleName();
+                name = new QualifiedNameSyntax(name, dot, right);
+            }
+
+            Reset(rp);
+            return false;
         }
         private DelegateDeclarationSyntax ParseDelegateDeclarationAfterModifiers(
             SyntaxList<AttributeListSyntax> attributeLists,
@@ -1464,7 +1701,7 @@ namespace Cnidaria.Cs
 
             BlockSyntax? body = null;
             ArrowExpressionClauseSyntax? exprBody = null;
-            SyntaxToken semi = default; // optional
+            SyntaxToken semi = default; // Default when absent
 
             ParseMemberBody(out body, out exprBody, out semi);
 
@@ -1565,7 +1802,7 @@ namespace Cnidaria.Cs
 
             var rp = GetResetPoint();
 
-            NameSyntax name = ParseSimpleName();
+            NameSyntax name = ParseAliasQualifiedName(ParseSimpleName);
 
             if (_tokens.CurrentKind != SyntaxKind.DotToken)
             {
@@ -1684,7 +1921,7 @@ namespace Cnidaria.Cs
                     {
                         arms.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
 
-                        // allow trailing comma
+                        // Accept a trailing comma during recovery
                         if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
                             break;
 
@@ -1710,6 +1947,15 @@ namespace Cnidaria.Cs
                 new SeparatedSyntaxList<SwitchExpressionArmSyntax>(arms.ToArray()),
                 closeBrace);
         }
+        private WithExpressionSyntax ParseWithExpressionAfterReceiver(ExpressionSyntax receiver)
+        {
+            var withKeyword = ConvertTokenKind(
+                MatchContextualKeyword(SyntaxKind.WithKeyword),
+                SyntaxKind.WithKeyword);
+            var initializer = ParseWithInitializerExpression();
+            return new WithExpressionSyntax(receiver, withKeyword, initializer);
+        }
+
         private SwitchExpressionArmSyntax ParseSwitchExpressionArm()
         {
             var pattern = ParsePatternCore();
@@ -1735,61 +1981,97 @@ namespace Cnidaria.Cs
         }
         private AnonymousMethodExpressionSyntax ParseAnonymousMethodExpression()
         {
-            SyntaxToken asyncKeyword = default;
-            if (IsCurrentContextual(SyntaxKind.AsyncKeyword) && _tokens.Peek(1).Kind == SyntaxKind.DelegateKeyword)
-                asyncKeyword = _tokens.EatToken();
-
+            var modifiers = ParseAnonymousFunctionModifiers();
             var delegateKeyword = MatchToken(SyntaxKind.DelegateKeyword);
 
             ParameterListSyntax? parameterList = null;
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
                 parameterList = ParseParameterList();
 
-            using var __ = _ctx.Push(asyncKeyword.Span.Length != 0 ? ParseContext.Async : ParseContext.None);
+            using var __ = _ctx.Push(ContainsModifier(modifiers, SyntaxKind.AsyncKeyword) ? ParseContext.Async : ParseContext.None);
             var block = ParseBlock();
 
-            return new AnonymousMethodExpressionSyntax(asyncKeyword, delegateKeyword, parameterList, block);
+            return new AnonymousMethodExpressionSyntax(modifiers, delegateKeyword, parameterList, block);
         }
         private ExpressionSyntax ParseLambdaExpression()
         {
-            SyntaxToken staticKeyword = default;
-            if (_tokens.CurrentKind == SyntaxKind.StaticKeyword)
-                staticKeyword = _tokens.EatToken();
+            var attributeLists = ParseAttributeLists();
+            var modifiers = ParseAnonymousFunctionModifiers();
 
-            SyntaxToken asyncKeyword = default;
-            if (IsCurrentContextual(SyntaxKind.AsyncKeyword) && _tokens.Peek(1).Kind != SyntaxKind.EqualsGreaterThanToken)
-                asyncKeyword = _tokens.EatToken();
+            TypeSyntax? returnType = null;
+            var returnTypeResetPoint = GetResetPoint();
+            var returnTypeCandidate = ParseType();
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                returnType = returnTypeCandidate;
+            else
+                Reset(returnTypeResetPoint);
 
-            // simple
-            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken &&
+            if (returnType is null &&
+                _tokens.CurrentKind == SyntaxKind.IdentifierToken &&
                 _tokens.Peek(1).Kind == SyntaxKind.EqualsGreaterThanToken)
             {
                 var id = _tokens.EatToken();
                 var parameter = new ParameterSyntax(SyntaxList<AttributeListSyntax>.Empty, SyntaxTokenList.Empty, type: null, identifier: id, @default: null);
                 var arrow = _tokens.EatToken();
 
-                using var __ = _ctx.Push(asyncKeyword.Span.Length != 0 ? ParseContext.Async : ParseContext.None);
+                using var __ = _ctx.Push(ContainsModifier(modifiers, SyntaxKind.AsyncKeyword) ? ParseContext.Async : ParseContext.None);
 
                 SyntaxNode body = _tokens.CurrentKind == SyntaxKind.OpenBraceToken
                     ? (SyntaxNode)ParseBlock()
                     : (SyntaxNode)ParseExpression();
 
-                return new SimpleLambdaExpressionSyntax(staticKeyword, asyncKeyword, parameter, arrow, body);
+                return new SimpleLambdaExpressionSyntax(attributeLists, modifiers, parameter, arrow, body);
             }
 
-            // parenthesized
             var parameterList = ParseLambdaParameterList();
             var arrow2 = MatchToken(SyntaxKind.EqualsGreaterThanToken);
 
-            using var __2 = _ctx.Push(asyncKeyword.Span.Length != 0 ? ParseContext.Async : ParseContext.None);
+            using var __2 = _ctx.Push(ContainsModifier(modifiers, SyntaxKind.AsyncKeyword) ? ParseContext.Async : ParseContext.None);
 
             SyntaxNode body2 = _tokens.CurrentKind == SyntaxKind.OpenBraceToken
                 ? (SyntaxNode)ParseBlock()
                 : (SyntaxNode)ParseExpression();
 
-            return new ParenthesizedLambdaExpressionSyntax(staticKeyword, asyncKeyword, parameterList, arrow2, body2);
+            return new ParenthesizedLambdaExpressionSyntax(attributeLists, modifiers, returnType, parameterList, arrow2, body2);
         }
-        // parameters
+        private SyntaxTokenList ParseAnonymousFunctionModifiers()
+        {
+            var modifiers = new List<SyntaxToken>();
+            while (true)
+            {
+                if (_tokens.CurrentKind == SyntaxKind.StaticKeyword)
+                {
+                    modifiers.Add(_tokens.EatToken());
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.AsyncKeyword) &&
+                    _tokens.Peek(1).Kind != SyntaxKind.EqualsGreaterThanToken)
+                {
+                    modifiers.Add(_tokens.EatToken());
+                    continue;
+                }
+
+                break;
+            }
+
+            return new SyntaxTokenList(modifiers.ToArray());
+        }
+        private static bool ContainsModifier(SyntaxTokenList modifiers, SyntaxKind kind)
+        {
+            for (int i = 0; i < modifiers.Count; i++)
+            {
+                var modifier = modifiers[i];
+                if (modifier.Kind == kind ||
+                    (modifier.Kind == SyntaxKind.IdentifierToken && modifier.ContextualKind == kind))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        // Parameters and type parameters
         private ParameterListSyntax ParseLambdaParameterList()
         {
             var open = MatchToken(SyntaxKind.OpenParenToken);
@@ -1826,10 +2108,14 @@ namespace Cnidaria.Cs
 
             return new SeparatedSyntaxList<ParameterSyntax>(list.ToArray());
         }
-        private ParameterListSyntax ParseParameterList()
+        private ParameterListSyntax ParseParameterList(
+            bool identifierIsOptional = false, bool requireOneParameter = false)
         {
             var open = MatchToken(SyntaxKind.OpenParenToken);
-            var parameters = ParseSeparatedParameters(closeKind: SyntaxKind.CloseParenToken);
+            var parameters = ParseSeparatedParameters(
+                closeKind: SyntaxKind.CloseParenToken,
+                identifierIsOptional: identifierIsOptional,
+                requireOneParameter: requireOneParameter);
             var close = MatchToken(SyntaxKind.CloseParenToken);
             return new ParameterListSyntax(open, parameters, close);
         }
@@ -1999,7 +2285,7 @@ namespace Cnidaria.Cs
             return new TypeParameterSyntax(attrs, variance, id);
         }
 
-        private BaseListSyntax ParseBaseList(bool allowPrimaryConstructorBaseType = false)
+        private BaseListSyntax ParseBaseList(bool allowPrimaryConstructorBaseType)
         {
             var colon = MatchToken(SyntaxKind.ColonToken);
 
@@ -2018,6 +2304,10 @@ namespace Cnidaria.Cs
         private BaseTypeSyntax ParseBaseType(bool allowPrimaryConstructorBaseType = false)
         {
             var t = ParseType();
+
+            if (allowPrimaryConstructorBaseType && _tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                return new PrimaryConstructorBaseTypeSyntax(t, ParseArgumentList());
+
             return new SimpleBaseTypeSyntax(t);
         }
         private ConstructorInitializerSyntax? ParseConstructorInitializerOptional()
@@ -2042,7 +2332,7 @@ namespace Cnidaria.Cs
             }
             else
             {
-                // recover
+                // Consume one token when parameter parsing stalls
                 thisOrBase = MatchToken(SyntaxKind.ThisKeyword);
                 kind = SyntaxKind.ThisConstructorInitializer;
             }
@@ -2050,16 +2340,40 @@ namespace Cnidaria.Cs
             var args = ParseArgumentList();
             return new ConstructorInitializerSyntax(kind, colon, thisOrBase, args);
         }
-        private SeparatedSyntaxList<ParameterSyntax> ParseSeparatedParameters(SyntaxKind closeKind)
+        private SeparatedSyntaxList<ParameterSyntax> ParseSeparatedParameters(
+            SyntaxKind closeKind, bool identifierIsOptional = false, bool requireOneParameter = false)
         {
             var list = new List<SyntaxNodeOrToken>();
+
+            if (requireOneParameter &&
+                (_tokens.CurrentKind == closeKind ||
+                 _tokens.CurrentKind == SyntaxKind.OpenBraceToken ||
+                 _tokens.CurrentKind == SyntaxKind.CloseBraceToken ||
+                 _tokens.CurrentKind == SyntaxKind.SemicolonToken ||
+                 _tokens.CurrentKind == SyntaxKind.EndOfFileToken ||
+                 IsCurrentContextual(SyntaxKind.WhereKeyword)))
+            {
+                var position = _tokens.Current.Span.Start;
+                _diagnostics.Add(new SyntaxDiagnostic(position, "Expected extension receiver parameter."));
+
+                list.Add(new SyntaxNodeOrToken(new ParameterSyntax(
+                    SyntaxList<AttributeListSyntax>.Empty,
+                    SyntaxTokenList.Empty,
+                    CreateMissingIdentifierName(position),
+                    identifier: default,
+                    @default: null)));
+
+                return new SeparatedSyntaxList<ParameterSyntax>(list.ToArray());
+            }
 
             while (_tokens.CurrentKind != closeKind &&
                    _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
             {
                 var start = _tokens.Position;
 
-                var p = ParseParameter(allowTypeOmitted: false);
+                var p = ParseParameter(
+                    allowTypeOmitted: false,
+                    identifierIsOptional: identifierIsOptional);
                 list.Add(new SyntaxNodeOrToken(p));
 
                 if (_tokens.CurrentKind == SyntaxKind.CommaToken)
@@ -2076,14 +2390,14 @@ namespace Cnidaria.Cs
 
             return new SeparatedSyntaxList<ParameterSyntax>(list.ToArray());
         }
-        private ParameterSyntax ParseParameter(bool allowTypeOmitted)
+        private ParameterSyntax ParseParameter(bool allowTypeOmitted, bool identifierIsOptional = false)
         {
             var attrs = ParseAttributeLists();
             var modifiers = ParseModifiers(ModifierContext.Parameter);
 
             if (allowTypeOmitted)
             {
-                // Try parse typed parameter
+                // Prefer a typed parameter when lookahead is unambiguous
                 var mark = _tokens.MarkState();
                 int diagStart = _diagnostics.Count;
 
@@ -2099,7 +2413,7 @@ namespace Cnidaria.Cs
                     return new ParameterSyntax(attrs, modifiers, maybeType, id2, def2);
                 }
 
-                // Not typed
+                // Fall back to an untyped lambda parameter
                 _tokens.Reset(mark);
                 RollbackDiagnostics(diagStart);
 
@@ -2114,7 +2428,11 @@ namespace Cnidaria.Cs
             else
             {
                 var type = ParseType();
-                var id = MatchToken(SyntaxKind.IdentifierToken);
+                var id = identifierIsOptional &&
+                    (_tokens.CurrentKind != SyntaxKind.IdentifierToken ||
+                     IsCurrentContextual(SyntaxKind.WhereKeyword))
+                    ? default
+                    : MatchToken(SyntaxKind.IdentifierToken);
 
                 EqualsValueClauseSyntax? def = null;
                 if (_tokens.CurrentKind == SyntaxKind.EqualsToken)
@@ -2123,7 +2441,7 @@ namespace Cnidaria.Cs
                 return new ParameterSyntax(attrs, modifiers, type, id, def);
             }
         }
-        // =statements=
+        // Statements
         private StatementSyntax ParseStatement()
         {
             using var __ = _ctx.Push(ParseContext.Statement);
@@ -2161,6 +2479,7 @@ namespace Cnidaria.Cs
 
                 SyntaxKind.UnsafeKeyword => ParseUnsafeStatement(),
                 SyntaxKind.FixedKeyword => ParseFixedStatement(),
+                SyntaxKind.LockKeyword => ParseLockStatement(),
 
                 SyntaxKind.TryKeyword => ParseTryStatement(),
                 SyntaxKind.GotoKeyword => ParseGotoStatement(),
@@ -2210,6 +2529,9 @@ namespace Cnidaria.Cs
                 return ParseLabeledStatement();
             }
 
+            if (IsQueryExpression(mayBeVariableDeclaration: true, mayBeMemberDeclaration: false))
+                return ParseExpressionStatement();
+
             if (TryParseLocalFunctionStatement(out var localFunc))
                 return localFunc;
 
@@ -2248,7 +2570,14 @@ namespace Cnidaria.Cs
         {
             var modifiers = ParseModifiers(ModifierContext.Local);
 
-            var type = ParseType();
+            SyntaxToken scopedKeyword = default;
+            if (IsPossibleScopedLocalDeclaration())
+                scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+            TypeSyntax type = ParseType();
+            if (scopedKeyword.Span.Length != 0)
+                type = new ScopedTypeSyntax(scopedKeyword, type);
+
             var firstId = MatchToken(SyntaxKind.IdentifierToken);
 
             var vars = ParseVariableDeclarators(firstId, closeKind: SyntaxKind.SemicolonToken);
@@ -2261,6 +2590,26 @@ namespace Cnidaria.Cs
                 modifiers: modifiers,
                 declaration: decl,
                 semicolonToken: semi);
+        }
+        private bool IsPossibleScopedLocalDeclaration()
+        {
+            if (!IsCurrentContextual(SyntaxKind.ScopedKeyword))
+                return false;
+
+            return Probe(
+                scan: () =>
+                {
+                    _tokens.EatToken();
+
+                    if (_tokens.CurrentKind == SyntaxKind.RefKeyword)
+                        return true;
+
+                    if (!ScanType())
+                        return false;
+
+                    return _tokens.CurrentKind == SyntaxKind.IdentifierToken;
+                },
+                tempContext: ParseContext.Type);
         }
         private LocalFunctionStatementSyntax ParseLocalFunctionStatement()
         {
@@ -2371,7 +2720,7 @@ namespace Cnidaria.Cs
                 type = ParseType();
             }
 
-            // Identifier is optional
+            // The identifier is omitted by goto case and goto default
             SyntaxToken identifier = default;
             if (_tokens.CurrentKind == SyntaxKind.IdentifierToken)
                 identifier = _tokens.EatToken();
@@ -2460,7 +2809,7 @@ namespace Cnidaria.Cs
                 return new GotoStatementSyntax(SyntaxKind.GotoDefaultStatement, gotoKeyword, defaultKeyword, expression: null, semi);
             }
 
-            // goto label;
+            // Label target
             ExpressionSyntax labelExpr;
             if (_tokens.CurrentKind == SyntaxKind.IdentifierToken)
                 labelExpr = new IdentifierNameSyntax(_tokens.EatToken());
@@ -2582,7 +2931,14 @@ namespace Cnidaria.Cs
 
             if (Probe(scan: ScanTypedForEachHeader, tempContext: ParseContext.Type))
             {
-                var type = ParseType();
+                SyntaxToken scopedKeyword = default;
+                if (IsPossibleScopedLocalDeclaration())
+                    scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+                TypeSyntax type = ParseType();
+                if (scopedKeyword.Span.Length != 0)
+                    type = new ScopedTypeSyntax(scopedKeyword, type);
+
                 var id = MatchToken(SyntaxKind.IdentifierToken);
                 var inKeyword = MatchToken(SyntaxKind.InKeyword);
                 var expr = ParseExpression();
@@ -2605,11 +2961,24 @@ namespace Cnidaria.Cs
         }
         private bool ScanTypedForEachHeader()
         {
+            if (IsCurrentContextual(SyntaxKind.ScopedKeyword))
+            {
+                var mark = _tokens.MarkState();
+                _tokens.EatToken();
+                if (ScanTypedForEachHeaderAfterOptionalScoped())
+                    return true;
+                _tokens.Reset(mark);
+            }
+
+            return ScanTypedForEachHeaderAfterOptionalScoped();
+        }
+        private bool ScanTypedForEachHeaderAfterOptionalScoped()
+        {
             if (!ScanType())
                 return false;
             if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
                 return false;
-            _tokens.EatToken(); // identifier
+            _tokens.EatToken();
             return _tokens.Current.Kind == SyntaxKind.InKeyword;
         }
         private ThrowStatementSyntax ParseThrowStatement()
@@ -2640,6 +3009,22 @@ namespace Cnidaria.Cs
             return new CheckedStatementSyntax(isChecked ? SyntaxKind.CheckedStatement : SyntaxKind.UncheckedStatement, keyword, block);
         }
 
+        private LockStatementSyntax ParseLockStatement()
+        {
+            var lockKeyword = MatchToken(SyntaxKind.LockKeyword);
+            var openParenToken = MatchToken(SyntaxKind.OpenParenToken);
+            var expression = ParseExpression();
+            var closeParenToken = MatchToken(SyntaxKind.CloseParenToken);
+            var statement = ParseStatement();
+
+            return new LockStatementSyntax(
+                lockKeyword,
+                openParenToken,
+                expression,
+                closeParenToken,
+                statement);
+        }
+
         private FixedStatementSyntax ParseFixedStatement()
         {
             var fixedKeyword = MatchToken(SyntaxKind.FixedKeyword);
@@ -2661,11 +3046,13 @@ namespace Cnidaria.Cs
         {
             var usingKeyword = MatchToken(SyntaxKind.UsingKeyword);
 
-            // using (...) statement
+            // using (...)
+            // Parenthesized form is a using statement
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
                 return ParseUsingStatementAfterUsing(awaitKeyword, usingKeyword);
 
             // using var x = ...;
+            // Declaration form remains in the current scope
             return ParseUsingDeclarationAfterUsing(awaitKeyword, usingKeyword);
         }
         private UsingStatementSyntax ParseUsingStatementAfterUsing(SyntaxToken awaitKeyword, SyntaxToken usingKeyword)
@@ -2682,7 +3069,7 @@ namespace Cnidaria.Cs
             }
             else if (TryParseUsingVariableDeclaration(out decl))
             {
-                // ok
+                // fallthrough
             }
             else
             {
@@ -2701,7 +3088,14 @@ namespace Cnidaria.Cs
         {
             var modifiers = ParseModifiers(ModifierContext.Local);
 
-            var type = ParseType();
+            SyntaxToken scopedKeyword = default;
+            if (IsPossibleScopedLocalDeclaration())
+                scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+            TypeSyntax type = ParseType();
+            if (scopedKeyword.Span.Length != 0)
+                type = new ScopedTypeSyntax(scopedKeyword, type);
+
             var firstId = MatchToken(SyntaxKind.IdentifierToken);
 
             var vars = ParseVariableDeclarators(firstId, closeKind: SyntaxKind.SemicolonToken);
@@ -2724,7 +3118,14 @@ namespace Cnidaria.Cs
             return TryParse(
                 parse: () =>
                 {
-                    var type = ParseType();
+                    SyntaxToken scopedKeyword = default;
+                    if (IsPossibleScopedLocalDeclaration())
+                        scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+                    TypeSyntax type = ParseType();
+                    if (scopedKeyword.Span.Length != 0)
+                        type = new ScopedTypeSyntax(scopedKeyword, type);
+
                     var firstId = MatchToken(SyntaxKind.IdentifierToken);
                     var vars = ParseVariableDeclarators(firstId, closeKind: SyntaxKind.CloseParenToken);
                     return new VariableDeclarationSyntax(type, vars);
@@ -2761,7 +3162,7 @@ namespace Cnidaria.Cs
                 return new YieldStatementSyntax(kind, yieldKeyword, returnOrBreak, expr, semi);
             }
 
-            // yield break;
+            // Yield break has no expression
             returnOrBreak = MatchToken(SyntaxKind.BreakKeyword);
             kind = SyntaxKind.YieldBreakStatement;
 
@@ -2782,7 +3183,14 @@ namespace Cnidaria.Cs
             if (TryParse(
                 parse: () =>
                 {
-                    var type = ParseType();
+                    SyntaxToken scopedKeyword = default;
+                    if (IsPossibleScopedLocalDeclaration())
+                        scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+                    TypeSyntax type = ParseType();
+                    if (scopedKeyword.Span.Length != 0)
+                        type = new ScopedTypeSyntax(scopedKeyword, type);
+
                     var firstId = MatchToken(SyntaxKind.IdentifierToken);
                     var vars = ParseVariableDeclarators(firstId, closeKind: SyntaxKind.SemicolonToken);
                     return new VariableDeclarationSyntax(type, vars);
@@ -2865,12 +3273,12 @@ namespace Cnidaria.Cs
         {
             var labels = new List<SwitchLabelSyntax>();
 
-            // At least one label
+            // Each section starts with at least one label
             if (_tokens.CurrentKind != SyntaxKind.CaseKeyword &&
                 _tokens.CurrentKind != SyntaxKind.DefaultKeyword)
             {
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start, "Expected 'case' or 'default' label."));
-                // recovery
+                // Preserve progress on a malformed section
                 EatAsSkippedToken("Skipping token while recovering to a switch label.");
             }
 
@@ -2986,23 +3394,64 @@ namespace Cnidaria.Cs
             return new EqualsValueClauseSyntax(eq, value);
         }
 
-        // names/types
+        // Names and types
         private NameSyntax ParseName()
         {
-            NameSyntax left = ParseSimpleName();
+            NameSyntax left = ParseAliasQualifiedName(ParseSimpleName);
 
-            while (_tokens.CurrentKind == SyntaxKind.DotToken)
+            while (_tokens.CurrentKind == SyntaxKind.DotToken ||
+                   _tokens.CurrentKind == SyntaxKind.ColonColonToken)
             {
-                var dot = _tokens.EatToken();
+                var separator = _tokens.EatToken();
                 var right = ParseSimpleName();
-                left = new QualifiedNameSyntax(left, dot, right);
+                left = CreateQualifiedName(left, separator, right);
             }
 
             return left;
         }
+        private NameSyntax ParseAliasQualifiedName(Func<SimpleNameSyntax> parseSimpleName)
+        {
+            var left = parseSimpleName();
+            if (_tokens.CurrentKind != SyntaxKind.ColonColonToken)
+                return left;
+
+            var separator = _tokens.EatToken();
+            var right = parseSimpleName();
+            return CreateQualifiedName(left, separator, right);
+        }
+        private NameSyntax ParseAliasQualifiedNameInExpressionContext()
+        {
+            var left = ParseSimpleNameInExpressionContext();
+            var separator = MatchToken(SyntaxKind.ColonColonToken);
+            var right = ParseSimpleName();
+            return CreateQualifiedName(left, separator, right);
+        }
+        private NameSyntax CreateQualifiedName(
+            NameSyntax left,
+            SyntaxToken separator,
+            SimpleNameSyntax right)
+        {
+            if (separator.Kind == SyntaxKind.DotToken)
+                return new QualifiedNameSyntax(left, separator, right);
+
+            if (left is IdentifierNameSyntax alias)
+            {
+                if (alias.Identifier.ContextualKind == SyntaxKind.GlobalKeyword)
+                    alias = new IdentifierNameSyntax(ConvertTokenKind(alias.Identifier, SyntaxKind.GlobalKeyword));
+
+                return new AliasQualifiedNameSyntax(alias, separator, right);
+            }
+
+            _diagnostics.Add(new SyntaxDiagnostic(
+                separator.Span.Start,
+                "An alias qualifier must follow a simple identifier."));
+
+            var missingDot = CreateMissingToken(SyntaxKind.DotToken, separator.Span.Start);
+            return new QualifiedNameSyntax(left, missingDot, right);
+        }
         private SimpleNameSyntax ParseSimpleName()
         {
-            var id = MatchToken(SyntaxKind.IdentifierToken);
+            var id = MatchIdentifierToken();
 
             if (_tokens.CurrentKind == SyntaxKind.LessThanToken)
             {
@@ -3014,7 +3463,7 @@ namespace Cnidaria.Cs
         }
         private SimpleNameSyntax ParseSimpleNameInExpressionContext()
         {
-            var id = MatchToken(SyntaxKind.IdentifierToken);
+            var id = MatchIdentifierToken();
 
             if (_tokens.Current.Kind == SyntaxKind.LessThanToken && IsTypeArgumentListInExpressionContext())
             {
@@ -3026,11 +3475,29 @@ namespace Cnidaria.Cs
         }
         private TypeArgumentListSyntax ParseTypeArgumentList()
         {
+            bool isOpenName = IsOpenName();
             var lt = MatchToken(SyntaxKind.LessThanToken);
 
             var args = new List<SyntaxNodeOrToken>();
 
-            // At least one type
+            if (isOpenName)
+            {
+                args.Add(new SyntaxNodeOrToken(CreateOmittedTypeArgument(lt.Span.End)));
+
+                while (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    var comma = _tokens.EatToken();
+                    args.Add(new SyntaxNodeOrToken(comma));
+                    args.Add(new SyntaxNodeOrToken(CreateOmittedTypeArgument(comma.Span.End)));
+                }
+
+                var openNameGt = EatGreaterThanTokenForTypeArgs();
+                return new TypeArgumentListSyntax(
+                    lt,
+                    new SeparatedSyntaxList<TypeSyntax>(args.ToArray()),
+                    openNameGt);
+            }
+
             args.Add(new SyntaxNodeOrToken(ParseType()));
 
             while (_tokens.CurrentKind == SyntaxKind.CommaToken)
@@ -3038,9 +3505,28 @@ namespace Cnidaria.Cs
                 args.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
                 args.Add(new SyntaxNodeOrToken(ParseType()));
             }
-            var gt = EatGreaterThanTokenForTypeArgs(); // handles >, >>, >>>
+            var gt = EatGreaterThanTokenForTypeArgs(); // Splits shift tokens when needed
             return new TypeArgumentListSyntax(lt, new SeparatedSyntaxList<TypeSyntax>(args.ToArray()), gt);
         }
+        private OmittedTypeArgumentSyntax CreateOmittedTypeArgument(int position)
+            => new OmittedTypeArgumentSyntax(
+                CreateMissingToken(SyntaxKind.OmittedTypeArgumentToken, position));
+
+        private bool IsOpenName()
+        {
+            if (_tokens.CurrentKind != SyntaxKind.LessThanToken)
+                return false;
+
+            int offset = 1;
+            while (_tokens.Peek(offset).Kind == SyntaxKind.CommaToken)
+                offset++;
+
+            return IsGreaterThanTokenForTypeArguments(_tokens.Peek(offset).Kind);
+        }
+        private static bool IsGreaterThanTokenForTypeArguments(SyntaxKind kind)
+            => kind == SyntaxKind.GreaterThanToken ||
+               kind == SyntaxKind.GreaterThanGreaterThanToken ||
+               kind == SyntaxKind.GreaterThanGreaterThanGreaterThanToken;
 
         private FunctionPointerTypeSyntax ParseFunctionPointerType()
         {
@@ -3187,7 +3673,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            // split >> or >>>
+            // Split a shift token (>> or >>>) 
             var t = _tokens.Current;
 
             if (t.Kind == SyntaxKind.GreaterThanGreaterThanToken)
@@ -3213,7 +3699,7 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.GreaterThanToken)
                 return _tokens.EatToken();
 
-            // split >> or >>>
+            // Split a shift token without losing source spans or trivia
             var t = _tokens.Current;
             if (t.Kind == SyntaxKind.GreaterThanGreaterThanToken)
             {
@@ -3231,13 +3717,13 @@ namespace Cnidaria.Cs
                 return parts[0];
             }
 
-            // recovery
+            // Insert a missing greater-than token for recovery
             _diagnostics.Add(new SyntaxDiagnostic(t.Span.Start, $"Expected '>' in type argument list, found '{t.Kind}'."));
             return CreateMissingToken(SyntaxKind.GreaterThanToken, t.Span.Start);
         }
         private static (SyntaxToken first, SyntaxToken second) SplitShiftTokenIntoGreaterThans(SyntaxToken t, int count)
         {
-            // count==2 for >>
+            // Two parts represent a right shift token
             int start = t.Span.Start;
 
             var first = new SyntaxToken(
@@ -3309,7 +3795,17 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind != SyntaxKind.LessThanToken)
                 return false;
 
-            _tokens.EatToken(); // '<'
+            bool isOpenName = IsOpenName();
+
+            _tokens.EatToken();
+
+            if (isOpenName)
+            {
+                while (_tokens.Current.Kind == SyntaxKind.CommaToken)
+                    _tokens.EatToken();
+
+                return TryEatGreaterThanTokenForTypeArgs();
+            }
 
             if (!ScanType())
                 return false;
@@ -3325,7 +3821,7 @@ namespace Cnidaria.Cs
         }
         private bool ScanSimpleName()
         {
-            if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
+            if (_tokens.Current.Kind != SyntaxKind.IdentifierToken || IsCurrentQueryContextualKeywordInQuery())
                 return false;
 
             _tokens.EatToken();
@@ -3344,7 +3840,15 @@ namespace Cnidaria.Cs
             if (!ScanSimpleName())
                 return false;
 
-            while (_tokens.Current.Kind == SyntaxKind.DotToken)
+            if (_tokens.Current.Kind == SyntaxKind.ColonColonToken)
+            {
+                _tokens.EatToken();
+                if (!ScanSimpleName())
+                    return false;
+            }
+
+            while (_tokens.Current.Kind == SyntaxKind.DotToken ||
+                   _tokens.Current.Kind == SyntaxKind.ColonColonToken)
             {
                 _tokens.EatToken();
                 if (!ScanSimpleName())
@@ -3358,23 +3862,23 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind == SyntaxKind.DelegateKeyword && _tokens.Peek(1).Kind == SyntaxKind.AsteriskToken)
                 return ScanFunctionPointerType();
 
-            // ref type
+            // Ref type prefix
             if (_tokens.Current.Kind == SyntaxKind.RefKeyword)
             {
-                _tokens.EatToken(); // ref
+                _tokens.EatToken();
 
                 if (_tokens.Current.Kind == SyntaxKind.ReadOnlyKeyword)
-                    _tokens.EatToken(); // readonly
+                    _tokens.EatToken();
 
                 return ScanType();
             }
-            // tuple type
+            // Tuple type
             if (_tokens.Current.Kind == SyntaxKind.OpenParenToken)
             {
                 if (!ScanTupleTypeCore())
                     return false;
             }
-            // predefined
+            // Predefined type
             else if (IsPredefinedTypeKeyword(_tokens.Current.Kind)
                 || (_tokens.Current.Kind == SyntaxKind.IdentifierToken
                 && (_tokens.Current.ValueText == "nint" || _tokens.Current.ValueText == "nuint")))
@@ -3387,7 +3891,7 @@ namespace Cnidaria.Cs
                     return false;
             }
 
-            // suffixes
+            // Pointer, nullable and array suffixes
             while (true)
             {
                 if (_tokens.Current.Kind == SyntaxKind.QuestionToken)
@@ -3404,12 +3908,12 @@ namespace Cnidaria.Cs
                 {
                     do
                     {
-                        _tokens.EatToken(); // '['
+                        _tokens.EatToken();
                         while (_tokens.Current.Kind == SyntaxKind.CommaToken)
                             _tokens.EatToken();
                         if (_tokens.Current.Kind != SyntaxKind.CloseBracketToken)
                             return false;
-                        _tokens.EatToken(); // ']'
+                        _tokens.EatToken();
                     }
                     while (_tokens.Current.Kind == SyntaxKind.OpenBracketToken);
 
@@ -3427,8 +3931,8 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind != SyntaxKind.DelegateKeyword || _tokens.Peek(1).Kind != SyntaxKind.AsteriskToken)
                 return false;
 
-            _tokens.EatToken(); // delegate
-            _tokens.EatToken(); // *
+            _tokens.EatToken();
+            _tokens.EatToken();
 
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
                 (_tokens.Current.ContextualKind == SyntaxKind.ManagedKeyword ||
@@ -3439,7 +3943,7 @@ namespace Cnidaria.Cs
 
                 if (callingConventionKind == SyntaxKind.UnmanagedKeyword && _tokens.Current.Kind == SyntaxKind.OpenBracketToken)
                 {
-                    _tokens.EatToken(); // '['
+                    _tokens.EatToken();
 
                     if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
                         return false;
@@ -3458,14 +3962,14 @@ namespace Cnidaria.Cs
                     if (_tokens.Current.Kind != SyntaxKind.CloseBracketToken)
                         return false;
 
-                    _tokens.EatToken(); // ']'
+                    _tokens.EatToken();
                 }
             }
 
             if (_tokens.Current.Kind != SyntaxKind.LessThanToken)
                 return false;
 
-            _tokens.EatToken(); // '<'
+            _tokens.EatToken();
 
             if (!ScanFunctionPointerParameter())
                 return false;
@@ -3493,13 +3997,13 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind != SyntaxKind.OpenParenToken)
                 return false;
 
-            _tokens.EatToken(); // '('
+            _tokens.EatToken();
 
-            // First element
+            // Parse the first tuple element before separators
             if (!ScanType())
                 return false;
 
-            // Optional element name
+            // Tuple element names are optional
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken)
             {
                 var next = _tokens.Peek(1).Kind;
@@ -3527,11 +4031,14 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind != SyntaxKind.CloseParenToken)
                 return false;
 
-            _tokens.EatToken(); // ')'
+            _tokens.EatToken();
             return true;
         }
         private bool IsTypeArgumentListInExpressionContext()
         {
+            if (IsOpenName())
+                return true;
+
             return Probe(
                 scan: () =>
                 {
@@ -3539,7 +4046,9 @@ namespace Cnidaria.Cs
                         return false;
 
                     var k = _tokens.Current.Kind;
-                    return k == SyntaxKind.OpenParenToken || k == SyntaxKind.DotToken;
+                    return k == SyntaxKind.OpenParenToken ||
+                           k == SyntaxKind.DotToken ||
+                           k == SyntaxKind.ColonColonToken;
                 },
                 tempContext: ParseContext.Type);
         }
@@ -3549,7 +4058,7 @@ namespace Cnidaria.Cs
 
             var list = new List<SyntaxNodeOrToken>();
 
-            // First omitted
+            // The first omitted size is represented explicitly
             list.Add(new SyntaxNodeOrToken(new OmittedArraySizeExpressionSyntax(
                 CreateMissingToken(SyntaxKind.OmittedArraySizeExpressionToken, open.Span.End))));
 
@@ -3601,7 +4110,7 @@ namespace Cnidaria.Cs
 
             var list = new List<SyntaxNodeOrToken>();
 
-            // First element
+            // Parse the first tuple element before separators
             list.Add(new SyntaxNodeOrToken(ParseTupleTypeElement()));
 
             bool hasComma = false;
@@ -3632,10 +4141,10 @@ namespace Cnidaria.Cs
         }
         private TupleElementSyntax ParseTupleTypeElement()
         {
-            // Element type
+            // Tuple element type
             var type = ParseType();
 
-            // Optional element name
+            // Tuple element names are optional
             SyntaxToken identifier = default;
             if (_tokens.CurrentKind == SyntaxKind.IdentifierToken)
             {
@@ -3646,7 +4155,7 @@ namespace Cnidaria.Cs
 
             return new TupleElementSyntax(type, identifier);
         }
-        // expressions
+        // Expressions
         private ExpressionSyntax ParseExpression()
         {
             using var __ = _ctx.Push(ParseContext.Expression);
@@ -3672,7 +4181,7 @@ namespace Cnidaria.Cs
             if (IsAssignmentOperator(_tokens.CurrentKind))
             {
                 var op = _tokens.EatToken();
-                var right = ParseAssignmentExpression(); // right associative
+                var right = ParseAssignmentExpression(); // Assignment is right associative
                 var kind = GetAssignmentExpressionKind(op.Kind);
                 return new AssignmentExpressionSyntax(kind, left, op, right);
             }
@@ -3701,21 +4210,52 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.QuestionQuestionToken)
             {
                 var op = _tokens.EatToken();
-                var right = ParseNullCoalescingExpression(); // right associative
+                var right = ParseNullCoalescingExpression(); // Null coalescing is right associative
                 return new BinaryExpressionSyntax(SyntaxKind.CoalesceExpression, left, op, right);
             }
 
             return left;
         }
+        private const int SwitchExpressionPrecedence = 11;
+
+        private int GetCurrentExpressionOperatorPrecedence()
+        {
+            if (_tokens.CurrentKind == SyntaxKind.SwitchKeyword &&
+                _tokens.Peek(1).Kind == SyntaxKind.OpenBraceToken)
+            {
+                return SwitchExpressionPrecedence;
+            }
+
+            if (IsCurrentContextual(SyntaxKind.WithKeyword) &&
+                _tokens.Peek(1).Kind == SyntaxKind.OpenBraceToken)
+            {
+                return SwitchExpressionPrecedence;
+            }
+
+            return SyntaxFacts.GetBinaryOperatorPrecedence(_tokens.CurrentKind);
+        }
+
         private ExpressionSyntax ParseBinaryExpression(int parentPrecedence = 0)
         {
             var left = ParseRangeExpression();
 
             while (true)
             {
-                int precedence = SyntaxFacts.GetBinaryOperatorPrecedence(_tokens.CurrentKind);
+                int precedence = GetCurrentExpressionOperatorPrecedence();
                 if (precedence == 0 || precedence <= parentPrecedence)
                     break;
+
+                if (_tokens.CurrentKind == SyntaxKind.SwitchKeyword)
+                {
+                    left = ParseSwitchExpressionAfterGoverningExpression(left);
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.WithKeyword))
+                {
+                    left = ParseWithExpressionAfterReceiver(left);
+                    continue;
+                }
 
                 var op = _tokens.EatToken();
 
@@ -3744,7 +4284,7 @@ namespace Cnidaria.Cs
         }
         private ExpressionSyntax ParseRangeExpression()
         {
-            // prefix range: ..x / ..
+            // Prefix and open-ended range
             if (_tokens.CurrentKind == SyntaxKind.DotDotToken)
             {
                 var op = _tokens.EatToken();
@@ -3772,6 +4312,9 @@ namespace Cnidaria.Cs
 
         private ExpressionSyntax ParseUnaryExpression()
         {
+            if (IsQueryExpression(mayBeVariableDeclaration: false, mayBeMemberDeclaration: false))
+                return ParseQueryExpression();
+
             if (_tokens.CurrentKind == SyntaxKind.ThrowKeyword)
                 return ParseThrowExpression();
 
@@ -3787,7 +4330,7 @@ namespace Cnidaria.Cs
             if (TryParseCastExpression(out var castExpr))
                 return castExpr;
 
-            // prefix unary
+            // Prefix unary operator
             int prec = SyntaxFacts.GetUnaryOperatorPrecedence(_tokens.CurrentKind);
             if (prec != 0)
             {
@@ -3796,10 +4339,264 @@ namespace Cnidaria.Cs
                 var kind = GetPrefixUnaryExpressionKind(op.Kind);
                 return new PrefixUnaryExpressionSyntax(kind, op, operand);
             }
-            // postfix unary
+            // Postfix unary operator
             var expr = ParsePrimaryExpression();
             return ParsePostfixExpression(expr);
         }
+        private bool IsQueryExpression(bool mayBeVariableDeclaration, bool mayBeMemberDeclaration)
+        {
+            return IsCurrentContextual(SyntaxKind.FromKeyword) &&
+                IsQueryExpressionAfterFrom(mayBeVariableDeclaration, mayBeMemberDeclaration);
+        }
+        private bool IsQueryExpressionAfterFrom(bool mayBeVariableDeclaration, bool mayBeMemberDeclaration)
+        {
+            var nextKind = _tokens.Peek(1).Kind;
+            if (IsPredefinedTypeKeyword(nextKind))
+                return true;
+
+            if (nextKind == SyntaxKind.IdentifierToken)
+            {
+                var followingKind = _tokens.Peek(2).Kind;
+                if (followingKind == SyntaxKind.InKeyword)
+                    return true;
+
+                if (mayBeVariableDeclaration &&
+                    followingKind is SyntaxKind.SemicolonToken or SyntaxKind.CommaToken or SyntaxKind.EqualsToken)
+                {
+                    return false;
+                }
+
+                if (mayBeMemberDeclaration &&
+                    followingKind is SyntaxKind.OpenParenToken or SyntaxKind.OpenBraceToken)
+                {
+                    return false;
+                }
+
+                if (!mayBeMemberDeclaration)
+                    return true;
+            }
+
+            return Probe(
+                scan: () =>
+                {
+                    _tokens.EatToken();
+                    return ScanType() &&
+                        (_tokens.CurrentKind == SyntaxKind.IdentifierToken || _tokens.CurrentKind == SyntaxKind.InKeyword);
+                },
+                tempContext: ParseContext.Type,
+                requireProgress: true);
+        }
+        private QueryExpressionSyntax ParseQueryExpression()
+        {
+            using var __ = _ctx.Push(ParseContext.Query);
+            var fromClause = ParseFromClause();
+            return new QueryExpressionSyntax(fromClause, ParseQueryBody());
+        }
+        private QueryBodySyntax ParseQueryBody()
+        {
+            var clauses = new List<QueryClauseSyntax>();
+
+            while (true)
+            {
+                if (IsCurrentContextual(SyntaxKind.FromKeyword))
+                {
+                    clauses.Add(ParseFromClause());
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.JoinKeyword))
+                {
+                    clauses.Add(ParseJoinClause());
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.LetKeyword))
+                {
+                    clauses.Add(ParseLetClause());
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.WhereKeyword))
+                {
+                    clauses.Add(ParseWhereClause());
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.OrderByKeyword))
+                {
+                    clauses.Add(ParseOrderByClause());
+                    continue;
+                }
+
+                break;
+            }
+
+            SelectOrGroupClauseSyntax selectOrGroup;
+            if (IsCurrentContextual(SyntaxKind.SelectKeyword))
+            {
+                selectOrGroup = ParseSelectClause();
+            }
+            else if (IsCurrentContextual(SyntaxKind.GroupKeyword))
+            {
+                selectOrGroup = ParseGroupClause();
+            }
+            else
+            {
+                var position = _tokens.Current.Span.Start;
+                _diagnostics.Add(new SyntaxDiagnostic(position, "Expected 'select' or 'group' clause."));
+                selectOrGroup = new SelectClauseSyntax(
+                    CreateMissingContextualToken(SyntaxKind.SelectKeyword, position),
+                    CreateMissingIdentifierName(position));
+            }
+
+            QueryContinuationSyntax? continuation = IsCurrentContextual(SyntaxKind.IntoKeyword)
+                ? ParseQueryContinuation()
+                : null;
+
+            return new QueryBodySyntax(
+                new SyntaxList<QueryClauseSyntax>(clauses.ToArray()),
+                selectOrGroup,
+                continuation);
+        }
+        private SyntaxToken ParseQueryIdentifierToken(bool recoverBeforeInKeyword = false)
+        {
+            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken && !IsCurrentQueryContextualKeywordInQuery())
+                return _tokens.EatToken();
+
+            if (recoverBeforeInKeyword && _tokens.Peek(1).Kind == SyntaxKind.InKeyword)
+            {
+                var invalid = _tokens.EatToken();
+                _diagnostics.Add(new SyntaxDiagnostic(invalid.Span.Start, "Expected query range variable identifier."));
+                return CreateMissingToken(SyntaxKind.IdentifierToken, invalid.Span.Start);
+            }
+
+            return MatchIdentifierToken();
+        }
+        private FromClauseSyntax ParseFromClause()
+        {
+            var fromKeyword = MatchContextualKeyword(SyntaxKind.FromKeyword);
+            TypeSyntax? type = _tokens.Peek(1).Kind != SyntaxKind.InKeyword
+                ? ParseType()
+                : null;
+            var identifier = ParseQueryIdentifierToken(recoverBeforeInKeyword: true);
+            var inKeyword = MatchToken(SyntaxKind.InKeyword);
+            var expression = ParseExpression();
+
+            return new FromClauseSyntax(fromKeyword, type, identifier, inKeyword, expression);
+        }
+        private LetClauseSyntax ParseLetClause()
+        {
+            var letKeyword = MatchContextualKeyword(SyntaxKind.LetKeyword);
+
+            SyntaxToken identifier;
+            if (SyntaxFacts.IsReservedKeyword(_tokens.CurrentKind) &&
+                _tokens.Peek(1).Kind == SyntaxKind.EqualsToken)
+            {
+                var invalid = _tokens.EatToken();
+                _diagnostics.Add(new SyntaxDiagnostic(invalid.Span.Start, "Expected query range variable identifier."));
+                identifier = CreateMissingToken(SyntaxKind.IdentifierToken, invalid.Span.Start);
+            }
+            else
+            {
+                identifier = ParseQueryIdentifierToken();
+            }
+
+            var equalsToken = MatchToken(SyntaxKind.EqualsToken);
+            var expression = ParseExpression();
+            return new LetClauseSyntax(letKeyword, identifier, equalsToken, expression);
+        }
+        private JoinClauseSyntax ParseJoinClause()
+        {
+            var joinKeyword = MatchContextualKeyword(SyntaxKind.JoinKeyword);
+            TypeSyntax? type = _tokens.Peek(1).Kind != SyntaxKind.InKeyword
+                ? ParseType()
+                : null;
+            var identifier = ParseQueryIdentifierToken();
+            var inKeyword = MatchToken(SyntaxKind.InKeyword);
+            var inExpression = ParseExpression();
+            var onKeyword = MatchContextualKeyword(SyntaxKind.OnKeyword);
+            var leftExpression = ParseExpression();
+            var equalsKeyword = MatchContextualKeyword(SyntaxKind.EqualsKeyword);
+            var rightExpression = ParseExpression();
+
+            JoinIntoClauseSyntax? into = null;
+            if (IsCurrentContextual(SyntaxKind.IntoKeyword))
+            {
+                var intoKeyword = MatchContextualKeyword(SyntaxKind.IntoKeyword);
+                into = new JoinIntoClauseSyntax(intoKeyword, ParseQueryIdentifierToken());
+            }
+
+            return new JoinClauseSyntax(
+                joinKeyword,
+                type,
+                identifier,
+                inKeyword,
+                inExpression,
+                onKeyword,
+                leftExpression,
+                equalsKeyword,
+                rightExpression,
+                into);
+        }
+        private WhereClauseSyntax ParseWhereClause()
+        {
+            var whereKeyword = MatchContextualKeyword(SyntaxKind.WhereKeyword);
+            return new WhereClauseSyntax(whereKeyword, ParseExpression());
+        }
+        private OrderByClauseSyntax ParseOrderByClause()
+        {
+            var orderByKeyword = MatchContextualKeyword(SyntaxKind.OrderByKeyword);
+            var orderings = new List<SyntaxNodeOrToken>
+            {
+                new SyntaxNodeOrToken(ParseOrdering())
+            };
+
+            while (_tokens.CurrentKind == SyntaxKind.CommaToken)
+            {
+                orderings.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                orderings.Add(new SyntaxNodeOrToken(ParseOrdering()));
+            }
+
+            return new OrderByClauseSyntax(
+                orderByKeyword,
+                new SeparatedSyntaxList<OrderingSyntax>(orderings.ToArray()));
+        }
+        private OrderingSyntax ParseOrdering()
+        {
+            var expression = ParseExpression();
+            SyntaxToken direction = default;
+            var kind = SyntaxKind.AscendingOrdering;
+
+            if (IsCurrentContextual(SyntaxKind.AscendingKeyword) ||
+                IsCurrentContextual(SyntaxKind.DescendingKeyword))
+            {
+                direction = _tokens.EatToken();
+                if (direction.ContextualKind == SyntaxKind.DescendingKeyword)
+                    kind = SyntaxKind.DescendingOrdering;
+            }
+
+            return new OrderingSyntax(kind, expression, direction);
+        }
+        private SelectClauseSyntax ParseSelectClause()
+        {
+            var selectKeyword = MatchContextualKeyword(SyntaxKind.SelectKeyword);
+            return new SelectClauseSyntax(selectKeyword, ParseExpression());
+        }
+        private GroupClauseSyntax ParseGroupClause()
+        {
+            var groupKeyword = MatchContextualKeyword(SyntaxKind.GroupKeyword);
+            var groupExpression = ParseExpression();
+            var byKeyword = MatchContextualKeyword(SyntaxKind.ByKeyword);
+            var byExpression = ParseExpression();
+            return new GroupClauseSyntax(groupKeyword, groupExpression, byKeyword, byExpression);
+        }
+        private QueryContinuationSyntax ParseQueryContinuation()
+        {
+            var intoKeyword = MatchContextualKeyword(SyntaxKind.IntoKeyword);
+            var identifier = ParseQueryIdentifierToken();
+            return new QueryContinuationSyntax(intoKeyword, identifier, ParseQueryBody());
+        }
+
         private RefExpressionSyntax ParseRefExpression()
         {
             var refKeyword = MatchToken(SyntaxKind.RefKeyword);
@@ -3884,10 +4681,6 @@ namespace Cnidaria.Cs
                         expr = ParsePostfixUnary(expr);
                         continue;
 
-                    case SyntaxKind.SwitchKeyword:
-                        expr = ParseSwitchExpressionAfterGoverningExpression(expr);
-                        continue;
-
                     default:
                         return expr;
                 }
@@ -3915,14 +4708,14 @@ namespace Cnidaria.Cs
             {
                 var expr = ParseExpression();
 
-                // Parenthesized expression: (expr)
+                // Parenthesized expression
                 if (_tokens.CurrentKind != SyntaxKind.CommaToken)
                 {
                     var close0 = MatchToken(SyntaxKind.CloseParenToken);
                     return new ParenthesizedExpressionSyntax(open, expr, close0);
                 }
 
-                // Tuple expression: (expr, ...)
+                // Tuple expression
                 var list = new List<SyntaxNodeOrToken>
                 {
                     new SyntaxNodeOrToken(new ArgumentSyntax(null, null, expr))
@@ -4083,7 +4876,17 @@ namespace Cnidaria.Cs
                     return ParseCheckedExpression(isChecked: false);
 
                 case SyntaxKind.IdentifierToken:
-                    return ParseSimpleNameInExpressionContext();
+                    if (_ctx.Has(ParseContext.FieldExpression) &&
+                        t.ContextualKind == SyntaxKind.FieldKeyword &&
+                        _tokens.Peek(1).Kind != SyntaxKind.ColonColonToken)
+                    {
+                        return new FieldExpressionSyntax(
+                            ConvertTokenKind(_tokens.EatToken(), SyntaxKind.FieldKeyword));
+                    }
+
+                    return _tokens.Peek(1).Kind == SyntaxKind.ColonColonToken
+                        ? ParseAliasQualifiedNameInExpressionContext()
+                        : ParseSimpleNameInExpressionContext();
 
                 case SyntaxKind.NumericLiteralToken:
                     return new LiteralExpressionSyntax(SyntaxKind.NumericLiteralExpression, _tokens.EatToken());
@@ -4210,7 +5013,7 @@ namespace Cnidaria.Cs
                 if (_tokens.CurrentKind == SyntaxKind.CommaToken)
                 {
                     list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
-                    if (_tokens.CurrentKind == closeKind) // trailing comma allowed
+                    if (_tokens.CurrentKind == closeKind) // Accept a trailing comma
                         break;
                     continue;
                 }
@@ -4251,29 +5054,62 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
                 return ParseImplicitArrayCreationExpression(newKeyword);
 
-            // Target typed
+            // Target-typed object creation
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
                 return ParseImplicitObjectCreationExpression(newKeyword);
 
             // Anonymous object creation
             if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
-            {
-                _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Anonymous object creation 'new { ... }' is not implemented."));
-
-                var missingType = (TypeSyntax)CreateMissingIdentifierName(_tokens.Current.Span.Start);
-                var init = ParseInitializerExpression(SyntaxKind.ObjectInitializerExpression);
-                return new ObjectCreationExpressionSyntax(newKeyword, missingType, argumentList: null, initializer: init);
-            }
+                return ParseAnonymousObjectCreationExpression(newKeyword);
 
             var type = ParseTypeWithoutArrayCreationRankSpecifiers();
 
-            // Array creation
+            // Explicit array creation
             if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
                 return ParseArrayCreationExpression(newKeyword, type);
 
             return ParseObjectCreationExpressionAfterNew(newKeyword, type);
         }
+        private AnonymousObjectCreationExpressionSyntax ParseAnonymousObjectCreationExpression(SyntaxToken newKeyword)
+        {
+            var openBraceToken = MatchToken(SyntaxKind.OpenBraceToken);
+            var initializers = new List<SyntaxNodeOrToken>();
+
+            while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                initializers.Add(new SyntaxNodeOrToken(ParseAnonymousObjectMemberDeclarator()));
+
+                if (_tokens.CurrentKind != SyntaxKind.CommaToken)
+                    break;
+
+                initializers.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
+                    break;
+            }
+
+            var closeBraceToken = MatchToken(SyntaxKind.CloseBraceToken);
+            return new AnonymousObjectCreationExpressionSyntax(
+                newKeyword,
+                openBraceToken,
+                new SeparatedSyntaxList<AnonymousObjectMemberDeclaratorSyntax>(initializers.ToArray()),
+                closeBraceToken);
+        }
+
+        private AnonymousObjectMemberDeclaratorSyntax ParseAnonymousObjectMemberDeclarator()
+        {
+            NameEqualsSyntax? nameEquals = null;
+            if (_tokens.CurrentKind == SyntaxKind.IdentifierToken &&
+                _tokens.Peek(1).Kind == SyntaxKind.EqualsToken)
+            {
+                var name = new IdentifierNameSyntax(_tokens.EatToken());
+                nameEquals = new NameEqualsSyntax(name, _tokens.EatToken());
+            }
+
+            var expression = ParseExpression();
+            return new AnonymousObjectMemberDeclaratorSyntax(nameEquals, expression);
+        }
+
         private ExpressionSyntax ParseImplicitObjectCreationExpression(SyntaxToken newKeyword)
         {
             var argList = ParseArgumentList();
@@ -4352,7 +5188,7 @@ namespace Cnidaria.Cs
         {
             var stackAllocKeyword = MatchToken(SyntaxKind.StackAllocKeyword);
 
-            // Implicit stackalloc array creation
+            // Implicit stack allocation
             if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
                 return ParseImplicitStackAllocArrayCreationExpression(stackAllocKeyword);
 
@@ -4383,7 +5219,7 @@ namespace Cnidaria.Cs
         {
             var open = MatchToken(SyntaxKind.OpenBracketToken);
 
-            // stackalloc[] is always 1D; if commas exist, consume them as skipped tokens.
+            // Implicit stack allocation is one-dimensional so commas are recovered as skipped tokens
             while (_tokens.CurrentKind == SyntaxKind.CommaToken)
                 EatAsSkippedToken("Unexpected ',' in implicit stackalloc rank specifier.");
 
@@ -4436,7 +5272,7 @@ namespace Cnidaria.Cs
             var open = MatchToken(SyntaxKind.OpenBracketToken);
             var list = new List<SyntaxNodeOrToken>();
 
-            // First size or omitted
+            // First size expression or omission
             if (_tokens.CurrentKind == SyntaxKind.CloseBracketToken || _tokens.CurrentKind == SyntaxKind.CommaToken)
             {
                 list.Add(new SyntaxNodeOrToken(new OmittedArraySizeExpressionSyntax(
@@ -4481,6 +5317,33 @@ namespace Cnidaria.Cs
             var close = CreateMissingToken(SyntaxKind.CloseBraceToken, position);
             return new InitializerExpressionSyntax(kind, open, new SeparatedSyntaxList<ExpressionSyntax>(Array.Empty<SyntaxNodeOrToken>()), close);
         }
+        private InitializerExpressionSyntax ParseWithInitializerExpression()
+        {
+            var open = MatchToken(SyntaxKind.OpenBraceToken);
+            var expressions = new List<SyntaxNodeOrToken>();
+
+            while (_tokens.CurrentKind != SyntaxKind.CloseBraceToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken)
+            {
+                var expression = ParseExpression();
+                expressions.Add(new SyntaxNodeOrToken(expression));
+
+                if (_tokens.CurrentKind != SyntaxKind.CommaToken)
+                    break;
+
+                expressions.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                if (_tokens.CurrentKind == SyntaxKind.CloseBraceToken)
+                    break;
+            }
+
+            var close = MatchToken(SyntaxKind.CloseBraceToken);
+            return new InitializerExpressionSyntax(
+                SyntaxKind.WithInitializerExpression,
+                open,
+                new SeparatedSyntaxList<ExpressionSyntax>(expressions.ToArray()),
+                close);
+        }
+
         private InitializerExpressionSyntax ParseInitializerExpression(SyntaxKind kind)
         {
             return kind switch
@@ -4581,7 +5444,7 @@ namespace Cnidaria.Cs
                 IsImplicitElementInitializerStart())
             {
                 var left = new ImplicitElementAccessSyntax(ParseBracketedArgumentList());
-                inferredKind = SyntaxKind.CollectionInitializerExpression;
+                inferredKind = SyntaxKind.ObjectInitializerExpression;
                 return ParseInitializerAssignmentAfterLeft(left);
             }
 
@@ -4670,7 +5533,7 @@ namespace Cnidaria.Cs
         }
         private MemberAccessExpressionSyntax ParseMemberAccess(ExpressionSyntax receiver)
         {
-            var op = _tokens.EatToken(); // '.' or '->'
+            var op = _tokens.EatToken();
             var name = ParseSimpleNameInExpressionContext();
 
             var kind = op.Kind switch
@@ -4742,7 +5605,6 @@ namespace Cnidaria.Cs
         {
             NameColonSyntax? nameColon = null;
 
-            // Named argument
             if (_tokens.CurrentKind == SyntaxKind.IdentifierToken &&
                 _tokens.Peek(1).Kind == SyntaxKind.ColonToken)
             {
@@ -4751,7 +5613,6 @@ namespace Cnidaria.Cs
                 nameColon = new NameColonSyntax(id, colon);
             }
 
-            // Argument modifier ref/out/in
             SyntaxToken? refKindKeyword = null;
             if (_tokens.CurrentKind == SyntaxKind.RefKeyword ||
                 _tokens.CurrentKind == SyntaxKind.InKeyword ||
@@ -4775,7 +5636,14 @@ namespace Cnidaria.Cs
         }
         private DeclarationExpressionSyntax ParseDeclarationExpression()
         {
-            var type = ParseType();
+            SyntaxToken scopedKeyword = default;
+            if (IsPossibleScopedDeclarationExpression())
+                scopedKeyword = MatchContextualKeyword(SyntaxKind.ScopedKeyword);
+
+            TypeSyntax type = ParseType();
+            if (scopedKeyword.Span.Length != 0)
+                type = new ScopedTypeSyntax(scopedKeyword, type);
+
             var designation = ParseVariableDesignation();
             return new DeclarationExpressionSyntax(type, designation);
 
@@ -4829,7 +5697,7 @@ namespace Cnidaria.Cs
             var close = MatchToken(SyntaxKind.CloseParenToken);
             return new ParenthesizedVariableDesignationSyntax(open, new SeparatedSyntaxList<VariableDesignationSyntax>(list.ToArray()), close);
         }
-        // =patterns=
+        // Patterns
         private PatternSyntax ParsePatternCore()
         {
             return ParseDisjunctivePattern();
@@ -4873,15 +5741,36 @@ namespace Cnidaria.Cs
         }
         private PatternSyntax ParsePrimaryPattern()
         {
-            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+            if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+                return ParseListPattern();
+
+            if (_tokens.CurrentKind == SyntaxKind.DotDotToken)
             {
-                var open = _tokens.EatToken();
-                var pattern = ParsePatternCore();
-                var close = MatchToken(SyntaxKind.CloseParenToken);
-                return new ParenthesizedPatternSyntax(open, pattern, close);
+                var dotDotToken = _tokens.EatToken();
+                PatternSyntax? pattern = CanStartSlicePatternOperand()
+                    ? ParsePatternCore()
+                    : null;
+                return new SlicePatternSyntax(dotDotToken, pattern);
             }
 
-            if (IsCurrentContextual(SyntaxKind.VarKeyword))
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+            {
+                if (LooksLikeCastExpressionInPattern())
+                    return new ConstantPatternSyntax(ParseExpression());
+
+                return ParseParenthesizedOrPositionalPattern();
+            }
+
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+            {
+                var propertyPatternClause = ParsePropertyPatternClause();
+                var designation = ParseSimplePatternDesignationIfPresent();
+                return new RecursivePatternSyntax(null, null, propertyPatternClause, designation);
+            }
+
+            if (IsCurrentContextual(SyntaxKind.VarKeyword) &&
+                (_tokens.Peek(1).Kind == SyntaxKind.OpenParenToken ||
+                 IsSimplePatternDesignationToken(_tokens.Peek(1))))
             {
                 var varKeyword = _tokens.EatToken();
                 var designation = ParseVariableDesignation();
@@ -4916,6 +5805,28 @@ namespace Cnidaria.Cs
                 requireProgress: true,
                 requireNoNewDiagnostics: true))
             {
+                if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                {
+                    var positionalPatternClause = ParsePositionalPatternClause();
+                    PropertyPatternClauseSyntax? propertyPatternClause = null;
+                    if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                        propertyPatternClause = ParsePropertyPatternClause();
+
+                    var designation = ParseSimplePatternDesignationIfPresent();
+                    return new RecursivePatternSyntax(
+                        parsedType,
+                        positionalPatternClause,
+                        propertyPatternClause,
+                        designation);
+                }
+
+                if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                {
+                    var propertyPatternClause = ParsePropertyPatternClause();
+                    var designation = ParseSimplePatternDesignationIfPresent();
+                    return new RecursivePatternSyntax(parsedType, null, propertyPatternClause, designation);
+                }
+
                 if (CanStartPatternDesignation())
                 {
                     var designation = ParseVariableDesignation();
@@ -4930,6 +5841,326 @@ namespace Cnidaria.Cs
 
             var expr2 = ParseExpression();
             return new ConstantPatternSyntax(expr2);
+        }
+        private ListPatternSyntax ParseListPattern()
+        {
+            var openBracketToken = MatchToken(SyntaxKind.OpenBracketToken);
+            var list = new List<SyntaxNodeOrToken>();
+
+            while (_tokens.CurrentKind != SyntaxKind.CloseBracketToken &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken &&
+                   _tokens.CurrentKind != SyntaxKind.SemicolonToken &&
+                   _tokens.CurrentKind != SyntaxKind.EqualsGreaterThanToken)
+            {
+                int start = _tokens.Position;
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    _diagnostics.Add(new SyntaxDiagnostic(
+                        _tokens.Current.Span.Start,
+                        "Expected pattern before ','."));
+                    list.Add(new SyntaxNodeOrToken(CreateMissingPattern(_tokens.Current.Span.Start)));
+                }
+                else
+                {
+                    list.Add(new SyntaxNodeOrToken(ParsePatternCore()));
+                }
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    list.Add(new SyntaxNodeOrToken(_tokens.EatToken()));
+                    if (_tokens.CurrentKind == SyntaxKind.CloseBracketToken)
+                        break;
+
+                    continue;
+                }
+
+                if (_tokens.CurrentKind != SyntaxKind.CloseBracketToken &&
+                    _tokens.CurrentKind != SyntaxKind.EndOfFileToken &&
+                    _tokens.CurrentKind != SyntaxKind.SemicolonToken &&
+                    _tokens.CurrentKind != SyntaxKind.EqualsGreaterThanToken)
+                {
+                    EatAsSkippedToken("Expected ',' or ']' in list pattern.");
+                    continue;
+                }
+
+                if (_tokens.Position == start)
+                {
+                    EatAsSkippedToken("Parser made no progress in list pattern parsing.");
+                    break;
+                }
+            }
+
+            var closeBracketToken = MatchToken(SyntaxKind.CloseBracketToken);
+            var designation = ParseSimplePatternDesignationIfPresent();
+            return new ListPatternSyntax(
+                openBracketToken,
+                new SeparatedSyntaxList<PatternSyntax>(list.ToArray()),
+                closeBracketToken,
+                designation);
+        }
+        private PatternSyntax CreateMissingPattern(int position)
+            => new ConstantPatternSyntax(CreateMissingIdentifierName(position));
+        private bool CanStartSlicePatternOperand()
+        {
+            switch (_tokens.CurrentKind)
+            {
+                case SyntaxKind.CommaToken:
+                case SyntaxKind.CloseBracketToken:
+                case SyntaxKind.CloseParenToken:
+                case SyntaxKind.CloseBraceToken:
+                case SyntaxKind.SemicolonToken:
+                case SyntaxKind.ColonToken:
+                case SyntaxKind.EqualsGreaterThanToken:
+                case SyntaxKind.EndOfFileToken:
+                    return false;
+            }
+
+            return !IsCurrentContextual(SyntaxKind.WhenKeyword) &&
+                   !IsCurrentContextual(SyntaxKind.AndKeyword) &&
+                   !IsCurrentContextual(SyntaxKind.OrKeyword);
+        }
+        private bool LooksLikeCastExpressionInPattern()
+        {
+            return Probe(
+                scan: () =>
+                {
+                    _tokens.EatToken();
+                    var type = ParseType();
+                    if (_tokens.CurrentKind != SyntaxKind.CloseParenToken)
+                        return false;
+
+                    _tokens.EatToken();
+                    if (IsCurrentContextual(SyntaxKind.AndKeyword) ||
+                        IsCurrentContextual(SyntaxKind.OrKeyword) ||
+                        IsCurrentContextual(SyntaxKind.WhenKeyword))
+                    {
+                        return false;
+                    }
+
+                    return TypeDefinitelyNotExpression(type) || IsCastFollowerToken(_tokens.Current);
+                },
+                tempContext: ParseContext.Type,
+                requireProgress: true);
+        }
+        private PatternSyntax ParseParenthesizedOrPositionalPattern()
+        {
+            var positionalPatternClause = ParsePositionalPatternClause();
+
+            PropertyPatternClauseSyntax? propertyPatternClause = null;
+            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
+                propertyPatternClause = ParsePropertyPatternClause();
+
+            var designation = ParseSimplePatternDesignationIfPresent();
+
+            if (propertyPatternClause is null &&
+                designation is null &&
+                positionalPatternClause.Subpatterns.Count == 1 &&
+                positionalPatternClause.Subpatterns.SeparatorCount == 0 &&
+                positionalPatternClause.Subpatterns[0].ExpressionColon is null)
+            {
+                var subpattern = positionalPatternClause.Subpatterns[0].Pattern;
+                if (subpattern is ConstantPatternSyntax constantPattern)
+                {
+                    var expression = new ParenthesizedExpressionSyntax(
+                        positionalPatternClause.OpenParenToken,
+                        constantPattern.Expression,
+                        positionalPatternClause.CloseParenToken);
+                    return new ConstantPatternSyntax(expression);
+                }
+
+                return new ParenthesizedPatternSyntax(
+                    positionalPatternClause.OpenParenToken,
+                    subpattern,
+                    positionalPatternClause.CloseParenToken);
+            }
+
+            return new RecursivePatternSyntax(
+                null,
+                positionalPatternClause,
+                propertyPatternClause,
+                designation);
+        }
+        private PositionalPatternClauseSyntax ParsePositionalPatternClause()
+        {
+            ParseSubpatternList(
+                SyntaxKind.OpenParenToken,
+                SyntaxKind.CloseParenToken,
+                allowTrailingSeparator: false,
+                out var openParenToken,
+                out var subpatterns,
+                out var closeParenToken);
+
+            return new PositionalPatternClauseSyntax(openParenToken, subpatterns, closeParenToken);
+        }
+        private PropertyPatternClauseSyntax ParsePropertyPatternClause()
+        {
+            ParseSubpatternList(
+                SyntaxKind.OpenBraceToken,
+                SyntaxKind.CloseBraceToken,
+                allowTrailingSeparator: true,
+                out var openBraceToken,
+                out var subpatterns,
+                out var closeBraceToken);
+
+            return new PropertyPatternClauseSyntax(openBraceToken, subpatterns, closeBraceToken);
+        }
+        private void ParseSubpatternList(
+            SyntaxKind openKind,
+            SyntaxKind closeKind,
+            bool allowTrailingSeparator,
+            out SyntaxToken openToken,
+            out SeparatedSyntaxList<SubpatternSyntax> subpatterns,
+            out SyntaxToken closeToken)
+        {
+            openToken = MatchToken(openKind);
+            var list = new List<SyntaxNodeOrToken>();
+
+            while (_tokens.CurrentKind != closeKind &&
+                   _tokens.CurrentKind != SyntaxKind.EndOfFileToken &&
+                   _tokens.CurrentKind != SyntaxKind.SemicolonToken)
+            {
+                int start = _tokens.Position;
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    _diagnostics.Add(new SyntaxDiagnostic(
+                        _tokens.Current.Span.Start,
+                        "Expected subpattern before ','."));
+                    list.Add(new SyntaxNodeOrToken(CreateMissingSubpattern(_tokens.Current.Span.Start)));
+                }
+                else
+                {
+                    list.Add(new SyntaxNodeOrToken(ParseSubpatternElement()));
+                }
+
+                if (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                {
+                    var commaToken = _tokens.EatToken();
+                    list.Add(new SyntaxNodeOrToken(commaToken));
+                    if (_tokens.CurrentKind == closeKind)
+                    {
+                        if (!allowTrailingSeparator)
+                        {
+                            _diagnostics.Add(new SyntaxDiagnostic(
+                                commaToken.Span.End,
+                                "Expected subpattern after ','."));
+                            list.Add(new SyntaxNodeOrToken(CreateMissingSubpattern(commaToken.Span.End)));
+                        }
+
+                        break;
+                    }
+                    continue;
+                }
+
+                if (_tokens.CurrentKind != closeKind &&
+                    _tokens.CurrentKind != SyntaxKind.EndOfFileToken &&
+                    _tokens.CurrentKind != SyntaxKind.SemicolonToken)
+                {
+                    EatAsSkippedToken("Expected ',' or closing token in subpattern list.");
+                    continue;
+                }
+
+                if (_tokens.Position == start)
+                {
+                    EatAsSkippedToken("Parser made no progress in subpattern list parsing.");
+                    break;
+                }
+            }
+
+            closeToken = MatchToken(closeKind);
+            subpatterns = new SeparatedSyntaxList<SubpatternSyntax>(list.ToArray());
+        }
+        private SubpatternSyntax ParseSubpatternElement()
+        {
+            BaseExpressionColonSyntax? expressionColon = null;
+            var pattern = ParsePatternCore();
+
+            if (_tokens.CurrentKind == SyntaxKind.ColonToken &&
+                TryConvertPatternToExpression(pattern, out var expression))
+            {
+                var colonToken = _tokens.EatToken();
+                expressionColon = expression is IdentifierNameSyntax identifierName
+                    ? new NameColonSyntax(identifierName, colonToken)
+                    : new ExpressionColonSyntax(expression, colonToken);
+
+                pattern = ParsePatternCore();
+            }
+
+            return new SubpatternSyntax(expressionColon, pattern);
+        }
+        private SubpatternSyntax CreateMissingSubpattern(int position)
+        {
+            var expression = CreateMissingIdentifierName(position);
+            return new SubpatternSyntax(null, new ConstantPatternSyntax(expression));
+        }
+        private VariableDesignationSyntax? ParseSimplePatternDesignationIfPresent()
+        {
+            if (!CanStartSimplePatternDesignation())
+                return null;
+
+            var identifier = _tokens.EatToken();
+            if (string.Equals(identifier.ValueText, "_", StringComparison.Ordinal))
+                return new DiscardDesignationSyntax(identifier);
+
+            return new SingleVariableDesignationSyntax(identifier);
+        }
+        private bool CanStartSimplePatternDesignation()
+            => IsSimplePatternDesignationToken(_tokens.Current);
+        private static bool IsSimplePatternDesignationToken(SyntaxToken token)
+        {
+            if (token.Kind != SyntaxKind.IdentifierToken)
+                return false;
+
+            return token.ContextualKind != SyntaxKind.AndKeyword &&
+                   token.ContextualKind != SyntaxKind.OrKeyword &&
+                   token.ContextualKind != SyntaxKind.NotKeyword &&
+                   token.ContextualKind != SyntaxKind.WhenKeyword;
+        }
+        private bool TryConvertPatternToExpression(PatternSyntax pattern, out ExpressionSyntax expression)
+        {
+            switch (pattern)
+            {
+                case ConstantPatternSyntax constantPattern:
+                    expression = constantPattern.Expression;
+                    return true;
+
+                case TypePatternSyntax typePattern:
+                    return TryConvertTypeToExpression(typePattern.Type, out expression);
+
+                case DiscardPatternSyntax discardPattern:
+                    expression = new IdentifierNameSyntax(discardPattern.UnderscoreToken);
+                    return true;
+
+                default:
+                    expression = null!;
+                    return false;
+            }
+        }
+        private bool TryConvertTypeToExpression(TypeSyntax type, out ExpressionSyntax expression)
+        {
+            switch (type)
+            {
+                case SimpleNameSyntax simpleName:
+                    expression = simpleName;
+                    return true;
+
+                case QualifiedNameSyntax qualifiedName:
+                    var leftExpression = TryConvertTypeToExpression(qualifiedName.Left, out var convertedLeft)
+                        ? convertedLeft
+                        : qualifiedName.Left;
+
+                    expression = new MemberAccessExpressionSyntax(
+                        SyntaxKind.SimpleMemberAccessExpression,
+                        leftExpression,
+                        qualifiedName.DotToken,
+                        qualifiedName.Right);
+                    return true;
+
+                default:
+                    expression = null!;
+                    return false;
+            }
         }
         private bool CanStartPatternDesignation()
         {
@@ -4970,7 +6201,8 @@ namespace Cnidaria.Cs
 
             return type is IdentifierNameSyntax
                 || type is QualifiedNameSyntax
-                || type is GenericNameSyntax;
+                || type is GenericNameSyntax
+                || type is AliasQualifiedNameSyntax;
         }
         private static bool IsRelationalPatternOperator(SyntaxKind kind)
             => kind == SyntaxKind.LessThanToken ||
@@ -4996,49 +6228,103 @@ namespace Cnidaria.Cs
             return new WhenClauseSyntax(whenKeyword, condition);
         }
 
-        // heuristics
+        // Ambiguity probes and lookahead heuristics
         private bool IsLambdaExpressionStart()
         {
             return Probe(scan: ScanLambdaExpressionStart, tempContext: ParseContext.None, requireProgress: true);
         }
         private bool IsAnonymousMethodExpressionStart()
         {
-            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
-                return true;
+            return Probe(
+                scan: () =>
+                {
+                    ScanAnonymousFunctionModifiers();
+                    return _tokens.CurrentKind == SyntaxKind.DelegateKeyword;
+                },
+                tempContext: ParseContext.None,
+                requireProgress: false);
+        }
+        private bool IsDelegateDeclarationStart()
+        {
+            return Probe(
+                scan: () =>
+                {
+                    if (_tokens.CurrentKind != SyntaxKind.DelegateKeyword)
+                        return false;
 
-            if (IsCurrentContextual(SyntaxKind.AsyncKeyword) && _tokens.Peek(1).Kind == SyntaxKind.DelegateKeyword)
-                return true;
+                    _tokens.EatToken();
+                    if (_tokens.CurrentKind == SyntaxKind.AsteriskToken || !ScanType())
+                        return false;
 
-            return false;
+                    if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
+                        return false;
+
+                    _tokens.EatToken();
+                    return _tokens.CurrentKind == SyntaxKind.OpenParenToken ||
+                        _tokens.CurrentKind == SyntaxKind.LessThanToken;
+                },
+                tempContext: ParseContext.Type,
+                requireProgress: true);
         }
         private bool ScanLambdaExpressionStart()
         {
-            // optional static
-            if (_tokens.Current.Kind == SyntaxKind.StaticKeyword)
-                _tokens.EatToken();
+            while (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+                ParseAttributeList();
 
-            // optional async
-            if (IsCurrentContextual(SyntaxKind.AsyncKeyword) && _tokens.Peek(1).Kind != SyntaxKind.EqualsGreaterThanToken)
-                _tokens.EatToken();
+            ScanAnonymousFunctionModifiers();
 
-            // x =>
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
+                !IsCurrentQueryContextualKeywordInQuery() &&
                 _tokens.Peek(1).Kind == SyntaxKind.EqualsGreaterThanToken)
             {
                 _tokens.EatToken();
                 return _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken;
-            }    
+            }
 
-            // ( ... ) =>
+            var returnTypeMark = _tokens.MarkState();
+            if (ScanType() &&
+                _tokens.Current.Kind == SyntaxKind.OpenParenToken &&
+                ScanLambdaParameterList() &&
+                _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken)
+            {
+                return true;
+            }
+
+            _tokens.Reset(returnTypeMark);
+            return ScanLambdaParameterList() &&
+                _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken;
+        }
+        private void ScanAnonymousFunctionModifiers()
+        {
+            while (true)
+            {
+                if (_tokens.CurrentKind == SyntaxKind.StaticKeyword)
+                {
+                    _tokens.EatToken();
+                    continue;
+                }
+
+                if (IsCurrentContextual(SyntaxKind.AsyncKeyword) &&
+                    _tokens.Peek(1).Kind != SyntaxKind.EqualsGreaterThanToken)
+                {
+                    _tokens.EatToken();
+                    continue;
+                }
+
+                return;
+            }
+        }
+        private bool ScanLambdaParameterList()
+        {
             if (_tokens.Current.Kind != SyntaxKind.OpenParenToken)
                 return false;
 
-            _tokens.EatToken(); // '('
+            _tokens.EatToken();
 
             if (_tokens.Current.Kind == SyntaxKind.CloseParenToken)
             {
-                _tokens.EatToken(); // ')'
-                return _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken;
+                _tokens.EatToken();
+                return true;
             }
 
             if (!ScanLambdaParameter())
@@ -5054,50 +6340,83 @@ namespace Cnidaria.Cs
             if (_tokens.Current.Kind != SyntaxKind.CloseParenToken)
                 return false;
 
-            _tokens.EatToken(); // ')'
-            return _tokens.Current.Kind == SyntaxKind.EqualsGreaterThanToken;
+            _tokens.EatToken();
+            return true;
         }
         private bool ScanLambdaParameter()
         {
-            // modifiers
+            while (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+                ParseAttributeList();
+
             while (IsModifierToken(_tokens.Current, ModifierContext.Parameter))
                 _tokens.EatToken();
 
-            // Try typed
             var mark = _tokens.MarkState();
 
             if (ScanType() && _tokens.Current.Kind == SyntaxKind.IdentifierToken)
             {
                 _tokens.EatToken();
+                ScanLambdaParameterDefault();
                 return true;
             }
 
             _tokens.Reset(mark);
 
-            // Untyped
-            if (_tokens.Current.Kind != SyntaxKind.IdentifierToken)
+            if (_tokens.Current.Kind != SyntaxKind.IdentifierToken || IsCurrentQueryContextualKeywordInQuery())
                 return false;
 
             _tokens.EatToken();
+            ScanLambdaParameterDefault();
             return true;
+        }
+        private void ScanLambdaParameterDefault()
+        {
+            if (_tokens.CurrentKind == SyntaxKind.EqualsToken)
+                ParseEqualsValueClause();
+        }
+        private bool IsPossibleScopedDeclarationExpression()
+        {
+            if (!IsCurrentContextual(SyntaxKind.ScopedKeyword))
+                return false;
+
+            return Probe(
+                scan: () =>
+                {
+                    _tokens.EatToken();
+                    return ScanType() && ScanVariableDesignation();
+                },
+                tempContext: ParseContext.Type);
         }
         private bool IsOutDeclarationExpressionStart()
         {
             return Probe(
-            scan: () =>
-            {
-                if (!ScanType())
-                    return false;
+                scan: () =>
+                {
+                    if (IsCurrentContextual(SyntaxKind.ScopedKeyword))
+                    {
+                        var mark = _tokens.MarkState();
+                        _tokens.EatToken();
+                        if (ScanOutDeclarationExpressionAfterOptionalScoped())
+                            return true;
+                        _tokens.Reset(mark);
+                    }
 
-                if (!ScanVariableDesignation())
-                    return false;
+                    return ScanOutDeclarationExpressionAfterOptionalScoped();
+                },
+                tempContext: ParseContext.Type,
+                requireProgress: true);
+        }
+        private bool ScanOutDeclarationExpressionAfterOptionalScoped()
+        {
+            if (!ScanType())
+                return false;
 
-                return _tokens.CurrentKind == SyntaxKind.CommaToken ||
-                    _tokens.CurrentKind == SyntaxKind.CloseParenToken ||
-                    _tokens.CurrentKind == SyntaxKind.CloseBracketToken;
-            },
-            tempContext: ParseContext.Type,
-            requireProgress: true);
+            if (!ScanVariableDesignation())
+                return false;
+
+            return _tokens.CurrentKind == SyntaxKind.CommaToken ||
+                _tokens.CurrentKind == SyntaxKind.CloseParenToken ||
+                _tokens.CurrentKind == SyntaxKind.CloseBracketToken;
         }
         private bool ScanVariableDesignation()
         {
@@ -5131,40 +6450,53 @@ namespace Cnidaria.Cs
             return Probe(
                 scan: () =>
                 {
-                    var start = _tokens.Current;
-
-                    if (!ScanTypeNoPointerSuffix())
-                        return false;
-
-                    if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+                    if (IsCurrentContextual(SyntaxKind.ScopedKeyword))
                     {
-                        if (!(start.Kind == SyntaxKind.IdentifierToken && start.ContextualKind == SyntaxKind.VarKeyword) &&
-                            start.Kind != SyntaxKind.RefKeyword)
-                        {
-                            return false;
-                        }
-
-                        if (!ScanParenthesizedVariableDesignation())
-                            return false;
-                    }
-                    else
-                    {
-                        if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
-                            return false;
-
-                        _tokens.EatToken(); // single designation identifier
+                        var mark = _tokens.MarkState();
+                        _tokens.EatToken();
+                        if (ScanDeclarationExpressionAfterOptionalScoped())
+                            return true;
+                        _tokens.Reset(mark);
                     }
 
-                    var k = _tokens.CurrentKind;
-                    return k == SyntaxKind.CommaToken
-                        || k == SyntaxKind.CloseParenToken
-                        || k == SyntaxKind.CloseBracketToken
-                        || k == SyntaxKind.EqualsToken
-                        || k == SyntaxKind.InKeyword
-                        || k == SyntaxKind.SemicolonToken;
+                    return ScanDeclarationExpressionAfterOptionalScoped();
                 },
                 tempContext: ParseContext.Type,
                 requireProgress: true);
+        }
+        private bool ScanDeclarationExpressionAfterOptionalScoped()
+        {
+            var start = _tokens.Current;
+
+            if (!ScanTypeNoPointerSuffix())
+                return false;
+
+            if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
+            {
+                if (!(start.Kind == SyntaxKind.IdentifierToken && start.ContextualKind == SyntaxKind.VarKeyword) &&
+                    start.Kind != SyntaxKind.RefKeyword)
+                {
+                    return false;
+                }
+
+                if (!ScanParenthesizedVariableDesignation())
+                    return false;
+            }
+            else
+            {
+                if (_tokens.CurrentKind != SyntaxKind.IdentifierToken)
+                    return false;
+
+                _tokens.EatToken();
+            }
+
+            var k = _tokens.CurrentKind;
+            return k == SyntaxKind.CommaToken
+                || k == SyntaxKind.CloseParenToken
+                || k == SyntaxKind.CloseBracketToken
+                || k == SyntaxKind.EqualsToken
+                || k == SyntaxKind.InKeyword
+                || k == SyntaxKind.SemicolonToken;
         }
         private bool ScanTypeNoPointerSuffix()
         {
@@ -5205,12 +6537,12 @@ namespace Cnidaria.Cs
                 {
                     do
                     {
-                        _tokens.EatToken(); // '['
+                        _tokens.EatToken();
                         while (_tokens.Current.Kind == SyntaxKind.CommaToken)
                             _tokens.EatToken();
                         if (_tokens.Current.Kind != SyntaxKind.CloseBracketToken)
                             return false;
-                        _tokens.EatToken(); // ']'
+                        _tokens.EatToken();
                     }
                     while (_tokens.Current.Kind == SyntaxKind.OpenBracketToken);
 
@@ -5305,7 +6637,9 @@ namespace Cnidaria.Cs
             return node switch
             {
                 QualifiedNameSyntax q => ContainsGenericName(q.Left) || ContainsGenericName(q.Right),
+                AliasQualifiedNameSyntax a => ContainsGenericName(a.Name),
                 NullableTypeSyntax n => ContainsGenericName(n.ElementType),
+                ScopedTypeSyntax s => ContainsGenericName(s.Type),
                 ArrayTypeSyntax a => ContainsGenericName(a.ElementType),
                 PointerTypeSyntax p => ContainsGenericName(p.ElementType),
                 RefTypeSyntax r => ContainsGenericName(r.Type),
@@ -5338,10 +6672,12 @@ namespace Cnidaria.Cs
         {
             if (t is PredefinedTypeSyntax) return true;
             if (t is NullableTypeSyntax) return true;
+            if (t is ScopedTypeSyntax) return true;
             if (t is ArrayTypeSyntax) return true;
             if (t is RefTypeSyntax) return true;
             if (t is PointerTypeSyntax) return true;
             if (t is FunctionPointerTypeSyntax) return true;
+            if (t is AliasQualifiedNameSyntax) return true;
 
             if (ContainsGenericName(t)) return true;
 
@@ -5379,7 +6715,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
-        // tables
+        // Token classification tables
         private static bool IsExpressionTerminator(SyntaxKind kind) => kind switch
         {
             SyntaxKind.SemicolonToken => true,
@@ -5476,7 +6812,9 @@ namespace Cnidaria.Cs
                 {
                     SyntaxKind.PartialKeyword => ctx == ModifierContext.Type || ctx == ModifierContext.Member,
                     SyntaxKind.AsyncKeyword => ctx == ModifierContext.Member || ctx == ModifierContext.LocalFunction,
+                    SyntaxKind.RequiredKeyword => ctx == ModifierContext.Member,
                     SyntaxKind.ScopedKeyword => ctx == ModifierContext.Parameter,
+                    SyntaxKind.FileKeyword => ctx == ModifierContext.Type,
                     _ => false
                 };
             }
@@ -5490,7 +6828,7 @@ namespace Cnidaria.Cs
                     or SyntaxKind.UnsafeKeyword
                     or SyntaxKind.ReadOnlyKeyword // readonly struct
                     or SyntaxKind.RefKeyword      // ref struct
-                    or SyntaxKind.NewKeyword      // nested type
+                    or SyntaxKind.NewKeyword      // Nested type
                         => true,
                     _ => false
                 },
@@ -5518,6 +6856,7 @@ namespace Cnidaria.Cs
                 ModifierContext.LocalFunction => t.Kind switch
                 {
                     SyntaxKind.StaticKeyword
+                    or SyntaxKind.ExternKeyword
                     or SyntaxKind.UnsafeKeyword
                         => true,
                     _ => false
@@ -5535,7 +6874,7 @@ namespace Cnidaria.Cs
 
                 ModifierContext.Accessor => t.Kind switch
                 {
-                    SyntaxKind.PublicKeyword or SyntaxKind.PrivateKeyword or SyntaxKind.ProtectedKeyword
+                    SyntaxKind.PublicKeyword or SyntaxKind.PrivateKeyword or SyntaxKind.ProtectedKeyword or SyntaxKind.InternalKeyword
                     or SyntaxKind.InterfaceKeyword or SyntaxKind.ReadOnlyKeyword
                     => true,
                     _ => false
@@ -5554,7 +6893,9 @@ namespace Cnidaria.Cs
             _ => false
         };
         private bool IsCurrentTypeDeclarationKeyword()
-            => IsCurrentContextual(SyntaxKind.RecordKeyword) || _tokens.CurrentKind switch
+            => IsCurrentContextual(SyntaxKind.RecordKeyword)
+            || IsCurrentContextual(SyntaxKind.ExtensionKeyword)
+            || _tokens.CurrentKind switch
             {
                 SyntaxKind.ClassKeyword => true,
                 SyntaxKind.StructKeyword => true,

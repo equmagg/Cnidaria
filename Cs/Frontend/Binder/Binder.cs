@@ -2,13 +2,11 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Defines chained symbol lookup and syntax binding</summary>
+    /// <remarks>Derived binders specialize one semantic layer and delegate unresolved work to their parent</remarks>
     public abstract class Binder
     {
         public Binder? Parent { get; }
@@ -20,13 +18,19 @@ namespace Cnidaria.Cs
             Flags = flags;
         }
 
+        /// <summary>Returns symbols visible at a source position</summary>
         public abstract ImmutableArray<Symbol> LookupSymbols(int position, string? name = null);
+        /// <summary>Binds type syntax in the current context</summary>
         public abstract TypeSymbol BindType(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics);
-        // Bind layer
+        // Value binding entry points
+        /// <summary>Binds an expression and records diagnostics</summary>
         public abstract BoundExpression BindExpression(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics);
+        /// <summary>Binds a statement and records diagnostics</summary>
         public abstract BoundStatement BindStatement(StatementSyntax node, BindingContext context, DiagnosticBag diagnostics);
 
+        /// <summary>Returns the symbol declared by syntax when known</summary>
         public abstract Symbol? GetDeclaredSymbol(SyntaxNode declaration);
+        /// <summary>Determines whether a symbol or binder flags permit unsafe constructs</summary>
         internal static bool IsUnsafeContext(Symbol? symbol, BinderFlags flags = BinderFlags.None)
         {
             if ((flags & BinderFlags.UnsafeRegion) != 0)
@@ -47,11 +51,15 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+        /// <summary>Binds an expression as a namespace or type</summary>
         public virtual Symbol? BindNamespaceOrType(ExpressionSyntax expr, BindingContext context, DiagnosticBag diagnostics)
             => Parent?.BindNamespaceOrType(expr, context, diagnostics);
+        /// <summary>Returns imports active for the binding context</summary>
         internal virtual Imports GetImports(BindingContext context)
             => Parent?.GetImports(context) ?? Imports.Empty;
     }
+    /// <summary>Binds type and namespace syntax without executable semantics</summary>
+    /// <remarks>Expression and statement binding report unsupported operations</remarks>
     internal sealed class TypeBinder : Binder
     {
         private readonly Compilation _compilation;
@@ -71,6 +79,7 @@ namespace Cnidaria.Cs
         }
         public override Symbol? GetDeclaredSymbol(SyntaxNode declaration)
             => Parent?.GetDeclaredSymbol(declaration);
+        /// <summary>Binds an attribute name with optional Attribute suffix lookup</summary>
         internal TypeSymbol BindAttributeType(NameSyntax name, BindingContext context, DiagnosticBag diagnostics)
             => BindNameType(name, context, diagnostics, allowAttributeSuffix: true, allowTypeParameterLookup: false);
         public override BoundExpression BindExpression(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -88,6 +97,7 @@ namespace Cnidaria.Cs
                 new Location(context.SemanticModel.SyntaxTree, node.Span)));
             return new BoundBadStatement(node);
         }
+        /// <summary>Binds supported type syntax and returns an error type on failure</summary>
         public override TypeSymbol BindType(TypeSyntax? syntax, BindingContext context, DiagnosticBag diagnostics)
         {
 
@@ -104,6 +114,9 @@ namespace Cnidaria.Cs
 
                 case RefTypeSyntax rt:
                     return BindRefType(rt, context, diagnostics);
+
+                case ScopedTypeSyntax st:
+                    return BindType(st.Type, context, diagnostics);
 
                 case PointerTypeSyntax pt:
                     return BindPointerType(pt, context, diagnostics);
@@ -157,6 +170,7 @@ namespace Cnidaria.Cs
                 new Location(context.SemanticModel.SyntaxTree, p.Span)));
             return new ErrorTypeSymbol("type", containing: null, ImmutableArray<Location>.Empty);
         }
+        // Reference annotations preserve the underlying type while value types construct Nullable<T>
         private TypeSymbol BindNullableType(NullableTypeSyntax nt, BindingContext context, DiagnosticBag diagnostics)
         {
             if (nt.ElementType is NullableTypeSyntax)
@@ -244,6 +258,7 @@ namespace Cnidaria.Cs
             return def.ContainingSymbol is NamespaceSymbol ns
                 && string.Equals(ns.Name, "System", StringComparison.Ordinal);
         }
+        /// <summary>Resolves System.Nullable&lt;T&gt; or reports a missing predefined type</summary>
         internal static NamedTypeSymbol GetSystemNullableDefinitionOrReport(
             BindingContext context, DiagnosticBag diagnostics, SyntaxNode diagnosticNode)
         {
@@ -608,6 +623,7 @@ namespace Cnidaria.Cs
             }
             return b.ToImmutable();
         }
+        /// <summary>Resolves a qualified type name through lexical scopes and imports</summary>
         private TypeSymbol BindNameType(
             NameSyntax name,
             BindingContext context,
@@ -636,7 +652,7 @@ namespace Cnidaria.Cs
             {
                 var nextSet = CollectNext(currentSet, part.Name, part.Arity, hasTypeArgs, boundTypeArgs, context);
 
-                // Attribute lookup
+                // Retry attribute names with the conventional suffix
                 if (nextSet.Count == 0 &&
                     allowAttributeSuffix &&
                     !hasTypeArgs &&
@@ -761,6 +777,7 @@ namespace Cnidaria.Cs
             return new ErrorTypeSymbol("not-a-type", containing: null, ImmutableArray<Location>.Empty);
         }
 
+        /// <summary>Resolves a qualified expression as a namespace or type symbol</summary>
         public override Symbol? BindNamespaceOrType(ExpressionSyntax expr, BindingContext context, DiagnosticBag diagnostics)
         {
             var imports = GetImports(context);
@@ -946,9 +963,10 @@ namespace Cnidaria.Cs
                     return;
             list.Add(sym);
         }
+        // Lookup proceeds from lexical containers through imports to the global namespace
         private void BuildRootLayers(BindingContext context, Imports imports, List<Symbol> layer0, List<Symbol> layer1, List<Symbol> layer2)
         {
-            // Enclosing types
+            // Lexically enclosing types and namespaces
             for (Symbol? s = context.ContainingSymbol; s != null; s = s.ContainingSymbol)
             {
                 if (s is NamedTypeSymbol nt)
@@ -962,15 +980,15 @@ namespace Cnidaria.Cs
                     AddUnique(layer0, n);
             }
 
-            // Imported containers
+            // Imported namespace and type containers
             for (int i = 0; i < imports.Containers.Length; i++)
                 AddUnique(layer1, imports.Containers[i]);
 
-            // using static
+            // Statically imported types
             for (int i = 0; i < imports.StaticTypes.Length; i++)
                 AddUnique(layer1, imports.StaticTypes[i]);
 
-            // Global
+            // Global namespace fallback
             AddUnique(layer2, _compilation.GlobalNamespace);
         }
         private bool TryAddMergedEnclosingNamespaces(Symbol? containing, List<Symbol> layer0)
@@ -1010,6 +1028,7 @@ namespace Cnidaria.Cs
             AddUnique(layer0, _compilation.GlobalNamespace);
             return true;
         }
+        // Advance one qualified name part through namespaces and nested types
         private List<Symbol> CollectNext(
             List<Symbol> current,
             string name,
@@ -1052,6 +1071,7 @@ namespace Cnidaria.Cs
             }
             return next;
         }
+        // One syntactic segment of a qualified type name
         private readonly struct NamePart
         {
             public readonly string Name;
@@ -1066,6 +1086,7 @@ namespace Cnidaria.Cs
                 TypeArgListOpt = typeArgListOpt;
             }
         }
+        // One syntactic segment of a namespace-or-type expression
         private readonly struct ExprPart
         {
             public readonly string Name;

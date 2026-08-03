@@ -6,6 +6,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    /// <summary>Produces typed bound nodes from a semantic model</summary>
     public sealed class Binder
     {
         private readonly SemanticModel _semanticModel;
@@ -25,6 +26,7 @@ namespace Cnidaria.C
             _compilation = semanticModel.Compilation;
         }
 
+        /// <summary>Binds one semantic model into an immutable tree</summary>
         public static BoundTree BindTree(SemanticModel semanticModel)
         {
             var binder = new Binder(semanticModel);
@@ -36,6 +38,8 @@ namespace Cnidaria.C
 
             return new BoundTree(semanticModel, root, diagnostics.ToImmutable());
         }
+
+        // Top-level members
 
         private BoundTranslationUnit BindTranslationUnit(TranslationUnitSyntax syntax)
         {
@@ -72,6 +76,7 @@ namespace Cnidaria.C
             var previousLabels = _currentLabels;
 
             _currentFunction = symbol;
+            // Labels are function scoped and may be referenced before declaration
             _currentLabels = BuildLabelMap(syntax.Body);
 
             var body = BindCompoundStatement(syntax.Body);
@@ -235,10 +240,12 @@ namespace Cnidaria.C
                 case InitializerListSyntax initializerList:
                     {
                         var items = ImmutableArray.CreateBuilder<BoundInitializerListItem>();
+                        int nextField = 0;
 
                         foreach (var item in initializerList.Items)
                         {
-                            var boundItemInitializer = BindInitializer(item.Initializer, targetType);
+                            var itemTargetType = GetInitializerItemTargetType(targetType, item, ref nextField);
+                            var boundItemInitializer = BindInitializer(item.Initializer, itemTargetType);
                             items.Add(new BoundInitializerListItem(item, boundItemInitializer));
                         }
 
@@ -248,6 +255,80 @@ namespace Cnidaria.C
                 default:
                     throw new InvalidOperationException($"Unexpected initializer syntax: {syntax.GetType().Name}");
             }
+        }
+
+        private QualifiedType GetInitializerItemTargetType(QualifiedType targetType, InitializerListItemSyntax item, ref int nextField)
+        {
+            if (item.Designators.IsDefaultOrEmpty)
+            {
+                switch (targetType.Type)
+                {
+                    case ArrayType arrayType:
+                        return arrayType.ElementType;
+
+                    case TagType structTagType when structTagType.Symbol.TagKind == TagKind.Struct:
+                        if (nextField < structTagType.Symbol.Fields.Length)
+                            return structTagType.Symbol.Fields[nextField++].Type;
+
+                        return ErrorType;
+
+                    case TagType unionTagType when unionTagType.Symbol.TagKind == TagKind.Union:
+                        return unionTagType.Symbol.Fields.Length != 0
+                            ? unionTagType.Symbol.Fields[0].Type
+                            : ErrorType;
+
+                    default:
+                        return targetType;
+                }
+            }
+
+            if (targetType.Type is TagType rootTagType &&
+                rootTagType.Symbol.TagKind == TagKind.Struct &&
+                item.Designators[0] is FieldDesignatorSyntax firstFieldDesignator &&
+                rootTagType.Symbol.TryGetField(firstFieldDesignator.NameToken.Text, out var firstField) &&
+                firstField is not null)
+            {
+                nextField = Math.Min(firstField.Ordinal + 1, rootTagType.Symbol.Fields.Length);
+            }
+
+            var itemTargetType = targetType;
+            foreach (var designator in item.Designators)
+            {
+                switch (designator)
+                {
+                    case ArrayDesignatorSyntax arrayDesignator:
+                        if (itemTargetType.Type is ArrayType designatedArray)
+                        {
+                            itemTargetType = designatedArray.ElementType;
+                        }
+                        else
+                        {
+                            Report(
+                                $"Array designator cannot be applied to object of type '{itemTargetType.ToDisplayString()}'.",
+                                arrayDesignator.OpenBracketToken.Span);
+                            return ErrorType;
+                        }
+                        break;
+
+                    case FieldDesignatorSyntax fieldDesignator:
+                        if (itemTargetType.Type is TagType tagType &&
+                            tagType.Symbol.TagKind is TagKind.Struct or TagKind.Union &&
+                            TryLookupField(tagType.Symbol, fieldDesignator.NameToken.Text, out var field))
+                        {
+                            itemTargetType = field.Type;
+                        }
+                        else
+                        {
+                            Report(
+                                $"Field designator '{fieldDesignator.NameToken.Text}' cannot be applied to object of type '{itemTargetType.ToDisplayString()}'.",
+                                fieldDesignator.NameToken.Span);
+                            return ErrorType;
+                        }
+                        break;
+                }
+            }
+
+            return itemTargetType;
         }
 
         private static bool IsNarrowStringArrayInitializer(QualifiedType targetType, BoundExpression expression)
@@ -284,6 +365,8 @@ namespace Cnidaria.C
 
             return new BoundStaticAssertDeclaration(syntax, condition, message);
         }
+
+        // Statements
 
         private BoundStatement BindStatement(StatementSyntax syntax)
         {
@@ -683,6 +766,7 @@ namespace Cnidaria.C
             if (!syntax.IsGoto && labels.Count != 0)
                 Report("Inline assembly label lists require the 'goto' qualifier.", syntax.AsmKeyword.Span);
 
+            // Assembly without outputs is implicitly volatile
             return new BoundAsmStatement(
                 syntax,
                 syntax.Text,
@@ -748,6 +832,8 @@ namespace Cnidaria.C
 
             return condition;
         }
+
+        // Expressions
 
         private BoundExpression BindExpression(ExpressionSyntax syntax)
         {
@@ -878,6 +964,15 @@ namespace Cnidaria.C
             {
                 Report($"Undefined identifier '{syntax.IdentifierToken.Text}'.", syntax.IdentifierToken.Span);
                 return new BoundNameExpression(syntax, ErrorSymbol.Instance, ErrorType, BoundValueKind.Error);
+            }
+            if (symbol is EnumConstantSymbol enumConstant)
+            {
+                return new BoundNameExpression(
+                    syntax,
+                    enumConstant,
+                    enumConstant.Type,
+                    BoundValueKind.RValue,
+                    enumConstant.Value);
             }
 
             if (symbol is TypeAliasSymbol)
@@ -1023,6 +1118,7 @@ namespace Cnidaria.C
             var right = ApplyDefaultConversions(BindExpression(syntax.Right));
 
             var resultType = BindBinaryResultType(syntax.OperatorToken, left, right);
+            // Operand conversions depend on the resolved result type
             ApplyBinaryOperandConversions(syntax.OperatorToken, ref left, ref right, resultType);
             return new BoundBinaryExpression(
                 syntax,
@@ -1402,6 +1498,7 @@ namespace Cnidaria.C
                     arguments[i] = ConvertCallArgument(argument, parameterType);
                 }
             }
+            // Variadic arguments beyond the fixed list receive default promotions
             if (functionType.IsVariadic)
                 ApplyDefaultArgumentPromotions(arguments, fixedCount);
         }
@@ -1569,6 +1666,7 @@ namespace Cnidaria.C
                 return true;
             }
 
+            // Unnamed aggregate fields expose members recursively
             foreach (var anonymousField in tag.Fields)
             {
                 if (anonymousField.Name.Length != 0 ||
@@ -1587,6 +1685,8 @@ namespace Cnidaria.C
             field = null!;
             return false;
         }
+
+        // Conversions and type relations
 
         private BoundExpression ApplyDefaultConversions(BoundExpression expression)
         {
@@ -1631,6 +1731,7 @@ namespace Cnidaria.C
             if (tokens.IsDefaultOrEmpty)
                 return ErrorType;
 
+            // Type names reuse declaration parsing with an abstract declarator
             SplitTypeNameTokens(tokens, scope, out var specifierTokens, out var declaratorTokens);
 
             if (specifierTokens.Length == 0)
@@ -2047,6 +2148,8 @@ namespace Cnidaria.C
             return left.ToDisplayString() == right.ToDisplayString();
         }
 
+        // Literal typing and parsing
+
         private QualifiedType InferIntegerLiteralType(string text, out object? value)
         {
             value = TryParseIntegerLiteral(text, out var parsed) ? parsed : null;
@@ -2160,11 +2263,14 @@ namespace Cnidaria.C
             return text.Substring(0, end);
         }
 
+        // Function control flow
+
         private void AnalyzeFunctionControlFlow(FunctionSymbol? function, BoundCompoundStatement body)
         {
             ControlFlowAnalyzer.Analyze(function, body, Report, ReportWarning);
         }
 
+        /// <summary>Tracks case values and the default label for one switch</summary>
         private sealed class SwitchContext
         {
             private readonly Dictionary<long, CaseStatementSyntax> _caseLabels = new();
@@ -2190,6 +2296,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Summarizes fallthrough break and continue paths</summary>
         private readonly struct FlowResult
         {
             public bool CanFallThrough { get; }
@@ -2215,6 +2322,7 @@ namespace Cnidaria.C
                     left.HasContinue || right.HasContinue);
         }
 
+        /// <summary>Reports unreachable code and missing function returns</summary>
         private sealed class ControlFlowAnalyzer
         {
             private readonly Action<string, TextSpan> _reportError;
@@ -2244,6 +2352,7 @@ namespace Cnidaria.C
 
             private void AnalyzeFunction(FunctionSymbol? function, BoundCompoundStatement body)
             {
+                // Reachable goto targets form a fixed point
                 do
                 {
                     _gotoTargetSetChanged = false;
@@ -2253,11 +2362,12 @@ namespace Cnidaria.C
                 }
                 while (_gotoTargetSetChanged);
 
+                // Diagnostics are emitted only after the target set stabilizes
                 _collectGotoTargets = false;
                 _reportUnreachable = true;
                 var result = AnalyzeCompound(body, isReachable: true);
 
-                if (RequiresReturnValue(function) && result.CanFallThrough)
+                if (RequiresExplicitReturn(function) && result.CanFallThrough)
                 {
                     _reportError(
                         "Not all control paths return a value.",
@@ -2265,14 +2375,25 @@ namespace Cnidaria.C
                 }
             }
 
-            private static bool RequiresReturnValue(FunctionSymbol? function)
+            private static bool RequiresExplicitReturn(FunctionSymbol? function)
             {
                 var returnType = function?.FunctionType?.ReturnType;
                 if (!returnType.HasValue || returnType.Value.IsError)
                     return false;
 
-                return returnType.Value.Type is not BuiltinType builtin ||
-                       builtin.BuiltinKind != BuiltinTypeKind.Void;
+                if (returnType.Value.Type is BuiltinType builtin)
+                {
+                    if (builtin.BuiltinKind == BuiltinTypeKind.Void)
+                        return false;
+
+                    if (builtin.BuiltinKind == BuiltinTypeKind.Int &&
+                        string.Equals(function?.Name, "main", StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             }
 
             private FlowResult AnalyzeNode(BoundNode node, bool isReachable)
@@ -2413,6 +2534,7 @@ namespace Cnidaria.C
                 FlowResult bodyResult;
                 try
                 {
+                    // Case and default labels reintroduce reachability into the body
                     bodyResult = AnalyzeStatement(switchStatement.Statement, isReachable: false);
                 }
                 finally
@@ -2584,6 +2706,8 @@ namespace Cnidaria.C
                     _reportWarning("Unreachable code.", SpanOf(node.Syntax));
             }
         }
+
+        // Constant evaluation
 
         private static bool? TryGetKnownBool(BoundExpression expression)
         {
@@ -2850,6 +2974,8 @@ namespace Cnidaria.C
                 ? value
                 : null;
         }
+
+        // Diagnostics
 
         private void Report(string message, TextSpan span)
             => _diagnostics.Add(SemanticDiagnostic.Error(message, span));

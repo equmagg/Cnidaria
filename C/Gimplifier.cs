@@ -7,9 +7,12 @@ using System.Text;
 
 namespace Cnidaria.C
 {
+    /// <summary>Lowers bound declarations and expressions into explicit blocks and temporaries</summary>
     internal sealed class Gimplifier
     {
         private readonly TypeCatalog _types = TypeCatalog.Instance;
+
+        // Function-local lowering state is reset before each definition
         private readonly Dictionary<LabelSymbol, GimpleLabel> _labels = new();
         private readonly Stack<GimpleLabel> _breakTargets = new();
         private readonly Stack<GimpleLabel> _continueTargets = new();
@@ -26,6 +29,7 @@ namespace Cnidaria.C
         {
         }
 
+        /// <summary>Lowers a semantic model into a lowered tree</summary>
         internal static GimpleTree Lower(SemanticModel semanticModel)
         {
             if (semanticModel is null)
@@ -34,6 +38,8 @@ namespace Cnidaria.C
             return Lower(semanticModel.GetBoundTree());
         }
 
+        /// <summary>Lowers all bound top-level members</summary>
+        /// <remarks>Preserves source order</remarks>
         private static GimpleTree Lower(BoundTree boundTree)
         {
             if (boundTree is null)
@@ -98,6 +104,7 @@ namespace Cnidaria.C
                 declarator.Syntax);
         }
 
+        // Global initializers are represented without emitting function statements
         private GimpleInitializer LowerInitializerForDeclaration(BoundInitializer initializer)
         {
             switch (initializer)
@@ -133,6 +140,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Lowers one function into labeled blocks and allocated temporaries</summary>
         private GimpleFunctionDefinition LowerFunction(BoundFunctionDefinition function)
         {
             ResetFunctionState(function.Symbol);
@@ -142,7 +150,18 @@ namespace Cnidaria.C
             LowerCompoundStatement(function.Body);
 
             if (!IsCurrentBlockTerminated())
-                Emit(new GimpleReturnStatement(function.Symbol, expression: null, function.Syntax));
+            {
+                GimpleValue? expression = null;
+                var returnType = function.Symbol?.FunctionType?.ReturnType;
+                if (returnType.HasValue &&
+                    returnType.Value.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Int } &&
+                    string.Equals(function.Symbol?.Name, "main", StringComparison.Ordinal))
+                {
+                    expression = CreateZeroValue(returnType.Value, function.Syntax);
+                }
+
+                Emit(new GimpleReturnStatement(function.Symbol, expression, function.Syntax));
+            }
 
             var blocks = _blocks.Select(static block => block.ToImmutable()).ToImmutableArray();
             return new GimpleFunctionDefinition(
@@ -270,6 +289,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Lowers assembly operands and creates a fallthrough block for goto assembly</summary>
         private void LowerAsmStatement(BoundAsmStatement statement)
         {
             var outputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
@@ -321,6 +341,7 @@ namespace Cnidaria.C
                 LowerNode(member);
         }
 
+        // Emit storage declarations before executable initialization
         private void LowerLocalDeclaration(BoundDeclaration declaration)
         {
             foreach (var declarator in declaration.Declarators)
@@ -336,6 +357,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Emits executable initialization for a local place</summary>
         private void LowerInitializer(GimplePlace target, BoundInitializer initializer)
         {
             switch (initializer)
@@ -362,6 +384,7 @@ namespace Cnidaria.C
             }
         }
 
+        // Zero-fill first so truncation and the optional terminator need no special tail handling
         private void LowerStringArrayInitializer(GimplePlace target, ArrayType arrayType, string text, SyntaxNode? syntax)
         {
             EmitZeroInitialize(target, syntax);
@@ -381,6 +404,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Zero-fills the destination then applies initializer items in source order</summary>
         private void LowerInitializerList(GimplePlace target, BoundInitializerList initializer)
         {
             EmitZeroInitialize(target, initializer.Syntax);
@@ -535,6 +559,7 @@ namespace Cnidaria.C
                    tagType.Symbol.TagKind is TagKind.Struct or TagKind.Union;
         }
 
+        /// <summary>Resolves a designator chain into a nested assignable place</summary>
         private bool TryApplyDesignators(
             GimplePlace root,
             QualifiedType rootType,
@@ -582,6 +607,7 @@ namespace Cnidaria.C
             return true;
         }
 
+        /// <summary>Finds a direct or anonymous aggregate field path by name</summary>
         private static bool TryFindFieldPath(QualifiedType aggregateType, string name, out ImmutableArray<FieldSymbol> path)
         {
             path = ImmutableArray<FieldSymbol>.Empty;
@@ -600,6 +626,7 @@ namespace Cnidaria.C
             return path.Length != 0;
         }
 
+        // Track visited tags so recursive anonymous aggregates cannot cycle
         private static bool TryFindFieldPath(
             TagSymbol tag,
             string name,
@@ -695,6 +722,7 @@ namespace Cnidaria.C
                    TryEvaluateIntegerConstantExpression(arrayDesignator.Expression, out index);
         }
 
+        // Emit explicit branch targets and a common continuation block
         private void LowerIfStatement(BoundIfStatement statement)
         {
             var thenLabel = CreateGeneratedLabel("if_then");
@@ -719,6 +747,7 @@ namespace Cnidaria.C
             StartBlock(endLabel);
         }
 
+        // Continue targets the test block while break targets the continuation
         private void LowerWhileStatement(BoundWhileStatement statement)
         {
             var testLabel = CreateGeneratedLabel("while_test");
@@ -742,6 +771,7 @@ namespace Cnidaria.C
             StartBlock(endLabel);
         }
 
+        // The body precedes the test so the first iteration is unconditional
         private void LowerDoStatement(BoundDoStatement statement)
         {
             var bodyLabel = CreateGeneratedLabel("do_body");
@@ -763,6 +793,7 @@ namespace Cnidaria.C
             StartBlock(endLabel);
         }
 
+        // Continue targets the increment block
         private void LowerForStatement(BoundForStatement statement)
         {
             var testLabel = CreateGeneratedLabel("for_test");
@@ -800,6 +831,7 @@ namespace Cnidaria.C
             StartBlock(endLabel);
         }
 
+        // Collect labels before lowering the body so forward case edges are stable
         private void LowerSwitchStatement(BoundSwitchStatement statement)
         {
             var endLabel = CreateGeneratedLabel("switch_end");
@@ -830,6 +862,7 @@ namespace Cnidaria.C
             Emit(new GimpleReturnStatement(statement.Function ?? _currentFunction, expression, statement.Syntax));
         }
 
+        /// <summary>Lowers a static expression without emitting function statements</summary>
         private GimpleValue LowerStaticExpression(BoundExpression expression)
         {
             if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
@@ -841,6 +874,8 @@ namespace Cnidaria.C
             return LowerExpressionNoEmit(expression);
         }
 
+        /// <summary>Builds a side-effect-free lowered value for static contexts</summary>
+        /// <remarks>Unsupported forms become error values</remarks>
         private GimpleValue LowerExpressionNoEmit(BoundExpression expression)
         {
             switch (expression)
@@ -929,6 +964,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Builds an assignable place without emitting statements</summary>
         private GimplePlace LowerPlaceNoEmit(BoundExpression expression)
         {
             switch (expression)
@@ -966,6 +1002,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Lowers an expression when its resulting value is discarded</summary>
         private void LowerExpressionForSideEffects(BoundExpression expression)
         {
             switch (expression)
@@ -1049,6 +1086,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Lowers an expression while preserving sequencing and value semantics</summary>
         private GimpleValue LowerRValue(BoundExpression expression)
         {
             switch (expression)
@@ -1084,6 +1122,9 @@ namespace Cnidaria.C
         {
             if (expression.Symbol is null)
                 return new GimpleErrorValue(expression.Syntax);
+
+            if (expression.Symbol is EnumConstantSymbol enumConstant)
+                return new GimpleConstantValue(enumConstant.Value, expression.Type, expression.Syntax);
 
             return new GimpleSymbolValue(expression.Symbol, expression.Type, expression.Syntax);
         }
@@ -1129,6 +1170,7 @@ namespace Cnidaria.C
             }
         }
 
+        // Prefix update returns the modified place
         private GimpleValue LowerPrefixIncrement(BoundUnaryExpression expression)
         {
             var target = LowerPlace(expression.Operand);
@@ -1147,6 +1189,7 @@ namespace Cnidaria.C
             return target;
         }
 
+        // Materialize the old value before updating the place
         private GimpleValue LowerPostfixUnaryExpression(BoundPostfixUnaryExpression expression)
         {
             var target = LowerPlace(expression.Operand);
@@ -1185,6 +1228,7 @@ namespace Cnidaria.C
                 expression.Syntax));
         }
 
+        /// <summary>Emits a store and returns the assigned place as the expression value</summary>
         private GimpleValue LowerAssignmentExpression(BoundAssignmentExpression expression)
         {
             var target = LowerPlace(expression.Left);
@@ -1209,6 +1253,7 @@ namespace Cnidaria.C
             return target;
         }
 
+        /// <summary>Converts conditional evaluation into branches assigning one result temporary</summary>
         private GimpleValue LowerConditionalExpressionToValue(BoundExpression expression)
         {
             var result = CreateTemporary(expression.Type, expression.Syntax);
@@ -1290,6 +1335,7 @@ namespace Cnidaria.C
             return target;
         }
 
+        // Only the final expression statement contributes the extension value
         private GimpleValue LowerStatementExpression(BoundStatementExpression expression)
         {
             var members = expression.Statement.Members;
@@ -1319,6 +1365,7 @@ namespace Cnidaria.C
                 expression.Type,
                 expression.Syntax);
         }
+        // Preserve direct function references without materializing the callee
         private GimpleValue LowerCallCalleeExpression(BoundExpression expression)
         {
             switch (expression)
@@ -1364,6 +1411,7 @@ namespace Cnidaria.C
                 expression.Syntax);
         }
 
+        /// <summary>Lowers an assignable expression and recovers with a temporary when needed</summary>
         private GimplePlace LowerPlace(BoundExpression expression)
         {
             switch (expression)
@@ -1395,6 +1443,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Emits short-circuit control flow for a condition</summary>
         private void EmitConditional(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
         {
             switch (condition)
@@ -1446,6 +1495,7 @@ namespace Cnidaria.C
                 condition.Syntax));
         }
 
+        /// <summary>Stores a non-temporary value once and returns its temporary</summary>
         private GimpleTemporaryValue Materialize(GimpleValue value)
         {
             if (value is GimpleTemporaryValue temporary)
@@ -1469,6 +1519,7 @@ namespace Cnidaria.C
         private GimpleConstantValue CreateIntegerOne(QualifiedType type, SyntaxNode? syntax)
             => new GimpleConstantValue(1, type.IsError ? _types.Builtin(BuiltinTypeKind.Int) : type, syntax);
 
+        // Statements after a terminator begin a distinct unreachable block
         private void Emit(GimpleStatement statement)
         {
             if (_currentBlock is null || _currentBlock.HasTerminator)
@@ -1477,6 +1528,7 @@ namespace Cnidaria.C
             _currentBlock!.Statements.Add(statement);
         }
 
+        // Preserve fallthrough explicitly when the previous block has no terminator
         private void StartBlock(GimpleLabel label)
         {
             if (label is null)
@@ -1530,6 +1582,7 @@ namespace Cnidaria.C
             return CreateGeneratedLabel("default");
         }
 
+        /// <summary>Collects case labels owned by one switch while skipping nested switches</summary>
         private SwitchLabels CollectSwitchLabels(BoundStatement statement)
         {
             var cases = ImmutableArray.CreateBuilder<GimpleSwitchCase>();
@@ -1595,6 +1648,7 @@ namespace Cnidaria.C
             return CreateGeneratedLabel("logical_false");
         }
 
+        /// <summary>Evaluates the supported bound integer constant expression subset</summary>
         private static bool TryEvaluateIntegerConstantValue(BoundExpression expression, out long value)
         {
             switch (expression)
@@ -1628,6 +1682,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Evaluates the supported syntax-only integer constant expression subset</summary>
         private static bool TryEvaluateIntegerConstantExpression(ExpressionSyntax expression, out long value)
         {
             switch (expression)
@@ -1685,6 +1740,7 @@ namespace Cnidaria.C
             return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
         }
 
+        // Checked arithmetic turns overflow into a failed constant evaluation
         private static bool TryEvaluateUnaryIntegerConstant(SyntaxKind operatorKind, long operand, out long value)
         {
             value = 0;
@@ -1750,6 +1806,7 @@ namespace Cnidaria.C
             return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
         }
 
+        // Reject invalid shifts, division by zero, and arithmetic overflow
         private static bool TryEvaluateBinaryIntegerConstant(
             long left,
             SyntaxKind operatorKind,
@@ -1910,6 +1967,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Parses decimal, hexadecimal, or octal integer spelling into a signed value</summary>
         private static bool TryParseIntegerLiteral(string text, out long value)
         {
             value = 0;
@@ -2019,6 +2077,7 @@ namespace Cnidaria.C
                 ImmutableArray<SyntaxTrivia>.Empty);
         }
 
+        /// <summary>Tracks labels active while lowering one switch body</summary>
         private sealed class SwitchContext
         {
             public GimpleLabel BreakLabel { get; }
@@ -2036,6 +2095,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Stores labels collected before a switch body is emitted</summary>
         private readonly struct SwitchLabels
         {
             public ImmutableArray<GimpleSwitchCase> Cases { get; }
@@ -2053,6 +2113,7 @@ namespace Cnidaria.C
             }
         }
 
+        /// <summary>Accumulates statements for one basic block</summary>
         private sealed class BlockBuilder
         {
             public GimpleLabel Label { get; }

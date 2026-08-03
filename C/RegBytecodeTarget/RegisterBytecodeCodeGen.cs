@@ -55,8 +55,9 @@ namespace Cnidaria.C
 
             modules.Add(stdModule.Name, stdModule);
 
+            target ??= TargetInfo.Default;
             var runtimeTypes = new RuntimeTypeSystem(modules);
-            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId, target ?? TargetInfo.Default);
+            RegisterSyntheticRuntimeMethods(runtimeTypes, methodIds, signaturesByMethodId, printfMethodId, target);
             return new RegisterBytecodeSyntheticRuntime(runtimeTypes, modules, entryPc);
         }
 
@@ -219,6 +220,18 @@ namespace Cnidaria.C
         }
     }
 
+    internal sealed class RegisterBytecodeCompilationUnit
+    {
+        public LirModule Module { get; }
+        public FileScopeLinkageMap Linkage { get; }
+
+        public RegisterBytecodeCompilationUnit(LirModule module, FileScopeLinkageMap linkage)
+        {
+            Module = module ?? throw new ArgumentNullException(nameof(module));
+            Linkage = linkage ?? throw new ArgumentNullException(nameof(linkage));
+        }
+    }
+
     public sealed class RegisterBytecodeCodeGenerator
     {
         public const int FirstCMethodId = 10_000_000;
@@ -233,45 +246,92 @@ namespace Cnidaria.C
         private static readonly MachineRegister FpScratch1 = MachineRegister.F1;
         private static readonly MachineRegister FpScratch2 = MachineRegister.F2;
 
-        private readonly LirModule _module;
+        private readonly ImmutableArray<RegisterBytecodeCompilationUnit> _units;
         private readonly TargetInfo _target;
         private readonly LSRAOptions _allocationOptions;
+        private readonly string _entryFunctionName;
         private Assembler _assembler = null!;
         private RuntimeTypeSystem _runtimeTypes = null!;
         private RegisterBytecodeSyntheticRuntime _syntheticRuntime = null!;
         private readonly Dictionary<FunctionSymbol, int> _methodIds = new Dictionary<FunctionSymbol, int>();
-        private readonly Dictionary<string, int> _methodIdsByName = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> _externalMethodIdsByName = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly Dictionary<(int UnitIndex, string Name), int> _internalMethodIdsByName = new Dictionary<(int UnitIndex, string Name), int>();
+        private readonly Dictionary<Symbol, GlobalStorage> _globalStorageBySymbol = new Dictionary<Symbol, GlobalStorage>();
+        private readonly Dictionary<string, GlobalStorage> _externalGlobalStorageByName = new Dictionary<string, GlobalStorage>(StringComparer.Ordinal);
+        private readonly Dictionary<(int UnitIndex, string Name), GlobalStorage> _internalGlobalStorageByName = new Dictionary<(int UnitIndex, string Name), GlobalStorage>();
         private readonly Dictionary<int, FunctionType?> _signatures = new Dictionary<int, FunctionType?>();
         private readonly Dictionary<int, RuntimeMethod> _runtimeMethodsById = new Dictionary<int, RuntimeMethod>();
         private readonly Dictionary<int, Label> _methodEntryLabels = new Dictionary<int, Label>();
         private readonly List<FunctionPointerFixup> _functionPointerFixups = new List<FunctionPointerFixup>();
+        private int _entryMethodId;
+        private int _writableGlobalDataBlobOffset = -1;
+        private int _writableGlobalDataSize;
 
-        private RegisterBytecodeCodeGenerator(LirModule module, LSRAOptions? allocationOptions)
+        private RegisterBytecodeCodeGenerator(
+            ImmutableArray<RegisterBytecodeCompilationUnit> units,
+            string entryFunctionName,
+            LSRAOptions? allocationOptions)
         {
-            _module = module ?? throw new ArgumentNullException(nameof(module));
-            _target = module.SemanticModel.Compilation.Options.Target;
+            if (units.IsDefaultOrEmpty)
+                throw new ArgumentException("At least one register-bytecode compilation unit is required.", nameof(units));
+
+            _units = units;
+            _target = units[0].Module.SemanticModel.Compilation.Options.Target;
+            _entryFunctionName = string.IsNullOrWhiteSpace(entryFunctionName)
+                ? throw new ArgumentException("The entry function name cannot be empty.", nameof(entryFunctionName))
+                : entryFunctionName;
             _allocationOptions = allocationOptions ?? LSRAOptions.Default;
+
+            foreach (var unit in units)
+            {
+                var target = unit.Module.SemanticModel.Compilation.Options.Target;
+                if (target.Architecture != _target.Architecture ||
+                    target.ArchitectureFeatures != _target.ArchitectureFeatures ||
+                    target.OperatingSystem != _target.OperatingSystem ||
+                    target.PointerSize != _target.PointerSize ||
+                    target.PointerAlignment != _target.PointerAlignment ||
+                    target.Endianness != _target.Endianness)
+                {
+                    throw new ArgumentException("All register-bytecode compilation units must use the same target.", nameof(units));
+                }
+            }
         }
 
         public static RegisterBytecodeProgram Generate(LirModule module, LSRAOptions? allocationOptions = null)
-            => new RegisterBytecodeCodeGenerator(module, allocationOptions).Generate();
+        {
+            if (module is null)
+                throw new ArgumentNullException(nameof(module));
+
+            var unit = new RegisterBytecodeCompilationUnit(module, FileScopeLinkageMap.Create(module.SemanticModel));
+            return new RegisterBytecodeCodeGenerator(ImmutableArray.Create(unit), "main", allocationOptions).Generate();
+        }
+
+        internal static RegisterBytecodeProgram Generate(
+            ImmutableArray<RegisterBytecodeCompilationUnit> units,
+            string entryFunctionName,
+            LSRAOptions? allocationOptions = null)
+            => new RegisterBytecodeCodeGenerator(units, entryFunctionName, allocationOptions).Generate();
 
         private RegisterBytecodeProgram Generate()
         {
-            if (_target.Architecture != TargetArchitectureKind.RegisterBytecode)
-                throw new NotSupportedException($"Register-bytecode C backend cannot emit target architecture '{_target.Architecture}'. Use TargetInfo.RegisterBytecode for this backend.");
+            if (!_target.IsRegisterBytecode)
+                throw new NotSupportedException($"Register-bytecode C backend cannot emit target architecture '{_target.Architecture}'.");
 
             if (_target.PointerSize != TargetArchitecture.PointerSize)
                 throw new NotSupportedException($"Register-bytecode C backend currently supports only the VM native pointer size ({TargetArchitecture.PointerSize.ToString(CultureInfo.InvariantCulture)} bytes).");
 
             IndexMethods();
-            var entryMethodId = ResolveEntryMethodId();
+            _entryMethodId = ResolveEntryMethodId();
             CreateSyntheticRuntimeForEmission();
             _assembler = new Assembler(_runtimeTypes);
+            IndexGlobals();
             CreateMethodEntryLabels();
 
-            foreach (var function in _module.Functions)
-                EmitFunction(function);
+            for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
+            {
+                foreach (var function in _units[unitIndex].Module.Functions)
+                    EmitFunction(function, unitIndex);
+            }
 
             var flags = ImageFlags.LittleEndian;
             if (_target.PointerSize == 4)
@@ -279,34 +339,52 @@ namespace Cnidaria.C
 
             var image = _assembler.Build(flags, validate: true);
             image = PatchFunctionPointerFixups(image);
-            var entryPc = ResolveMethodEntryPc(image, entryMethodId);
+            var entryPc = ResolveMethodEntryPc(image, _entryMethodId);
             return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures, _target);
         }
 
         private void IndexMethods()
         {
             var next = FirstCMethodId;
-            foreach (var function in _module.Functions)
+            for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
             {
-                var symbol = function.Symbol;
-                if (symbol is null)
-                    continue;
+                var unit = _units[unitIndex];
+                foreach (var function in unit.Module.Functions)
+                {
+                    var symbol = function.Symbol;
+                    if (symbol is null)
+                        continue;
 
-                if (_methodIds.ContainsKey(symbol))
-                    continue;
+                    if (_methodIds.ContainsKey(symbol))
+                        continue;
 
-                var methodId = next++;
-                _methodIds.Add(symbol, methodId);
-                if (!_methodIdsByName.ContainsKey(symbol.Name))
-                    _methodIdsByName.Add(symbol.Name, methodId);
-                _signatures[methodId] = symbol.FunctionType;
+                    var methodId = next++;
+                    _methodIds.Add(symbol, methodId);
+                    if (unit.Linkage.IsInternal(symbol))
+                    {
+                        var key = (unitIndex, symbol.Name);
+                        if (!_internalMethodIdsByName.TryAdd(key, methodId))
+                            throw new InvalidOperationException($"Duplicate internal function definition '{symbol.Name}' in one translation unit.");
+                    }
+                    else if (!_externalMethodIdsByName.TryAdd(symbol.Name, methodId))
+                    {
+                        throw new InvalidOperationException($"Duplicate external function definition '{symbol.Name}'.");
+                    }
+                    _signatures[methodId] = symbol.FunctionType;
+                }
             }
         }
 
         private int ResolveEntryMethodId()
         {
-            if (_methodIdsByName.TryGetValue("main", out var main))
-                return main;
+            if (_externalMethodIdsByName.TryGetValue(_entryFunctionName, out var externalEntry))
+                return externalEntry;
+
+            for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
+            {
+                if (_internalMethodIdsByName.TryGetValue((unitIndex, _entryFunctionName), out var internalEntry))
+                    return internalEntry;
+            }
 
             if (_methodIds.Count == 0)
                 throw new InvalidOperationException("C module does not contain a function body to execute.");
@@ -392,7 +470,327 @@ namespace Cnidaria.C
             return method;
         }
 
-        private void EmitFunction(LirFunction function)
+        private void IndexGlobals()
+        {
+            var groups = new Dictionary<(int UnitIndex, string Name), List<GlobalDeclaration>>();
+            var order = new List<(int UnitIndex, string Name)>();
+            var writableGlobalData = new List<byte>();
+
+            for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
+            {
+                var unit = _units[unitIndex];
+                foreach (var global in unit.Module.Globals)
+                {
+                    if (global.Symbol is null ||
+                        global.StorageClass == StorageClass.Typedef ||
+                        global.Symbol is TypeAliasSymbol or FunctionSymbol ||
+                        global.Type.Type is FunctionType)
+                    {
+                        continue;
+                    }
+
+                    var scopeIndex = unit.Linkage.IsInternal(global.Symbol) ? unitIndex : -1;
+                    var key = (scopeIndex, global.Symbol.Name);
+                    if (!groups.TryGetValue(key, out var declarations))
+                    {
+                        declarations = new List<GlobalDeclaration>();
+                        groups.Add(key, declarations);
+                        order.Add(key);
+                    }
+                    declarations.Add(new GlobalDeclaration(global));
+                }
+            }
+
+            foreach (var key in order)
+            {
+                var declarations = groups[key];
+                GlobalDeclaration? strongDefinition = null;
+                GlobalDeclaration? tentativeDefinition = null;
+                var tentativeSize = -1;
+
+                foreach (var declaration in declarations)
+                {
+                    if (declaration.Global.Initializer is not null)
+                    {
+                        if (strongDefinition is not null)
+                            throw new InvalidOperationException($"Duplicate definition of global object '{key.Name}'.");
+                        strongDefinition = declaration;
+                        continue;
+                    }
+
+                    if (declaration.Global.StorageClass == StorageClass.Extern)
+                        continue;
+
+                    var size = GetGlobalStorageSize(declaration.Global.Type);
+                    if (tentativeDefinition is null || size > tentativeSize)
+                    {
+                        tentativeDefinition = declaration;
+                        tentativeSize = size;
+                    }
+                }
+
+                var definition = strongDefinition ?? tentativeDefinition;
+                if (definition is null)
+                {
+                    if (key.UnitIndex >= 0)
+                        throw new InvalidOperationException($"Undefined internal object '{key.Name}'.");
+                    continue;
+                }
+
+                {
+                    var global = definition.Value.Global;
+                    var size = GetGlobalStorageSize(global.Type);
+                    var bytes = new byte[size];
+                    if (global.Initializer is not null)
+                        WriteGlobalInitializer(bytes, 0, global.Type, global.Initializer, size);
+
+                    GlobalStorage storage;
+                    if (IsReadOnlyGlobal(global) || IsStringLiteralSymbol(global.Symbol))
+                    {
+                        storage = GlobalStorage.ReadOnly(_assembler.AddBlob(bytes), bytes.Length);
+                    }
+                    else
+                    {
+                        var alignment = Math.Min(16, Math.Max(1, _target.AlignOf(global.Type)));
+                        var offset = AlignTo(writableGlobalData.Count, alignment);
+                        while (writableGlobalData.Count < offset)
+                            writableGlobalData.Add(0);
+                        writableGlobalData.AddRange(bytes);
+                        storage = GlobalStorage.Writable(offset);
+                    }
+
+                    if (key.UnitIndex >= 0)
+                        _internalGlobalStorageByName.Add(key, storage);
+                    else
+                        _externalGlobalStorageByName.Add(key.Name, storage);
+
+                    foreach (var declaration in declarations)
+                    {
+                        if (declaration.Global.Symbol is not null)
+                            _globalStorageBySymbol[declaration.Global.Symbol] = storage;
+                    }
+                }
+            }
+
+            if (writableGlobalData.Count != 0)
+            {
+                _writableGlobalDataSize = AlignTo(writableGlobalData.Count, 16);
+                while (writableGlobalData.Count < _writableGlobalDataSize)
+                    writableGlobalData.Add(0);
+                _writableGlobalDataBlobOffset = _assembler.AddBlob(writableGlobalData.ToArray());
+            }
+        }
+
+        private static bool IsReadOnlyGlobal(LirGlobal global)
+            => (global.Type.Qualifiers & TypeQualifiers.Const) != 0;
+
+        private static bool IsStringLiteralSymbol(Symbol? symbol)
+            => symbol is TypedSymbol { DeclaringSyntax: LiteralExpressionSyntax literal } &&
+               literal.LiteralToken.Kind is SyntaxKind.StringLiteralToken or
+                   SyntaxKind.Utf8StringLiteralToken or
+                   SyntaxKind.WideStringLiteralToken or
+                   SyntaxKind.Utf16StringLiteralToken or
+                   SyntaxKind.Utf32StringLiteralToken;
+
+        private int GetGlobalStorageSize(QualifiedType type)
+            => type.Type is ArrayType { Length: null } incompleteArray
+                ? Math.Max(1, _target.SizeOf(incompleteArray.ElementType))
+                : Math.Max(1, _target.SizeOf(type));
+
+        private void WriteGlobalInitializer(
+            byte[] destination,
+            int destinationOffset,
+            QualifiedType type,
+            GimpleInitializer initializer,
+            int availableSize)
+        {
+            if (availableSize <= 0)
+                return;
+
+            if (initializer is GimpleExpressionInitializer expressionInitializer)
+            {
+                WriteGlobalExpressionInitializer(destination, destinationOffset, type, expressionInitializer.Expression, availableSize);
+                return;
+            }
+
+            if (initializer is not GimpleInitializerList list)
+                throw new NotSupportedException($"Unsupported global initializer kind '{initializer.GetType().Name}'.");
+
+            WriteGlobalInitializerList(destination, destinationOffset, type, list, availableSize);
+        }
+
+        private void WriteGlobalInitializerList(
+            byte[] destination,
+            int destinationOffset,
+            QualifiedType type,
+            GimpleInitializerList list,
+            int availableSize)
+        {
+            foreach (var item in list.Items)
+            {
+                if (!item.Designators.IsDefaultOrEmpty)
+                    throw new NotSupportedException("Designated global initializers are not supported by the register-bytecode backend.");
+            }
+
+            if (type.Type is ArrayType array)
+            {
+                var elementSize = Math.Max(1, _target.SizeOf(array.ElementType));
+                for (var index = 0; index < list.Items.Length; index++)
+                {
+                    var offset = checked(index * elementSize);
+                    if (offset >= availableSize)
+                        break;
+                    WriteGlobalInitializer(
+                        destination,
+                        checked(destinationOffset + offset),
+                        array.ElementType,
+                        list.Items[index].Initializer,
+                        Math.Min(elementSize, availableSize - offset));
+                }
+                return;
+            }
+
+            if (type.Type is TagType tagType)
+            {
+                if (tagType.Symbol.TagKind == TagKind.Union)
+                {
+                    if (list.Items.Length != 0 && tagType.Symbol.Fields.Length != 0)
+                    {
+                        var field = tagType.Symbol.Fields[0];
+                        WriteGlobalInitializer(destination, destinationOffset, field.Type, list.Items[0].Initializer, Math.Min(availableSize, Math.Max(1, _target.SizeOf(field.Type))));
+                    }
+                    return;
+                }
+
+                var fieldCount = Math.Min(list.Items.Length, tagType.Symbol.Fields.Length);
+                for (var index = 0; index < fieldCount; index++)
+                {
+                    var field = tagType.Symbol.Fields[index];
+                    var fieldOffset = GetFieldOffset(field);
+                    if (fieldOffset >= availableSize)
+                        break;
+                    var fieldSize = Math.Max(1, _target.SizeOf(field.Type));
+                    WriteGlobalInitializer(
+                        destination,
+                        checked(destinationOffset + fieldOffset),
+                        field.Type,
+                        list.Items[index].Initializer,
+                        Math.Min(fieldSize, availableSize - fieldOffset));
+                }
+                return;
+            }
+
+            if (list.Items.Length != 0)
+                WriteGlobalInitializer(destination, destinationOffset, type, list.Items[0].Initializer, availableSize);
+        }
+
+        private void WriteGlobalExpressionInitializer(
+            byte[] destination,
+            int destinationOffset,
+            QualifiedType type,
+            GimpleValue expression,
+            int availableSize)
+        {
+            if (expression is not GimpleConstantValue constant)
+                throw new NotSupportedException("Global pointer relocations are not supported by the register-bytecode backend.");
+
+            var value = constant.Value;
+            if (value is string text && type.Type is ArrayType)
+            {
+                var bytes = Encoding.UTF8.GetBytes(text);
+                var count = Math.Min(availableSize, checked(bytes.Length + 1));
+                for (var index = 0; index < count; index++)
+                    destination[destinationOffset + index] = index < bytes.Length ? bytes[index] : (byte)0;
+                return;
+            }
+
+            if (type.Type is (PointerType or FunctionType) && IsZeroConstant(value))
+                return;
+
+            if (type.Type is BuiltinType builtin && builtin.BuiltinKind is (BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble))
+            {
+                var raw = builtin.BuiltinKind == BuiltinTypeKind.Float
+                    ? BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture))
+                    : BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture));
+                Array.Copy(raw, 0, destination, destinationOffset, Math.Min(availableSize, raw.Length));
+                return;
+            }
+
+            var size = Math.Min(Math.Max(1, _target.SizeOf(type)), availableSize);
+            var integer = ConvertGlobalIntegerConstant(value);
+            for (var index = 0; index < size; index++)
+                destination[destinationOffset + index] = unchecked((byte)(integer >> (index * 8)));
+        }
+
+        private int GetFieldOffset(FieldSymbol field)
+        {
+            if (field.ContainingTag.TagKind == TagKind.Union)
+                return 0;
+
+            var offset = 0;
+            foreach (var candidate in field.ContainingTag.Fields)
+            {
+                offset = AlignTo(offset, Math.Max(1, _target.AlignOf(candidate.Type)));
+                if (ReferenceEquals(candidate, field))
+                    return offset;
+                offset = checked(offset + Math.Max(1, _target.SizeOf(candidate.Type)));
+            }
+            return 0;
+        }
+
+        private static int AlignTo(int value, int alignment)
+        {
+            if (alignment <= 1)
+                return value;
+            var remainder = value % alignment;
+            return remainder == 0 ? value : checked(value + alignment - remainder);
+        }
+
+        private static bool IsZeroConstant(object? value)
+            => value is null || ConvertGlobalIntegerConstant(value) == 0;
+
+        private static long ConvertGlobalIntegerConstant(object? value)
+        {
+            return value switch
+            {
+                null => 0,
+                bool boolean => boolean ? 1 : 0,
+                char character => character,
+                sbyte number => number,
+                byte number => number,
+                short number => number,
+                ushort number => number,
+                int number => number,
+                uint number => unchecked((long)number),
+                long number => number,
+                ulong number => unchecked((long)number),
+                _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
+            };
+        }
+
+        private bool TryGetGlobalStorage(Symbol symbol, int unitIndex, out GlobalStorage storage)
+        {
+            if (_globalStorageBySymbol.TryGetValue(symbol, out storage))
+                return true;
+
+            if (_units[unitIndex].Linkage.IsInternal(symbol))
+                return _internalGlobalStorageByName.TryGetValue((unitIndex, symbol.Name), out storage);
+
+            return _externalGlobalStorageByName.TryGetValue(symbol.Name, out storage);
+        }
+
+        private bool TryGetMethodId(FunctionSymbol function, int unitIndex, out int methodId)
+        {
+            if (_methodIds.TryGetValue(function, out methodId))
+                return true;
+
+            if (_units[unitIndex].Linkage.IsInternal(function))
+                return _internalMethodIdsByName.TryGetValue((unitIndex, function.Name), out methodId);
+
+            return _externalMethodIdsByName.TryGetValue(function.Name, out methodId);
+        }
+
+        private void EmitFunction(LirFunction function, int unitIndex)
         {
             if (function.Symbol is null || !_methodIds.TryGetValue(function.Symbol, out var methodId))
                 throw new NotSupportedException("Cannot emit anonymous C functions to register bytecode.");
@@ -402,7 +800,7 @@ namespace Cnidaria.C
             foreach (var block in function.Blocks)
                 labels.Add(block, _assembler.CreateLabel());
 
-            var context = new FunctionEmissionContext(this, function, allocation, labels);
+            var context = new FunctionEmissionContext(this, function, unitIndex, allocation, labels);
             _assembler.BeginMethod(methodId, GetMethodEntryLabel(methodId), -1, ToStackFrameLayout(allocation.Frame));
             context.EmitPrologue();
             context.EmitBlocks();
@@ -441,6 +839,48 @@ namespace Cnidaria.C
         }
 
 
+        private readonly struct GlobalDeclaration
+        {
+            public LirGlobal Global { get; }
+
+            public GlobalDeclaration(LirGlobal global)
+            {
+                Global = global ?? throw new ArgumentNullException(nameof(global));
+            }
+        }
+
+        private readonly struct GlobalStorage
+        {
+            public bool IsWritable { get; }
+            public int BlobOffset { get; }
+            public int Length { get; }
+            public int WritableOffset { get; }
+
+            private GlobalStorage(bool isWritable, int blobOffset, int length, int writableOffset)
+            {
+                IsWritable = isWritable;
+                BlobOffset = blobOffset;
+                Length = length;
+                WritableOffset = writableOffset;
+            }
+
+            public static GlobalStorage ReadOnly(int blobOffset, int length)
+            {
+                if (blobOffset < 0)
+                    throw new ArgumentOutOfRangeException(nameof(blobOffset));
+                if (length <= 0)
+                    throw new ArgumentOutOfRangeException(nameof(length));
+                return new GlobalStorage(false, blobOffset, length, 0);
+            }
+
+            public static GlobalStorage Writable(int offset)
+            {
+                if (offset < 0)
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                return new GlobalStorage(true, 0, 0, offset);
+            }
+        }
+
         private readonly struct FunctionPointerFixup
         {
             public readonly int Pc;
@@ -461,6 +901,7 @@ namespace Cnidaria.C
         {
             private readonly RegisterBytecodeCodeGenerator _owner;
             private readonly LirFunction _function;
+            private readonly int _unitIndex;
             private readonly AllocationResult _allocation;
             private readonly IReadOnlyDictionary<LirBlock, Label> _labels;
             private readonly Dictionary<LirBlock, LirBlock?> _nextBlocks;
@@ -471,11 +912,13 @@ namespace Cnidaria.C
             public FunctionEmissionContext(
                 RegisterBytecodeCodeGenerator owner,
                 LirFunction function,
+                int unitIndex,
                 AllocationResult allocation,
                 IReadOnlyDictionary<LirBlock, Label> labels)
             {
                 _owner = owner;
                 _function = function;
+                _unitIndex = unitIndex;
                 _allocation = allocation;
                 _labels = labels;
                 _asm = owner._assembler;
@@ -520,6 +963,31 @@ namespace Cnidaria.C
                     var op = IsFloatRegister(pair.Key) ? Op.StF64 : Op.StI8;
                     EmitMem(op, pair.Key, MachineRegister.Invalid, pair.Value, MachineRegister.Invalid, MemoryBase.StackPointer, alignment: 8);
                 }
+
+                if (_function.Symbol is not null &&
+                    _owner._methodIds.TryGetValue(_function.Symbol, out var methodId) &&
+                    methodId == _owner._entryMethodId)
+                {
+                    EmitWritableGlobalStorageInitialization();
+                }
+            }
+
+            private void EmitWritableGlobalStorageInitialization()
+            {
+                if (_owner._writableGlobalDataSize == 0)
+                    return;
+                if (_owner._writableGlobalDataBlobOffset < 0)
+                    throw new InvalidOperationException("Writable global data template is missing.");
+
+                var initialized = _asm.CreateLabel();
+                EmitI64Imm(Op.I64NeImm, GpScratch0, MachineRegisters.GlobalPointer, 0);
+                _asm.BrTrueI32(GpScratch0, initialized);
+
+                _asm.LiI32(GpScratch0, _owner._writableGlobalDataSize / 16);
+                EmitRaw(Op.StackAlloc, MachineRegisters.GlobalPointer, GpScratch0, imm: 16);
+                LoadStaticBlob(_owner._writableGlobalDataBlobOffset, _owner._writableGlobalDataSize, GpScratch0);
+                EmitRaw(Op.CpBlk, MachineRegisters.GlobalPointer, GpScratch0, imm: _owner._writableGlobalDataSize);
+                _asm.Bind(initialized);
             }
 
             private void StoreIncomingHiddenReturnBufferAddress(int frameOffset)
@@ -1245,7 +1713,8 @@ namespace Cnidaria.C
                 AlignPointerRegister(GpScratch1, align);
                 var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 MoveRegister(destination, GpScratch1);
-                EmitI64Imm(Op.I64AddImm, GpScratch1, GpScratch1, CAbi.AlignUp(size, _owner._target.PointerSize));
+                var homeSlotSize = CAbi.VariadicHomeSlotSize(_owner._target, _owner._allocationOptions.StackArgumentSlotSize);
+                EmitI64Imm(Op.I64AddImm, GpScratch1, GpScratch1, CAbi.AlignUp(size, homeSlotSize));
                 EmitMem(Op.StPtr, GpScratch1, ap, 0, MachineRegister.Invalid, MemoryBase.Register, _owner._target.PointerAlignment);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
@@ -1272,8 +1741,14 @@ namespace Cnidaria.C
                     return;
                 }
 
-                var normalStackSlots = CountStackArgumentSlots(instruction, startOperand: 1);
-                var baseOffset = checked(_allocation.Frame.OutgoingArgumentAreaOffset + normalStackSlots * _owner._allocationOptions.StackArgumentSlotSize);
+                var normalStackBytes = CAbi.ComputeOutgoingArgumentAreaSize(
+                    instruction,
+                    startOperand: 1,
+                    _owner._target,
+                    _owner._allocationOptions.StackArgumentSlotSize,
+                    includeVariadicHomeArea: false);
+                var homeSlotSize = CAbi.VariadicHomeSlotSize(_owner._target, _owner._allocationOptions.StackArgumentSlotSize);
+                var baseOffset = checked(_allocation.Frame.OutgoingArgumentAreaOffset + CAbi.AlignUp(normalStackBytes, homeSlotSize));
 
                 for (var i = 0; i < variadicCount; i++)
                 {
@@ -1282,21 +1757,12 @@ namespace Cnidaria.C
                         throw Unsupported(instruction, "Aggregate variadic arguments are not supported yet.");
                     var source = LoadOperand(operand, IsFloatType(operand.Type) ? FpScratch0 : GpScratch0);
                     EmitMem(StoreOpForType(operand.Type), source, MachineRegister.Invalid,
-                        checked(baseOffset + i * _owner._allocationOptions.StackArgumentSlotSize), MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
+                        checked(baseOffset + i * homeSlotSize), MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(operand.Type));
                 }
 
                 EmitI64Imm(Op.I64AddImm, VarArgsRegister, Sp, baseOffset);
             }
-            private int CountStackArgumentSlots(LirInstruction instruction, int startOperand)
-            {
-                var bytes = CAbi.ComputeOutgoingArgumentAreaSize(
-                    instruction,
-                    startOperand,
-                    _owner._target,
-                    _owner._allocationOptions.StackArgumentSlotSize,
-                    includeVariadicHomeArea: false);
-                return CAbi.SlotsFor(bytes, _owner._allocationOptions.StackArgumentSlotSize);
-            }
+
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
             {
                 var cursor = new AbiCursor();
@@ -1741,13 +2207,7 @@ namespace Cnidaria.C
                     return true;
                 }
 
-                if (_owner._methodIds.TryGetValue(function, out methodId))
-                    return true;
-
-                if (_owner._methodIdsByName.TryGetValue(function.Name, out methodId))
-                    return true;
-
-                return false;
+                return _owner.TryGetMethodId(function, _unitIndex, out methodId);
             }
 
             private bool TryMaterializeFunctionPointer(FunctionSymbol function, MachineRegister destination)
@@ -2178,19 +2638,33 @@ namespace Cnidaria.C
 
             private void LoadCStringLiteral(string text, MachineRegister destination)
             {
-                var bytes = Encoding.UTF8.GetBytes((text ?? string.Empty) + "\0");
+                var bytes = Encoding.UTF8.GetBytes($"{text ?? string.Empty}\0");
                 LoadStaticBlob(bytes, destination);
             }
 
             private void LoadStaticBlob(byte[] bytes, MachineRegister destination)
             {
                 var offset = _asm.AddBlob(bytes);
-                var packed = ((long)(uint)offset << 32) | (uint)bytes.Length;
+                LoadStaticBlob(offset, bytes.Length, destination);
+            }
+
+            private void LoadStaticBlob(int offset, int length, MachineRegister destination)
+            {
+                var packed = ((long)(uint)offset << 32) | (uint)length;
                 EmitRaw(Op.StaticData, destination, MachineRegister.Invalid, MachineRegister.Invalid, imm: packed);
             }
 
             private bool TryMaterializeStaticSymbolAddress(Symbol symbol, MachineRegister destination)
             {
+                if (_owner.TryGetGlobalStorage(symbol, _unitIndex, out var storage))
+                {
+                    if (storage.IsWritable)
+                        EmitI64Imm(Op.I64AddImm, destination, MachineRegisters.GlobalPointer, storage.WritableOffset);
+                    else
+                        LoadStaticBlob(storage.BlobOffset, storage.Length, destination);
+                    return true;
+                }
+
                 if (TryGetStringLiteralFromSymbol(symbol, out var text))
                 {
                     LoadCStringLiteral(text, destination);
@@ -2266,7 +2740,13 @@ namespace Cnidaria.C
                         }
 
                     case LirAddressKind.Symbol:
-                        throw new NotSupportedException("Mutable global/static C objects are not supported by the register-bytecode backend yet.");
+                        {
+                            if (address.Symbol is null)
+                                throw new InvalidOperationException("Symbol address has no symbol.");
+                            if (!TryMaterializeStaticSymbolAddress(address.Symbol, scratchBase))
+                                throw new MissingFieldException($"C global object '{address.Symbol.Name}' is not present in the register-bytecode image.");
+                            return new AddressParts(scratchBase, MachineRegister.Invalid, address.Displacement, MemoryBase.Register, 0);
+                        }
 
                     default:
                         throw new NotSupportedException($"Unsupported LIR address kind {address.Kind}.");

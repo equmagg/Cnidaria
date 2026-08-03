@@ -6,7 +6,7 @@ using System.Xml.Linq;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class RegisterAllocatorOptions
+    public sealed class RegisterAllocatorOptions
     {
         public static RegisterAllocatorOptions Default => ForTarget(TargetInfo.Default);
 
@@ -46,7 +46,7 @@ namespace Cnidaria.Cs
             };
         }
 
-        public ImmutableArray<MachineRegister> GetAllocatableRegisters(RegisterClass registerClass)
+        internal ImmutableArray<MachineRegister> GetAllocatableRegisters(RegisterClass registerClass)
         {
             return registerClass switch
             {

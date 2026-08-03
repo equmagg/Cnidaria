@@ -6,6 +6,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    /// <summary>Identifies the concrete shape of a lowered node</summary>
     public enum GimpleNodeKind : ushort
     {
         Tree,
@@ -42,6 +43,7 @@ namespace Cnidaria.C
         ErrorValue,
     }
 
+    /// <summary>Identifies the semantic conversion preserved by a lowered expression</summary>
     public enum GimpleConversionKind : byte
     {
         Identity,
@@ -53,11 +55,14 @@ namespace Cnidaria.C
         Error,
     }
 
+    /// <summary>Contains lowered top-level members for one semantic model</summary>
+    /// <remarks>The tree is immutable and preserves top-level source order</remarks>
     public sealed class GimpleTree
     {
         public SemanticModel SemanticModel { get; }
         public ImmutableArray<GimpleNode> Members { get; }
         public ImmutableArray<SemanticDiagnostic> Diagnostics { get; }
+        /// <summary>Gets whether the configured inlining pass has already run</summary>
         internal bool HasInliningApplied { get; }
 
         public GimpleTree(
@@ -89,6 +94,7 @@ namespace Cnidaria.C
             return normalized;
         }
 
+        /// <summary>Lowers a semantic model into explicit statements and basic blocks</summary>
         public static GimpleTree Lower(SemanticModel semanticModel)
         {
             if (semanticModel is null)
@@ -98,8 +104,10 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for all lowered nodes</summary>
     public abstract class GimpleNode
     {
+        /// <summary>Gets the source syntax associated with this node when available</summary>
         public SyntaxNode? Syntax { get; }
         public abstract GimpleNodeKind Kind { get; }
 
@@ -109,12 +117,16 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a function as temporaries and labeled basic blocks</summary>
+    /// <remarks>The first block owns EntryLabel and every non-final block has an explicit terminator</remarks>
     public sealed class GimpleFunctionDefinition : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.FunctionDefinition;
 
         public FunctionSymbol? Symbol { get; }
+        /// <summary>Gets function-local temporaries in allocation order</summary>
         public ImmutableArray<GimpleTemporaryValue> Temporaries { get; }
+        /// <summary>Gets basic blocks in emitted order</summary>
         public ImmutableArray<GimpleBasicBlock> Blocks { get; }
         public GimpleLabel EntryLabel { get; }
 
@@ -168,6 +180,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Describes one lowered variable declarator and its optional initializer</summary>
     public sealed class GimpleVariableDeclaration
     {
         public SyntaxNode? Syntax { get; }
@@ -191,6 +204,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for lowered static and aggregate initializers</summary>
     public abstract class GimpleInitializer
     {
         public SyntaxNode? Syntax { get; }
@@ -203,6 +217,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Initializes an object from one lowered value</summary>
     public sealed class GimpleExpressionInitializer : GimpleInitializer
     {
         public GimpleValue Expression { get; }
@@ -214,6 +229,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Initializes an aggregate or scalar from ordered initializer items</summary>
     public sealed class GimpleInitializerList : GimpleInitializer
     {
         public ImmutableArray<GimpleInitializerListItem> Items { get; }
@@ -240,6 +256,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Pairs an initializer with the designator path selecting its target</summary>
     public readonly struct GimpleInitializerListItem
     {
         public SyntaxNode? Syntax { get; }
@@ -257,6 +274,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents a top-level declaration containing one or more variables</summary>
     public sealed class GimpleGlobalDeclaration : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.GlobalDeclaration;
@@ -288,6 +306,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves a translated static assertion and its optional message</summary>
     public sealed class GimpleStaticAssertDeclaration : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.StaticAssertDeclaration;
@@ -306,6 +325,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves source association for a top-level member with no lowered form</summary>
     public sealed class GimpleSkippedDeclaration : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.SkippedDeclaration;
@@ -316,6 +336,8 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Contains a label followed by an ordered statement sequence</summary>
+    /// <remarks>A terminator may appear only as the final statement</remarks>
     public sealed class GimpleBasicBlock : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.BasicBlock;
@@ -323,6 +345,7 @@ namespace Cnidaria.C
         public GimpleLabel Label { get; }
         public ImmutableArray<GimpleStatement> Statements { get; }
 
+        /// <summary>Gets whether the final statement terminates control flow</summary>
         public bool HasTerminator => Statements.Length != 0 && Statements[^1].IsTerminator;
 
         public GimpleBasicBlock(GimpleLabel label, ImmutableArray<GimpleStatement> statements)
@@ -348,6 +371,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies a basic block and optionally retains its source label symbol</summary>
     public sealed class GimpleLabel : GimpleNode
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.Label;
@@ -365,8 +389,10 @@ namespace Cnidaria.C
         public override string ToString() => Name;
     }
 
+    /// <summary>Base class for lowered statements</summary>
     public abstract class GimpleStatement : GimpleNode
     {
+        /// <summary>Gets whether the statement ends its basic block</summary>
         public virtual bool IsTerminator => false;
 
         protected GimpleStatement(SyntaxNode? syntax)
@@ -375,6 +401,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Introduces a local variable without executing its initializer</summary>
     public sealed class GimpleDeclarationStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.DeclarationStatement;
@@ -391,6 +418,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Stores a value into an assignable place</summary>
     public sealed class GimpleAssignmentStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.AssignmentStatement;
@@ -406,6 +434,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Zero-initializes an aggregate place</summary>
     public sealed class GimpleZeroInitializeStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ZeroInitializeStatement;
@@ -419,6 +448,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Evaluates a value only for its side effects</summary>
     public sealed class GimpleExpressionStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ExpressionStatement;
@@ -432,6 +462,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Transfers control unconditionally to a label</summary>
     public sealed class GimpleGotoStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.GotoStatement;
@@ -446,6 +477,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Transfers control to one of two labels based on a value</summary>
     public sealed class GimpleConditionalGotoStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ConditionalGotoStatement;
@@ -468,6 +500,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Dispatches an integral value to case or default labels</summary>
     public sealed class GimpleSwitchStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.SwitchStatement;
@@ -502,6 +535,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Returns from the current function with an optional value</summary>
     public sealed class GimpleReturnStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ReturnStatement;
@@ -518,11 +552,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Describes one input or output operand of an inline assembly statement</summary>
     public sealed class GimpleAsmOperand
     {
         public string? Name { get; }
         public string Constraint { get; }
+        /// <summary>Gets the destination place for an output operand</summary>
         public GimplePlace? Target { get; }
+        /// <summary>Gets the input value or the initial value of a read-write output</summary>
         public GimpleValue? Value { get; }
         public bool IsOutput { get; }
         public bool IsReadWrite { get; }
@@ -547,6 +584,8 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents inline assembly with normalized operands, clobbers, and targets</summary>
+    /// <remarks>Goto assembly terminates the block but also permits an explicit fallthrough edge</remarks>
     public sealed class GimpleAsmStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.AsmStatement;
@@ -585,6 +624,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves a statement position without semantic work</summary>
     public sealed class GimpleNopStatement : GimpleStatement
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.NopStatement;
@@ -595,6 +635,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Maps one constant switch value to a target label</summary>
     public readonly struct GimpleSwitchCase
     {
         public GimpleConstantValue Value { get; }
@@ -607,12 +648,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Normalizes missing semantic types into the error type</summary>
     internal static class GimpleTypeHelpers
     {
         public static QualifiedType Normalize(QualifiedType type)
             => type.Type is null ? new QualifiedType(CErrorType.Instance) : type;
     }
 
+    /// <summary>Base class for typed values</summary>
     public abstract class GimpleValue : GimpleNode
     {
         public QualifiedType Type { get; }
@@ -624,6 +667,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Base class for values that identify assignable storage</summary>
     public abstract class GimplePlace : GimpleValue
     {
         protected GimplePlace(SyntaxNode? syntax, QualifiedType type)
@@ -632,6 +676,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>References storage or a function through a semantic symbol</summary>
     public sealed class GimpleSymbolValue : GimplePlace
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.SymbolValue;
@@ -647,6 +692,7 @@ namespace Cnidaria.C
         public override string ToString() => Symbol.Name;
     }
 
+    /// <summary>Identifies a function-local temporary by allocation ordinal</summary>
     public sealed class GimpleTemporaryValue : GimplePlace
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.TemporaryValue;
@@ -667,6 +713,7 @@ namespace Cnidaria.C
         public override string ToString() => Name;
     }
 
+    /// <summary>Represents a typed compile-time value</summary>
     public sealed class GimpleConstantValue : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ConstantValue;
@@ -682,6 +729,7 @@ namespace Cnidaria.C
         public override string ToString() => Value?.ToString() ?? "null";
     }
 
+    /// <summary>Applies a unary operator to one lowered operand</summary>
     public sealed class GimpleUnaryExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.UnaryExpression;
@@ -697,6 +745,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Applies a binary operator to two lowered operands</summary>
     public sealed class GimpleBinaryExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.BinaryExpression;
@@ -714,6 +763,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Preserves a semantic conversion around a lowered operand</summary>
     public sealed class GimpleConversionExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ConversionExpression;
@@ -729,6 +779,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an explicit cast to the node type</summary>
     public sealed class GimpleCastExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.CastExpression;
@@ -742,6 +793,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Produces the address of an assignable place</summary>
     public sealed class GimpleAddressOfExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.AddressOfExpression;
@@ -755,6 +807,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies storage reached through a pointer value</summary>
     public sealed class GimpleIndirectExpression : GimplePlace
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.IndirectExpression;
@@ -768,6 +821,8 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies an indexed element of an aggregate or pointer value</summary>
+    /// <remarks>Index may be null when source recovery omitted the index expression</remarks>
     public sealed class GimpleElementAccessExpression : GimplePlace
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ElementAccessExpression;
@@ -783,6 +838,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Identifies a named field reached through member access</summary>
     public sealed class GimpleMemberAccessExpression : GimplePlace
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.MemberAccessExpression;
@@ -790,6 +846,7 @@ namespace Cnidaria.C
         public GimpleValue Expression { get; }
         public SyntaxToken OperatorToken { get; }
         public SyntaxToken NameToken { get; }
+        /// <summary>Gets the resolved field or null when binding failed</summary>
         public FieldSymbol? Field { get; }
 
         public GimpleMemberAccessExpression(
@@ -808,12 +865,14 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Invokes a lowered callee with ordered argument values</summary>
     public sealed class GimpleCallExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.CallExpression;
 
         public GimpleValue Callee { get; }
         public ImmutableArray<GimpleValue> Arguments { get; }
+        /// <summary>Gets the resolved call signature when available</summary>
         public FunctionType? FunctionType { get; }
 
         public GimpleCallExpression(
@@ -842,6 +901,7 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Represents an invalid value while preserving source and type shape</summary>
     public sealed class GimpleErrorValue : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.ErrorValue;

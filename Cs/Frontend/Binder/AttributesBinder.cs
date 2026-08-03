@@ -1,16 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Binds attribute applications and validates attribute usage</summary>
     internal static class AttributeBinder
     {
+        // Minimal semantic model for binding attributes outside executable bodies
         private sealed class SemanticModelStub : SemanticModel
         {
             public SemanticModelStub(Compilation c, SyntaxTree t)
@@ -36,6 +36,7 @@ namespace Cnidaria.Cs
             internal override BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default)
                 => throw new NotSupportedException();
         }
+        // Retains a bound application for cross-owner validation
         private readonly struct BoundAttributeApplication
         {
             public readonly SyntaxTree Tree;
@@ -52,6 +53,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        // Decoded AttributeUsage policy
         private readonly struct AttributeUsageSpec
         {
             public readonly ulong ValidOnMask;
@@ -65,6 +67,7 @@ namespace Cnidaria.Cs
                 Inherited = inherited;
             }
         }
+        // Identity key for duplicate attribute detection
         private readonly struct AppliedAttrKey : IEquatable<AppliedAttrKey>
         {
             public readonly Symbol Owner;
@@ -91,10 +94,11 @@ namespace Cnidaria.Cs
                     RuntimeHelpers.GetHashCode(AttrClass),
                     (int)Target);
         }
+        // Bound constructor argument with optional NameColon syntax
         private readonly struct BoundAttrArg
         {
             public readonly AttributeArgumentSyntax Syntax;
-            public readonly string? Name; // NameColon -> ctor named arg; NameEquals handled separately
+            public readonly string? Name; // NameColon selects a constructor argument while NameEquals is bound separately
             public readonly BoundExpression Expression;
 
             public BoundAttrArg(AttributeArgumentSyntax syntax, string? name, BoundExpression expression)
@@ -105,6 +109,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        // Bound NameEquals assignment
         private readonly struct NamedAttrAssign
         {
             public readonly AttributeArgumentSyntax Syntax;
@@ -119,6 +124,8 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Binds source attributes and validates rules spanning multiple applications</summary>
+        /// <remarks>Attribute data is attached to symbols before usage and inline array validation</remarks>
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             var applications = new List<BoundAttributeApplication>(capacity: 64);
@@ -247,6 +254,7 @@ namespace Cnidaria.Cs
             ValidateAttributeUsageApplications(applications, diagnostics);
             ValidateInlineArrayTypes(compilation, trees, diagnostics);
         }
+        /// <summary>Binds every attribute list attached to one declared owner</summary>
         private static void BindAttributeListsOnOwner(
             Compilation compilation,
                 SyntaxTree tree,
@@ -302,6 +310,83 @@ namespace Cnidaria.Cs
             }
 
         }
+        internal static void BindAnonymousFunctionAttributes(
+            LambdaExpressionSyntax syntax,
+            MethodSymbol owner,
+            LocalScopeBinder enclosingBinder,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            Action<AttributeData> addAttribute)
+        {
+            if (syntax.AttributeLists.Count == 0)
+                return;
+
+            TypeBinder? typeBinder = null;
+            for (Binder? binder = enclosingBinder; binder is not null; binder = binder.Parent)
+            {
+                if (binder is TypeBinder candidate)
+                {
+                    typeBinder = candidate;
+                    break;
+                }
+            }
+
+            if (typeBinder is null)
+                throw new InvalidOperationException("Lambda attribute binding requires a TypeBinder in the binder chain.");
+
+            var tree = context.SemanticModel.SyntaxTree;
+            var exprBinder = new LocalScopeBinder(
+                parent: typeBinder,
+                flags: enclosingBinder.Flags,
+                containing: GetAttributeExpressionContainer(owner),
+                inheritFlowFromParent: false);
+            var attributeContext = new BindingContext(
+                context.Compilation,
+                context.SemanticModel,
+                context.ContainingSymbol,
+                context.Recorder);
+            var applications = new List<BoundAttributeApplication>();
+            var defaultTarget = AttributeApplicationTarget.Method;
+
+            for (int li = 0; li < syntax.AttributeLists.Count; li++)
+            {
+                var list = syntax.AttributeLists[li];
+                var target = ResolveAttributeTarget(
+                    list.Target,
+                    defaultTarget,
+                    owner,
+                    syntax,
+                    tree,
+                    diagnostics);
+                if (target == AttributeApplicationTarget.Unknown)
+                    continue;
+
+                for (int ai = 0; ai < list.Attributes.Count; ai++)
+                {
+                    var attrSyntax = list.Attributes[ai];
+                    if (!TryBindSingleAttribute(
+                        tree,
+                        attrSyntax,
+                        target,
+                        owner,
+                        typeBinder,
+                        exprBinder,
+                        attributeContext,
+                        diagnostics,
+                        out var data))
+                    {
+                        continue;
+                    }
+
+                    addAttribute(data!);
+                    applications.Add(new BoundAttributeApplication(tree, attrSyntax, owner, data!));
+                }
+            }
+
+            ValidateAttributeUsageApplications(applications, diagnostics);
+        }
+
+        /// <summary>Validates types marked for inline array layout</summary>
         private static void ValidateInlineArrayTypes(
             Compilation compilation,
             ImmutableArray<SyntaxTree> trees,
@@ -379,6 +464,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Enforces target masks and duplicate application rules</summary>
         private static void ValidateAttributeUsageApplications(
             List<BoundAttributeApplication> applications,
             DiagnosticBag diagnostics)
@@ -414,6 +500,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Decodes the effective AttributeUsage policy for an attribute type</summary>
         private static AttributeUsageSpec GetAttributeUsageSpec(NamedTypeSymbol attributeClass)
         {
             // [AttributeUsage(AttributeTargets.All, AllowMultiple = false, Inherited = true)]
@@ -508,6 +595,7 @@ namespace Cnidaria.Cs
                 _ => 0
             };
         }
+        /// <summary>Resolves an explicit attribute target against its owner</summary>
         private static AttributeApplicationTarget ResolveAttributeTarget(
                 AttributeTargetSpecifierSyntax? targetSyntax,
                 AttributeApplicationTarget defaultTarget,
@@ -664,6 +752,7 @@ namespace Cnidaria.Cs
                 _ => owner
             };
         }
+        /// <summary>Binds one attribute type, constructor call, and named assignments</summary>
         private static bool TryBindSingleAttribute(
                 SyntaxTree tree,
                 AttributeSyntax attrSyntax,
@@ -760,6 +849,7 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        /// <summary>Selects an applicable attribute constructor and converts its arguments</summary>
         private static bool TryResolveAttributeConstructor(
                 SyntaxTree tree,
                 AttributeSyntax attrSyntax,
@@ -928,6 +1018,7 @@ namespace Cnidaria.Cs
             convertedArgsInParameterOrder = ImmutableArray.Create(converted);
             return true;
         }
+        /// <summary>Binds a writable attribute field or property assignment</summary>
         private static bool TryBindNamedAttributeAssignment(
             SyntaxTree tree,
             NamedTypeSymbol attributeType,
@@ -1011,6 +1102,7 @@ namespace Cnidaria.Cs
             memberType = null;
             return false;
         }
+        /// <summary>Converts a bound attribute value into serialized constant form</summary>
         private static bool TryCreateTypedConstant(
             SyntaxTree tree,
             SyntaxNode argSpanNode,
@@ -1177,14 +1269,17 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Validates platform invocation declarations and signatures</summary>
     internal static class PlatformInvokeBinder
     {
+        /// <summary>Validates platform invocation declarations across all syntax trees</summary>
         public static void ValidateAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             for (int i = 0; i < trees.Length; i++)
                 ValidateTree(compilation, trees[i], diagnostics);
         }
 
+        /// <summary>Validates platform invocation declarations in one syntax tree</summary>
         public static void ValidateTree(Compilation compilation, SyntaxTree tree, DiagnosticBag diagnostics)
         {
             if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declarations))
@@ -1199,6 +1294,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Validates one attributed extern method and its marshalled signature</summary>
         private static void ValidateMethod(
             Compilation compilation,
             SyntaxTree tree,
@@ -1212,7 +1308,7 @@ namespace Cnidaria.Cs
 
             if (method.IsExtern && syntax.AttributeLists.Count == 0)
             {
-                diagnostics.Add(new Diagnostic("CN_EXTERN000", 
+                diagnostics.Add(new Diagnostic("CN_EXTERN000",
                     DiagnosticSeverity.Warning,
                     $"Method, operator, or accessor '{method.Name}' is marked external and has no attributes on it. " +
                     $"Consider adding a DllImport attribute to specify the external implementation.",

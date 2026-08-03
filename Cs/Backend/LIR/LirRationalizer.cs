@@ -140,7 +140,7 @@ namespace Cnidaria.Cs
             return result.ToImmutable();
         }
     }
-    internal sealed class LinearRationalizationOptions
+    public sealed class LinearRationalizationOptions
     {
         public static LinearRationalizationOptions Default => new LinearRationalizationOptions();
 

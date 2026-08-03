@@ -9,8 +9,10 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Binds explicit interface targets and validates required implementations</summary>
     internal static class ExplicitInterfaceImplementationBinder
     {
+        // Minimal semantic model for declaration-level interface binding
         private sealed class SemanticModelStub : SemanticModel
         {
             public SemanticModelStub(Compilation c, SyntaxTree t)
@@ -35,6 +37,7 @@ namespace Cnidaria.Cs
             internal override BoundNode GetBoundNode(SyntaxNode node, CancellationToken cancellationToken = default)
                 => throw new NotSupportedException();
         }
+        /// <summary>Binds explicit targets before validating interface completeness</summary>
         public static void BindAll(
             Compilation compilation,
             ImmutableArray<SyntaxTree> trees,
@@ -43,6 +46,7 @@ namespace Cnidaria.Cs
             BindExplicitInterfaceImplementations(compilation, trees, diagnostics);
             ValidateInterfaceImplementations(compilation, trees, diagnostics);
         }
+        // Resolve explicit method and property targets first
         private static void BindExplicitInterfaceImplementations(
             Compilation compilation,
             ImmutableArray<SyntaxTree> trees,
@@ -99,6 +103,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        // Validate the completed interface map after explicit targets are known
         private static void ValidateInterfaceImplementations(
             Compilation compilation,
             ImmutableArray<SyntaxTree> trees,
@@ -184,6 +189,7 @@ namespace Cnidaria.Cs
 
         }
 
+        /// <summary>Collects the transitive interface closure without duplicate definitions</summary>
         private static ImmutableArray<NamedTypeSymbol> GetEffectiveInterfaceSet(NamedTypeSymbol type)
         {
             var seen = new List<NamedTypeSymbol>();
@@ -512,6 +518,7 @@ namespace Cnidaria.Cs
             sb.Append(']');
             return sb.ToString();
         }
+        /// <summary>Resolves one explicit interface method declaration</summary>
         private static void BindExplicitInterfaceMethod(
             Compilation compilation,
             SyntaxTree tree,
@@ -617,6 +624,7 @@ namespace Cnidaria.Cs
             method.SetExplicitInterfaceImplementation(match);
         }
 
+        /// <summary>Resolves one explicit interface property declaration</summary>
         private static void BindExplicitInterfaceProperty(
             Compilation compilation,
             SyntaxTree tree,

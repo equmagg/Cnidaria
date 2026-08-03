@@ -7,6 +7,7 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Identifies the storage category of a value crossing the host boundary</summary>
     public enum VmValueKind : byte
     {
         Null,
@@ -19,12 +20,18 @@ namespace Cnidaria.Cs
         Value,
     }
 
+    /// <summary>Represents one value exchanged between runtime code and a host handler</summary>
+    /// <remarks>Payload stores primitive bits or a runtime handle while Aux carries category-specific metadata</remarks>
     public readonly struct VmValue
     {
+        /// <summary>Gets the interpretation of the payload</summary>
         public VmValueKind Kind { get; }
+        /// <summary>Gets the primitive bits or runtime handle</summary>
         public long Payload { get; }
+        /// <summary>Gets category-specific type or address metadata</summary>
         public int Aux { get; }
 
+        /// <summary>Creates a value from its raw runtime representation</summary>
         public VmValue(VmValueKind kind, long payload, int aux = 0)
         {
             Kind = kind;
@@ -32,6 +39,7 @@ namespace Cnidaria.Cs
             Aux = aux;
         }
 
+        /// <summary>Converts a numeric or null value to a 32-bit integer</summary>
         public int AsInt32()
         {
             return Kind switch
@@ -44,6 +52,7 @@ namespace Cnidaria.Cs
             };
         }
 
+        /// <summary>Converts a numeric or null value to a 64-bit integer</summary>
         public long AsInt64()
         {
             return Kind switch
@@ -56,6 +65,7 @@ namespace Cnidaria.Cs
             };
         }
 
+        /// <summary>Converts a numeric value to double precision</summary>
         public double AsDouble()
         {
             return Kind switch
@@ -67,7 +77,9 @@ namespace Cnidaria.Cs
             };
         }
 
+        /// <summary>Converts a numeric value to its Boolean interpretation</summary>
         public bool AsBool() => AsInt32() != 0;
+        /// <summary>Converts a numeric value to a character</summary>
         public char AsChar() => (char)AsInt32();
 
         internal VmValue(Cnidaria.Cs.Slot s)
@@ -105,9 +117,11 @@ namespace Cnidaria.Cs
         public static VmValue FromInt32(int v) => new VmValue(VmValueKind.I4, v);
         public static VmValue FromInt64(long v) => new VmValue(VmValueKind.I8, v);
         public static VmValue FromDouble(double v) => new VmValue(VmValueKind.R8, BitConverter.DoubleToInt64Bits(v));
+        /// <summary>Gets the null runtime value</summary>
         public static VmValue Null => new VmValue(VmValueKind.Null, 0);
     }
 
+    /// <summary>Exposes runtime services available while a host override is executing</summary>
     public sealed class VmCallContext
     {
         private readonly Cnidaria.Cs.StackBasedVm? _stackVm;
@@ -119,39 +133,55 @@ namespace Cnidaria.Cs
 
         internal void SetToken(CancellationToken ct) => _ct = ct;
 
+        /// <summary>Gets the cancellation token for the current invocation</summary>
         public CancellationToken CancellationToken => _ct;
+        /// <summary>Reads a runtime string value into host memory</summary>
         public string? ReadString(VmValue v)
             => _stackVm != null ? _stackVm.HostReadString(v, _ct) : _registerVm!.HostReadString(v, _ct);
+        /// <summary>Allocates a runtime string from a host string</summary>
         public VmValue NewString(string? s)
             => _stackVm != null ? _stackVm.HostAllocString(s) : _registerVm!.HostAllocString(s);
+        /// <summary>Gets the linear memory address represented by a pointer-like value</summary>
         public int GetAddress(VmValue v)
             => _stackVm != null ? _stackVm.HostGetAddress(v) : _registerVm!.HostGetAddress(v);
+        /// <summary>Gets a read-only view over a validated linear memory range</summary>
         public ReadOnlySpan<byte> ReadOnlyMemory(int address, int size)
         {
             if (_stackVm != null) return _stackVm.HostGetSpan(address, size, writable: false);
             return _registerVm!.HostGetSpan(address, size, writable: false);
         }
+        /// <summary>Gets a writable view over a validated linear memory range</summary>
         public Span<byte> Memory(int address, int size)
         {
             if (_stackVm != null) return _stackVm.HostGetSpan(address, size, writable: true);
             return _registerVm!.HostGetSpan(address, size, writable: true);
         }
+        /// <summary>Gets the length of a runtime array</summary>
         public int GetArrayLength(VmValue array)
             => _stackVm != null ? _stackVm.HostGetArrayLength(array) : _registerVm!.HostGetArrayLength(array);
+        /// <summary>Reads one element from a runtime array</summary>
         public VmValue GetArrayElement(VmValue array, int index)
             => _stackVm != null ? _stackVm.HostGetArrayElement(array, index) : _registerVm!.HostGetArrayElement(array, index);
 
+        /// <summary>Reads a little-endian 32-bit integer from linear memory</summary>
         public int ReadInt32(int address) => BinaryPrimitives.ReadInt32LittleEndian(ReadOnlyMemory(address, 4));
+        /// <summary>Reads a little-endian 64-bit integer from linear memory</summary>
         public long ReadInt64(int address) => BinaryPrimitives.ReadInt64LittleEndian(ReadOnlyMemory(address, 8));
+        /// <summary>Reads a little-endian unsigned 16-bit integer from linear memory</summary>
         public ushort ReadUInt16(int address) => BinaryPrimitives.ReadUInt16LittleEndian(ReadOnlyMemory(address, 2));
+        /// <summary>Writes a little-endian 32-bit integer to linear memory</summary>
         public void WriteInt32(int address, int value) => BinaryPrimitives.WriteInt32LittleEndian(Memory(address, 4), value);
+        /// <summary>Writes a little-endian 64-bit integer to linear memory</summary>
         public void WriteInt64(int address, long value) => BinaryPrimitives.WriteInt64LittleEndian(Memory(address, 8), value);
+        /// <summary>Writes a little-endian unsigned 16-bit integer to linear memory</summary>
         public void WriteUInt16(int address, ushort value) => BinaryPrimitives.WriteUInt16LittleEndian(Memory(address, 2), value);
 
     }
 
+    /// <summary>Handles a runtime method invocation in host code</summary>
     public delegate VmValue HostMethod(VmCallContext ctx, ReadOnlySpan<VmValue> args);
 
+    /// <summary>Binds a runtime method identifier to its host handler</summary>
     internal sealed class HostOverride
     {
         public readonly int MethodId;
@@ -168,6 +198,8 @@ namespace Cnidaria.Cs
 
     }
 
+    /// <summary>Registers and marshals host implementations of runtime methods</summary>
+    /// <remarks>Overrides are resolved by assembly, type, method name, and compatible signature</remarks>
     public sealed class HostInterface
     {
         private readonly Cnidaria.Cs.StackBasedVm? _stackVm;
@@ -189,6 +221,8 @@ namespace Cnidaria.Cs
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
         }
 
+        /// <summary>Registers a typed host delegate for a static runtime method</summary>
+        /// <remarks>A leading call context parameter is optional and is not part of method resolution</remarks>
         public void OverrideStatic(string assemblyName, string typeFullName, string methodName, Delegate handler)
         {
             if (handler is null) throw new ArgumentNullException(nameof(handler));
@@ -197,6 +231,7 @@ namespace Cnidaria.Cs
             RegisterHostOverride(new HostOverride(stackMethod, BuildWrapperStack(handler, stackSig, stackMethod)));
         }
 
+        /// <summary>Registers a raw host handler with an explicit runtime signature</summary>
         public void OverrideStaticRaw(string assemblyName, string typeFullName, string methodName, Type returnType, Type[] paramTypes, HostMethod handler)
         {
             if (returnType is null) throw new ArgumentNullException(nameof(returnType));
@@ -209,6 +244,7 @@ namespace Cnidaria.Cs
             var stackMethod = ResolveStaticMethodStack(assemblyName, typeFullName, methodName, stackParams, stackRet);
             RegisterHostOverride(new HostOverride(stackMethod, handler));
         }
+        /// <summary>Installs an override in the active execution engine</summary>
         private void RegisterHostOverride(HostOverride ov)
         {
             if (_stackVm != null)
@@ -220,6 +256,7 @@ namespace Cnidaria.Cs
             _registerVm!.RegisterHostOverride(ov);
         }
 
+        /// <summary>Extracts host and runtime signature forms from a delegate</summary>
         private (bool HasContext, Type ReturnClr, Cnidaria.Cs.RuntimeType ReturnType, Type[] ParamClr, Cnidaria.Cs.RuntimeType[] ParamTypes) ExtractSignatureStack(Delegate d)
         {
             var mi = d.Method;
@@ -237,6 +274,7 @@ namespace Cnidaria.Cs
         }
 
 
+        /// <summary>Builds the argument and return marshaling wrapper for a typed delegate</summary>
         private HostMethod BuildWrapperStack(Delegate handler, (bool HasContext, Type ReturnClr, Cnidaria.Cs.RuntimeType ReturnType, Type[] ParamClr, Cnidaria.Cs.RuntimeType[] ParamTypes) sig, Cnidaria.Cs.RuntimeMethod targetMethod)
         {
             ValidateHostSignature(sig.ParamClr, sig.ReturnClr);
@@ -253,6 +291,7 @@ namespace Cnidaria.Cs
             };
         }
 
+        /// <summary>Rejects host signature shapes that cannot be marshaled safely</summary>
         private static void ValidateHostSignature(Type[] paramClr, Type returnClr)
         {
             for (int i = 0; i < paramClr.Length; i++)
@@ -262,6 +301,7 @@ namespace Cnidaria.Cs
                 throw new NotSupportedException($"Delegate return '{returnClr}' is byref-like. Use OverrideStaticRaw + HostMethod instead.");
         }
 
+        /// <summary>Converts one runtime argument to its declared host type</summary>
         private object? ConvertArg(VmCallContext ctx, VmValue v, Type clr)
         {
             if (clr.IsEnum)
@@ -298,6 +338,7 @@ namespace Cnidaria.Cs
             if (clr == typeof(UIntPtr)) return _rts.Target.PointerSize == 8 ? new UIntPtr(unchecked((ulong)v.AsInt64())) : new UIntPtr(unchecked((uint)v.AsInt32()));
             throw new NotSupportedException($"Host arg type not supported: {clr.FullName}");
         }
+        /// <summary>Creates an enum value from a normalized underlying value</summary>
         private static object CreateEnumValue(Type enumType, object raw)
         {
             Type underlying = Enum.GetUnderlyingType(enumType);
@@ -313,6 +354,7 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException($"Unexpected enum underlying type '{underlying.FullName}'.");
         }
+        /// <summary>Copies a one-dimensional runtime array into a host array</summary>
         private object ConvertArrayArg(VmCallContext ctx, VmValue v, Type clr, Type elementClr)
         {
             int length = ctx.GetArrayLength(v);
@@ -351,6 +393,7 @@ namespace Cnidaria.Cs
 
             throw new NotSupportedException($"Host array element type not supported: {elementClr.FullName}");
         }
+        /// <summary>Creates the zero value for a supported enum underlying type</summary>
         private static object CreateDefaultEnumUnderlyingValue(Type underlying)
         {
             if (underlying == typeof(byte)) return default(byte);
@@ -365,6 +408,7 @@ namespace Cnidaria.Cs
             throw new InvalidOperationException($"Unexpected enum underlying type '{underlying.FullName}'.");
         }
 
+        /// <summary>Converts a typed host return value to its runtime representation</summary>
         private VmValue ConvertRetStack(VmCallContext ctx, object? retObj, Type clr, Cnidaria.Cs.RuntimeType actualVmType)
         {
             if (clr.IsEnum)
@@ -393,6 +437,7 @@ namespace Cnidaria.Cs
             return ConvertScalarRet(ctx, retObj, clr);
         }
 
+        /// <summary>Converts a scalar host return value to a runtime value</summary>
         private VmValue ConvertScalarRet(VmCallContext ctx, object? retObj, Type clr)
         {
             if (clr == typeof(void)) return VmValue.Null;
@@ -425,6 +470,7 @@ namespace Cnidaria.Cs
         }
 
 
+        /// <summary>Resolves a unique static internal method compatible with the requested signature</summary>
         private Cnidaria.Cs.RuntimeMethod ResolveStaticMethodStack(string assemblyName, string typeFullName, string methodName, Cnidaria.Cs.RuntimeType[] ps, Cnidaria.Cs.RuntimeType ret)
         {
             if (!_modules.TryGetValue(assemblyName, out var mod)) throw new TypeLoadException($"Module '{assemblyName}' not loaded.");
@@ -451,6 +497,7 @@ namespace Cnidaria.Cs
             return match ?? throw new MissingMethodException($"Static method '{typeFullName}.{methodName}' not found or ambiguous in '{assemblyName}'.");
         }
 
+        /// <summary>Ranks exact type matches before enum-underlying matches</summary>
         private bool TryGetHostTypeMatchCostStack(Cnidaria.Cs.RuntimeType actual, Cnidaria.Cs.RuntimeType requested, out int cost)
         {
             if (actual.TypeId == requested.TypeId) { cost = 0; return true; }
@@ -461,6 +508,7 @@ namespace Cnidaria.Cs
         }
 
 
+        /// <summary>Maps a supported host type to its runtime type</summary>
         private Cnidaria.Cs.RuntimeType MapClrTypeToVmStack(Type t)
         {
             if (t == typeof(void)) return ResolveStdStack("System", "Void");
@@ -489,6 +537,7 @@ namespace Cnidaria.Cs
         }
 
 
+        /// <summary>Resolves a required type from the standard runtime module</summary>
         private Cnidaria.Cs.RuntimeType ResolveStdStack(string ns, string name)
         {
             if (!_modules.TryGetValue("std", out var std)) throw new InvalidOperationException("Std module not loaded.");
@@ -496,6 +545,7 @@ namespace Cnidaria.Cs
             return _rts.ResolveType(std, tok);
         }
 
+        /// <summary>Splits a qualified type name at its final namespace separator</summary>
         private static void SplitTypeFullName(string full, out string ns, out string name)
         {
             int lastDot = full.LastIndexOf('.');

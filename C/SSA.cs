@@ -51,7 +51,6 @@ namespace Cnidaria.C
         public SsaOptimizationOptions(
             bool enableConstantFolding = true,
             bool enableCopyPropagation = true,
-            bool enableValueNumberCopyPropagation = true,
             bool enableBranchFolding = true,
             bool enableDeadCodeElimination = true,
             int maxIterations = 3)
@@ -635,6 +634,41 @@ namespace Cnidaria.C
 
                 case GimpleExpressionStatement expressionStatement:
                     ScanValue(expressionStatement.Expression);
+                    break;
+
+                case GimpleAsmStatement asmStatement:
+                    foreach (var output in asmStatement.Outputs)
+                    {
+                        if (output.IsReadWrite && output.Value is not null)
+                            ScanValue(output.Value);
+
+                        if (output.Target is null)
+                            continue;
+
+                        if (InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) == InlineAsmOperandStorage.Memory)
+                        {
+                            MarkAddressTaken(output.Target);
+                            ScanPlace(output.Target, addressContext: true);
+                        }
+                        else
+                        {
+                            ScanPlace(output.Target, addressContext: false);
+                        }
+                    }
+
+                    foreach (var input in asmStatement.Inputs)
+                    {
+                        if (input.Value is GimplePlace inputPlace &&
+                            InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) == InlineAsmOperandStorage.Memory)
+                        {
+                            MarkAddressTaken(inputPlace);
+                            ScanPlace(inputPlace, addressContext: true);
+                        }
+                        else if (input.Value is not null)
+                        {
+                            ScanValue(input.Value);
+                        }
+                    }
                     break;
 
                 case GimpleConditionalGotoStatement conditional:

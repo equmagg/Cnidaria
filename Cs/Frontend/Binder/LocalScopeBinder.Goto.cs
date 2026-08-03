@@ -1,14 +1,9 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Labels, goto statements, and branch transfer validation
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundStatement BindGoto(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -29,6 +24,7 @@ namespace Cnidaria.Cs
                 new Location(context.SemanticModel.SyntaxTree, node.Span)));
             return new BoundBadStatement(node);
         }
+        // Identifier targets may be defined later and are validated after body binding
         private BoundStatement BindGotoIdentifier(GotoStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             if (node.Expression is not IdentifierNameSyntax id)
@@ -143,6 +139,7 @@ namespace Cnidaria.Cs
             _flow.RegisterGoto(node, label);
             return new BoundGotoStatement(node, label);
         }
+        // Label definitions capture their current exception region stack
         private BoundStatement BindLabeledStatement(LabeledStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var name = node.Identifier.ValueText ?? string.Empty;
@@ -189,24 +186,38 @@ namespace Cnidaria.Cs
                 return ImmutableArray<BoundStatement>.Empty;
 
             var isVar = IsVar(decl.Type);
+            var isScoped = decl.Type is ScopedTypeSyntax;
+            var unwrappedType = decl.Type is ScopedTypeSyntax scopedType ? scopedType.Type : decl.Type;
+            var isRefLocal = unwrappedType is RefTypeSyntax;
+
+            if (isRefLocal && decl.Variables.Count != 1)
+            {
+                diagnostics.Add(new Diagnostic("CN_REFLOC001", DiagnosticSeverity.Error,
+                    "A ref local declaration must declare exactly one variable.",
+                    new Location(context.SemanticModel.SyntaxTree, decl.Span)));
+            }
 
             TypeSymbol? explicitType = null;
             if (!isVar)
-                explicitType = BindType(decl.Type, context, diagnostics);
+            {
+                if (unwrappedType is RefTypeSyntax refType)
+                    unwrappedType = refType.Type;
+                explicitType = BindType(unwrappedType, context, diagnostics);
+            }
 
             if (decl.Variables.Count == 1)
             {
                 var s = BindSingleDeclarator(
-                    ownerSyntax, decl.Variables[0], isVar, explicitType, isRefLocal: false, isConst: false, isUsing: false, context, diagnostics);
+                    ownerSyntax, decl.Variables[0], isVar, explicitType, isRefLocal, isConst: false, isUsing: false, isScoped, context, diagnostics);
                 return ImmutableArray.Create(s);
             }
 
             var list = ImmutableArray.CreateBuilder<BoundStatement>(decl.Variables.Count);
             for (int i = 0; i < decl.Variables.Count; i++)
                 list.Add(BindSingleDeclarator(
-                    ownerSyntax, decl.Variables[i], isVar, explicitType, isRefLocal: false, isConst: false, isUsing: false, context, diagnostics));
+                    ownerSyntax, decl.Variables[i], isVar, explicitType, isRefLocal, isConst: false, isUsing: false, isScoped, context, diagnostics));
 
             return list.ToImmutable();
         }
-        }
+    }
 }

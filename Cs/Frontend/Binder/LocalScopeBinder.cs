@@ -1,16 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Binds executable code within a lexical scope</summary>
+    /// <remarks>Nested scopes may share control-flow state while maintaining distinct symbol tables</remarks>
     internal sealed partial class LocalScopeBinder : Binder
     {
+        // Pairs a writable target with the expression used to read its current value
         private readonly struct LValue
         {
             public BoundExpression Target { get; }
@@ -21,6 +19,7 @@ namespace Cnidaria.Cs
                 Read = read;
             }
         }
+        // Preserves both constant value and runtime type for switch label identity
         private readonly struct SwitchCaseKey : IEquatable<SwitchCaseKey>
         {
             private readonly object? _value;
@@ -49,6 +48,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        // Maps constant switch labels for goto case and goto default binding
         private sealed class SwitchGotoScope
         {
             private readonly Dictionary<SwitchCaseKey, LabelSymbol> _caseLabels;
@@ -69,6 +69,7 @@ namespace Cnidaria.Cs
             public bool TryGetCaseLabel(SwitchCaseKey key, out LabelSymbol? label)
                 => _caseLabels.TryGetValue(key, out label);
         }
+        // Tracks labels, branch targets, and exception regions shared by nested scopes
         private sealed class ControlFlowScope
         {
             private enum ExceptionRegionKind : byte
@@ -219,7 +220,7 @@ namespace Cnidaria.Cs
                 DiagnosticBag diagnostics)
             {
                 var src = SnapshotExceptionRegions();
-                var dst = ImmutableArray<ExceptionRegionFrame>.Empty; // method exit
+                var dst = ImmutableArray<ExceptionRegionFrame>.Empty; // Method exit has no enclosing exception region
                 AddTransferDiagnosticIfInvalid(src, dst, syntax, context, diagnostics);
             }
             public bool TryGetCurrentBreak(out LabelSymbol breakLabel)
@@ -254,6 +255,8 @@ namespace Cnidaria.Cs
                 scope = _switchGotoStack.Peek();
                 return true;
             }
+            /// <summary>Reports unresolved labels and validates deferred goto transfers</summary>
+            /// <remarks>Diagnostics are emitted at most once for the shared control-flow scope</remarks>
             public void ReportUndefinedLabels(BindingContext context, DiagnosticBag diagnostics)
             {
                 if (_diagnosticsEmitted)
@@ -348,6 +351,7 @@ namespace Cnidaria.Cs
                 return false;
             }
         }
+        // Carries a resolved type through APIs that otherwise accept value expressions
         private sealed class BoundTypeOnlyExpression : BoundExpression
         {
             public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
@@ -359,6 +363,7 @@ namespace Cnidaria.Cs
                 ConstantValueOpt = Optional<object>.None;
             }
         }
+        // Mutable method symbol used while lambda parameters and return type are inferred
         private sealed class LambdaMethodSymbol : MethodSymbol
         {
             public override string Name { get; }
@@ -371,6 +376,8 @@ namespace Cnidaria.Cs
             public override bool IsStatic { get; }
             public override bool IsConstructor => false;
             public override bool IsAsync { get; }
+            private readonly List<AttributeData> _attributes = new();
+            public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
 
             public LambdaMethodSymbol(
                 string name,
@@ -392,7 +399,11 @@ namespace Cnidaria.Cs
 
             public void SetParameters(ImmutableArray<ParameterSymbol> parameters)
                 => _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
+
+            public void AddAttribute(AttributeData attribute)
+                => _attributes.Add(attribute);
         }
+        // Defers the element type of an out discard until overload resolution
         private sealed class BoundOutDiscardExpression : BoundExpression
         {
             public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
@@ -410,30 +421,36 @@ namespace Cnidaria.Cs
                 ConstantValueOpt = Optional<object>.None;
             }
         }
+        // Defers an out variable declaration until its parameter type is selected
         private sealed class BoundOutVarPendingExpression : BoundExpression
         {
             public override BoundNodeKind Kind => BoundNodeKind.BadExpression;
 
             public string Name { get; }
             public SingleVariableDesignationSyntax Designation { get; }
+            public bool IsScoped { get; }
 
             public BoundOutVarPendingExpression(
                 DeclarationExpressionSyntax syntax,
                 string name,
                 SingleVariableDesignationSyntax designation,
-                TypeSymbol markerType)
+                TypeSymbol markerType,
+                bool isScoped)
                 : base(syntax)
             {
                 Name = name;
                 Designation = designation;
+                IsScoped = isScoped;
                 Type = markerType;
                 ConstantValueOpt = Optional<object>.None;
             }
         }
+        // Selects read, write, or method-group semantics for member binding
         private enum BindValueKind : byte
         {
             RValue, LValue
         }
+        // Suppresses semantic records during speculative binding
         private sealed class NullBindingRecorder : IBindingRecorder
         {
             public static readonly NullBindingRecorder Instance = new();
@@ -454,6 +471,8 @@ namespace Cnidaria.Cs
         private readonly LocalScopeBinder? _nameConflictStop;
 
         private int _tempId;
+        /// <summary>Creates a lexical binder for an executable symbol</summary>
+        /// <remarks>Flow state is inherited from a parent local binder unless explicitly isolated</remarks>
         public LocalScopeBinder(
             Binder? parent,
             BinderFlags flags,
@@ -493,7 +512,7 @@ namespace Cnidaria.Cs
             {
                 if ((Flags & BinderFlags.CheckedContext) != 0) return true;
                 if ((Flags & BinderFlags.UncheckedContext) != 0) return false;
-                return false; // default unchecked
+                return false; // Unspecified contexts are unchecked
             }
         }
         private static BinderFlags ApplyCheckedContext(BinderFlags flags, bool isChecked)
@@ -537,6 +556,7 @@ namespace Cnidaria.Cs
         public override Symbol? GetDeclaredSymbol(SyntaxNode declaration)
             => Parent?.GetDeclaredSymbol(declaration);
 
+        /// <summary>Dispatches statement syntax to the matching binder and records the result</summary>
         public override BoundStatement BindStatement(StatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             BoundStatement result;
@@ -664,6 +684,7 @@ namespace Cnidaria.Cs
 
             return Record(node, result, context);
         }
+        /// <summary>Dispatches expression syntax to the matching binder and records the result</summary>
         public override BoundExpression BindExpression(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             BoundExpression result;

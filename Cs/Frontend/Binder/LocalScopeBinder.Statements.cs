@@ -1,16 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Structured statement binding and switch lowering
     internal sealed partial class LocalScopeBinder : Binder
     {
+        // Resource acquisition is bound before the protected body and disposal lowering
         private BoundStatement BindUsingStatement(UsingStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             if (node.AwaitKeyword.Span.Length != 0)
@@ -72,9 +69,24 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics)
         {
             var isVar = IsVar(declaration.Type);
+            var isScoped = declaration.Type is ScopedTypeSyntax;
+            TypeSyntax typeSyntax = declaration.Type is ScopedTypeSyntax scopedType ? scopedType.Type : declaration.Type;
+            var isRefLocal = typeSyntax is RefTypeSyntax;
+            if (typeSyntax is RefTypeSyntax refType)
+                typeSyntax = refType.Type;
+
+            if (isRefLocal)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_USING_REF000",
+                    DiagnosticSeverity.Error,
+                    "A using local cannot be a ref local.",
+                    new Location(context.SemanticModel.SyntaxTree, declaration.Type.Span)));
+            }
+
             TypeSymbol? explicitType = null;
             if (!isVar)
-                explicitType = BindType(declaration.Type, context, diagnostics);
+                explicitType = BindType(typeSyntax, context, diagnostics);
 
             var builder = ImmutableArray.CreateBuilder<BoundLocalDeclarationStatement>(declaration.Variables.Count);
             for (int i = 0; i < declaration.Variables.Count; i++)
@@ -94,9 +106,10 @@ namespace Cnidaria.Cs
                     v,
                     isVar,
                     explicitType,
-                    isRefLocal: false,
+                    isRefLocal,
                     isConst: false,
                     isUsing: true,
+                    isScoped,
                     context,
                     diagnostics);
 
@@ -204,6 +217,7 @@ namespace Cnidaria.Cs
 
             return Visit(type);
         }
+        // Exception region tracking is updated while each clause is bound
         private BoundStatement BindTry(TryStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             if (node.Catches.Count == 0 && node.Finally == null)
@@ -508,6 +522,7 @@ namespace Cnidaria.Cs
 
             return new BoundIfStatement(node, condition, thenStmt, elseStmt);
         }
+        // Case labels lower to boolean tests against one stabilized governing value
         private BoundExpression BindSwitchLabelCondition(
             SyntaxNode diagnosticNode,
             ExpressionSyntax tmpExprSyntax,
@@ -650,6 +665,7 @@ namespace Cnidaria.Cs
             return MakeLogicalAnd(arm, match, whenCond, ctx, diagnostics);
         }
 
+        // Switch binding predeclares labels so goto case can target later sections
         private BoundStatement BindSwitchStatement(SwitchStatementSyntax node, BindingContext ctx, DiagnosticBag diagnostics)
         {
             var governing = BindExpression(node.Expression, ctx, diagnostics);
@@ -761,7 +777,7 @@ namespace Cnidaria.Cs
                         boundSecStmts.Add(sectionBinder.BindStatement(secStatements[s], ctx, diagnostics));
 
                     stmts.Add(new BoundBlockStatement(sec, boundSecStmts.ToImmutable()));
-                    stmts.Add(new BoundGotoStatement(sec, breakLabel)); // implicit break
+                    stmts.Add(new BoundGotoStatement(sec, breakLabel)); // End the section when control reaches its boundary
                 }
             }
             finally
@@ -774,6 +790,7 @@ namespace Cnidaria.Cs
             return new BoundBlockStatement(node, stmts.ToImmutable());
         }
 
+        // Switch expressions evaluate the governing expression once before arm tests
         private BoundExpression BindSwitchExpression(SwitchExpressionSyntax node, BindingContext ctx, DiagnosticBag diagnostics)
         {
             var governing = BindExpression(node.GoverningExpression, ctx, diagnostics);
@@ -893,7 +910,7 @@ namespace Cnidaria.Cs
                 sideEffects.Add(new BoundConditionalGotoStatement(arm, cond, armLabels[i], jumpIfTrue: true));
             }
 
-            sideEffects.Add(new BoundGotoStatement(node, endLabel)); // no match => default(resultLocal)
+            sideEffects.Add(new BoundGotoStatement(node, endLabel)); // No matching arm leaves the default result
 
             for (int i = 0; i < armCount; i++)
             {

@@ -8,18 +8,18 @@ using System.Xml.Linq;
 
 namespace Cnidaria.Cs
 {
-    internal sealed class GenTreeProgram
+    public sealed class GenTreeProgram
     {
-        public ImmutableArray<GenTreeMethod> Methods { get; }
-        public IReadOnlyDictionary<int, GenTreeMethod> MethodsByRuntimeMethodId { get; }
+        internal ImmutableArray<GenTreeMethod> Methods { get; }
+        internal IReadOnlyDictionary<int, GenTreeMethod> MethodsByRuntimeMethodId { get; }
         public RuntimeTypeSystem? TypeSystem { get; }
         public TargetInfo Target => TypeSystem?.Target ?? (Methods.IsDefaultOrEmpty ? TargetInfo.Default : Methods[0].Target);
-        public GenTreeProgram(ImmutableArray<GenTreeMethod> methods)
+        internal GenTreeProgram(ImmutableArray<GenTreeMethod> methods)
             : this(null, methods)
         {
         }
 
-        public GenTreeProgram(RuntimeTypeSystem? typeSystem, ImmutableArray<GenTreeMethod> methods)
+        internal GenTreeProgram(RuntimeTypeSystem? typeSystem, ImmutableArray<GenTreeMethod> methods)
         {
             TypeSystem = typeSystem;
             Methods = methods.IsDefault ? ImmutableArray<GenTreeMethod>.Empty : methods;
@@ -35,7 +35,7 @@ namespace Cnidaria.Cs
         public GenTreeBuildException(string message) : base(message) { }
         public GenTreeBuildException(string message, Exception innerException) : base(message, innerException) { }
     }
-    internal sealed class GenTreeBuilder
+    public sealed class GenTreeBuilder
     {
         private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
         private readonly RuntimeTypeSystem _rts;
@@ -376,239 +376,10 @@ namespace Cnidaria.Cs
 
             foreach (RuntimeType runtimeType in _liveInstantiatedTypes.Values)
             {
-                if (runtimeType.GenericTypeDefinition is not null)
-                    _rts.EnsureConstructedMembers(runtimeType);
-
-                if (!CanBeVirtualTarget(runtimeType, declared.DeclaringType))
-                    continue;
-
-                for (RuntimeType? owner = runtimeType; owner is not null; owner = owner.BaseType)
-                {
-                    if (owner.GenericTypeDefinition is not null)
-                        _rts.EnsureConstructedMembers(owner);
-
-                    if (declared.DeclaringType.Kind == RuntimeTypeKind.Interface)
-                    {
-                        foreach (RuntimeMethod explicitTarget in EnumerateExplicitInterfaceTargets(owner, declared))
-                            yield return explicitTarget;
-                    }
-
-                    var methods = owner.Methods;
-                    for (int m = 0; m < methods.Length; m++)
-                    {
-                        var candidate = methods[m];
-
-                        if (IsVirtualTargetCandidate(candidate, declared))
-                            yield return candidate;
-                    }
-                }
+                RuntimeMethod? target = _rts.ResolveVirtualMethod(declared, runtimeType);
+                if (target is not null && target.MethodId != declared.MethodId)
+                    yield return target;
             }
-        }
-        private IEnumerable<RuntimeMethod> EnumerateExplicitInterfaceTargets(RuntimeType candidateOwner, RuntimeMethod declared)
-        {
-            var map = candidateOwner.ExplicitInterfaceMethodImpls;
-
-            if (map is null || map.Count == 0)
-                yield break;
-
-            if (map.TryGetValue(declared.MethodId, out var exact))
-            {
-                yield return ProjectRuntimeMethodToOwner(candidateOwner, exact);
-            }
-
-            foreach (var kv in map)
-            {
-                RuntimeMethod ifaceMethod;
-
-                try
-                {
-                    ifaceMethod = _rts.GetMethodById(kv.Key);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (!SameInterfaceMethodIdentity(ifaceMethod, declared))
-                    continue;
-
-                yield return ProjectRuntimeMethodToOwner(candidateOwner, kv.Value);
-            }
-        }
-        private static RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType candidateOwner, RuntimeMethod method)
-        {
-            if (method.DeclaringType.TypeId == candidateOwner.TypeId)
-                return method;
-
-            var methods = candidateOwner.Methods;
-
-            for (int i = 0; i < methods.Length; i++)
-            {
-                var candidate = methods[i];
-
-                if (!StringComparer.Ordinal.Equals(candidate.Name, method.Name))
-                    continue;
-
-                if (candidate.GenericArity != method.GenericArity)
-                    continue;
-
-                if (candidate.IsStatic != method.IsStatic)
-                    continue;
-
-                if (candidate.Body is not null &&
-                    method.Body is not null &&
-                    ReferenceEquals(candidate.Body, method.Body))
-                {
-                    return candidate;
-                }
-
-                if (SameSignature(candidate, method))
-                    return candidate;
-            }
-
-            return method;
-        }
-        private static bool IsVirtualTargetCandidate(RuntimeMethod candidate, RuntimeMethod declared)
-        {
-            if (candidate.MethodId == declared.MethodId)
-                return false;
-
-            if (candidate.IsStatic)
-                return false;
-
-            if (!StringComparer.Ordinal.Equals(candidate.Name, declared.Name))
-                return false;
-
-            if (candidate.GenericArity != declared.GenericArity)
-                return false;
-
-            if (!SameSignature(candidate, declared))
-                return false;
-
-            if (!CanBeVirtualTarget(candidate.DeclaringType, declared.DeclaringType))
-                return false;
-
-            return true;
-        }
-        private static bool SameSignature(RuntimeMethod a, RuntimeMethod b)
-        {
-            if (!SameRuntimeType(a.ReturnType, b.ReturnType))
-                return false;
-
-            if (a.ParameterTypes.Length != b.ParameterTypes.Length)
-                return false;
-
-            for (int i = 0; i < a.ParameterTypes.Length; i++)
-            {
-                if (!SameRuntimeType(a.ParameterTypes[i], b.ParameterTypes[i]))
-                    return false;
-            }
-
-            return true;
-        }
-        private static bool SameInterfaceMethodIdentity(RuntimeMethod ifaceMethod, RuntimeMethod declared)
-        {
-            if (!StringComparer.Ordinal.Equals(ifaceMethod.Name, declared.Name))
-                return false;
-
-            if (ifaceMethod.GenericArity != declared.GenericArity)
-                return false;
-
-            if (!SameRuntimeTypeDefinitionOrExact(ifaceMethod.DeclaringType, declared.DeclaringType))
-                return false;
-
-            if (ifaceMethod.ParameterTypes.Length != declared.ParameterTypes.Length)
-                return false;
-
-            if (!CompatibleInterfaceSignatureType(ifaceMethod.ReturnType, declared.ReturnType))
-                return false;
-
-            for (int i = 0; i < ifaceMethod.ParameterTypes.Length; i++)
-            {
-                if (!CompatibleInterfaceSignatureType(ifaceMethod.ParameterTypes[i], declared.ParameterTypes[i]))
-                    return false;
-            }
-
-            return true;
-        }
-
-        private static bool SameRuntimeType(RuntimeType a, RuntimeType b)
-            => a.TypeId == b.TypeId;
-
-        private static bool SameRuntimeTypeDefinitionOrExact(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-
-            RuntimeType ad = a.GenericTypeDefinition ?? a;
-            RuntimeType bd = b.GenericTypeDefinition ?? b;
-
-            return ad.TypeId == bd.TypeId;
-        }
-        private static bool CompatibleInterfaceSignatureType(RuntimeType a, RuntimeType b)
-        {
-            if (a.TypeId == b.TypeId)
-                return true;
-
-            if (a.Kind == RuntimeTypeKind.TypeParam || b.Kind == RuntimeTypeKind.TypeParam)
-                return true;
-
-            return SameRuntimeTypeDefinitionOrExact(a, b);
-        }
-        private static bool CanBeVirtualTarget(RuntimeType candidateOwner, RuntimeType declaredOwner)
-        {
-            if (ReferenceEquals(candidateOwner, declaredOwner))
-                return true;
-
-            if (declaredOwner.Kind == RuntimeTypeKind.Interface)
-            {
-                for (var t = candidateOwner; t is not null; t = t.BaseType)
-                {
-                    var interfaces = t.Interfaces;
-                    for (int i = 0; i < interfaces.Length; i++)
-                    {
-                        if (SameInterfaceType(interfaces[i], declaredOwner))
-                            return true;
-                    }
-                }
-                return false;
-            }
-
-            for (var t = candidateOwner.BaseType; t is not null; t = t.BaseType)
-            {
-                if (ReferenceEquals(t, declaredOwner))
-                    return true;
-            }
-
-            return false;
-        }
-        private static bool SameInterfaceType(RuntimeType implemented, RuntimeType declared)
-        {
-            if (implemented.TypeId == declared.TypeId)
-                return true;
-
-            RuntimeType? implementedDef = implemented.GenericTypeDefinition;
-            RuntimeType? declaredDef = declared.GenericTypeDefinition;
-
-            if (implementedDef is null || declaredDef is null)
-                return false;
-
-            if (implementedDef.TypeId != declaredDef.TypeId)
-                return false;
-
-            RuntimeType[] implementedArgs = implemented.GenericTypeArguments;
-            RuntimeType[] declaredArgs = declared.GenericTypeArguments;
-
-            if (implementedArgs.Length != declaredArgs.Length)
-                return false;
-
-            for (int i = 0; i < implementedArgs.Length; i++)
-            {
-                if (!CompatibleInterfaceSignatureType(implementedArgs[i], declaredArgs[i]))
-                    return false;
-            }
-
-            return true;
         }
     }
     internal sealed class GenTreeMethodBuilder
@@ -754,6 +525,17 @@ namespace Cnidaria.Cs
             }
 
             return true;
+        }
+        internal static bool IsLengthGetter(RuntimeMethod? method)
+        {
+            return method is not null &&
+                   method.HasThis &&
+                   !method.IsStatic &&
+                   method.ParameterTypes.Length == 0 &&
+                   method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
+                   StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array");
         }
         internal static bool IsNonEscapingLocalAddressConsumer(BytecodeOp op)
             => op is BytecodeOp.Ldfld or BytecodeOp.Stfld;
@@ -929,7 +711,7 @@ namespace Cnidaria.Cs
                     case BytecodeOp.Pop:
                         {
                             var value = Pop(stack, pc, ins.Op);
-                            AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(value.Node)));
+                            AppendImporterStatement(statements, stack, CreateDiscardStatement(value.Node, pc, ins.Op));
                             break;
                         }
 
@@ -1104,20 +886,6 @@ namespace Cnidaria.Cs
                         {
                             var count = Pop(stack, pc, ins.Op);
                             PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(count.Node), int32: ins.Operand0));
-                            break;
-                        }
-
-                    case BytecodeOp.AllocHGlobal:
-                        {
-                            var byteCount = Pop(stack, pc, ins.Op);
-                            PushImportedValue(stack, statements, Node(GenTreeKind.AllocHGlobal, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(byteCount.Node)));
-                            break;
-                        }
-
-                    case BytecodeOp.FreeHGlobal:
-                        {
-                            var pointer = Pop(stack, pc, ins.Op);
-                            AppendImporterStatement(statements, stack, Node(GenTreeKind.FreeHGlobal, pc, ins.Op, stackKind: GenStackKind.Void, operands: One(pointer.Node)));
                             break;
                         }
 
@@ -1332,10 +1100,13 @@ namespace Cnidaria.Cs
             for (int i = 0; i < stack.Count; i++)
             {
                 GenTree value = stack[i].Node;
-                statements.Add(Node(GenTreeKind.Eval, pc, sourceOp, operands: One(value)));
+                statements.Add(CreateDiscardStatement(value, pc, sourceOp));
             }
             stack.Clear();
         }
+        private GenTree CreateDiscardStatement(GenTree value, int pc, BytecodeOp sourceOp)
+            => Node(GenTreeKind.Eval, pc, sourceOp, operands: One(value));
+
         private static bool RangesIntersect(int aStart, int aEnd, int bStart, int bEnd)
             => aStart < bEnd && bStart < aEnd;
         private bool PcInExceptionRegion(int pc)
@@ -1652,7 +1423,6 @@ namespace Cnidaria.Cs
                 GenTreeKind.LoadIndirect or
                 GenTreeKind.StaticData or
                 GenTreeKind.StackAlloc or
-                GenTreeKind.AllocHGlobal or
                 GenTreeKind.Box or
                 GenTreeKind.UnboxAny or
                 GenTreeKind.CastClass;
@@ -2485,7 +2255,7 @@ namespace Cnidaria.Cs
             }
 
             var init = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: valueType, stackKind: StackKindOf(valueType), runtimeType: valueType);
-            statements.Add(Node(storeKind, pc, sourceOp, operands: One(init), int32: index));
+            statements.Add(MarkExplicitInit(Node(storeKind, pc, sourceOp, operands: One(init), int32: index)));
         }
 
         private void EmitStructDefaultInitializationThroughAddress(
@@ -2526,8 +2296,8 @@ namespace Cnidaria.Cs
                     continue;
 
                 var fieldDefault = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: field.FieldType, stackKind: StackKindOf(field.FieldType), runtimeType: field.FieldType);
-                statements.Add(Node(GenTreeKind.StoreField, pc, sourceOp,
-                    operands: Two(createDestinationAddress(), fieldDefault), field: field, runtimeType: field.FieldType));
+                statements.Add(MarkExplicitInit(Node(GenTreeKind.StoreField, pc, sourceOp,
+                    operands: Two(createDestinationAddress(), fieldDefault), field: field, runtimeType: field.FieldType)));
             }
 
             return true;
@@ -3107,6 +2877,411 @@ namespace Cnidaria.Cs
                 PushImportedValue(stack, statements, call);
         }
 
+        private enum DevirtualizationReceiverTransform : byte
+        {
+            None,
+            Unbox,
+            TakeAddress,
+            Box,
+        }
+
+        private readonly struct DevirtualizationReceiverInfo
+        {
+            public RuntimeType? Type { get; }
+            public bool IsExact { get; }
+            public bool IsNonNull { get; }
+            public bool IsBoxedValue { get; }
+            public bool IsUnboxedValue { get; }
+
+            public DevirtualizationReceiverInfo(
+                RuntimeType? type,
+                bool isExact,
+                bool isNonNull,
+                bool isBoxedValue = false,
+                bool isUnboxedValue = false)
+            {
+                Type = type;
+                IsExact = isExact;
+                IsNonNull = isNonNull;
+                IsBoxedValue = isBoxedValue;
+                IsUnboxedValue = isUnboxedValue;
+            }
+        }
+
+        private bool TryDevirtualizeCall(
+            RuntimeMethod declaredMethod,
+            ImmutableArray<GenTree> args,
+            List<GenTree> statements,
+            out RuntimeMethod targetMethod,
+            out bool requiresNullCheck,
+            out DevirtualizationReceiverTransform receiverTransform)
+        {
+            targetMethod = declaredMethod;
+            requiresNullCheck = false;
+            receiverTransform = DevirtualizationReceiverTransform.None;
+
+            if (!declaredMethod.HasThis || args.IsDefaultOrEmpty)
+                return false;
+
+            GenTree receiver = args[0];
+            bool isReferenceReceiver = receiver.StackKind is GenStackKind.Ref or GenStackKind.Null;
+            bool isValueReceiver = receiver.Type is not null &&
+                receiver.Type.IsValueType &&
+                receiver.StackKind is not (GenStackKind.ByRef or GenStackKind.Ptr);
+            if (!isReferenceReceiver && !isValueReceiver)
+                return false;
+
+            DevirtualizationReceiverInfo receiverInfo = GetDevirtualizationReceiverInfo(
+                receiver,
+                statements,
+                statements.Count,
+                new HashSet<int>());
+
+            RuntimeMethod resolvedMethod;
+            if (!declaredMethod.IsVirtual && declaredMethod.DeclaringType.Kind != RuntimeTypeKind.Interface)
+            {
+                resolvedMethod = declaredMethod;
+            }
+            else
+            {
+                RuntimeType? objectType = receiverInfo.Type;
+                if (objectType is null ||
+                    objectType.Kind is RuntimeTypeKind.Interface or RuntimeTypeKind.TypeParam ||
+                    (!objectType.IsReferenceType && !objectType.IsValueType))
+                {
+                    return false;
+                }
+
+                RuntimeMethod? candidate = _rts.ResolveVirtualMethod(declaredMethod, objectType);
+                if (candidate is null)
+                    return false;
+
+                bool canDevirtualize = receiverInfo.IsExact ||
+                    objectType.IsFinal ||
+                    (declaredMethod.DeclaringType.Kind != RuntimeTypeKind.Interface && candidate.IsFinal);
+
+                if (!canDevirtualize)
+                    return false;
+
+                resolvedMethod = candidate;
+            }
+
+            targetMethod = resolvedMethod;
+            requiresNullCheck = isReferenceReceiver && !receiverInfo.IsNonNull;
+            if (receiverInfo.IsBoxedValue && resolvedMethod.DeclaringType.IsValueType)
+            {
+                receiverTransform = DevirtualizationReceiverTransform.Unbox;
+            }
+            else if (receiverInfo.IsUnboxedValue)
+            {
+                receiverTransform = resolvedMethod.DeclaringType.IsValueType
+                    ? DevirtualizationReceiverTransform.TakeAddress
+                    : DevirtualizationReceiverTransform.Box;
+            }
+
+            return true;
+        }
+
+        private DevirtualizationReceiverInfo GetDevirtualizationReceiverInfo(
+            GenTree node, List<GenTree> statements, int statementLimit, HashSet<int> visitingTemps)
+        {
+            if (node.Kind != GenTreeKind.Box &&
+                node.Type is not null &&
+                node.Type.IsValueType &&
+                node.StackKind is not (GenStackKind.ByRef or GenStackKind.Ptr))
+            {
+                return new DevirtualizationReceiverInfo(
+                    node.Type,
+                    isExact: true,
+                    isNonNull: true,
+                    isUnboxedValue: true);
+            }
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.NewObject:
+                    return ExactNonNullReference(node.RuntimeType ?? node.Type);
+
+                case GenTreeKind.NewArray:
+                case GenTreeKind.NewDelegate:
+                    return ExactNonNullReference(node.Type ?? node.RuntimeType);
+
+                case GenTreeKind.ConstString:
+                    return new DevirtualizationReceiverInfo(_rts.SystemString, isExact: true, isNonNull: true);
+
+                case GenTreeKind.Box:
+                    {
+                        RuntimeType? boxedType = node.RuntimeType;
+                        if (boxedType is not null && boxedType.IsValueType)
+                        {
+                            return new DevirtualizationReceiverInfo(
+                                boxedType,
+                                isExact: true,
+                                isNonNull: true,
+                                isBoxedValue: true);
+                        }
+                        return StaticReference(node.Type, isNonNull: true);
+                    }
+
+                case GenTreeKind.Copy:
+                case GenTreeKind.Reload:
+                case GenTreeKind.Spill:
+                    if (node.Operands.Length == 1)
+                        return GetDevirtualizationReceiverInfo(node.Operands[0], statements, statementLimit, visitingTemps);
+                    break;
+
+                case GenTreeKind.CastClass:
+                    {
+                        RuntimeType? castType = node.RuntimeType ?? node.Type;
+                        if (node.Operands.Length != 1)
+                            return StaticReference(castType, isNonNull: false);
+
+                        DevirtualizationReceiverInfo sourceInfo = GetDevirtualizationReceiverInfo(
+                            node.Operands[0],
+                            statements,
+                            statementLimit,
+                            visitingTemps);
+                        if (sourceInfo.IsExact &&
+                            sourceInfo.Type is not null &&
+                            castType is not null &&
+                            _rts.IsAssignableTo(sourceInfo.Type, castType))
+                        {
+                            return sourceInfo;
+                        }
+
+                        return StaticReference(castType, sourceInfo.IsNonNull);
+                    }
+
+                case GenTreeKind.IsInst:
+                    {
+                        RuntimeType? targetType = node.RuntimeType ?? node.Type;
+                        if (node.Operands.Length == 1)
+                        {
+                            DevirtualizationReceiverInfo sourceInfo = GetDevirtualizationReceiverInfo(
+                                node.Operands[0],
+                                statements,
+                                statementLimit,
+                                visitingTemps);
+                            if (sourceInfo.IsExact &&
+                                sourceInfo.IsNonNull &&
+                                sourceInfo.Type is not null &&
+                                targetType is not null &&
+                                _rts.IsAssignableTo(sourceInfo.Type, targetType))
+                            {
+                                return sourceInfo;
+                            }
+                        }
+
+                        return StaticReference(node.Type, isNonNull: false);
+                    }
+
+                case GenTreeKind.Temp:
+                    {
+                        int tempIndex = node.Int32;
+                        if (!visitingTemps.Add(tempIndex))
+                            return StaticReference(node.Type, isNonNull: false);
+
+                        try
+                        {
+                            if (HasTempAddressUse(statements, tempIndex, statementLimit))
+                                return StaticReference(node.Type, isNonNull: false);
+
+                            for (int i = statementLimit - 1; i >= 0; i--)
+                            {
+                                GenTree statement = statements[i];
+                                if (statement.Kind != GenTreeKind.StoreTemp ||
+                                    statement.Int32 != tempIndex ||
+                                    statement.Operands.Length != 1)
+                                {
+                                    continue;
+                                }
+
+                                DevirtualizationReceiverInfo storedInfo = GetDevirtualizationReceiverInfo(
+                                    statement.Operands[0],
+                                    statements,
+                                    i,
+                                    visitingTemps);
+
+                                if (storedInfo.Type is not null)
+                                    return storedInfo;
+
+                                return StaticReference(node.Type, storedInfo.IsNonNull);
+                            }
+                        }
+                        finally
+                        {
+                            visitingTemps.Remove(tempIndex);
+                        }
+
+                        return StaticReference(node.Type, isNonNull: false);
+                    }
+
+                case GenTreeKind.Arg:
+                    return StaticReference(
+                        node.Type,
+                        _method.HasThis && node.Int32 == 0 && node.StackKind == GenStackKind.Ref);
+
+                case GenTreeKind.Local:
+                case GenTreeKind.Field:
+                case GenTreeKind.StaticField:
+                case GenTreeKind.ArrayElement:
+                case GenTreeKind.Call:
+                case GenTreeKind.VirtualCall:
+                case GenTreeKind.DelegateInvoke:
+                case GenTreeKind.DefaultValue:
+                    return StaticReference(node.Type, isNonNull: false);
+            }
+
+            return default;
+        }
+
+        private static DevirtualizationReceiverInfo ExactNonNullReference(RuntimeType? type)
+        {
+            if (type is null || !type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+                return default;
+            return new DevirtualizationReceiverInfo(type, isExact: true, isNonNull: true);
+        }
+
+        private static DevirtualizationReceiverInfo StaticReference(RuntimeType? type, bool isNonNull)
+        {
+            if (type is null || !type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+                return new DevirtualizationReceiverInfo(null, isExact: false, isNonNull: isNonNull);
+            return new DevirtualizationReceiverInfo(type, isExact: false, isNonNull: isNonNull);
+        }
+
+        private static bool HasTempAddressUse(List<GenTree> statements, int tempIndex, int statementLimit)
+        {
+            for (int i = 0; i < statementLimit; i++)
+            {
+                if (TreeContainsTempAddress(statements[i], tempIndex))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool TreeContainsTempAddress(GenTree node, int tempIndex)
+        {
+            if (node.Kind == GenTreeKind.TempAddr && node.Int32 == tempIndex)
+                return true;
+
+            ImmutableArray<GenTree> operands = node.Operands;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                if (TreeContainsTempAddress(operands[i], tempIndex))
+                    return true;
+            }
+            return false;
+        }
+
+        private ImmutableArray<GenTree> RewriteDevirtualizedReceiver(
+            List<GenTree> statements,
+            int pc,
+            BytecodeOp sourceOp,
+            ImmutableArray<GenTree> operands,
+            RuntimeMethod targetMethod,
+            DevirtualizationReceiverTransform transform)
+        {
+            if (transform == DevirtualizationReceiverTransform.None)
+                return operands;
+            if (operands.IsDefaultOrEmpty)
+                throw Fail(pc, sourceOp, "Devirtualized call has no receiver.");
+
+            GenTree receiver = operands[0];
+            GenTree rewrittenReceiver;
+            switch (transform)
+            {
+                case DevirtualizationReceiverTransform.Unbox:
+                    {
+                        if (!targetMethod.DeclaringType.IsValueType)
+                            throw Fail(pc, sourceOp, "Devirtualized unboxing target is not a value-type method.");
+
+                        GenTree payloadPointer = Node(
+                            GenTreeKind.PointerElementAddr,
+                            pc,
+                            sourceOp,
+                            stackKind: GenStackKind.Ptr,
+                            operands: Two(receiver, ConstI4(pc, sourceOp, 1)),
+                            int32: _rts.Target.ManagedObjectHeaderSize,
+                            runtimeType: targetMethod.DeclaringType);
+                        RuntimeType payloadByRefType = _rts.GetByRefType(targetMethod.DeclaringType);
+                        rewrittenReceiver = Node(
+                            GenTreeKind.PointerToByRef,
+                            pc,
+                            sourceOp,
+                            type: payloadByRefType,
+                            stackKind: GenStackKind.ByRef,
+                            operands: One(payloadPointer),
+                            runtimeType: targetMethod.DeclaringType);
+                        break;
+                    }
+
+                case DevirtualizationReceiverTransform.TakeAddress:
+                    {
+                        if (receiver.Type is null || !receiver.Type.IsValueType || !targetMethod.DeclaringType.IsValueType)
+                            throw Fail(pc, sourceOp, "Devirtualized value-type call has an invalid receiver.");
+
+                        GenTemp receiverTemp = CreateImporterSpillTemp(receiver.Type, receiver.StackKind);
+                        statements.Add(Node(
+                            GenTreeKind.StoreTemp,
+                            pc,
+                            sourceOp,
+                            operands: One(receiver),
+                            int32: receiverTemp.Index));
+                        rewrittenReceiver = TempAddress(pc, sourceOp, receiverTemp).Node;
+                        break;
+                    }
+
+                case DevirtualizationReceiverTransform.Box:
+                    {
+                        if (receiver.Type is null || !receiver.Type.IsValueType || targetMethod.DeclaringType.IsValueType)
+                            throw Fail(pc, sourceOp, "Devirtualized boxing call has an invalid receiver.");
+
+                        MarkInstantiatedType(receiver.Type);
+                        rewrittenReceiver = Node(
+                            GenTreeKind.Box,
+                            pc,
+                            BytecodeOp.Box,
+                            type: _rts.SystemObject,
+                            stackKind: GenStackKind.Ref,
+                            operands: One(receiver),
+                            int32: receiver.Type.TypeId,
+                            runtimeType: receiver.Type);
+                        break;
+                    }
+
+                default:
+                    throw Fail(pc, sourceOp, "Unknown devirtualized receiver transform.");
+            }
+
+            var rewritten = operands.ToBuilder();
+            rewritten[0] = rewrittenReceiver;
+            return rewritten.ToImmutable();
+        }
+
+        private ImmutableArray<GenTree> MaterializeCallVirtOperandsAndAppendNullCheck(
+            List<GenTree> statements, int pc, BytecodeOp sourceOp, ImmutableArray<GenTree> operands)
+        {
+            if (operands.IsDefaultOrEmpty)
+                throw Fail(pc, sourceOp, "Devirtualized callvirt has no receiver.");
+
+            var materialized = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
+            GenTree receiver = operands[0];
+            GenTemp receiverTemp = CreateImporterSpillTemp(receiver.Type, receiver.StackKind);
+            statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(receiver), int32: receiverTemp.Index));
+            materialized.Add(TempLoad(pc, sourceOp, receiverTemp).Node);
+
+            for (int i = 1; i < operands.Length; i++)
+            {
+                GenTree operand = operands[i];
+                GenTemp temp = CreateImporterSpillTemp(operand.Type, operand.StackKind);
+                statements.Add(Node(GenTreeKind.StoreTemp, pc, sourceOp, operands: One(operand), int32: temp.Index));
+                materialized.Add(TempLoad(pc, sourceOp, temp).Node);
+            }
+
+            statements.Add(Node(GenTreeKind.NullCheck, pc, sourceOp, operands: One(TempLoad(pc, sourceOp, receiverTemp).Node)));
+            return materialized.ToImmutable();
+        }
+
         private bool EmitCall(List<StackValue> stack, List<GenTree> statements, List<int> successorPcs, int pc, Instruction ins, bool isVirtual)
         {
             int packed = ins.Operand1;
@@ -3116,18 +3291,62 @@ namespace Cnidaria.Cs
 
             var args = PopMany(stack, total, pc, ins.Op);
             var method = _rts.ResolveMethodInMethodContext(_module, ins.Operand0, _method);
-            bool requiresTypeInitialization = RequiresTypeInitializationBeforeCall(method);
-            if (isVirtual)
-                AddVirtualDependency(method);
+            bool isArrayLength = args.Length == 1 && IsLengthGetter(method);
+            bool requiresCallvirtNullCheck = false;
+            DevirtualizationReceiverTransform receiverTransform = DevirtualizationReceiverTransform.None;
+
+            if (isVirtual && !isArrayLength)
+            {
+                if (TryDevirtualizeCall(
+                    method,
+                    args,
+                    statements,
+                    out RuntimeMethod devirtualizedMethod,
+                    out requiresCallvirtNullCheck,
+                    out receiverTransform))
+                {
+                    method = devirtualizedMethod;
+                    isVirtual = false;
+                }
+                else
+                {
+                    AddVirtualDependency(method);
+                }
+            }
+
+            bool requiresTypeInitialization = !isArrayLength && RequiresTypeInitializationBeforeCall(method);
             if (requiresTypeInitialization)
                 AddTypeInitializerDependency(method.DeclaringType);
 
+            if (isArrayLength)
+            {
+                PushImportedValue(stack, statements, Node(
+                    GenTreeKind.ArrayLength,
+                    pc,
+                    ins.Op,
+                    type: method.ReturnType,
+                    stackKind: GenStackKind.I4,
+                    operands: args));
+                return false;
+            }
+
             SpillEvaluationStackForImportBarrier(statements, stack, pc, ins.Op);
+            args = RewriteDevirtualizedReceiver(
+                statements,
+                pc,
+                ins.Op,
+                args,
+                method,
+                receiverTransform);
+
             if (requiresTypeInitialization && NeedsTypeInitialization(method.DeclaringType))
             {
                 args = MaterializeTypeInitializationOperands(statements, pc, ins.Op, args);
                 AppendTypeInitialization(stack, statements, pc, ins.Op, method.DeclaringType);
             }
+
+            if (requiresCallvirtNullCheck)
+                args = MaterializeCallVirtOperandsAndAppendNullCheck(statements, pc, ins.Op, args);
 
             if (!isVirtual && TryInlineCall(method, args, statements, successorPcs, stack, pc, ins.Op, out var inlineResult, out bool terminatedBlock))
             {
@@ -3139,9 +3358,7 @@ namespace Cnidaria.Cs
             }
 
             if (!isVirtual)
-            {
                 AddDirectDependency(method);
-            }
 
             bool returnsVoid = IsVoid(method.ReturnType);
             var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
@@ -3237,7 +3454,7 @@ namespace Cnidaria.Cs
                 return;
 
             var init = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: valueType, stackKind: StackKindOf(valueType), runtimeType: valueType);
-            AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreTemp, pc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
+            AppendImporterStatement(statements, stack, MarkExplicitInit(Node(GenTreeKind.StoreTemp, pc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index)));
         }
 
         private bool TryEmitFieldWiseStructDefaultInitialization(List<GenTree> statements, List<StackValue> stack, int pc, BytecodeOp sourceOp, GenTemp temp, RuntimeType valueType)
@@ -3259,8 +3476,8 @@ namespace Cnidaria.Cs
                     continue;
 
                 var fieldDefault = Node(GenTreeKind.DefaultValue, pc, BytecodeOp.DefaultValue, type: field.FieldType, stackKind: StackKindOf(field.FieldType), runtimeType: field.FieldType);
-                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreField, pc, sourceOp,
-                    operands: Two(TempAddress(pc, sourceOp, temp).Node, fieldDefault), field: field, runtimeType: field.FieldType));
+                AppendImporterStatement(statements, stack, MarkExplicitInit(Node(GenTreeKind.StoreField, pc, sourceOp,
+                    operands: Two(TempAddress(pc, sourceOp, temp).Node, fieldDefault), field: field, runtimeType: field.FieldType)));
             }
 
             return true;
@@ -3318,9 +3535,12 @@ namespace Cnidaria.Cs
             if (calleeArgTypes.Length != args.Length)
                 return false;
 
-            if (inlineInfo.HasControlFlow && (successorPcs is null || callerContinuationStack is null || inlineDepth > 1))
+            if (inlineInfo.HasControlFlow &&
+                (successorPcs is null || callerContinuationStack is null || inlineDepth > 1 || !_pcToBlockId.ContainsKey(callPc + 1)))
+            {
                 return false;
-
+            }
+                
             bool registeredActiveInline = _activeInlineMethods.Add(callee.MethodId);
             if (!registeredActiveInline)
                 return false;
@@ -3364,7 +3584,7 @@ namespace Cnidaria.Cs
                     if (inlineInfo.LocalNeedsInit(i))
                     {
                         var init = Node(GenTreeKind.DefaultValue, callPc, BytecodeOp.DefaultValue, type: t, stackKind: StackKindOf(t), runtimeType: t);
-                        statements.Add(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
+                        statements.Add(MarkExplicitInit(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index)));
                     }
                 }
 
@@ -3489,7 +3709,7 @@ namespace Cnidaria.Cs
                         case BytecodeOp.Pop:
                             {
                                 var value = Pop(inlineStack, callPc, ins.Op);
-                                AppendImporterStatement(statements, inlineStack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
+                                AppendImporterStatement(statements, inlineStack, CreateDiscardStatement(value.Node, callPc, ins.Op));
                                 break;
                             }
 
@@ -3716,7 +3936,7 @@ namespace Cnidaria.Cs
                 if (inlineInfo.LocalNeedsInit(i))
                 {
                     var init = Node(GenTreeKind.DefaultValue, callPc, BytecodeOp.DefaultValue, type: t, stackKind: StackKindOf(t), runtimeType: t);
-                    callStatements.Add(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index));
+                    callStatements.Add(MarkExplicitInit(Node(GenTreeKind.StoreTemp, callPc, BytecodeOp.Stloc, operands: One(init), int32: temp.Index)));
                 }
             }
 
@@ -4019,7 +4239,7 @@ namespace Cnidaria.Cs
                 case BytecodeOp.Pop:
                     {
                         var value = Pop(stack, callPc, ins.Op);
-                        AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(value.Node)));
+                        AppendImporterStatement(statements, stack, CreateDiscardStatement(value.Node, callPc, ins.Op));
                         break;
                     }
 
@@ -4967,18 +5187,62 @@ namespace Cnidaria.Cs
             var args = PopMany(stack, total, callPc, ins.Op);
             var method = _rts.ResolveMethodInMethodContext(bodyModule, ins.Operand0, callerContext);
 
-            bool requiresTypeInitialization = RequiresTypeInitializationBeforeCall(method);
-            if (isVirtual)
-                AddVirtualDependency(method);
+            bool isArrayLength = args.Length == 1 && IsLengthGetter(method);
+            bool requiresCallvirtNullCheck = false;
+            DevirtualizationReceiverTransform receiverTransform = DevirtualizationReceiverTransform.None;
+
+            if (isVirtual && !isArrayLength)
+            {
+                if (TryDevirtualizeCall(
+                    method,
+                    args,
+                    statements,
+                    out RuntimeMethod devirtualizedMethod,
+                    out requiresCallvirtNullCheck,
+                    out receiverTransform))
+                {
+                    method = devirtualizedMethod;
+                    isVirtual = false;
+                }
+                else
+                {
+                    AddVirtualDependency(method);
+                }
+            }
+
+            bool requiresTypeInitialization = !isArrayLength && RequiresTypeInitializationBeforeCall(method);
             if (requiresTypeInitialization)
                 AddTypeInitializerDependency(method.DeclaringType);
 
+            if (isArrayLength)
+            {
+                PushImportedValue(stack, statements, Node(
+                    GenTreeKind.ArrayLength,
+                    callPc,
+                    ins.Op,
+                    type: method.ReturnType,
+                    stackKind: GenStackKind.I4,
+                    operands: args));
+                return;
+            }
+
             SpillEvaluationStackForImportBarrier(statements, stack, callPc, ins.Op);
+            args = RewriteDevirtualizedReceiver(
+                statements,
+                callPc,
+                ins.Op,
+                args,
+                method,
+                receiverTransform);
+
             if (requiresTypeInitialization && NeedsTypeInitialization(method.DeclaringType))
             {
                 args = MaterializeTypeInitializationOperands(statements, callPc, ins.Op, args);
                 AppendTypeInitialization(stack, statements, callPc, ins.Op, method.DeclaringType);
             }
+
+            if (requiresCallvirtNullCheck)
+                args = MaterializeCallVirtOperandsAndAppendNullCheck(statements, callPc, ins.Op, args);
 
             if (!isVirtual && TryInlineCall(method, args, statements, callPc, ins.Op, out var inlineResult, inlineDepth + 1))
             {
@@ -4988,9 +5252,7 @@ namespace Cnidaria.Cs
             }
 
             if (!isVirtual)
-            {
                 AddDirectDependency(method);
-            }
 
             bool returnsVoid = IsVoid(method.ReturnType);
             var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
@@ -5331,6 +5593,31 @@ namespace Cnidaria.Cs
             int targetBlockId = -1)
         {
             var actualOperands = operands.IsDefault ? ImmutableArray<GenTree>.Empty : operands;
+            if (kind == GenTreeKind.Eval &&
+                actualOperands.Length == 1 &&
+                actualOperands[0].Operands.Length == 1 &&
+                (actualOperands[0].Operands[0].StackKind is GenStackKind.Ref or GenStackKind.Null) &&
+                (actualOperands[0].Kind is GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.ArrayLength or GenTreeKind.ArrayDataRef))
+            {
+                GenTree value = actualOperands[0];
+                kind = GenTreeKind.NullCheck;
+                pc = value.Pc;
+                sourceOp = value.SourceOp;
+                type = null;
+                stackKind = GenStackKind.Void;
+                actualOperands = One(value.Operands[0]);
+            }
+
+            if ((kind is GenTreeKind.Call or GenTreeKind.VirtualCall) &&
+                actualOperands.Length == 1 &&
+                IsLengthGetter(method))
+            {
+                kind = GenTreeKind.ArrayLength;
+                type = method!.ReturnType;
+                stackKind = GenStackKind.I4;
+                method = null;
+            }
+
             var flags = ComputeFlags(kind, sourceOp, type, stackKind, actualOperands, convFlags);
 
             return new GenTree(
@@ -5354,11 +5641,17 @@ namespace Cnidaria.Cs
                 targetBlockId);
         }
 
+        private static GenTree MarkExplicitInit(GenTree store)
+        {
+            store.Flags |= GenTreeFlags.ExplicitInit;
+            return store;
+        }
+
         private GenTreeFlags ComputeFlags(GenTreeKind kind, BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, NumericConvFlags convFlags)
         {
             GenTreeFlags flags = GenTreeFlags.None;
             for (int i = 0; i < operands.Length; i++)
-                flags |= operands[i].Flags & ~GenTreeFlags.AssertionProperties;
+                flags |= operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
 
             switch (kind)
             {
@@ -5415,6 +5708,11 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
+                case GenTreeKind.NullCheck:
+                    flags |= GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
+                    break;
+
+                case GenTreeKind.ArrayLength:
                 case GenTreeKind.ArrayElement:
                 case GenTreeKind.ArrayElementAddr:
                 case GenTreeKind.ArrayDataRef:
@@ -5430,12 +5728,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.StackAlloc:
-                case GenTreeKind.AllocHGlobal:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
-                    break;
-
-                case GenTreeKind.FreeHGlobal:
-                    flags |= GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.CastClass:
@@ -5673,7 +5966,7 @@ namespace Cnidaria.Cs
 
         private bool IsInlineContinuationBoundary(BytecodeFunction body, int pc, Instruction instruction)
         {
-            if (instruction.Op != BytecodeOp.Call)
+            if (instruction.Op != BytecodeOp.Call && instruction.Op != BytecodeOp.CallVirt)
                 return false;
 
             int continuationPc = pc + 1;

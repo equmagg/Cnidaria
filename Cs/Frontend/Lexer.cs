@@ -7,6 +7,8 @@ using System.Text;
 
 namespace Cnidaria.Cs
 {
+    // Diagnostics and lexical primitives
+
     public enum TriviaKind
     {
         WhitespaceTrivia,
@@ -20,6 +22,7 @@ namespace Cnidaria.Cs
 
         SkippedTokensTrivia
     }
+    ///<summary>Represents a source range</summary>
     public readonly struct TextSpan
     {
         public readonly int Start;
@@ -88,7 +91,7 @@ namespace Cnidaria.Cs
 
     public enum SyntaxColor : byte
     {
-        
+
     }
     public readonly struct ColorSpan
     {
@@ -107,6 +110,7 @@ namespace Cnidaria.Cs
         public static bool operator ==(ColorSpan left, ColorSpan right) => left.Equals(right);
         public static bool operator !=(ColorSpan left, ColorSpan right) => !left.Equals(right);
     }
+    ///<summary>Stores a lexer or parser diagnostic at a source position</summary>
     public readonly struct SyntaxDiagnostic : IDiagnostic
     {
         public readonly int Position;
@@ -152,6 +156,7 @@ namespace Cnidaria.Cs
             return line;
         }
     }
+    ///<summary>References trivia by kind and source span</summary>
     public readonly struct SyntaxTrivia
     {
         public readonly TriviaKind Kind;
@@ -166,13 +171,14 @@ namespace Cnidaria.Cs
         public string GetText(string source) => source.Substring(Span.Start, Span.Length);
         public override string ToString() => $"{Kind} {Span}";
     }
+    ///<summary>Stores token identity, decoded value and trivia</summary>
     public readonly struct SyntaxToken
     {
         public readonly SyntaxKind Kind;
         public readonly SyntaxKind ContextualKind;
         public readonly TextSpan Span;
-        public readonly string? ValueText; // decoded identifier
-        public readonly object? Value; // actual value of a represented object
+        public readonly string? ValueText; // Decoded identifier text
+        public readonly object? Value; // Decoded literal value
         public readonly SyntaxTrivia[] LeadingTrivia;
         public readonly SyntaxTrivia[] TrailingTrivia;
         public SyntaxToken(
@@ -207,20 +213,19 @@ namespace Cnidaria.Cs
         public string GetText(string source) => source.Substring(Span.Start, Span.Length);
         public override string ToString() => $"{Kind} {Span}";
     }
+    ///<summary>Controls trivia retention and conditional compilation symbols</summary>
     public sealed class LexerOptions
     {
         public bool IncludeTrivia { get; set; } = true;
 
-        /// <summary>
-        /// Target pointer size used to synthesize TARGET_32BIT/TARGET_64BIT symbols.
-        /// </summary>
+        ///<summary>Target pointer size used for architecture symbols</summary>
         public int TargetPointerSize { get; set; } = IntPtr.Size;
 
-        /// <summary>
-        /// Initial conditional compilation symbols.
-        /// </summary>
+        ///<summary>Initial conditional compilation symbols</summary>
         public HashSet<string> PreprocessorSymbols { get; } = new HashSet<string>(StringComparer.Ordinal);
     }
+    // Keyword, operator and precedence tables
+
     internal static partial class SyntaxFacts
     {
         public static int GetUnaryOperatorPrecedence(SyntaxKind kind) => kind switch
@@ -245,21 +250,21 @@ namespace Cnidaria.Cs
 
         public static int GetBinaryOperatorPrecedence(SyntaxKind kind) => kind switch
         {
-            // multiplicative
+            // Multiplicative operators
             SyntaxKind.AsteriskToken => 10,
             SyntaxKind.SlashToken => 10,
             SyntaxKind.PercentToken => 10,
 
-            // additive
+            // Additive operators
             SyntaxKind.PlusToken => 9,
             SyntaxKind.MinusToken => 9,
 
-            // shift
+            // Shift operators
             SyntaxKind.LessThanLessThanToken => 8,
             SyntaxKind.GreaterThanGreaterThanToken => 8,
             SyntaxKind.GreaterThanGreaterThanGreaterThanToken => 8,
 
-            // relational / type testing
+            // Relational and type testing operators
             SyntaxKind.LessThanToken => 7,
             SyntaxKind.LessThanEqualsToken => 7,
             SyntaxKind.GreaterThanToken => 7,
@@ -267,16 +272,16 @@ namespace Cnidaria.Cs
             SyntaxKind.IsKeyword => 7,
             SyntaxKind.AsKeyword => 7,
 
-            // equality
+            // Equality operators
             SyntaxKind.EqualsEqualsToken => 6,
             SyntaxKind.ExclamationEqualsToken => 6,
 
-            // bitwise
+            // Bitwise operators
             SyntaxKind.AmpersandToken => 5,
             SyntaxKind.CaretToken => 4,
             SyntaxKind.BarToken => 3,
 
-            // logical
+            // Logical operators
             SyntaxKind.AmpersandAmpersandToken => 2,
             SyntaxKind.BarBarToken => 1,
 
@@ -288,7 +293,7 @@ namespace Cnidaria.Cs
     {
         public static readonly Dictionary<string, SyntaxKind> ReservedKeywords = new(StringComparer.Ordinal)
         {
-            // Reserved
+            // Reserved keywords
             ["abstract"] = SyntaxKind.AbstractKeyword,
             ["as"] = SyntaxKind.AsKeyword,
             ["base"] = SyntaxKind.BaseKeyword,
@@ -370,7 +375,7 @@ namespace Cnidaria.Cs
 
         public static readonly Dictionary<string, SyntaxKind> ContextualKeywords = new(StringComparer.Ordinal)
         {
-            // Contextual
+            // Contextual keywords
             ["add"] = SyntaxKind.AddKeyword,
             ["allows"] = SyntaxKind.AllowsKeyword,
             ["alias"] = SyntaxKind.AliasKeyword,
@@ -445,7 +450,7 @@ namespace Cnidaria.Cs
             ["annotations"] = SyntaxKind.AnnotationsKeyword,
         };
 
-        // Longest match operator table
+        // Operators are ordered by longest match
         public static readonly (string Text, SyntaxKind Kind)[] Operators =
         {
 
@@ -559,6 +564,8 @@ namespace Cnidaria.Cs
                kind == SyntaxKind.WarningsKeyword ||
                kind == SyntaxKind.AnnotationsKeyword;
     }
+    // Token classification helpers
+
     public static class CSharpExtensions
     {
         public static SyntaxKind Kind(this SyntaxToken token) => token.Kind;
@@ -578,6 +585,7 @@ namespace Cnidaria.Cs
 
         public static bool IsNone(this SyntaxToken t) => t.Kind == SyntaxKind.None;
     }
+    ///<summary>Produces syntax tokens from the source</summary>
     public sealed class Lexer
     {
         internal enum LexMode
@@ -676,6 +684,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        ///<summary>Returns the next token in the current lexical mode</summary>
         public SyntaxToken Lex()
         {
             if (_mode == LexMode.InterpolatedText)
@@ -687,12 +696,11 @@ namespace Cnidaria.Cs
             if (_mode == LexMode.InterpolationFormat)
                 return LexInterpolationFormatToken();
 
-            // Normal mode. Preprocessor state is advanced here, so the parser only sees
-            // tokens from active conditional-compilation regions.
+            // Directives are evaluated here so the parser only sees active regions
             SyntaxTrivia[] leading = ReadLeadingTriviaAndSkippedText();
             SyntaxTrivia[] trailing = Array.Empty<SyntaxTrivia>();
 
-            // Try start interpolated string
+            // Interpolated strings switch the lexer into a stateful token stream
             if (TryStartInterpolatedString(leading, out var startTok))
             {
                 _seenNonDirectiveToken = true;
@@ -738,7 +746,7 @@ namespace Cnidaria.Cs
 
             if (_is.IsRaw)
             {
-                // Raw interpolated
+                // Raw format text ends on a brace run matching the dollar count
                 while (!IsAtEnd())
                 {
                     char c = Current();
@@ -752,14 +760,14 @@ namespace Cnidaria.Cs
                         }
 
                         Diagnostics.Add(new SyntaxDiagnostic(_pos, "Curly braces are not allowed in interpolation format specifier."));
-                        _pos++; // progress
+                        _pos++;
                         continue;
                     }
 
                     if (c == '{')
                     {
                         Diagnostics.Add(new SyntaxDiagnostic(_pos, "Curly braces are not allowed in interpolation format specifier."));
-                        _pos++; // progress
+                        _pos++;
                         continue;
                     }
 
@@ -780,14 +788,14 @@ namespace Cnidaria.Cs
 
                     if (c == '}')
                     {
-                        // first closing brace ends the interpolation
+                        // The first unmatched closing brace ends the interpolation
                         break;
                     }
 
                     if (c == '{')
                     {
                         Diagnostics.Add(new SyntaxDiagnostic(_pos, "Curly braces are not allowed in interpolation format specifier."));
-                        _pos++; // progress
+                        _pos++;
                         continue;
                     }
 
@@ -838,7 +846,7 @@ namespace Cnidaria.Cs
             {
                 int dollars = CountWhile('$');
 
-                // interpolated raw
+                // Raw interpolated string
                 if (Peek(dollars) == '"' && Peek(dollars + 1) == '"' && Peek(dollars + 2) == '"')
                 {
                     int quoteCount = CountWhileFrom(_pos + dollars, '"'); // >= 3
@@ -855,7 +863,7 @@ namespace Cnidaria.Cs
 
                     int afterOpen = _pos + dollars + quoteCount;
 
-                    // Determine multiline
+                    // A newline after the opening delimiter selects multiline form
                     int p = afterOpen;
                     while (p < _text.Length && IsWhitespaceButNotNewLine(_text[p]))
                         p++;
@@ -888,7 +896,7 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                // regular interpolated
+                // Regular interpolated string
                 if (dollars == 1 && Peek(1) == '"')
                 {
                     PushFrame();
@@ -901,7 +909,7 @@ namespace Cnidaria.Cs
                         QuoteCount = 1
                     };
 
-                    _pos += 2; // $"
+                    _pos += 2;
                     _mode = LexMode.InterpolatedText;
                     _interpBraceDepth = 0;
 
@@ -915,7 +923,7 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                // verbatim interpolated
+                // Verbatim interpolated string
                 if (dollars == 1 && Peek(1) == '@' && Peek(2) == '"')
                 {
                     PushFrame();
@@ -944,7 +952,7 @@ namespace Cnidaria.Cs
 
                 return false;
             }
-            // @$"
+            // Alternate verbatim interpolation prefix
             if (Current() == '@' && Peek(1) == '$' && Peek(2) == '"')
             {
                 PushFrame();
@@ -1014,7 +1022,7 @@ namespace Cnidaria.Cs
                     _interpBraceDepth--;
                 else
                 {
-                    // keep going
+                    // An unmatched brace is handled by the interpolation boundary check
                 }
             }
 
@@ -1055,7 +1063,7 @@ namespace Cnidaria.Cs
         {
             int start = _pos;
 
-            // Interpolation start
+            // Start interpolation expression
             if (Current() == '{' && Peek(1) != '{')
             {
                 _pos++;
@@ -1066,18 +1074,17 @@ namespace Cnidaria.Cs
                     Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
             }
 
-            // End
+            // End interpolated string
             if (Current() == '"')
             {
                 _pos++; // closing "
-                TryConsumeU8Suffix();
                 PopFrameOrNormal();
 
                 return new SyntaxToken(SyntaxKind.InterpolatedStringEndToken, new TextSpan(start, _pos - start), null, null,
                     Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
             }
 
-            // read text until next special point
+            // Scan text until a delimiter or interpolation boundary
             while (!IsAtEnd())
             {
                 char c = Current();
@@ -1089,37 +1096,37 @@ namespace Cnidaria.Cs
                 {
                     if (Peek(1) == '{')
                     {
-                        _pos += 2; // escaped {{
+                        _pos += 2; // Escaped opening brace
                         continue;
                     }
-                    break; // start interpolation
+                    break;
                 }
 
                 if (c == '}')
                 {
                     if (Peek(1) == '}')
                     {
-                        _pos += 2; // escaped }}
+                        _pos += 2; // Escaped closing brace
                         continue;
                     }
 
-                    // Unescaped '}'
+                    // An unmatched closing brace remains recoverable text
                     Diagnostics.Add(new SyntaxDiagnostic(_pos, "Unescaped '}' in interpolated string text."));
                     _pos++;
                     continue;
                 }
 
-                // Allow newlines for recovery
+                // Newlines are consumed only to keep recovery moving
                 if (IsNewLineChar(c))
                 {
                     Diagnostics.Add(new SyntaxDiagnostic(_pos, "Newline in interpolated string (non-verbatim)."));
-                    ConsumeNewLine(); // advances _pos
+                    ConsumeNewLine();
                     continue;
                 }
 
                 if (c == '\\')
                 {
-                    // escaped sequence inside regular string
+                    // Preserve regular string escape boundaries
                     _pos++;
                     if (!IsAtEnd())
                     {
@@ -1136,7 +1143,7 @@ namespace Cnidaria.Cs
             int len = _pos - start;
             if (len == 0)
             {
-                // Force progress
+                // Consume invalid input to prevent a stalled token stream
                 _pos++;
                 return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, 1), null, null, Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
             }
@@ -1156,7 +1163,7 @@ namespace Cnidaria.Cs
         {
             int start = _pos;
 
-            // Interpolation start
+            // Start interpolation expression
             if (Current() == '{' && Peek(1) != '{')
             {
                 _pos++;
@@ -1167,18 +1174,17 @@ namespace Cnidaria.Cs
                     Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
             }
 
-            // End
+            // End interpolated string
             if (Current() == '"' && Peek(1) != '"')
             {
-                _pos++; // closing "
-                TryConsumeU8Suffix();
+                _pos++;
                 PopFrameOrNormal();
 
                 return new SyntaxToken(SyntaxKind.InterpolatedStringEndToken, new TextSpan(start, _pos - start), null, null,
                     Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
             }
 
-            // Text scan
+            // Scan interpolated text
             while (!IsAtEnd())
             {
                 char c = Current();
@@ -1190,7 +1196,7 @@ namespace Cnidaria.Cs
                         _pos += 2; // escaped quote ""
                         continue;
                     }
-                    break; // end
+                    break;
                 }
 
                 if (c == '{')
@@ -1255,7 +1261,6 @@ namespace Cnidaria.Cs
                 if (run >= _is.QuoteCount)
                 {
                     _pos += _is.QuoteCount;
-                    TryConsumeU8Suffix();
                     PopFrameOrNormal();
 
                     return new SyntaxToken(
@@ -1266,7 +1271,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            // Interpolation start delimiter for raw
+            // Raw interpolation uses a brace run matching the dollar count
             if (Current() == '{')
             {
                 int run = CountWhileFrom(_pos, '{');
@@ -1300,7 +1305,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            // Text scan
+            // Scan interpolated text
             while (!IsAtEnd())
             {
                 if (TryGetRawMultiLineEndLength(_pos, out _))
@@ -1365,17 +1370,17 @@ namespace Cnidaria.Cs
             {
                 char c = raw[i];
 
-                // Escaped braces
+                // Doubled braces remain text
                 if (c == '{' && i + 1 < raw.Length && raw[i + 1] == '{') { sb.Append('{'); i++; continue; }
                 if (c == '}' && i + 1 < raw.Length && raw[i + 1] == '}') { sb.Append('}'); i++; continue; }
 
-                // Regular string escape sequences
+                // Regular strings decode escape sequences
                 if (c == '\\')
                 {
                     int j = i + 1;
                     if (!TryDecodeEscape(raw, ref j, allowSurrogatePairInString: true, out var decoded))
                     {
-                        // Keep original for recovery
+                        // Preserve invalid text for recovery
                         sb.Append('\\');
                     }
                     else
@@ -1401,11 +1406,11 @@ namespace Cnidaria.Cs
             {
                 char c = raw[i];
 
-                // Escaped braces
+                // Doubled braces remain text
                 if (c == '{' && i + 1 < raw.Length && raw[i + 1] == '{') { sb.Append('{'); i++; continue; }
                 if (c == '}' && i + 1 < raw.Length && raw[i + 1] == '}') { sb.Append('}'); i++; continue; }
 
-                // Escaped quote
+                // Doubled quotes remain text
                 if (c == '"' && i + 1 < raw.Length && raw[i + 1] == '"') { sb.Append('"'); i++; continue; }
 
                 sb.Append(c);
@@ -1429,17 +1434,17 @@ namespace Cnidaria.Cs
 
             int p = pos;
 
-            // newline length
+            // Measure the opening newline
             if (c == '\r' && (p + 1) < _text.Length && _text[p + 1] == '\n')
                 p += 2;
             else
                 p += 1;
 
-            // indentafter newline
+            // Capture indentation used to trim multiline content
             while (p < _text.Length && IsWhitespaceButNotNewLine(_text[p]))
                 p++;
 
-            // quotes
+            // Skip the closing quote run
             int run = 0;
             while ((p + run) < _text.Length && _text[p + run] == '"')
                 run++;
@@ -1448,10 +1453,6 @@ namespace Cnidaria.Cs
                 return false;
 
             p += _is.QuoteCount;
-
-            // optional u8 suffix
-            if ((p + 1) < _text.Length && (_text[p] == 'u' || _text[p] == 'U') && _text[p + 1] == '8')
-                p += 2;
 
             length = p - pos;
             return true;
@@ -1467,7 +1468,7 @@ namespace Cnidaria.Cs
 
             _atStartOfLine = false;
 
-            // Strings / chars / interpolated / raw
+            // String, character and interpolated literals
             if (c == '\'')
                 return ReadCharLiteral(start, leadingTrivia);
 
@@ -1476,23 +1477,23 @@ namespace Cnidaria.Cs
                 var s = TryReadStringLike(start, leadingTrivia);
                 if (s.Kind != SyntaxKind.BadToken || s.Span.Length > 0)
                     return s;
-                // else fallthrough to operators
+                // Otherwise continue with operator scanning
             }
 
-            // Identifier / keyword
+            // Identifier or keyword
             if (c == '@' || c == '_' || c == '\\' || IsIdentifierStartChar(c))
                 return ReadIdentifierOrKeyword(start, leadingTrivia);
 
             // Numeric literal
-            if (char.IsDigit(c) || (c == '.' && char.IsDigit(Peek(1))))
+            if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek(1))))
                 return ReadNumberLiteral(start, leadingTrivia);
 
-            // Operators / punctuators
+            // Operator or punctuation
             var op = ReadOperatorOrPunctuator(start, leadingTrivia);
             if (op.Kind != SyntaxKind.BadToken)
                 return op;
 
-            // Unknown
+            // Invalid character
             Diagnostics.Add(new SyntaxDiagnostic(_pos, $"Unexpected character '{c}' (U+{((int)c):X4})."));
             _pos++;
             return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, 1), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
@@ -1515,10 +1516,10 @@ namespace Cnidaria.Cs
 
             if (Current() == '@')
             {
-                // @identifier
+                // Verbatim identifier
                 if (Peek(1) == '"')
                 {
-                    // handled by string literal reader
+                    // Verbatim strings are handled by literal scanning
                 }
                 else
                 {
@@ -1530,16 +1531,16 @@ namespace Cnidaria.Cs
             StringBuilder? sb = null;
             int valueStart = _pos;
 
-            // First char
+            // Decode the first identifier character
             if (!TryConsumeIdentifierPart(ref sb, valueStart, first: true))
             {
-                // verbatim without valid identifier start
+                // An invalid verbatim prefix is returned for recovery
                 int len = Math.Max(1, _pos - start);
                 Diagnostics.Add(new SyntaxDiagnostic(start, "Invalid identifier start."));
                 return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, len), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
             }
 
-            // Rest
+            // Decode the remaining identifier characters
             while (TryConsumeIdentifierPart(ref sb, valueStart, first: false))
             {
             }
@@ -1553,8 +1554,8 @@ namespace Cnidaria.Cs
                 ? sb!.ToString()
                 : _text.Substring(valueStart, end - valueStart);
 
-
-            if (!isVerbatim)
+            // Unicode escapes are permitted in identifiers, but not in keywords
+            if (!isVerbatim && !hadUnicodeEscapes)
             {
                 if (SyntaxFacts.TryGetReservedKeyword(valueText, out var reserved))
                 {
@@ -1582,7 +1583,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            // Identifiers expose their decoded name
+            // Identifier values expose decoded Unicode text
             return new SyntaxToken(SyntaxKind.IdentifierToken, span, valueText, valueText, leadingTrivia, Array.Empty<SyntaxTrivia>());
         }
         private bool TryConsumeIdentifierPart(ref StringBuilder? sb, int valueStart, bool first)
@@ -1596,12 +1597,12 @@ namespace Cnidaria.Cs
                 {
                     if (first)
                     {
-                        if (!IsIdentifierStartChar(escaped) && escaped != '_')
+                        if (!IsIdentifierStartText(escaped))
                             return false;
                     }
                     else
                     {
-                        if (!IsIdentifierPartChar(escaped) && escaped != '_')
+                        if (!IsIdentifierPartText(escaped))
                             return false;
                     }
 
@@ -1651,14 +1652,14 @@ namespace Cnidaria.Cs
             if (Current() == '.')
             {
                 isReal = true;
-                _pos++; // consume dot
+                _pos++;
                 ReadDigitsWithSeparators(baseKind: 10, requireAtLeastOneDigit: true);
                 ReadExponentPartIfAny();
                 ReadRealSuffixIfAny();
                 goto ComputeTokenValue;
             }
 
-            // base prefix?
+            // Numeric base prefix
             if (Current() == '0' && (Peek(1) == 'x' || Peek(1) == 'X'))
             {
                 _pos += 2;
@@ -1675,13 +1676,13 @@ namespace Cnidaria.Cs
                 goto ComputeTokenValue;
             }
 
-            // decimal / real
+            // Decimal or real literal
             ReadDigitsWithSeparators(baseKind: 10, requireAtLeastOneDigit: true);
 
-            if (Current() == '.' && char.IsDigit(Peek(1)))
+            if (Current() == '.' && char.IsAsciiDigit(Peek(1)))
             {
                 isReal = true;
-                _pos++; // skip dot
+                _pos++;
                 ReadDigitsWithSeparators(baseKind: 10, requireAtLeastOneDigit: true);
             }
 
@@ -1717,44 +1718,32 @@ namespace Cnidaria.Cs
         private void ReadDigitsWithSeparators(int baseKind, bool requireAtLeastOneDigit, bool allowLeadingSeparator = false)
         {
             int digits = 0;
-            bool lastWasUnderscore = false;
 
             while (!IsAtEnd())
             {
                 char c = Current();
-                if (c == '_')
+                if (IsDigitForBase(c, baseKind))
                 {
-                    if (digits == 0)
-                    {
-                        if (!allowLeadingSeparator || lastWasUnderscore || !IsDigitForBase(Peek(1), baseKind))
-                            break;
-                        lastWasUnderscore = true;
-                        _pos++;
-                        continue;
-                    }
-                    if (lastWasUnderscore)
-                        break;
-                    lastWasUnderscore = true;
+                    digits++;
                     _pos++;
                     continue;
                 }
 
-                bool isDigit = IsDigitForBase(c, baseKind);
-
-                if (!isDigit)
+                if (c != '_')
                     break;
 
-                digits++;
-                lastWasUnderscore = false;
-                _pos++;
-            }
+                int separatorStart = _pos;
 
-            // Trailing underscore
-            if (lastWasUnderscore)
-            {
-                // rewind underscore
-                _pos--;
-                Diagnostics.Add(new SyntaxDiagnostic(_pos, "Trailing '_' in numeric literal."));
+                while (Current() == '_')
+                    _pos++;
+
+                bool canStartWithSeparator = digits != 0 || allowLeadingSeparator;
+                if (!canStartWithSeparator || !IsDigitForBase(Current(), baseKind))
+                {
+                    _pos = separatorStart;
+                    Diagnostics.Add(new SyntaxDiagnostic(separatorStart, "Trailing '_' in numeric literal."));
+                    break;
+                }
             }
 
             if (requireAtLeastOneDigit && digits == 0)
@@ -1762,7 +1751,7 @@ namespace Cnidaria.Cs
 
             static bool IsDigitForBase(char c, int baseKind) => baseKind switch
             {
-                10 => char.IsDigit(c),
+                10 => char.IsAsciiDigit(c),
                 16 => IsHexDigit(c),
                 2 => (c == '0' || c == '1'),
                 _ => false
@@ -1779,7 +1768,7 @@ namespace Cnidaria.Cs
             if (c != 'e' && c != 'E')
                 return false;
 
-            _pos++; // skip e/E
+            _pos++;
 
             if (Current() == '+' || Current() == '-')
                 _pos++;
@@ -1838,7 +1827,7 @@ namespace Cnidaria.Cs
         {
             int p = _pos;
 
-            // Interpolated raw
+            // Raw interpolated string
             if (Current() == '$')
             {
                 int dollars = CountWhile('$');
@@ -1848,7 +1837,7 @@ namespace Cnidaria.Cs
                     return ReadRawStringLiteral(start, leadingTrivia);
                 }
 
-                // Regular interpolated
+                // Regular interpolated string
                 if (dollars == 1)
                 {
                     if (Peek(1) == '"')
@@ -1856,37 +1845,37 @@ namespace Cnidaria.Cs
 
                     if (Peek(1) == '@' && Peek(2) == '"')
                     {
-                        _pos += 2; // consume $@
+                        _pos += 2;
                         return ReadVerbatimStringLiteral(start, leadingTrivia, isInterpolated: true);
                     }
                 }
 
-                // Not a string start
+                // The prefix does not form a string
                 _pos = p;
                 return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, 0), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
             }
 
-            // Verbatim interpolated
+            // Verbatim interpolated string
             if (Current() == '@' && Peek(1) == '$' && Peek(2) == '"')
             {
-                _pos += 3; // consume @$"
+                _pos += 3;
                 return ReadVerbatimStringLiteral(start, leadingTrivia, isInterpolated: true);
             }
 
-            // Verbatim
+            // Verbatim string
             if (Current() == '@' && Peek(1) == '"')
             {
-                _pos += 2; // consume @"
+                _pos += 2;
                 return ReadVerbatimStringLiteral(start, leadingTrivia, isInterpolated: false);
             }
 
-            // Raw
+            // Raw string
             if (Current() == '"' && Peek(1) == '"' && Peek(2) == '"')
             {
                 return ReadRawStringLiteral(start, leadingTrivia);
             }
 
-            // Regular
+            // Regular string
             if (Current() == '"')
                 return ReadRegularStringLiteral(start, leadingTrivia, isInterpolated: false, isVerbatim: false);
 
@@ -1898,14 +1887,14 @@ namespace Cnidaria.Cs
             if (Current() != '"')
                 return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, 0), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
 
-            _pos++; // opening "
+            _pos++;
             while (!IsAtEnd())
             {
                 char c = Current();
                 if (c == '"')
                 {
-                    _pos++; // closing "
-                    // optional u8 suffix
+                    _pos++;
+                    // Consume the optional UTF-8 suffix
                     bool isU8 = TryConsumeU8Suffix();
                     var kind = isU8 ? SyntaxKind.Utf8StringLiteralToken
                                     : (SyntaxKind.StringLiteralToken);
@@ -1934,7 +1923,7 @@ namespace Cnidaria.Cs
 
                 if (c == '\\')
                 {
-                    // escape
+                    // Escape sequence
                     _pos++;
                     if (!IsAtEnd())
                     {
@@ -1955,7 +1944,7 @@ namespace Cnidaria.Cs
                         }
                         else
                         {
-                            _pos++; // simple escape
+                            _pos++;
                         }
                     }
                     continue;
@@ -1975,17 +1964,17 @@ namespace Cnidaria.Cs
                 {
                     if (Peek(1) == '"')
                     {
-                        // doubled quote inside
+                        // Doubled quote inside a verbatim string
                         _pos += 2;
                         continue;
                     }
 
-                    _pos++; // closing "
+                    _pos++;
                     bool isU8 = TryConsumeU8Suffix();
                     var kind = isU8 ? SyntaxKind.Utf8StringLiteralToken
                                     : SyntaxKind.StringLiteralToken;
 
-                    // Compute decoded value
+                    // Decode after the closing delimiter is known
                     var span = new TextSpan(start, _pos - start);
                     var text = _text.AsSpan(span.Start, span.Length);
 
@@ -2016,7 +2005,7 @@ namespace Cnidaria.Cs
             if (quoteCount < 3)
                 return new SyntaxToken(SyntaxKind.BadToken, new TextSpan(start, 0), null, null, leadingTrivia, Array.Empty<SyntaxTrivia>());
 
-            _pos += quoteCount; // skip opening quotes
+            _pos += quoteCount;
             bool isMultiLine = false;
             {
                 int p = _pos;
@@ -2033,7 +2022,7 @@ namespace Cnidaria.Cs
                     int run = CountWhileFrom(_pos, '"');
                     if (run >= quoteCount)
                     {
-                        _pos += quoteCount; // consume closing quotes
+                        _pos += quoteCount;
                         bool isU8 = TryConsumeU8Suffix();
                         SyntaxKind kind;
                         if (isU8)
@@ -2082,7 +2071,7 @@ namespace Cnidaria.Cs
         }
         private SyntaxToken ReadCharLiteral(int start, SyntaxTrivia[] leadingTrivia)
         {
-            _pos++; // opening '
+            _pos++;
             if (IsAtEnd() || IsNewLineChar(Current()))
             {
                 Diagnostics.Add(new SyntaxDiagnostic(start, "Unterminated character literal."));
@@ -2111,18 +2100,18 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        _pos++; // simple escape
+                        _pos++;
                     }
                 }
             }
             else
             {
-                _pos++; // one char
+                _pos++;
             }
 
             if (Current() == '\'')
             {
-                _pos++; // closing '
+                _pos++;
                 var span = new TextSpan(start, _pos - start);
                 var text = _text.AsSpan(span.Start, span.Length);
 
@@ -2256,7 +2245,7 @@ namespace Cnidaria.Cs
         private SyntaxTrivia ReadPreprocessorDirectiveTrivia()
         {
             int directiveStart = _pos;
-            _pos++; // #
+            _pos++;
 
             while (!IsAtEnd() && IsWhitespaceButNotNewLine(Current()))
                 _pos++;
@@ -2274,12 +2263,55 @@ namespace Cnidaria.Cs
                 _pos++;
 
             int directiveEnd = _pos;
+            ReportDelimitedCommentInPreprocessorDirective(keyword, argsStart, directiveEnd);
             ProcessPreprocessorDirective(keyword, argsStart, directiveEnd, directiveStart);
 
             _atStartOfLine = false;
             return new SyntaxTrivia(
                 TriviaKind.PreprocessorDirectiveTrivia,
                 new TextSpan(directiveStart, directiveEnd - directiveStart));
+        }
+
+        private void ReportDelimitedCommentInPreprocessorDirective(string keyword, int start, int end)
+        {
+            bool hasQuotedArguments = keyword is "line" or "pragma" or "r" or "reference" or "load";
+
+            for (int p = start; p + 1 < end; p++)
+            {
+                if (hasQuotedArguments && _text[p] == '"')
+                {
+                    p++;
+                    while (p < end)
+                    {
+                        if (_text[p] == '\\' && p + 1 < end)
+                        {
+                            p += 2;
+                            continue;
+                        }
+
+                        if (_text[p] == '"')
+                            break;
+
+                        p++;
+                    }
+
+                    continue;
+                }
+
+                if (_text[p] != '/')
+                    continue;
+
+                if (_text[p + 1] == '/')
+                    return;
+
+                if (_text[p + 1] == '*')
+                {
+                    Diagnostics.Add(new SyntaxDiagnostic(
+                        p,
+                        "Delimited comments are not permitted in preprocessor directives."));
+                    return;
+                }
+            }
         }
 
         private void ProcessPreprocessorDirective(string keyword, int argsStart, int argsEnd, int directiveStart)
@@ -2325,7 +2357,7 @@ namespace Cnidaria.Cs
                     return;
 
                 case "warning":
-                    // SyntaxDiagnostic has error severity only. Do not turn #warning into a build-stopping lexer error.
+                    // Warning directives are preserved without adding an error diagnostic
                     return;
 
                 case "region":
@@ -2336,7 +2368,7 @@ namespace Cnidaria.Cs
                 case "r":
                 case "reference":
                 case "load":
-                    // Accepted and intentionally ignored by this lexer-level preprocessor.
+                    // Accepted directives that do not affect tokenization are ignored
                     return;
 
                 case "":
@@ -2774,7 +2806,7 @@ namespace Cnidaria.Cs
                 int start = _pos;
                 char c = Current();
 
-                // New line
+                // End of line
                 if (IsNewLineChar(c))
                 {
                     int len = ConsumeNewLine();
@@ -2789,7 +2821,7 @@ namespace Cnidaria.Cs
                 // Preprocessor directive
                 if (_atStartOfLine && IsWhitespaceButNotNewLine(c))
                 {
-                    // consume whitespace
+                    // Include indentation in directive trivia
                     int wsStart = _pos;
                     while (!IsAtEnd() && IsWhitespaceButNotNewLine(Current()))
                         _pos++;
@@ -2802,7 +2834,7 @@ namespace Cnidaria.Cs
                     list.Add(ReadPreprocessorDirectiveTrivia());
                     continue;
                 }
-                // Whitespace
+                // Horizontal whitespace
                 if (IsWhitespaceButNotNewLine(c))
                 {
                     int wsStart = _pos;
@@ -2841,7 +2873,7 @@ namespace Cnidaria.Cs
                     continue;
                 }
 
-                // Not trivia
+                // The next character starts a token
                 break;
             }
             return list.Count == 0 ? Array.Empty<SyntaxTrivia>() : list.ToArray();
@@ -2865,7 +2897,7 @@ namespace Cnidaria.Cs
             bool isBinaryLiteral = startsWith0 && (tokenText[1] == 'b' || tokenText[1] == 'B');
             bool isNonDecimalIntegerLiteral = isHexLiteral || isBinaryLiteral;
 
-            // Split suffix
+            // Separate the suffix from the digit sequence
             if (tokenText.Length >= 2)
             {
                 char a = ToLowerAscii(tokenText[^2]);
@@ -2967,7 +2999,7 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                // default double
+                // No suffix selects double
                 if (!double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
                 {
                     error = "Invalid double literal.";
@@ -3010,7 +3042,7 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                // Suffix dispatch
+                // Decode according to the literal suffix
                 if (suffix.Length == 1)
                 {
                     char sfx = ToLowerAscii(suffix[0]);
@@ -3116,7 +3148,7 @@ namespace Cnidaria.Cs
         {
             value = string.Empty;
 
-            // Strip optional u8 suffix
+            // Remove the optional UTF-8 suffix
             if (tokenText.Length >= 2 && (tokenText[^2] == 'u' || tokenText[^2] == 'U') && tokenText[^1] == '8')
                 tokenText = tokenText.Slice(0, tokenText.Length - 2);
 
@@ -3162,7 +3194,9 @@ namespace Cnidaria.Cs
             {
                 if (IsNewLineChar(inner[i]))
                 {
-                    lastNl = i;
+                    lastNl = inner[i] == '\n' && i > i0 && inner[i - 1] == '\r'
+                        ? i - 1
+                        : i;
                     break;
                 }
             }
@@ -3199,18 +3233,23 @@ namespace Cnidaria.Cs
                         if (!IsNewLineChar(contentPart[p]))
                             return false;
                     }
+
+                    if (p >= contentPart.Length)
+                        break;
                 }
 
                 char c = contentPart[p];
-                sb.Append(c);
 
                 if (IsNewLineChar(c))
                 {
-                    p += ConsumeNewLineSpan(contentPart, p);
+                    int newLineLength = ConsumeNewLineSpan(contentPart, p);
+                    sb.Append(contentPart.Slice(p, newLineLength));
+                    p += newLineLength;
                     atLineStart = true;
                     continue;
                 }
 
+                sb.Append(c);
                 atLineStart = false;
                 p++;
             }
@@ -3261,24 +3300,24 @@ namespace Cnidaria.Cs
         {
             value = string.Empty;
 
-            // Strip optional u8 suffix
+            // Remove the optional UTF-8 suffix
             if (tokenText.Length >= 2 && (tokenText[^2] == 'u' || tokenText[^2] == 'U') && tokenText[^1] == '8')
                 tokenText = tokenText.Slice(0, tokenText.Length - 2);
 
-            // Strip optional $
+            // Remove interpolation prefixes
             while (tokenText.Length > 0 && tokenText[0] == '$')
                 tokenText = tokenText.Slice(1);
 
             bool verbatim = false;
 
-            // @"..."
+            // Verbatim string
             if (tokenText.Length >= 2 && tokenText[0] == '@' && tokenText[1] == '"')
             {
                 verbatim = true;
                 tokenText = tokenText.Slice(1);
             }
 
-            // raw strings
+            // Raw string
             if (tokenText.Length >= 3 && tokenText[0] == '"' && tokenText[1] == '"' && tokenText[2] == '"')
                 return false;
 
@@ -3289,7 +3328,7 @@ namespace Cnidaria.Cs
 
             if (verbatim)
             {
-                // "" -> "
+                // Decode doubled quotes
                 var sb = new StringBuilder(inner.Length);
                 for (int i = 0; i < inner.Length; i++)
                 {
@@ -3359,6 +3398,7 @@ namespace Cnidaria.Cs
                 case '0': decoded = "\0"; return true;
                 case 'a': decoded = "\a"; return true;
                 case 'b': decoded = "\b"; return true;
+                case 'e': decoded = "\u001B"; return true;
                 case 'f': decoded = "\f"; return true;
                 case 'n': decoded = "\n"; return true;
                 case 'r': decoded = "\r"; return true;
@@ -3367,7 +3407,7 @@ namespace Cnidaria.Cs
 
                 case 'x':
                     {
-                        // 1-4 hex digits
+                        // Variable length hexadecimal escape
                         int val = 0, digits = 0;
                         while (digits < 4 && (uint)i < (uint)s.Length)
                         {
@@ -3503,9 +3543,9 @@ namespace Cnidaria.Cs
                 _pos++;
             }
         }
-        private bool TryReadUnicodeEscape(out char ch, out int consumed)
+        private bool TryReadUnicodeEscape(out string text, out int consumed)
         {
-            ch = '\0';
+            text = string.Empty;
             consumed = 0;
 
             if (Current() != '\\')
@@ -3515,55 +3555,74 @@ namespace Cnidaria.Cs
             if (kind != 'u' && kind != 'U')
                 return false;
 
-            int digits = (kind == 'u') ? 4 : 8;
+            int digits = kind == 'u' ? 4 : 8;
+            uint value = 0;
 
-            int val = 0;
             for (int i = 0; i < digits; i++)
             {
-                char d = Peek(2 + i);
-                int x;
-                if (d >= '0' && d <= '9') x = d - '0';
-                else if (d >= 'a' && d <= 'f') x = 10 + (d - 'a');
-                else if (d >= 'A' && d <= 'F') x = 10 + (d - 'A');
+                char digit = Peek(2 + i);
+                int hex;
+                if (digit >= '0' && digit <= '9') hex = digit - '0';
+                else if (digit >= 'a' && digit <= 'f') hex = 10 + digit - 'a';
+                else if (digit >= 'A' && digit <= 'F') hex = 10 + digit - 'A';
                 else return false;
 
-                unchecked { val = (val << 4) | x; }
+                value = (value << 4) | (uint)hex;
             }
 
-            if (digits == 8 && val > 0xFFFF)
-                ch = '\uFFFD';
-            else
-                ch = (char)val;
+            if (value > 0x10FFFF)
+                return false;
 
+            text = value <= char.MaxValue
+                ? ((char)value).ToString()
+                : char.ConvertFromUtf32((int)value);
             consumed = 2 + digits;
             return true;
         }
-        private static bool IsIdentifierStartChar(char c)
+        private static bool IsIdentifierStartText(string text)
         {
-            if (c == '_')
+            if (text.Length == 0)
+                return false;
+
+            if (text.Length == 1 && text[0] == '_')
                 return true;
 
-            var cat = CharUnicodeInfo.GetUnicodeCategory(c);
-            return cat == UnicodeCategory.UppercaseLetter ||
-                   cat == UnicodeCategory.LowercaseLetter ||
-                   cat == UnicodeCategory.TitlecaseLetter ||
-                   cat == UnicodeCategory.ModifierLetter ||
-                   cat == UnicodeCategory.OtherLetter ||
-                   cat == UnicodeCategory.LetterNumber;
+            return IsIdentifierStartCategory(CharUnicodeInfo.GetUnicodeCategory(text, 0));
         }
+        private static bool IsIdentifierPartText(string text)
+        {
+            if (text.Length == 0)
+                return false;
 
+            if (text.Length == 1 && text[0] == '_')
+                return true;
+
+            var category = CharUnicodeInfo.GetUnicodeCategory(text, 0);
+            return IsIdentifierStartCategory(category) || IsIdentifierPartCategory(category);
+        }
+        private static bool IsIdentifierStartChar(char c)
+            => c == '_' || IsIdentifierStartCategory(CharUnicodeInfo.GetUnicodeCategory(c));
         private static bool IsIdentifierPartChar(char c)
         {
             if (IsIdentifierStartChar(c))
                 return true;
 
-            var cat = CharUnicodeInfo.GetUnicodeCategory(c);
-            return cat == UnicodeCategory.DecimalDigitNumber ||
-                   cat == UnicodeCategory.ConnectorPunctuation ||
-                   cat == UnicodeCategory.NonSpacingMark ||
-                   cat == UnicodeCategory.SpacingCombiningMark ||
-                   cat == UnicodeCategory.Format;
+            return IsIdentifierPartCategory(CharUnicodeInfo.GetUnicodeCategory(c));
         }
+        private static bool IsIdentifierStartCategory(UnicodeCategory category)
+            => category == UnicodeCategory.UppercaseLetter ||
+               category == UnicodeCategory.LowercaseLetter ||
+               category == UnicodeCategory.TitlecaseLetter ||
+               category == UnicodeCategory.ModifierLetter ||
+               category == UnicodeCategory.OtherLetter ||
+               category == UnicodeCategory.LetterNumber;
+
+        private static bool IsIdentifierPartCategory(UnicodeCategory category)
+            => category == UnicodeCategory.DecimalDigitNumber ||
+               category == UnicodeCategory.ConnectorPunctuation ||
+               category == UnicodeCategory.NonSpacingMark ||
+               category == UnicodeCategory.SpacingCombiningMark ||
+               category == UnicodeCategory.Format;
         #endregion
 
         internal readonly struct Snapshot
@@ -3573,7 +3632,7 @@ namespace Cnidaria.Cs
 
             public readonly LexMode Mode;
 
-            // InterpolatedState
+            // Current interpolated string state
             public readonly bool IsVerbatim;
             public readonly bool IsRaw;
             public readonly bool IsRawMultiLine;
@@ -3582,7 +3641,7 @@ namespace Cnidaria.Cs
 
             public readonly int InterpBraceDepth;
 
-            // Stack frames flattened
+            // Mode frames are flattened for deterministic restore
             public readonly FrameSnapshot[] Frames;
             public readonly ConditionalFrameSnapshot[] ConditionalFrames;
             public readonly string[] PreprocessorSymbols;
@@ -3663,6 +3722,8 @@ namespace Cnidaria.Cs
                 DirectiveStart = directiveStart;
             }
         }
+
+        // Snapshots restore lexer state when buffered tokens are discarded
         internal Snapshot CaptureSnapshot()
         {
             var frames = _modeStack.ToArray();
@@ -3763,11 +3824,13 @@ namespace Cnidaria.Cs
             for (int i = 0; i < s.PreprocessorSymbols.Length; i++)
                 _preprocessorSymbols.Add(s.PreprocessorSymbols[i]);
 
-            // Roll back diagnostics
+            // Diagnostics produced after the snapshot are speculative
             if (Diagnostics.Count > s.DiagnosticCount)
                 Diagnostics.RemoveRange(s.DiagnosticCount, Diagnostics.Count - s.DiagnosticCount);
         }
     }
+
+    // Buffered token stream with reset and synthetic token injection
     internal sealed class SlidingTokenWindow
     {
         public readonly struct TokenWindowMark
@@ -3874,7 +3937,7 @@ namespace Cnidaria.Cs
                 _injectedIndex = 0;
                 return;
             }
-            // Prepend before remaining injected tokens
+            // New split tokens must precede previously injected tokens
             var remaining = _injected.GetRange(_injectedIndex, _injected.Count - _injectedIndex);
             _injected.Clear();
             _injectedIndex = 0;

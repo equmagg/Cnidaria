@@ -1,14 +1,9 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Pattern matching, fixed statements, and pinning
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundStatement BindCheckedStatement(CheckedStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -22,6 +17,7 @@ namespace Cnidaria.Cs
                 ? new BoundCheckedStatement(node, statement)
                 : new BoundUncheckedStatement(node, statement);
         }
+        // Each fixed declarator produces a pinned local scoped to the embedded statement
         private BoundStatement BindFixedStatement(
             FixedStatementSyntax node,
             BindingContext context,
@@ -107,6 +103,7 @@ namespace Cnidaria.Cs
             var body = scope.BindStatement(node.Statement, context, diagnostics);
             return new BoundFixedStatement(node, decls.ToImmutable(), body);
         }
+        // Pinning accepts arrays, strings, address-of expressions, and the pinnable pattern
         private BoundExpression BindFixedInitializer(
             ExpressionSyntax exprSyntax,
             PointerTypeSymbol declaredPointerType,
@@ -125,7 +122,7 @@ namespace Cnidaria.Cs
 
             var expr = BindExpression(exprSyntax, context, diagnostics);
 
-            // array
+            // Array pinning
             if (expr.Type is ArrayTypeSymbol arrayType)
             {
                 if (!GenericConstraintFacts.IsUnmanagedType(arrayType.ElementType))
@@ -166,7 +163,7 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            // string
+            // String pinning
             if (expr.Type.SpecialType == SpecialType.System_String)
             {
                 var charType = context.Compilation.GetSpecialType(SpecialType.System_Char);
@@ -196,7 +193,7 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            // GetPinnableReference
+            // GetPinnableReference pattern
             if (TryBindFixedGetPinnableReference(exprSyntax, expr, declaredPointerType, context, diagnostics, out var fixedInit))
             {
                 context.Recorder.RecordBound(exprSyntax, fixedInit);
@@ -419,6 +416,7 @@ namespace Cnidaria.Cs
 
             return BindIsPatternCore(node, operand, node.Pattern, context, diagnostics);
         }
+        // Complex patterns evaluate their input once into a temporary
         private BoundExpression BindIsPatternExpressionWithInputTemp(
             IsPatternExpressionSyntax node,
             BoundExpression operand,
@@ -463,6 +461,7 @@ namespace Cnidaria.Cs
                 _ => false
             };
         }
+        // Pattern binding returns a boolean expression and records declared locals for flow
         private BoundExpression BindIsPatternCore(
             SyntaxNode wholeSyntax,
             BoundExpression operand,
@@ -788,6 +787,7 @@ namespace Cnidaria.Cs
             return expr.Type is NullTypeSymbol
                 || (expr.ConstantValueOpt.HasValue && expr.ConstantValueOpt.Value is null);
         }
+        // Designations declare locals only after a valid pattern type is known
         private bool TryBindPatternDesignation(
             VariableDesignationSyntax designation,
             TypeSymbol localType,

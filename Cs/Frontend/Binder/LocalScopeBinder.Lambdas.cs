@@ -2,13 +2,10 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Anonymous function and method group conversion
     internal sealed partial class LocalScopeBinder : Binder
     {
         private static bool TryGetAnonymousFunctionParts(
@@ -16,6 +13,7 @@ namespace Cnidaria.Cs
             out ImmutableArray<ParameterSyntax> parameters,
             out bool hasExplicitParameterList,
             out SyntaxNode body,
+            out TypeSyntax? explicitReturnType,
             out bool isStatic,
             out bool isAsync)
         {
@@ -25,34 +23,53 @@ namespace Cnidaria.Cs
                     parameters = ImmutableArray.Create(simple.Parameter);
                     hasExplicitParameterList = true;
                     body = simple.Body;
-                    isStatic = simple.StaticKeyword.Span.Length != 0;
-                    isAsync = simple.AsyncKeyword.Span.Length != 0;
+                    explicitReturnType = null;
+                    isStatic = HasAnonymousFunctionModifier(simple.Modifiers, SyntaxKind.StaticKeyword);
+                    isAsync = HasAnonymousFunctionModifier(simple.Modifiers, SyntaxKind.AsyncKeyword);
                     return true;
 
                 case ParenthesizedLambdaExpressionSyntax parenthesized:
                     parameters = parenthesized.ParameterList.Parameters.ToImmutableArray();
                     hasExplicitParameterList = true;
                     body = parenthesized.Body;
-                    isStatic = parenthesized.StaticKeyword.Span.Length != 0;
-                    isAsync = parenthesized.AsyncKeyword.Span.Length != 0;
+                    explicitReturnType = parenthesized.ReturnType;
+                    isStatic = HasAnonymousFunctionModifier(parenthesized.Modifiers, SyntaxKind.StaticKeyword);
+                    isAsync = HasAnonymousFunctionModifier(parenthesized.Modifiers, SyntaxKind.AsyncKeyword);
                     return true;
 
                 case AnonymousMethodExpressionSyntax anonymous:
                     parameters = anonymous.ParameterList?.Parameters.ToImmutableArray() ?? ImmutableArray<ParameterSyntax>.Empty;
                     hasExplicitParameterList = anonymous.ParameterList is not null;
                     body = anonymous.Block;
-                    isStatic = false;
-                    isAsync = anonymous.AsyncKeyword.Span.Length != 0;
+                    explicitReturnType = null;
+                    isStatic = HasAnonymousFunctionModifier(anonymous.Modifiers, SyntaxKind.StaticKeyword);
+                    isAsync = HasAnonymousFunctionModifier(anonymous.Modifiers, SyntaxKind.AsyncKeyword);
                     return true;
 
                 default:
                     parameters = ImmutableArray<ParameterSyntax>.Empty;
                     hasExplicitParameterList = false;
                     body = syntax;
+                    explicitReturnType = null;
                     isStatic = false;
                     isAsync = false;
                     return false;
             }
+        }
+
+        private static bool HasAnonymousFunctionModifier(SyntaxTokenList modifiers, SyntaxKind kind)
+        {
+            for (int i = 0; i < modifiers.Count; i++)
+            {
+                var modifier = modifiers[i];
+                if (modifier.Kind == kind ||
+                    (modifier.Kind == SyntaxKind.IdentifierToken && modifier.ContextualKind == kind))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool TryGetDelegateInvokeMethod(TypeSymbol targetType, out NamedTypeSymbol delegateType, out MethodSymbol invoke)
@@ -77,6 +94,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // Speculative lambda binding suppresses diagnostics and semantic records
         private bool CanConvertLambdaToDelegate(
             BoundUnboundLambdaExpression lambda,
             TypeSymbol targetType,
@@ -90,6 +108,7 @@ namespace Cnidaria.Cs
                     out var parameterSyntaxes,
                     out var hasExplicitParameterList,
                     out _,
+                    out var explicitReturnType,
                     out _,
                     out _))
             {
@@ -98,6 +117,17 @@ namespace Cnidaria.Cs
 
             if (hasExplicitParameterList && parameterSyntaxes.Length != invoke.Parameters.Length)
                 return false;
+
+            if (explicitReturnType is not null)
+            {
+                if (IsVar(explicitReturnType))
+                    return false;
+
+                var returnDiagnostics = new DiagnosticBag();
+                var returnType = BindType(explicitReturnType, context, returnDiagnostics);
+                if (returnType.Kind == SymbolKind.Error || !AreSameType(returnType, invoke.ReturnType))
+                    return false;
+            }
 
             if (!hasExplicitParameterList)
                 return true;
@@ -122,6 +152,7 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        // Delegate parameter types establish the lambda signature before body binding
         private BoundExpression BindLambdaConversion(
             BoundUnboundLambdaExpression lambda,
             TypeSymbol targetType,
@@ -149,6 +180,7 @@ namespace Cnidaria.Cs
                     out var parameterSyntaxes,
                     out var hasExplicitParameterList,
                     out var bodySyntax,
+                    out var explicitReturnType,
                     out var isStatic,
                     out var isAsync))
             {
@@ -179,14 +211,63 @@ namespace Cnidaria.Cs
                 return bad;
             }
 
+            TypeSymbol lambdaReturnType = invoke.ReturnType;
+            if (explicitReturnType is not null)
+            {
+                if (IsVar(explicitReturnType))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LAMBDA009",
+                        DiagnosticSeverity.Error,
+                        "An explicit lambda return type cannot be 'var'.",
+                        new Location(context.SemanticModel.SyntaxTree, explicitReturnType.Span)));
+                }
+                else
+                {
+                    var boundReturnType = BindType(explicitReturnType, context, diagnostics);
+                    if (boundReturnType.Kind != SymbolKind.Error)
+                    {
+                        lambdaReturnType = boundReturnType;
+                        if (!AreSameType(boundReturnType, invoke.ReturnType))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_LAMBDA008",
+                                DiagnosticSeverity.Error,
+                                $"Explicit lambda return type '{boundReturnType.Name}' does not match delegate return type '{invoke.ReturnType.Name}'.",
+                                new Location(context.SemanticModel.SyntaxTree, explicitReturnType.Span)));
+                        }
+                    }
+                }
+            }
+
             var lambdaMethod = new LambdaMethodSymbol(
                 name: "<lambda>",
                 containing: context.ContainingSymbol,
-                returnType: invoke.ReturnType,
+                returnType: lambdaReturnType,
                 parameters: ImmutableArray<ParameterSymbol>.Empty,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
                 isAsync: isAsync);
+
+            if (syntax is LambdaExpressionSyntax lambdaSyntax)
+            {
+                if (lambdaSyntax is SimpleLambdaExpressionSyntax && lambdaSyntax.AttributeLists.Count > 0)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LAMBDA010",
+                        DiagnosticSeverity.Error,
+                        "Attributes on lambda expressions require a parenthesized parameter list.",
+                        new Location(context.SemanticModel.SyntaxTree, lambdaSyntax.AttributeLists[0].Span)));
+                }
+
+                AttributeBinder.BindAnonymousFunctionAttributes(
+                    lambdaSyntax,
+                    lambdaMethod,
+                    this,
+                    context,
+                    diagnostics,
+                    lambdaMethod.AddAttribute);
+            }
 
             var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length);
             var seenNames = new HashSet<string>(StringComparer.Ordinal);
@@ -270,7 +351,7 @@ namespace Cnidaria.Cs
             else if (bodySyntax is ExpressionSyntax expressionBody)
             {
                 var expression = bodyBinder.BindExpression(expressionBody, bodyContext, diagnostics);
-                if (invoke.ReturnType.SpecialType == SpecialType.System_Void)
+                if (lambdaReturnType.SpecialType == SpecialType.System_Void)
                 {
                     body = new BoundBlockStatement(
                         syntax,
@@ -281,7 +362,7 @@ namespace Cnidaria.Cs
                     expression = bodyBinder.ApplyConversion(
                         exprSyntax: expressionBody,
                         expr: expression,
-                        targetType: invoke.ReturnType,
+                        targetType: lambdaReturnType,
                         diagnosticNode: expressionBody,
                         context: bodyContext,
                         diagnostics: diagnostics,
@@ -332,6 +413,7 @@ namespace Cnidaria.Cs
                 out _);
         }
 
+        // Method group conversion uses the delegate Invoke signature as synthetic arguments
         private bool TryResolveMethodGroupConversion(
             BoundMethodGroupExpression methodGroup,
             TypeSymbol targetType,

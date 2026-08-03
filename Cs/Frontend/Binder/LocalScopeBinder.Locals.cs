@@ -1,14 +1,9 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Locals, element access, arrays, stack allocation, and method exits
     internal sealed partial class LocalScopeBinder : Binder
     {
         private static bool IsExtensionMethod(MethodSymbol method)
@@ -18,10 +13,7 @@ namespace Cnidaria.Cs
 
             return method.IsExtensionMethod;
         }
-        private BoundStatement BindLocalFunctionStatement(
-            LocalFunctionStatementSyntax lf,
-            BindingContext context,
-            DiagnosticBag diagnostics)
+        private BoundStatement BindLocalFunctionStatement(LocalFunctionStatementSyntax lf, BindingContext context, DiagnosticBag diagnostics)
         {
             var name = lf.Identifier.ValueText ?? "";
 
@@ -41,7 +33,21 @@ namespace Cnidaria.Cs
             var bodyCtx = new BindingContext(context.Compilation, context.SemanticModel, sym, context.Recorder);
 
             BoundStatement body;
-            if (lf.Body != null)
+            if (sym.IsExtern)
+            {
+                if (lf.Body != null || lf.ExpressionBody != null)
+                {
+                    diagnostics.Add(new Diagnostic("CN_LFUNC011", DiagnosticSeverity.Error,
+                        "An extern local function cannot declare a body.",
+                        new Location(context.SemanticModel.SyntaxTree, lf.Span)));
+                    body = new BoundBadStatement(lf);
+                }
+                else
+                {
+                    body = new BoundBlockStatement(lf, ImmutableArray<BoundStatement>.Empty);
+                }
+            }
+            else if (lf.Body != null)
             {
                 body = bodyBinder.BindStatement(lf.Body, bodyCtx, diagnostics);
             }
@@ -79,7 +85,8 @@ namespace Cnidaria.Cs
                 body = new BoundBadStatement(lf);
             }
 
-            bodyBinder.ReportControlFlowDiagnostics(bodyCtx, diagnostics, body, lf);
+            if (!sym.IsExtern)
+                bodyBinder.ReportControlFlowDiagnostics(bodyCtx, diagnostics, body, lf);
 
             return new BoundLocalFunctionStatement(lf, sym, body);
         }
@@ -98,7 +105,9 @@ namespace Cnidaria.Cs
             }
 
             var isConst = HasModifier(ld.Modifiers, SyntaxKind.ConstKeyword);
-            var isRefLocal = HasModifier(ld.Modifiers, SyntaxKind.RefKeyword);
+            var isRefLocal = HasModifier(ld.Modifiers, SyntaxKind.RefKeyword) ||
+                (decl.Type is ScopedTypeSyntax st && st.Type is RefTypeSyntax);
+            var isScoped = decl.Type is ScopedTypeSyntax;
             var isVar = IsVar(decl.Type);
 
             if (decl.Variables.Count == 0)
@@ -115,6 +124,12 @@ namespace Cnidaria.Cs
                 diagnostics.Add(new Diagnostic("CN_REFLOC000", DiagnosticSeverity.Error,
                     "A ref local cannot be const.",
                     new Location(context.SemanticModel.SyntaxTree, ld.Span)));
+            }
+            if (isConst && isScoped)
+            {
+                diagnostics.Add(new Diagnostic("CN_SCOPED000", DiagnosticSeverity.Error,
+                    "A const local cannot be scoped.",
+                    new Location(context.SemanticModel.SyntaxTree, decl.Type.Span)));
             }
             if (isUsingDeclaration && isConst)
             {
@@ -137,19 +152,28 @@ namespace Cnidaria.Cs
 
             TypeSymbol? explicitType = null;
             if (!isVar)
-                explicitType = BindType(decl.Type, context, diagnostics);
+            {
+                TypeSyntax explicitTypeSyntax = decl.Type;
+                if (explicitTypeSyntax is ScopedTypeSyntax scopedType)
+                    explicitTypeSyntax = scopedType.Type;
+                if (isRefLocal && explicitTypeSyntax is RefTypeSyntax refType)
+                    explicitTypeSyntax = refType.Type;
+
+                explicitType = BindType(explicitTypeSyntax, context, diagnostics);
+            }
 
             if (decl.Variables.Count == 1)
                 return BindSingleDeclarator(
-                    ld, decl.Variables[0], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, context, diagnostics);
+                    ld, decl.Variables[0], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, isScoped, context, diagnostics);
 
             var list = ImmutableArray.CreateBuilder<BoundStatement>(decl.Variables.Count);
             for (int i = 0; i < decl.Variables.Count; i++)
                 list.Add(BindSingleDeclarator(
-                    ld, decl.Variables[i], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, context, diagnostics));
+                    ld, decl.Variables[i], isVar, explicitType, isRefLocal, isConst, isUsingDeclaration, isScoped, context, diagnostics));
 
             return new BoundStatementList(ld, list.ToImmutable());
         }
+        // Bind the initializer before the local enters scope
         private BoundStatement BindSingleDeclarator(
             SyntaxNode ownerSyntax,
             VariableDeclaratorSyntax v,
@@ -158,6 +182,7 @@ namespace Cnidaria.Cs
             bool isRefLocal,
             bool isConst,
             bool isUsing,
+            bool isScoped,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -229,6 +254,7 @@ namespace Cnidaria.Cs
                     locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, v.Span)),
                     isConst: false,
                     isReadOnly: isUsing,
+                    isScoped: isScoped,
                     constantValueOpt: Optional<object>.None,
                     isByRef: true);
 
@@ -360,6 +386,13 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (isScoped && !isRefLocal && !localType.IsRefLikeType && localType is not ErrorTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic("CN_SCOPED001", DiagnosticSeverity.Error,
+                    "The scoped modifier can only be used with ref locals or ref-like value types.",
+                    new Location(context.SemanticModel.SyntaxTree, ownerSyntax.Span)));
+            }
+
             Optional<object> constValueOpt = Optional<object>.None;
             if (isConst)
             {
@@ -382,6 +415,7 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, v.Span)),
                 isConst: isConst,
                 isReadOnly: isUsing,
+                isScoped: isScoped,
                 constantValueOpt: constValueOpt);
 
             _locals[name] = local;
@@ -437,7 +471,7 @@ namespace Cnidaria.Cs
 
                 var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
 
-                // a[^x] => a[a.Length - x]
+                // From-end indexing subtracts the offset from Length
                 bool hasFromEndIndex = false;
                 for (int i = 0; i < node.ArgumentList.Arguments.Count; i++)
                 {
@@ -893,6 +927,7 @@ namespace Cnidaria.Cs
 
             return new BoundBadExpression(node);
         }
+        // Evaluate receiver, length, start, and slice length once before target-specific lowering
         private BoundExpression BindSliceElementAccess(
             ElementAccessExpressionSyntax node,
             BoundExpression receiver,
@@ -971,7 +1006,7 @@ namespace Cnidaria.Cs
                 rightValueExpr = new BoundLocalExpression(node, rightTmp);
             }
 
-            // Determine slicing strategy
+            // Select string, span, or array lowering
             var receiverTypeForLookup = GetReceiverTypeForMemberLookup(receiver.Type);
             if (receiverTypeForLookup is null)
             {
@@ -983,7 +1018,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            // Find instance Length
+            // Resolve the instance Length member
             Symbol? lengthMember = null;
             {
                 var members = LookupMembers(receiverTypeForLookup, "Length");
@@ -1012,7 +1047,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            // lenTmp = recv.Length
+            // Cache the receiver length
             var lenTmp = NewTemp("$slice_len", int32);
             var lenAccess = new BoundMemberAccessExpression(
                 (ExpressionSyntax)node.Expression,
@@ -1023,7 +1058,7 @@ namespace Cnidaria.Cs
             var lenDecl = new BoundLocalDeclarationStatement(node, lenTmp, lenAccess);
             var lenExpr = new BoundLocalExpression(node, lenTmp);
 
-            // startTmp
+            // Normalize the start index
             var startTmp = NewTemp("$slice_start", int32);
             BoundExpression startInit;
             if (leftValueExpr is null)
@@ -1048,12 +1083,12 @@ namespace Cnidaria.Cs
             var startDecl = new BoundLocalDeclarationStatement(node, startTmp, startInit);
             var startExpr = new BoundLocalExpression(node, startTmp);
 
-            // sliceLenTmp
+            // Compute the slice length
             var sliceLenTmp = NewTemp("$slice_count", int32);
             BoundExpression sliceLenInit;
             if (rightValueExpr is null)
             {
-                // len - start
+                // An omitted end consumes the remaining elements
                 sliceLenInit = new BoundBinaryExpression(
                     node,
                     BoundBinaryOperatorKind.Subtract,
@@ -1112,7 +1147,7 @@ namespace Cnidaria.Cs
             locals.Add(sliceLenTmp);
             sideEffects.Add(sliceLenDecl);
 
-            // string slicing => string.Substring
+            // String slices lower to Substring
             if (receiver.Type.SpecialType == SpecialType.System_String)
             {
                 var stringType = (NamedTypeSymbol)context.Compilation.GetSpecialType(SpecialType.System_String);
@@ -1153,7 +1188,7 @@ namespace Cnidaria.Cs
                 return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), call);
             }
 
-            // span slicing => Slice(start) / Slice(start, length)
+            // Span slices lower to the matching Slice overload
             if (TryGetSpanLikeElementType(receiver.Type, out var spanLikeType, out _))
             {
                 bool useTwoArgs = rightValueExpr is not null;
@@ -1192,7 +1227,7 @@ namespace Cnidaria.Cs
                 return new BoundSequenceExpression(node, locals.ToImmutable(), sideEffects.ToImmutable(), call);
             }
 
-            // array slicing => allocate + Array.Copy
+            // Array slices allocate a destination and copy elements
             if (receiver.Type is ArrayTypeSymbol at)
             {
                 if (at.Rank != 1)
@@ -1220,7 +1255,7 @@ namespace Cnidaria.Cs
 
                 var resultArrExpr = new BoundLocalExpression(node, resultArrTmp);
 
-                // Find Array.Copy(Array, int, Array, int, int)
+                // Resolve the five-argument Array.Copy overload
                 var arrayBase = context.Compilation.GetSpecialType(SpecialType.System_Array);
                 if (arrayBase is not NamedTypeSymbol arrayType)
                 {
@@ -1678,6 +1713,7 @@ namespace Cnidaria.Cs
                 return result;
             }
         }
+        /// <summary>Binds target-typed syntax and applies the requested conversion</summary>
         internal BoundExpression BindExpressionWithTargetType(
             ExpressionSyntax exprSyntax,
             TypeSymbol targetType,
@@ -1752,6 +1788,7 @@ namespace Cnidaria.Cs
                 diagnostics,
                 requireImplicit);
         }
+        // Rectangular initializers retain nesting so dimensions can be validated together
         private BoundArrayInitializerExpression? BindManagedArrayInitializer(
             InitializerExpressionSyntax? init,
             TypeSymbol elemType,
@@ -2174,6 +2211,7 @@ namespace Cnidaria.Cs
             => method is not null && !method.IsConstructor &&
                returnType.SpecialType != SpecialType.System_Void &&
                returnType.Kind != SymbolKind.Error;
+        // Yield binding validates iterator shape before converting the yielded value
         private BoundStatement BindYield(YieldStatementSyntax ys, BindingContext context, DiagnosticBag diagnostics)
         {
             bool isYieldReturn = ys.Kind == SyntaxKind.YieldReturnStatement;
@@ -2424,6 +2462,7 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
+        // Ref returns require a ref expression with an identical element type
         private BoundExpression BindRefReturningExpression(
             ExpressionSyntax syntax,
             BoundExpression expr,

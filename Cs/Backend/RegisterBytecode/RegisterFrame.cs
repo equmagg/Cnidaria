@@ -571,7 +571,7 @@ namespace Cnidaria.Cs
             return false;
         }
     }
-    internal sealed class RegisterStackLayoutOptions
+    public sealed class RegisterStackLayoutOptions
     {
         public static RegisterStackLayoutOptions Default => new RegisterStackLayoutOptions();
 

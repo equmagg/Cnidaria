@@ -1,7 +1,4 @@
-﻿#ifndef __STDIO_H
-#define __STDIO_H
-
-#include <stddef.h>
+﻿#include <stddef.h>
 #include <stdarg.h>
 
 #if defined(_WIN32) && defined(__x86_64__)
@@ -19,7 +16,7 @@ static void __printf(const char* text)
         "mov ecx, -11\n"
         "call qword ptr[rip + __imp_GetStdHandle]\n"
         "add rsp, 32"
-        : " = { rax }"(handle)
+        : "={rax}"(handle)
         :
         : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
 
@@ -49,7 +46,7 @@ static void __printf(const char* text)
     __asm__ volatile(
         "push - 11\n"
         "call dword ptr[__imp_GetStdHandle]"
-        : " = { eax }"(handle)
+        : "={eax}"(handle)
         :
         : "ecx", "edx", "memory");
 
@@ -919,7 +916,7 @@ int printf(const char* format, ...)
 
 // for testing purposes only:
 #if defined(__linux__) && defined(__x86_64__)
-static void shutdown(void)
+void shutdown(void)
 {
     __asm__ volatile(
         "mov eax, 169\n"
@@ -929,7 +926,7 @@ static void shutdown(void)
         : "rax", "rcx", "r11", "memory");
 }
 #elif defined(__linux__) && defined(__i386__)
-static void shutdown(void)
+void shutdown(void)
 {
     __asm__ volatile(
         "push ebx\n"
@@ -941,7 +938,7 @@ static void shutdown(void)
         : "eax", "memory");
 }
 #elif defined(__linux__) && defined(__aarch64__)
-static void shutdown(void)
+void shutdown(void)
 {
     __asm__ volatile(
         "mov x8, #142\n"
@@ -951,7 +948,7 @@ static void shutdown(void)
         : "x8", "memory");
 }
 #elif defined(__linux__) && defined(__arm__)
-static void shutdown(void)
+void shutdown(void)
 {
     __asm__ volatile(
         "mov r7, #88\n"
@@ -961,7 +958,7 @@ static void shutdown(void)
         : "r7", "memory");
 }
 #elif defined(__linux__) && defined(__riscv)
-static void shutdown(void)
+void shutdown(void)
 {
     __asm__ volatile(
         "addi a7, zero, 142\n"
@@ -972,7 +969,4 @@ static void shutdown(void)
 }
 #elif defined(__linux__)
 void shutdown(void);
-#endif
-
-
 #endif

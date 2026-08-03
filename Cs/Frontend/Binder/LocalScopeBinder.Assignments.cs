@@ -2,13 +2,11 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
 using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Assignment binding, writable target validation, and compound assignment lowering
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundExpression BindAssignment(AssignmentExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -36,7 +34,7 @@ namespace Cnidaria.Cs
             var leftTarget = lv.Target;
             bool hasErrors = leftTarget.HasErrors || right.HasErrors;
 
-            // const local assignment check
+            // Reject writes to constant locals
             if (!leftTarget.HasErrors &&
                 leftTarget is BoundLocalExpression le &&
                 le.Local.IsConst)
@@ -81,7 +79,7 @@ namespace Cnidaria.Cs
                 if (!leftTarget.HasErrors)
                 {
                     TypeSymbol assignmentTargetType = leftTarget.Type;
-                    // ref reassignment for ref
+                    // Reassign the managed reference
                     if (right is BoundRefExpression)
                     {
                         if (leftTarget is BoundMemberAccessExpression { Member: FieldSymbol field } &&
@@ -96,7 +94,7 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        // value assignment through ref
+                        // Write through the managed reference
                         if (leftTarget is BoundMemberAccessExpression { Member: FieldSymbol field } &&
                             field.Type is ByRefTypeSymbol refFieldType)
                         {
@@ -135,7 +133,7 @@ namespace Cnidaria.Cs
                         new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
                     return new BoundBadExpression(node);
                 }
-                // Convert rhs to lhs type
+                // Convert the right operand to the target type
                 var converted = ApplyConversion(
                     exprSyntax: node.Right,
                     expr: right,
@@ -213,6 +211,7 @@ namespace Cnidaria.Cs
                 usesDirectOperator: false,
                 isChecked: isChecked);
         }
+        // Evaluate the source once before recursively assigning deconstruction leaves
         private BoundExpression BindDeconstructionAssignment(
             AssignmentExpressionSyntax node,
             BindingContext context,
@@ -345,6 +344,8 @@ namespace Cnidaria.Cs
             ImmutableArray<LocalSymbol>.Builder locals,
             ImmutableArray<BoundStatement>.Builder sideEffects)
         {
+            var isScoped = declaration.Type is ScopedTypeSyntax;
+
             if (declaration.Designation is SingleVariableDesignationSyntax single)
             {
                 TypeSymbol localType;
@@ -371,7 +372,7 @@ namespace Cnidaria.Cs
                     localType = BindType(declaration.Type, context, diagnostics);
                 }
 
-                BindSingleDeconstructionLocal(single, declaration, localType, source, context, diagnostics, locals, sideEffects);
+                BindSingleDeconstructionLocal(single, declaration, localType, source, isScoped, context, diagnostics, locals, sideEffects);
                 return;
             }
 
@@ -386,6 +387,7 @@ namespace Cnidaria.Cs
                     explicitTargetType,
                     source,
                     sourceType,
+                    isScoped,
                     context,
                     diagnostics,
                     locals,
@@ -407,6 +409,7 @@ namespace Cnidaria.Cs
             TypeSymbol? explicitTargetType,
             BoundExpression source,
             TypeSymbol sourceType,
+            bool isScoped,
             BindingContext context,
             DiagnosticBag diagnostics,
             ImmutableArray<LocalSymbol>.Builder locals,
@@ -439,7 +442,7 @@ namespace Cnidaria.Cs
                             }
                         }
 
-                        BindSingleDeconstructionLocal(single, designation, localType, source, context, diagnostics, locals, sideEffects);
+                        BindSingleDeconstructionLocal(single, designation, localType, source, isScoped, context, diagnostics, locals, sideEffects);
                         return;
                     }
 
@@ -508,6 +511,7 @@ namespace Cnidaria.Cs
                                 i < expectedTypes.Length ? expectedTypes[i] : null,
                                 sourceElements[i],
                                 sourceElementTypes[i],
+                                isScoped,
                                 context,
                                 diagnostics,
                                 locals,
@@ -586,6 +590,7 @@ namespace Cnidaria.Cs
             sourceElementTypes = ImmutableArray<TypeSymbol>.Empty;
             return false;
         }
+        // A user-defined Deconstruct call materializes one temporary per out element
         private bool TryPrepareUserDefinedDeconstructionSource(
             SyntaxNode diagnosticNode,
             BoundExpression source,
@@ -921,6 +926,7 @@ namespace Cnidaria.Cs
             SyntaxNode ownerSyntax,
             TypeSymbol localType,
             BoundExpression source,
+            bool isScoped,
             BindingContext context,
             DiagnosticBag diagnostics,
             ImmutableArray<LocalSymbol>.Builder locals,
@@ -939,12 +945,22 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, single.Span)));
             }
 
+            if (isScoped && !localType.IsRefLikeType && localType is not ErrorTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SCOPED001",
+                    DiagnosticSeverity.Error,
+                    "The scoped modifier can only be used with ref locals or ref-like value types.",
+                    new Location(context.SemanticModel.SyntaxTree, ownerSyntax.Span)));
+            }
+
             var local = new LocalSymbol(
                 name: name,
                 containing: _containing,
                 type: localType,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, single.Span)),
                 isConst: false,
+                isScoped: isScoped,
                 constantValueOpt: Optional<object>.None,
                 isByRef: false);
 
@@ -1195,6 +1211,7 @@ namespace Cnidaria.Cs
                 _ => false
             };
         }
+        // Lower interpolations to concatenation after binding alignment and format clauses
         private BoundExpression BindInterpolatedString(
             InterpolatedStringExpressionSyntax node,
             BindingContext context,
@@ -1687,20 +1704,20 @@ namespace Cnidaria.Cs
 
             var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
 
-            // bool
+            // Boolean operands
             if (left.Type.SpecialType == SpecialType.System_Boolean &&
                 right.Type.SpecialType == SpecialType.System_Boolean)
             {
                 return new BoundBinaryExpression(node, op, boolType, left, right, Optional<object>.None);
             }
-            // enum op enum
+            // Matching enum operands
             if (IsEnumType(left.Type) && ReferenceEquals(left.Type, right.Type))
             {
                 var underlying = GetEnumUnderlyingTypeOrDefault(ctx.Compilation, left.Type);
                 var constValue = FoldBitwiseConstant(op, underlying.SpecialType, left, right);
                 return new BoundBinaryExpression(node, op, left.Type, left, right, constValue);
             }
-            // integral only
+            // Other operands must be integral
             if (!IsIntegral(left.Type.SpecialType) || !IsIntegral(right.Type.SpecialType))
             {
                 diagnostics.Add(new Diagnostic("CN_BIT000", DiagnosticSeverity.Error,
@@ -1770,9 +1787,10 @@ namespace Cnidaria.Cs
             if (leftConv.HasErrors || rightConv.HasErrors)
                 return new BoundBadExpression(node);
 
-            // shift result type is leftPromoted
+            // Shift result uses the promoted left operand type
             return new BoundBinaryExpression(node, op, leftPromoted, leftConv, rightConv, Optional<object>.None);
         }
+        // Compound assignment permits the operator result conversion defined for the target
         private BoundExpression ApplyCompoundAssignmentConversion(
             ExpressionSyntax syntaxForBoundNode,
             BoundExpression expr,
@@ -1821,6 +1839,7 @@ namespace Cnidaria.Cs
             bool isChecked = IsCheckedOverflowContext && conv.Kind == ConversionKind.ExplicitNumeric;
             return new BoundConversionExpression(syntaxForBoundNode, targetType, expr, conv, isChecked);
         }
+        // Central writable target validation for assignments and by-reference arguments
         private BoundExpression BindAssignableValue(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             BoundExpression expr;
@@ -1998,6 +2017,7 @@ namespace Cnidaria.Cs
             }
 
             var isVar = IsVar(de.Type);
+            var isScoped = de.Type is ScopedTypeSyntax;
 
             if (isVar)
             {
@@ -2005,10 +2025,20 @@ namespace Cnidaria.Cs
                     de,
                     name,
                     sv,
-                    context.Compilation.GetSpecialType(SpecialType.System_Void));
+                    context.Compilation.GetSpecialType(SpecialType.System_Void),
+                    isScoped);
             }
 
             TypeSymbol localType = BindType(de.Type, context, diagnostics);
+
+            if (isScoped && !localType.IsRefLikeType && localType is not ErrorTypeSymbol)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_SCOPED001",
+                    DiagnosticSeverity.Error,
+                    "The scoped modifier can only be used with ref locals or ref-like value types.",
+                    new Location(context.SemanticModel.SyntaxTree, de.Type.Span)));
+            }
 
             var local = new LocalSymbol(
                 name: name,
@@ -2017,7 +2047,8 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, sv.Span)),
                 isConst: false,
                 constantValueOpt: Optional<object>.None,
-                isByRef: false);
+                isByRef: false,
+                isScoped: isScoped);
 
             _locals[name] = local;
             context.Recorder.RecordDeclared(sv, local);
@@ -2047,7 +2078,7 @@ namespace Cnidaria.Cs
             if (context.ContainingSymbol is not MethodSymbol method)
                 return false;
 
-            // Constructors may assign fields
+            // Constructors are exempt and static members have no this receiver
             if (method.IsConstructor || method.IsStatic)
                 return false;
 
@@ -2088,21 +2119,21 @@ namespace Cnidaria.Cs
             if (!field.IsReadOnly)
                 return false;
 
-            // Must be inside a constructor of the same containing type
+            // The constructor must belong to the containing type
             if (context.ContainingSymbol is not MethodSymbol method || !method.IsConstructor)
                 return false;
 
             if (!ReferenceEquals(method.ContainingSymbol, field.ContainingSymbol))
                 return false;
 
-            // Static/instance must match
+            // Static state must match
             if (method.IsStatic != field.IsStatic)
                 return false;
 
             if (!field.IsStatic)
                 return receiver is null || receiver is BoundThisExpression;
 
-            // Static readonly field write in static ctor
+            // Static readonly fields are writable in the static constructor
             return receiver is null;
         }
         private static bool CanAssignReadOnlyAutoPropertyInConstructor(
@@ -2110,32 +2141,32 @@ namespace Cnidaria.Cs
             BoundExpression? receiver,
             BindingContext context)
         {
-            // Only source auto properties with synthesized backing field
+            // Only source auto-properties with synthesized backing fields qualify
             if (prop is not SourcePropertySymbol sp || sp.BackingFieldOpt is null)
                 return false;
 
-            // Property already has a setter
+            // A setter already provides the write path
             if (prop.HasSet)
                 return false;
 
-            // Must be inside a constructor of the same containing type
+            // The constructor must belong to the containing type
             if (context.ContainingSymbol is not MethodSymbol method || !method.IsConstructor)
                 return false;
 
             if (!ReferenceEquals(method.ContainingSymbol, prop.ContainingSymbol))
                 return false;
 
-            // Static/instance must match
+            // Static state must match
             if (method.IsStatic != prop.IsStatic)
                 return false;
 
-            // For instance property only 'this' is allowed
+            // Instance properties require the current receiver
             if (!prop.IsStatic)
             {
                 return receiver is null || receiver is BoundThisExpression;
             }
 
-            // Static property write in static ctor
+            // Static properties are writable in the static constructor
             return receiver is null;
         }
     }

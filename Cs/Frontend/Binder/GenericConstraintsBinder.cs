@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Provides reusable predicates for generic constraint evaluation</summary>
     internal static class GenericConstraintFacts
     {
         public static bool IsSystemNullableValueType(TypeSymbol t)
@@ -48,6 +44,7 @@ namespace Cnidaria.Cs
                 return IsNonNullableValueType(t);
             return t.IsReferenceType;
         }
+        /// <summary>Returns whether a type has recursively unmanaged storage</summary>
         public static bool IsUnmanagedType(TypeSymbol t)
         {
             var visiting = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
@@ -81,6 +78,7 @@ namespace Cnidaria.Cs
                 if (!nt.IsValueType)
                     return false;
 
+                // A repeated value type is already being validated on this path
                 if (!visiting.Add(nt))
                     return true;
 
@@ -110,8 +108,10 @@ namespace Cnidaria.Cs
             return false;
         }
     }
+    /// <summary>Validates constructed type and method arguments against declared constraints</summary>
     internal static class GenericConstraintChecker
     {
+        /// <summary>Checks type arguments for a constructed named type</summary>
         public static bool CheckNamedTypeInstantiation(
             NamedTypeSymbol constructedType,
             ImmutableArray<TypeSymbol> typeArguments,
@@ -128,6 +128,7 @@ namespace Cnidaria.Cs
                 context: context,
                 diagnostics: diagnostics);
         }
+        /// <summary>Checks type arguments for a constructed method</summary>
         public static bool CheckMethodInstantiation(
             MethodSymbol methodDefinition,
             ImmutableArray<TypeSymbol> typeArguments,
@@ -164,7 +165,7 @@ namespace Cnidaria.Cs
                 if (arg.Kind == SymbolKind.Error)
                     continue;
                 var constraints = tp.GenericConstraint;
-                // where T : allows ref struct
+                // Allows ref-like type arguments
                 if ((constraints & GenericConstraintsFlags.AllowsRefStruct) == 0
                     && RefLikeRestrictionFacts.ContainsRefLike(arg))
                 {
@@ -176,7 +177,7 @@ namespace Cnidaria.Cs
                         $"in '{ownerDisplayName}' unless '{tp.Name}' has 'allows ref struct'.",
                         location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
                 }
-                // where T : unmanaged
+                // Requires unmanaged storage
                 if ((constraints & GenericConstraintsFlags.UnmanagedConstraint) != 0
                     && !GenericConstraintFacts.IsUnmanagedType(arg))
                 {
@@ -188,7 +189,7 @@ namespace Cnidaria.Cs
                         $"the 'unmanaged' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
                         location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
                 }
-                // where T : struct
+                // Requires a non-nullable value type
                 if ((constraints & GenericConstraintsFlags.UnmanagedConstraint) == 0
                     && (constraints & GenericConstraintsFlags.StructConstraint) != 0
                     && !GenericConstraintFacts.IsNonNullableValueType(arg))
@@ -201,7 +202,7 @@ namespace Cnidaria.Cs
                         $"the 'struct' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
                         location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
                 }
-                // where T : notnull
+                // Requires a non-nullable type argument
                 if ((constraints & (GenericConstraintsFlags.StructConstraint
                     | GenericConstraintsFlags.UnmanagedConstraint)) == 0
                     && (constraints & GenericConstraintsFlags.NotNullConstraint) != 0
@@ -219,8 +220,10 @@ namespace Cnidaria.Cs
             return ok;
         }
     }
+    /// <summary>Detects ref-like storage through composite types</summary>
     internal static class RefLikeRestrictionFacts
     {
+        /// <summary>Returns whether a type directly or transitively contains ref-like storage</summary>
         public static bool ContainsRefLike(TypeSymbol type)
         {
             switch (type)
@@ -253,8 +256,10 @@ namespace Cnidaria.Cs
             }
         }
     }
+    /// <summary>Binds generic constraint clauses to source type parameters</summary>
     internal static class GenericConstraintBinder
     {
+        /// <summary>Binds constraint clauses for every declared generic owner</summary>
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             foreach (var tree in trees)
@@ -288,6 +293,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Binds and validates constraint clauses for one generic owner</summary>
         internal static void BindOwnerConstraintClauses(
             SyntaxTree tree,
             SyntaxList<TypeParameterConstraintClauseSyntax> clauses,

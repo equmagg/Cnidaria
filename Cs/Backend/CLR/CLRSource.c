@@ -181,6 +181,22 @@ typedef union RhEhRegisterContext
     usize alignment;
 } RhEhRegisterContext;
 
+#if defined(__riscv_flen) && __riscv_flen >= 32
+typedef union RhFloatBits
+{
+    float value;
+    u32 bits;
+} RhFloatBits;
+#endif
+
+#if defined(__riscv_flen) && __riscv_flen >= 64 && __SIZEOF_POINTER__ == 8
+typedef union RhDoubleBits
+{
+    double value;
+    usize bits;
+} RhDoubleBits;
+#endif
+
 typedef struct RhEhContinuation
 {
     usize kind;
@@ -241,6 +257,218 @@ usize RhpEhFrameCount;
 RhEhFrame RhpEhFrames[RH_EH_MAX_FRAMES];
 RhEhRegisterContext RhpEhRegisterContexts[RH_EH_MAX_FRAMES];
 RhObject* RhpCurrentException;
+
+#if defined(__riscv_flen) && __riscv_flen >= 32
+float RhpFmodF(float x, float y)
+{
+    RhFloatBits ux;
+    RhFloatBits uy;
+    int ex;
+    int ey;
+    u32 sx;
+    u32 difference;
+
+    ux.value = x;
+    uy.value = y;
+    ex = (int)((ux.bits >> 23) & 0xffu);
+    ey = (int)((uy.bits >> 23) & 0xffu);
+    sx = ux.bits & 0x80000000u;
+
+    if ((uy.bits << 1) == 0u ||
+        (uy.bits & 0x7fffffffu) > 0x7f800000u ||
+        ex == 0xff)
+    {
+        float invalid = x * y;
+        return invalid / invalid;
+    }
+
+    if ((ux.bits << 1) <= (uy.bits << 1))
+    {
+        if ((ux.bits << 1) == (uy.bits << 1))
+            return 0.0f * x;
+        return x;
+    }
+
+    if (ex == 0)
+    {
+        difference = ux.bits << 9;
+        while ((difference >> 31) == 0u)
+        {
+            ex = ex - 1;
+            difference = difference << 1;
+        }
+        ux.bits = ux.bits << (-ex + 1);
+    }
+    else
+    {
+        ux.bits = (ux.bits & 0x007fffffu) | 0x00800000u;
+    }
+
+    if (ey == 0)
+    {
+        difference = uy.bits << 9;
+        while ((difference >> 31) == 0u)
+        {
+            ey = ey - 1;
+            difference = difference << 1;
+        }
+        uy.bits = uy.bits << (-ey + 1);
+    }
+    else
+    {
+        uy.bits = (uy.bits & 0x007fffffu) | 0x00800000u;
+    }
+
+    while (ex > ey)
+    {
+        difference = ux.bits - uy.bits;
+        if ((difference >> 31) == 0u)
+        {
+            if (difference == 0u)
+                return 0.0f * x;
+            ux.bits = difference;
+        }
+        ux.bits = ux.bits << 1;
+        ex = ex - 1;
+    }
+
+    difference = ux.bits - uy.bits;
+    if ((difference >> 31) == 0u)
+    {
+        if (difference == 0u)
+            return 0.0f * x;
+        ux.bits = difference;
+    }
+
+    while ((ux.bits >> 23) == 0u)
+    {
+        ux.bits = ux.bits << 1;
+        ex = ex - 1;
+    }
+
+    if (ex > 0)
+    {
+        ux.bits = ux.bits - 0x00800000u;
+        ux.bits = ux.bits | ((u32)ex << 23);
+    }
+    else
+    {
+        ux.bits = ux.bits >> (-ex + 1);
+    }
+
+    ux.bits = ux.bits | sx;
+    return ux.value;
+}
+#endif
+
+#if defined(__riscv_flen) && __riscv_flen >= 64 && __SIZEOF_POINTER__ == 8
+double RhpFmod(double x, double y)
+{
+    RhDoubleBits ux;
+    RhDoubleBits uy;
+    int ex;
+    int ey;
+    usize sign_mask;
+    usize fraction_mask;
+    usize infinity_bits;
+    usize sx;
+    usize difference;
+
+    ux.value = x;
+    uy.value = y;
+    sign_mask = ((usize)1u) << 63;
+    fraction_mask = (sign_mask >> 11) - 1u;
+    infinity_bits = ((usize)0x7ffu) << 52;
+    ex = (int)((ux.bits >> 52) & 0x7ffu);
+    ey = (int)((uy.bits >> 52) & 0x7ffu);
+    sx = ux.bits & sign_mask;
+
+    if ((uy.bits << 1) == 0u ||
+        (uy.bits & (sign_mask - 1u)) > infinity_bits ||
+        ex == 0x7ff)
+    {
+        double invalid = x * y;
+        return invalid / invalid;
+    }
+
+    if ((ux.bits << 1) <= (uy.bits << 1))
+    {
+        if ((ux.bits << 1) == (uy.bits << 1))
+            return 0.0 * x;
+        return x;
+    }
+
+    if (ex == 0)
+    {
+        difference = ux.bits << 12;
+        while ((difference >> 63) == 0u)
+        {
+            ex = ex - 1;
+            difference = difference << 1;
+        }
+        ux.bits = ux.bits << (-ex + 1);
+    }
+    else
+    {
+        ux.bits = (ux.bits & fraction_mask) | (((usize)1u) << 52);
+    }
+
+    if (ey == 0)
+    {
+        difference = uy.bits << 12;
+        while ((difference >> 63) == 0u)
+        {
+            ey = ey - 1;
+            difference = difference << 1;
+        }
+        uy.bits = uy.bits << (-ey + 1);
+    }
+    else
+    {
+        uy.bits = (uy.bits & fraction_mask) | (((usize)1u) << 52);
+    }
+
+    while (ex > ey)
+    {
+        difference = ux.bits - uy.bits;
+        if ((difference >> 63) == 0u)
+        {
+            if (difference == 0u)
+                return 0.0 * x;
+            ux.bits = difference;
+        }
+        ux.bits = ux.bits << 1;
+        ex = ex - 1;
+    }
+
+    difference = ux.bits - uy.bits;
+    if ((difference >> 63) == 0u)
+    {
+        if (difference == 0u)
+            return 0.0 * x;
+        ux.bits = difference;
+    }
+
+    while ((ux.bits >> 52) == 0u)
+    {
+        ux.bits = ux.bits << 1;
+        ex = ex - 1;
+    }
+
+    if (ex > 0)
+    {
+        ux.bits = ux.bits - (((usize)1u) << 52);
+        ux.bits = ux.bits | ((usize)ex << 52);
+    }
+    else
+    {
+        ux.bits = ux.bits >> (-ex + 1);
+    }
+
+    ux.bits = ux.bits | sx;
+    return ux.value;
+}
+#endif
 
 void RhpFallbackFailFast(int code);
 void RhpEhTransfer(void* frame_pointer, const void* target, const void* register_context);
@@ -1323,12 +1551,69 @@ static usize rh_minimum_block_size(void)
 
 static void rh_zero(void* address, usize size)
 {
-    u8* p = (u8*)address;
-    usize i = 0ul;
-    while (i < size)
+    u8* bytes = (u8*)address;
+    usize word_size = (usize)__SIZEOF_POINTER__;
+    usize block_size = word_size * 8ul;
+
+#ifdef __riscv_vector
+    if (size >= 64ul)
     {
-        p[i] = 0u;
-        i = i + 1ul;
+        __asm__ volatile(
+            "vsetvli a2, zero, e8, m8, ta, ma\n"
+            "vxor.vv v8, v8, v8\n"
+            ".Lrh_zero_loop_%=:\n"
+            "vsetvli a2, %[count], e8, m8, ta, ma\n"
+            "vse8.v v8, (%[destination])\n"
+            "add %[destination], %[destination], a2\n"
+            "sub %[count], %[count], a2\n"
+            "bne %[count], zero, .Lrh_zero_loop_%="
+            :
+        : [destination] "{a0}"(bytes), [count] "{a1}"(size)
+            : "memory");
+        return;
+    }
+#endif
+
+    while (size != 0ul && ((usize)bytes & (word_size - 1ul)) != 0ul)
+    {
+        *bytes = 0u;
+        bytes = bytes + 1;
+        size = size - 1ul;
+    }
+
+    if (size >= word_size)
+    {
+        usize* words = (usize*)bytes;
+
+        while (size >= block_size)
+        {
+            words[0] = 0ul;
+            words[1] = 0ul;
+            words[2] = 0ul;
+            words[3] = 0ul;
+            words[4] = 0ul;
+            words[5] = 0ul;
+            words[6] = 0ul;
+            words[7] = 0ul;
+            words = words + 8;
+            size = size - block_size;
+        }
+
+        while (size >= word_size)
+        {
+            *words = 0ul;
+            words = words + 1;
+            size = size - word_size;
+        }
+
+        bytes = (u8*)words;
+    }
+
+    while (size != 0ul)
+    {
+        *bytes = 0u;
+        bytes = bytes + 1;
+        size = size - 1ul;
     }
 }
 

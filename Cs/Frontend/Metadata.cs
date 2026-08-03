@@ -18,7 +18,7 @@ namespace Cnidaria.Cs
         public int GetHashCode(T obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
-    internal interface IRuntimeMetadataModule
+    public interface IRuntimeMetadataModule
     {
         string Name { get; }
         IMetadataView Md { get; }
@@ -100,7 +100,7 @@ namespace Cnidaria.Cs
         PInvokeMapRow GetPInvokeMap(int rid);
 
     }
-    internal sealed class FlatMetadataView : IMetadataView
+    public sealed class FlatMetadataView : IMetadataView
     {
         private readonly ReadOnlyMemory<byte> _data;
         private readonly SectionDesc[] _sections = new SectionDesc[(int)FlatMdSection.PInvokeMapTable + 1];
@@ -710,7 +710,7 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Attribute blob is truncated.");
         }
     }
-    internal static class FlatMetadataBuilder
+    public static class FlatMetadataBuilder
     {
         public const uint Magic = 0x444D4E43; // "CNMD" little endian
         /// <summary>Backwards compatibility is NOT preserved</summary>

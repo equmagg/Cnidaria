@@ -9,8 +9,10 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Detects conflicting source member signatures</summary>
     internal static class NameConflictBinder
     {
+        /// <summary>Validates duplicate callable signatures across all source types</summary>
         public static void BindAll(Compilation compilation, DiagnosticBag diagnostics)
         {
             var visited = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
@@ -37,6 +39,7 @@ namespace Cnidaria.Cs
                     VisitType(nestedType, diagnostics, visited);
             }
         }
+        // Explicit interface implementations are excluded from ordinary member conflicts
         private static void ValidateDuplicateMethodSignatures(NamedTypeSymbol type, DiagnosticBag diagnostics)
         {
             var members = type.GetMembers();

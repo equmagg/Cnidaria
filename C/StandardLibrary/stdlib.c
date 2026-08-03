@@ -1,7 +1,4 @@
-﻿#ifndef __STDLIB_H
-#define __STDLIB_H
-
-#include <stddef.h>
+﻿#include <stddef.h>
 #include <string.h>
 
 #if defined(_WIN32) && defined(__x86_64__)
@@ -19,7 +16,7 @@ static void* __stdlib_windows_heap(void)
     return heap;
 }
 
-static void* malloc(size_t size)
+void* malloc(size_t size)
 {
     void* result;
     void* heap = __stdlib_windows_heap();
@@ -38,7 +35,7 @@ static void* malloc(size_t size)
     return result;
 }
 
-static void free(void* pointer)
+void free(void* pointer)
 {
     void* heap;
 
@@ -56,7 +53,7 @@ static void free(void* pointer)
         : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
 }
 
-static void* realloc(void* pointer, size_t size)
+void* realloc(void* pointer, size_t size)
 {
     void* result;
     void* heap;
@@ -94,7 +91,7 @@ static void* __stdlib_windows_heap(void)
     return heap;
 }
 
-static void* malloc(size_t size)
+void* malloc(size_t size)
 {
     void* result;
     void* heap = __stdlib_windows_heap();
@@ -113,7 +110,7 @@ static void* malloc(size_t size)
     return result;
 }
 
-static void free(void* pointer)
+void free(void* pointer)
 {
     void* heap;
 
@@ -131,7 +128,7 @@ static void free(void* pointer)
         : "eax", "ecx", "edx", "memory");
 }
 
-static void* realloc(void* pointer, size_t size)
+void* realloc(void* pointer, size_t size)
 {
     void* result;
     void* heap;
@@ -277,7 +274,7 @@ static void __stdlib_linux_unmap(void* address, size_t length)
 #endif
 }
 
-static void* malloc(size_t size)
+void* malloc(size_t size)
 {
     size_t total_size;
     __stdlib_linux_block* block;
@@ -297,7 +294,7 @@ static void* malloc(size_t size)
     return (void*)(block + 1);
 }
 
-static void free(void* pointer)
+void free(void* pointer)
 {
     __stdlib_linux_block* block;
 
@@ -308,7 +305,7 @@ static void free(void* pointer)
     __stdlib_linux_unmap((void*)block, block->mapping_size);
 }
 
-static void* realloc(void* pointer, size_t size)
+void* realloc(void* pointer, size_t size)
 {
     __stdlib_linux_block* block;
     size_t copy_size;
@@ -394,7 +391,7 @@ static void __stdlib_arena_split(__stdlib_arena_block* block, size_t size)
     block->next = next;
 }
 
-static void* malloc(size_t size)
+void* malloc(size_t size)
 {
     __stdlib_arena_block* block;
 
@@ -437,7 +434,7 @@ static void __stdlib_arena_coalesce(void)
     }
 }
 
-static void free(void* pointer)
+void free(void* pointer)
 {
     __stdlib_arena_block* block;
 
@@ -449,7 +446,7 @@ static void free(void* pointer)
     __stdlib_arena_coalesce();
 }
 
-static void* realloc(void* pointer, size_t size)
+void* realloc(void* pointer, size_t size)
 {
     __stdlib_arena_block* block;
     size_t aligned_size;
@@ -498,7 +495,7 @@ static void* realloc(void* pointer, size_t size)
 
 #endif
 
-static void* calloc(size_t count, size_t size)
+void* calloc(size_t count, size_t size)
 {
     size_t total_size;
     void* pointer;
@@ -514,5 +511,3 @@ static void* calloc(size_t count, size_t size)
     memset(pointer, 0, total_size);
     return pointer;
 }
-
-#endif

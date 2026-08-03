@@ -171,6 +171,16 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(']');
                     return;
+                case GenTreeKind.NullCheck:
+                    sb.Append("nullcheck(");
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
+                case GenTreeKind.ArrayLength:
+                    sb.Append("arrLength(");
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
                 case GenTreeKind.ArrayElement:
                 case GenTreeKind.ArrayElementAddr:
                     TryAppendOperand(sb, node, 0);
@@ -196,16 +206,6 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.StackAlloc:
                     sb.Append("stackalloc(size=").Append(node.Int32).Append(", count=");
-                    AppendOperands(sb, node);
-                    sb.Append(')');
-                    return;
-                case GenTreeKind.AllocHGlobal:
-                    sb.Append("alloc_hglobal(");
-                    AppendOperands(sb, node);
-                    sb.Append(')');
-                    return;
-                case GenTreeKind.FreeHGlobal:
-                    sb.Append("free_hglobal(");
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;

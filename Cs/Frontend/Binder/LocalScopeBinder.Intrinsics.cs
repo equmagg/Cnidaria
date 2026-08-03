@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Intrinsic expressions, compile-time sizes, and checked contexts
     internal sealed partial class LocalScopeBinder : Binder
     {
         private BoundExpression BindTypeOf(TypeOfExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
@@ -83,6 +79,7 @@ namespace Cnidaria.Cs
             var visiting = new HashSet<TypeSymbol>();
             return TryGetStorageSizeAlign(type, target, visiting, out size, out _);
         }
+        // Recursive value type layout uses declared instance fields and target pointer size
         private static bool TryGetStorageSizeAlign(
             TypeSymbol type,
             TargetInfo target,
@@ -123,7 +120,7 @@ namespace Cnidaria.Cs
                 if (nt.TypeKind == TypeKind.Struct)
                 {
                     if (!visiting.Add(nt))
-                        return false; // recursive cycle guard
+                        return false; // Reject recursive value layouts
 
                     try
                     {
@@ -161,7 +158,7 @@ namespace Cnidaria.Cs
 
                         size = AlignUp(offset, maxAlign);
                         if (size == 0)
-                            size = 1; // empty struct behavior
+                            size = 1; // Empty structs occupy one byte
 
                         align = maxAlign;
                         return true;
@@ -238,6 +235,7 @@ namespace Cnidaria.Cs
 
             return new BoundThrowExpression(node, expr);
         }
+        // Checked and unchecked expressions clone binder flags while sharing scope state
         private BoundExpression BindCheckedExpression(CheckedExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             bool isChecked = node.Keyword.Kind == SyntaxKind.CheckedKeyword;

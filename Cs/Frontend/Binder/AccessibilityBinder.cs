@@ -1,16 +1,12 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Evaluates symbol accessibility from a binding context</summary>
     internal static class AccessibilityHelper
     {
+        /// <summary>Returns whether a symbol is accessible from the current context</summary>
+        /// <remarks>Assembly identity is approximated by source versus metadata origin</remarks>
         public static bool IsAccessible(Symbol symbol, BindingContext context)
         {
             if (context.SemanticModel.IgnoresAccessibility)

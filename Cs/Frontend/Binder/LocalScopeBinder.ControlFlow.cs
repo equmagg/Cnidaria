@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Reachability and definite completion diagnostics
     internal sealed partial class LocalScopeBinder : Binder
     {
         internal void ReportControlFlowDiagnostics(

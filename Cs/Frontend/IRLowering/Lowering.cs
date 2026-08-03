@@ -7,11 +7,11 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Converts bound method bodies into the reduced forms consumed by code generation</summary>
     internal static class IRLowering
     {
-        public static BoundMethodBody Rewrite(
-            Compilation compilation,
-            BoundMethodBody methodBody)
+        /// <summary>Converts bound method bodies into the reduced forms consumed by code generation</summary>
+        public static BoundMethodBody Rewrite(Compilation compilation, BoundMethodBody methodBody)
         {
             if (compilation is null) throw new ArgumentNullException(nameof(compilation));
             if (methodBody is null) throw new ArgumentNullException(nameof(methodBody));
@@ -62,6 +62,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Normalizes a method body to a block without changing statement order</summary>
         private static BoundMethodBody EnsureBlockBody(BoundMethodBody body)
         {
             if (body.Body is BoundBlockStatement)
@@ -80,6 +81,7 @@ namespace Cnidaria.Cs
                 body.Method,
                 new BoundBlockStatement(body.Body.Syntax, ImmutableArray.Create<BoundStatement>(body.Body)));
         }
+        /// <summary>Discovers iterator bodies in a syntax tree and registers their state machine symbols</summary>
         internal static void PrepareIteratorStateMachines(Compilation compilation, SyntaxTree tree, SemanticModel model)
         {
             var preparer = new IteratorStateMachinePreparer(
@@ -100,8 +102,10 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Builds the synthesized method bodies for a prepared iterator state machine</summary>
         internal static ImmutableArray<BoundMethodBody> GetIteratorStateMachineBodies(Compilation compilation, IteratorStateMachineInfo info)
             => IteratorLowering.BuildBodies(compilation, info);
+        /// <summary>Replaces iterator local functions with calls to their synthesized state machines</summary>
         private static BoundMethodBody RewriteIteratorLocalFunctions(
             Compilation compilation,
             BoundMethodBody body)
@@ -117,6 +121,7 @@ namespace Cnidaria.Cs
             return EnsureBlockBody(rewritten);
         }
 
+        /// <summary>Collects locals that must survive across iterator suspension points</summary>
         private sealed class IteratorLocalCollector : BoundTreeRewriter
         {
             private readonly HashSet<LocalSymbol> _seen =
@@ -145,6 +150,7 @@ namespace Cnidaria.Cs
                 => node;
         }
 
+        /// <summary>Detects yields in one method body without entering nested functions</summary>
         private sealed class IteratorYieldFinder : BoundTreeRewriter
         {
             public bool Found { get; private set; }
@@ -164,6 +170,7 @@ namespace Cnidaria.Cs
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
         }
+        /// <summary>Collects symbols used by an iterator but owned by an outer method</summary>
         private sealed class IteratorExternalCaptureCollector : BoundTreeRewriter
         {
             private readonly MethodSymbol _owner;
@@ -214,6 +221,7 @@ namespace Cnidaria.Cs
                     _captures.Add(symbol);
             }
         }
+        /// <summary>Detects local functions whose bodies require iterator lowering</summary>
         private sealed class IteratorLocalFunctionYieldFinder : BoundTreeRewriter
         {
             public bool Found { get; private set; }
@@ -240,6 +248,7 @@ namespace Cnidaria.Cs
                 => node;
         }
 
+        /// <summary>Creates and registers state machine metadata before ordinary lowering begins</summary>
         private sealed class IteratorStateMachinePreparer : BoundTreeRewriter
         {
             private readonly Compilation _compilation;
@@ -261,6 +270,7 @@ namespace Cnidaria.Cs
                 RewriteStatement(body.Body);
             }
 
+            /// <summary>Registers a state machine when the body contains a yield</summary>
             private void RegisterIfIterator(BoundMethodBody body)
             {
                 if (!IteratorLowering.ContainsYield(body.Body))
@@ -299,6 +309,7 @@ namespace Cnidaria.Cs
                 => node;
         }
 
+        /// <summary>Rewrites iterator local function declarations into state machine factories</summary>
         private sealed class IteratorLocalFunctionRewriter : BoundTreeRewriter
         {
             private readonly Compilation _compilation;
@@ -389,6 +400,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Identifies the interface shape returned by an iterator method</summary>
         internal enum IteratorReturnKind : byte
         {
             Enumerable,
@@ -397,6 +409,7 @@ namespace Cnidaria.Cs
             GenericEnumerator,
         }
 
+        /// <summary>Stores synthesized iterator symbols and source-to-field mappings</summary>
         internal sealed class IteratorStateMachineInfo
         {
             public SyntaxTree SyntaxTree { get; }
@@ -470,6 +483,7 @@ namespace Cnidaria.Cs
             }
         }
 
+        /// <summary>Builds iterator state machine symbols and executable method bodies</summary>
         private static class IteratorLowering
         {
             public static bool ContainsYield(BoundStatement statement)
@@ -479,6 +493,7 @@ namespace Cnidaria.Cs
                 return finder.Found;
             }
 
+            /// <summary>Lowers ordinary constructs while retaining yield statements as suspension markers</summary>
             public static BoundMethodBody PreLowerIteratorBodyPreservingYield(
                 Compilation compilation,
                 BoundMethodBody body)
@@ -490,6 +505,7 @@ namespace Cnidaria.Cs
                 return EnsureBlockBody(lowered);
             }
 
+            /// <summary>Creates the state machine type, interface members, fields, and symbol mappings</summary>
             public static IteratorStateMachineInfo Create(
                 Compilation compilation,
                 SyntaxTree tree,
@@ -722,6 +738,7 @@ namespace Cnidaria.Cs
                 throw new NotSupportedException(
                     $"Iterator lowering requires method '{method.Name}' to be nested in a source type.");
             }
+            /// <summary>Builds all synthesized state machine method bodies in declaration order</summary>
             public static ImmutableArray<BoundMethodBody> BuildBodies(
                 Compilation compilation,
                 IteratorStateMachineInfo info)
@@ -737,6 +754,7 @@ namespace Cnidaria.Cs
                     BuildObjectGetEnumeratorBody(compilation, info));
             }
 
+            /// <summary>Replaces an iterator entry body with state machine allocation and initialization</summary>
             public static BoundMethodBody RewriteOriginalIteratorMethod(
                 Compilation compilation,
                 BoundMethodBody body,
@@ -794,6 +812,7 @@ namespace Cnidaria.Cs
                     body.Method,
                     new BoundBlockStatement(syntax, statements.ToImmutable()));
             }
+            /// <summary>Maps a hidden capture parameter to the state machine field that stores it</summary>
             public static bool TryGetIteratorCaptureFieldForHiddenParameter(
                 IteratorStateMachineInfo info,
                 ParameterSymbol parameter,
@@ -855,6 +874,7 @@ namespace Cnidaria.Cs
                     new BoundBlockStatement(syntax, statements));
             }
 
+            /// <summary>Builds the resume dispatch and rewritten iterator body for MoveNext</summary>
             private static BoundMethodBody BuildMoveNextBody(
                 Compilation compilation,
                 IteratorStateMachineInfo info)
@@ -991,6 +1011,7 @@ namespace Cnidaria.Cs
                 IteratorStateMachineInfo info)
                 => BuildGetEnumeratorBody(compilation, info, info.ObjectGetEnumerator);
 
+            /// <summary>Builds an enumerator factory that creates a fresh state machine instance</summary>
             private static BoundMethodBody BuildGetEnumeratorBody(
                 Compilation compilation,
                 IteratorStateMachineInfo info,
@@ -1048,6 +1069,7 @@ namespace Cnidaria.Cs
                     new BoundBlockStatement(syntax, statements.ToImmutable()));
             }
 
+            /// <summary>Rewrites yields and lifted symbols inside the iterator execution body</summary>
             private sealed class IteratorMoveNextRewriter : BoundTreeRewriter
             {
                 private readonly Compilation _compilation;
@@ -1068,6 +1090,7 @@ namespace Cnidaria.Cs
                 public BoundStatement RewriteIteratorBody(BoundStatement statement)
                     => RewriteStatement(statement);
 
+                /// <summary>Stores the yielded value and emits a resumable return sequence</summary>
                 protected override BoundStatement RewriteYieldStatement(BoundYieldStatement node)
                 {
                     var syntax = node.Syntax;
@@ -1149,6 +1172,7 @@ namespace Cnidaria.Cs
                 protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                     => node;
 
+                /// <summary>Marks the iterator complete and returns false</summary>
                 private BoundStatement FinishFalse(SyntaxNode syntax)
                 {
                     return new BoundBlockStatement(
@@ -1403,6 +1427,7 @@ namespace Cnidaria.Cs
                 return string.Join(".", parts);
             }
         }
+        /// <summary>Lowers high-level statements and expressions into primitive bound operations</summary>
         private sealed class LocalRewriter : BoundTreeRewriterWithStackGuard
         {
             private readonly Compilation _compilation;
@@ -1414,6 +1439,7 @@ namespace Cnidaria.Cs
             private NamespaceSymbol? _systemNsCache;
             private readonly Dictionary<int, NamedTypeSymbol> _valueTupleDefCache = new();
             private readonly Dictionary<TypeSymbol, MethodSymbol> _unsafeAddRefIntCache = new(ReferenceEqualityComparer<TypeSymbol>.Instance);
+            /// <summary>Overrides overflow checking for the lexical checked context</summary>
             private IDisposable PushCheckedContext(bool value)
             {
                 var previous = _checkedContextOverride;
@@ -1502,7 +1528,7 @@ namespace Cnidaria.Cs
             {
                 while (true)
                 {
-                    // Drop identity conversions early
+                    // Strip identity conversions before testing the branch shape
                     if (condition is BoundConversionExpression c &&
                         c.Conversion.Kind == ConversionKind.Identity &&
                         !c.HasErrors &&
@@ -1512,7 +1538,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    // !cond => invert branch
+                    // Invert the branch instead of materializing logical negation
                     if (condition is BoundUnaryExpression u &&
                         u.OperatorKind == BoundUnaryOperatorKind.LogicalNot)
                     {
@@ -1546,6 +1572,7 @@ namespace Cnidaria.Cs
                 value = default;
                 return false;
             }
+            /// <summary>Builds the nested value tuple representation for semantic tuple elements</summary>
             private NamedTypeSymbol GetValueTupleTypeForElements(ImmutableArray<TypeSymbol> elems)
             {
                 if (elems.Length == 0)
@@ -1590,6 +1617,7 @@ namespace Cnidaria.Cs
                     b.Add(src[start + i]);
                 return b.ToImmutable();
             }
+            /// <summary>Constructs a nested value tuple while preserving element evaluation order</summary>
             private BoundExpression CreateValueTupleValue(
                 SyntaxNode syntax,
                 ImmutableArray<TypeSymbol> tupleElemTypes,
@@ -1615,7 +1643,7 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    // Build Rest recursively
+                    // Store elements after the seventh in the recursive Rest field
                     var firstTypes = SliceTypes(tupleElemTypes, 0, 7);
                     var restTypes = SliceTypes(tupleElemTypes, 7, n - 7);
 
@@ -1624,7 +1652,7 @@ namespace Cnidaria.Cs
 
                     var restExpr = CreateValueTupleValue(syntax, restTypes, restVals);
 
-                    var vt8 = GetValueTupleTypeForElements(tupleElemTypes); // ValueTuple`8<...>
+                    var vt8 = GetValueTupleTypeForElements(tupleElemTypes); // Nested tuple node with seven elements and Rest
                     var ctor8 = FindStructCtorByParamCount(vt8, 8);
 
                     var args = ImmutableArray.CreateBuilder<BoundExpression>(8);
@@ -1634,6 +1662,7 @@ namespace Cnidaria.Cs
                     return new BoundObjectCreationExpression(syntax, vt8, ctor8, args.ToImmutable());
                 }
             }
+            /// <summary>Reads a semantic tuple element through the nested value tuple field layout</summary>
             private BoundExpression ReadValueTupleElement(
                 ExpressionSyntax syntax,
                 BoundExpression receiver,
@@ -1678,12 +1707,13 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteTupleExpression(BoundTupleExpression node)
             {
-                // Rewrite elements first
+                // Preserve element evaluation order before constructing the tuple
                 var elems = RewriteExpressions(node.Elements, out _);
 
                 var tupleType = (TupleTypeSymbol)node.Type;
                 return CreateValueTupleValue(node.Syntax, tupleType.ElementTypes, elems);
             }
+            /// <summary>Lowers a method body and inserts required constructor initialization</summary>
             protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
             {
                 var previousSpanCollectionStackAllocLocals = _spanCollectionStackAllocLocals;
@@ -1854,6 +1884,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
+            /// <summary>Nests using declarations so disposal order remains reverse declaration order</summary>
             private BoundStatement LowerUsingDeclarations(
                 SyntaxNode syntax,
                 ImmutableArray<BoundLocalDeclarationStatement> declarations,
@@ -1873,6 +1904,7 @@ namespace Cnidaria.Cs
                 return current;
             }
 
+            /// <summary>Rewrites one using local into initialization followed by guarded disposal</summary>
             private BoundStatement LowerUsingLocal(
                 SyntaxNode syntax,
                 BoundLocalDeclarationStatement declaration,
@@ -1938,6 +1970,7 @@ namespace Cnidaria.Cs
 
                 return LowerSpanCollectionToHeapArray(node);
             }
+            /// <summary>Materializes constant read-only span elements in method-local static data</summary>
             private BoundExpression LowerReadOnlySpanCollectionToStaticData(BoundSpanCollectionExpression node)
             {
                 var spanLikeType = (NamedTypeSymbol)node.Type;
@@ -2033,6 +2066,7 @@ namespace Cnidaria.Cs
                     SpecialType.System_Single or
                     SpecialType.System_Double;
             }
+            /// <summary>Materializes a non-escaping unmanaged span collection in stack storage</summary>
             private BoundExpression LowerSpanCollectionToStackAlloc(BoundSpanCollectionExpression node)
             {
                 var spanLikeType = (NamedTypeSymbol)node.Type;
@@ -2097,6 +2131,7 @@ namespace Cnidaria.Cs
                     spanCreation);
             }
 
+            /// <summary>Materializes a span collection through a managed array when stack storage is unsafe</summary>
             private BoundExpression LowerSpanCollectionToHeapArray(BoundSpanCollectionExpression node)
             {
                 var spanLikeType = (NamedTypeSymbol)node.Type;
@@ -2327,6 +2362,7 @@ namespace Cnidaria.Cs
                 return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
             }
 
+            /// <summary>Selects array, string, span, or enumerator lowering for foreach</summary>
             protected override BoundStatement RewriteForEachStatement(BoundForEachStatement node)
             {
                 var collection = RewriteExpression(node.Collection);
@@ -2536,6 +2572,7 @@ namespace Cnidaria.Cs
                 return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
             }
 
+            /// <summary>Lowers enumerator iteration with conditional disposal in a finally block</summary>
             private BoundStatement LowerEnumeratorForEach(
                 BoundForEachStatement node,
                 BoundExpression collection,
@@ -2799,6 +2836,7 @@ namespace Cnidaria.Cs
                        string.Equals(ns.Name, "System", StringComparison.Ordinal);
             }
 
+            /// <summary>Builds the disposal finally block when the enumerator is disposable</summary>
             private bool TryCreateForEachFinally(
                 SyntaxNode syntax,
                 LocalSymbol enumeratorLocal,
@@ -3048,6 +3086,7 @@ namespace Cnidaria.Cs
                 using (PushCheckedContext(false))
                     return RewriteExpression(node.Expression);
             }
+            /// <summary>Lowers fixed initializers into pointer-producing expressions</summary>
             protected override BoundStatement RewriteFixedStatement(BoundFixedStatement node)
             {
                 var body = RewriteStatement(node.Body);
@@ -3388,6 +3427,7 @@ namespace Cnidaria.Cs
                 return ptrValue;
             }
 
+            /// <summary>Lowers tuple conversions and propagates the effective checked context</summary>
             protected override BoundExpression RewriteConversionExpression(BoundConversionExpression node)
             {
                 var effectiveChecked = GetEffectiveIsChecked(node.IsChecked);
@@ -3405,7 +3445,7 @@ namespace Cnidaria.Cs
                         ?? node.Operand.Syntax as ExpressionSyntax
                         ?? throw new InvalidOperationException("Expected ExpressionSyntax for tuple conversion.");
 
-                    // Fast path
+                    // Convert tuple literal elements directly
                     if (node.Operand is BoundTupleExpression lit)
                     {
                         var converted = ImmutableArray.CreateBuilder<BoundExpression>(n);
@@ -3423,7 +3463,7 @@ namespace Cnidaria.Cs
                                 ? src
                                 : new BoundConversionExpression(exprSyntax, targetType, src, conv, effectiveChecked);
 
-                            // allow nested tuple conversions to lower
+                            // Lower nested tuple conversions before construction
                             e = RewriteExpression(e);
                             converted.Add(e);
                         }
@@ -3431,7 +3471,7 @@ namespace Cnidaria.Cs
                         return CreateValueTupleValue(node.Syntax, toTuple.ElementTypes, converted.ToImmutable());
                     }
 
-                    // General path
+                    // Spill a nonliteral tuple so its operand is evaluated once
                     var operandLowered = RewriteExpression(node.Operand);
 
                     var srcVtType = GetValueTupleTypeForElements(fromTuple.ElementTypes);
@@ -3469,15 +3509,17 @@ namespace Cnidaria.Cs
                         value: value);
                 }
 
-                // default behavior
+                // Preserve ordinary conversions while applying the lexical checked context
                 var operand = RewriteExpression(node.Operand);
                 if (!ReferenceEquals(operand, node.Operand) || effectiveChecked != node.IsChecked)
                     return new BoundConversionExpression(node.Syntax, node.Type, operand, node.Conversion, effectiveChecked);
 
                 return node;
             }
+            /// <summary>Finds span collection locals whose backing storage cannot escape the method</summary>
             private static class SpanCollectionEscapeAnalysis
             {
+                /// <summary>Returns collection locals eligible for stack allocation</summary>
                 public static HashSet<LocalSymbol> ComputeStackAllocLocals(MethodSymbol method, BoundStatement body)
                 {
                     var result = new HashSet<LocalSymbol>(ReferenceEqualityComparer<LocalSymbol>.Instance);
@@ -4176,9 +4218,10 @@ namespace Cnidaria.Cs
 
                 return node;
             }
+            /// <summary>Flattens a string concatenation chain and selects an available concatenation overload</summary>
             private BoundExpression LowerStringConcatenation(BoundBinaryExpression node)
             {
-                // Flatten left associated chain
+                // Flatten the left-associated chain
                 var nodes = new List<BoundBinaryExpression>(8);
                 var rightsReversed = new List<BoundExpression>(8);
 
@@ -4196,7 +4239,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < rightsReversed.Count; i++)
                     operands[i + 1] = rightsReversed[rightsReversed.Count - 1 - i];
 
-                // Rewrite operands in eval order
+                // Rewrite concatenation operands in source order
                 for (int i = 0; i < operands.Length; i++)
                     operands[i] = RewriteExpression(operands[i]);
 
@@ -4252,7 +4295,7 @@ namespace Cnidaria.Cs
                         isChecked: false);
                 }
 
-                // Prefer overloads without array for up to 4 operands
+                // Prefer fixed-arity overloads for up to four operands
                 if (operands.Length == 2)
                 {
                     var m = FindConcat(objectType, objectType);
@@ -4272,13 +4315,13 @@ namespace Cnidaria.Cs
                         ImmutableArray.Create(ToObject(operands[0]), ToObject(operands[1]), ToObject(operands[2]), ToObject(operands[3])));
                 }
 
-                // object[] path for longer chains
+                // Use an object array for longer chains
                 var objArrayType = _compilation.CreateArrayType(objectType, rank: 1);
                 var arrLocal = CreateTempLocal(objArrayType);
 
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2 + operands.Length);
 
-                // arr = new object[operandCount]
+                // Allocate the argument array once
                 var countLit = new BoundLiteralExpression(node.Syntax, int32Type, operands.Length);
                 var newArr = new BoundArrayCreationExpression(node.Syntax, objArrayType, objectType, countLit, initializerOpt: null);
 
@@ -4289,7 +4332,7 @@ namespace Cnidaria.Cs
                         new BoundLocalExpression(node.Syntax, arrLocal),
                         newArr)));
 
-                // arr[i] = (object)operand[i]
+                // Box and store each operand in evaluation order
                 for (int i = 0; i < operands.Length; i++)
                 {
                     var idxLit = new BoundLiteralExpression(node.Syntax, int32Type, i);
@@ -4317,11 +4360,12 @@ namespace Cnidaria.Cs
                     sideEffects: sideEffects.ToImmutable(),
                     value: call);
             }
+            /// <summary>Rebuilds a left-associated binary chain after rewriting operands in source order</summary>
             private BoundExpression RewriteBinaryOperatorChain(BoundBinaryExpression node)
             {
                 var op = node.OperatorKind;
 
-                // Collect left nested nodes
+                // Collect the left-nested operator chain
                 var nodes = new List<BoundBinaryExpression>(capacity: 8);
                 var rightsReversed = new List<BoundExpression>(capacity: 8);
 
@@ -4339,7 +4383,7 @@ namespace Cnidaria.Cs
                 var forcedChecked = _checkedContextOverride;
                 var anyCheckedDiff = forcedChecked.HasValue && nodes.Exists(n => n.IsChecked != forcedChecked.Value);
 
-                // Rewrite operands in evaluation order
+                // Rewrite binary operands in source order
                 var operandCount = 1 + rightsReversed.Count;
                 var operands = new BoundExpression[operandCount];
 
@@ -4401,7 +4445,7 @@ namespace Cnidaria.Cs
 
                 if (node.Left is BoundMemberAccessExpression { Member: PropertySymbol prop } left)
                 {
-                    // Auto property
+                    // Access the backing field directly
                     if (TryGetAutoPropertyBackingField(prop, out _))
                     {
                         var rewrittenLeft = RewriteExpression(node.Left);
@@ -4409,7 +4453,7 @@ namespace Cnidaria.Cs
                         return new BoundAssignmentExpression(node.Syntax, rewrittenLeft, rewrittenRight);
                     }
 
-                    // Regular property
+                    // Preserve the property setter call
                     if (prop.SetMethod is MethodSymbol setMethod)
                         return LowerPropertyAssignment(node, left, setMethod);
                 }
@@ -4418,7 +4462,7 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteMemberAccessExpression(BoundMemberAccessExpression node)
             {
-                // Tuple element access
+                // Map the semantic tuple element to its storage field
                 if (node.Member is TupleElementFieldSymbol tef &&
                     node.ReceiverOpt is not null &&
                     node.ReceiverOpt.Type is TupleTypeSymbol tuple)
@@ -4432,7 +4476,7 @@ namespace Cnidaria.Cs
                     return ReadValueTupleElement(exprSyntax, receiver, vtType, tuple, tef.ElementIndex);
                 }
 
-                // Auto property
+                // Read the backing field directly
                 if (node.Member is PropertySymbol prop && TryGetAutoPropertyBackingField(prop, out var backingField))
                 {
                     var rewrittenReceiver = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
@@ -4446,7 +4490,7 @@ namespace Cnidaria.Cs
                         constantValueOpt: Optional<object>.None);
                 }
 
-                // Regular property read
+                // Preserve the property getter call
                 if (node.Member is PropertySymbol p && p.GetMethod is MethodSymbol getMethod)
                 {
                     var receiver = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
@@ -4619,6 +4663,7 @@ namespace Cnidaria.Cs
 
                 return base.RewriteIndexerAccessExpression(node);
             }
+            /// <summary>Lowers a property assignment while evaluating receiver and value once</summary>
             private BoundExpression LowerPropertyAssignment(
                 BoundAssignmentExpression node,
                 BoundMemberAccessExpression left,
@@ -4632,7 +4677,7 @@ namespace Cnidaria.Cs
                     left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt),
                     locals,
                     sideEffects);
-                // Ensure assigned value is evaluated once and is the result of the assignment expression
+                // Evaluate the assigned value once and return that same value
                 var rewrittenRight = RewriteExpression(node.Right);
 
                 var valueTemp = CreateTempLocal(node.Type);
@@ -4669,6 +4714,7 @@ namespace Cnidaria.Cs
                     or BoundThisExpression
                     or BoundBaseExpression;
 
+            /// <summary>Spills a receiver when repeated lvalue access would duplicate evaluation</summary>
             private BoundExpression? SpillReceiverForLValueAccess(
                 SyntaxNode syntax,
                 BoundExpression? receiver,
@@ -4712,6 +4758,7 @@ namespace Cnidaria.Cs
 
                 return new BoundLocalExpression(syntax, temp);
             }
+            /// <summary>Lowers increment or decrement while preserving one evaluation of the target</summary>
             private BoundExpression LowerIncrementDecrementWithSpill(
                 BoundIncrementDecrementExpression node,
                 BoundExpression rewrittenTarget)
@@ -5135,7 +5182,7 @@ namespace Cnidaria.Cs
                     return new BoundAssignmentExpression(node.Syntax, rewrittenLeft2, rewrittenValue);
                 }
 
-                //Fields
+                // Fields
                 return LowerCompoundAssignmentWithSpill(node, rewrittenLeft2);
             }
             private BoundExpression LowerSimpleDirectCompoundAssignment(
@@ -5152,6 +5199,7 @@ namespace Cnidaria.Cs
                     rewrittenLeft);
             }
 
+            /// <summary>Lowers compound assignment through a stable spilled lvalue</summary>
             private BoundExpression LowerDirectCompoundAssignmentWithSpill(
                 BoundCompoundAssignmentExpression node,
                 BoundExpression rewrittenLeft)
@@ -5260,7 +5308,7 @@ namespace Cnidaria.Cs
             }
             protected override BoundExpression RewriteNullCoalescingAssignmentExpression(BoundNullCoalescingAssignmentExpression node)
             {
-                // indexer
+                // Indexer target
                 if (node.Left is BoundIndexerAccessExpression leftIndexer &&
                     leftIndexer.Indexer.GetMethod is MethodSymbol indexerGet &&
                     leftIndexer.Indexer.SetMethod is MethodSymbol indexerSet)
@@ -5268,10 +5316,10 @@ namespace Cnidaria.Cs
                     return LowerIndexerNullCoalescingAssignment(node, leftIndexer, indexerGet, indexerSet);
                 }
 
-                // Property
+                // Property target
                 if (node.Left is BoundMemberAccessExpression { Member: PropertySymbol prop } leftProp)
                 {
-                    // Auto property => lower as backing field access (field-like)
+                    // Treat an auto property as its backing field
                     if (TryGetAutoPropertyBackingField(prop, out var backingField))
                     {
                         return LowerAutoPropertyNullCoalescingAssignment(node, leftProp, backingField);
@@ -5424,6 +5472,7 @@ namespace Cnidaria.Cs
 
                 return LowerNullCoalescingAssignmentCore(node, locals, sideEffects, readExpr: lvalue, lvalueForSet: lvalue);
             }
+            /// <summary>Builds the shared read, test, conditional write, and result sequence</summary>
             private BoundExpression LowerNullCoalescingAssignmentCore(
                 BoundNullCoalescingAssignmentExpression node,
                 ImmutableArray<LocalSymbol>.Builder locals,
@@ -5431,7 +5480,7 @@ namespace Cnidaria.Cs
                 BoundExpression readExpr,
                 BoundExpression lvalueForSet)
             {
-                // tmp = readExpr
+                // Read the target once
                 var tmp = CreateTempLocal(node.Type);
                 locals.Add(tmp);
 
@@ -5447,7 +5496,7 @@ namespace Cnidaria.Cs
                 var whenFalse = new BoundAssignmentExpression(
                     node.Syntax,
                     lvalueForSet,
-                    RewriteExpression(node.Value)); // RHS executed only on false branch
+                    RewriteExpression(node.Value)); // Evaluate the right side only when assignment is required
 
                 var s = (AssignmentExpressionSyntax)node.Syntax;
                 var condSyntax = new ConditionalExpressionSyntax(
@@ -5573,6 +5622,7 @@ namespace Cnidaria.Cs
                     sideEffects.ToImmutable(),
                     valueExpr);
             }
+            /// <summary>Preserves receiver and index evaluation across read-modify-write lowering</summary>
             private BoundExpression LowerCompoundAssignmentWithSpill(
                 BoundCompoundAssignmentExpression node,
                 BoundExpression rewrittenLeft)
@@ -5692,6 +5742,7 @@ namespace Cnidaria.Cs
                     sideEffectsBuilder.ToImmutable(),
                     assignment);
             }
+            /// <summary>Spills call operands while retaining a by-ref return as the assignable target</summary>
             private BoundCallExpression SpillByRefReturnCallLValue(
                 SyntaxNode syntax,
                 BoundCallExpression call,
@@ -6008,6 +6059,7 @@ namespace Cnidaria.Cs
                     sideEffects.ToImmutable(),
                     node.IsPostfix ? oldValueExpr! : assignedValueExpr);
             }
+            /// <summary>Evaluates an indexer receiver and arguments once in source order</summary>
             private void SpillIndexerReceiverAndArguments(
                 SyntaxNode syntax,
                 BoundExpression? receiver,
@@ -6076,6 +6128,7 @@ namespace Cnidaria.Cs
                 var replacer = new ReferenceReplacingRewriter(from, to);
                 return (BoundExpression)replacer.RewriteNode(root);
             }
+            /// <summary>Replaces one bound expression instance without structural matching</summary>
             private sealed class ReferenceReplacingRewriter : BoundTreeRewriter
             {
                 private readonly BoundExpression _from;
@@ -6095,11 +6148,12 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        /// <summary>Flattens lowered statement shapes and removes redundant control flow</summary>
         private sealed class CleanupRewriter : BoundTreeRewriterWithStackGuard
         {
             protected override BoundStatement RewriteStatementList(BoundStatementList node)
             {
-                // just in case
+                // Normalize nested statement lists before block cleanup
                 return RewriteBlockStatement(new BoundBlockStatement(node.Syntax, node.Statements));
             }
 
@@ -6136,7 +6190,7 @@ namespace Cnidaria.Cs
                     builder.Add(r);
                 }
 
-                // Remove jumps to the immediately following location
+                // Remove jumps whose target is the next executable location
                 for (int i = 0; i < builder.Count - 1; i++)
                 {
                     if (builder[i] is BoundGotoStatement g)
@@ -6220,7 +6274,7 @@ namespace Cnidaria.Cs
 
                 var value = RewriteExpression(node.Value);
 
-                // Merge nested sequences
+                // Merge nested sequences while preserving side effect order
                 if (value is BoundSequenceExpression inner)
                 {
                     var mergedLocals = Concat(locals, inner.Locals);
@@ -6241,6 +6295,7 @@ namespace Cnidaria.Cs
                 return node;
             }
 
+            /// <summary>Removes empty statements and flattens blocks that carry no local scope</summary>
             private static ImmutableArray<BoundStatement> FilterEmptyAndFlattenBlocks(
                 ImmutableArray<BoundStatement> statements,
                 ref bool changed)

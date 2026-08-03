@@ -2,15 +2,13 @@
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    // Invocation, overload resolution, argument binding, and object creation
     internal sealed partial class LocalScopeBinder : Binder
     {
+        // Bind arguments before dispatching by callable expression shape
         private BoundExpression BindInvocation(InvocationExpressionSyntax inv, BindingContext context, DiagnosticBag diagnostics)
         {
             var argSyntaxes = inv.ArgumentList.Arguments;
@@ -199,6 +197,7 @@ namespace Cnidaria.Cs
             return BindUnsupportedInvocation(inv, context, diagnostics);
         }
 
+        // Function pointer calls validate exact reference kinds before conversions
         private BoundExpression BindFunctionPointerInvocation(
             InvocationExpressionSyntax inv,
             BoundExpression receiver,
@@ -543,7 +542,7 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(inv);
                 }
 
-                // For instance methods, ReceiverOpt == null => implicit this 
+                // A null receiver represents implicit this for instance methods
                 return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
             }
         }
@@ -595,7 +594,7 @@ namespace Cnidaria.Cs
                 .Where(m => AccessibilityHelper.IsAccessible(m, context))
                 .ToImmutableArray();
 
-            if (methodFound && candidates.IsDefaultOrEmpty) // method exists but not accessible
+            if (methodFound && candidates.IsDefaultOrEmpty) // A matching method exists but is inaccessible
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_CALL_ACC002",
@@ -666,7 +665,7 @@ namespace Cnidaria.Cs
                 }
                 return new BoundBadExpression(inv);
             }
-            // extentions
+            // Extension methods
             if (receiverValue is not null)
             {
                 var extensionCandidates = LookupExtensionMethods(name, receiverValue, context);
@@ -719,6 +718,7 @@ namespace Cnidaria.Cs
 
             return new BoundBadExpression(inv);
         }
+        // Normalize static and instance receivers after a method candidate is selected
         private BoundExpression? PrepareReceiverForResolvedMemberCall(
             SyntaxNode syntax, BoundExpression? receiver, MethodSymbol method, BindingContext context)
         {
@@ -881,7 +881,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(inv);
             }
 
-            // For instance methods, ReceiverOpt == null => implicit this
+            // A null receiver represents implicit this for instance methods
             return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
         }
         private bool TryBindReceiverForMemberAccess(
@@ -1140,7 +1140,7 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, ma.Name.Span)));
                 return new BoundBadExpression(ma);
             }
-            // field
+            // Bind the selected field
             if (field is not null)
             {
                 if (valueKind == BindValueKind.LValue && field.IsConst)
@@ -1209,7 +1209,7 @@ namespace Cnidaria.Cs
                     isLValue: canWriteField,
                     constantValueOpt: cv);
             }
-            // property
+            // Bind the selected property
             if (prop is null)
                 return new BoundBadExpression(ma);
             bool canReadProperty =
@@ -1323,7 +1323,7 @@ namespace Cnidaria.Cs
             var imports = GetImports(context);
             var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
 
-            // using static X;
+            // Search statically imported types
             for (int i = 0; i < imports.StaticTypes.Length; i++)
             {
                 var t = imports.StaticTypes[i];
@@ -1331,7 +1331,7 @@ namespace Cnidaria.Cs
                     yield return t;
             }
 
-            // regular namespace/type imports
+            // Search imported namespace and type containers
             for (int i = 0; i < imports.Containers.Length; i++)
             {
                 switch (imports.Containers[i])
@@ -1352,7 +1352,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            // current enclosing type namespace
+            // Search the enclosing type namespace
             for (Symbol? s = context.ContainingSymbol; s is not null; s = s.ContainingSymbol)
             {
                 if (s is NamespaceSymbol curNs)
@@ -1365,6 +1365,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        // Extension lookup preserves import scope order before overload resolution
         private ImmutableArray<MethodSymbol> LookupExtensionMethods(
             string name,
             BoundExpression receiver,
@@ -1816,6 +1817,7 @@ namespace Cnidaria.Cs
             }
             return new BoundObjectCreationExpression(syntax, type, chosen!, convertedArgs);
         }
+        // Stabilize the created receiver before emitting initializer side effects
         private BoundExpression BindObjectCreationInitializer(
             ExpressionSyntax syntax,
             BoundExpression created,
@@ -2369,6 +2371,7 @@ namespace Cnidaria.Cs
                 prop.Type,
                 isLValue: canWriteProperty || allowCtorAutoPropWrite);
         }
+        // Infer method type arguments from the selected argument-to-parameter mapping
         private bool TryInferAndConstructGenericMethodCandidate(
             MethodSymbol candidate,
             ImmutableArray<BoundExpression> args,
@@ -2725,6 +2728,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // Rank applicable candidates after argument mapping, inference, and conversion analysis
         private bool TryResolveOverload(
             ImmutableArray<MethodSymbol> candidates,
             ImmutableArray<BoundExpression> args,
@@ -2832,14 +2836,14 @@ namespace Cnidaria.Cs
                 var m = candidates[i];
                 var ps = m.Parameters;
 
-                // Regular form
+                // Fixed-arity form
                 if (args.Length <= ps.Length)
                 {
                     if (TryScoreRegular(m, args, getArgRefKindKeyword, getArgName, context, out var scoredMethod, out int score, out var map))
                         ConsiderCandidate(scoredMethod, usesParamsExpansion: false, score, map, paramsElementArgIndices: null);
                 }
 
-                // Params expansion form
+                // Expanded params form
                 if (allowParamsExpansion && ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
                 {
                     int fixedCount = ps.Length - 1;
@@ -2847,7 +2851,7 @@ namespace Cnidaria.Cs
                     if (TryScoreParamsExpanded(m, args, fixedCount, getArgRefKindKeyword, getArgName,
                         context, out var scoredMethod, out int score, out var map, out var paramsElementArgIndices))
                     {
-                        // Penalize params expansion so that nonexpanded matches win when both are viable
+                        // Penalize params expansion so non-expanded matches win ties
                         score += 5;
                         ConsiderCandidate(scoredMethod, usesParamsExpansion: true, score, map, paramsElementArgIndices);
                     }
@@ -2920,7 +2924,7 @@ namespace Cnidaria.Cs
                 var paramsArrayType = (ArrayTypeSymbol)paramsParam.Type;
                 var elementType = paramsArrayType.ElementType;
 
-                // Figure out which arg supplies each fixed parameter
+                // Map arguments to fixed parameters
                 var fixedArgIndex = new int[fixedCount];
                 for (int p = 0; p < fixedCount; p++)
                     fixedArgIndex[p] = -1;
@@ -2932,7 +2936,7 @@ namespace Cnidaria.Cs
                         fixedArgIndex[p] = a;
                 }
 
-                // Fixed parameters
+                // Convert fixed arguments
                 for (int p = 0; p < fixedCount; p++)
                 {
                     int a = fixedArgIndex[p];
@@ -2960,7 +2964,7 @@ namespace Cnidaria.Cs
                 var arrLocal = NewTemp("<params$>", paramsArrayType);
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2 + elemCount);
 
-                // arr = new T[elemCount]
+                // Allocate the expanded params array
                 var countLit = new BoundLiteralExpression(diagnosticNode, int32Type, elemCount);
                 var newArr = new BoundArrayCreationExpression(diagnosticNode, paramsArrayType, elementType, countLit, initializerOpt: null);
 
@@ -2971,7 +2975,7 @@ namespace Cnidaria.Cs
                         new BoundLocalExpression(diagnosticNode, arrLocal),
                         newArr)));
 
-                // arr[i] = (T)arg
+                // Store each expanded argument
                 for (int i = 0; i < elemCount; i++)
                 {
                     int argIndex = paramElems[i];
@@ -3238,7 +3242,7 @@ namespace Cnidaria.Cs
                 map = new int[argCount];
                 assigned = new bool[parameters.Length];
 
-                // Fast path for purely positional
+                // Positional arguments need no remapping
                 if (getArgName is null)
                 {
                     for (int i = 0; i < argCount; i++)
@@ -3294,7 +3298,7 @@ namespace Cnidaria.Cs
                 paramsElementArgIndices = Array.Empty<int>();
                 int paramsIndex = parameters.Length - 1;
 
-                // Fast path for positional
+                // Positional arguments need no remapping
                 if (getArgName is null)
                 {
                     var elems = new int[Math.Max(0, argCount - fixedCount)];
@@ -3425,6 +3429,7 @@ namespace Cnidaria.Cs
                 _ => 10
             };
         }
+        // Operator overload resolution reuses the general candidate ranking pipeline
         private bool TryBindUserDefinedUnaryOperator(
             ExpressionSyntax operatorSyntax,
             ExpressionSyntax operandSyntax,

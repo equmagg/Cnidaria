@@ -61,6 +61,7 @@ namespace Cnidaria.C
         {
             private readonly ControlFlowGraph _controlFlowGraph;
             private readonly GimpleTree _tree;
+            private readonly FileScopeLinkageMap _fileScopeLinkage;
             private readonly ImmutableArray<SsaFunction> _ssaFunctions;
             private readonly TrimmingOptions _options;
             private readonly Dictionary<FunctionSymbol, List<GimpleFunctionDefinition>> _functionsBySymbol = new();
@@ -80,6 +81,7 @@ namespace Cnidaria.C
             {
                 _controlFlowGraph = controlFlowGraph;
                 _tree = controlFlowGraph.GimpleTree;
+                _fileScopeLinkage = FileScopeLinkageMap.Create(_tree.SemanticModel);
                 _ssaFunctions = ssaFunctions.IsDefault ? ImmutableArray<SsaFunction>.Empty : ssaFunctions;
                 _options = options;
             }
@@ -132,7 +134,7 @@ namespace Cnidaria.C
                     {
                         if (function.Symbol is null ||
                             _options.RootSymbols.Contains(function.Symbol.Name) ||
-                            (_options.PreserveExternallyVisibleSymbols && function.Symbol.StorageClass != StorageClass.Static))
+                            (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(function.Symbol)))
                         {
                             MarkFunction(function);
                         }
@@ -148,11 +150,14 @@ namespace Cnidaria.C
                         if (!IsObjectDeclaration(declaration))
                             continue;
 
-                        if (declaration.Symbol is null ||
-                            _options.RootSymbols.Contains(declaration.Symbol.Name) ||
-                            (_options.PreserveExternallyVisibleSymbols && declaration.StorageClass != StorageClass.Static))
+                        if (declaration.Symbol is null)
                         {
                             MarkGlobal(declaration);
+                        }
+                        else if (_options.RootSymbols.Contains(declaration.Symbol.Name) ||
+                            (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(declaration.Symbol)))
+                        {
+                            MarkGlobalsByName(declaration.Symbol.Name);
                         }
                     }
                 }
@@ -317,7 +322,11 @@ namespace Cnidaria.C
                     foreach (var global in globals)
                         MarkGlobal(global);
                     MarkGlobalsByName(symbol.Name);
+                    return;
                 }
+
+                if (symbol is VariableSymbol { StorageClass: StorageClass.Extern })
+                    MarkGlobalsByName(symbol.Name);
             }
 
             private void MarkByName(string name)
@@ -371,7 +380,6 @@ namespace Cnidaria.C
                             foreach (var declaration in global.Declarators)
                             {
                                 if (!IsObjectDeclaration(declaration) ||
-                                    declaration.StorageClass == StorageClass.Extern ||
                                     _liveGlobals.Contains(declaration))
                                 {
                                     declarators.Add(declaration);

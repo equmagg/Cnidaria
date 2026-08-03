@@ -5,6 +5,7 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    ///<summary>Builds a syntax tree from preprocessed tokens</summary>
     public sealed class Parser
     {
         private readonly Lexer _lexer;
@@ -21,9 +22,9 @@ namespace Cnidaria.C
 
         public IReadOnlyList<SyntaxDiagnostic> Diagnostics => _diagnostics;
         private SyntaxToken Current => Peek(0);
-        public static ParseResult Parse(
-            string text,
-            PreprocessorOptions? options = null)
+        ///<summary>Parses a translation unit</summary>
+        ///<remarks>Combines lexer and parser diagnostics</remarks>
+        public static ParseResult Parse(string text, PreprocessorOptions? options = null)
         {
             TypeNameTable typeNames = new TypeNameTable();
 
@@ -42,6 +43,8 @@ namespace Cnidaria.C
             return new ParseResult(root, diagnostics, typeNames);
         }
 
+        // Translation unit and declarations
+
         private TranslationUnitSyntax ParseTranslationUnit()
         {
             var members = ImmutableArray.CreateBuilder<SyntaxNode>();
@@ -52,6 +55,7 @@ namespace Cnidaria.C
 
                 members.Add(ParseExternalDeclaration());
 
+                // Recovery must consume input even after an incomplete declaration
                 if (_position == start)
                     members.Add(ParseSkippedExternalDeclaration());
             }
@@ -411,6 +415,8 @@ namespace Cnidaria.C
                 NextToken();
             }
         }
+
+        // Statements
 
         private CompoundStatementSyntax ParseCompoundStatement()
         {
@@ -846,6 +852,8 @@ namespace Cnidaria.C
             return new ExpressionStatementSyntax(expression, semicolon);
         }
 
+        // Expressions
+
         private ExpressionSyntax ParseExpression()
         {
             var expression = ParseAssignmentExpression();
@@ -1244,6 +1252,8 @@ namespace Cnidaria.C
             return tokens.ToImmutable();
         }
 
+        // Recovery and balanced token capture
+
         private SkippedExternalDeclarationSyntax ParseSkippedExternalDeclaration()
         {
             var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
@@ -1400,6 +1410,7 @@ namespace Cnidaria.C
             } while (depth > 0 && Current.Kind != SyntaxKind.EndOfFileToken);
         }
 
+        // Typedef classification is updated as soon as each declarator is complete
         private void DeclareDeclaratorName(DeclaratorSyntax declarator, bool isTypedefName)
         {
             var identifier = declarator.Identifier;
@@ -1415,6 +1426,8 @@ namespace Cnidaria.C
             else
                 _typeNames.DeclareOrdinaryIdentifier(text);
         }
+
+        // Token stream and missing token recovery
 
         private SyntaxToken Peek(int offset)
         {
@@ -1457,6 +1470,8 @@ namespace Cnidaria.C
         {
             _diagnostics.Add(SyntaxDiagnostic.Error(message, token.Span));
         }
+
+        // Grammar classification and precedence tables
 
         private static bool IsStaticAssertDeclarationStart(SyntaxKind kind)
         {
@@ -1601,6 +1616,7 @@ namespace Cnidaria.C
                    IsTypeNameStart(Peek(1));
         }
 
+        // The closing type parenthesis must be followed by an initializer brace
         private bool IsCompoundLiteralExpressionStart()
         {
             if (Current.Kind != SyntaxKind.OpenParenToken ||

@@ -1,14 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Contains the source namespace graph and syntax-to-symbol maps</summary>
     internal sealed class DeclarationResult
     {
         public NamespaceSymbol GlobalNamespace { get; }
@@ -22,6 +18,7 @@ namespace Cnidaria.Cs
             DeclaredSymbolsByTree = declaredSymbolsByTree;
         }
     }
+    /// <summary>Builds source declarations and required synthesized members</summary>
     internal sealed class DeclarationBuilder
     {
         private const string OpetatorPrefix = "op_";
@@ -37,6 +34,7 @@ namespace Cnidaria.Cs
         private SourceNamedTypeSymbol? _topLevelProgram;
         private MethodSymbol? _topLevelMain;
 
+        /// <summary>Gets the synthesized entry point for top-level statements</summary>
         public MethodSymbol? SynthesizedEntryPoint => _topLevelMain;
 
         public DeclarationBuilder(DiagnosticBag diagnostics, TypeManager types, bool isCoreLibrary)
@@ -46,6 +44,8 @@ namespace Cnidaria.Cs
             _isCoreLibrary = isCoreLibrary;
             _global = new SourceNamespaceSymbol(name: "", containing: null, isGlobal: true);
         }
+        /// <summary>Declares all source symbols and finalizes synthesized members</summary>
+        /// <remarks>Delegate bases are completed before constructors and type initializers are synthesized</remarks>
         public DeclarationResult Build(ImmutableArray<SyntaxTree> trees)
         {
             foreach (var tree in trees)
@@ -74,6 +74,7 @@ namespace Cnidaria.Cs
                 if (kv.Value is SourceNamedTypeSymbol s)
                     EnsureTypeInitializer(s);
         }
+        // A static field initializer requires a type initializer symbol even without explicit syntax
         private void EnsureTypeInitializer(SourceNamedTypeSymbol type)
         {
             var members = type.GetMembers();
@@ -128,6 +129,7 @@ namespace Cnidaria.Cs
 
             type.AddMember(cctor);
         }
+        // Constructor synthesis depends on type kind and existing instance constructors
         private void EnsureDefaultConstructor(SourceNamedTypeSymbol type)
         {
             if (type.TypeKind is not (TypeKind.Class or TypeKind.Struct))
@@ -155,7 +157,7 @@ namespace Cnidaria.Cs
                         parameters: ImmutableArray<ParameterSymbol>.Empty));
                 return;
             }
-            // struct
+            // Structs require a parameterless instance constructor symbol
             if (!hasParameterlessInstanceCtor)
                 type.AddMember(new SynthesizedConstructorSymbol(
                     containing: type,
@@ -194,6 +196,7 @@ namespace Cnidaria.Cs
             }
             return string.Join(".", parts);
         }
+        // Reuse predefined symbols while declaring core library types
         private bool TryMapSpecialType(Symbol container, string name, int arity, TypeKind declaredKind, out NamedTypeSymbol special)
         {
             special = null!;
@@ -292,10 +295,11 @@ namespace Cnidaria.Cs
                     return;
 
                 default:
-                    // unknown member kind
+                    // Ignore unsupported member syntax
                     return;
             }
         }
+        // Top-level statements share one synthesized program type and entry point
         private void DeclareTopLevelStatement(SyntaxTree tree, GlobalStatementSyntax gs, Symbol container)
         {
             if (container is not SourceNamespaceSymbol global || !global.IsGlobalNamespace)
@@ -320,12 +324,13 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            // Ensure Program exists and is the container for top level statements
+            // Create the shared top-level container on first use
             _topLevelProgram ??= GetOrCreateProgramType(tree, global, gs);
 
-            // Ensure synthesized entry method exists
+            // Create the synthesized entry point on first use
             _topLevelMain ??= GetOrCreateTopLevelMain(tree, _topLevelProgram, gs);
         }
+        /// <summary>Returns the shared synthesized container for top-level statements</summary>
         private SourceNamedTypeSymbol GetOrCreateProgramType(
             SyntaxTree tree, SourceNamespaceSymbol global, SyntaxNode locationNode)
         {
@@ -349,6 +354,7 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException("Cached Program type is not a SourceNamedTypeSymbol.");
         }
+        /// <summary>Returns the synthesized entry point for top-level statements</summary>
         private MethodSymbol GetOrCreateTopLevelMain(
             SyntaxTree tree, SourceNamedTypeSymbol programType, SyntaxNode locationNode)
         {
@@ -384,7 +390,7 @@ namespace Cnidaria.Cs
             var ns = GetOrCreateNamespacePath(tree, container, syntax.Name, syntax);
             RecordDeclared(tree, syntax, ns);
 
-            // declare nested members under this namespace
+            // Declare members under the containing namespace
             foreach (var member in syntax.Members)
                 DeclareMember(tree, member, ns);
         }
@@ -528,7 +534,7 @@ namespace Cnidaria.Cs
                 srcType.AddDeclaration(tree, syntax);
             RecordDeclared(tree, syntax, type);
 
-            // type parameters are declarations too
+            // Type parameters participate in declaration lookup
             if (typeParameterList != null)
             {
                 for (int i = 0; i < typeParameterList.Parameters.Count; i++)
@@ -585,6 +591,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        // Delegate base types are assigned after all source types are declared
         private void CompleteDelegateBaseTypes()
         {
             var delegateBase = GetDelegateBaseType();
@@ -620,6 +627,7 @@ namespace Cnidaria.Cs
             return _types.GetSpecialType(SpecialType.System_Object);
         }
 
+        /// <summary>Finds a top-level System type by name and arity</summary>
         internal static bool TryFindSystemType(NamespaceSymbol global, string name, int arity, out NamedTypeSymbol type)
         {
             type = null!;
@@ -721,6 +729,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // Delegate declarations receive constructor and Invoke symbols
         private void AddSynthesizedDelegateMembers(SyntaxTree tree, DelegateDeclarationSyntax syntax, SourceNamedTypeSymbol delegateType)
         {
             var voidType = _types.GetSpecialType(SpecialType.System_Void);
@@ -795,6 +804,7 @@ namespace Cnidaria.Cs
             }
             return false;
         }
+        /// <summary>Decodes accessibility modifiers and reports invalid combinations</summary>
         private Accessibility DecodeDeclaredAccessibility(
             SyntaxTokenList mods,
             Accessibility @default,
@@ -873,6 +883,78 @@ namespace Cnidaria.Cs
             }
 
             return @default;
+        }
+        private static bool HasAccessibilityModifier(SyntaxTokenList modifiers)
+            => HasModifier(modifiers, SyntaxKind.PublicKeyword) ||
+               HasModifier(modifiers, SyntaxKind.PrivateKeyword) ||
+               HasModifier(modifiers, SyntaxKind.ProtectedKeyword) ||
+               HasModifier(modifiers, SyntaxKind.InternalKeyword);
+
+        private Accessibility DecodeAccessorAccessibility(
+            SyntaxTree tree,
+            AccessorDeclarationSyntax accessor,
+            Accessibility propertyAccessibility,
+            bool hasGetAndSet,
+            ref bool hasAccessorAccessibility)
+        {
+            if (!HasAccessibilityModifier(accessor.Modifiers))
+                return propertyAccessibility;
+
+            var location = new Location(tree, accessor.Span);
+            var accessibility = DecodeDeclaredAccessibility(
+                accessor.Modifiers,
+                propertyAccessibility,
+                allowProtected: true,
+                allowInternal: true,
+                diagLocation: location);
+
+            if (!hasGetAndSet)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_ACC_ACCESSOR001",
+                    DiagnosticSeverity.Error,
+                    "An accessor modifier is only valid when the property or indexer has both accessors.",
+                    location));
+            }
+
+            if (hasAccessorAccessibility)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_ACC_ACCESSOR002",
+                    DiagnosticSeverity.Error,
+                    "Only one accessor may declare an accessibility modifier.",
+                    location));
+            }
+            hasAccessorAccessibility = true;
+
+            if (!IsMoreRestrictiveAccessibility(accessibility, propertyAccessibility))
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_ACC_ACCESSOR003",
+                    DiagnosticSeverity.Error,
+                    "The accessor accessibility must be more restrictive than the property or indexer accessibility.",
+                    location));
+            }
+
+            return accessibility;
+        }
+
+        private static bool IsMoreRestrictiveAccessibility(Accessibility accessor, Accessibility property)
+        {
+            if (accessor == property || accessor == Accessibility.NotApplicable)
+                return false;
+
+            return property switch
+            {
+                Accessibility.Public => accessor is Accessibility.Private or Accessibility.Protected or
+                    Accessibility.Internal or Accessibility.ProtectedOrInternal or Accessibility.ProtectedAndInternal,
+                Accessibility.ProtectedOrInternal => accessor is Accessibility.Private or Accessibility.Protected or
+                    Accessibility.Internal or Accessibility.ProtectedAndInternal,
+                Accessibility.Protected => accessor is Accessibility.Private or Accessibility.ProtectedAndInternal,
+                Accessibility.Internal => accessor is Accessibility.Private or Accessibility.ProtectedAndInternal,
+                Accessibility.ProtectedAndInternal => accessor == Accessibility.Private,
+                _ => false,
+            };
         }
         private static Accessibility GetDefaultTypeMemberAccessibility(NamedTypeSymbol container)
             => container.TypeKind == TypeKind.Interface
@@ -965,7 +1047,7 @@ namespace Cnidaria.Cs
                 isOverride = false;
                 isSealed = false;
             }
-            // placeholder types
+            // Signature types are bound in a later pass
             var placeholderReturn = new ErrorTypeSymbol("unbound-return", containing: null, ImmutableArray<Location>.Empty);
 
             var method = new SourceMethodSymbol(
@@ -986,7 +1068,7 @@ namespace Cnidaria.Cs
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);
             method.SetTypeParameters(tps);
-            // placeholder
+            // Parameter types are bound in a later pass
             var ps = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
             for (int i = 0; i < syntax.ParameterList.Parameters.Count; i++)
             {
@@ -1023,6 +1105,7 @@ namespace Cnidaria.Cs
                 || (HasModifier(p.Modifiers, SyntaxKind.RefKeyword)
                 && HasModifier(p.Modifiers, SyntaxKind.ReadOnlyKeyword));
         }
+        /// <summary>Maps parameter modifiers to their semantic reference kind</summary>
         internal static ParameterRefKind GetParameterRefKind(ParameterSyntax p)
         {
             if (HasModifier(p.Modifiers, SyntaxKind.RefKeyword)) return ParameterRefKind.Ref;
@@ -1457,6 +1540,7 @@ namespace Cnidaria.Cs
                             getAccessorSyntax ??= a;
                             break;
                         case SyntaxKind.SetAccessorDeclaration:
+                        case SyntaxKind.InitAccessorDeclaration:
                             hasSet = true;
                             setAccessorSyntax ??= a;
                             break;
@@ -1473,6 +1557,14 @@ namespace Cnidaria.Cs
                     location: new Location(tree, syntax.Span)));
                 return;
             }
+
+            bool hasAccessorAccessibility = false;
+            var getAccessibility = getAccessorSyntax is null
+                ? declaredAcc
+                : DecodeAccessorAccessibility(tree, getAccessorSyntax, declaredAcc, hasGet && hasSet, ref hasAccessorAccessibility);
+            var setAccessibility = setAccessorSyntax is null
+                ? declaredAcc
+                : DecodeAccessorAccessibility(tree, setAccessorSyntax, declaredAcc, hasGet && hasSet, ref hasAccessorAccessibility);
 
             var placeholderType = new ErrorTypeSymbol("unbound-indexer", containing: null, ImmutableArray<Location>.Empty);
 
@@ -1491,7 +1583,7 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: declaredAcc);
+                    declaredAccessibility: getAccessibility);
 
                 getMethod.AddDeclaration(new SyntaxReference(tree, (getAccessorSyntax ?? (SyntaxNode)syntax)));
 
@@ -1514,7 +1606,7 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: declaredAcc);
+                    declaredAccessibility: setAccessibility);
 
                 setMethod.AddDeclaration(new SyntaxReference(tree, (setAccessorSyntax ?? (SyntaxNode)syntax)));
 
@@ -1577,7 +1669,7 @@ namespace Cnidaria.Cs
                 getMethod.SetParameters(getParams.ToImmutable());
             }
 
-            // Setter parameters indexer parameters + implicit value
+            // Setter parameters append the implicit value parameter to indexer parameters
             if (setMethod is not null)
             {
                 var setParams = ImmutableArray.CreateBuilder<ParameterSymbol>(propParams.Count + 1);
@@ -1627,7 +1719,7 @@ namespace Cnidaria.Cs
 
             if (syntax.ExpressionBody is not null)
             {
-                // Expression bodied property
+                // Expression-bodied property
                 hasGet = true;
             }
             else if (syntax.AccessorList is not null)
@@ -1643,6 +1735,7 @@ namespace Cnidaria.Cs
                             getAccessorSyntax ??= a;
                             break;
                         case SyntaxKind.SetAccessorDeclaration:
+                        case SyntaxKind.InitAccessorDeclaration:
                             hasSet = true;
                             setAccessorSyntax ??= a;
                             break;
@@ -1658,6 +1751,14 @@ namespace Cnidaria.Cs
                     location: new Location(tree, syntax.Span)));
                 return;
             }
+            bool hasAccessorAccessibility = false;
+            var getAccessibility = getAccessorSyntax is null
+                ? declaredAcc
+                : DecodeAccessorAccessibility(tree, getAccessorSyntax, declaredAcc, hasGet && hasSet, ref hasAccessorAccessibility);
+            var setAccessibility = setAccessorSyntax is null
+                ? declaredAcc
+                : DecodeAccessorAccessibility(tree, setAccessorSyntax, declaredAcc, hasGet && hasSet, ref hasAccessorAccessibility);
+
             var placeholderType = new ErrorTypeSymbol("unbound-property", containing: null, ImmutableArray<Location>.Empty);
 
             SourceMethodSymbol? getMethod = null;
@@ -1675,7 +1776,7 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: declaredAcc);
+                    declaredAccessibility: getAccessibility);
 
                 getMethod.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
                 getMethod.AddDeclaration(new SyntaxReference(tree, (getAccessorSyntax ?? syntax as SyntaxNode)));
@@ -1699,7 +1800,7 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: declaredAcc);
+                    declaredAccessibility: setAccessibility);
 
                 // Implicit value parameter
                 var valueParam = new ParameterSymbol(
