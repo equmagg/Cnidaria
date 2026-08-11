@@ -99,11 +99,11 @@ SSA/VN-based optimizations we currently implement in order:
 - Copy propagation
 - Redundant Branch Optimization
 - Common Subexpression Elimination
+- Bounds coalescing
 - Assertion propagation
-- Constant/fact propagation
-- Constant folding
+- Range Analysis
+- Induction Variables
 - Dead Store Elimination
-- Strength reduction
 
 ---
 

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
@@ -311,10 +311,12 @@ namespace Cnidaria.Cs
                 case GenTreeKind.ArrayElementAddr:
                     sb.Append(source.Kind == GenTreeKind.ArrayElementAddr ? "arr_addr " : "arr_elem ");
                     AppendUses(sb, node);
+                    if (source.HasBoundsCheckIndexOverride) sb.Append(" bc=").Append(source.BoundsCheckIndexOverride);
                     return;
                 case GenTreeKind.StoreArrayElement:
                     sb.Append("st_elem ");
                     AppendUses(sb, node);
+                    if (source.HasBoundsCheckIndexOverride) sb.Append(" bc=").Append(source.BoundsCheckIndexOverride);
                     return;
                 case GenTreeKind.ArrayDataRef:
                     sb.Append("array_data_ref ");
@@ -324,8 +326,13 @@ namespace Cnidaria.Cs
                     sb.Append("static_data offset=").Append(source.Int32).Append(" length=").Append(source.Int64);
                     return;
                 case GenTreeKind.StackAlloc:
-                    sb.Append("stackalloc elemSize=").Append(source.Int32).Append(' ');
-                    AppendUses(sb, node);
+                    if (source.Operands.Length == 0)
+                        sb.Append("stackalloc bytes=").Append(source.Int64).Append(" elemSize=").Append(source.Int32);
+                    else
+                    {
+                        sb.Append("stackalloc elemSize=").Append(source.Int32).Append(' ');
+                        AppendUses(sb, node);
+                    }
                     return;
                 case GenTreeKind.PointerElementAddr:
                     sb.Append("ptr_elem_addr elemSize=").Append(source.Int32).Append(' ');

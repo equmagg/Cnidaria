@@ -1,4 +1,4 @@
-﻿using Cnidaria.C;
+using Cnidaria.C;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -884,7 +884,56 @@ namespace Cnidaria.Cs
 
                     case BytecodeOp.StackAlloc:
                         {
+                            if (ins.Operand0 <= 0)
+                                throw Fail(pc, ins.Op, "Invalid stack allocation element size.");
+
+                            if (ins.Operand1 == 1)
+                            {
+                                if (ins.Operand2 < 0 || ins.Operand2 >= uint.MaxValue)
+                                    throw Fail(pc, ins.Op, "Invalid constant stack allocation.");
+
+                                if (ins.Operand2 == 0)
+                                {
+                                    PushImportedValue(stack, statements, Node(GenTreeKind.ConstI4, pc, ins.Op, stackKind: GenStackKind.Ptr, int32: 0));
+                                    break;
+                                }
+
+                                PushImportedValue(stack, statements, Node(
+                                    GenTreeKind.StackAlloc,
+                                    pc,
+                                    ins.Op,
+                                    stackKind: GenStackKind.Ptr,
+                                    int32: ins.Operand0,
+                                    int64: ins.Operand2));
+                                break;
+                            }
+
+                            if (ins.Operand1 != 0)
+                                throw Fail(pc, ins.Op, "Invalid stack allocation encoding.");
+
                             var count = Pop(stack, pc, ins.Op);
+                            if (count.Node.Kind == GenTreeKind.ConstI4)
+                            {
+                                long byteCount = unchecked((long)(uint)count.Node.Int32 * ins.Operand0);
+                                if (byteCount == 0)
+                                {
+                                    PushImportedValue(stack, statements, Node(GenTreeKind.ConstI4, pc, ins.Op, stackKind: GenStackKind.Ptr, int32: 0));
+                                    break;
+                                }
+
+                                if (byteCount < uint.MaxValue)
+                                {
+                                    PushImportedValue(stack, statements, Node(
+                                        GenTreeKind.StackAlloc,
+                                        pc,
+                                        ins.Op,
+                                        stackKind: GenStackKind.Ptr,
+                                        int32: ins.Operand0,
+                                        int64: byteCount));
+                                    break;
+                                }
+                            }
+
                             PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ins.Op, stackKind: GenStackKind.Ptr, operands: One(count.Node), int32: ins.Operand0));
                             break;
                         }
@@ -2067,7 +2116,8 @@ namespace Cnidaria.Cs
                 convKind: node.ConvKind,
                 convFlags: node.ConvFlags,
                 targetPc: node.TargetPc,
-                targetBlockId: node.TargetBlockId);
+                targetBlockId: node.TargetBlockId,
+                boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
         }
 
         private bool DestinationMayBeExternallyAliased(GenTreeKind destinationAddressKind, int destinationIndex)
@@ -3540,7 +3590,7 @@ namespace Cnidaria.Cs
             {
                 return false;
             }
-                
+
             bool registeredActiveInline = _activeInlineMethods.Add(callee.MethodId);
             if (!registeredActiveInline)
                 return false;
@@ -4444,7 +4494,8 @@ namespace Cnidaria.Cs
                 convKind: node.ConvKind,
                 convFlags: node.ConvFlags,
                 targetPc: node.TargetPc,
-                targetBlockId: node.TargetBlockId);
+                targetBlockId: node.TargetBlockId,
+                boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
         }
 
         private StackValue LoadInlineArgFromContext(int index, int pc, BytecodeOp op)
@@ -5590,7 +5641,8 @@ namespace Cnidaria.Cs
             NumericConvKind convKind = default,
             NumericConvFlags convFlags = default,
             int targetPc = -1,
-            int targetBlockId = -1)
+            int targetBlockId = -1,
+            int boundsCheckIndexOverride = -1)
         {
             var actualOperands = operands.IsDefault ? ImmutableArray<GenTree>.Empty : operands;
             if (kind == GenTreeKind.Eval &&
@@ -5638,7 +5690,8 @@ namespace Cnidaria.Cs
                 convKind,
                 convFlags,
                 targetPc,
-                targetBlockId);
+                targetBlockId,
+                boundsCheckIndexOverride);
         }
 
         private static GenTree MarkExplicitInit(GenTree store)

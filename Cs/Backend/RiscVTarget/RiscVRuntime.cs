@@ -1,4 +1,4 @@
-﻿using Cnidaria.RiscV;
+using Cnidaria.RiscV;
 using System;
 using System.Collections.Concurrent;
 using System.IO;

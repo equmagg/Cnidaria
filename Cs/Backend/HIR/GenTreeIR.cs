@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
@@ -176,6 +176,12 @@ namespace Cnidaria.Cs
         HandlerEntry = 1 << 4,
         InTryRegion = 1 << 5,
         InHandlerRegion = 1 << 6,
+        LoopInvertedPreheader = 1 << 7,
+        LoopCloneFastPath = 1 << 8,
+        LoopCloneSlowPath = 1 << 9,
+        LoopCloneChoice = 1 << 10,
+        LoopCloneFastPreheader = 1 << 11,
+        LoopCloneSlowPreheader = 1 << 12,
     }
     internal enum GenTreeMethodPhase : byte
     {
@@ -927,6 +933,7 @@ namespace Cnidaria.Cs
         public ImmutableArray<SsaMemoryValueName> SsaMemoryDefinitions { get; internal set; } = ImmutableArray<SsaMemoryValueName>.Empty;
         public GenTreeLsraInfo LsraInfo { get; private set; } = GenTreeLsraInfo.Empty;
         public int CseNumber { get; internal set; }
+        public int BoundsCheckIndexOverride { get; private set; }
         public ImmutableArray<GenTreeInternalRegister> InternalRegisters => LsraInfo.InternalRegisters;
         public GenTreeLsraFlags LsraFlags => LsraInfo.Flags;
 
@@ -1020,8 +1027,17 @@ namespace Cnidaria.Cs
             NumericConvKind convKind = default,
             NumericConvFlags convFlags = default,
             int targetPc = -1,
-            int targetBlockId = -1)
+            int targetBlockId = -1,
+            int boundsCheckIndexOverride = -1)
         {
+            if (boundsCheckIndexOverride < -1)
+                throw new ArgumentOutOfRangeException(nameof(boundsCheckIndexOverride));
+            if (boundsCheckIndexOverride >= 0 &&
+                kind is not (GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement))
+            {
+                throw new ArgumentException("A bounds-check index override requires an array element operation.", nameof(boundsCheckIndexOverride));
+            }
+
             Id = id;
             Kind = kind;
             Pc = pc;
@@ -1040,7 +1056,19 @@ namespace Cnidaria.Cs
             ConvFlags = convFlags;
             TargetPc = targetPc;
             TargetBlockId = targetBlockId;
+            BoundsCheckIndexOverride = boundsCheckIndexOverride;
             ValueKey = GenTreeValueKey.ForTree(this);
+        }
+
+        public bool HasBoundsCheckIndexOverride => BoundsCheckIndexOverride >= 0;
+
+        internal void SetBoundsCheckIndexOverride(int index)
+        {
+            if (index < 0)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            if (Kind is not (GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement))
+                throw new InvalidOperationException("Only array element operations can own a bounds-check index override.");
+            BoundsCheckIndexOverride = index;
         }
 
         internal void SetOperands(ImmutableArray<GenTree> operands)
@@ -1483,12 +1511,13 @@ namespace Cnidaria.Cs
         public int Id { get; }
         public int StartPc { get; }
         public int EndPcExclusive { get; }
+        public int RegionPc { get; }
         public int EntryStackDepth { get; }
         public int ExitStackDepth { get; }
         public GenTreeBlockJumpKind JumpKind { get; }
         public GenTreeBlockFlags Flags { get; }
-        public ImmutableArray<GenTree> Statements { get; }
-        public ImmutableArray<ImmutableArray<GenTree>> StatementTreeLists { get; }
+        public ImmutableArray<GenTree> Statements { get; private set; }
+        public ImmutableArray<ImmutableArray<GenTree>> StatementTreeLists { get; private set; }
         public ImmutableArray<GenTree> LinearNodes { get; private set; }
         public GenTree? FirstNode { get; private set; }
         public GenTree? LastNode { get; private set; }
@@ -1505,11 +1534,13 @@ namespace Cnidaria.Cs
             GenTreeBlockFlags flags,
             ImmutableArray<GenTree> statements,
             ImmutableArray<int> successorBlockIds,
-            ImmutableArray<int> successorPcs)
+            ImmutableArray<int> successorPcs,
+            int regionPc = -1)
         {
             Id = id;
             StartPc = startPc;
             EndPcExclusive = endPcExclusive;
+            RegionPc = regionPc >= 0 ? regionPc : startPc;
             EntryStackDepth = entryStackDepth;
             ExitStackDepth = exitStackDepth;
             JumpKind = jumpKind;
@@ -1541,6 +1572,14 @@ namespace Cnidaria.Cs
             node.SetParent(parent);
             for (int i = 0; i < node.Operands.Length; i++)
                 NormalizeParent(node.Operands[i], node, seen);
+        }
+
+        internal void ReplaceStatementsPreservingFlow(ImmutableArray<GenTree> statements)
+        {
+            Statements = statements.IsDefault ? ImmutableArray<GenTree>.Empty : statements;
+            NormalizeParents(Statements);
+            StatementTreeLists = GenTreeTreeOrder.BuildStatements(Statements);
+            SetLinearNodes(GenTreeTreeOrder.Flatten(StatementTreeLists));
         }
 
         internal void SetLinearNodes(ImmutableArray<GenTree> nodes)

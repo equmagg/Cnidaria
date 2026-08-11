@@ -1,4 +1,4 @@
-﻿using Cnidaria.RiscV;
+using Cnidaria.RiscV;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -4238,9 +4238,34 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Stack allocation element size must be positive");
 
                     RVRegister destination = ToIntegerRegister(RequireResultRegister(node));
+
+                    if (node.Operands.Length == 0)
+                    {
+                        if (node.Int64 <= 0)
+                            throw Unsupported(node, "Constant stack allocation byte count must be positive");
+
+                        ulong byteCount = (ulong)node.Int64;
+                        ulong alignmentMask = (ulong)Target.CallFrameAlignment - 1;
+                        ulong alignedByteCount = (byteCount + alignmentMask) & ~alignmentMask;
+
+                        if (MachineTarget.Is32Bit && alignedByteCount > uint.MaxValue)
+                        {
+                            EmitStackAllocFailure();
+                            return;
+                        }
+
+                        _owner.EmitLoadImmediate(RVRegister.X31, unchecked((long)alignedByteCount));
+                        _owner.Emit(RVInstruction.R(RVInstrKind.Sub, RVRegister.X2, RVRegister.X2, RVRegister.X31));
+                        _owner.EmitMove(destination, RVRegister.X2);
+                        return;
+                    }
+
+                    if (node.Operands.Length != 1)
+                        throw Unsupported(node, "Stack allocation must have zero or one operand");
+
                     RVRegister count = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "stack allocation count"));
                     RVRegister allocationCount = count;
-                    RVRegister byteCount = RVRegister.X31;
+                    RVRegister byteCountRegister = RVRegister.X31;
 
                     if (MachineTarget.Is64Bit)
                     {
@@ -4255,7 +4280,7 @@ namespace Cnidaria.Cs
 
                     if (node.Int32 == 1)
                     {
-                        _owner.EmitMove(byteCount, allocationCount);
+                        _owner.EmitMove(byteCountRegister, allocationCount);
                     }
                     else if (BitOperations.IsPow2(node.Int32))
                     {
@@ -4268,14 +4293,14 @@ namespace Cnidaria.Cs
                             EmitStackAllocFailure();
                             _owner.DefineLabel(productFits);
                         }
-                        _owner.Emit(RVInstruction.I(RVInstrKind.Slli, byteCount, allocationCount, shift));
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Slli, byteCountRegister, allocationCount, shift));
                     }
                     else
                     {
                         if (!MachineTarget.HasM)
                             throw Unsupported(node, "Variable stack allocation requires the M extension for a non-power-of-two element size");
                         _owner.EmitLoadImmediate(RVRegister.X29, node.Int32);
-                        _owner.Emit(RVInstruction.R(RVInstrKind.Mul, byteCount, allocationCount, RVRegister.X29));
+                        _owner.Emit(RVInstruction.R(RVInstrKind.Mul, byteCountRegister, allocationCount, RVRegister.X29));
                         if (MachineTarget.Is32Bit)
                         {
                             string productFits = _owner.CreateLocalLabel(_methodLabel + "_stackalloc_product_fits");
@@ -4286,18 +4311,18 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    _owner.EmitMove(RVRegister.X29, byteCount);
-                    _owner.EmitAddImmediate(byteCount, byteCount, Target.CallFrameAlignment - 1);
+                    _owner.EmitMove(RVRegister.X29, byteCountRegister);
+                    _owner.EmitAddImmediate(byteCountRegister, byteCountRegister, Target.CallFrameAlignment - 1);
                     if (MachineTarget.Is32Bit)
                     {
                         string alignmentFits = _owner.CreateLocalLabel(_methodLabel + "_stackalloc_alignment_fits");
-                        _owner.Emit(RVInstruction.B(RVInstrKind.Bgeu, byteCount, RVRegister.X29, alignmentFits));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bgeu, byteCountRegister, RVRegister.X29, alignmentFits));
                         EmitStackAllocFailure();
                         _owner.DefineLabel(alignmentFits);
                     }
                     _owner.EmitLoadImmediate(RVRegister.X30, -Target.CallFrameAlignment);
-                    _owner.Emit(RVInstruction.R(RVInstrKind.And, byteCount, byteCount, RVRegister.X30));
-                    _owner.Emit(RVInstruction.R(RVInstrKind.Sub, RVRegister.X2, RVRegister.X2, byteCount));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, byteCountRegister, byteCountRegister, RVRegister.X30));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sub, RVRegister.X2, RVRegister.X2, byteCountRegister));
                     _owner.EmitMove(destination, RVRegister.X2);
                 }
 
@@ -6549,7 +6574,15 @@ namespace Cnidaria.Cs
                     {
                         EmitMemoryLoad(MachineRegister.X30, array, Target.ArrayLengthOffset, 4, signed: true);
                         string inRange = _owner.CreateLocalLabel(_methodLabel + "_array_index_in_range");
-                        EmitLongConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
+                        if (node.HasBoundsCheckIndexOverride)
+                        {
+                            _owner.EmitLoadImmediate(RVRegister.X31, node.BoundsCheckIndexOverride);
+                            EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X31, RVRegister.X30, inRange);
+                        }
+                        else
+                        {
+                            EmitLongConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
+                        }
                         EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
                         _owner.DefineLabel(inRange);
                     }
@@ -7772,11 +7805,7 @@ namespace Cnidaria.Cs
                     RegisterClass registerClass = floating ? RegisterClass.Float : RegisterClass.General;
                     if (IsAggregate(type, kind) || !CanMoveThroughRegister(registerClass, size))
                     {
-                        if (!destination.IsFrameSlot || !source.IsFrameSlot)
-                            throw new InvalidOperationException("Block-copy operands must be finalized frame slots.");
-                        _owner.EmitAddImmediate(RVRegister.X29, FrameBase(destination), EffectiveFrameOffset(destination));
-                        _owner.EmitAddImmediate(RVRegister.X28, FrameBase(source), EffectiveFrameOffset(source));
-                        EmitBlockCopy(null, RVRegister.X29, RVRegister.X28, size);
+                        EmitFrameToFrameCopy(destination, source, size);
                         return;
                     }
 
@@ -7784,6 +7813,106 @@ namespace Cnidaria.Cs
                     EmitLoad(scratch, source, type, kind);
                     EmitStore(destination, scratch, type, kind);
                 }
+
+                private void EmitFrameToFrameCopy(RegisterOperand destination, RegisterOperand source, int size)
+                {
+                    if (!destination.IsFrameSlot || !source.IsFrameSlot)
+                        throw new InvalidOperationException("Block-copy operands must be finalized frame slots.");
+                    if (size < 0)
+                        throw new InvalidOperationException("Block-copy size is negative.");
+                    if (size == 0 || destination.Equals(source))
+                        return;
+
+                    RVRegister destinationBase = FrameBase(destination);
+                    RVRegister sourceBase = FrameBase(source);
+                    int destinationOffset = EffectiveFrameOffset(destination);
+                    int sourceOffset = EffectiveFrameOffset(source);
+                    if (destinationBase == sourceBase && destinationOffset == sourceOffset)
+                        return;
+
+                    RVRegister scratch = SelectBlockCopyScratch(destinationBase, sourceBase);
+                    bool copyBackward = destinationBase == sourceBase &&
+                        destinationOffset > sourceOffset &&
+                        destinationOffset < checked(sourceOffset + size);
+
+                    if (copyBackward)
+                    {
+                        for (int endOffset = size; endOffset > 0;)
+                        {
+                            int chunk = BackwardFrameCopyChunk(endOffset, sourceOffset, destinationOffset);
+                            endOffset -= chunk;
+                            EmitMemoryLoad(
+                                (MachineRegister)(byte)scratch,
+                                sourceBase,
+                                checked(sourceOffset + endOffset),
+                                chunk,
+                                signed: false);
+                            EmitMemoryStore(
+                                (MachineRegister)(byte)scratch,
+                                destinationBase,
+                                checked(destinationOffset + endOffset),
+                                chunk);
+                        }
+                        return;
+                    }
+
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = ForwardFrameCopyChunk(size - offset, sourceOffset + offset, destinationOffset + offset);
+                        EmitMemoryLoad(
+                            (MachineRegister)(byte)scratch,
+                            sourceBase,
+                            checked(sourceOffset + offset),
+                            chunk,
+                            signed: false);
+                        EmitMemoryStore(
+                            (MachineRegister)(byte)scratch,
+                            destinationBase,
+                            checked(destinationOffset + offset),
+                            chunk);
+                        offset += chunk;
+                    }
+                }
+
+                private int ForwardFrameCopyChunk(int remaining, int sourceOffset, int destinationOffset)
+                {
+                    if (Target.GeneralRegisterSize >= 8 && remaining >= 8 &&
+                        IsNaturallyAligned(sourceOffset, 8) && IsNaturallyAligned(destinationOffset, 8))
+                    {
+                        return 8;
+                    }
+                    if (remaining >= 4 && IsNaturallyAligned(sourceOffset, 4) && IsNaturallyAligned(destinationOffset, 4))
+                        return 4;
+                    if (remaining >= 2 && IsNaturallyAligned(sourceOffset, 2) && IsNaturallyAligned(destinationOffset, 2))
+                        return 2;
+                    return 1;
+                }
+
+                private int BackwardFrameCopyChunk(int endOffset, int sourceOffset, int destinationOffset)
+                {
+                    if (Target.GeneralRegisterSize >= 8 && endOffset >= 8 &&
+                        IsNaturallyAligned(sourceOffset + endOffset - 8, 8) &&
+                        IsNaturallyAligned(destinationOffset + endOffset - 8, 8))
+                    {
+                        return 8;
+                    }
+                    if (endOffset >= 4 &&
+                        IsNaturallyAligned(sourceOffset + endOffset - 4, 4) &&
+                        IsNaturallyAligned(destinationOffset + endOffset - 4, 4))
+                    {
+                        return 4;
+                    }
+                    if (endOffset >= 2 &&
+                        IsNaturallyAligned(sourceOffset + endOffset - 2, 2) &&
+                        IsNaturallyAligned(destinationOffset + endOffset - 2, 2))
+                    {
+                        return 2;
+                    }
+                    return 1;
+                }
+
+                private static bool IsNaturallyAligned(int offset, int alignment)
+                    => (offset & (alignment - 1)) == 0;
 
                 private bool CanMoveThroughRegister(RegisterClass registerClass, int size)
                 {

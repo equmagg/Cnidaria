@@ -1,4 +1,4 @@
-﻿namespace Cnidaria.C
+namespace Cnidaria.C
 {
     public enum SyntaxKind : ushort
     {

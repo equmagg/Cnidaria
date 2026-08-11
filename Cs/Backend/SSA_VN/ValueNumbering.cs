@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
@@ -165,6 +165,7 @@ namespace Cnidaria.Cs
         DivideByZeroExc,
         IndexOutOfRangeExc,
         InvalidCastExc,
+        ArrayTypeMismatchExc,
         NewArrOverflowExc,
         HelperOpaqueExc,
 
@@ -695,6 +696,7 @@ namespace Cnidaria.Cs
                 ValueNumberFunction.ConvOverflowExc => 2,
                 ValueNumberFunction.IndexOutOfRangeExc => 2,
                 ValueNumberFunction.InvalidCastExc => 2,
+                ValueNumberFunction.ArrayTypeMismatchExc => 3,
                 _ => -1,
             };
 
@@ -958,6 +960,7 @@ namespace Cnidaria.Cs
                 or ValueNumberFunction.DivideByZeroExc
                 or ValueNumberFunction.IndexOutOfRangeExc
                 or ValueNumberFunction.InvalidCastExc
+                or ValueNumberFunction.ArrayTypeMismatchExc
                 or ValueNumberFunction.NewArrOverflowExc
                 or ValueNumberFunction.HelperOpaqueExc;
 
@@ -1401,12 +1404,19 @@ namespace Cnidaria.Cs
                 switch (function)
                 {
                     case ValueNumberFunction.Add:
+                        if (!integerLike)
+                            break;
+                        if (IsZero(args[0])) { folded = args[1]; return true; }
+                        if (IsZero(args[1])) { folded = args[0]; return true; }
+                        break;
                     case ValueNumberFunction.Or:
                         if (!integerLike)
                             break;
                         if (IsZero(args[0])) { folded = args[1]; return true; }
                         if (IsZero(args[1])) { folded = args[0]; return true; }
-                        if (args[0] == args[1] && function == ValueNumberFunction.Or) { folded = args[0]; return true; }
+                        if (IsAllBitsSet(args[0])) { folded = args[0]; return true; }
+                        if (IsAllBitsSet(args[1])) { folded = args[1]; return true; }
+                        if (args[0] == args[1]) { folded = args[0]; return true; }
                         break;
                     case ValueNumberFunction.Xor:
                         if (!integerLike)
@@ -1938,6 +1948,17 @@ namespace Cnidaria.Cs
         public bool TryGetSsaValue(SsaValueName name, out ValueNumberPair value) => SsaValues.TryGetValue(name, out value);
         public bool TryGetMemoryValue(SsaMemoryValueName name, out ValueNumber value) => MemoryValues.TryGetValue(name, out value);
         public bool TryGetTreeValue(GenTree tree, out ValueNumberPair value) => TreeValues.TryGetValue(tree, out value);
+
+        internal void SetTreeValue(GenTree tree, ValueNumberPair value)
+        {
+            if (TreeValues is Dictionary<GenTree, ValueNumberPair> treeValues)
+            {
+                treeValues[tree] = value;
+                return;
+            }
+
+            throw new InvalidOperationException("Tree value-number table is not mutable.");
+        }
     }
 
     internal static class SsaValueNumbering
@@ -3214,12 +3235,16 @@ namespace Cnidaria.Cs
 
             private ValueNumberPair StackAlloc(GenTree node, ImmutableArray<ValueNumberPair> operands)
             {
+                ImmutableArray<ValueNumber> args = operands.Length == 0
+                    ? ImmutableArray.Create(_store.VNForInt64(node.Int64), _store.VNForInt32(1))
+                    : ArgsFromPairs(operands).Add(_store.VNForInt32(node.Int32));
+
                 ValueNumber liberal = _store.VNForStableUnique(
                     node.Id,
                     node.StackKind,
                     node.Type,
                     ValueNumberFunction.StackAlloc,
-                    ArgsFromPairs(operands).Add(_store.VNForInt32(node.Int32)));
+                    args);
                 return node.CanThrow ? WithException(node, liberal) : ValueNumberPair.Same(liberal);
             }
 
@@ -3366,17 +3391,57 @@ namespace Cnidaria.Cs
                         if (operands.Length >= 2)
                         {
                             ValueNumber array = OperandNormal(operands, 0);
-                            ValueNumber index = OperandNormal(operands, 1);
-                            ValueNumber length = _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, array);
-                            result = AddException(result, ValueNumberFunction.NullPtrExc, array);
-                            result = AddException(result, ValueNumberFunction.IndexOutOfRangeExc, length, index);
+                            if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                                result = AddException(result, ValueNumberFunction.NullPtrExc, array);
+
+                            result = AddException(
+                                result,
+                                ValueNumberFunction.ArrayTypeMismatchExc,
+                                array,
+                                _store.VNForType(node.RuntimeType),
+                                _store.VNForInt32(node.Kind == GenTreeKind.ArrayElementAddr ? 1 : 0));
+
+                            if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                            {
+                                ValueNumber index = node.HasBoundsCheckIndexOverride
+                                    ? _store.VNForInt32(node.BoundsCheckIndexOverride)
+                                    : OperandNormal(operands, 1);
+                                ValueNumber length = _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, array);
+                                result = AddException(result, ValueNumberFunction.IndexOutOfRangeExc, length, index);
+                            }
+
+                            if (node.Kind == GenTreeKind.StoreArrayElement &&
+                                node.RuntimeType?.IsReferenceType == true &&
+                                operands.Length >= 3)
+                            {
+                                result = AddException(
+                                    result,
+                                    ValueNumberFunction.ArrayTypeMismatchExc,
+                                    array,
+                                    OperandNormal(operands, 2),
+                                    _store.VNForInt32(2));
+                            }
                         }
                         break;
 
                     case GenTreeKind.ArrayLength:
+                        if (operands.Length != 0 && (node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                            result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
+                        break;
+
                     case GenTreeKind.ArrayDataRef:
                         if (operands.Length != 0)
-                            result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
+                        {
+                            ValueNumber array = OperandNormal(operands, 0);
+                            if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                                result = AddException(result, ValueNumberFunction.NullPtrExc, array);
+                            result = AddException(
+                                result,
+                                ValueNumberFunction.ArrayTypeMismatchExc,
+                                array,
+                                _store.VNForInt32(0),
+                                _store.VNForInt32(3));
+                        }
                         break;
 
                     case GenTreeKind.NewArray:

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -762,7 +762,8 @@ namespace Cnidaria.Cs
                         oldBlock.Flags,
                         statements.ToImmutable(),
                         oldBlock.SuccessorBlockIds,
-                        oldBlock.SuccessorPcs));
+                        oldBlock.SuccessorPcs,
+                        oldBlock.RegionPc));
                 }
 
                 return _method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
@@ -797,7 +798,8 @@ namespace Cnidaria.Cs
                     convKind: node.ConvKind,
                     convFlags: node.ConvFlags,
                     targetPc: node.TargetPc,
-                    targetBlockId: node.TargetBlockId);
+                    targetBlockId: node.TargetBlockId,
+                    boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
                 clone.LocalDescriptor = node.LocalDescriptor;
                 clone.CseNumber = node.CseNumber;
                 return clone;
@@ -843,7 +845,8 @@ namespace Cnidaria.Cs
                     convKind: node.ConvKind,
                     convFlags: node.ConvFlags,
                     targetPc: node.TargetPc,
-                    targetBlockId: node.TargetBlockId);
+                    targetBlockId: node.TargetBlockId,
+                    boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
                 clone.LocalDescriptor = node.LocalDescriptor;
                 return clone;
             }

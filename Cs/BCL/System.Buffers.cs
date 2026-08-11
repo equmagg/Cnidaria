@@ -1,4 +1,4 @@
-﻿namespace System.Buffers
+namespace System.Buffers
 {
     public abstract class ArrayPool<T>
     {

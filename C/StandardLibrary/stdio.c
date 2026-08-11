@@ -1,4 +1,4 @@
-﻿#include <stddef.h>
+#include <stddef.h>
 #include <stdarg.h>
 
 #if defined(_WIN32) && defined(__x86_64__)

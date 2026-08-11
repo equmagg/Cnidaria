@@ -1,4 +1,4 @@
-﻿namespace System.Runtime.CompilerServices
+namespace System.Runtime.CompilerServices
 {
     public static class RuntimeHelpers
     {
@@ -244,6 +244,17 @@
             //ldarg .0
             //ret
             return ref source;
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void* AsPointer<T>(ref readonly T value)
+            where T : allows ref struct
+        {
+            throw new PlatformNotSupportedException();
+
+            // ldarg.0
+            // conv.u
+            // ret
         }
         [Intrinsic]
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

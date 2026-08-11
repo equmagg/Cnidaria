@@ -1,4 +1,4 @@
-﻿namespace System.Text
+namespace System.Text
 {
     public sealed class StringBuilder
     {

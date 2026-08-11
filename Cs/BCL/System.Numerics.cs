@@ -1,4 +1,4 @@
-﻿namespace System.Numerics
+namespace System.Numerics
 {
     public static class BitOperations
     {

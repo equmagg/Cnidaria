@@ -1,4 +1,4 @@
-﻿using Cnidaria.C;
+using Cnidaria.C;
 using Cnidaria.RiscV;
 using Cnidaria.X86;
 using System;
@@ -29,8 +29,12 @@ namespace Cnidaria.Cs
         public bool ValidateHir { get; set; } = true;
         public bool ValidateSsa { get; set; } = true;
         public bool EnablePhysicalPromotion { get; set; } = true;
+        public bool EnableLoopInversion { get; set; } = true;
+        public bool EnableLoopUnrolling { get; set; } = true;
 
         public PhysicalPromotionOptions PhysicalPromotionOptions { get; set; } = PhysicalPromotionOptions.Default;
+        public LoopInversionOptions LoopInversionOptions { get; set; } = LoopInversionOptions.Default;
+        public LoopUnrollingOptions LoopUnrollingOptions { get; set; } = LoopUnrollingOptions.Default;
         public SsaOptimizationOptions SsaOptimizationOptions { get; set; } = SsaOptimizationOptions.DefaultWithoutValidation;
         public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
         public RegisterAllocatorOptions? RegisterAllocatorOptions { get; set; }
@@ -289,6 +293,15 @@ namespace Cnidaria.Cs
                 {
                     ssaMethod = SsaOptimizer.OptimizeMethod(ssaMethod, options.SsaOptimizationOptions);
 
+                    if (options.SsaOptimizationOptions.EnableInductionVariableOptimization)
+                    {
+                        var inductionVariables = SsaInductionVariableOptimizer.OptimizeMethod(
+                            ssaMethod,
+                            options.SsaOptimizationOptions,
+                            options.ValidateSsa);
+                        ssaMethod = inductionVariables.Method;
+                    }
+
                     if (options.SsaOptimizationOptions.EnableDeadStoreRemoval)
                     {
                         var deadStores = SsaDeadStoreRemoval.Run(ssaMethod, validate: options.ValidateSsa);
@@ -353,6 +366,22 @@ namespace Cnidaria.Cs
             method = GenTreeMorpher.MorphMethod(method);
             method = GenTreeLocalRewriter.RewriteMethod(method);
 
+            if (options.EnablePhysicalPromotion)
+            {
+                var promotion = GenTreePhysicalPromoter.PromoteMethod(method, options.PhysicalPromotionOptions);
+                method = promotion.Method;
+                if (promotion.Changed)
+                    method = GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir);
+            }
+
+            method = GenTreeClassInitializationOptimizer.OptimizeMethod(method);
+
+            if (options.EnableLoopInversion)
+                method = GenTreeLoopInverter.InvertLoops(method, options.LoopInversionOptions);
+
+            if (options.EnableLoopUnrolling)
+                method = GenTreeLoopUnroller.UnrollLoops(method, options.LoopUnrollingOptions);
+
             if (options.SplitCriticalEdgesBeforeSsa)
             {
                 GenTreeMethod split;
@@ -374,16 +403,6 @@ namespace Cnidaria.Cs
                     method = GenTreeLocalRewriter.RewriteMethod(method);
                 }
             }
-
-            if (options.EnablePhysicalPromotion)
-            {
-                var promotion = GenTreePhysicalPromoter.PromoteMethod(method, options.PhysicalPromotionOptions);
-                method = promotion.Method;
-                if (promotion.Changed)
-                    method = GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir);
-            }
-
-            method = GenTreeClassInitializationOptimizer.OptimizeMethod(method);
 
             var cfg = ControlFlowGraph.Build(method);
             method.AttachFlowGraph(cfg);
@@ -412,10 +431,13 @@ namespace Cnidaria.Cs
             if (from.IsInHandlerRegion || to.IsInHandlerRegion || to.IsHandlerEntry)
                 return false;
 
-            if (to.IsInTryRegion)
+            if (!to.IsInTryRegion)
+                return true;
+
+            if (GenTreeCriticalEdgeSplitter.IsTryRegionEntry(cfg, edge.ToBlockId))
                 return false;
 
-            return true;
+            return GenTreeCriticalEdgeSplitter.SameEhRegion(from, to);
         }
 
         private static LinearRationalizationOptions CreateLirOptions(
@@ -485,7 +507,8 @@ namespace Cnidaria.Cs
                 entry.Flags,
                 statements.ToImmutable(),
                 entry.SuccessorBlockIds,
-                entry.SuccessorPcs);
+                entry.SuccessorPcs,
+                entry.RegionPc);
             return method.CloneWithBlocks(blocks.ToImmutableArray());
         }
     }
@@ -569,7 +592,8 @@ namespace Cnidaria.Cs
                         block.Flags,
                         rewritten.ToImmutable(),
                         block.SuccessorBlockIds,
-                        block.SuccessorPcs);
+                        block.SuccessorPcs,
+                        block.RegionPc);
                 }
 
                 var children = cfg.DominatorTreeChildren[blockId];
@@ -581,44 +605,119 @@ namespace Cnidaria.Cs
 
     internal static class GenTreeMorpher
     {
+        private const GenTreeFlags EffectMask =
+            GenTreeFlags.ContainsCall |
+            GenTreeFlags.CanThrow |
+            GenTreeFlags.SideEffect |
+            GenTreeFlags.MemoryRead |
+            GenTreeFlags.MemoryWrite |
+            GenTreeFlags.GlobalRef |
+            GenTreeFlags.Ordered;
+
         public static GenTreeMethod MorphMethod(GenTreeMethod method, GenTreeMethodPhase phase = GenTreeMethodPhase.MorphedHir)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
 
             var target = method.Target;
+            bool methodChanged = false;
+            var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length);
+
             for (int b = 0; b < method.Blocks.Length; b++)
             {
-                var statements = method.Blocks[b].Statements;
-                for (int s = 0; s < statements.Length; s++)
-                    NormalizeTreeFlags(statements[s], target);
+                var block = method.Blocks[b];
+                bool blockChanged = false;
+                var statements = ImmutableArray.CreateBuilder<GenTree>(block.Statements.Length);
+
+                for (int s = 0; s < block.Statements.Length; s++)
+                {
+                    GenTree statement = block.Statements[s];
+                    GenTree morphed = MorphTree(statement, target, ref blockChanged);
+                    morphed.SetParent(null);
+                    statements.Add(morphed);
+                }
+
+                if (blockChanged)
+                {
+                    methodChanged = true;
+                    blocks.Add(new GenTreeBlock(
+                        block.Id,
+                        block.StartPc,
+                        block.EndPcExclusive,
+                        block.EntryStackDepth,
+                        block.ExitStackDepth,
+                        block.JumpKind,
+                        block.Flags,
+                        statements.ToImmutable(),
+                        block.SuccessorBlockIds,
+                        block.SuccessorPcs,
+                        block.RegionPc));
+                }
+                else
+                {
+                    blocks.Add(block);
+                }
             }
+
+            if (methodChanged)
+                method = method.CloneWithBlocks(blocks.ToImmutable());
 
             method.SetPhase(phase);
             return method;
         }
 
+        private static GenTree MorphTree(GenTree tree, TargetInfo target, ref bool changed)
+        {
+            if (!tree.Operands.IsDefaultOrEmpty)
+            {
+                bool operandsChanged = false;
+                var operands = ImmutableArray.CreateBuilder<GenTree>(tree.Operands.Length);
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    GenTree original = tree.Operands[i];
+                    GenTree morphed = MorphTree(original, target, ref changed);
+                    operandsChanged |= !ReferenceEquals(original, morphed);
+                    operands.Add(morphed);
+                }
+
+                if (operandsChanged)
+                {
+                    tree.SetOperands(operands.ToImmutable());
+                    changed = true;
+                }
+            }
+
+            GenTree folded = MorphNode(tree, target);
+            if (!ReferenceEquals(folded, tree))
+            {
+                changed = true;
+                return folded;
+            }
+
+            return tree;
+        }
+
+        internal static GenTree MorphNode(GenTree node, TargetInfo target)
+        {
+            NormalizeNodeFlags(node, target);
+            return GenTreeFolder.Fold(node, target);
+        }
+
         internal static GenTreeFlags NormalizeTreeFlags(GenTree node, TargetInfo target)
         {
-            var flags = node.Flags & ~GenTreeFlags.CanThrow;
             for (int i = 0; i < node.Operands.Length; i++)
-            {
-                var childFlags = NormalizeTreeFlags(node.Operands[i], target);
-                if ((childFlags & GenTreeFlags.ContainsCall) != 0)
-                    flags |= GenTreeFlags.ContainsCall;
-                if ((childFlags & GenTreeFlags.CanThrow) != 0)
-                    flags |= GenTreeFlags.CanThrow;
-                if ((childFlags & GenTreeFlags.SideEffect) != 0)
-                    flags |= GenTreeFlags.SideEffect;
-                if ((childFlags & GenTreeFlags.MemoryRead) != 0)
-                    flags |= GenTreeFlags.MemoryRead;
-                if ((childFlags & GenTreeFlags.MemoryWrite) != 0)
-                    flags |= GenTreeFlags.MemoryWrite;
-                if ((childFlags & GenTreeFlags.GlobalRef) != 0)
-                    flags |= GenTreeFlags.GlobalRef;
-                if ((childFlags & GenTreeFlags.Ordered) != 0)
-                    flags |= GenTreeFlags.Ordered;
-            }
+                NormalizeTreeFlags(node.Operands[i], target);
+            return NormalizeNodeFlags(node, target);
+        }
+
+        private static GenTreeFlags NormalizeNodeFlags(GenTree node, TargetInfo target)
+        {
+            var flags = node.Flags & ~EffectMask;
+            for (int i = 0; i < node.Operands.Length; i++)
+                flags |= node.Operands[i].Flags & EffectMask;
+
+            if (SsaSlotHelpers.TryGetLocalFieldAccess(node, out var localFieldAccess))
+                return NormalizeLocalFieldFlags(node, localFieldAccess);
 
             switch (node.Kind)
             {
@@ -627,8 +726,11 @@ namespace Cnidaria.Cs
                 case GenTreeKind.IndirectCall:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
+                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
+                    break;
+
                 case GenTreeKind.NewObject:
-                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.NewDelegate:
@@ -636,12 +738,15 @@ namespace Cnidaria.Cs
                 case GenTreeKind.DelegateRemove:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
-                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.StaticData:
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
+                    break;
+
                 case GenTreeKind.StackAlloc:
-                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.Field:
@@ -653,7 +758,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.StaticField:
                 case GenTreeKind.StaticFieldAddr:
-                    flags |= GenTreeFlags.MemoryRead;
+                    flags |= GenTreeFlags.MemoryRead | GenTreeFlags.GlobalRef;
                     break;
 
                 case GenTreeKind.LoadIndirect:
@@ -676,32 +781,19 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.ArrayElement:
                 case GenTreeKind.ArrayElementAddr:
-                    flags |= GenTreeFlags.MemoryRead;
-                    if ((node.Flags & (GenTreeFlags.NullCheckEliminated | GenTreeFlags.BoundsCheckEliminated)) !=
-                        (GenTreeFlags.NullCheckEliminated | GenTreeFlags.BoundsCheckEliminated))
-                    {
-                        flags |= GenTreeFlags.CanThrow;
-                    }
-                    break;
-
                 case GenTreeKind.ArrayDataRef:
-                    flags |= GenTreeFlags.MemoryRead;
-                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
-                        flags |= GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.MemoryRead | GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.StoreLocal:
                 case GenTreeKind.StoreArg:
                 case GenTreeKind.StoreTemp:
-                    flags |= GenTreeFlags.LocalDef | GenTreeFlags.SideEffect;
+                    flags |= GenTreeFlags.LocalDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.Local:
                 case GenTreeKind.Arg:
                 case GenTreeKind.Temp:
-                    flags |= GenTreeFlags.LocalUse;
-                    break;
-
                 case GenTreeKind.LocalAddr:
                 case GenTreeKind.ArgAddr:
                 case GenTreeKind.TempAddr:
@@ -709,35 +801,36 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.StoreField:
-                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect;
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.StoreStaticField:
-                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.GlobalRef | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.StoreIndirect:
-                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect;
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.Ordered;
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
                 case GenTreeKind.StoreArrayElement:
-                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.Branch:
                 case GenTreeKind.BranchTrue:
                 case GenTreeKind.BranchFalse:
                 case GenTreeKind.Return:
+                case GenTreeKind.EndFinally:
+                    flags |= GenTreeFlags.ControlFlow | GenTreeFlags.Ordered;
+                    break;
+
                 case GenTreeKind.Throw:
                 case GenTreeKind.Rethrow:
-                case GenTreeKind.EndFinally:
-                    flags |= GenTreeFlags.ControlFlow;
-                    if (node.Kind is GenTreeKind.Throw or GenTreeKind.Rethrow)
-                        flags |= GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
                 case GenTreeKind.Binary:
@@ -760,6 +853,37 @@ namespace Cnidaria.Cs
                 (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) &&
                 !GenTreeArithmeticSemantics.DivRemCanThrow(node, target))
                 flags = ClearNodeOwnedCanThrow(flags, node.Operands);
+
+            node.Flags = flags;
+            return flags;
+        }
+
+        internal static GenTreeFlags NormalizeLocalFieldFlags(GenTree node, SsaLocalAccess localFieldAccess)
+        {
+            GenTreeFlags flags =
+                (node.Flags & GenTreeFlags.ExplicitInit) |
+                GenTreeFlags.NullCheckEliminated;
+            for (int i = 0; i < node.Operands.Length; i++)
+            {
+                flags |= node.Operands[i].Flags
+                    & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
+            }
+
+            flags |= GenTreeFlags.Indirect;
+
+            if (localFieldAccess.IsUse || localFieldAccess.IsPartialDefinition)
+                flags |= GenTreeFlags.LocalUse;
+
+            if (localFieldAccess.IsDefinition)
+            {
+                flags |= GenTreeFlags.LocalDef |
+                         GenTreeFlags.VarDef |
+                         GenTreeFlags.SideEffect |
+                         GenTreeFlags.Ordered;
+
+                if (localFieldAccess.IsPartialDefinition)
+                    flags |= GenTreeFlags.VarUseAsg;
+            }
 
             node.Flags = flags;
             return flags;
@@ -861,21 +985,7 @@ namespace Cnidaria.Cs
                 if (descriptor is not null)
                     descriptor.MarkPromotedStructParent();
 
-                GenTreeFlags flags = node.Flags & GenTreeFlags.ExplicitInit;
-                for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
-
-                flags |= GenTreeFlags.Indirect;
-                if (localFieldAccess.IsUse || localFieldAccess.IsPartialDefinition)
-                    flags |= GenTreeFlags.LocalUse;
-                if (localFieldAccess.IsDefinition)
-                {
-                    flags |= GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered;
-                    if (localFieldAccess.IsPartialDefinition)
-                        flags |= GenTreeFlags.VarUseAsg;
-                }
-
-                node.Flags = flags;
+                GenTreeMorpher.NormalizeLocalFieldFlags(node, localFieldAccess);
             }
         }
     }

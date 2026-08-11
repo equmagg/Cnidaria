@@ -1,4 +1,4 @@
-﻿using System.Runtime.CompilerServices;
+using System.Runtime.CompilerServices;
 
 namespace System
 {
@@ -10066,6 +10066,14 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
     public static class Console
     {
+        private static ReadOnlySpan<char> _trueString => ['T', 'r', 'u', 'e', '\0'];
+        private static ReadOnlySpan<char> _trueWithNewLineString => ['T', 'r', 'u', 'e', '\n', '\0'];
+        private static ReadOnlySpan<char> _falseString => ['F', 'a', 'l', 's', 'e', '\0'];
+        private static ReadOnlySpan<char> _falseWithNewLineString => ['F', 'a', 'l', 's', 'e', '\n', '\0'];
+        private static ReadOnlySpan<char> _intMinValueString => ['-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\0'];
+        private static ReadOnlySpan<char> _intMinValueWithNewLineString => ['-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\n', '\0'];
+        private static ReadOnlySpan<char> _longMinValueString => 
+            ['-','9','2','2','3','3','7','2','0','3', '6','8','5','4','7','7','5','8','0','8','\0'];
         public static void Write(sbyte value) { Write((int)value); }
         public static void Write(byte value) { Write((int)value); }
         public static void Write(short value) { Write((int)value); }
@@ -10077,7 +10085,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             if (value == unchecked((int)0x80000000)) //int.MinValue
             {
                 //-2147483648
-                _Write((char*)(stackalloc char[] { '-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _intMinValueString._reference));
                 return;
             }
             bool negative = value < 0;
@@ -10105,9 +10113,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             if (value == unchecked((long)0x8000000000000000)) // long.MinValue
             {
                 //-9223372036854775808
-                char* min = stackalloc char[] { '-','9','2','2','3','3','7','2','0','3',
-                                                '6','8','5','4','7','7','5','8','0','8','\0' };
-                _Write(min);
+                _Write((char*)Unsafe.AsPointer(in _longMinValueString._reference));
                 return;
             }
             bool negative = value < 0;
@@ -10159,9 +10165,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static unsafe void Write(bool value)
         {
             if (value)
-                _Write((char*)(stackalloc char[] { 'T', 'r', 'u', 'e', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _trueString._reference));
             else
-                _Write((char*)(stackalloc char[] { 'F', 'a', 'l', 's', 'e', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _falseString._reference));
         }
         public static unsafe void Write(char* value) { _Write(value); }
         public static void Write(ReadOnlySpan<char> value) { _Write(value); }
@@ -10181,7 +10187,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             if (value == unchecked((int)0x80000000)) //int.MinValue
             {
                 //-2147483648
-                _Write((char*)(stackalloc char[] { '-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\n', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _intMinValueWithNewLineString._reference));
                 return;
             }
             bool negative = value < 0;
@@ -10207,9 +10213,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public unsafe static void WriteLine(bool value)
         {
             if (value)
-                _Write((char*)(stackalloc char[] { 'T', 'r', 'u', 'e', '\n', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _trueWithNewLineString._reference));
             else
-                _Write((char*)(stackalloc char[] { 'F', 'a', 'l', 's', 'e', '\n', '\0' }));
+                _Write((char*)Unsafe.AsPointer(in _falseWithNewLineString._reference));
         }
         public unsafe static void WriteLine(float value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
         public unsafe static void WriteLine(double value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }

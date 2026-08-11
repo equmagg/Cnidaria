@@ -1,4 +1,4 @@
-﻿_start: 
+_start: 
     li sp, ${ZBOOT_ZS2_STACK_ADDRESS} # FSBL private stack, default 0x80010000
     li s0, ${ZBOOT_BLOCK_DEVICE_BASE} # ZS storage command block base
     # Load the SBI image from storage[0x00000000..0x00010000) to RAM at 0x80100000

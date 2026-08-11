@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
@@ -60,6 +60,9 @@ namespace Cnidaria.Cs
     {
         public readonly int Index;
         public readonly int Header;
+        public readonly ImmutableArray<CfgEdge> BackEdges;
+        public readonly ImmutableArray<CfgEdge> EntryEdges;
+        public readonly ImmutableArray<CfgEdge> ExitEdges;
         public readonly ImmutableArray<int> Latches;
         public readonly ImmutableArray<int> Blocks;
         public readonly ImmutableArray<int> Entries;
@@ -75,6 +78,9 @@ namespace Cnidaria.Cs
         public CfgLoop(
             int index,
             int header,
+            ImmutableArray<CfgEdge> backEdges,
+            ImmutableArray<CfgEdge> entryEdges,
+            ImmutableArray<CfgEdge> exitEdges,
             ImmutableArray<int> latches,
             ImmutableArray<int> blocks,
             ImmutableArray<int> entries,
@@ -89,6 +95,9 @@ namespace Cnidaria.Cs
         {
             Index = index;
             Header = header;
+            BackEdges = backEdges.IsDefault ? ImmutableArray<CfgEdge>.Empty : backEdges;
+            EntryEdges = entryEdges.IsDefault ? ImmutableArray<CfgEdge>.Empty : entryEdges;
+            ExitEdges = exitEdges.IsDefault ? ImmutableArray<CfgEdge>.Empty : exitEdges;
             Latches = latches.IsDefault ? ImmutableArray<int>.Empty : latches;
             Blocks = blocks.IsDefault ? ImmutableArray<int>.Empty : blocks;
             Entries = entries.IsDefault ? ImmutableArray<int>.Empty : entries;
@@ -282,14 +291,7 @@ namespace Cnidaria.Cs
                 pred[i] = new List<CfgEdge>();
             }
 
-            var blockByStartPc = new Dictionary<int, int>(n);
-            for (int i = 0; i < n; i++)
-            {
-                if (!blockByStartPc.ContainsKey(method.Blocks[i].StartPc))
-                    blockByStartPc.Add(method.Blocks[i].StartPc, method.Blocks[i].Id);
-            }
-
-            var exceptionRegions = BuildExceptionRegions(method, blockByStartPc);
+            var exceptionRegions = BuildExceptionRegions(method);
 
             for (int i = 0; i < n; i++)
             {
@@ -374,7 +376,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static ImmutableArray<CfgExceptionRegion> BuildExceptionRegions(GenTreeMethod method, IReadOnlyDictionary<int, int> blockByStartPc)
+        private static ImmutableArray<CfgExceptionRegion> BuildExceptionRegions(GenTreeMethod method)
         {
             if (method.Function.ExceptionHandlers.Length == 0)
                 return ImmutableArray<CfgExceptionRegion>.Empty;
@@ -383,9 +385,11 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.Function.ExceptionHandlers.Length; i++)
             {
                 var eh = method.Function.ExceptionHandlers[i];
-                if (!blockByStartPc.TryGetValue(eh.TryStartPc, out int tryStartBlock))
+                int tryStartBlock = FindBlockStart(method, eh.TryStartPc);
+                if (tryStartBlock < 0)
                     continue;
-                if (!blockByStartPc.TryGetValue(eh.HandlerStartPc, out int handlerStartBlock))
+                int handlerStartBlock = FindBlockStart(method, eh.HandlerStartPc);
+                if (handlerStartBlock < 0)
                     continue;
 
                 int tryEndBlock = FindBlockEndExclusive(method, eh.TryEndPc);
@@ -631,14 +635,30 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static int FindBlockEndExclusive(GenTreeMethod method, int endPc)
+        private static int FindBlockStart(GenTreeMethod method, int startPc)
         {
+            int exactStart = -1;
             for (int i = 0; i < method.Blocks.Length; i++)
             {
-                if (method.Blocks[i].StartPc >= endPc)
-                    return method.Blocks[i].Id;
+                var block = method.Blocks[i];
+                if (block.RegionPc == startPc)
+                    return block.Id;
+                if (exactStart < 0 && block.StartPc == startPc)
+                    exactStart = block.Id;
             }
-            return method.Blocks.Length;
+            return exactStart;
+        }
+
+        private static int FindBlockEndExclusive(GenTreeMethod method, int endPc)
+        {
+            int endExclusive = 0;
+            for (int i = 0; i < method.Blocks.Length; i++)
+            {
+                var block = method.Blocks[i];
+                if (block.RegionPc >= 0 && block.RegionPc < endPc)
+                    endExclusive = block.Id + 1;
+            }
+            return endExclusive;
         }
 
         private static int CompareEdges(CfgEdge x, CfgEdge y)
@@ -1032,6 +1052,7 @@ namespace Cnidaria.Cs
                         byHeader.Add(header, loop);
                     }
 
+                    loop.BackEdges.Add(edge);
                     loop.Latches.Add(latch);
                     AddNaturalLoopBody(blocks, header, latch, loop.Body);
                 }
@@ -1046,6 +1067,8 @@ namespace Cnidaria.Cs
                 var accumulator = pair.Value;
                 var body = ToImmutableSorted(accumulator.Body);
                 var latches = ToImmutableSorted(accumulator.Latches);
+                var entryEdges = new HashSet<CfgEdge>();
+                var exitEdges = new HashSet<CfgEdge>();
                 var entryBlocks = new SortedSet<int>();
                 var exitBlocks = new SortedSet<int>();
                 var exitDestinations = new SortedSet<int>();
@@ -1068,6 +1091,7 @@ namespace Cnidaria.Cs
 
                         if (!accumulator.Body.Contains(pred.FromBlockId))
                         {
+                            entryEdges.Add(pred);
                             entryBlocks.Add(blockId);
                             if (blockId != accumulator.Header)
                                 reducible = false;
@@ -1084,6 +1108,7 @@ namespace Cnidaria.Cs
                         bool succInLoop = accumulator.Body.Contains(succ.ToBlockId);
                         if (!succInLoop)
                         {
+                            exitEdges.Add(succ);
                             exitBlocks.Add(blockId);
                             exitDestinations.Add(succ.ToBlockId);
                         }
@@ -1099,6 +1124,9 @@ namespace Cnidaria.Cs
 
                 loops.Add(new LoopShape(
                     accumulator.Header,
+                    ToImmutableSorted(accumulator.BackEdges),
+                    ToImmutableSorted(entryEdges),
+                    ToImmutableSorted(exitEdges),
                     latches,
                     body,
                     ToImmutableSorted(entryBlocks),
@@ -1153,6 +1181,9 @@ namespace Cnidaria.Cs
                 result.Add(new CfgLoop(
                     i,
                     loop.Header,
+                    loop.BackEdges,
+                    loop.EntryEdges,
+                    loop.ExitEdges,
                     loop.Latches,
                     loop.Body,
                     loop.EntryBlocks,
@@ -1172,6 +1203,7 @@ namespace Cnidaria.Cs
         private sealed class LoopAccumulator
         {
             public readonly int Header;
+            public readonly HashSet<CfgEdge> BackEdges = new();
             public readonly SortedSet<int> Latches = new();
             public readonly SortedSet<int> Body = new();
 
@@ -1185,6 +1217,9 @@ namespace Cnidaria.Cs
         private readonly struct LoopShape
         {
             public readonly int Header;
+            public readonly ImmutableArray<CfgEdge> BackEdges;
+            public readonly ImmutableArray<CfgEdge> EntryEdges;
+            public readonly ImmutableArray<CfgEdge> ExitEdges;
             public readonly ImmutableArray<int> Latches;
             public readonly ImmutableArray<int> Body;
             public readonly ImmutableArray<int> EntryBlocks;
@@ -1197,6 +1232,9 @@ namespace Cnidaria.Cs
 
             public LoopShape(
                 int header,
+                ImmutableArray<CfgEdge> backEdges,
+                ImmutableArray<CfgEdge> entryEdges,
+                ImmutableArray<CfgEdge> exitEdges,
                 ImmutableArray<int> latches,
                 ImmutableArray<int> body,
                 ImmutableArray<int> entryBlocks,
@@ -1208,6 +1246,9 @@ namespace Cnidaria.Cs
                 bool headerHasExceptionalSuccessorInsideLoop)
             {
                 Header = header;
+                BackEdges = backEdges;
+                EntryEdges = entryEdges;
+                ExitEdges = exitEdges;
                 Latches = latches;
                 Body = body;
                 EntryBlocks = entryBlocks;
@@ -1250,6 +1291,23 @@ namespace Cnidaria.Cs
                         stack.Push(pred);
                 }
             }
+        }
+
+        private static ImmutableArray<CfgEdge> ToImmutableSorted(IEnumerable<CfgEdge> values)
+        {
+            var builder = ImmutableArray.CreateBuilder<CfgEdge>();
+            builder.AddRange(values);
+            builder.Sort(static (left, right) =>
+            {
+                int c = left.FromBlockId.CompareTo(right.FromBlockId);
+                if (c != 0) return c;
+                c = left.ToBlockId.CompareTo(right.ToBlockId);
+                if (c != 0) return c;
+                c = left.Kind.CompareTo(right.Kind);
+                if (c != 0) return c;
+                return left.HandlerIndex.CompareTo(right.HandlerIndex);
+            });
+            return builder.ToImmutable();
         }
 
         private static ImmutableArray<int> ToImmutableSorted(SortedSet<int> values)

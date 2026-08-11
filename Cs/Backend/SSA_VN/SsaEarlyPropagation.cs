@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -21,7 +21,7 @@ namespace Cnidaria.Cs
                 return method;
 
             var rewritten = method.GenTreeMethod.CloneWithBlocks(blocks);
-            NormalizeTreeFlags(rewritten);
+            rewritten = GenTreeMorpher.MorphMethod(rewritten, GenTreeMethodPhase.GlobalMorphedHir);
 
             bool includeExceptionEdges = HasExceptionEdges(method.Cfg);
             var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
@@ -31,16 +31,6 @@ namespace Cnidaria.Cs
             rewritten.AttachHirLiveness(liveness);
 
             return GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate);
-        }
-
-        private static void NormalizeTreeFlags(GenTreeMethod method)
-        {
-            for (int blockIndex = 0; blockIndex < method.Blocks.Length; blockIndex++)
-            {
-                var statements = method.Blocks[blockIndex].Statements;
-                for (int statementIndex = 0; statementIndex < statements.Length; statementIndex++)
-                    GenTreeMorpher.NormalizeTreeFlags(statements[statementIndex], method.Target);
-            }
         }
 
         private static bool HasExceptionEdges(ControlFlowGraph cfg)
@@ -112,7 +102,8 @@ namespace Cnidaria.Cs
                             block.Flags,
                             statements.ToImmutable(),
                             block.SuccessorBlockIds,
-                            block.SuccessorPcs));
+                            block.SuccessorPcs,
+                            block.RegionPc));
                     }
                     else
                     {
@@ -492,7 +483,8 @@ namespace Cnidaria.Cs
                     source.ConvKind,
                     source.ConvFlags,
                     source.TargetPc,
-                    source.TargetBlockId);
+                    source.TargetBlockId,
+                    source.BoundsCheckIndexOverride);
             }
         }
     }

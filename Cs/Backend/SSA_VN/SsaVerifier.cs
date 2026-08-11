@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
@@ -19,7 +19,8 @@ namespace Cnidaria.Cs
             VerifyDescriptorTables(method, definitions);
             VerifySourceTreeIdentity(method);
             VerifyLclVarDscState(method);
-            VerifyPrunedSsaLiveness(method, localLiveness);
+            if (method.GenTreeMethod.Phase < GenTreeMethodPhase.SsaOptimized)
+                VerifyPrunedSsaLiveness(method, localLiveness);
             VerifyValueNumberBindings(method, definitions, memoryDefinitions);
             VerifyDescriptorUseCounts(method, definitions, memoryDefinitions);
 

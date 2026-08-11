@@ -1,4 +1,4 @@
-﻿#include <stddef.h>
+#include <stddef.h>
 
 void* memcpy(void* restrict destination, const void* restrict source, size_t count)
 {

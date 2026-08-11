@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -116,7 +116,7 @@ namespace Cnidaria.Cs
 
         // Pointers
         StaticData,  // operand0: static data blob offset, operand1: byte length, stack: -> unmanaged ptr
-        StackAlloc,  // operand0: elementSize
+        StackAlloc,  // operand0: elementSize, operand1: constant-size marker, operand2: constant byte count
         PtrElemAddr, // operand0: elementSize
         PtrToByRef,  // stack: ptr -> byref
         // Typed indirect
@@ -2478,6 +2478,19 @@ namespace Cnidaria.Cs
                         }
                     }
 
+                    // Unsafe.AsPointer<T>(ref readonly T value)
+                    if (def.Name == "AsPointer" && ps.Length == 1 &&
+                        ps[0].Type is ByRefTypeSymbol)
+                    {
+                        EmitExpression(call.Arguments[0], EmitMode.Value);
+                        EmitIntrinsicConv(NumericConvKind.NativeUInt);
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
+                    }
+
                     // Unsafe.ReadUnaligned<T>(scoped ref readonly byte source)
                     if (def.Name == "ReadUnaligned" && ps.Length == 1 &&
                         ps[0].Type is ByRefTypeSymbol br0 &&
@@ -3056,11 +3069,26 @@ namespace Cnidaria.Cs
             /// <summary>Allocates stack storage and writes initializer elements in order</summary>
             private void EmitStackAlloc(BoundStackAllocArrayCreationExpression sa, EmitMode mode)
             {
-                // count -> StackAlloc(elementSize)
-                EmitExpression(sa.Count, EmitMode.Value);
-
                 int size = GetElementSizeOrThrow(sa.ElementType);
-                _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
+                if (sa.Count.ConstantValueOpt.HasValue && sa.Count.ConstantValueOpt.Value is int constantCount)
+                {
+                    long byteCount = unchecked((long)(uint)constantCount * size);
+                    if (byteCount < uint.MaxValue)
+                    {
+                        _il.Emit(BytecodeOp.StackAlloc, operand0: size, operand1: 1, operand2: byteCount, pop: 0, push: 1);
+                    }
+                    else
+                    {
+                        EmitExpression(sa.Count, EmitMode.Value);
+                        _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
+                    }
+                }
+                else
+                {
+                    EmitExpression(sa.Count, EmitMode.Value);
+                    _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
+                }
+
                 int elemTok = _tokens.GetTypeToken(sa.ElementType);
                 if (sa.InitializerOpt is not null)
                 {
@@ -3305,10 +3333,17 @@ namespace Cnidaria.Cs
 
                             if (ma.ReceiverOpt.Type.IsValueType)
                             {
-                                if (!IsAddressableValueTypeReceiver(ma.ReceiverOpt))
-                                    throw new InvalidOperationException("Cannot take ref to a field of a non-lvalue value-type receiver.");
-
-                                EmitLoadAddressOfLValue(ma.ReceiverOpt);
+                                if (IsAddressableValueTypeReceiver(ma.ReceiverOpt))
+                                {
+                                    EmitLoadAddressOfLValue(ma.ReceiverOpt);
+                                }
+                                else
+                                {
+                                    int spill = AllocateSpillLocal(ma.ReceiverOpt.Type);
+                                    EmitExpression(ma.ReceiverOpt, EmitMode.Value);
+                                    _il.Emit(BytecodeOp.Stloc, operand0: spill, pop: 1, push: 0);
+                                    _il.Emit(BytecodeOp.Ldloca, operand0: spill, pop: 0, push: 1);
+                                }
                             }
                             else
                             {

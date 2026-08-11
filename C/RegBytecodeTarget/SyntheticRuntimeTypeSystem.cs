@@ -1,4 +1,4 @@
-﻿using Cnidaria.Cs;
+using Cnidaria.Cs;
 using System;
 using System.Collections.Generic;
 using System.Reflection;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -111,7 +111,8 @@ namespace Cnidaria.Cs
                         block.Flags,
                         statements.ToImmutable(),
                         block.SuccessorBlockIds,
-                        block.SuccessorPcs));
+                        block.SuccessorPcs,
+                        block.RegionPc));
                 }
 
                 if (!changed)
@@ -619,7 +620,8 @@ namespace Cnidaria.Cs
                     convKind: node.ConvKind,
                     convFlags: node.ConvFlags,
                     targetPc: node.TargetPc,
-                    targetBlockId: node.TargetBlockId);
+                    targetBlockId: node.TargetBlockId,
+                    boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
 
                 if (node.LocalDescriptor is not null)
                     AttachDescriptor(clone, node.LocalDescriptor);

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
@@ -990,7 +990,12 @@ namespace Cnidaria.Cs
                             break;
 
                         case BytecodeOp.StackAlloc:
-                            ExecStackAlloc(ins.Operand0);
+                            if (ins.Operand1 == 0)
+                                ExecStackAlloc(ins.Operand0);
+                            else if (ins.Operand1 == 1)
+                                ExecStackAllocConstant(ins.Operand2, ins.Operand0);
+                            else
+                                throw new InvalidOperationException("Bad stackalloc encoding.");
                             break;
 
                         case BytecodeOp.PtrToByRef:
@@ -3221,7 +3226,29 @@ namespace Cnidaria.Cs
             int count = PopSlot().AsI4Checked();
             if (count < 0) throw new InvalidOperationException("Negative stackalloc size.");
 
-            int bytes = checked(count * elemSize);
+            ExecStackAllocBytes(checked(count * elemSize), elemSize);
+        }
+
+        private void ExecStackAllocConstant(long byteCount, int elemSize)
+        {
+            if (byteCount == 0)
+            {
+                if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
+                PushSlot(new Slot(SlotKind.Ptr, 0, aux: elemSize));
+                return;
+            }
+
+            if ((ulong)byteCount > int.MaxValue)
+                throw new InvalidOperationException("Stack overflow (stackalloc).");
+
+            ExecStackAllocBytes((int)byteCount, elemSize);
+        }
+
+        private void ExecStackAllocBytes(int bytes, int elemSize)
+        {
+            if (bytes < 0) throw new InvalidOperationException("Negative stackalloc size.");
+            if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
+
             int align = AlignForSize(elemSize);
 
             int baseAbs = ReadI32(_frameBase + 60);

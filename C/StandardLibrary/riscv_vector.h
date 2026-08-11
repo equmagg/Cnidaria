@@ -1,4 +1,4 @@
-﻿#ifndef __RISCV_VECTOR_H
+#ifndef __RISCV_VECTOR_H
 #define __RISCV_VECTOR_H
 
 #include <stddef.h>

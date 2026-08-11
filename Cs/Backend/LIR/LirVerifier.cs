@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
@@ -514,6 +514,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < ssa.ValueDefinitions.Length; i++)
                 declaredSsaValues.Add(ssa.ValueDefinitions[i].Name);
 
+            var materializedSsaValues = new HashSet<GenTreeValueKey>();
             for (int i = 0; i < method.Values.Length; i++)
             {
                 var key = method.Values[i].Value;
@@ -523,6 +524,8 @@ namespace Cnidaria.Cs
                 var name = new SsaValueName(key.SsaSlot, key.SsaVersion);
                 if (!declaredSsaValues.Contains(name))
                     throw new InvalidOperationException("linear IR contains SSA value " + name + " that is not declared by the SSA side table.");
+
+                materializedSsaValues.Add(key);
             }
 
             var expectedPhiCopies = new Dictionary<(int from, int to, GenTreeValueKey source, GenTreeValueKey destination), int>();
@@ -533,6 +536,9 @@ namespace Cnidaria.Cs
                 {
                     var phi = block.Phis[p];
                     var destination = GenTreeValueKey.ForSsaValue(phi.Target);
+                    if (!materializedSsaValues.Contains(destination))
+                        continue;
+
                     for (int i = 0; i < phi.Inputs.Length; i++)
                     {
                         var input = phi.Inputs[i];

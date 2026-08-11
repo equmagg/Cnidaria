@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -60,7 +60,7 @@ namespace Cnidaria.C
         {
             var reservedGeneral = target.Architecture switch
             {
-                TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X4, MachineRegister.X5),
+                TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2),
                 TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
                 TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
                 _ => ImmutableHashSet<MachineRegister>.Empty,

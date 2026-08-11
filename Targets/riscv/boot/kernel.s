@@ -1,4 +1,4 @@
-﻿_start:
+_start:
     j kernel_boot_start
 
 kernel_enter_user:

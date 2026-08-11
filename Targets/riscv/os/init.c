@@ -1,4 +1,4 @@
-﻿int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv, char** envp)
 {
     char* autorun_argv[2];
     char* shell_argv[2];

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -60,7 +60,6 @@ namespace Cnidaria.C
         private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options)
         {
             var reservedGeneral = ImmutableHashSet.CreateBuilder<MachineRegister>();
-            reservedGeneral.UnionWith(TargetRegisterInfo.IntegerArgumentRegisters(target));
             if (target.Architecture == TargetArchitectureKind.Arm64)
             {
                 reservedGeneral.UnionWith(new[]

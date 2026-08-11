@@ -1,4 +1,4 @@
-﻿using Cnidaria.X86;
+using Cnidaria.X86;
 using System;
 using System.Collections.Concurrent;
 using System.IO;

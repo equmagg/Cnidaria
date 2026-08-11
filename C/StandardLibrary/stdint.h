@@ -1,4 +1,4 @@
-﻿#ifndef _STDINT_H
+#ifndef _STDINT_H
 #define _STDINT_H
 
 typedef signed char int8_t;

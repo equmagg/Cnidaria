@@ -1,4 +1,4 @@
-﻿using Cnidaria.X86;
+using Cnidaria.X86;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -2361,6 +2361,8 @@ namespace Cnidaria.Cs
                 private readonly string[] _blockLabels;
                 private readonly string[] _blockEndLabels;
                 private readonly Dictionary<int, int> _nodePositions;
+                private readonly Dictionary<(int Offset, int Length), string> _staticDataLabels =
+                    new Dictionary<(int Offset, int Length), string>();
                 private readonly EhMethodDraft? _ehMethod;
                 private readonly string _returnThunkLabel;
                 private int _nextBlockId = -1;
@@ -3380,6 +3382,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.StackAlloc:
                             EmitStackAlloc(node);
                             return;
+                        case GenTreeKind.StaticData:
+                            EmitStaticData(node);
+                            return;
                         case GenTreeKind.CastClass:
                             EmitRuntimeTypeCheck(node, throwOnFailure: true);
                             return;
@@ -3437,6 +3442,48 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Stack allocation element size must be positive");
 
                     X86Register destination = ToX86Register(RequireResultRegister(node), Target);
+
+                    if (node.Operands.Length == 0)
+                    {
+                        if (node.Int64 <= 0)
+                            throw Unsupported(node, "Constant stack allocation byte count must be positive");
+
+                        ulong byteCount = (ulong)node.Int64;
+                        ulong alignmentMask = (ulong)Target.CallFrameAlignment - 1;
+                        ulong alignedByteCount = (byteCount + alignmentMask) & ~alignmentMask;
+
+                        if (Target.Is32Bit && alignedByteCount > uint.MaxValue)
+                        {
+                            EmitStackAllocFailure();
+                            return;
+                        }
+
+                        if (alignedByteCount <= int.MaxValue)
+                        {
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Sub,
+                                Reg(X86Register.Rsp, Target.PointerSize),
+                                Imm((long)alignedByteCount)));
+                        }
+                        else
+                        {
+                            EmitIntegerConstant(RequireResultRegister(node), (long)alignedByteCount, Target.PointerSize);
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Sub,
+                                Reg(X86Register.Rsp, Target.PointerSize),
+                                Reg(destination, Target.PointerSize)));
+                        }
+
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(destination, Target.PointerSize),
+                            Reg(X86Register.Rsp, Target.PointerSize)));
+                        return;
+                    }
+
+                    if (node.Operands.Length != 1)
+                        throw Unsupported(node, "Stack allocation must have zero or one operand");
+
                     X86Register count = ToX86Register(RequireUseRegister(node, 0), Target);
                     string nonNegative = _owner.CreateLocalLabel($"{_methodLabel}_stackalloc_nonnegative");
 
@@ -3726,6 +3773,44 @@ namespace Cnidaria.Cs
                         size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd,
                         Reg(ToX86Register(destination, Target), size),
                         _owner.SymbolMemory(label, 0, size)));
+                }
+
+                private void EmitStaticData(GenTree node)
+                {
+                    MachineRegister result = RequireResultRegister(node);
+                    if (MachineRegisters.GetClass(result) != RegisterClass.General)
+                        throw Unsupported(node, "static data address result is not in an integer register");
+
+                    int sourceOffset = node.Int32;
+                    int sourceLength;
+                    try
+                    {
+                        sourceLength = checked((int)node.Int64);
+                    }
+                    catch (OverflowException)
+                    {
+                        throw Unsupported(node, "static data length does not fit a native image blob");
+                    }
+
+                    ImmutableArray<byte> staticData = _method.Function.StaticDataBlob;
+                    if (sourceOffset < 0 || sourceLength < 0 || sourceOffset > staticData.Length || sourceLength > staticData.Length - sourceOffset)
+                        throw Unsupported(node, "invalid static data blob range");
+
+                    if (sourceLength == 0)
+                    {
+                        EmitZeroRegister(result);
+                        return;
+                    }
+
+                    var key = (sourceOffset, sourceLength);
+                    if (!_staticDataLabels.TryGetValue(key, out string? label))
+                    {
+                        byte[] bytes = staticData.AsSpan().Slice(sourceOffset, sourceLength).ToArray();
+                        label = _owner.AddConstantData(bytes, 8, $"static_data_M{_method.RuntimeMethod.MethodId}");
+                        _staticDataLabels.Add(key, label);
+                    }
+
+                    _owner.EmitLea(ToX86Register(result, Target), label);
                 }
 
                 private void EmitLocalLike(GenTree node)
@@ -4214,18 +4299,7 @@ namespace Cnidaria.Cs
                         EmitNullCheck(node, array, "array");
 
                     if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
-                    {
-                        string inRange = _owner.CreateLocalLabel($"{_methodLabel}_array_index_in_range_{node.LinearId}");
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Cmp,
-                            Reg(index, 4),
-                            Mem(array, Target.ArrayLengthOffset, 4)));
-                        _owner.Emit(X86Instruction.ConditionalBranch(
-                            X86Condition.B,
-                            X86Operand.SymbolOperand(inRange, 4, X86ObjectRelocationKind.Relative32)));
-                        EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
-                        _owner.DefineLabel(inRange);
-                    }
+                        EmitArrayBoundsCheck(node, array, index);
 
                     int elementSize = ArrayElementSize(elementType);
                     if (elementSize <= 0)
@@ -4272,18 +4346,7 @@ namespace Cnidaria.Cs
                         EmitNullCheck(node, array, "array");
 
                     if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
-                    {
-                        string inRange = _owner.CreateLocalLabel($"{_methodLabel}_array_index_in_range_{node.LinearId}");
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Cmp,
-                            Reg(index, 4),
-                            Mem(array, Target.ArrayLengthOffset, 4)));
-                        _owner.Emit(X86Instruction.ConditionalBranch(
-                            X86Condition.B,
-                            X86Operand.SymbolOperand(inRange, 4, X86ObjectRelocationKind.Relative32)));
-                        EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
-                        _owner.DefineLabel(inRange);
-                    }
+                        EmitArrayBoundsCheck(node, array, index);
 
                     int elementSize = ArrayElementSize(elementType);
                     if (elementSize is not (1 or 2 or 4 or 8))
@@ -4294,6 +4357,34 @@ namespace Cnidaria.Cs
                         size == 0 ? elementSize : size,
                         index,
                         elementSize);
+                }
+
+                private void EmitArrayBoundsCheck(GenTree node, X86Register array, X86Register index)
+                {
+                    string inRange = _owner.CreateLocalLabel($"{_methodLabel}_array_index_in_range_{node.LinearId}");
+                    if (node.HasBoundsCheckIndexOverride)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Cmp,
+                            Mem(array, Target.ArrayLengthOffset, 4),
+                            Imm(node.BoundsCheckIndexOverride)));
+                        _owner.Emit(X86Instruction.ConditionalBranch(
+                            X86Condition.A,
+                            X86Operand.SymbolOperand(inRange, 4, X86ObjectRelocationKind.Relative32)));
+                    }
+                    else
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Cmp,
+                            Reg(index, 4),
+                            Mem(array, Target.ArrayLengthOffset, 4)));
+                        _owner.Emit(X86Instruction.ConditionalBranch(
+                            X86Condition.B,
+                            X86Operand.SymbolOperand(inRange, 4, X86ObjectRelocationKind.Relative32)));
+                    }
+
+                    EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
+                    _owner.DefineLabel(inRange);
                 }
 
                 private void EmitArrayElementTypeCheck(

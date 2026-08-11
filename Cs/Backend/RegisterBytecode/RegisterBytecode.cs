@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
@@ -1821,6 +1821,20 @@ namespace Cnidaria.Cs
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
                     return;
                 case Op.StackAlloc:
+                    RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    if (inst.Rs1 != RegisterVmIsa.InvalidRegister)
+                    {
+                        RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
+                    }
+                    else
+                    {
+                        int elementSize = checked((int)(inst.Imm >> 32));
+                        uint byteCount = unchecked((uint)inst.Imm);
+                        if (elementSize <= 0 || byteCount == 0)
+                            throw new InvalidOperationException($"Invalid constant stack allocation encoding at PC {pc}");
+                    }
+                    return;
+
                 case Op.ByRefToPtr:
                 case Op.PtrToByRef:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
@@ -3541,7 +3555,12 @@ namespace Cnidaria.Cs
                 return $"{FormatRegister(inst.Rd)}, blobOffset={(int)(inst.Imm >> 32)}, length={unchecked((int)(uint)inst.Imm)}";
 
             if (inst.Op == Op.StackAlloc)
+            {
+                if (inst.Rs1 == RegisterVmIsa.InvalidRegister)
+                    return $"{FormatRegister(inst.Rd)}, bytes={unchecked((uint)inst.Imm)}, elemSize={(int)(inst.Imm >> 32)}";
+
                 return $"{FormatRegister(inst.Rd)}, count={FormatRegister(inst.Rs1)}, elemSize={inst.Imm}";
+            }
 
             if (IsPointerOp(inst.Op))
                 return FormatPointerOperands(inst);

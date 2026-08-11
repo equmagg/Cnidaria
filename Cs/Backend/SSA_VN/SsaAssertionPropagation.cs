@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -140,15 +140,59 @@ namespace Cnidaria.Cs
             };
     }
 
+    internal sealed class SsaAssertionFacts
+    {
+        private readonly ImmutableArray<SsaAssertionDescriptor> _assertions;
+        private readonly ImmutableArray<ImmutableArray<int>> _blockIn;
+        private readonly IReadOnlyDictionary<CfgEdge, ImmutableArray<int>> _edgeOut;
+        private readonly IReadOnlyDictionary<GenTree, ImmutableArray<int>> _generatedAfter;
+
+        public static SsaAssertionFacts Empty { get; } = new SsaAssertionFacts(
+            ImmutableArray<SsaAssertionDescriptor>.Empty,
+            ImmutableArray<ImmutableArray<int>>.Empty,
+            new Dictionary<CfgEdge, ImmutableArray<int>>(),
+            new Dictionary<GenTree, ImmutableArray<int>>(ReferenceEqualityComparer<GenTree>.Instance));
+
+        public SsaAssertionFacts(
+            ImmutableArray<SsaAssertionDescriptor> assertions,
+            ImmutableArray<ImmutableArray<int>> blockIn,
+            IReadOnlyDictionary<CfgEdge, ImmutableArray<int>> edgeOut,
+            IReadOnlyDictionary<GenTree, ImmutableArray<int>> generatedAfter)
+        {
+            _assertions = assertions.IsDefault ? ImmutableArray<SsaAssertionDescriptor>.Empty : assertions;
+            _blockIn = blockIn.IsDefault ? ImmutableArray<ImmutableArray<int>>.Empty : blockIn;
+            _edgeOut = edgeOut ?? throw new ArgumentNullException(nameof(edgeOut));
+            _generatedAfter = generatedAfter ?? throw new ArgumentNullException(nameof(generatedAfter));
+        }
+
+        public int Count => _assertions.Length;
+
+        public SsaAssertionDescriptor GetAssertion(int index)
+        {
+            if ((uint)(index - 1) >= (uint)_assertions.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            return _assertions[index - 1];
+        }
+
+        public ImmutableArray<int> GetBlockIn(int blockId)
+            => (uint)blockId < (uint)_blockIn.Length ? _blockIn[blockId] : ImmutableArray<int>.Empty;
+
+        public ImmutableArray<int> GetEdgeOut(CfgEdge edge)
+            => _edgeOut.TryGetValue(edge, out var assertions) ? assertions : ImmutableArray<int>.Empty;
+
+        public ImmutableArray<int> GetGeneratedAfter(GenTree tree)
+            => _generatedAfter.TryGetValue(tree, out var assertions) ? assertions : ImmutableArray<int>.Empty;
+    }
+
     internal sealed class SsaAssertionPropagationResult
     {
-        public ImmutableArray<SsaBlock> Blocks { get; }
+        public SsaMethod Method { get; }
         public bool Changed { get; }
         public int NextSyntheticTreeId { get; }
 
-        public SsaAssertionPropagationResult(ImmutableArray<SsaBlock> blocks, bool changed, int nextSyntheticTreeId)
+        public SsaAssertionPropagationResult(SsaMethod method, bool changed, int nextSyntheticTreeId)
         {
-            Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
+            Method = method ?? throw new ArgumentNullException(nameof(method));
             Changed = changed;
             NextSyntheticTreeId = nextSyntheticTreeId;
         }
@@ -158,14 +202,35 @@ namespace Cnidaria.Cs
     {
         public static SsaAssertionPropagationResult OptimizeMethod(
             SsaMethod method,
-            int nextSyntheticTreeId)
+            int nextSyntheticTreeId,
+            bool validate)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
             if (method.ValueNumbers is null || method.Blocks.IsDefaultOrEmpty)
-                return new SsaAssertionPropagationResult(method.Blocks, changed: false, nextSyntheticTreeId);
+                return new SsaAssertionPropagationResult(method, changed: false, nextSyntheticTreeId);
 
-            return new Propagator(method, nextSyntheticTreeId).Run();
+            var rewrite = new Propagator(method, nextSyntheticTreeId).RunWithValueNumberFolding();
+            nextSyntheticTreeId = Math.Max(nextSyntheticTreeId, rewrite.NextSyntheticTreeId);
+            if (!rewrite.Changed)
+                return new SsaAssertionPropagationResult(method, changed: false, nextSyntheticTreeId);
+
+            method = SsaGenTreeRewriter.WithBlocksPreservingSsa(
+                method,
+                rewrite.Blocks,
+                rewrite.TreeValueUpdates,
+                validate);
+            return new SsaAssertionPropagationResult(method, changed: true, nextSyntheticTreeId);
+        }
+
+        public static SsaAssertionFacts AnalyzeMethod(SsaMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            if (method.ValueNumbers is null || method.Blocks.IsDefaultOrEmpty)
+                return SsaAssertionFacts.Empty;
+
+            return new Propagator(method, nextSyntheticTreeId: 0).Analyze();
         }
 
         private enum AssertionValueKind : byte
@@ -264,6 +329,9 @@ namespace Cnidaria.Cs
                     throw new ArgumentOutOfRangeException(nameof(index));
                 return _entries[index - 1];
             }
+
+            public ImmutableArray<SsaAssertionDescriptor> ToImmutableArray()
+                => _entries.ToImmutableArray();
         }
 
         private sealed class AssertionSet : IEquatable<AssertionSet>
@@ -355,6 +423,9 @@ namespace Cnidaria.Cs
                 return hash;
             }
 
+            public ImmutableArray<int> ToImmutableArray()
+                => ImmutableArray.CreateRange(Enumerate());
+
             public IEnumerable<int> Enumerate()
             {
                 for (int wordIndex = 0; wordIndex < _words.Length; wordIndex++)
@@ -370,15 +441,36 @@ namespace Cnidaria.Cs
             }
         }
 
+        private readonly struct RewriteResult
+        {
+            public readonly ImmutableArray<SsaBlock> Blocks;
+            public readonly IReadOnlyDictionary<GenTree, ValueNumberPair> TreeValueUpdates;
+            public readonly bool Changed;
+            public readonly int NextSyntheticTreeId;
+
+            public RewriteResult(
+                ImmutableArray<SsaBlock> blocks,
+                IReadOnlyDictionary<GenTree, ValueNumberPair> treeValueUpdates,
+                bool changed,
+                int nextSyntheticTreeId)
+            {
+                Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
+                TreeValueUpdates = treeValueUpdates ?? throw new ArgumentNullException(nameof(treeValueUpdates));
+                Changed = changed;
+                NextSyntheticTreeId = nextSyntheticTreeId;
+            }
+        }
+
         private sealed class Propagator
         {
-            private readonly SsaMethod _method;
+            private SsaMethod _method;
             private readonly SsaValueNumberingResult _valueNumbers;
             private readonly ValueNumberStore _store;
             private readonly AssertionTable _table;
             private readonly Dictionary<GenTree, List<int>> _generatedAfter = new(ReferenceEqualityComparer<GenTree>.Instance);
             private readonly Dictionary<CfgEdge, List<int>> _generatedOnEdge = new();
             private readonly Dictionary<ValueNumber, SsaPhi> _phiByValueNumber = new();
+            private readonly Dictionary<GenTree, ValueNumberPair> _treeValueUpdates = new(ReferenceEqualityComparer<GenTree>.Instance);
             private AssertionSet[] _blockIn = Array.Empty<AssertionSet>();
             private Dictionary<CfgEdge, AssertionSet> _edgeOut = new();
             private int _nextSyntheticTreeId;
@@ -413,11 +505,59 @@ namespace Cnidaria.Cs
                 }
             }
 
-            public SsaAssertionPropagationResult Run()
+            public RewriteResult RunWithValueNumberFolding()
+            {
+                var vnFold = RewriteValueNumbersBeforeAssertionGeneration();
+                if (vnFold.Changed)
+                    _method = WithBlocksForPropagation(_method, vnFold.Blocks);
+
+                GenerateAssertions();
+                ComputeDataflow();
+                var assertionRewrite = Rewrite();
+                return new RewriteResult(
+                    assertionRewrite.Blocks,
+                    _treeValueUpdates,
+                    vnFold.Changed || assertionRewrite.Changed,
+                    _nextSyntheticTreeId);
+            }
+
+            public SsaAssertionFacts Analyze()
             {
                 GenerateAssertions();
                 ComputeDataflow();
-                return Rewrite();
+                return BuildFacts();
+            }
+
+            private static SsaMethod WithBlocksForPropagation(SsaMethod method, ImmutableArray<SsaBlock> blocks)
+                => new SsaMethod(
+                    method.GenTreeMethod,
+                    method.Cfg,
+                    method.Slots,
+                    method.InitialValues,
+                    method.ValueDefinitions,
+                    blocks,
+                    method.ValueNumbers,
+                    method.SsaLocalDescriptors,
+                    method.InitialMemoryValues,
+                    method.MemoryDefinitions);
+
+            private SsaAssertionFacts BuildFacts()
+            {
+                var blockIn = ImmutableArray.CreateBuilder<ImmutableArray<int>>(_blockIn.Length);
+                for (int i = 0; i < _blockIn.Length; i++)
+                    blockIn.Add(_blockIn[i].ToImmutableArray());
+
+                var edgeOut = new Dictionary<CfgEdge, ImmutableArray<int>>(_edgeOut.Count);
+                foreach (var pair in _edgeOut)
+                    edgeOut.Add(pair.Key, pair.Value.ToImmutableArray());
+
+                var generatedAfter = new Dictionary<GenTree, ImmutableArray<int>>(
+                    _generatedAfter.Count,
+                    ReferenceEqualityComparer<GenTree>.Instance);
+                foreach (var pair in _generatedAfter)
+                    generatedAfter.Add(pair.Key, pair.Value.ToImmutableArray());
+
+                return new SsaAssertionFacts(_table.ToImmutableArray(), blockIn.ToImmutable(), edgeOut, generatedAfter);
             }
 
             private void GenerateAssertions()
@@ -523,7 +663,7 @@ namespace Cnidaria.Cs
                 if (tree.Operands.Length < 2)
                     return;
                 if (!TryGetNormalValueNumber(tree.Operands[0].Source, out var arrayValue) ||
-                    !TryGetAssertionValue(tree.Operands[1].Source, out var indexValue))
+                    !TryGetBoundsCheckIndexValue(tree, out var indexValue))
                 {
                     return;
                 }
@@ -908,7 +1048,80 @@ namespace Cnidaria.Cs
                 while (changed);
             }
 
-            private SsaAssertionPropagationResult Rewrite()
+            private RewriteResult RewriteValueNumbersBeforeAssertionGeneration()
+            {
+                var blocks = ImmutableArray.CreateBuilder<SsaBlock>(_method.Blocks.Length);
+                bool changed = false;
+
+                for (int blockIndex = 0; blockIndex < _method.Blocks.Length; blockIndex++)
+                {
+                    var block = _method.Blocks[blockIndex];
+                    var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
+                    var treeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.StatementTreeLists.Length);
+                    bool blockChanged = false;
+
+                    for (int statementIndex = 0; statementIndex < block.Statements.Length; statementIndex++)
+                    {
+                        var originalRoot = block.Statements[statementIndex];
+                        var originalList = block.StatementTreeLists[statementIndex];
+                        var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                        var draftTreeList = ImmutableArray.CreateBuilder<SsaTree>(originalList.Length + 4);
+                        var appended = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
+                        bool statementChanged = false;
+
+                        for (int treeIndex = 0; treeIndex < originalList.Length; treeIndex++)
+                        {
+                            var original = originalList[treeIndex];
+                            var candidate = RebuildWithOperands(original, rewrittenByTree, ref statementChanged);
+                            var rewritten = candidate;
+
+                            if (TryVnBasedFold(original, candidate, out var vnFolded))
+                            {
+                                rewritten = vnFolded;
+                                statementChanged = true;
+                            }
+                            else if (TryMorphFoldCandidate(candidate, out var morphFolded))
+                            {
+                                rewritten = morphFolded;
+                                statementChanged = true;
+                            }
+
+                            rewrittenByTree.Add(original, rewritten);
+                            AppendTreePreservingExistingOrder(rewritten, appended, draftTreeList);
+                        }
+
+                        var rewrittenRoot = rewrittenByTree[originalRoot];
+                        if (statementChanged)
+                            GenTreeMorpher.NormalizeTreeFlags(rewrittenRoot.Source, _method.GenTreeMethod.Target);
+                        var materializedList = ProjectReachableTreeList(rewrittenRoot, draftTreeList.ToImmutable());
+
+                        statements.Add(rewrittenRoot);
+                        treeLists.Add(materializedList);
+                        blockChanged |= statementChanged;
+                    }
+
+                    if (blockChanged)
+                    {
+                        changed = true;
+                        blocks.Add(new SsaBlock(
+                            block.CfgBlock,
+                            block.Phis,
+                            statements.ToImmutable(),
+                            block.MemoryPhis,
+                            block.MemoryIn,
+                            block.MemoryOut,
+                            treeLists.ToImmutable()));
+                    }
+                    else
+                    {
+                        blocks.Add(block);
+                    }
+                }
+
+                return new RewriteResult(blocks.ToImmutable(), _treeValueUpdates, changed, _nextSyntheticTreeId);
+            }
+
+            private RewriteResult Rewrite()
             {
                 var blocks = ImmutableArray.CreateBuilder<SsaBlock>(_method.Blocks.Length);
                 bool changed = false;
@@ -973,7 +1186,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                return new SsaAssertionPropagationResult(blocks.ToImmutable(), changed, _nextSyntheticTreeId);
+                return new RewriteResult(blocks.ToImmutable(), _treeValueUpdates, changed, _nextSyntheticTreeId);
             }
 
             private static void AppendTreePreservingExistingOrder(
@@ -1060,6 +1273,7 @@ namespace Cnidaria.Cs
                 changed = true;
                 var operands = rewrittenOperands.ToImmutable();
                 var source = CloneSource(tree.Source, operands, tree.Source.Flags);
+                RecordInheritedTreeValue(source, tree.Source);
                 return new SsaTree(
                     source,
                     operands,
@@ -1084,7 +1298,15 @@ namespace Cnidaria.Cs
                     CanReplaceWithConstant(original.Source, constant))
                 {
                     changed = true;
-                    return new SsaTree(CreateConstantTree(candidate.Source, constant), ImmutableArray<SsaTree>.Empty);
+                    var source = CreateConstantTree(candidate.Source, constant);
+                    RecordConstantTreeValue(source);
+                    return new SsaTree(source, ImmutableArray<SsaTree>.Empty);
+                }
+
+                if (TryMorphFoldCandidate(candidate, out var morphFolded))
+                {
+                    changed = true;
+                    return morphFolded;
                 }
 
                 if (candidate.Kind == GenTreeKind.Binary &&
@@ -1094,7 +1316,9 @@ namespace Cnidaria.Cs
                     TryEvaluateRelational(original, active, out bool relationValue))
                 {
                     changed = true;
-                    return new SsaTree(CreateBooleanConstant(candidate.Source, relationValue), ImmutableArray<SsaTree>.Empty);
+                    var source = CreateBooleanConstant(candidate.Source, relationValue);
+                    RecordConstantTreeValue(source);
+                    return new SsaTree(source, ImmutableArray<SsaTree>.Empty);
                 }
 
                 GenTreeFlags flags = candidate.Source.Flags;
@@ -1164,6 +1388,7 @@ namespace Cnidaria.Cs
                 {
                     changed = true;
                     var source = CloneSource(candidate.Source, candidate.Operands, flags, sourceOp);
+                    RecordInheritedTreeValue(source, candidate.Source);
                     return new SsaTree(
                         source,
                         candidate.Operands,
@@ -1178,10 +1403,153 @@ namespace Cnidaria.Cs
                 return candidate;
             }
 
+            private bool TryVnBasedFold(SsaTree original, SsaTree candidate, out SsaTree folded)
+            {
+                folded = candidate;
+                if (!IsVnBasedFoldCandidate(original) ||
+                    !TryGetNormalValueNumber(original.Source, out var value))
+                {
+                    return false;
+                }
+
+                if (TryConvertLiteralConstant(value, out var constant) &&
+                    CanReplaceWithConstant(original.Source, constant) &&
+                    CanDiscardTree(original))
+                {
+                    var source = CreateConstantTree(candidate.Source, constant);
+                    RecordInheritedTreeValue(source, original.Source);
+                    folded = new SsaTree(source, ImmutableArray<SsaTree>.Empty);
+                    return true;
+                }
+
+                if (original.Source.CanThrow || original.Operands.IsDefaultOrEmpty)
+                    return false;
+
+                for (int i = 0; i < original.Operands.Length; i++)
+                {
+                    if (!TryGetNormalValueNumber(original.Operands[i].Source, out var operandValue) ||
+                        operandValue != value ||
+                        !AreReplacementTypesCompatible(candidate.Source, candidate.Operands[i].Source) ||
+                        !CanDiscardOtherOperands(original, i))
+                    {
+                        continue;
+                    }
+
+                    folded = candidate.Operands[i];
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool TryMorphFoldCandidate(SsaTree candidate, out SsaTree folded)
+            {
+                folded = candidate;
+                GenTree foldedSource = GenTreeMorpher.MorphNode(candidate.Source, _method.GenTreeMethod.Target);
+                if (ReferenceEquals(foldedSource, candidate.Source))
+                    return false;
+
+                if (TryFindTreeBySource(candidate, foldedSource, out folded))
+                    return true;
+
+                RecordConstantTreeValue(foldedSource);
+                folded = new SsaTree(foldedSource);
+                return true;
+            }
+
+            private static bool TryFindTreeBySource(SsaTree tree, GenTree source, out SsaTree found)
+            {
+                if (ReferenceEquals(tree.Source, source))
+                {
+                    found = tree;
+                    return true;
+                }
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (TryFindTreeBySource(tree.Operands[i], source, out found))
+                        return true;
+                }
+
+                found = null!;
+                return false;
+            }
+
+            private static bool IsVnBasedFoldCandidate(SsaTree tree)
+            {
+                if (tree.StoreTarget.HasValue || !tree.MemoryDefinitions.IsDefaultOrEmpty)
+                    return false;
+
+                return tree.Kind is GenTreeKind.Local or
+                    GenTreeKind.Arg or
+                    GenTreeKind.Temp or
+                    GenTreeKind.Unary or
+                    GenTreeKind.Binary or
+                    GenTreeKind.Conv or
+                    GenTreeKind.SizeOf or
+                    GenTreeKind.DefaultValue;
+            }
+
+            private static bool AreReplacementTypesCompatible(GenTree use, GenTree replacement)
+                => ValueNumberType.For(use.StackKind, use.Type).Equals(ValueNumberType.For(replacement.StackKind, replacement.Type));
+
+            private static bool CanDiscardOtherOperands(SsaTree tree, int retainedOperand)
+            {
+                if (tree.Source.CanThrow || tree.StoreTarget.HasValue || !tree.MemoryDefinitions.IsDefaultOrEmpty)
+                    return false;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (i != retainedOperand && HasObservableEffect(tree.Operands[i]))
+                        return false;
+                }
+
+                return true;
+            }
+
+            private static bool CanDiscardTree(SsaTree tree)
+            {
+                if (tree.Source.CanThrow || tree.StoreTarget.HasValue || !tree.MemoryDefinitions.IsDefaultOrEmpty)
+                    return false;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (HasObservableEffect(tree.Operands[i]))
+                        return false;
+                }
+
+                return !tree.HasMemoryEffects;
+            }
+
+            private static bool HasObservableEffect(SsaTree tree)
+            {
+                if (tree.HasMemoryEffects || tree.StoreTarget.HasValue)
+                    return true;
+
+                const GenTreeFlags effects = GenTreeFlags.ContainsCall |
+                                             GenTreeFlags.CanThrow |
+                                             GenTreeFlags.SideEffect |
+                                             GenTreeFlags.MemoryWrite |
+                                             GenTreeFlags.ControlFlow |
+                                             GenTreeFlags.ExceptionFlow |
+                                             GenTreeFlags.Ordered;
+
+                if ((tree.Source.Flags & effects) != 0)
+                    return true;
+
+                for (int i = 0; i < tree.Operands.Length; i++)
+                {
+                    if (HasObservableEffect(tree.Operands[i]))
+                        return true;
+                }
+
+                return false;
+            }
+
             private bool IsBoundsCheckRedundant(SsaTree tree, AssertionSet active)
             {
                 if (!TryGetNormalValueNumber(tree.Operands[0].Source, out var arrayValue) ||
-                    !TryGetAssertionValue(tree.Operands[1].Source, out var indexValue))
+                    !TryGetBoundsCheckIndexValue(tree, out var indexValue))
                 {
                     return false;
                 }
@@ -1205,10 +1573,22 @@ namespace Cnidaria.Cs
                 if (IsBoundsCheckRedundantByValueNumberShape(indexValue, lengthValueNumber, active))
                     return true;
 
-                return TryGetIntegralRange(indexValue, active, out var indexRange) &&
-                       TryGetIntegralRange(lengthValue, active, out var lengthRange) &&
-                       indexRange.Lower >= 0 &&
-                       indexRange.Upper < lengthRange.Lower;
+                return false;
+            }
+
+            private bool TryGetBoundsCheckIndexValue(SsaTree tree, out AssertionValue value)
+            {
+                if (tree.Source.HasBoundsCheckIndexOverride)
+                {
+                    value = AssertionValue.ForInt32(tree.Source.BoundsCheckIndexOverride);
+                    return true;
+                }
+
+                if (tree.Operands.Length >= 2)
+                    return TryGetAssertionValue(tree.Operands[1].Source, out value);
+
+                value = default;
+                return false;
             }
 
             private bool IsBoundsCheckRedundantByValueNumberShape(
@@ -1816,6 +2196,7 @@ namespace Cnidaria.Cs
                 ref int budget,
                 out AssertionRange range)
             {
+                value = NormalizeRangeValueNumber(value);
                 range = default;
                 if (!_store.TryGetEntry(value, out var entry) || !TryGetBaseIntegralRange(entry, out var baseRange))
                     return false;
@@ -1827,9 +2208,10 @@ namespace Cnidaria.Cs
                 }
 
                 range = baseRange;
-                if (budget > 0 && visited.Add(value))
+                bool added = budget > 0 && visited.Add(value);
+                try
                 {
-                    try
+                    if (added)
                     {
                         budget--;
                         if (entry.Function == ValueNumberFunction.PhiDef &&
@@ -1843,14 +2225,15 @@ namespace Cnidaria.Cs
                             range = range.Intersect(functionRange);
                         }
                     }
-                    finally
-                    {
-                        visited.Remove(value);
-                    }
-                }
 
-                ApplyAssertionsToRange(value, entry, active, ref range);
-                return range.IsValid;
+                    ApplyAssertionsToRange(value, entry, active, visited, ref budget, added, ref range);
+                    return range.IsValid;
+                }
+                finally
+                {
+                    if (added)
+                        visited.Remove(value);
+                }
             }
 
             private bool TryGetFunctionRange(
@@ -2001,7 +2384,7 @@ namespace Cnidaria.Cs
                         direction = stepDirection;
 
                         var sourceRange = typeRange;
-                        ApplyAssertionsToRange(value, entry, edgeAssertions, ref sourceRange);
+                        ApplyAssertionsToRange(value, entry, edgeAssertions, visited, ref budget, true, ref sourceRange);
                         if (!sourceRange.IsValid)
                             return false;
 
@@ -2081,23 +2464,25 @@ namespace Cnidaria.Cs
             private bool TryGetInductionStep(ValueNumber expression, ValueNumber phiValue, out long step)
             {
                 step = 0;
-                while (TryUnwrapRangePreservingIntegralSsaNormalize(expression, out var unwrapped))
-                    expression = unwrapped;
+                expression = NormalizeRangeValueNumber(expression);
+                phiValue = NormalizeRangeValueNumber(phiValue);
 
                 if (!_store.TryGetEntry(expression, out var entry) || entry.Args.Length != 2)
                     return false;
 
+                ValueNumber left = NormalizeRangeValueNumber(entry.Args[0]);
+                ValueNumber right = NormalizeRangeValueNumber(entry.Args[1]);
                 if (entry.Function == ValueNumberFunction.Add)
                 {
-                    if (entry.Args[0] == phiValue && TryGetIntegralConstantValue(entry.Args[1], out step))
+                    if (left == phiValue && TryGetIntegralConstantValue(right, out step))
                         return true;
-                    if (entry.Args[1] == phiValue && TryGetIntegralConstantValue(entry.Args[0], out step))
+                    if (right == phiValue && TryGetIntegralConstantValue(left, out step))
                         return true;
                     return false;
                 }
 
-                if (entry.Function == ValueNumberFunction.Sub && entry.Args[0] == phiValue &&
-                    TryGetIntegralConstantValue(entry.Args[1], out long subtrahend) && subtrahend != long.MinValue)
+                if (entry.Function == ValueNumberFunction.Sub && left == phiValue &&
+                    TryGetIntegralConstantValue(right, out long subtrahend) && subtrahend != long.MinValue)
                 {
                     step = -subtrahend;
                     return true;
@@ -2128,6 +2513,8 @@ namespace Cnidaria.Cs
 
             private bool TryProveDoesNotContainValueNumber(ValueNumber expression, ValueNumber target, HashSet<ValueNumber> visited, int budget)
             {
+                expression = NormalizeRangeValueNumber(expression);
+                target = NormalizeRangeValueNumber(target);
                 if (expression == target || budget <= 0 || !visited.Add(expression))
                     return false;
 
@@ -2154,13 +2541,18 @@ namespace Cnidaria.Cs
                 ValueNumber value,
                 ValueNumberEntry entry,
                 AssertionSet active,
+                HashSet<ValueNumber> visited,
+                ref int budget,
+                bool allowRecursive,
                 ref AssertionRange range)
             {
+                value = NormalizeRangeValueNumber(value);
                 var aliases = CollectEqualityAliases(value, active);
                 foreach (ValueNumber alias in aliases)
                 {
-                    if (alias == value ||
-                        !_store.TryGetEntry(alias, out var aliasEntry) ||
+                    ValueNumber normalizedAlias = NormalizeRangeValueNumber(alias);
+                    if (normalizedAlias == value ||
+                        !_store.TryGetEntry(normalizedAlias, out var aliasEntry) ||
                         aliasEntry.StackKind != entry.StackKind ||
                         !TryGetBaseIntegralRange(aliasEntry, out var aliasRange))
                     {
@@ -2170,64 +2562,187 @@ namespace Cnidaria.Cs
                     range = range.Intersect(aliasRange);
                 }
 
+                if (!TryGetBaseIntegralRange(entry, out var typeRange))
+                    return;
+
                 foreach (int assertionIndex in active.Enumerate())
                 {
                     var assertion = _table.Get(assertionIndex);
-                    if (assertion.Operand1Kind != SsaAssertionOperand1Kind.ValueNumber ||
-                        !aliases.Contains(assertion.Operand1Value))
-                    {
+                    if (assertion.Operand1Kind != SsaAssertionOperand1Kind.ValueNumber)
                         continue;
-                    }
+
+                    bool operand1Matches = ContainsRangeAlias(aliases, assertion.Operand1Value);
+                    bool operand2Matches = assertion.Operand2Kind == SsaAssertionOperand2Kind.ValueNumberPlusConstant &&
+                                           ContainsRangeAlias(aliases, assertion.Operand2Value);
 
                     if (assertion.Kind == SsaAssertionKind.Subrange &&
-                        assertion.Operand2Kind == SsaAssertionOperand2Kind.Subrange)
+                        assertion.Operand2Kind == SsaAssertionOperand2Kind.Subrange &&
+                        operand1Matches)
                     {
                         range = range.Intersect(new AssertionRange(assertion.RangeLower, assertion.RangeUpper));
                         continue;
                     }
 
-                    if (!_store.TryGetEntry(assertion.Operand1Value, out var assertionEntry) ||
-                        !TryGetAssertionConstant(assertion, out long assertionConstant, out bool isInt32) ||
-                        !IsAssertionConstantCompatible(assertionEntry, assertion.Operand2Kind))
+                    if (operand1Matches &&
+                        _store.TryGetEntry(assertion.Operand1Value, out var assertionEntry) &&
+                        TryGetAssertionConstant(assertion, out long assertionConstant, out bool isInt32) &&
+                        IsAssertionConstantCompatible(assertionEntry, assertion.Operand2Kind))
+                    {
+                        ApplyConstantRangeAssertion(assertion.Kind, assertionConstant, isInt32, ref range);
+                        continue;
+                    }
+
+                    if (!allowRecursive ||
+                        assertion.Operand2Kind != SsaAssertionOperand2Kind.ValueNumberPlusConstant ||
+                        operand1Matches == operand2Matches)
                     {
                         continue;
                     }
 
-                    switch (assertion.Kind)
+                    SsaAssertionKind kind;
+                    ValueNumber other;
+                    long offset;
+                    if (operand1Matches)
                     {
-                        case SsaAssertionKind.Equal:
-                            range = range.Intersect(new AssertionRange(assertionConstant, assertionConstant));
-                            break;
-                        case SsaAssertionKind.NotEqual:
-                            if (assertionConstant == 0)
-                            {
-                                if (range.Lower == 0)
-                                    range = range.Intersect(new AssertionRange(1, long.MaxValue));
-                                else if (range.Upper == 0)
-                                    range = range.Intersect(new AssertionRange(long.MinValue, -1));
-                            }
-                            break;
-                        case SsaAssertionKind.LessThan:
-                            if (assertionConstant != long.MinValue)
-                                range = range.Intersect(new AssertionRange(long.MinValue, assertionConstant - 1));
-                            break;
-                        case SsaAssertionKind.LessThanOrEqual:
-                            range = range.Intersect(new AssertionRange(long.MinValue, assertionConstant));
-                            break;
-                        case SsaAssertionKind.GreaterThan:
-                            if (assertionConstant != long.MaxValue)
-                                range = range.Intersect(new AssertionRange(assertionConstant + 1, long.MaxValue));
-                            break;
-                        case SsaAssertionKind.GreaterThanOrEqual:
-                            range = range.Intersect(new AssertionRange(assertionConstant, long.MaxValue));
-                            break;
-                        case SsaAssertionKind.LessThanUnsigned:
-                        case SsaAssertionKind.LessThanOrEqualUnsigned:
-                            if (TryGetUnsignedUpperBound(assertion.Kind, assertionConstant, isInt32, out long unsignedUpper))
-                                range = range.Intersect(new AssertionRange(0, unsignedUpper));
-                            break;
+                        kind = assertion.Kind;
+                        other = assertion.Operand2Value;
+                        offset = assertion.Operand2Constant;
                     }
+                    else
+                    {
+                        if (assertion.Operand2Constant != 0)
+                            continue;
+                        kind = SsaAssertionDescriptor.ReverseKind(assertion.Kind);
+                        other = assertion.Operand1Value;
+                        offset = 0;
+                    }
+
+                    other = NormalizeRangeValueNumber(other);
+                    bool compatible = kind is SsaAssertionKind.Equal or SsaAssertionKind.NotEqual
+                        ? AreValueNumbersEqualityCompatible(value, other)
+                        : AreValueNumbersOrderedCompatible(value, other);
+                    if (!compatible ||
+                        !TryGetIntegralRangeWorker(other, active, visited, ref budget, out var otherRange) ||
+                        !TryOffsetAssertionRange(otherRange, offset, typeRange, out var boundRange))
+                    {
+                        continue;
+                    }
+
+                    ApplyRangeAssertion(kind, boundRange, typeRange, ref range);
                 }
+            }
+
+            private bool ContainsRangeAlias(HashSet<ValueNumber> aliases, ValueNumber candidate)
+            {
+                candidate = NormalizeRangeValueNumber(candidate);
+                foreach (ValueNumber alias in aliases)
+                {
+                    if (NormalizeRangeValueNumber(alias) == candidate)
+                        return true;
+                }
+                return false;
+            }
+
+            private static void ApplyConstantRangeAssertion(
+                SsaAssertionKind kind,
+                long constant,
+                bool isInt32,
+                ref AssertionRange range)
+            {
+                switch (kind)
+                {
+                    case SsaAssertionKind.Equal:
+                        range = range.Intersect(new AssertionRange(constant, constant));
+                        break;
+                    case SsaAssertionKind.NotEqual:
+                        ExcludeExactRangeValue(constant, ref range);
+                        break;
+                    case SsaAssertionKind.LessThan:
+                        if (constant != long.MinValue)
+                            range = range.Intersect(new AssertionRange(long.MinValue, constant - 1));
+                        break;
+                    case SsaAssertionKind.LessThanOrEqual:
+                        range = range.Intersect(new AssertionRange(long.MinValue, constant));
+                        break;
+                    case SsaAssertionKind.GreaterThan:
+                        if (constant != long.MaxValue)
+                            range = range.Intersect(new AssertionRange(constant + 1, long.MaxValue));
+                        break;
+                    case SsaAssertionKind.GreaterThanOrEqual:
+                        range = range.Intersect(new AssertionRange(constant, long.MaxValue));
+                        break;
+                    case SsaAssertionKind.LessThanUnsigned:
+                    case SsaAssertionKind.LessThanOrEqualUnsigned:
+                        if (TryGetUnsignedUpperBound(kind, constant, isInt32, out long unsignedUpper))
+                            range = range.Intersect(new AssertionRange(0, unsignedUpper));
+                        break;
+                }
+            }
+
+            private static void ApplyRangeAssertion(
+                SsaAssertionKind kind,
+                AssertionRange bound,
+                AssertionRange typeRange,
+                ref AssertionRange range)
+            {
+                switch (kind)
+                {
+                    case SsaAssertionKind.Equal:
+                        range = range.Intersect(bound);
+                        break;
+                    case SsaAssertionKind.NotEqual:
+                        if (bound.IsExact)
+                            ExcludeExactRangeValue(bound.Lower, ref range);
+                        break;
+                    case SsaAssertionKind.LessThan:
+                        if (bound.Upper != long.MinValue)
+                            range = range.Intersect(new AssertionRange(typeRange.Lower, bound.Upper - 1));
+                        break;
+                    case SsaAssertionKind.LessThanOrEqual:
+                        range = range.Intersect(new AssertionRange(typeRange.Lower, bound.Upper));
+                        break;
+                    case SsaAssertionKind.GreaterThan:
+                        if (bound.Lower != long.MaxValue)
+                            range = range.Intersect(new AssertionRange(bound.Lower + 1, typeRange.Upper));
+                        break;
+                    case SsaAssertionKind.GreaterThanOrEqual:
+                        range = range.Intersect(new AssertionRange(bound.Lower, typeRange.Upper));
+                        break;
+                    case SsaAssertionKind.LessThanUnsigned:
+                        if (bound.Lower >= 0 && bound.Upper > 0 && bound.Upper <= typeRange.Upper)
+                            range = range.Intersect(new AssertionRange(0, bound.Upper - 1));
+                        break;
+                    case SsaAssertionKind.LessThanOrEqualUnsigned:
+                        if (bound.Lower >= 0 && bound.Upper <= typeRange.Upper)
+                            range = range.Intersect(new AssertionRange(0, bound.Upper));
+                        break;
+                }
+            }
+
+            private static void ExcludeExactRangeValue(long value, ref AssertionRange range)
+            {
+                if (range.Lower == value && value != long.MaxValue)
+                    range = new AssertionRange(value + 1, range.Upper);
+                else if (range.Upper == value && value != long.MinValue)
+                    range = new AssertionRange(range.Lower, value - 1);
+            }
+
+            private static bool TryOffsetAssertionRange(
+                AssertionRange range,
+                long offset,
+                AssertionRange typeRange,
+                out AssertionRange result)
+            {
+                System.Numerics.BigInteger lower = (System.Numerics.BigInteger)range.Lower + offset;
+                System.Numerics.BigInteger upper = (System.Numerics.BigInteger)range.Upper + offset;
+                if (lower < typeRange.Lower || upper > typeRange.Upper || lower > upper)
+                {
+                    result = default;
+                    return false;
+                }
+
+                result = new AssertionRange((long)lower, (long)upper);
+                return true;
             }
 
             private static bool TryAddRanges(AssertionRange left, AssertionRange right, AssertionRange typeRange, out AssertionRange range)
@@ -2766,7 +3281,7 @@ namespace Cnidaria.Cs
 
             private bool TryGetNormalValueNumber(GenTree tree, out ValueNumber value)
             {
-                if (_valueNumbers.TryGetTreeValue(tree, out var pair))
+                if (TryGetTreeValue(tree, out var pair))
                 {
                     value = _store.VNNormalValue(pair.Conservative);
                     return value.IsValid;
@@ -2774,6 +3289,33 @@ namespace Cnidaria.Cs
 
                 value = default;
                 return false;
+            }
+
+            private bool TryGetTreeValue(GenTree tree, out ValueNumberPair value)
+            {
+                if (_treeValueUpdates.TryGetValue(tree, out value))
+                    return true;
+                return _valueNumbers.TryGetTreeValue(tree, out value);
+            }
+
+            private void RecordInheritedTreeValue(GenTree tree, GenTree source)
+            {
+                if (TryGetTreeValue(source, out var value))
+                    _treeValueUpdates[tree] = value;
+            }
+
+            private void RecordConstantTreeValue(GenTree tree)
+            {
+                ValueNumber value = tree.Kind switch
+                {
+                    GenTreeKind.ConstI4 => _store.VNForInt32(tree.Int32),
+                    GenTreeKind.ConstI8 => _store.VNForInt64(tree.Int64),
+                    GenTreeKind.ConstNull => _store.VNForNull(tree.Type),
+                    _ => default,
+                };
+
+                if (value.IsValid)
+                    _treeValueUpdates[tree] = ValueNumberPair.Same(value);
             }
 
             private bool TryConvertConstant(ValueNumber valueNumber, out AssertionValue value)
@@ -2804,6 +3346,21 @@ namespace Cnidaria.Cs
 
                 value = default;
                 return false;
+            }
+
+            private ValueNumber NormalizeRangeValueNumber(ValueNumber value)
+            {
+                if (!value.IsValid)
+                    return value;
+
+                value = _store.VNNormalValue(value);
+                for (int depth = 0; depth < 32; depth++)
+                {
+                    if (!TryUnwrapRangePreservingIntegralSsaNormalize(value, out var unwrapped) || unwrapped == value)
+                        break;
+                    value = _store.VNNormalValue(unwrapped);
+                }
+                return value;
             }
 
             private bool TryUnwrapRangePreservingIntegralSsaNormalize(ValueNumber value, out ValueNumber operand)
@@ -3109,7 +3666,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < operands.Length; i++)
                     genOperands.Add(operands[i].Source);
 
-                return new GenTree(
+                var clone = new GenTree(
                     source.Id,
                     source.Kind,
                     source.Pc,
@@ -3127,7 +3684,11 @@ namespace Cnidaria.Cs
                     source.ConvKind,
                     source.ConvFlags,
                     source.TargetPc,
-                    source.TargetBlockId);
+                    source.TargetBlockId,
+                    source.BoundsCheckIndexOverride);
+                clone.LocalDescriptor = source.LocalDescriptor;
+                clone.CseNumber = source.CseNumber;
+                return clone;
             }
         }
     }

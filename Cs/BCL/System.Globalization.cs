@@ -1,4 +1,4 @@
-﻿namespace System.Globalization
+namespace System.Globalization
 {
     public enum UnicodeCategory
     {

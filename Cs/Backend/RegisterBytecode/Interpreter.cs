@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -896,10 +896,7 @@ namespace Cnidaria.Cs
                         SetI32(ins.Rd, ReadI32Unchecked(arrAbs + ArrayLengthOffset));
                         break;
                     case Op.LdArrayDataAddr:
-                        ValidateArrayRefForExecution(
-                            GetGpr(ins.Rs1),
-                            out int dataArrAbs,
-                            skipNullCheck: (((InstructionFlags)ins.Aux) & InstructionFlags.NoNullCheck) != 0);
+                        ValidateArrayRefForExecution(GetGpr(ins.Rs1), out int dataArrAbs);
                         SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
                         break;
                     case Op.LdElemAddr:
@@ -1130,7 +1127,10 @@ namespace Cnidaria.Cs
                         SetGpr(ins.Rd, StaticData(executingPc, ins));
                         break;
                     case Op.StackAlloc:
-                        SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
+                        if (ins.Rs1 == RegisterVmIsa.InvalidRegister)
+                            SetGpr(ins.Rd, StackAllocConstant(ins.Imm));
+                        else
+                            SetGpr(ins.Rd, StackAlloc((int)GetGpr(ins.Rs1), checked((int)ins.Imm)));
                         break;
                     case Op.PtrAddI32:
                     case Op.ByRefAddI32:
@@ -4009,10 +4009,7 @@ namespace Cnidaria.Cs
             InstructionFlags flags = (InstructionFlags)instruction.Aux;
             long arrRef = GetGpr(instruction.Rs1);
             int index = unchecked((int)GetGpr(instruction.Rs2));
-            ValidateArrayRefForExecution(
-                arrRef,
-                out int arrAbs,
-                skipNullCheck: (flags & InstructionFlags.NoNullCheck) != 0);
+            ValidateArrayRefForExecution(arrRef, out int arrAbs);
             if ((flags & InstructionFlags.NoBoundsCheck) == 0)
             {
                 int len = ReadI32(arrAbs + ArrayLengthOffset);
@@ -4200,6 +4197,18 @@ namespace Cnidaria.Cs
             if (elementSize <= 0) throw new ArgumentOutOfRangeException(nameof(elementSize));
 
             return StackAllocBytes(checked(count * elementSize), elementSize);
+        }
+
+        private int StackAllocConstant(long packed)
+        {
+            int elementSize = checked((int)(packed >> 32));
+            uint byteCount = unchecked((uint)packed);
+            if (elementSize <= 0)
+                throw new InvalidOperationException("Invalid constant stack allocation element size.");
+            if (byteCount == 0 || byteCount > int.MaxValue)
+                throw new StackOverflowException();
+
+            return StackAllocBytes((int)byteCount, elementSize);
         }
 
         private int StackAllocBytes(int byteCount, int alignment)
@@ -6244,9 +6253,10 @@ namespace Cnidaria.Cs
             return value & ~((long)mask);
         }
 
-        private void ValidateArrayRefForExecution(long objRef, out int abs, bool skipNullCheck = false)
+        private void ValidateArrayRefForExecution(long objRef, out int abs)
         {
-            if (!skipNullCheck && objRef == 0) throw new NullReferenceException();
+            // We can skip the null check, but we do not want to, as skipping the check is slower, then performing the check
+            if (/*!skipNullCheck &&*/ objRef == 0) throw new NullReferenceException();
             if (objRef < int.MinValue || objRef > int.MaxValue)
                 throw new AccessViolationException("Array reference is outside VM address space.");
             abs = checked((int)objRef);

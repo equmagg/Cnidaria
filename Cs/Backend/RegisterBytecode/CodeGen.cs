@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -1275,8 +1275,27 @@ namespace Cnidaria.Cs
                         EmitStaticData(instruction, source);
                         return;
                     case GenTreeKind.StackAlloc:
-                        _asm.Emit(new InstrDesc(Op.StackAlloc, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
-                            RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: Aux.Instruction(InstructionFlags.MayThrow), imm: source.Int32));
+                        if (source.Operands.Length == 0)
+                        {
+                            long packed = ((long)source.Int32 << 32) | (uint)source.Int64;
+                            _asm.Emit(new InstrDesc(
+                                Op.StackAlloc,
+                                RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                                aux: Aux.Instruction(InstructionFlags.MayThrow),
+                                imm: packed));
+                        }
+                        else
+                        {
+                            if (source.Operands.Length != 1)
+                                throw Unsupported(instruction, "stack allocation must have zero or one operand");
+
+                            _asm.Emit(new InstrDesc(
+                                Op.StackAlloc,
+                                RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                                RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                                aux: Aux.Instruction(InstructionFlags.MayThrow),
+                                imm: source.Int32));
+                        }
                         return;
                     case GenTreeKind.PointerElementAddr:
                         EmitPointerElementAddress(instruction, source);
@@ -3326,7 +3345,7 @@ namespace Cnidaria.Cs
                             var array = RequireUseRegister(instruction, 0);
                             var index = RequireUseRegister(instruction, 1);
                             MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, array, index);
-                            _asm.Emit(InstrDesc.Array(Op.LdElemAddr, address, array, index, elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
+                            EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.LdElemAddr, address, array, index, elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                             EmitMultiRegisterLoadFromAddress(instruction, elem, source.StackKind, address);
                             return;
                         }
@@ -3337,15 +3356,15 @@ namespace Cnidaria.Cs
                             var index = RequireUseRegister(instruction, 1);
                             MachineRegister destinationAddress = PickScratchRegister(instruction, RegisterClass.General, array, index);
                             EmitAddressOf(destinationAddress, RequireSingleResult(instruction));
-                            _asm.Emit(InstrDesc.Array(Op.LdElemObj, destinationAddress,
+                            EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.LdElemObj, destinationAddress,
                                 array, index, elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                             return;
                         }
-                        _asm.Emit(InstrDesc.Array(SelectLoadElementOp(elem, source.StackKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction),
+                        EmitArrayElementInstruction(instruction, InstrDesc.Array(SelectLoadElementOp(elem, source.StackKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction),
                             RequireUseRegister(instruction, 0), RequireUseRegister(instruction, 1), elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                         return;
                     case GenTreeKind.ArrayElementAddr:
-                        _asm.Emit(InstrDesc.Array(Op.LdElemAddr, RequireResultRegister(instruction), RequireUseRegister(instruction, 0),
+                        EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.LdElemAddr, RequireResultRegister(instruction), RequireUseRegister(instruction, 0),
                             RequireUseRegister(instruction, 1), elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                         return;
                     case GenTreeKind.StoreArrayElement:
@@ -3369,12 +3388,12 @@ namespace Cnidaria.Cs
                                         "array-element store value",
                                         array,
                                         index);
-                                    _asm.Emit(InstrDesc.Array(Op.StElemObj, valueAddress, array, index, elemTypeLayout, WithAssertionFlags(instruction, ElementStoreAux(valueType))));
+                                    EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.StElemObj, valueAddress, array, index, elemTypeLayout, WithAssertionFlags(instruction, ElementStoreAux(valueType))));
                                     return;
                                 }
 
                                 MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, array, index);
-                                _asm.Emit(InstrDesc.Array(Op.LdElemAddr, address, array, index, elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
+                                EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.LdElemAddr, address, array, index, elemTypeLayout, WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                                 EmitMultiRegisterStoreToAddress(instruction, valueUseIndex, valueType, valueKind, address);
                                 return;
                             }
@@ -3386,7 +3405,7 @@ namespace Cnidaria.Cs
                                 var index = RequireUseRegister(instruction, indexUseIndex);
                                 MachineRegister valueAddress = PickScratchRegister(instruction, RegisterClass.General, array, index);
                                 EmitAddressOf(valueAddress, valueOperand);
-                                _asm.Emit(InstrDesc.Array(Op.StElemObj, valueAddress,
+                                EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.StElemObj, valueAddress,
                                     array, index, elemTypeLayout, WithAssertionFlags(instruction, ElementStoreAux(valueType))));
                                 return;
                             }
@@ -3404,12 +3423,12 @@ namespace Cnidaria.Cs
                                     "array-element store value",
                                     array,
                                     index);
-                                _asm.Emit(InstrDesc.Array(Op.StElemObj, valueAddress,
+                                EmitArrayElementInstruction(instruction, InstrDesc.Array(Op.StElemObj, valueAddress,
                                     array, index, elemTypeLayout, WithAssertionFlags(instruction, ElementStoreAux(valueType))));
                                 return;
                             }
 
-                            _asm.Emit(InstrDesc.Array(op, RequireUseRegister(instruction, valueUseIndex),
+                            EmitArrayElementInstruction(instruction, InstrDesc.Array(op, RequireUseRegister(instruction, valueUseIndex),
                                 RequireUseRegister(instruction, arrayUseIndex), RequireUseRegister(instruction, indexUseIndex), elemTypeLayout, WithAssertionFlags(instruction, ElementStoreAux(valueType))));
                             return;
                         }
@@ -3418,6 +3437,52 @@ namespace Cnidaria.Cs
                             RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)), aux: WithAssertionFlags(instruction, Aux.Instruction(InstructionFlags.MayThrow))));
                         return;
                 }
+            }
+
+            private void EmitArrayElementInstruction(GenTree instruction, InstrDesc descriptor)
+            {
+                if (instruction.HasBoundsCheckIndexOverride &&
+                    (instruction.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                {
+                    MachineRegister resultOrValue = RegisterVmIsa.DecodeRegister(descriptor.Rd);
+                    MachineRegister array = RegisterVmIsa.DecodeRegister(descriptor.Rs1);
+                    MachineRegister actualIndex = RegisterVmIsa.DecodeRegister(descriptor.Rs2);
+                    MachineRegister length = PickScratchRegister(
+                        instruction,
+                        RegisterClass.General,
+                        resultOrValue,
+                        array,
+                        actualIndex);
+                    MachineRegister checkIndex = PickScratchRegister(
+                        instruction,
+                        RegisterClass.General,
+                        resultOrValue,
+                        array,
+                        actualIndex,
+                        length);
+
+                    InstructionFlags lengthFlags = InstructionFlags.MayThrow;
+                    if ((instruction.Flags & GenTreeFlags.NullCheckEliminated) != 0)
+                        lengthFlags |= InstructionFlags.NoNullCheck;
+
+                    _asm.Emit(new InstrDesc(
+                        Op.LdLen,
+                        rd: RegisterVmIsa.EncodeRegister(length),
+                        rs1: descriptor.Rs1,
+                        aux: Aux.Instruction(lengthFlags)));
+                    _asm.LiI32(checkIndex, instruction.BoundsCheckIndexOverride);
+                    _asm.Emit(new InstrDesc(
+                        Op.BoundsCheck,
+                        rs1: RegisterVmIsa.EncodeRegister(checkIndex),
+                        rs2: RegisterVmIsa.EncodeRegister(length),
+                        aux: Aux.Instruction(InstructionFlags.MayThrow)));
+
+                    descriptor = descriptor.WithAux((ushort)(
+                        descriptor.Aux |
+                        (ushort)(InstructionFlags.NoNullCheck | InstructionFlags.NoBoundsCheck)));
+                }
+
+                _asm.Emit(descriptor);
             }
 
             private void EmitPointerElementAddress(GenTree instruction, GenTree source)

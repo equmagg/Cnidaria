@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Immutable;
 using Cnidaria.Cs;
 
@@ -523,6 +523,7 @@ namespace Cnidaria.C
                     MachineRegister.X14),
 
                 TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => ImmutableArray.Create(
+                    MachineRegister.X9,
                     MachineRegister.X18,
                     MachineRegister.X19,
                     MachineRegister.X20,
@@ -591,6 +592,15 @@ namespace Cnidaria.C
                 return CAbi.RiscVAbiFloatingRegisterSize(target) == 0
                     ? ImmutableArray<MachineRegister>.Empty
                     : ImmutableArray.Create(
+                        MachineRegister.F3,
+                        MachineRegister.F4,
+                        MachineRegister.F5,
+                        MachineRegister.F6,
+                        MachineRegister.F7,
+                        MachineRegister.F28,
+                        MachineRegister.F29,
+                        MachineRegister.F30,
+                        MachineRegister.F31,
                         MachineRegister.F8,
                         MachineRegister.F9,
                         MachineRegister.F18,

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
@@ -10,20 +10,22 @@ namespace Cnidaria.Cs
         public static SsaOptimizationOptions DefaultWithoutValidation => new SsaOptimizationOptions { Validate = false };
 
         public bool Validate { get; set; } = true;
-        public bool EnableConstantPropagation { get; set; } = true;
-        public bool EnableConstantFolding { get; set; } = true;
         public bool EnableDeadStoreRemoval { get; set; } = true;
         public bool EnableCopyPropagation { get; set; } = true;
         public bool EnableCommonSubexpressionElimination { get; set; } = true;
         public bool EnableLoopInvariantCodeMotion { get; set; } = true;
+        public bool EnableBoundsCheckCoalescing { get; set; } = true;
         public bool EnableAssertionPropagation { get; set; } = true;
+        public bool EnableRangeCheckAnalysis { get; set; } = true;
+        public bool EnableInductionVariableOptimization { get; set; } = true;
         public bool EnableRedundantBranchOptimization { get; set; } = true;
         public bool EnableBranchJumpThreading { get; set; } = true;
         public bool EnableDeadCodeElimination { get; set; } = true;
         public int MaxBranchOptimizationPasses { get; set; } = 4;
         public int MaxLoopHoistsPerLoop { get; set; } = 16;
         public int LoopHoistMinCost { get; set; } = 2;
-        public int MaxScalarCleanupPasses { get; set; } = 8;
+        public int RangeCheckOperationBudget { get; set; } = 8192;
+        public int RangeCheckMaximumSearchDepth { get; set; } = 100;
     }
     internal static class SsaOptimizer
     {
@@ -43,92 +45,10 @@ namespace Cnidaria.Cs
             return result;
         }
 
-        private enum ConstKind : byte
-        {
-            I4,
-            I8,
-            Null,
-        }
-
-        private readonly struct ConstValue : IEquatable<ConstValue>
-        {
-            public readonly ConstKind Kind;
-            public readonly int I4;
-            public readonly long I8;
-
-            private ConstValue(ConstKind kind, int i4, long i8)
-            {
-                Kind = kind;
-                I4 = i4;
-                I8 = i8;
-            }
-
-            public static ConstValue ForI4(int value) => new ConstValue(ConstKind.I4, value, value);
-            public static ConstValue ForI8(long value) => new ConstValue(ConstKind.I8, unchecked((int)value), value);
-            public static ConstValue Null => new ConstValue(ConstKind.Null, 0, 0);
-
-            public bool Equals(ConstValue other) => Kind == other.Kind && I4 == other.I4 && I8 == other.I8;
-            public override bool Equals(object? obj) => obj is ConstValue other && Equals(other);
-            public override int GetHashCode() => ((int)Kind * 397) ^ I4 ^ I8.GetHashCode();
-        }
-
-        private enum ValueFactKind : byte
-        {
-            Unknown,
-            Constant,
-        }
-
-        private readonly struct ValueFact : IEquatable<ValueFact>
-        {
-            public readonly ValueFactKind Kind;
-            public readonly ConstValue Constant;
-
-            private ValueFact(ValueFactKind kind, ConstValue constant)
-            {
-                Kind = kind;
-                Constant = constant;
-            }
-
-            public static ValueFact Unknown => default;
-            public static ValueFact ForConstant(ConstValue constant) => new ValueFact(ValueFactKind.Constant, constant);
-
-            public bool Equals(ValueFact other)
-            {
-                if (Kind != other.Kind)
-                    return false;
-
-                return Kind switch
-                {
-                    ValueFactKind.Constant => Constant.Equals(other.Constant),
-                    _ => true,
-                };
-            }
-
-            public override bool Equals(object? obj) => obj is ValueFact other && Equals(other);
-            public override int GetHashCode() => Kind switch
-            {
-                ValueFactKind.Constant => ((int)Kind * 397) ^ Constant.GetHashCode(),
-                _ => 0,
-            };
-        }
-
-        private sealed class OptimizationResult
-        {
-            public ImmutableArray<SsaBlock> Blocks { get; }
-            public bool Changed { get; }
-
-            public OptimizationResult(ImmutableArray<SsaBlock> blocks, bool changed)
-            {
-                Blocks = blocks;
-                Changed = changed;
-            }
-        }
-
         private sealed class MethodOptimizer
         {
             private readonly SsaMethod _original;
             private readonly SsaOptimizationOptions _options;
-            private readonly TargetInfo _target;
             private readonly Dictionary<SsaSlot, SsaSlotInfo> _slotInfos = new();
             private int _nextSyntheticTreeId;
 
@@ -136,7 +56,6 @@ namespace Cnidaria.Cs
             {
                 _original = method;
                 _options = options;
-                _target = method.GenTreeMethod.Target;
                 for (int i = 0; i < method.Slots.Length; i++)
                     _slotInfos[method.Slots[i].Slot] = method.Slots[i];
                 _nextSyntheticTreeId = MaxTreeId(method) + 1;
@@ -178,24 +97,41 @@ namespace Cnidaria.Cs
                         current = RemoveUnresolvedLoopHoists(current);
                 }
 
+                if (_options.EnableBoundsCheckCoalescing &&
+                    _options.EnableAssertionPropagation &&
+                    SsaBoundsCheckCoalescer.OptimizeMethod(current))
+                {
+                    current = RebuildValueNumbers(current);
+                }
+
                 bool assertionPropagationChanged = false;
                 if (_options.EnableAssertionPropagation)
                 {
-                    var assertions = SsaAssertionPropagator.OptimizeMethod(current, _nextSyntheticTreeId);
+                    var assertions = SsaAssertionPropagator.OptimizeMethod(
+                        current,
+                        _nextSyntheticTreeId,
+                        _options.Validate);
                     _nextSyntheticTreeId = Math.Max(_nextSyntheticTreeId, assertions.NextSyntheticTreeId);
                     assertionPropagationChanged = assertions.Changed;
-                    if (assertionPropagationChanged)
-                        current = WithBlocks(current, assertions.Blocks);
+                    current = assertions.Method;
                 }
 
-                bool scalarCleanupChanged = false;
-                if (_options.EnableConstantPropagation ||
-                    _options.EnableConstantFolding)
+                bool rangeCheckAnalysisChanged = false;
+                if (_options.EnableAssertionPropagation && _options.EnableRangeCheckAnalysis)
                 {
-                    current = RunScalarCleanupFixedPoint(current, out scalarCleanupChanged);
+                    current = EnsureValueNumbers(current);
+                    var facts = SsaAssertionPropagator.AnalyzeMethod(current);
+                    var ranges = SsaRangeCheckAnalyzer.OptimizeMethod(
+                        current,
+                        facts,
+                        _options.RangeCheckOperationBudget,
+                        _options.RangeCheckMaximumSearchDepth);
+                    rangeCheckAnalysisChanged = ranges.Changed;
+                    if (rangeCheckAnalysisChanged)
+                        current = WithBlocks(current, ranges.Blocks);
                 }
 
-                if ((assertionPropagationChanged || scalarCleanupChanged) &&
+                if ((assertionPropagationChanged || rangeCheckAnalysisChanged) &&
                     (_options.EnableRedundantBranchOptimization ||
                      _options.EnableBranchJumpThreading ||
                      _options.EnableDeadCodeElimination) &&
@@ -249,7 +185,8 @@ namespace Cnidaria.Cs
                         oldBlock.Flags,
                         statements.ToImmutable(),
                         oldBlock.SuccessorBlockIds,
-                        oldBlock.SuccessorPcs));
+                        oldBlock.SuccessorPcs,
+                        oldBlock.RegionPc));
                 }
 
                 var rewritten = method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
@@ -297,11 +234,15 @@ namespace Cnidaria.Cs
                     convKind: node.ConvKind,
                     convFlags: node.ConvFlags,
                     targetPc: node.TargetPc,
-                    targetBlockId: node.TargetBlockId);
+                    targetBlockId: node.TargetBlockId,
+                    boundsCheckIndexOverride: node.BoundsCheckIndexOverride);
                 clone.LocalDescriptor = node.LocalDescriptor;
                 clone.CseNumber = node.CseNumber;
                 return clone;
             }
+
+            private static bool TryGetSourceConstant(GenTree source, out GenTreeConstantValue constant)
+                => GenTreeFolder.TryGetConstant(source, out constant);
 
             private SsaMethod RunCopyPropagation(SsaMethod method)
             {
@@ -312,34 +253,6 @@ namespace Cnidaria.Cs
                     ? EnsureValueNumbers(WithBlocks(method, copyPropagation.Blocks))
                     : method;
             }
-
-            private SsaMethod RunScalarCleanupFixedPoint(SsaMethod method, out bool changed)
-            {
-                changed = false;
-                var current = EnsureValueNumbers(method);
-                int maxPasses = Math.Max(0, _options.MaxScalarCleanupPasses);
-
-                for (int pass = 0; pass < maxPasses; pass++)
-                {
-                    current = EnsureValueNumbers(current);
-                    var pointLiveness = SsaLocalLiveness.Build(current);
-                    var facts = ComputeFacts(current);
-                    var rewrite = Rewrite(current, facts, pointLiveness);
-                    var afterRewrite = rewrite.Changed
-                        ? WithBlocks(current, rewrite.Blocks)
-                        : current;
-
-                    if (!rewrite.Changed)
-                        return EnsureValueNumbers(afterRewrite);
-
-                    changed = true;
-                    current = afterRewrite;
-                }
-
-                return EnsureValueNumbers(current);
-            }
-
-
 
             private readonly struct FlowOptimizationResult
             {
@@ -387,21 +300,6 @@ namespace Cnidaria.Cs
 
             private SsaMethod RebuildSsaAfterFlowRewrite(SsaMethod previous, GenTreeMethod rewritten)
                 => RebuildSsaAfterGenTreeRewrite(previous, rewritten);
-
-            private static bool HasExceptionEdges(ControlFlowGraph cfg)
-            {
-                for (int b = 0; b < cfg.Blocks.Length; b++)
-                {
-                    var successors = cfg.Blocks[b].Successors;
-                    for (int s = 0; s < successors.Length; s++)
-                    {
-                        if (successors[s].Kind == CfgEdgeKind.Exception)
-                            return true;
-                    }
-                }
-
-                return false;
-            }
 
             private sealed class RedundantBranchOptimizer
             {
@@ -1051,7 +949,8 @@ namespace Cnidaria.Cs
                         convKind: tree.ConvKind,
                         convFlags: tree.ConvFlags,
                         targetPc: targetPc,
-                        targetBlockId: targetBlockId);
+                        targetBlockId: targetBlockId,
+                        boundsCheckIndexOverride: tree.BoundsCheckIndexOverride);
                 }
 
                 private bool TryBuildBranchInfo(SsaBlock ssaBlock, out BranchInfo branch)
@@ -1478,7 +1377,7 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                private bool TryEvaluateSsaTreeWithSubstitution(SsaTree tree, LocalConstSubstitution substitution, out ConstValue constant)
+                private bool TryEvaluateSsaTreeWithSubstitution(SsaTree tree, LocalConstSubstitution substitution, out GenTreeConstantValue constant)
                 {
                     if (TryGetSourceConstant(tree.Source, out constant))
                         return true;
@@ -1514,7 +1413,7 @@ namespace Cnidaria.Cs
                     if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
                     {
                         if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
-                            TryFoldUnary(tree.Source, operand, out constant))
+                            GenTreeFolder.TryFoldUnary(tree.Source, operand, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1530,7 +1429,7 @@ namespace Cnidaria.Cs
 
                         if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var left) &&
                             TryEvaluateSsaTreeWithSubstitution(tree.Operands[1], substitution, out var right) &&
-                            TryFoldBinary(tree.Source, left, right, out constant))
+                            GenTreeFolder.TryFoldBinary(tree.Source, tree.Operands[0].Source, left, right, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1538,7 +1437,7 @@ namespace Cnidaria.Cs
                     else if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
                     {
                         if (TryEvaluateSsaTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
-                            TryFoldConversion(tree.Source, operand, out constant))
+                            GenTreeFolder.TryFoldConversion(tree.Source, operand, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1548,7 +1447,7 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                private bool TryEvaluateTreeAsConstant(GenTree tree, out ConstValue constant)
+                private bool TryEvaluateTreeAsConstant(GenTree tree, out GenTreeConstantValue constant)
                 {
                     if (TryGetSourceConstant(tree, out constant))
                         return true;
@@ -1568,7 +1467,7 @@ namespace Cnidaria.Cs
                     return TryEvaluateTreeWithSubstitution(tree, default, out constant);
                 }
 
-                private bool TryEvaluateTreeWithSubstitution(GenTree tree, LocalConstSubstitution substitution, out ConstValue constant)
+                private bool TryEvaluateTreeWithSubstitution(GenTree tree, LocalConstSubstitution substitution, out GenTreeConstantValue constant)
                 {
                     if (TryGetSourceConstant(tree, out constant))
                         return true;
@@ -1591,7 +1490,7 @@ namespace Cnidaria.Cs
                     if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
                     {
                         if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
-                            TryFoldUnary(tree, operand, out constant))
+                            GenTreeFolder.TryFoldUnary(tree, operand, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1607,7 +1506,7 @@ namespace Cnidaria.Cs
 
                         if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var left) &&
                             TryEvaluateTreeWithSubstitution(tree.Operands[1], substitution, out var right) &&
-                            TryFoldBinary(tree, left, right, out constant))
+                            GenTreeFolder.TryFoldBinary(tree, tree.Operands[0], left, right, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1615,7 +1514,7 @@ namespace Cnidaria.Cs
                     else if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
                     {
                         if (TryEvaluateTreeWithSubstitution(tree.Operands[0], substitution, out var operand) &&
-                            TryFoldConversion(tree, operand, out constant))
+                            GenTreeFolder.TryFoldConversion(tree, operand, _method.GenTreeMethod.Target, out constant))
                         {
                             return true;
                         }
@@ -1784,7 +1683,7 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                private bool TryGetConstantFromDescriptor(SsaDescriptor descriptor, out ConstValue constant)
+                private bool TryGetConstantFromDescriptor(SsaDescriptor descriptor, out GenTreeConstantValue constant)
                 {
                     constant = default;
                     if (_method.ValueNumbers is null)
@@ -1800,20 +1699,20 @@ namespace Cnidaria.Cs
                     switch (key.Kind)
                     {
                         case ValueNumberConstantKind.Int32:
-                            constant = ConstValue.ForI4((int)key.A);
+                            constant = GenTreeConstantValue.ForI4((int)key.A);
                             return true;
                         case ValueNumberConstantKind.Int64:
-                            constant = ConstValue.ForI8(key.A);
+                            constant = GenTreeConstantValue.ForI8(key.A);
                             return true;
                         case ValueNumberConstantKind.Null:
-                            constant = ConstValue.Null;
+                            constant = GenTreeConstantValue.Null;
                             return true;
                         default:
                             return false;
                     }
                 }
 
-                private bool TryGetConstantFromValueNumber(ValueNumber vn, out ConstValue constant)
+                private bool TryGetConstantFromValueNumber(ValueNumber vn, out GenTreeConstantValue constant)
                 {
                     constant = default;
                     if (_method.ValueNumbers is null)
@@ -1829,30 +1728,30 @@ namespace Cnidaria.Cs
                     switch (key.Kind)
                     {
                         case ValueNumberConstantKind.Int32:
-                            constant = ConstValue.ForI4((int)key.A);
+                            constant = GenTreeConstantValue.ForI4((int)key.A);
                             return true;
                         case ValueNumberConstantKind.Int64:
-                            constant = ConstValue.ForI8(key.A);
+                            constant = GenTreeConstantValue.ForI8(key.A);
                             return true;
                         case ValueNumberConstantKind.Null:
-                            constant = ConstValue.Null;
+                            constant = GenTreeConstantValue.Null;
                             return true;
                         default:
                             return false;
                     }
                 }
 
-                private static bool TryConvertConstantToBoolean(ConstValue constant, out bool value)
+                private static bool TryConvertConstantToBoolean(GenTreeConstantValue constant, out bool value)
                 {
                     switch (constant.Kind)
                     {
-                        case ConstKind.I4:
+                        case GenTreeConstantKind.I4:
                             value = constant.I4 != 0;
                             return true;
-                        case ConstKind.I8:
+                        case GenTreeConstantKind.I8:
                             value = constant.I8 != 0;
                             return true;
-                        case ConstKind.Null:
+                        case GenTreeConstantKind.Null:
                             value = false;
                             return true;
                         default:
@@ -2205,7 +2104,8 @@ namespace Cnidaria.Cs
                             edit.Original.Flags,
                             edit.Statements,
                             edit.Successors,
-                            edit.SuccessorPcs));
+                            edit.SuccessorPcs,
+                            edit.Original.RegionPc));
                     }
 
                     return builder.ToImmutable();
@@ -2295,7 +2195,8 @@ namespace Cnidaria.Cs
                             RemapBlockFlags(old.Flags, oldId, newId),
                             statements,
                             successors,
-                            SuccessorPcsFor(successors, blocks, map)));
+                            SuccessorPcsFor(successors, blocks, map),
+                            old.RegionPc));
                     }
 
                     return builder.ToImmutable();
@@ -2415,7 +2316,8 @@ namespace Cnidaria.Cs
                         convKind: tree.ConvKind,
                         convFlags: tree.ConvFlags,
                         targetPc: mappedTargetPc,
-                        targetBlockId: mappedTarget);
+                        targetBlockId: mappedTarget,
+                        boundsCheckIndexOverride: tree.BoundsCheckIndexOverride);
                 }
 
                 private static GenTreeBlockFlags RemapBlockFlags(GenTreeBlockFlags flags, int oldId, int newId)
@@ -2475,7 +2377,8 @@ namespace Cnidaria.Cs
                         convKind: tree.ConvKind,
                         convFlags: tree.ConvFlags,
                         targetPc: TargetPc(targetBlockId),
-                        targetBlockId: targetBlockId);
+                        targetBlockId: targetBlockId,
+                        boundsCheckIndexOverride: tree.BoundsCheckIndexOverride);
 
                 private ImmutableArray<GenTree> GetStatements(int blockId)
                     => _edits.TryGetValue(blockId, out var edit)
@@ -2580,10 +2483,10 @@ namespace Cnidaria.Cs
                 private readonly struct LocalConstSubstitution
                 {
                     public readonly SsaSlot Slot;
-                    public readonly ConstValue Constant;
+                    public readonly GenTreeConstantValue Constant;
                     public readonly bool IsValid;
 
-                    public LocalConstSubstitution(SsaSlot slot, ConstValue constant)
+                    public LocalConstSubstitution(SsaSlot slot, GenTreeConstantValue constant)
                     {
                         Slot = slot;
                         Constant = constant;
@@ -2864,10 +2767,10 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private OptimizationResult CopyPropagate(SsaMethod method, SsaLocalLiveness pointLiveness)
+            private (ImmutableArray<SsaBlock> Blocks, bool Changed) CopyPropagate(SsaMethod method, SsaLocalLiveness pointLiveness)
             {
                 if (method.ValueNumbers is null)
-                    return new OptimizationResult(method.Blocks, changed: false);
+                    return (method.Blocks, Changed: false);
 
                 var availability = new SsaAvailability(method);
                 var blocks = new SsaBlock[method.Blocks.Length];
@@ -2896,7 +2799,7 @@ namespace Cnidaria.Cs
                         blocks[i] = method.Blocks[i];
                 }
 
-                return new OptimizationResult(ImmutableArray.Create(blocks), changed);
+                return (ImmutableArray.Create(blocks), changed);
 
                 void VisitBlock(int blockId)
                 {
@@ -3232,864 +3135,23 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private Dictionary<SsaValueName, ValueFact> ComputeFacts(SsaMethod method)
-            {
-                method = EnsureValueNumbers(method);
-
-                var facts = new Dictionary<SsaValueName, ValueFact>();
-                for (int i = 0; i < method.ValueDefinitions.Length; i++)
-                    facts[method.ValueDefinitions[i].Name] = ValueFact.Unknown;
-
-                if (method.ValueNumbers is null)
-                    return facts;
-
-                if (_options.EnableConstantPropagation)
-                {
-                    for (int i = 0; i < method.ValueDefinitions.Length; i++)
-                    {
-                        var name = method.ValueDefinitions[i].Name;
-                        if (TryGetSsaConstant(method, name, out var constant))
-                            SetFact(facts, name, ValueFact.ForConstant(constant));
-                    }
-                }
-
-                return facts;
-            }
-
-            private bool SetFact(Dictionary<SsaValueName, ValueFact> facts, SsaValueName name, ValueFact fact)
-            {
-                if (!facts.TryGetValue(name, out var current))
-                {
-                    facts.Add(name, fact);
-                    return true;
-                }
-
-                if (current.Equals(fact))
-                    return false;
-
-                facts[name] = fact;
-                return true;
-            }
-
-            private ValueFact EvaluateTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts)
-            {
-                if (tree.Value.HasValue)
-                    return NormalizeValue(tree.Value.Value, facts);
-
-                if (TryGetSourceConstant(tree.Source, out var sourceConstant))
-                    return ValueFact.ForConstant(sourceConstant);
-
-                if (_options.EnableConstantFolding && TryGetTreeConstant(method, tree, out var vnConstant))
-                    return ValueFact.ForConstant(vnConstant);
-
-                if (!_options.EnableConstantFolding)
-                    return ValueFact.Unknown;
-
-                if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
-                {
-                    var operand = EvaluateTree(method, tree.Operands[0], facts);
-                    if (operand.Kind == ValueFactKind.Constant && TryFoldUnary(tree.Source, operand.Constant, out var folded))
-                        return ValueFact.ForConstant(folded);
-                }
-
-                if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
-                {
-                    var left = EvaluateTree(method, tree.Operands[0], facts);
-                    var right = EvaluateTree(method, tree.Operands[1], facts);
-                    if (left.Kind == ValueFactKind.Constant
-                        && right.Kind == ValueFactKind.Constant && TryFoldBinary(tree.Source, left.Constant, right.Constant, out var folded))
-                        return ValueFact.ForConstant(folded);
-                }
-
-                if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
-                {
-                    var operand = EvaluateTree(method, tree.Operands[0], facts);
-                    if (operand.Kind == ValueFactKind.Constant && TryFoldConversion(tree.Source, operand.Constant, out var folded))
-                        return ValueFact.ForConstant(folded);
-                }
-
-                return ValueFact.Unknown;
-            }
-
-            private ValueFact NormalizeValue(SsaValueName name, Dictionary<SsaValueName, ValueFact> facts)
-            {
-                return facts.TryGetValue(name, out var fact) && fact.Kind == ValueFactKind.Constant
-                    ? fact
-                    : ValueFact.Unknown;
-            }
-
             private SsaMethod EnsureValueNumbers(SsaMethod method)
                 => method.ValueNumbers is null ? SsaValueNumbering.BuildMethod(method, validate: _options.Validate) : method;
 
-            private bool TryGetSsaConstant(SsaMethod method, SsaValueName name, out ConstValue constant)
+            private SsaMethod RebuildValueNumbers(SsaMethod method)
             {
-                constant = default;
-                if (!TryGetSsaValueNumber(method, name, out var vn))
-                    return false;
-                return TryGetConstantFromValueNumber(method, vn, out constant);
-            }
-
-            private bool TryGetTreeConstant(SsaMethod method, SsaTree tree, out ConstValue constant)
-            {
-                constant = default;
-
-                if (tree.Value.HasValue)
-                    return TryGetSsaConstant(method, tree.Value.Value, out constant);
-
-                if (tree.Source is null || method.ValueNumbers is null)
-                    return false;
-
-                if (tree.Source.CanThrow)
-                    return false;
-
-                if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
-                    return false;
-
-                return TryGetConstantFromValueNumber(method, NormalValueNumber(method, pair.Conservative), out constant);
-            }
-
-            private static bool TryGetSsaValueNumber(SsaMethod method, SsaValueName name, out ValueNumber vn)
-            {
-                vn = ValueNumberStore.NoVN;
-                if (!method.TryGetSsaDescriptor(name, out var descriptor))
-                    return false;
-
-                vn = NormalValueNumber(method, descriptor.ValueNumbers.Conservative);
-                return vn.IsValid;
-            }
-
-            private bool TryGetTreeValueNumber(SsaMethod method, SsaTree tree, out ValueNumber vn)
-            {
-                vn = ValueNumberStore.NoVN;
-
-                if (tree.Value.HasValue)
-                    return TryGetSsaValueNumber(method, tree.Value.Value, out vn);
-
-                if (method.ValueNumbers is null || tree.Source is null)
-                    return false;
-
-                if (!method.ValueNumbers.TryGetTreeValue(tree.Source, out var pair))
-                    return false;
-
-                vn = NormalValueNumber(method, pair.Conservative);
-                return vn.IsValid;
-            }
-
-            private bool TryGetConstantFromValueNumber(SsaMethod method, ValueNumber vn, out ConstValue constant)
-            {
-                constant = default;
-                if (method.ValueNumbers is null || !vn.IsValid)
-                    return false;
-
-                vn = NormalValueNumber(method, vn);
-                if (!vn.IsValid)
-                    return false;
-
-                if (!method.ValueNumbers.Store.TryGetConstant(vn, out var key))
-                    return false;
-
-                switch (key.Kind)
-                {
-                    case ValueNumberConstantKind.Int32:
-                        constant = ConstValue.ForI4((int)key.A);
-                        return true;
-                    case ValueNumberConstantKind.Int64:
-                        constant = ConstValue.ForI8(key.A);
-                        return true;
-                    case ValueNumberConstantKind.Null:
-                        constant = ConstValue.Null;
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-
-            private bool SameValueNumber(SsaMethod method, SsaTree left, SsaTree right)
-            {
-                return TryGetTreeValueNumber(method, left, out var leftVn) &&
-                       TryGetTreeValueNumber(method, right, out var rightVn) &&
-                       leftVn.IsValid &&
-                       leftVn == rightVn;
-            }
-
-            private static bool CanReplaceWithConstant(GenTree template, ConstValue constant)
-            {
-                if (template.CanThrow)
-                    return false;
-                if (constant.Kind == ConstKind.Null)
-                    return template.StackKind is GenStackKind.Ref or GenStackKind.Null;
-
-                return IsIntegerLike(template.StackKind);
-            }
-
-            private OptimizationResult Rewrite(SsaMethod method, Dictionary<SsaValueName, ValueFact> facts, SsaLocalLiveness pointLiveness)
-            {
-                bool changed = false;
-                var blocks = ImmutableArray.CreateBuilder<SsaBlock>(method.Blocks.Length);
-
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var block = method.Blocks[b];
-                    var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
-                    phis.AddRange(block.Phis);
-
-                    var statements = ImmutableArray.CreateBuilder<SsaTree>(block.Statements.Length);
-                    var statementTreeLists = ImmutableArray.CreateBuilder<ImmutableArray<SsaTree>>(block.Statements.Length);
-                    for (int s = 0; s < block.Statements.Length; s++)
-                    {
-                        var rewritten = RewriteStatement(method, block.Statements[s], block.StatementTreeLists[s], facts, pointLiveness, block.Id, s, ref changed);
-                        statements.Add(rewritten.Root);
-                        statementTreeLists.Add(rewritten.TreeList);
-                    }
-
-                    blocks.Add(new SsaBlock(
-                        block.CfgBlock,
-                        phis.ToImmutable(),
-                        statements.ToImmutable(),
-                        block.MemoryPhis,
-                        block.MemoryIn,
-                        block.MemoryOut,
-                        statementTreeLists: statementTreeLists.ToImmutable()));
-                }
-
-                return new OptimizationResult(blocks.ToImmutable(), changed);
-            }
-
-            private bool PhiIsTrivial(SsaPhi phi, Dictionary<SsaValueName, ValueFact> facts)
-            {
-                if (!_options.EnableConstantPropagation)
-                    return false;
-
-                var fact = NormalizeValue(phi.Target, facts);
-                return fact.Kind == ValueFactKind.Constant;
-            }
-
-            private (SsaTree Root, ImmutableArray<SsaTree> TreeList) RewriteStatement(
-                SsaMethod method,
-                SsaTree root,
-                ImmutableArray<SsaTree> treeList,
-                Dictionary<SsaValueName, ValueFact> facts,
-                SsaLocalLiveness pointLiveness,
-                int blockId,
-                int statementIndex,
-                ref bool changed)
-            {
-                if (treeList.IsDefaultOrEmpty)
-                {
-                    var recursivelyRewritten = RewriteTreeRecursive(method, root, facts, pointLiveness, blockId, statementIndex, ref changed);
-                    return (recursivelyRewritten, SsaTreeLinearOrder.BuildStatement(recursivelyRewritten));
-                }
-
-                var rewrittenByTree = new Dictionary<SsaTree, SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-                var draftTreeList = ImmutableArray.CreateBuilder<SsaTree>(treeList.Length + 4);
-                var appended = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-                bool statementChanged = false;
-
-                for (int i = 0; i < treeList.Length; i++)
-                {
-                    var tree = treeList[i];
-                    var candidate = RebuildSsaTreeWithRewrittenOperands(tree, rewrittenByTree, ref statementChanged);
-                    var rewritten = RewriteTreeNode(method, candidate, facts, pointLiveness, blockId, statementIndex, ref statementChanged);
-                    rewrittenByTree[tree] = rewritten;
-                    AppendTreePreservingExistingOrder(rewritten, appended, draftTreeList);
-                }
-
-                if (statementChanged)
-                    changed = true;
-
-                var rewrittenRoot = rewrittenByTree.TryGetValue(root, out var foundRoot) ? foundRoot : root;
-                var finalTreeList = ProjectReachableTreeList(rewrittenRoot, draftTreeList.ToImmutable());
-                return (rewrittenRoot, finalTreeList);
-            }
-
-            private SsaTree RewriteTreeRecursive(
-                SsaMethod method,
-                SsaTree tree,
-                Dictionary<SsaValueName, ValueFact> facts,
-                SsaLocalLiveness pointLiveness,
-                int blockId,
-                int statementIndex,
-                ref bool changed)
-            {
-                var operands = ImmutableArray.CreateBuilder<SsaTree>(tree.Operands.Length);
-                bool operandChanged = false;
-                for (int i = 0; i < tree.Operands.Length; i++)
-                {
-                    var rewritten = RewriteTreeRecursive(method, tree.Operands[i], facts, pointLiveness, blockId, statementIndex, ref changed);
-                    if (!ReferenceEquals(rewritten, tree.Operands[i]))
-                        operandChanged = true;
-                    operands.Add(rewritten);
-                }
-
-                var candidate = operandChanged
-                    ? new SsaTree(
-                        tree.Source,
-                        operands.ToImmutable(),
-                        tree.Value,
-                        tree.StoreTarget,
-                        tree.LocalFieldBaseValue,
-                        tree.LocalField,
-                        tree.MemoryUses,
-                        tree.MemoryDefinitions)
-                    : tree;
-
-                return RewriteTreeNode(method, candidate, facts, pointLiveness, blockId, statementIndex, ref changed);
-            }
-
-            private SsaTree RewriteTreeNode(
-                SsaMethod method,
-                SsaTree candidate,
-                Dictionary<SsaValueName, ValueFact> facts,
-                SsaLocalLiveness pointLiveness,
-                int blockId,
-                int statementIndex,
-                ref bool changed)
-            {
-                if (candidate.Value.HasValue)
-                {
-                    var fact = NormalizeValue(candidate.Value.Value, facts);
-                    if (_options.EnableConstantPropagation && fact.Kind == ValueFactKind.Constant && CanReplaceWithConstant(candidate.Source, fact.Constant))
-                    {
-                        changed = true;
-                        return new SsaTree(CreateConstantTree(candidate.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
-                    }
-
-                    return candidate;
-                }
-
-                if (TrySimplifyTree(method, candidate, facts, out var simplified))
-                {
-                    if (CanUseReplacementTreeAt(method, pointLiveness, candidate, simplified, blockId, statementIndex))
-                    {
-                        changed = true;
-                        return simplified;
-                    }
-                }
-
-                if (_options.EnableConstantFolding && !candidate.StoreTarget.HasValue && ProducesValue(candidate.Source) && !HasObservableEffect(candidate))
-                {
-                    var fact = EvaluateTree(method, candidate, facts);
-                    if (fact.Kind == ValueFactKind.Constant &&
-                        !TryGetSourceConstant(candidate.Source, out _) &&
-                        CanReplaceWithConstant(candidate.Source, fact.Constant))
-                    {
-                        changed = true;
-                        return new SsaTree(CreateConstantTree(candidate.Source, fact.Constant), ImmutableArray<SsaTree>.Empty);
-                    }
-                }
-
-                return candidate;
-            }
-
-            private static void AppendTreePreservingExistingOrder(
-                SsaTree tree,
-                HashSet<SsaTree> appended,
-                ImmutableArray<SsaTree>.Builder builder)
-            {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    AppendTreePreservingExistingOrder(tree.Operands[i], appended, builder);
-
-                if (appended.Add(tree))
-                    builder.Add(tree);
-            }
-
-            private static ImmutableArray<SsaTree> ProjectReachableTreeList(SsaTree root, ImmutableArray<SsaTree> candidateOrder)
-            {
-                var reachable = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-                MarkReachable(root, reachable);
-
-                var builder = ImmutableArray.CreateBuilder<SsaTree>(reachable.Count);
-                var appended = new HashSet<SsaTree>(ReferenceEqualityComparer<SsaTree>.Instance);
-
-                for (int i = 0; i < candidateOrder.Length; i++)
-                {
-                    var tree = candidateOrder[i];
-                    if (reachable.Contains(tree) && appended.Add(tree))
-                        builder.Add(tree);
-                }
-
-                AppendMissingReachable(root, reachable, appended, builder);
-
-                if (builder.Count == 0 || !ReferenceEquals(builder[builder.Count - 1], root))
-                {
-                    if (!appended.Contains(root))
-                    {
-                        appended.Add(root);
-                        builder.Add(root);
-                    }
-                    else
-                    {
-                        throw new InvalidOperationException($"SSA rewritten statement tree-list root is not last for node {root.Source.Id}.");
-                    }
-                }
-
-                return builder.ToImmutable();
-            }
-
-            private static void MarkReachable(SsaTree tree, HashSet<SsaTree> reachable)
-            {
-                if (!reachable.Add(tree))
-                    return;
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    MarkReachable(tree.Operands[i], reachable);
-            }
-
-            private static void AppendMissingReachable(
-                SsaTree tree,
-                HashSet<SsaTree> reachable,
-                HashSet<SsaTree> appended,
-                ImmutableArray<SsaTree>.Builder builder)
-            {
-                if (!reachable.Contains(tree) || appended.Contains(tree))
-                    return;
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    AppendMissingReachable(tree.Operands[i], reachable, appended, builder);
-
-                if (appended.Add(tree))
-                    builder.Add(tree);
-            }
-
-            private bool CanUseReplacementTreeAt(
-                SsaMethod method,
-                SsaLocalLiveness pointLiveness,
-                SsaTree useSite,
-                SsaTree replacement,
-                int blockId,
-                int statementIndex)
-            {
-                if (ReferenceEquals(useSite, replacement))
-                    return true;
-
-                var requiredSlots = new HashSet<SsaSlot>();
-                CollectReplacementLocalUses(replacement, requiredSlots);
-                if (requiredSlots.Count == 0)
-                    return true;
-
-                foreach (var slot in requiredSlots)
-                {
-                    if (!pointLiveness.IsLiveBeforeTree(blockId, statementIndex, useSite.Source.Id, slot))
-                        return false;
-                }
-
-                return true;
-            }
-
-            private static void CollectReplacementLocalUses(SsaTree tree, HashSet<SsaSlot> slots)
-            {
-                if (tree.Value.HasValue)
-                    slots.Add(tree.Value.Value.Slot);
-
-                if (tree.LocalFieldBaseValue.HasValue)
-                    slots.Add(tree.LocalFieldBaseValue.Value.Slot);
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                    CollectReplacementLocalUses(tree.Operands[i], slots);
-            }
-
-            private bool HasObservableEffect(SsaTree tree)
-            {
-                if (tree.HasMemoryEffects)
-                    return true;
-
-                if (tree.Value.HasValue)
-                    return false;
-
-                if (tree.StoreTarget.HasValue)
-                    return StoreRhsHasObservableEffect(tree);
-
-                switch (tree.Kind)
-                {
-                    case GenTreeKind.ConstI4:
-                    case GenTreeKind.ConstI8:
-                    case GenTreeKind.ConstR4Bits:
-                    case GenTreeKind.ConstR8Bits:
-                    case GenTreeKind.ConstNull:
-                    case GenTreeKind.ConstString:
-                    case GenTreeKind.DefaultValue:
-                    case GenTreeKind.SizeOf:
-                    case GenTreeKind.Local:
-                    case GenTreeKind.Arg:
-                    case GenTreeKind.Temp:
-                    case GenTreeKind.TempAddr:
-                        return false;
-                }
-
-                var flags = tree.Source.Flags;
-                if ((flags & (GenTreeFlags.ContainsCall |
-                              GenTreeFlags.CanThrow |
-                              GenTreeFlags.SideEffect |
-                              GenTreeFlags.MemoryWrite |
-                              GenTreeFlags.ControlFlow |
-                              GenTreeFlags.ExceptionFlow |
-                              GenTreeFlags.Ordered)) != 0)
-                    return true;
-
-                for (int i = 0; i < tree.Operands.Length; i++)
-                {
-                    if (HasObservableEffect(tree.Operands[i]))
-                        return true;
-                }
-
-                return false;
-            }
-
-            private bool StoreRhsHasObservableEffect(SsaTree tree)
-            {
-                for (int i = 0; i < tree.Operands.Length; i++)
-                {
-                    if (HasObservableEffect(tree.Operands[i]))
-                        return true;
-                }
-
-                return false;
-            }
-
-            private bool TrySimplifyTree(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
-            {
-                simplified = null!;
-
-                if (tree.StoreTarget.HasValue || !ProducesValue(tree.Source))
-                    return false;
-
-                if (tree.Kind == GenTreeKind.Unary && tree.Operands.Length == 1)
-                    return TrySimplifyUnary(method, tree, facts, out simplified);
-
-                if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
-                    return TrySimplifyBinary(method, tree, facts, out simplified);
-
-                if (tree.Kind == GenTreeKind.Conv && tree.Operands.Length == 1)
-                    return TrySimplifyConversion(method, tree, facts, out simplified);
-
-                return false;
-            }
-
-            private bool TrySimplifyUnary(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
-            {
-                simplified = null!;
-                var operand = tree.Operands[0];
-                var fact = EvaluateTree(method, operand, facts);
-
-                bool integerLike = IsIntegerLike(tree.Source.StackKind);
-
-                if (integerLike && tree.Source.SourceOp == BytecodeOp.Neg && IsZero(fact))
-                {
-                    simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
-                    return true;
-                }
-
-                if (integerLike && tree.Source.SourceOp == BytecodeOp.Not && IsAllBitsSet(fact))
-                {
-                    simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source));
-                    return true;
-                }
-
-                if (integerLike && operand.Kind == GenTreeKind.Unary && operand.Operands.Length == 1 &&
-                    operand.Source.SourceOp == tree.Source.SourceOp &&
-                    (tree.Source.SourceOp == BytecodeOp.Neg || tree.Source.SourceOp == BytecodeOp.Not))
-                {
-                    simplified = operand.Operands[0];
-                    return true;
-                }
-
-                return false;
-            }
-
-            private bool TrySimplifyConversion(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
-            {
-                simplified = null!;
-
-                if ((tree.Source.ConvFlags & NumericConvFlags.Checked) != 0)
-                    return false;
-
-                var operand = tree.Operands[0];
-                if (!operand.Value.HasValue)
-                    return false;
-
-                if (!_slotInfos.TryGetValue(operand.Value.Value.Slot, out var operandInfo))
-                    return false;
-
-                if (!IsSemanticallyNoOpConversion(tree.Source.ConvKind, tree.Source.ConvFlags, operandInfo.StackKind))
-                    return false;
-
-                var sourceAbi = MachineAbi.ClassifyStorageValue(operandInfo.Type, operandInfo.StackKind, _target);
-                var destinationAbi = MachineAbi.ClassifyStorageValue(tree.Source.Type, tree.Source.StackKind, _target);
-                if (sourceAbi.PassingKind == destinationAbi.PassingKind &&
-                    sourceAbi.RegisterClass == destinationAbi.RegisterClass &&
-                    sourceAbi.Size == destinationAbi.Size &&
-                    sourceAbi.ContainsGcPointers == destinationAbi.ContainsGcPointers)
-                {
-                    simplified = operand;
-                    return true;
-                }
-
-                return false;
-            }
-
-            private bool IsSemanticallyNoOpConversion(NumericConvKind targetKind, NumericConvFlags flags, GenStackKind sourceStackKind)
-            {
-                if ((flags & NumericConvFlags.Checked) != 0)
-                    return false;
-
-                if (targetKind is NumericConvKind.Bool or
-                    NumericConvKind.I1 or NumericConvKind.U1 or
-                    NumericConvKind.I2 or NumericConvKind.U2 or NumericConvKind.Char)
-                {
-                    return false;
-                }
-
-                if (targetKind is NumericConvKind.I4 or NumericConvKind.U4)
-                    return sourceStackKind == GenStackKind.I4;
-
-                if (targetKind is NumericConvKind.I8 or NumericConvKind.U8)
-                    return sourceStackKind == GenStackKind.I8;
-
-                if (targetKind == NumericConvKind.R4)
-                    return sourceStackKind == GenStackKind.R4;
-
-                if (targetKind == NumericConvKind.R8)
-                    return sourceStackKind == GenStackKind.R8;
-
-                if (targetKind == NumericConvKind.NativeInt)
-                    return sourceStackKind == GenStackKind.NativeInt ||
-                           (_target.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
-
-                if (targetKind == NumericConvKind.NativeUInt)
-                    return sourceStackKind == GenStackKind.NativeUInt ||
-                           sourceStackKind == GenStackKind.Ptr ||
-                           (_target.PointerSize == 4 && sourceStackKind == GenStackKind.I4);
-
-                return false;
-            }
-
-            private bool TrySimplifyBinary(SsaMethod method, SsaTree tree, Dictionary<SsaValueName, ValueFact> facts, out SsaTree simplified)
-            {
-                simplified = null!;
-
-                var left = tree.Operands[0];
-                var right = tree.Operands[1];
-                var leftFact = EvaluateTree(method, left, facts);
-                var rightFact = EvaluateTree(method, right, facts);
-                var op = tree.Source.SourceOp;
-
-                bool integerResult = IsIntegerLike(tree.Source.StackKind);
-                bool comparableOperands = CanFoldComparisonOperands(left.Source.StackKind, right.Source.StackKind);
-                bool orderedOperands = IsIntegerLike(left.Source.StackKind) && IsIntegerLike(right.Source.StackKind);
-
-                switch (op)
-                {
-                    case BytecodeOp.Add:
-                        if (!integerResult) break;
-                        if (IsZero(rightFact)) { simplified = left; return true; }
-                        if (IsZero(leftFact)) { simplified = right; return true; }
-                        break;
-
-                    case BytecodeOp.Sub:
-                        if (!integerResult) break;
-                        if (IsZero(rightFact)) { simplified = left; return true; }
-                        if (SameValue(method, left, right, facts)) { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        break;
-
-                    case BytecodeOp.Mul:
-                        if (!integerResult) break;
-                        if (IsOne(rightFact)) { simplified = left; return true; }
-                        if (IsOne(leftFact)) { simplified = right; return true; }
-                        if (IsZero(rightFact) && !HasObservableEffect(left))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        break;
-
-                    case BytecodeOp.Div:
-                        if (!integerResult) break;
-                        if (IsOne(rightFact)) { simplified = left; return true; }
-                        break;
-
-                    case BytecodeOp.Div_Un:
-                        if (!integerResult) break;
-                        if (IsOne(rightFact)) { simplified = left; return true; }
-                        break;
-
-                    case BytecodeOp.Rem:
-                        if (!integerResult) break;
-                        if (IsOne(rightFact) && !HasObservableEffect(left))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        break;
-
-                    case BytecodeOp.Rem_Un:
-                        if (!integerResult) break;
-                        if (IsOne(rightFact) && !HasObservableEffect(left))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        break;
-
-                    case BytecodeOp.And:
-                        if (!integerResult) break;
-                        if (IsZero(rightFact) && !HasObservableEffect(left))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsZero(leftFact) && !HasObservableEffect(right))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        if (IsAllBitsSet(rightFact)) { simplified = left; return true; }
-                        if (IsAllBitsSet(leftFact)) { simplified = right; return true; }
-                        if (SameValue(method, left, right, facts)) { simplified = left; return true; }
-                        break;
-
-                    case BytecodeOp.Or:
-                        if (!integerResult) break;
-                        if (IsZero(rightFact)) { simplified = left; return true; }
-                        if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (IsAllBitsSet(rightFact) && !HasObservableEffect(left))
-                        { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
-                        if (IsAllBitsSet(leftFact) && !HasObservableEffect(right))
-                        { simplified = CreateConstantSsaTree(tree.Source, AllBitsSetFor(tree.Source)); return true; }
-                        if (SameValue(method, left, right, facts)) { simplified = left; return true; }
-                        break;
-
-                    case BytecodeOp.Xor:
-                        if (!integerResult) break;
-                        if (IsZero(rightFact)) { simplified = left; return true; }
-                        if (IsZero(leftFact)) { simplified = right; return true; }
-                        if (SameValue(method, left, right, facts))
-                        { simplified = CreateConstantSsaTree(tree.Source, ZeroFor(tree.Source)); return true; }
-                        break;
-
-                    case BytecodeOp.Shl:
-                    case BytecodeOp.Shr:
-                    case BytecodeOp.Shr_Un:
-                        if (!integerResult) break;
-                        if (IsEffectiveZeroShift(rightFact, tree.Source.StackKind)) { simplified = left; return true; }
-                        break;
-
-                    case BytecodeOp.Ceq:
-                        if (comparableOperands && SameValue(method, left, right, facts))
-                        { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(1)); return true; }
-                        break;
-
-                    case BytecodeOp.Clt:
-                    case BytecodeOp.Clt_Un:
-                    case BytecodeOp.Cgt:
-                    case BytecodeOp.Cgt_Un:
-                        if (orderedOperands && SameValue(method, left, right, facts))
-                        { simplified = CreateConstantSsaTree(tree.Source, ConstValue.ForI4(0)); return true; }
-                        break;
-                }
-
-                return false;
-            }
-
-            private SsaTree CreateConstantSsaTree(GenTree template, ConstValue value)
-                => new SsaTree(CreateConstantTree(template, value), ImmutableArray<SsaTree>.Empty);
-
-            private bool SameValue(SsaMethod method, SsaTree left, SsaTree right, Dictionary<SsaValueName, ValueFact> facts)
-            {
-                if (SameValueNumber(method, left, right))
-                    return true;
-
-                var leftFact = EvaluateTree(method, left, facts);
-                var rightFact = EvaluateTree(method, right, facts);
-
-                if (leftFact.Kind == ValueFactKind.Constant && rightFact.Kind == ValueFactKind.Constant)
-                    return leftFact.Constant.Equals(rightFact.Constant);
-
-                if (left.Value.HasValue && right.Value.HasValue)
-                    return left.Value.Value.Equals(right.Value.Value);
-
-                return false;
-            }
-
-            private static bool IsZero(ValueFact fact)
-                => fact.Kind == ValueFactKind.Constant &&
-                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == 0 ||
-                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 0);
-
-            private static bool IsOne(ValueFact fact)
-                => fact.Kind == ValueFactKind.Constant &&
-                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == 1 ||
-                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == 1);
-
-            private static bool IsAllBitsSet(ValueFact fact)
-                => fact.Kind == ValueFactKind.Constant &&
-                   (fact.Constant.Kind == ConstKind.I4 && fact.Constant.I4 == -1 ||
-                    fact.Constant.Kind == ConstKind.I8 && fact.Constant.I8 == -1);
-
-            private bool UsesEightByteInteger(GenStackKind stackKind)
-                => stackKind == GenStackKind.I8 ||
-                   ((stackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr) &&
-                    _target.PointerSize == 8);
-
-            private bool IsEffectiveZeroShift(ValueFact fact, GenStackKind stackKind)
-            {
-                if (fact.Kind != ValueFactKind.Constant || fact.Constant.Kind == ConstKind.Null)
-                    return false;
-
-                int mask = UsesEightByteInteger(stackKind) ? 0x3f : 0x1f;
-                int amount = fact.Constant.Kind == ConstKind.I8
-                    ? unchecked((int)fact.Constant.I8)
-                    : fact.Constant.I4;
-
-                return (amount & mask) == 0;
-            }
-
-            private static ConstValue ZeroFor(GenTree template)
-                => template.StackKind == GenStackKind.I8 ? ConstValue.ForI8(0) : ConstValue.ForI4(0);
-
-            private static ConstValue AllBitsSetFor(GenTree template)
-                => template.StackKind == GenStackKind.I8 ? ConstValue.ForI8(-1) : ConstValue.ForI4(-1);
-
-            private GenTree CreateConstantTree(GenTree template, ConstValue constant)
-            {
-                return constant.Kind switch
-                {
-                    ConstKind.I4 => new GenTree(
-                        _nextSyntheticTreeId++,
-                        GenTreeKind.ConstI4,
-                        template.Pc,
-                        BytecodeOp.Ldc_I4,
-                        type: null,
-                        stackKind: GenStackKind.I4,
-                        flags: GenTreeFlags.None,
-                        operands: ImmutableArray<GenTree>.Empty,
-                        int32: constant.I4),
-                    ConstKind.I8 => new GenTree(
-                        _nextSyntheticTreeId++,
-                        GenTreeKind.ConstI8,
-                        template.Pc,
-                        BytecodeOp.Ldc_I8,
-                        type: null,
-                        stackKind: GenStackKind.I8,
-                        flags: GenTreeFlags.None,
-                        operands: ImmutableArray<GenTree>.Empty,
-                        int64: constant.I8),
-                    ConstKind.Null => new GenTree(
-                        _nextSyntheticTreeId++,
-                        GenTreeKind.ConstNull,
-                        template.Pc,
-                        BytecodeOp.Ldnull,
-                        type: template.Type,
-                        stackKind: GenStackKind.Null,
-                        flags: GenTreeFlags.None,
-                        operands: ImmutableArray<GenTree>.Empty),
-                    _ => throw new InvalidOperationException("Unknown SSA constant kind."),
-                };
-            }
-
-            private static bool TryGetSourceConstant(GenTree source, out ConstValue constant)
-            {
-                switch (source.Kind)
-                {
-                    case GenTreeKind.ConstI4:
-                        constant = ConstValue.ForI4(source.Int32);
-                        return true;
-                    case GenTreeKind.ConstI8:
-                        constant = ConstValue.ForI8(source.Int64);
-                        return true;
-                    case GenTreeKind.ConstNull:
-                        constant = ConstValue.Null;
-                        return true;
-                    default:
-                        constant = default;
-                        return false;
-                }
+                var unnumbered = new SsaMethod(
+                    method.GenTreeMethod,
+                    method.Cfg,
+                    method.Slots,
+                    method.InitialValues,
+                    method.ValueDefinitions,
+                    method.Blocks,
+                    valueNumbers: null,
+                    ssaLocalDescriptors: method.SsaLocalDescriptors,
+                    initialMemoryValues: method.InitialMemoryValues,
+                    memoryDefinitions: method.MemoryDefinitions);
+                return SsaValueNumbering.BuildMethod(unnumbered, validate: _options.Validate);
             }
 
             private static bool CanFoldComparisonOperands(GenStackKind left, GenStackKind right)
@@ -4109,483 +3171,11 @@ namespace Cnidaria.Cs
             private static bool IsIntegerLike(GenStackKind stackKind)
                 => stackKind is GenStackKind.I4 or GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
 
-            private static bool TryFoldUnary(GenTree source, ConstValue operand, out ConstValue result)
-            {
-                result = default;
-                if (source.SourceOp == BytecodeOp.Neg)
-                {
-                    if (operand.Kind == ConstKind.I4)
-                    {
-                        result = ConstValue.ForI4(unchecked(-operand.I4));
-                        return true;
-                    }
-                    if (operand.Kind == ConstKind.I8)
-                    {
-                        result = ConstValue.ForI8(unchecked(-operand.I8));
-                        return true;
-                    }
-                }
-
-                if (source.SourceOp == BytecodeOp.Not)
-                {
-                    if (operand.Kind == ConstKind.I4)
-                    {
-                        result = ConstValue.ForI4(~operand.I4);
-                        return true;
-                    }
-                    if (operand.Kind == ConstKind.I8)
-                    {
-                        result = ConstValue.ForI8(~operand.I8);
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-
-            private static bool TryFoldBinary(GenTree source, ConstValue left, ConstValue right, out ConstValue result)
-            {
-                result = default;
-
-                if (left.Kind == ConstKind.Null || right.Kind == ConstKind.Null)
-                {
-                    if (source.SourceOp == BytecodeOp.Ceq)
-                    {
-                        result = ConstValue.ForI4(left.Kind == ConstKind.Null && right.Kind == ConstKind.Null ? 1 : 0);
-                        return true;
-                    }
-                    return false;
-                }
-
-                if (left.Kind == ConstKind.I8 || right.Kind == ConstKind.I8 || source.StackKind == GenStackKind.I8)
-                    return TryFoldBinaryI8(source.SourceOp, left.Kind == ConstKind.I8 ? left.I8 : left.I4, right.Kind == ConstKind.I8 ? right.I8 : right.I4, out result);
-
-                return TryFoldBinaryI4(source.SourceOp, left.I4, right.I4, out result);
-            }
-
-            private static bool TryFoldBinaryI4(BytecodeOp op, int left, int right, out ConstValue result)
-            {
-                result = default;
-                switch (op)
-                {
-                    case BytecodeOp.Add_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI4(checked(left + right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Sub_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI4(checked(left - right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Mul_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI4(checked(left * right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Add_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI4(unchecked((int)checked((uint)left + (uint)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Sub_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI4(unchecked((int)checked((uint)left - (uint)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Mul_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI4(unchecked((int)checked((uint)left * (uint)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Add:
-                        result = ConstValue.ForI4(unchecked(left + right));
-                        return true;
-                    case BytecodeOp.Sub:
-                        result = ConstValue.ForI4(unchecked(left - right));
-                        return true;
-                    case BytecodeOp.Mul:
-                        result = ConstValue.ForI4(unchecked(left * right));
-                        return true;
-                    case BytecodeOp.Div:
-                        if (right == 0 || (left == int.MinValue && right == -1)) return false;
-                        result = ConstValue.ForI4(left / right);
-                        return true;
-                    case BytecodeOp.Div_Un:
-                        if (right == 0) return false;
-                        result = ConstValue.ForI4(unchecked((int)((uint)left / (uint)right)));
-                        return true;
-                    case BytecodeOp.Rem:
-                        if (right == 0 || (left == int.MinValue && right == -1)) return false;
-                        result = ConstValue.ForI4(left % right);
-                        return true;
-                    case BytecodeOp.Rem_Un:
-                        if (right == 0) return false;
-                        result = ConstValue.ForI4(unchecked((int)((uint)left % (uint)right)));
-                        return true;
-                    case BytecodeOp.And:
-                        result = ConstValue.ForI4(left & right);
-                        return true;
-                    case BytecodeOp.Or:
-                        result = ConstValue.ForI4(left | right);
-                        return true;
-                    case BytecodeOp.Xor:
-                        result = ConstValue.ForI4(left ^ right);
-                        return true;
-                    case BytecodeOp.Shl:
-                        result = ConstValue.ForI4(left << (right & 31));
-                        return true;
-                    case BytecodeOp.Shr:
-                        result = ConstValue.ForI4(left >> (right & 31));
-                        return true;
-                    case BytecodeOp.Shr_Un:
-                        result = ConstValue.ForI4(unchecked((int)((uint)left >> (right & 31))));
-                        return true;
-                    case BytecodeOp.Ceq:
-                        result = ConstValue.ForI4(left == right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Clt:
-                        result = ConstValue.ForI4(left < right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Clt_Un:
-                        result = ConstValue.ForI4((uint)left < (uint)right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Cgt:
-                        result = ConstValue.ForI4(left > right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Cgt_Un:
-                        result = ConstValue.ForI4((uint)left > (uint)right ? 1 : 0);
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-            private static bool TryFoldBinaryI8(BytecodeOp op, long left, long right, out ConstValue result)
-            {
-                result = default;
-                switch (op)
-                {
-                    case BytecodeOp.Add_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI8(checked(left + right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Sub_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI8(checked(left - right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Mul_Ovf:
-                        try
-                        {
-                            result = ConstValue.ForI8(checked(left * right));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Add_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left + (ulong)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Sub_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left - (ulong)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Mul_Ovf_Un:
-                        try
-                        {
-                            result = ConstValue.ForI8(unchecked((long)checked((ulong)left * (ulong)right)));
-                            return true;
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-                    case BytecodeOp.Add:
-                        result = ConstValue.ForI8(unchecked(left + right));
-                        return true;
-                    case BytecodeOp.Sub:
-                        result = ConstValue.ForI8(unchecked(left - right));
-                        return true;
-                    case BytecodeOp.Mul:
-                        result = ConstValue.ForI8(unchecked(left * right));
-                        return true;
-                    case BytecodeOp.Div:
-                        if (right == 0 || (left == long.MinValue && right == -1)) return false;
-                        result = ConstValue.ForI8(left / right);
-                        return true;
-                    case BytecodeOp.Div_Un:
-                        if (right == 0) return false;
-                        result = ConstValue.ForI8(unchecked((long)((ulong)left / (ulong)right)));
-                        return true;
-                    case BytecodeOp.Rem:
-                        if (right == 0 || (left == long.MinValue && right == -1)) return false;
-                        result = ConstValue.ForI8(left % right);
-                        return true;
-                    case BytecodeOp.Rem_Un:
-                        if (right == 0) return false;
-                        result = ConstValue.ForI8(unchecked((long)((ulong)left % (ulong)right)));
-                        return true;
-                    case BytecodeOp.And:
-                        result = ConstValue.ForI8(left & right);
-                        return true;
-                    case BytecodeOp.Or:
-                        result = ConstValue.ForI8(left | right);
-                        return true;
-                    case BytecodeOp.Xor:
-                        result = ConstValue.ForI8(left ^ right);
-                        return true;
-                    case BytecodeOp.Shl:
-                        result = ConstValue.ForI8(left << ((int)right & 63));
-                        return true;
-                    case BytecodeOp.Shr:
-                        result = ConstValue.ForI8(left >> ((int)right & 63));
-                        return true;
-                    case BytecodeOp.Shr_Un:
-                        result = ConstValue.ForI8(unchecked((long)((ulong)left >> ((int)right & 63))));
-                        return true;
-                    case BytecodeOp.Ceq:
-                        result = ConstValue.ForI4(left == right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Clt:
-                        result = ConstValue.ForI4(left < right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Clt_Un:
-                        result = ConstValue.ForI4((ulong)left < (ulong)right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Cgt:
-                        result = ConstValue.ForI4(left > right ? 1 : 0);
-                        return true;
-                    case BytecodeOp.Cgt_Un:
-                        result = ConstValue.ForI4((ulong)left > (ulong)right ? 1 : 0);
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-
-            private static bool TryFoldConversion(GenTree source, ConstValue operand, out ConstValue result)
-            {
-                result = default;
-                if (operand.Kind == ConstKind.Null)
-                    return false;
-
-                bool isChecked = (source.ConvFlags & NumericConvFlags.Checked) != 0;
-                bool sourceUnsigned = (source.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
-
-                try
-                {
-                    switch (source.ConvKind)
-                    {
-                        case NumericConvKind.I1:
-                            result = ConstValue.ForI4(isChecked
-                                ? checked((sbyte)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4))
-                                : unchecked((sbyte)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.U1:
-                            result = ConstValue.ForI4(isChecked
-                                ? checked((byte)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4))
-                                : unchecked((byte)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.I2:
-                            result = ConstValue.ForI4(isChecked
-                                ? checked((short)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4))
-                                : unchecked((short)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.U2:
-                        case NumericConvKind.Char:
-                            result = ConstValue.ForI4(isChecked
-                                ? checked((ushort)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4))
-                                : unchecked((ushort)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.I4:
-                        case NumericConvKind.Bool:
-                            result = ConstValue.ForI4(isChecked && operand.Kind == ConstKind.I8
-                                ? checked((int)operand.I8)
-                                : unchecked((int)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.U4:
-                            result = ConstValue.ForI4(isChecked
-                                ? unchecked((int)checked((uint)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)))
-                                : unchecked((int)(uint)(operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4)));
-                            return true;
-                        case NumericConvKind.I8:
-                        case NumericConvKind.NativeInt:
-                            result = ConstValue.ForI8(operand.Kind == ConstKind.I8
-                                ? operand.I8
-                                : sourceUnsigned ? (long)(uint)operand.I4 : operand.I4);
-                            return true;
-                        case NumericConvKind.U8:
-                        case NumericConvKind.NativeUInt:
-                            if (sourceUnsigned)
-                            {
-                                result = ConstValue.ForI8(operand.Kind == ConstKind.I8
-                                    ? operand.I8
-                                    : unchecked((long)(uint)operand.I4));
-                            }
-                            else
-                            {
-                                long signed = operand.Kind == ConstKind.I8 ? operand.I8 : operand.I4;
-                                result = ConstValue.ForI8(isChecked
-                                    ? unchecked((long)checked((ulong)signed))
-                                    : unchecked((long)(ulong)signed));
-                            }
-                            return true;
-                        default:
-                            return false;
-                    }
-                }
-                catch (OverflowException)
-                {
-                    return false;
-                }
-            }
-
-            private static bool ProducesValue(GenTree node)
-            {
-                if (node.StackKind == GenStackKind.Void)
-                    return false;
-
-                return node.Kind switch
-                {
-                    GenTreeKind.Nop => false,
-                    GenTreeKind.StoreIndirect => false,
-                    GenTreeKind.StoreLocal => false,
-                    GenTreeKind.StoreArg => false,
-                    GenTreeKind.StoreTemp => false,
-                    GenTreeKind.StoreField => false,
-                    GenTreeKind.StoreStaticField => false,
-                    GenTreeKind.StoreArrayElement => false,
-                    GenTreeKind.Eval => false,
-                    GenTreeKind.Branch => false,
-                    GenTreeKind.BranchTrue => false,
-                    GenTreeKind.BranchFalse => false,
-                    GenTreeKind.Return => false,
-                    GenTreeKind.Throw => false,
-                    GenTreeKind.Rethrow => false,
-                    GenTreeKind.EndFinally => false,
-                    _ => true,
-                };
-            }
-
             private SsaMethod WithBlocks(SsaMethod method, ImmutableArray<SsaBlock> blocks)
-            {
-                var rewrittenBlocks = MaterializeGenTreeBlocks(method.GenTreeMethod.Blocks, blocks);
-                var rewritten = method.GenTreeMethod.CloneWithBlocks(rewrittenBlocks);
-                return RebuildSsaAfterGenTreeRewrite(method, rewritten);
-            }
+                => SsaGenTreeRewriter.WithBlocks(method, blocks, _options.Validate);
 
             private SsaMethod RebuildSsaAfterGenTreeRewrite(SsaMethod previous, GenTreeMethod rewritten)
-            {
-                NormalizeTreeFlags(rewritten);
-
-                bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
-                var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
-                rewritten.AttachFlowGraph(cfg);
-
-                var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
-                rewritten.AttachHirLiveness(liveness);
-
-                var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate: _options.Validate);
-                return EnsureValueNumbers(rebuilt);
-            }
-
-            private static void NormalizeTreeFlags(GenTreeMethod method)
-            {
-                for (int b = 0; b < method.Blocks.Length; b++)
-                {
-                    var statements = method.Blocks[b].Statements;
-                    for (int s = 0; s < statements.Length; s++)
-                        GenTreeMorpher.NormalizeTreeFlags(statements[s], method.Target);
-                }
-            }
-
-            private static ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(ImmutableArray<GenTreeBlock> originalBlocks, ImmutableArray<SsaBlock> ssaBlocks)
-            {
-                if (originalBlocks.Length != ssaBlocks.Length)
-                    throw new InvalidOperationException("SSA block count does not match GenTree block count.");
-
-                var result = ImmutableArray.CreateBuilder<GenTreeBlock>(originalBlocks.Length);
-                for (int i = 0; i < originalBlocks.Length; i++)
-                {
-                    var original = originalBlocks[i];
-                    var ssaBlock = ssaBlocks[i];
-                    if (original.Id != ssaBlock.Id)
-                        throw new InvalidOperationException("SSA block B" + ssaBlock.Id.ToString() + " is not aligned with GenTree block B" + original.Id.ToString() + ".");
-
-                    var statements = ImmutableArray.CreateBuilder<GenTree>(ssaBlock.Statements.Length);
-                    for (int s = 0; s < ssaBlock.Statements.Length; s++)
-                        statements.Add(ssaBlock.Statements[s].Source);
-
-                    result.Add(new GenTreeBlock(
-                        original.Id,
-                        original.StartPc,
-                        original.EndPcExclusive,
-                        original.EntryStackDepth,
-                        original.ExitStackDepth,
-                        original.JumpKind,
-                        original.Flags,
-                        statements.ToImmutable(),
-                        original.SuccessorBlockIds,
-                        original.SuccessorPcs));
-                }
-
-                return result.ToImmutable();
-            }
+                => SsaGenTreeRewriter.RebuildAfterGenTreeRewrite(previous, rewritten, _options.Validate);
 
             private static int MaxTreeId(SsaMethod method)
             {
@@ -4606,6 +3196,205 @@ namespace Cnidaria.Cs
                         Visit(tree.Operands[i]);
                 }
             }
+        }
+    }
+
+    internal static class SsaGenTreeRewriter
+    {
+        public static SsaMethod WithBlocks(
+            SsaMethod method,
+            ImmutableArray<SsaBlock> blocks,
+            bool validate)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            var rewrittenBlocks = MaterializeGenTreeBlocks(method.GenTreeMethod.Blocks, blocks);
+            var rewritten = method.GenTreeMethod.CloneWithBlocks(rewrittenBlocks);
+            return RebuildAfterGenTreeRewrite(method, rewritten, validate);
+        }
+
+        public static SsaMethod WithBlocksPreservingSsa(
+            SsaMethod method,
+            ImmutableArray<SsaBlock> blocks,
+            IReadOnlyDictionary<GenTree, ValueNumberPair> treeValueUpdates,
+            bool validate)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            var valueNumbers = method.ValueNumbers ??
+                throw new InvalidOperationException("SSA-preserving rewrite requires value numbering.");
+            if (treeValueUpdates is null)
+                throw new ArgumentNullException(nameof(treeValueUpdates));
+            if (method.GenTreeMethod.Blocks.Length != blocks.Length)
+                throw new InvalidOperationException("SSA block count does not match GenTree block count.");
+
+            for (int i = 0; i < blocks.Length; i++)
+            {
+                var genBlock = method.GenTreeMethod.Blocks[i];
+                var ssaBlock = blocks[i];
+                if (genBlock.Id != ssaBlock.Id)
+                    throw new InvalidOperationException("SSA block is not aligned with GenTree block.");
+                if (genBlock.Statements.Length != ssaBlock.Statements.Length)
+                    throw new InvalidOperationException("SSA-preserving rewrite cannot change statement count.");
+
+                bool blockChanged = false;
+                for (int s = 0; s < ssaBlock.Statements.Length; s++)
+                {
+                    if (!ReferenceEquals(genBlock.Statements[s], ssaBlock.Statements[s].Source))
+                    {
+                        blockChanged = true;
+                        break;
+                    }
+                }
+
+                if (!blockChanged)
+                    continue;
+
+                var statements = ImmutableArray.CreateBuilder<GenTree>(ssaBlock.Statements.Length);
+                for (int s = 0; s < ssaBlock.Statements.Length; s++)
+                    statements.Add(ssaBlock.Statements[s].Source);
+                genBlock.ReplaceStatementsPreservingFlow(statements.ToImmutable());
+            }
+
+            foreach (var pair in treeValueUpdates)
+                valueNumbers.SetTreeValue(pair.Key, pair.Value);
+
+            RefreshSsaBookkeeping(method, blocks);
+
+            var rewritten = new SsaMethod(
+                method.GenTreeMethod,
+                method.Cfg,
+                method.Slots,
+                method.InitialValues,
+                method.ValueDefinitions,
+                blocks,
+                valueNumbers,
+                method.SsaLocalDescriptors,
+                method.InitialMemoryValues,
+                method.MemoryDefinitions);
+
+            SsaSourceAnnotations.Attach(rewritten);
+            method.GenTreeMethod.AttachSsa(rewritten, optimized: true);
+            if (validate)
+                SsaVerifier.Verify(rewritten);
+            return rewritten;
+        }
+
+        private static void RefreshSsaBookkeeping(SsaMethod method, ImmutableArray<SsaBlock> blocks)
+        {
+            var localDefinitions = new Dictionary<SsaValueName, SsaDescriptor>(method.ValueDefinitions.Length);
+            for (int i = 0; i < method.ValueDefinitions.Length; i++)
+            {
+                var descriptor = method.ValueDefinitions[i].Descriptor;
+                descriptor.ResetUseTracking();
+                localDefinitions[descriptor.Name] = descriptor;
+            }
+
+            var memoryDefinitions = new Dictionary<SsaMemoryValueName, SsaMemoryDescriptor>(method.MemoryDefinitions.Length);
+            for (int i = 0; i < method.MemoryDefinitions.Length; i++)
+            {
+                var descriptor = method.MemoryDefinitions[i].Descriptor;
+                descriptor.ResetUseTracking();
+                memoryDefinitions[descriptor.Name] = descriptor;
+            }
+
+            GenTreeSsaBuilder.AnnotateSsaUses(method.ValueDefinitions, method.MemoryDefinitions, blocks);
+
+            for (int b = 0; b < blocks.Length; b++)
+            {
+                var treeList = blocks[b].TreeList;
+                for (int i = 0; i < treeList.Length; i++)
+                {
+                    var tree = treeList[i].Tree;
+                    if (tree.StoreTarget.HasValue && localDefinitions.TryGetValue(tree.StoreTarget.Value, out var descriptor))
+                        descriptor.DefNode = tree.Source;
+
+                    for (int m = 0; m < tree.MemoryDefinitions.Length; m++)
+                    {
+                        if (memoryDefinitions.TryGetValue(tree.MemoryDefinitions[m], out var memoryDescriptor))
+                            memoryDescriptor.DefNode = tree.Source;
+                    }
+                }
+            }
+        }
+
+        public static SsaMethod RebuildAfterGenTreeRewrite(
+            SsaMethod previous,
+            GenTreeMethod rewritten,
+            bool validate)
+        {
+            if (previous is null)
+                throw new ArgumentNullException(nameof(previous));
+            if (rewritten is null)
+                throw new ArgumentNullException(nameof(rewritten));
+
+            rewritten = GenTreeMorpher.MorphMethod(rewritten, GenTreeMethodPhase.GlobalMorphedHir);
+
+            bool includeExceptionEdges = HasExceptionEdges(previous.Cfg);
+            var cfg = ControlFlowGraph.Build(rewritten, includeExceptionEdges);
+            rewritten.AttachFlowGraph(cfg);
+
+            var liveness = GenTreeLocalLiveness.Build(rewritten, cfg);
+            rewritten.AttachHirLiveness(liveness);
+
+            var rebuilt = GenTreeSsaBuilder.BuildMethod(rewritten, cfg, liveness, validate);
+            return SsaValueNumbering.BuildMethod(rebuilt, validate);
+        }
+
+        private static bool HasExceptionEdges(ControlFlowGraph cfg)
+        {
+            for (int b = 0; b < cfg.Blocks.Length; b++)
+            {
+                var successors = cfg.Blocks[b].Successors;
+                for (int s = 0; s < successors.Length; s++)
+                {
+                    if (successors[s].Kind == CfgEdgeKind.Exception)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static ImmutableArray<GenTreeBlock> MaterializeGenTreeBlocks(
+            ImmutableArray<GenTreeBlock> originalBlocks,
+            ImmutableArray<SsaBlock> ssaBlocks)
+        {
+            if (originalBlocks.Length != ssaBlocks.Length)
+                throw new InvalidOperationException("SSA block count does not match GenTree block count.");
+
+            var result = ImmutableArray.CreateBuilder<GenTreeBlock>(originalBlocks.Length);
+            for (int i = 0; i < originalBlocks.Length; i++)
+            {
+                var original = originalBlocks[i];
+                var ssaBlock = ssaBlocks[i];
+                if (original.Id != ssaBlock.Id)
+                {
+                    throw new InvalidOperationException(
+                        "SSA block B" + ssaBlock.Id.ToString() +
+                        " is not aligned with GenTree block B" + original.Id.ToString() + ".");
+                }
+
+                var statements = ImmutableArray.CreateBuilder<GenTree>(ssaBlock.Statements.Length);
+                for (int s = 0; s < ssaBlock.Statements.Length; s++)
+                    statements.Add(ssaBlock.Statements[s].Source);
+
+                result.Add(new GenTreeBlock(
+                    original.Id,
+                    original.StartPc,
+                    original.EndPcExclusive,
+                    original.EntryStackDepth,
+                    original.ExitStackDepth,
+                    original.JumpKind,
+                    original.Flags,
+                    statements.ToImmutable(),
+                    original.SuccessorBlockIds,
+                    original.SuccessorPcs,
+                    original.RegionPc));
+            }
+
+            return result.ToImmutable();
         }
     }
 

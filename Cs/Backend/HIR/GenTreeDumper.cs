@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
@@ -188,6 +188,7 @@ namespace Cnidaria.Cs
                     TryAppendOperand(sb, node, 1);
                     sb.Append(']');
                     if (node.Kind == GenTreeKind.ArrayElementAddr) sb.Append(".addr");
+                    if (node.HasBoundsCheckIndexOverride) sb.Append(" bc=").Append(node.BoundsCheckIndexOverride);
                     return;
                 case GenTreeKind.StoreArrayElement:
                     TryAppendOperand(sb, node, 0);
@@ -195,6 +196,7 @@ namespace Cnidaria.Cs
                     TryAppendOperand(sb, node, 1);
                     sb.Append("] = ");
                     TryAppendOperand(sb, node, 2);
+                    if (node.HasBoundsCheckIndexOverride) sb.Append(" bc=").Append(node.BoundsCheckIndexOverride);
                     return;
                 case GenTreeKind.ArrayDataRef:
                     sb.Append("arrayDataRef(");
@@ -205,9 +207,14 @@ namespace Cnidaria.Cs
                     sb.Append("staticData(offset=").Append(node.Int32).Append(", length=").Append(node.Int64).Append(')');
                     return;
                 case GenTreeKind.StackAlloc:
-                    sb.Append("stackalloc(size=").Append(node.Int32).Append(", count=");
-                    AppendOperands(sb, node);
-                    sb.Append(')');
+                    if (node.Operands.Length == 0)
+                        sb.Append("stackalloc(bytes=").Append(node.Int64).Append(", elemSize=").Append(node.Int32).Append(')');
+                    else
+                    {
+                        sb.Append("stackalloc(elemSize=").Append(node.Int32).Append(", count=");
+                        AppendOperands(sb, node);
+                        sb.Append(')');
+                    }
                     return;
                 case GenTreeKind.PointerElementAddr:
                     sb.Append("ptrElemAddr(size=").Append(node.Int32).Append(", ");
