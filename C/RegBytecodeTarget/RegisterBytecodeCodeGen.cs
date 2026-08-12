@@ -906,7 +906,7 @@ namespace Cnidaria.C
             private readonly IReadOnlyDictionary<LirBlock, Label> _labels;
             private readonly Dictionary<LirBlock, LirBlock?> _nextBlocks;
             private readonly Assembler _asm;
-            private readonly ParameterState _parameters = new ParameterState();
+            private ParameterState _parameters = new ParameterState();
             private LirBlock? _currentBlock;
 
             public FunctionEmissionContext(
@@ -1807,8 +1807,14 @@ namespace Cnidaria.C
 
             private void EmitBranch(LirInstruction instruction)
             {
+                if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
+                {
+                    EmitComparisonBranch(instruction);
+                    return;
+                }
+
                 if (instruction.Operands.Length != 1)
-                    throw Unsupported(instruction, "Branch expects one condition operand.");
+                    throw Unsupported(instruction, "Branch expects one condition operand or two comparison operands.");
 
                 var trueFallsThrough = IsFallthroughTarget(instruction.TrueTarget);
                 var falseFallsThrough = IsFallthroughTarget(instruction.FalseTarget);
@@ -1845,6 +1851,117 @@ namespace Cnidaria.C
                 if (!falseFallsThrough)
                     _asm.J(LabelOf(instruction.FalseTarget));
             }
+
+            private void EmitComparisonBranch(LirInstruction instruction)
+            {
+                var trueFallsThrough = IsFallthroughTarget(instruction.TrueTarget);
+                var falseFallsThrough = IsFallthroughTarget(instruction.FalseTarget);
+                if (trueFallsThrough && falseFallsThrough)
+                    return;
+
+                var leftType = instruction.Operands[0].Type;
+                var rightType = instruction.Operands[1].Type;
+
+                if (IsFloatType(leftType) || IsFloatType(rightType))
+                {
+                    if (IsLongDouble(leftType) || IsLongDouble(rightType))
+                        throw Unsupported(instruction, "long double comparison branches are not supported by the register-bytecode backend.");
+
+                    var floatType = FloatingBinaryComputationType(leftType, rightType, IsFloatType(leftType) ? leftType : rightType);
+                    var left = LoadOperandForFloatingBinary(instruction.Operands[0], floatType, FpScratch1, GpScratch1, instruction);
+                    var right = LoadOperandForFloatingBinary(instruction.Operands[1], floatType, FpScratch2, GpScratch2, instruction);
+                    var float32 = IsFloat32(floatType);
+
+                    if (trueFallsThrough && !falseFallsThrough)
+                    {
+                        if (instruction.Operator is "==" or "!=")
+                        {
+                            var inverse = instruction.Operator == "==" ? "!=" : "==";
+                            _asm.Branch(SelectFloatingBranchOp(inverse, float32), left, right, LabelOf(instruction.FalseTarget));
+                            return;
+                        }
+
+                        EmitRaw(SelectFloatBinaryOp(instruction.Operator, float32), GpScratch0, left, right);
+                        _asm.Branch(Op.BrFalseI32, GpScratch0, LabelOf(instruction.FalseTarget));
+                        return;
+                    }
+
+                    _asm.Branch(SelectFloatingBranchOp(instruction.Operator, float32), left, right, LabelOf(instruction.TrueTarget));
+                    if (!falseFallsThrough)
+                        _asm.J(LabelOf(instruction.FalseTarget));
+                    return;
+                }
+
+                var integerLeft = LoadOperand(instruction.Operands[0], GpScratch1);
+                var integerRight = LoadOperand(instruction.Operands[1], GpScratch2);
+                var is64 = Is64BitInteger(leftType) || Is64BitInteger(rightType) || IsPointerLike(leftType) || IsPointerLike(rightType);
+                var unsigned = IsPointerLike(leftType) || IsPointerLike(rightType) || IsUnsignedInteger(leftType) || IsUnsignedInteger(rightType);
+
+                if (trueFallsThrough && !falseFallsThrough)
+                {
+                    _asm.Branch(SelectIntegerBranchOp(InvertComparisonOperator(instruction.Operator), is64, unsigned), integerLeft, integerRight, LabelOf(instruction.FalseTarget));
+                    return;
+                }
+
+                _asm.Branch(SelectIntegerBranchOp(instruction.Operator, is64, unsigned), integerLeft, integerRight, LabelOf(instruction.TrueTarget));
+                if (!falseFallsThrough)
+                    _asm.J(LabelOf(instruction.FalseTarget));
+            }
+
+            private static string InvertComparisonOperator(string op)
+                => op switch
+                {
+                    "==" => "!=",
+                    "!=" => "==",
+                    "<" => ">=",
+                    "<=" => ">",
+                    ">" => "<=",
+                    ">=" => "<",
+                    _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                };
+
+            private static Op SelectFloatingBranchOp(string op, bool f32)
+                => op switch
+                {
+                    "==" => f32 ? Op.BrF32Eq : Op.BrF64Eq,
+                    "!=" => f32 ? Op.BrF32Ne : Op.BrF64Ne,
+                    "<" => f32 ? Op.BrF32Lt : Op.BrF64Lt,
+                    "<=" => f32 ? Op.BrF32Le : Op.BrF64Le,
+                    ">" => f32 ? Op.BrF32Gt : Op.BrF64Gt,
+                    ">=" => f32 ? Op.BrF32Ge : Op.BrF64Ge,
+                    _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                };
+
+            private static Op SelectIntegerBranchOp(string op, bool is64, bool unsigned)
+            {
+                if (is64)
+                {
+                    return op switch
+                    {
+                        "==" => Op.BrI64Eq,
+                        "!=" => Op.BrI64Ne,
+                        "<" => unsigned ? Op.BrU64Lt : Op.BrI64Lt,
+                        "<=" => unsigned ? Op.BrU64Le : Op.BrI64Le,
+                        ">" => unsigned ? Op.BrU64Gt : Op.BrI64Gt,
+                        ">=" => unsigned ? Op.BrU64Ge : Op.BrI64Ge,
+                        _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                    };
+                }
+
+                return op switch
+                {
+                    "==" => Op.BrI32Eq,
+                    "!=" => Op.BrI32Ne,
+                    "<" => unsigned ? Op.BrU32Lt : Op.BrI32Lt,
+                    "<=" => unsigned ? Op.BrU32Le : Op.BrI32Le,
+                    ">" => unsigned ? Op.BrU32Gt : Op.BrI32Gt,
+                    ">=" => unsigned ? Op.BrU32Ge : Op.BrI32Ge,
+                    _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                };
+            }
+
+            private static bool IsComparisonOperator(string op)
+                => op is "==" or "!=" or "<" or "<=" or ">" or ">=";
 
             private Op BranchOpForTruth(QualifiedType type, bool branchIfTrue)
             {
@@ -3329,7 +3446,7 @@ namespace Cnidaria.C
                     => new AddressParts(BaseRegister, indexRegister, Offset, BaseKind, scaleLog2);
             }
 
-            private sealed class ParameterState
+            private struct ParameterState
             {
                 public int Integer;
                 public int Float;

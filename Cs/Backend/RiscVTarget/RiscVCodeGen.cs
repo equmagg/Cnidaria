@@ -148,6 +148,8 @@ namespace Cnidaria.Cs
                         entryTypeInitializer);
                 }
 
+                _text.RelaxBranches(_symbols);
+
                 _symbols.Add(new RVObjectSymbol(
                     TextSectionName,
                     TextSectionName,
@@ -3726,7 +3728,7 @@ namespace Cnidaria.Cs
                     MarkEhCallSite(node, "throw");
                     _owner.EmitMove(RVRegister.X10, ToIntegerRegister(exception));
                     string nonNull = _owner.CreateLocalLabel($"{_methodLabel}_throw_non_null_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X10, RVRegister.X0, nonNull);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X10, RVRegister.X0, nonNull);
                     _owner.EmitMaterializeAddress(
                         _owner.GetStaticExceptionObjectLabel("System", "NullReferenceException"),
                         RVRegister.X10);
@@ -3994,7 +3996,7 @@ namespace Cnidaria.Cs
                     string done = _owner.CreateLocalLabel(_methodLabel + "_type_check_done");
 
                     _owner.EmitMove(RVRegister.X28, source);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X28, RVRegister.X0, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X28, RVRegister.X0, success);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X28, 0, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(targetType), RVRegister.X29);
                     EmitLoadedTypeAssignabilityCheck(success, failure);
@@ -4049,7 +4051,7 @@ namespace Cnidaria.Cs
                             checked(TypeOperationScratchOffset + hasValueField.Offset),
                             Math.Max(1, hasValueField.FieldType.SizeOf),
                             signed: false);
-                        EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, hasValue);
+                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, hasValue);
                         _owner.EmitMove(destination, RVRegister.X0);
                         EmitJump(done);
                         _owner.DefineLabel(hasValue);
@@ -4113,13 +4115,13 @@ namespace Cnidaria.Cs
 
                     string nonNull = _owner.CreateLocalLabel(_methodLabel + "_unbox_non_null");
                     string typeMatch = _owner.CreateLocalLabel(_methodLabel + "_unbox_type_match");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X0, nonNull);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X0, nonNull);
                     EmitManagedExceptionThrow(node, "NullReferenceException");
 
                     _owner.DefineLabel(nonNull);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X28, 0, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(targetType), RVRegister.X29);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, typeMatch);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, typeMatch);
                     EmitManagedExceptionThrow(node, "InvalidCastException");
 
                     _owner.DefineLabel(typeMatch);
@@ -4142,12 +4144,12 @@ namespace Cnidaria.Cs
                     string underlyingValue = _owner.CreateLocalLabel(_methodLabel + "_unbox_nullable_underlying");
                     string done = _owner.CreateLocalLabel(_methodLabel + "_unbox_nullable_done");
 
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X28, RVRegister.X0, nullValue);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X28, RVRegister.X0, nullValue);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X28, 0, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(nullableType), RVRegister.X29);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, directValue);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, directValue);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(underlyingType), RVRegister.X29);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, underlyingValue);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, underlyingValue);
                     EmitManagedExceptionThrow(node, "InvalidCastException");
 
                     _owner.DefineLabel(nullValue);
@@ -5012,6 +5014,23 @@ namespace Cnidaria.Cs
                     if (!i4 && !MachineTarget.Is64Bit)
                         throw Unsupported(node, "64-bit division and remainder on RV32 require a soft-long lowering pass");
 
+                    bool divide = node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un;
+                    RVInstrKind opcode = divide
+                        ? i4
+                            ? unsigned ? RVInstrKind.Divuw : RVInstrKind.Divw
+                            : unsigned ? RVInstrKind.Divu : RVInstrKind.Div
+                        : i4
+                            ? unsigned ? RVInstrKind.Remuw : RVInstrKind.Remw
+                            : unsigned ? RVInstrKind.Remu : RVInstrKind.Rem;
+                    bool checkDivideByZero = (node.Flags & GenTreeFlags.DivModNoByZero) == 0;
+                    bool checkOverflow = !unsigned && (node.Flags & GenTreeFlags.DivModNoOverflow) == 0;
+
+                    if (!checkDivideByZero && !checkOverflow)
+                    {
+                        EmitIntegerR(opcode, destination, left, right, i4);
+                        return;
+                    }
+
                     _owner.EmitMove(RVRegister.X28, left);
                     _owner.EmitMove(RVRegister.X29, right);
                     if (i4 && MachineTarget.Is64Bit)
@@ -5028,33 +5047,25 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    if ((node.Flags & GenTreeFlags.DivModNoByZero) == 0)
+                    if (checkDivideByZero)
                     {
                         string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_div_nonzero_{node.LinearId}");
-                        EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, nonZero);
+                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, nonZero);
                         EmitManagedExceptionThrow(node, "DivideByZeroException");
                         _owner.DefineLabel(nonZero);
                     }
 
-                    if (!unsigned && (node.Flags & GenTreeFlags.DivModNoOverflow) == 0)
+                    if (checkOverflow)
                     {
                         string perform = _owner.CreateLocalLabel($"{_methodLabel}_div_perform_{node.LinearId}");
                         _owner.EmitLoadImmediate(RVRegister.X30, -1);
-                        EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X30, perform);
+                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X30, perform);
                         _owner.EmitLoadImmediate(RVRegister.X30, i4 ? int.MinValue : long.MinValue);
-                        EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X30, perform);
+                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X30, perform);
                         EmitManagedExceptionThrow(node, "OverflowException");
                         _owner.DefineLabel(perform);
                     }
 
-                    bool divide = node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un;
-                    RVInstrKind opcode = divide
-                        ? i4
-                            ? unsigned ? RVInstrKind.Divuw : RVInstrKind.Divw
-                            : unsigned ? RVInstrKind.Divu : RVInstrKind.Div
-                        : i4
-                            ? unsigned ? RVInstrKind.Remuw : RVInstrKind.Remw
-                            : unsigned ? RVInstrKind.Remu : RVInstrKind.Rem;
                     EmitIntegerR(opcode, destination, RVRegister.X28, RVRegister.X29, i4);
                 }
 
@@ -5100,14 +5111,14 @@ namespace Cnidaria.Cs
                                     EmitZeroExtend32(RVRegister.X30, destination);
                                 else
                                     _owner.EmitMove(RVRegister.X30, destination);
-                                EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X30, RVRegister.X28, overflow);
+                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X30, RVRegister.X28, overflow);
                             }
                             else
                             {
                                 _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X30, RVRegister.X28, destination));
                                 _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X31, RVRegister.X29, destination));
                                 _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X30, RVRegister.X30, RVRegister.X31));
-                                EmitLongConditionalBranch(RVInstrKind.Blt, RVRegister.X30, RVRegister.X0, overflow);
+                                EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X30, RVRegister.X0, overflow);
                             }
                             break;
 
@@ -5116,14 +5127,14 @@ namespace Cnidaria.Cs
                             EmitIntegerR(i4 ? RVInstrKind.Subw : RVInstrKind.Sub, destination, RVRegister.X28, RVRegister.X29, i4);
                             if (unsigned)
                             {
-                                EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X28, RVRegister.X29, overflow);
+                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X28, RVRegister.X29, overflow);
                             }
                             else
                             {
                                 _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X30, RVRegister.X28, RVRegister.X29));
                                 _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X31, RVRegister.X28, destination));
                                 _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X30, RVRegister.X30, RVRegister.X31));
-                                EmitLongConditionalBranch(RVInstrKind.Blt, RVRegister.X30, RVRegister.X0, overflow);
+                                EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X30, RVRegister.X0, overflow);
                             }
                             break;
 
@@ -5135,14 +5146,14 @@ namespace Cnidaria.Cs
                                 {
                                     _owner.Emit(RVInstruction.R(RVInstrKind.Mul, RVRegister.X30, RVRegister.X28, RVRegister.X29));
                                     _owner.Emit(RVInstruction.I(RVInstrKind.Srli, RVRegister.X31, RVRegister.X30, 32));
-                                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
+                                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
                                     _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, destination, RVRegister.X30, 0));
                                 }
                                 else
                                 {
                                     _owner.Emit(RVInstruction.R(RVInstrKind.Mul, RVRegister.X30, RVRegister.X28, RVRegister.X29));
                                     _owner.Emit(RVInstruction.R(RVInstrKind.Mulhu, RVRegister.X31, RVRegister.X28, RVRegister.X29));
-                                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
+                                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
                                     _owner.EmitMove(destination, RVRegister.X30);
                                 }
                             }
@@ -5152,13 +5163,13 @@ namespace Cnidaria.Cs
                                 if (i4 && MachineTarget.Is64Bit)
                                 {
                                     _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, destination, RVRegister.X30, 0));
-                                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X30, destination, overflow);
+                                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X30, destination, overflow);
                                 }
                                 else
                                 {
                                     _owner.Emit(RVInstruction.R(RVInstrKind.Mulh, RVRegister.X31, RVRegister.X28, RVRegister.X29));
                                     _owner.Emit(RVInstruction.I(RVInstrKind.Srai, RVRegister.X28, RVRegister.X30, MachineTarget.Is64Bit ? 63 : 31));
-                                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X28, overflow);
+                                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X28, overflow);
                                     _owner.EmitMove(destination, RVRegister.X30);
                                 }
                             }
@@ -5420,14 +5431,14 @@ namespace Cnidaria.Cs
                         {
                             long maximum = targetBits == 64 ? long.MaxValue : (1L << (targetBits - 1)) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
+                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
                             emittedCheck = true;
                         }
                         else if (targetBits < MachineTarget.XLen || (MachineTarget.Is64Bit && !sourceWidth64 && targetBits < 32))
                         {
                             long maximum = targetBits == 32 ? uint.MaxValue : (1L << targetBits) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
+                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
                             emittedCheck = true;
                         }
                     }
@@ -5435,13 +5446,13 @@ namespace Cnidaria.Cs
                     {
                         if (targetUnsigned)
                         {
-                            EmitLongConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X0, overflow);
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X0, overflow);
                             emittedCheck = true;
                             if (targetBits < MachineTarget.XLen)
                             {
                                 long maximum = targetBits == 32 ? uint.MaxValue : (1L << targetBits) - 1L;
                                 _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                                EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
+                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
                             }
                         }
                         else if (targetBits < MachineTarget.XLen)
@@ -5449,9 +5460,9 @@ namespace Cnidaria.Cs
                             long minimum = -(1L << (targetBits - 1));
                             long maximum = (1L << (targetBits - 1)) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, minimum);
-                            EmitLongConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X29, overflow);
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X29, overflow);
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitLongConditionalBranch(RVInstrKind.Blt, RVRegister.X29, RVRegister.X28, overflow);
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X29, RVRegister.X28, overflow);
                             emittedCheck = true;
                         }
                     }
@@ -5587,7 +5598,7 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Conditional branch requires one condition operand");
 
                     RVRegister condition = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "branch condition"));
-                    EmitLongConditionalBranch(
+                    EmitConditionalBranch(
                         branchWhenTrue ? RVInstrKind.Bne : RVInstrKind.Beq,
                         condition,
                         RVRegister.X0,
@@ -5626,7 +5637,7 @@ namespace Cnidaria.Cs
                         }
 
                         _owner.Emit(RVInstruction.R(compare, RVRegister.X31, ToRegister(a), ToRegister(b)));
-                        EmitLongConditionalBranch(
+                        EmitConditionalBranch(
                             branchWhenTrue ? RVInstrKind.Bne : RVInstrKind.Beq,
                             RVRegister.X31,
                             RVRegister.X0,
@@ -5643,7 +5654,7 @@ namespace Cnidaria.Cs
                     if (node.SourceOp == BytecodeOp.Ceq && i4 && MachineTarget.Is64Bit)
                     {
                         _owner.Emit(RVInstruction.R(RVInstrKind.Subw, RVRegister.X31, aReg, bReg));
-                        EmitLongConditionalBranch(
+                        EmitConditionalBranch(
                             branchWhenTrue ? RVInstrKind.Beq : RVInstrKind.Bne,
                             RVRegister.X31,
                             RVRegister.X0,
@@ -5676,16 +5687,11 @@ namespace Cnidaria.Cs
                     if (i4)
                         NormalizeI4ComparisonOperands(ref aReg, ref bReg, unsigned);
 
-                    EmitLongConditionalBranch(branch, aReg, bReg, target);
+                    EmitConditionalBranch(branch, aReg, bReg, target);
                 }
 
-                private void EmitLongConditionalBranch(RVInstrKind branch, RVRegister left, RVRegister right, string target)
-                {
-                    string skip = _owner.CreateLocalLabel($"{_methodLabel}_br_skip");
-                    _owner.Emit(RVInstruction.B(InvertBranch(branch), left, right, skip));
-                    EmitJump(target);
-                    _owner.DefineLabel(skip);
-                }
+                private void EmitConditionalBranch(RVInstrKind branch, RVRegister left, RVRegister right, string target)
+                    => _owner.Emit(RVInstruction.B(branch, left, right, target));
 
                 private void EmitReturn(GenTree node)
                 {
@@ -5858,14 +5864,14 @@ namespace Cnidaria.Cs
                     _owner.EmitMaterializeAddress(cellLabel, RVRegister.X30);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X30, 0, Target.PointerSize, signed: false);
                     _owner.EmitAddImmediate(RVRegister.X30, RVRegister.X30, Target.PointerSize);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X29, RVRegister.X0, missing);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X29, RVRegister.X0, missing);
 
                     _owner.DefineLabel(loop);
                     EmitMemoryLoad(MachineRegister.X31, RVRegister.X30, 0, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X28, found);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X28, found);
                     _owner.EmitAddImmediate(RVRegister.X30, RVRegister.X30, checked(Target.PointerSize * 2));
                     _owner.EmitAddImmediate(RVRegister.X29, RVRegister.X29, -1);
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, loop);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, loop);
 
                     _owner.DefineLabel(missing);
                     EmitVirtualDispatchFailure();
@@ -5995,7 +6001,7 @@ namespace Cnidaria.Cs
                     _owner.EmitLoadImmediate(RVRegister.X30, 1);
                     string multicastLabel = _owner.CreateLocalLabel($"{_methodLabel}_delegate_multicast_{node.LinearId}");
                     string doneLabel = _owner.CreateLocalLabel($"{_methodLabel}_delegate_done_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X30, RVRegister.X29, multicastLabel);
+                    EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X30, RVRegister.X29, multicastLabel);
 
                     RestoreDelegateInvokeAbi(abi, saveOffset);
                     SafePointDraft singleSafePoint = PrepareSafePoint(node);
@@ -6010,7 +6016,7 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(MachineRegister.X28, RVRegister.X2, receiverSaveOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X28, invocationListOffset, Target.PointerSize, signed: false);
                     string listValidLabel = _owner.CreateLocalLabel($"{_methodLabel}_delegate_list_valid_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, listValidLabel);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, listValidLabel);
                     EmitDelegateFailFast(152);
                     _owner.DefineLabel(listValidLabel);
                     EmitMemoryStore(MachineRegister.X30, RVRegister.X2, listOffset, Target.PointerSize);
@@ -6021,7 +6027,7 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(loopLabel);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X2, indexOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X2, countOffset, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Bgeu, RVRegister.X29, RVRegister.X30, doneLabel);
+                    EmitConditionalBranch(RVInstrKind.Bgeu, RVRegister.X29, RVRegister.X30, doneLabel);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X2, listOffset, Target.PointerSize, signed: false);
                     _owner.EmitAddImmediate(RVRegister.X30, RVRegister.X30, Target.ArrayDataOffset);
                     int pointerShift = Target.PointerSize == 8 ? 3 : 2;
@@ -6029,7 +6035,7 @@ namespace Cnidaria.Cs
                     _owner.Emit(RVInstruction.R(RVInstrKind.Add, RVRegister.X30, RVRegister.X30, RVRegister.X31));
                     EmitMemoryLoad(MachineRegister.X28, RVRegister.X30, 0, Target.PointerSize, signed: false);
                     string leafValidLabel = _owner.CreateLocalLabel($"{_methodLabel}_delegate_leaf_valid_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X0, leafValidLabel);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X0, leafValidLabel);
                     EmitDelegateFailFast(152);
                     _owner.DefineLabel(leafValidLabel);
                     EmitMemoryStore(MachineRegister.X28, RVRegister.X2, receiverSaveOffset, Target.PointerSize);
@@ -6128,11 +6134,11 @@ namespace Cnidaria.Cs
                     string typesMatch = _owner.CreateLocalLabel($"{_methodLabel}_delegate_types_match_{node.LinearId}");
                     string done = _owner.CreateLocalLabel($"{_methodLabel}_delegate_combine_done_{node.LinearId}");
 
-                    EmitLongConditionalBranch(RVInstrKind.Beq, left, RVRegister.X0, leftNull);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, right, RVRegister.X0, rightNull);
+                    EmitConditionalBranch(RVInstrKind.Beq, left, RVRegister.X0, leftNull);
+                    EmitConditionalBranch(RVInstrKind.Beq, right, RVRegister.X0, rightNull);
                     EmitMemoryLoad(MachineRegister.X30, left, 0, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X31, right, 0, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X31, typesMatch);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X31, typesMatch);
                     if (remove)
                     {
                         _owner.EmitMove(result, left);
@@ -6301,7 +6307,7 @@ namespace Cnidaria.Cs
                         checkedLength = RVRegister.X28;
                     }
                     string nonNegative = _owner.CreateLocalLabel($"{_methodLabel}_array_length_non_negative_{node.LinearId}");
-                    EmitLongConditionalBranch(
+                    EmitConditionalBranch(
                         RVInstrKind.Bge,
                         checkedLength,
                         RVRegister.X0,
@@ -6389,7 +6395,7 @@ namespace Cnidaria.Cs
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
                     string valid = _owner.CreateLocalLabel(_methodLabel + "_array_data_valid");
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, valid);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, valid);
                     EmitManagedExceptionThrow(node, "ArrayTypeMismatchException");
                     _owner.DefineLabel(valid);
                     _owner.EmitAddImmediate(
@@ -6577,11 +6583,11 @@ namespace Cnidaria.Cs
                         if (node.HasBoundsCheckIndexOverride)
                         {
                             _owner.EmitLoadImmediate(RVRegister.X31, node.BoundsCheckIndexOverride);
-                            EmitLongConditionalBranch(RVInstrKind.Bltu, RVRegister.X31, RVRegister.X30, inRange);
+                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X31, RVRegister.X30, inRange);
                         }
                         else
                         {
-                            EmitLongConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
+                            EmitConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
                         }
                         EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
                         _owner.DefineLabel(inRange);
@@ -6617,7 +6623,7 @@ namespace Cnidaria.Cs
                 private void EmitArrayNullCheck(GenTree node, RVRegister array)
                 {
                     string nonNull = _owner.CreateLocalLabel(_methodLabel + "_array_non_null");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, array, RVRegister.X0, nonNull);
+                    EmitConditionalBranch(RVInstrKind.Bne, array, RVRegister.X0, nonNull);
                     EmitManagedExceptionThrow(node, "NullReferenceException");
                     _owner.DefineLabel(nonNull);
                 }
@@ -6651,17 +6657,17 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(MachineRegister.X30, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, fail);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, fail);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, 8, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(elementType), RVRegister.X29);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, done);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, done);
 
                     if (!requireExact && elementType.IsReferenceType)
                     {
                         EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                         _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x14));
                         _owner.Emit(RVInstruction.I(RVInstrKind.Sltiu, RVRegister.X31, RVRegister.X31, 5));
-                        EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, fail);
+                        EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, fail);
                         EmitLoadedTypeAssignabilityCheck(done, fail);
                     }
                     else
@@ -6679,7 +6685,7 @@ namespace Cnidaria.Cs
                     string done = _owner.CreateLocalLabel(_methodLabel + "_array_store_type_ok");
                     string fail = _owner.CreateLocalLabel(_methodLabel + "_array_store_type_fail");
 
-                    EmitLongConditionalBranch(RVInstrKind.Beq, value, RVRegister.X0, done);
+                    EmitConditionalBranch(RVInstrKind.Beq, value, RVRegister.X0, done);
                     EmitMemoryLoad(MachineRegister.X29, array, 0, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X29, 8, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X30, value, 0, Target.PointerSize, signed: false);
@@ -6709,66 +6715,66 @@ namespace Cnidaria.Cs
                     string interfaceLoop = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_interface_loop");
 
                     _owner.DefineLabel(loop);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X29);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeClass));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetClass);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetClass);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeClass - elementTypeInterface));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetInterface);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetInterface);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeInterface - elementTypeSystemArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSystemArray);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSystemArray);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeSystemArray - elementTypeSzArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSzArray);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSzArray);
                     EmitJump(failure);
 
                     _owner.DefineLabel(targetClass);
                     EmitMemoryLoad(MachineRegister.X31, RVRegister.X29, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeArray - elementTypeSzArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
                     EmitJump(sourceBase);
 
                     _owner.DefineLabel(targetSystemArray);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeArray - elementTypeSzArray));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
                     EmitJump(failure);
 
                     _owner.DefineLabel(targetSzArray);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeSzArray));
-                    EmitLongConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, failure);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X29, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X29);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeClass));
                     _owner.Emit(RVInstruction.I(RVInstrKind.Sltiu, RVRegister.X31, RVRegister.X31, elementTypeSzArray - elementTypeClass + 1));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeClass));
                     _owner.Emit(RVInstruction.I(RVInstrKind.Sltiu, RVRegister.X31, RVRegister.X31, elementTypeSzArray - elementTypeClass + 1));
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
                     EmitJump(loop);
 
                     _owner.DefineLabel(targetInterface);
                     EmitMemoryLoad(MachineRegister.X31, RVRegister.X30, methodTableInterfaceMapOffset, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, failure);
                     _owner.DefineLabel(interfaceLoop);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X31, 0, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X0, failure);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);
                     _owner.EmitAddImmediate(RVRegister.X31, RVRegister.X31, Target.PointerSize);
                     EmitJump(interfaceLoop);
 
                     _owner.DefineLabel(sourceBase);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
-                    EmitLongConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X0, failure);
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X0, failure);
                     EmitJump(loop);
                 }
 
@@ -7215,8 +7221,8 @@ namespace Cnidaria.Cs
                     string done = _owner.CreateLocalLabel(_methodLabel + "_block_copy_done");
 
                     _owner.EmitAddImmediate(boundary, source, size, destination);
-                    EmitLongConditionalBranch(RVInstrKind.Bltu, destination, source, forward);
-                    EmitLongConditionalBranch(RVInstrKind.Bgeu, destination, boundary, forward);
+                    EmitConditionalBranch(RVInstrKind.Bltu, destination, source, forward);
+                    EmitConditionalBranch(RVInstrKind.Bgeu, destination, boundary, forward);
 
                     for (int offset = size - 1; offset >= 0; offset--)
                     {
@@ -7366,7 +7372,7 @@ namespace Cnidaria.Cs
                 private void EmitNullCheck(GenTree node, RVRegister value, string suffix)
                 {
                     string nonNull = _owner.CreateLocalLabel($"{_methodLabel}_{suffix}_non_null_{node.LinearId}");
-                    EmitLongConditionalBranch(RVInstrKind.Bne, value, RVRegister.X0, nonNull);
+                    EmitConditionalBranch(RVInstrKind.Bne, value, RVRegister.X0, nonNull);
                     EmitManagedExceptionThrow(node, "NullReferenceException");
                     _owner.DefineLabel(nonNull);
                 }
@@ -8205,20 +8211,6 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "The operation requires the RISC-V M extension");
                 }
 
-                private static RVInstrKind InvertBranch(RVInstrKind branch)
-                {
-                    return branch switch
-                    {
-                        RVInstrKind.Beq => RVInstrKind.Bne,
-                        RVInstrKind.Bne => RVInstrKind.Beq,
-                        RVInstrKind.Blt => RVInstrKind.Bge,
-                        RVInstrKind.Bge => RVInstrKind.Blt,
-                        RVInstrKind.Bltu => RVInstrKind.Bgeu,
-                        RVInstrKind.Bgeu => RVInstrKind.Bltu,
-                        _ => throw new ArgumentOutOfRangeException(nameof(branch)),
-                    };
-                }
-
                 private static bool IsCompareOp(BytecodeOp op)
                     => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
 
@@ -8620,6 +8612,202 @@ namespace Cnidaria.Cs
 
             public void AddRelocation(int offset, string symbol, int addend, RVObjectRelocationKind kind)
                 => _relocations.Add(new RVObjectRelocation(Name, offset, symbol, addend, kind));
+
+            public void RelaxBranches(List<RVObjectSymbol> symbols)
+            {
+                while (true)
+                {
+                    var relaxations = new BranchRelaxationKind[_instructions.Count];
+                    var extraInstructions = new int[_instructions.Count];
+                    var relaxationCount = 0;
+                    for (var i = 0; i < _instructions.Count; i++)
+                    {
+                        var instruction = _instructions[i];
+                        if (instruction.Symbol is null || !_labels.TryGetValue(instruction.Symbol, out var targetOffset))
+                            continue;
+
+                        var displacement = checked(targetOffset - i * 4);
+                        BranchRelaxationKind relaxation;
+                        if (IsConditionalBranch(instruction.Opcode))
+                            relaxation = FitsBranchImmediate(displacement) ? BranchRelaxationKind.None : BranchRelaxationKind.ConditionalViaJal;
+                        else if (instruction.Opcode == RVInstrKind.Jal)
+                            relaxation = FitsJalImmediate(displacement) ? BranchRelaxationKind.None : BranchRelaxationKind.LongJal;
+                        else
+                            relaxation = BranchRelaxationKind.None;
+
+                        if (relaxation == BranchRelaxationKind.None)
+                            continue;
+                        relaxations[i] = relaxation;
+                        extraInstructions[i] = 1;
+                        relaxationCount++;
+                    }
+
+                    if (relaxationCount == 0)
+                        return;
+
+                    var prefix = new int[_instructions.Count + 1];
+                    for (var i = 0; i < _instructions.Count; i++)
+                        prefix[i + 1] = checked(prefix[i] + extraInstructions[i]);
+
+                    int RemapOffset(int offset)
+                    {
+                        var instructionIndex = offset / 4;
+                        if ((uint)instructionIndex > (uint)_instructions.Count)
+                            throw new InvalidOperationException("RISC-V text offset is outside the instruction stream.");
+                        return checked(offset + prefix[instructionIndex] * 4);
+                    }
+
+                    var rewritten = new List<RVInstruction>(checked(_instructions.Count + prefix[_instructions.Count]));
+                    var generatedLabels = new List<KeyValuePair<string, int>>();
+                    var generatedRelocations = new List<RVObjectRelocation>();
+                    for (var i = 0; i < _instructions.Count; i++)
+                    {
+                        var instruction = _instructions[i];
+                        var relaxation = relaxations[i];
+                        if (relaxation == BranchRelaxationKind.None)
+                        {
+                            rewritten.Add(instruction);
+                            continue;
+                        }
+
+                        var rewrittenOffset = checked(rewritten.Count * 4);
+                        switch (relaxation)
+                        {
+                            case BranchRelaxationKind.ConditionalViaJal:
+                                {
+                                    var skipLabel = CreateRelaxationLabel();
+                                    rewritten.Add(RVInstruction.B(InvertBranch(instruction.Opcode), instruction.Rs1, instruction.Rs2, skipLabel));
+                                    rewritten.Add(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, instruction.Symbol!));
+                                    generatedLabels.Add(new KeyValuePair<string, int>(skipLabel, checked(rewrittenOffset + 8)));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        checked(rewrittenOffset + 4),
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.Jal20));
+                                    break;
+                                }
+                            case BranchRelaxationKind.LongJal:
+                                {
+                                    var baseRegister = instruction.Rd == RVRegister.X0 ? RVRegister.X31 : instruction.Rd;
+                                    rewritten.Add(new RVInstruction(
+                                        RVInstrKind.Auipc,
+                                        baseRegister,
+                                        symbol: instruction.Symbol,
+                                        relocationKind: RVRelocationKind.AbsoluteUpper20));
+                                    rewritten.Add(new RVInstruction(
+                                        RVInstrKind.Jalr,
+                                        instruction.Rd,
+                                        baseRegister,
+                                        immediate: 0,
+                                        symbol: instruction.Symbol,
+                                        relocationKind: RVRelocationKind.AbsoluteLow12));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        rewrittenOffset,
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.PcrelHi20));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        checked(rewrittenOffset + 4),
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.PcrelLo12I));
+                                    break;
+                                }
+                            default:
+                                throw new ArgumentOutOfRangeException();
+                        }
+                    }
+
+                    foreach (var label in new List<string>(_labels.Keys))
+                        _labels[label] = RemapOffset(_labels[label]);
+                    foreach (var pair in generatedLabels)
+                        _labels.Add(pair.Key, pair.Value);
+
+                    var oldRelocations = _relocations.ToArray();
+                    _relocations.Clear();
+                    foreach (var relocation in oldRelocations)
+                    {
+                        var oldInstructionIndex = relocation.Offset / 4;
+                        if ((uint)oldInstructionIndex < (uint)relaxations.Length &&
+                            relaxations[oldInstructionIndex] != BranchRelaxationKind.None &&
+                            relocation.Kind is RVObjectRelocationKind.Branch12 or RVObjectRelocationKind.Jal20)
+                        {
+                            continue;
+                        }
+
+                        _relocations.Add(new RVObjectRelocation(
+                            relocation.SectionName,
+                            RemapOffset(relocation.Offset),
+                            relocation.SymbolName,
+                            relocation.Addend,
+                            relocation.Kind));
+                    }
+                    _relocations.AddRange(generatedRelocations);
+
+                    for (var i = 0; i < symbols.Count; i++)
+                    {
+                        var symbol = symbols[i];
+                        if (!string.Equals(symbol.SectionName, Name, StringComparison.Ordinal))
+                            continue;
+                        var start = RemapOffset(symbol.Offset);
+                        var end = RemapOffset(checked(symbol.Offset + symbol.Size));
+                        symbols[i] = new RVObjectSymbol(
+                            symbol.Name,
+                            symbol.SectionName,
+                            start,
+                            checked(end - start),
+                            symbol.Binding,
+                            symbol.Kind,
+                            symbol.IsTentative);
+                    }
+
+                    _instructions.Clear();
+                    _instructions.AddRange(rewritten);
+                }
+            }
+
+            private string CreateRelaxationLabel()
+            {
+                while (true)
+                {
+                    var label = $"__riscv_relax_skip_{_nextRelaxationLabelId++}";
+                    if (!_labels.ContainsKey(label))
+                        return label;
+                }
+            }
+
+            private static bool FitsJalImmediate(int displacement)
+                => (displacement & 1) == 0 && displacement >= -1048576 && displacement <= 1048574;
+
+            private static bool FitsBranchImmediate(int displacement)
+                => (displacement & 1) == 0 && displacement >= -4096 && displacement <= 4094;
+
+            private static bool IsConditionalBranch(RVInstrKind opcode)
+                => opcode is RVInstrKind.Beq or RVInstrKind.Bne or RVInstrKind.Blt or RVInstrKind.Bge or RVInstrKind.Bltu or RVInstrKind.Bgeu;
+
+            private static RVInstrKind InvertBranch(RVInstrKind opcode)
+                => opcode switch
+                {
+                    RVInstrKind.Beq => RVInstrKind.Bne,
+                    RVInstrKind.Bne => RVInstrKind.Beq,
+                    RVInstrKind.Blt => RVInstrKind.Bge,
+                    RVInstrKind.Bge => RVInstrKind.Blt,
+                    RVInstrKind.Bltu => RVInstrKind.Bgeu,
+                    RVInstrKind.Bgeu => RVInstrKind.Bltu,
+                    _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
+                };
+
+            private enum BranchRelaxationKind : byte
+            {
+                None,
+                ConditionalViaJal,
+                LongJal,
+            }
+
+            private int _nextRelaxationLabelId;
 
             public RVTextSection ToSection()
                 => new RVTextSection(_instructions, _labels, _relocations.ToImmutableArray());

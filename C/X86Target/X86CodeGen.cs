@@ -72,6 +72,7 @@ namespace Cnidaria.C
                 generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
                 floatingRegisters: options.FloatingRegisters,
                 vectorRegisters: options.VectorRegisters.Where(r => !reservedVector.Contains(r)).ToImmutableArray(),
+                callBoundarySplitClasses: ImmutableArray.Create(LirRegisterClass.General, LirRegisterClass.Address),
                 stackAlignment: options.StackAlignment,
                 spillSlotSize: options.SpillSlotSize,
                 spillSlotAlignment: options.SpillSlotAlignment,
@@ -707,6 +708,9 @@ namespace Cnidaria.C
             private readonly int _frameSize;
             private readonly int _stackArgumentSlotSize;
             private readonly int _sysVX64RegisterSaveAreaOffset;
+            private int _currentInstructionPosition;
+            private LirBlock? _fallthroughBlock;
+            private bool _useCallPreservationSources;
 
             public FunctionEmissionContext(
                 X86CodeGenerator owner,
@@ -759,12 +763,21 @@ namespace Cnidaria.C
 
             public void EmitBlocks()
             {
-                foreach (var block in _function.Blocks)
+                _currentInstructionPosition = 0;
+                for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
                 {
+                    var block = _function.Blocks[blockIndex];
+                    _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
+                        ? _function.Blocks[blockIndex + 1]
+                        : null;
                     DefineBlockLabel(block);
                     foreach (var instruction in block.Instructions)
+                    {
                         EmitInstruction(instruction);
+                        _currentInstructionPosition += 2;
+                    }
                 }
+                _fallthroughBlock = null;
             }
 
             public void EmitEpilogue()
@@ -3368,55 +3381,97 @@ namespace Cnidaria.C
                 if (instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Call instruction expects callee operand.");
 
-                StoreVariadicHomeArea(instruction);
-
-                var cursor = new AbiCursor();
-                AbiLocation hiddenReturnBufferRegister = AbiLocation.None;
-                if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
+                var preservations = _allocation.GetCallPreservations(_currentInstructionPosition);
+                SaveCallPreservations(preservations);
+                _useCallPreservationSources = preservations.Length != 0;
+                try
                 {
-                    var loc = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _stackArgumentSlotSize);
-                    if (loc.Kind == AbiLocationKind.Stack)
-                        StoreHiddenReturnBufferArgument(loc, instruction.Result, instruction);
-                    else
-                        hiddenReturnBufferRegister = loc;
-                }
+                    StoreVariadicHomeArea(instruction);
 
-                var stackArguments = new List<PendingCallArgumentSegment>();
-                var registerArguments = new List<PendingCallArgumentSegment>();
-                var signature = instruction.CallSignature;
-                for (var i = 1; i < instruction.Operands.Length; i++)
-                {
-                    var operand = instruction.Operands[i];
-                    var isVariadicUnnamed = signature is not null && signature.IsVariadic && i - 1 >= signature.Parameters.Length;
-                    var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: false, isVariadicUnnamed);
-                    CollectArgumentSegments(stackArguments, registerArguments, operand, value, ref cursor, instruction, isVariadicUnnamed);
-                }
-
-                EmitPendingCallArgumentSegments(stackArguments, instruction);
-                if (instruction.Result is not null && hiddenReturnBufferRegister.Kind != AbiLocationKind.None)
-                    StoreHiddenReturnBufferArgument(hiddenReturnBufferRegister, instruction.Result, instruction);
-                EmitPendingCallArgumentSegments(registerArguments, instruction);
-
-                EmitSysVX64VariadicVectorRegisterCount(instruction);
-
-                LoadVariadicHomePointer(instruction);
-
-                var callee = instruction.Operands[0];
-                if (callee.Kind == LirOperandKind.Symbol && callee.Symbol is not null)
-                    Emit(X86Instruction.Branch(X86InstrKind.Call, X86Operand.SymbolOperand(_owner.GetSymbolLabel(callee.Symbol), 4, X86ObjectRelocationKind.Relative32)));
-                else
-                {
-                    var target = LoadOperandForRead(callee, Scratch0, instruction, _wordSize);
-                    if (target.Kind == X86OperandKind.Memory)
+                    var cursor = new AbiCursor();
+                    AbiLocation hiddenReturnBufferRegister = AbiLocation.None;
+                    if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
                     {
-                        Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch0, _wordSize), target));
-                        target = Reg(Scratch0, _wordSize);
+                        var loc = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _stackArgumentSlotSize);
+                        if (loc.Kind == AbiLocationKind.Stack)
+                            StoreHiddenReturnBufferArgument(loc, instruction.Result, instruction);
+                        else
+                            hiddenReturnBufferRegister = loc;
                     }
-                    Emit(X86Instruction.Branch(X86InstrKind.Call, target));
+
+                    var stackArguments = new List<PendingCallArgumentSegment>();
+                    var registerArguments = new List<PendingCallArgumentSegment>();
+                    var signature = instruction.CallSignature;
+                    for (var i = 1; i < instruction.Operands.Length; i++)
+                    {
+                        var operand = instruction.Operands[i];
+                        var isVariadicUnnamed = signature is not null && signature.IsVariadic && i - 1 >= signature.Parameters.Length;
+                        var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: false, isVariadicUnnamed);
+                        CollectArgumentSegments(stackArguments, registerArguments, operand, value, ref cursor, instruction, isVariadicUnnamed);
+                    }
+
+                    EmitPendingCallArgumentSegments(stackArguments, instruction);
+                    if (instruction.Result is not null && hiddenReturnBufferRegister.Kind != AbiLocationKind.None)
+                        StoreHiddenReturnBufferArgument(hiddenReturnBufferRegister, instruction.Result, instruction);
+                    EmitPendingCallArgumentSegments(registerArguments, instruction);
+
+                    EmitSysVX64VariadicVectorRegisterCount(instruction);
+                    LoadVariadicHomePointer(instruction);
+
+                    var callee = instruction.Operands[0];
+                    if (callee.Kind == LirOperandKind.Symbol && callee.Symbol is not null)
+                    {
+                        Emit(X86Instruction.Branch(X86InstrKind.Call, X86Operand.SymbolOperand(_owner.GetSymbolLabel(callee.Symbol), 4, X86ObjectRelocationKind.Relative32)));
+                    }
+                    else
+                    {
+                        var target = LoadOperandForRead(callee, Scratch0, instruction, _wordSize);
+                        if (target.Kind == X86OperandKind.Memory)
+                        {
+                            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch0, _wordSize), target));
+                            target = Reg(Scratch0, _wordSize);
+                        }
+                        Emit(X86Instruction.Branch(X86InstrKind.Call, target));
+                    }
+                }
+                finally
+                {
+                    _useCallPreservationSources = false;
                 }
 
                 if (instruction.Result is not null)
                     LoadReturnValue(instruction.Result, instruction);
+                RestoreCallPreservations(preservations);
+            }
+
+            private void SaveCallPreservations(ImmutableArray<CallPreservation> preservations)
+            {
+                foreach (var preservation in preservations)
+                {
+                    var source = ToX86Register(preservation.PhysicalRegister, _owner._machineTarget);
+                    var size = _wordSize;
+                    if (preservation.UsesRegister)
+                    {
+                        MoveRegister(ToX86Register(preservation.PreservationRegister, _owner._machineTarget), source, size);
+                        continue;
+                    }
+                    EmitStoreToStack(source, preservation.StackOffset, size);
+                }
+            }
+
+            private void RestoreCallPreservations(ImmutableArray<CallPreservation> preservations)
+            {
+                foreach (var preservation in preservations)
+                {
+                    var destination = ToX86Register(preservation.PhysicalRegister, _owner._machineTarget);
+                    var size = _wordSize;
+                    if (preservation.UsesRegister)
+                    {
+                        MoveRegister(destination, ToX86Register(preservation.PreservationRegister, _owner._machineTarget), size);
+                        continue;
+                    }
+                    EmitLoadFromStack(destination, preservation.StackOffset, size, IsSignedIntegerType(preservation.Register.Type));
+                }
             }
 
             private void StoreVariadicHomeArea(LirInstruction instruction)
@@ -3985,17 +4040,32 @@ namespace Cnidaria.C
 
             private void EmitBranch(LirInstruction instruction)
             {
-                if (instruction.Operands.Length == 0)
-                    throw Unsupported(instruction, "Branch expects condition operand.");
+                if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
+                {
+                    EmitComparisonBranch(instruction);
+                    return;
+                }
+
+                if (instruction.Operands.Length != 1)
+                    throw Unsupported(instruction, "Branch expects one condition operand or two comparison operands.");
                 var condition = instruction.Operands[0];
+                var trueFallsThrough = IsFallthroughTarget(instruction.TrueTarget);
+                var falseFallsThrough = IsFallthroughTarget(instruction.FalseTarget);
                 if (IsFloatType(condition.Type))
                 {
                     var fpReg = LoadFloatingOperand(condition, FpScratch0, instruction);
                     Emit(X86Instruction.Binary(FloatingCompareOpcode(condition.Type),
                         Reg(fpReg, FloatingStorageSize(condition.Type)), Reg(LoadFloatingZero(FpScratch1, condition.Type), FloatingStorageSize(condition.Type))));
+                    if (trueFallsThrough && !falseFallsThrough)
+                    {
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.TrueTarget)));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.FalseTarget)));
+                        return;
+                    }
                     Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.TrueTarget)));
                     Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
-                    EmitJump(instruction.FalseTarget);
+                    if (!falseFallsThrough)
+                        EmitJump(instruction.FalseTarget);
                     return;
                 }
                 if (IsX86WideInteger(condition.Type))
@@ -4003,16 +4073,158 @@ namespace Cnidaria.C
                     LoadWideIntegerOperand(condition, X86Register.Rax, X86Register.Rdx, instruction);
                     Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
                     Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    if (trueFallsThrough && !falseFallsThrough)
+                    {
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.FalseTarget)));
+                        return;
+                    }
                     Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
-                    EmitJump(instruction.FalseTarget);
+                    if (!falseFallsThrough)
+                        EmitJump(instruction.FalseTarget);
                     return;
                 }
                 var size = RegisterSize(condition.Type);
                 var reg = LoadOperand(condition, Scratch0, instruction, size);
                 Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(reg, size), Reg(reg, size)));
+                if (trueFallsThrough && !falseFallsThrough)
+                {
+                    Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.FalseTarget)));
+                    return;
+                }
                 Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
-                EmitJump(instruction.FalseTarget);
+                if (!falseFallsThrough)
+                    EmitJump(instruction.FalseTarget);
             }
+
+            private void EmitComparisonBranch(LirInstruction instruction)
+            {
+                var left = instruction.Operands[0];
+                var right = instruction.Operands[1];
+
+                if (IsFloatType(left.Type) || IsFloatType(right.Type))
+                {
+                    if (IsLongDouble(left.Type) || IsLongDouble(right.Type))
+                        throw Unsupported(instruction, "x86 backend does not support long double comparison branches.");
+                    var comparisonType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(left.Type) ? left.Type : right.Type);
+                    var leftRegister = LoadOperandAsFloating(left, comparisonType, FpScratch0, instruction);
+                    var rightRegister = LoadOperandAsFloating(right, comparisonType, FpScratch1, instruction);
+                    Emit(X86Instruction.Binary(
+                        FloatingCompareOpcode(comparisonType),
+                        Reg(leftRegister, FloatingStorageSize(comparisonType)),
+                        Reg(rightRegister, FloatingStorageSize(comparisonType))));
+                    EmitFloatingComparisonBranch(instruction);
+                    return;
+                }
+
+                if (IsX86WideInteger(left.Type) || IsX86WideInteger(right.Type))
+                {
+                    EmitWideComparisonBranch(instruction);
+                    return;
+                }
+
+                var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
+                LoadOperandInto(left, Scratch0, instruction, size);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(Scratch0, size), LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
+                Emit(X86Instruction.ConditionalBranch(SelectIntegerComparisonCondition(instruction.Operator, IsSignedIntegerType(left.Type)), Label(instruction.TrueTarget)));
+                if (!IsFallthroughTarget(instruction.FalseTarget))
+                    EmitJump(instruction.FalseTarget);
+            }
+
+            private void EmitFloatingComparisonBranch(LirInstruction instruction)
+            {
+                switch (instruction.Operator)
+                {
+                    case "==":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.TrueTarget)));
+                        break;
+                    case "!=":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.TrueTarget)));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
+                        break;
+                    case "<":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.B, Label(instruction.TrueTarget)));
+                        break;
+                    case "<=":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.Be, Label(instruction.TrueTarget)));
+                        break;
+                    case ">":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.A, Label(instruction.TrueTarget)));
+                        break;
+                    case ">=":
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, Label(instruction.TrueTarget)));
+                        break;
+                    default:
+                        throw Unsupported(instruction, $"Unsupported floating-point comparison branch operator '{instruction.Operator}'.");
+                }
+
+                if (!IsFallthroughTarget(instruction.FalseTarget))
+                    EmitJump(instruction.FalseTarget);
+            }
+
+            private void EmitWideComparisonBranch(LirInstruction instruction)
+            {
+                StoreWideIntegerOperandToTemp(instruction.Operands[1], 0, instruction);
+                LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+
+                if (instruction.Operator is "==" or "!=")
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    Emit(X86Instruction.ConditionalBranch(instruction.Operator == "==" ? X86Condition.E : X86Condition.Ne, Label(instruction.TrueTarget)));
+                    if (!IsFallthroughTarget(instruction.FalseTarget))
+                        EmitJump(instruction.FalseTarget);
+                    return;
+                }
+
+                var signed = IsSignedIntegerType(instruction.Operands[0].Type);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+                var highTrue = instruction.Operator switch
+                {
+                    "<" or "<=" => signed ? X86Condition.L : X86Condition.B,
+                    ">" or ">=" => signed ? X86Condition.G : X86Condition.A,
+                    _ => throw Unsupported(instruction, $"Unsupported wide comparison branch operator '{instruction.Operator}'."),
+                };
+                var highFalse = instruction.Operator switch
+                {
+                    "<" or "<=" => signed ? X86Condition.G : X86Condition.A,
+                    ">" or ">=" => signed ? X86Condition.L : X86Condition.B,
+                    _ => throw Unsupported(instruction, $"Unsupported wide comparison branch operator '{instruction.Operator}'."),
+                };
+                Emit(X86Instruction.ConditionalBranch(highTrue, Label(instruction.TrueTarget)));
+                Emit(X86Instruction.ConditionalBranch(highFalse, Label(instruction.FalseTarget)));
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+                var lowCondition = instruction.Operator switch
+                {
+                    "<" => X86Condition.B,
+                    "<=" => X86Condition.Be,
+                    ">" => X86Condition.A,
+                    ">=" => X86Condition.Ae,
+                    _ => throw Unsupported(instruction, $"Unsupported wide comparison branch operator '{instruction.Operator}'."),
+                };
+                Emit(X86Instruction.ConditionalBranch(lowCondition, Label(instruction.TrueTarget)));
+                if (!IsFallthroughTarget(instruction.FalseTarget))
+                    EmitJump(instruction.FalseTarget);
+            }
+
+            private static X86Condition SelectIntegerComparisonCondition(string op, bool signed)
+                => op switch
+                {
+                    "==" => X86Condition.E,
+                    "!=" => X86Condition.Ne,
+                    "<" => signed ? X86Condition.L : X86Condition.B,
+                    "<=" => signed ? X86Condition.Le : X86Condition.Be,
+                    ">" => signed ? X86Condition.G : X86Condition.A,
+                    ">=" => signed ? X86Condition.Ge : X86Condition.Ae,
+                    _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                };
+
+            private static bool IsComparisonOperator(string op)
+                => op is "==" or "!=" or "<" or "<=" or ">" or ">=";
 
             private void EmitSwitch(LirInstruction instruction)
             {
@@ -4057,7 +4269,8 @@ namespace Cnidaria.C
             {
                 if (instruction.Operands.Length != 0)
                     StoreReturnValue(instruction.Operands[0], instruction);
-                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(_epilogueLabel, 4, X86ObjectRelocationKind.Relative32)));
+                if (_fallthroughBlock is not null)
+                    Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(_epilogueLabel, 4, X86ObjectRelocationKind.Relative32)));
             }
 
             private void StoreReturnValue(LirOperand operand, LirInstruction instruction)
@@ -4114,8 +4327,13 @@ namespace Cnidaria.C
 
             private void EmitJump(LirBlock? target)
             {
+                if (IsFallthroughTarget(target))
+                    return;
                 Emit(X86Instruction.Branch(X86InstrKind.Jmp, Label(target)));
             }
+
+            private bool IsFallthroughTarget(LirBlock? target)
+                => target is not null && ReferenceEquals(target, _fallthroughBlock);
 
             private void EmitValueCopy(LirVirtualRegister destination, LirOperand source, LirInstruction instruction)
             {
@@ -4396,7 +4614,16 @@ namespace Cnidaria.C
             {
                 var allocation = _allocation[register];
                 if (!allocation.IsSpilled)
+                {
+                    if (_useCallPreservationSources &&
+                        _allocation.TryGetCallPreservation(_currentInstructionPosition, register, out var preservation))
+                    {
+                        if (preservation.UsesRegister)
+                            return Reg(ToX86Register(preservation.PreservationRegister, _owner._machineTarget), size);
+                        return Mem(X86Register.Rsp, preservation.StackOffset, size);
+                    }
                     return Reg(ToX86Register(allocation.PhysicalRegister, _owner._machineTarget), size);
+                }
                 return Mem(X86Register.Rsp, allocation.StackOffset, size);
             }
 

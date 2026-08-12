@@ -14,6 +14,7 @@ namespace Cnidaria.C
         public ImmutableArray<MachineRegister> GeneralRegisters { get; }
         public ImmutableArray<MachineRegister> FloatingRegisters { get; }
         public ImmutableArray<MachineRegister> VectorRegisters { get; }
+        public ImmutableArray<LirRegisterClass> CallBoundarySplitClasses { get; }
 
         public int StackAlignment { get; }
         public int SpillSlotSize { get; }
@@ -24,6 +25,7 @@ namespace Cnidaria.C
             ImmutableArray<MachineRegister> generalRegisters = default,
             ImmutableArray<MachineRegister> floatingRegisters = default,
             ImmutableArray<MachineRegister> vectorRegisters = default,
+            ImmutableArray<LirRegisterClass> callBoundarySplitClasses = default,
             int stackAlignment = 16,
             int spillSlotSize = 8,
             int spillSlotAlignment = 8,
@@ -44,6 +46,10 @@ namespace Cnidaria.C
             VectorRegisters = vectorRegisters.IsDefault
                 ? ImmutableArray<MachineRegister>.Empty
                 : vectorRegisters;
+
+            CallBoundarySplitClasses = callBoundarySplitClasses.IsDefault
+                ? ImmutableArray<LirRegisterClass>.Empty
+                : callBoundarySplitClasses;
 
             StackAlignment = stackAlignment <= 0 ? 16 : stackAlignment;
             SpillSlotSize = spillSlotSize <= 0 ? 8 : spillSlotSize;
@@ -119,9 +125,9 @@ namespace Cnidaria.C
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
             }
 
-            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
 
             foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
             {
@@ -134,10 +140,14 @@ namespace Cnidaria.C
                 allocations.Add(interval.Register, VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass));
             }
 
-            var frame = LayoutStackFrame(allocations);
+            var callPreservations = BuildCallPreservations(intervals, allocations, out var preservationRegisters, out var stackPreservedRegisters);
+            foreach (var register in stackPreservedRegisters)
+                allocations[register] = allocations[register].WithCallPreservation();
+
+            var frame = LayoutStackFrame(allocations, preservationRegisters);
             foreach (var pair in allocations.ToArray())
             {
-                if (!pair.Value.IsSpilled)
+                if (!pair.Value.NeedsStackSlot)
                     continue;
 
                 if (!frame.SpillOffsets.TryGetValue(pair.Key, out var offset))
@@ -146,7 +156,8 @@ namespace Cnidaria.C
                 allocations[pair.Key] = pair.Value.WithStackOffset(offset);
             }
 
-            return new AllocationResult(_function, allocations, frame);
+            callPreservations = BindCallPreservationStackOffsets(callPreservations, allocations);
+            return new AllocationResult(_function, allocations, frame, callPreservations);
         }
 
         private Dictionary<LirVirtualRegister, LiveInterval> BuildIntervals()
@@ -295,7 +306,7 @@ namespace Cnidaria.C
 
 
         private static int DefinitionPosition(LirInstruction instruction, int position)
-            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy
+            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call
                 ? position + 1
                 : position;
 
@@ -466,32 +477,72 @@ namespace Cnidaria.C
         {
             var reserved = ImmutableHashSet.CreateBuilder<MachineRegister>();
             var touched = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            var inputTargets = ImmutableDictionary.CreateBuilder<LirVirtualRegister, MachineRegister>();
+            var outputTargets = ImmutableDictionary.CreateBuilder<LirVirtualRegister, MachineRegister>();
             if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
-                return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
+                return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable(), inputTargets.ToImmutable(), outputTargets.ToImmutable());
 
             ReserveInlineAssemblyTemplateRegisters(asmStatement.Text, reserved, touched);
 
+            var copyIndex = 0;
+            var operandIndex = 0;
             foreach (var output in asmStatement.Outputs)
             {
-                if (output.Target is null ||
-                    InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Register)
+                if (output.Target is null)
+                    continue;
+
+                var storage = InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type);
+                if (storage != InlineAsmOperandStorage.Register)
                 {
+                    if (storage == InlineAsmOperandStorage.Memory)
+                        operandIndex++;
                     continue;
                 }
 
                 ReserveInlineAssemblyOperand(reserved, touched, output.Constraint, output.Target.Type);
+                if (copyIndex < instruction.ParallelCopies.Length)
+                {
+                    var destination = instruction.ParallelCopies[copyIndex].Destination;
+                    var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(output.Constraint);
+                    var registerClass = CAbi.PreferredLirRegisterClass(_target, output.Target.Type);
+                    if (explicitRegister is not null &&
+                        TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
+                    {
+                        outputTargets[destination] = fixedRegister;
+                        AddAbiPreference(destination, fixedRegister);
+                    }
+                }
+                copyIndex++;
             }
 
             foreach (var input in asmStatement.Inputs)
             {
-                if (input.Value is null ||
-                    InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) != InlineAsmOperandStorage.Register ||
-                    InlineAsmConstraints.MatchingOperand(input.Constraint) is not null)
+                if (input.Value is null)
                 {
+                    operandIndex++;
                     continue;
                 }
 
-                ReserveInlineAssemblyOperand(reserved, touched, input.Constraint, input.Value.Type);
+                var storage = InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type);
+                if (storage == InlineAsmOperandStorage.Register && InlineAsmConstraints.MatchingOperand(input.Constraint) is null)
+                {
+                    ReserveInlineAssemblyOperand(reserved, touched, input.Constraint, input.Value.Type);
+                    if (operandIndex < instruction.Operands.Length &&
+                        instruction.Operands[operandIndex].Kind == LirOperandKind.Register &&
+                        instruction.Operands[operandIndex].Register is { } source)
+                    {
+                        var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(input.Constraint);
+                        var registerClass = CAbi.PreferredLirRegisterClass(_target, input.Value.Type);
+                        if (explicitRegister is not null &&
+                            TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
+                        {
+                            inputTargets[source] = fixedRegister;
+                            AddAbiPreference(source, fixedRegister);
+                        }
+                    }
+                }
+
+                operandIndex++;
             }
 
             foreach (var clobber in asmStatement.Clobbers)
@@ -507,7 +558,7 @@ namespace Cnidaria.C
                     AddInlineAssemblyRegister(reserved, touched, register);
             }
 
-            return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
+            return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable(), inputTargets.ToImmutable(), outputTargets.ToImmutable());
         }
 
         private void ReserveInlineAssemblyTemplateRegisters(
@@ -873,6 +924,7 @@ namespace Cnidaria.C
             IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
             IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
             TargetInfo target,
+            ImmutableArray<LirRegisterClass> callBoundarySplitClasses,
             IReadOnlyList<int> callPositions,
             IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
             IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
@@ -896,7 +948,7 @@ namespace Cnidaria.C
             {
                 ExpireOldIntervals(interval, active, allocations);
 
-                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, abiPreferences, callArgumentRegisters, target, callPositions, callArgumentTargets, instructionClobbers, inlineAssemblySites, incomingRegisterReleasePositions);
+                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, abiPreferences, callArgumentRegisters, target, callBoundarySplitClasses, callPositions, callArgumentTargets, instructionClobbers, inlineAssemblySites, incomingRegisterReleasePositions);
                 if (allowedRegisters.IsDefaultOrEmpty)
                 {
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
@@ -909,7 +961,7 @@ namespace Cnidaria.C
                 }
                 else
                 {
-                    var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, valueNumberPreferredRegisters);
+                    var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, valueNumberPreferredRegisters, target, callBoundarySplitClasses.Contains(interval.Register.RegisterClass) && IntervalSpansPosition(interval, callPositions));
                     interval.PhysicalRegister = reg;
                     allocations[interval.Register] = VirtualRegisterAllocation.InRegister(interval.Register, reg);
                     RememberValueNumberRegister(interval, reg, valueNumberPreferredRegisters);
@@ -924,6 +976,7 @@ namespace Cnidaria.C
             IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
             ImmutableArray<MachineRegister> callArgumentRegisters,
             TargetInfo target,
+            ImmutableArray<LirRegisterClass> callBoundarySplitClasses,
             IReadOnlyList<int> callPositions,
             IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
             IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
@@ -935,18 +988,32 @@ namespace Cnidaria.C
 
             var spansCall = IntervalSpansPosition(interval, callPositions);
             var safeCallArgumentRegister = SafeCallArgumentRegister(interval, callPositions, callArgumentTargets, out var liveBeforeCall);
+            var canSplitAcrossCalls = callBoundarySplitClasses.Contains(interval.Register.RegisterClass);
+            var preferCalleeSaved = canSplitAcrossCalls && spansCall;
+            var orderedRegisters = preferCalleeSaved
+                ? physicalRegisters.OrderByDescending(register => TargetRegisterInfo.IsCalleeSaved(target, register)).ToImmutableArray()
+                : physicalRegisters;
             var builder = ImmutableArray.CreateBuilder<MachineRegister>();
-            foreach (var register in physicalRegisters)
+            foreach (var register in orderedRegisters)
             {
                 if (incomingRegisterReleasePositions.TryGetValue(register, out var releasePosition) &&
                     interval.Start <= releasePosition &&
                     !(interval.Start == releasePosition && HasRegisterPreference(interval.Register, register, abiPreferences)))
                     continue;
-                if (spansCall && !CanUseRegisterAcrossCall(target, interval, register))
+                if (spansCall && !CanUseRegisterAcrossCall(target, interval, register) && !canSplitAcrossCalls)
                     continue;
-                if (liveBeforeCall && ContainsRegister(callArgumentRegisters, register) &&
-                    (target.IsRiscV || register != safeCallArgumentRegister))
-                    continue;
+                if (liveBeforeCall && ContainsRegister(callArgumentRegisters, register))
+                {
+                    if (canSplitAcrossCalls)
+                    {
+                        if (HasUnpreservedLiveBeforeCall(interval, callPositions) && register != safeCallArgumentRegister)
+                            continue;
+                    }
+                    else if (register != safeCallArgumentRegister)
+                    {
+                        continue;
+                    }
+                }
                 if (IsClobberedAtInstruction(interval, register, instructionClobbers))
                     continue;
 
@@ -955,9 +1022,19 @@ namespace Cnidaria.C
                 {
                     var conflictsWithSite = IntervalSpansPosition(interval, site.Position) ||
                         (target.IsRiscV && interval.IsLiveBefore(site.Position));
-                    if (!conflictsWithSite)
+                    if (!conflictsWithSite || !site.ReservedRegisters.Contains(register))
                         continue;
-                    if (!site.ReservedRegisters.Contains(register))
+
+                    var ownFixedInput = target.IsRiscV &&
+                        interval.IsLiveBefore(site.Position) &&
+                        !interval.IsLiveAcross(site.Position) &&
+                        site.InputTargets.TryGetValue(interval.Register, out var inputTarget) &&
+                        inputTarget == register;
+                    var ownFixedOutput = target.IsRiscV &&
+                        interval.HasDefinitionAtPosition(site.Position) &&
+                        site.OutputTargets.TryGetValue(interval.Register, out var outputTarget) &&
+                        outputTarget == register;
+                    if (ownFixedInput || ownFixedOutput)
                         continue;
 
                     reserved = true;
@@ -1050,6 +1127,37 @@ namespace Cnidaria.C
         private static bool IntervalSpansPosition(LiveInterval interval, int position)
             => interval.Spans(position);
 
+        private static int CountSpannedPositions(LiveInterval interval, IReadOnlyList<int> positions)
+        {
+            var count = 0;
+            foreach (var position in positions)
+            {
+                if (position < interval.Start)
+                    continue;
+                if (position >= interval.End)
+                    break;
+                if (interval.IsLiveAcross(position))
+                    count++;
+            }
+
+            return count;
+        }
+
+        private static bool HasUnpreservedLiveBeforeCall(LiveInterval interval, IReadOnlyList<int> positions)
+        {
+            foreach (var position in positions)
+            {
+                if (position < interval.Start)
+                    continue;
+                if (position >= interval.End)
+                    break;
+                if (interval.IsLiveBefore(position) && !interval.IsLiveAcross(position))
+                    return true;
+            }
+
+            return false;
+        }
+
         private static MachineRegister SafeCallArgumentRegister(
             LiveInterval interval,
             IReadOnlyList<int> positions,
@@ -1132,7 +1240,9 @@ namespace Cnidaria.C
             IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
             IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
             IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
-            IReadOnlyDictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters)
+            IReadOnlyDictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters,
+            TargetInfo target,
+            bool preferCalleeSaved)
         {
             if (interval.Register.HasFixedRegister && IsFreeRegister(interval, interval.Register.FixedRegister, physicalRegisters, active))
                 return interval.Register.FixedRegister;
@@ -1141,6 +1251,8 @@ namespace Cnidaria.C
             {
                 foreach (var preferred in preferredRegisters)
                 {
+                    if (preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                        continue;
                     if (IsFreeRegister(interval, preferred, physicalRegisters, active))
                         return preferred;
                 }
@@ -1155,6 +1267,8 @@ namespace Cnidaria.C
                         continue;
 
                     var preferred = sourceAllocation.PhysicalRegister;
+                    if (preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                        continue;
                     if (IsFreeRegister(interval, preferred, physicalRegisters, active))
                         return preferred;
                 }
@@ -1165,6 +1279,7 @@ namespace Cnidaria.C
                 !valueNumber.IsMemoryDependent &&
                 !valueNumber.IsUnique &&
                 valueNumberPreferredRegisters.TryGetValue(valueNumber, out var valueNumberRegister) &&
+                (!preferCalleeSaved || TargetRegisterInfo.IsCalleeSaved(target, valueNumberRegister)) &&
                 IsFreeRegister(interval, valueNumberRegister, physicalRegisters, active))
             {
                 return valueNumberRegister;
@@ -1314,7 +1429,127 @@ namespace Cnidaria.C
             active.Sort(static (a, b) => a.End.CompareTo(b.End));
         }
 
-        private StackFrameMap LayoutStackFrame(Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+        private IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> BuildCallPreservations(
+            IReadOnlyDictionary<LirVirtualRegister, LiveInterval> intervals,
+            IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+            out ImmutableHashSet<MachineRegister> preservationRegisters,
+            out ImmutableHashSet<LirVirtualRegister> stackPreservedRegisters)
+        {
+            var usedPreservationRegisters = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            var stackPreserved = ImmutableHashSet.CreateBuilder<LirVirtualRegister>();
+            var result = new Dictionary<int, ImmutableArray<CallPreservation>>();
+
+            if (_options.CallBoundarySplitClasses.IsDefaultOrEmpty)
+            {
+                preservationRegisters = usedPreservationRegisters.ToImmutable();
+                stackPreservedRegisters = stackPreserved.ToImmutable();
+                return result;
+            }
+
+            foreach (var position in _callPositions)
+            {
+                var occupied = new HashSet<MachineRegister>();
+                foreach (var pair in allocations)
+                {
+                    var allocation = pair.Value;
+                    if (allocation.IsSpilled || allocation.PhysicalRegister == MachineRegister.Invalid)
+                        continue;
+                    if (!intervals.TryGetValue(pair.Key, out var interval))
+                        continue;
+                    if (interval.IsLiveBefore(position) || interval.HasDefinitionAtPosition(position + 1))
+                        occupied.Add(allocation.PhysicalRegister);
+                }
+
+                var builder = ImmutableArray.CreateBuilder<CallPreservation>();
+                foreach (var pair in allocations.OrderBy(static p => p.Key.Ordinal))
+                {
+                    var allocation = pair.Value;
+                    if (allocation.IsSpilled || allocation.PhysicalRegister == MachineRegister.Invalid)
+                        continue;
+                    if (!_options.CallBoundarySplitClasses.Contains(pair.Key.RegisterClass))
+                        continue;
+                    if (TargetRegisterInfo.IsCalleeSaved(_target, allocation.PhysicalRegister))
+                        continue;
+                    if (!intervals.TryGetValue(pair.Key, out var interval) || !interval.IsLiveAcross(position))
+                        continue;
+
+                    var preservationRegister = FindCallPreservationRegister(interval, occupied);
+                    if (preservationRegister != MachineRegister.Invalid)
+                    {
+                        occupied.Add(preservationRegister);
+                        usedPreservationRegisters.Add(preservationRegister);
+                        builder.Add(CallPreservation.InRegister(pair.Key, allocation.PhysicalRegister, preservationRegister));
+                    }
+                    else
+                    {
+                        stackPreserved.Add(pair.Key);
+                        builder.Add(CallPreservation.OnStack(pair.Key, allocation.PhysicalRegister));
+                    }
+                }
+
+                if (builder.Count != 0)
+                    result[position] = builder.ToImmutable();
+            }
+
+            preservationRegisters = usedPreservationRegisters.ToImmutable();
+            stackPreservedRegisters = stackPreserved.ToImmutable();
+            return result;
+        }
+
+        private MachineRegister FindCallPreservationRegister(LiveInterval interval, HashSet<MachineRegister> occupied)
+        {
+            var registers = interval.Register.RegisterClass switch
+            {
+                LirRegisterClass.General or LirRegisterClass.Address => _options.GeneralRegisters,
+                LirRegisterClass.Floating => _options.FloatingRegisters,
+                LirRegisterClass.Vector => _options.VectorRegisters,
+                _ => ImmutableArray<MachineRegister>.Empty,
+            };
+
+            foreach (var register in registers)
+            {
+                if (occupied.Contains(register))
+                    continue;
+                if (!CanUseRegisterAcrossCall(_target, interval, register))
+                    continue;
+                return register;
+            }
+
+            return MachineRegister.Invalid;
+        }
+
+        private static IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> BindCallPreservationStackOffsets(
+            IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> preservations,
+            IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+        {
+            if (preservations.Count == 0)
+                return preservations;
+
+            var result = new Dictionary<int, ImmutableArray<CallPreservation>>();
+            foreach (var pair in preservations)
+            {
+                var builder = ImmutableArray.CreateBuilder<CallPreservation>(pair.Value.Length);
+                foreach (var preservation in pair.Value)
+                {
+                    if (preservation.UsesRegister)
+                    {
+                        builder.Add(preservation);
+                        continue;
+                    }
+
+                    if (!allocations.TryGetValue(preservation.Register, out var allocation) || allocation.StackOffset < 0)
+                        throw new InvalidOperationException("Missing call-preservation spill slot for " + preservation.Register.Name + ".");
+                    builder.Add(preservation.WithStackOffset(allocation.StackOffset));
+                }
+                result[pair.Key] = builder.ToImmutable();
+            }
+
+            return result;
+        }
+
+        private StackFrameMap LayoutStackFrame(
+            Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+            ImmutableHashSet<MachineRegister> preservationRegisters)
         {
             var offset = 0;
 
@@ -1354,7 +1589,7 @@ namespace Cnidaria.C
             var spillAreaOffset = offset;
             foreach (var pair in allocations.OrderBy(static p => p.Key.Ordinal))
             {
-                if (!pair.Value.IsSpilled)
+                if (!pair.Value.NeedsStackSlot)
                     continue;
 
                 offset = AlignUp(offset, SpillSlotAlignmentFor(pair.Key));
@@ -1376,6 +1611,7 @@ namespace Cnidaria.C
             var usedRegisters = allocations.Values
                 .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
                 .Select(static a => a.PhysicalRegister)
+                .Concat(preservationRegisters)
                 .Concat(_inlineAssemblySites.SelectMany(static site => site.TouchedRegisters))
                 .Where(register => TargetRegisterInfo.IsCalleeSaved(_target, register))
                 .Distinct()
@@ -1714,15 +1950,21 @@ namespace Cnidaria.C
             public int Position { get; }
             public ImmutableHashSet<MachineRegister> ReservedRegisters { get; }
             public ImmutableHashSet<MachineRegister> TouchedRegisters { get; }
+            public ImmutableDictionary<LirVirtualRegister, MachineRegister> InputTargets { get; }
+            public ImmutableDictionary<LirVirtualRegister, MachineRegister> OutputTargets { get; }
 
             public InlineAssemblySite(
                 int position,
                 ImmutableHashSet<MachineRegister> reservedRegisters,
-                ImmutableHashSet<MachineRegister> touchedRegisters)
+                ImmutableHashSet<MachineRegister> touchedRegisters,
+                ImmutableDictionary<LirVirtualRegister, MachineRegister> inputTargets,
+                ImmutableDictionary<LirVirtualRegister, MachineRegister> outputTargets)
             {
                 Position = position;
                 ReservedRegisters = reservedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
                 TouchedRegisters = touchedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
+                InputTargets = inputTargets ?? ImmutableDictionary<LirVirtualRegister, MachineRegister>.Empty;
+                OutputTargets = outputTargets ?? ImmutableDictionary<LirVirtualRegister, MachineRegister>.Empty;
             }
         }
 
@@ -1857,6 +2099,9 @@ namespace Cnidaria.C
                 return false;
             }
 
+            public bool HasDefinitionAtPosition(int position)
+                => HasDefinitionAt(position);
+
             private bool HasDefinitionAt(int position)
             {
                 foreach (var definitionPosition in _definitionPositions)
@@ -1900,6 +2145,7 @@ namespace Cnidaria.C
     internal sealed class AllocationResult
     {
         private readonly IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> _allocations;
+        private readonly IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> _callPreservations;
 
         public LirFunction Function { get; }
         public StackFrameMap Frame { get; }
@@ -1910,14 +2156,17 @@ namespace Cnidaria.C
         public AllocationResult(
             LirFunction function,
             IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
-            StackFrameMap frame)
+            StackFrameMap frame,
+            IReadOnlyDictionary<int, ImmutableArray<CallPreservation>>? callPreservations = null)
         {
             Function = function ?? throw new ArgumentNullException(nameof(function));
             _allocations = allocations ?? throw new ArgumentNullException(nameof(allocations));
+            _callPreservations = callPreservations ?? ImmutableDictionary<int, ImmutableArray<CallPreservation>>.Empty;
             Frame = frame ?? throw new ArgumentNullException(nameof(frame));
             UsedPhysicalRegisters = allocations.Values
                 .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
                 .Select(static a => a.PhysicalRegister)
+                .Concat(_callPreservations.Values.SelectMany(static p => p).Where(static p => p.UsesRegister).Select(static p => p.PreservationRegister))
                 .Distinct()
                 .OrderBy(static r => (int)r)
                 .ToImmutableArray();
@@ -1930,6 +2179,58 @@ namespace Cnidaria.C
 
         public bool TryGetAllocation(LirVirtualRegister register, out VirtualRegisterAllocation allocation)
             => _allocations.TryGetValue(register, out allocation!);
+
+        public ImmutableArray<CallPreservation> GetCallPreservations(int position)
+            => _callPreservations.TryGetValue(position, out var preservations)
+                ? preservations
+                : ImmutableArray<CallPreservation>.Empty;
+
+        public bool TryGetCallPreservation(int position, LirVirtualRegister register, out CallPreservation preservation)
+        {
+            foreach (var candidate in GetCallPreservations(position))
+            {
+                if (!ReferenceEquals(candidate.Register, register))
+                    continue;
+                preservation = candidate;
+                return true;
+            }
+
+            preservation = default;
+            return false;
+        }
+    }
+
+    internal readonly struct CallPreservation
+    {
+        public LirVirtualRegister Register { get; }
+        public MachineRegister PhysicalRegister { get; }
+        public MachineRegister PreservationRegister { get; }
+        public int StackOffset { get; }
+        public bool UsesRegister => PreservationRegister != MachineRegister.Invalid;
+
+        private CallPreservation(
+            LirVirtualRegister register,
+            MachineRegister physicalRegister,
+            MachineRegister preservationRegister,
+            int stackOffset)
+        {
+            Register = register ?? throw new ArgumentNullException(nameof(register));
+            PhysicalRegister = physicalRegister;
+            PreservationRegister = preservationRegister;
+            StackOffset = stackOffset;
+        }
+
+        public static CallPreservation InRegister(
+            LirVirtualRegister register,
+            MachineRegister physicalRegister,
+            MachineRegister preservationRegister)
+            => new CallPreservation(register, physicalRegister, preservationRegister, -1);
+
+        public static CallPreservation OnStack(LirVirtualRegister register, MachineRegister physicalRegister)
+            => new CallPreservation(register, physicalRegister, MachineRegister.Invalid, -1);
+
+        public CallPreservation WithStackOffset(int stackOffset)
+            => new CallPreservation(Register, PhysicalRegister, PreservationRegister, stackOffset);
     }
 
     internal sealed class VirtualRegisterAllocation
@@ -1937,6 +2238,8 @@ namespace Cnidaria.C
         public LirVirtualRegister Register { get; }
         public LirRegisterClass RegisterClass { get; }
         public bool IsSpilled { get; }
+        public bool PreserveAcrossCalls { get; }
+        public bool NeedsStackSlot => IsSpilled || PreserveAcrossCalls;
         public MachineRegister PhysicalRegister { get; }
         public int StackOffset { get; }
 
@@ -1944,24 +2247,29 @@ namespace Cnidaria.C
             LirVirtualRegister register,
             LirRegisterClass registerClass,
             bool isSpilled,
+            bool preserveAcrossCalls,
             MachineRegister physicalRegister,
             int stackOffset)
         {
             Register = register ?? throw new ArgumentNullException(nameof(register));
             RegisterClass = registerClass;
             IsSpilled = isSpilled;
+            PreserveAcrossCalls = preserveAcrossCalls;
             PhysicalRegister = physicalRegister;
             StackOffset = stackOffset;
         }
 
         public static VirtualRegisterAllocation InRegister(LirVirtualRegister register, MachineRegister physicalRegister)
-            => new VirtualRegisterAllocation(register, register.RegisterClass, isSpilled: false, physicalRegister, stackOffset: -1);
+            => new VirtualRegisterAllocation(register, register.RegisterClass, isSpilled: false, preserveAcrossCalls: false, physicalRegister, stackOffset: -1);
 
         public static VirtualRegisterAllocation Spilled(LirVirtualRegister register, LirRegisterClass registerClass)
-            => new VirtualRegisterAllocation(register, registerClass, isSpilled: true, MachineRegister.Invalid, stackOffset: -1);
+            => new VirtualRegisterAllocation(register, registerClass, isSpilled: true, preserveAcrossCalls: false, MachineRegister.Invalid, stackOffset: -1);
+
+        public VirtualRegisterAllocation WithCallPreservation()
+            => new VirtualRegisterAllocation(Register, RegisterClass, IsSpilled, preserveAcrossCalls: true, PhysicalRegister, StackOffset);
 
         public VirtualRegisterAllocation WithStackOffset(int stackOffset)
-            => new VirtualRegisterAllocation(Register, RegisterClass, isSpilled: true, MachineRegister.Invalid, stackOffset);
+            => new VirtualRegisterAllocation(Register, RegisterClass, IsSpilled, PreserveAcrossCalls, PhysicalRegister, stackOffset);
 
         public override string ToString()
             => IsSpilled

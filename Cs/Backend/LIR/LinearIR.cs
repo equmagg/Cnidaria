@@ -273,6 +273,8 @@ namespace Cnidaria.Cs
 
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
+            else if (PreservesCallerSavedRegisters(source, _target, memoryAccess))
+                flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
             else if (MayClobberCallerSaved(source, _target))
                 flags |= _nonCallOperationsClobberCallerSavedRegisters
                     ? GenTreeLinearFlags.CallerSavedKill
@@ -564,6 +566,17 @@ namespace Cnidaria.Cs
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
+        }
+
+        private static bool PreservesCallerSavedRegisters(GenTree source, TargetInfo target, LinearMemoryAccess memoryAccess)
+        {
+            if (!target.IsRiscV || source.Kind is not (GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect))
+                return false;
+
+            if (memoryAccess.IsBlockCopy)
+                return false;
+
+            return (memoryAccess.Flags & LinearMemoryAccessFlags.RequiresWriteBarrier) == 0;
         }
 
         public static bool MayClobberCallerSaved(GenTree source, TargetInfo target)

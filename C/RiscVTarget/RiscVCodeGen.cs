@@ -107,6 +107,7 @@ namespace Cnidaria.C
                 generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
                 floatingRegisters: options.FloatingRegisters.Where(r => !reservedFloating.Contains(r)).ToImmutableArray(),
                 vectorRegisters: options.VectorRegisters.Where(r => !reservedVector.Contains(r)).ToImmutableArray(),
+                callBoundarySplitClasses: ImmutableArray.Create(LirRegisterClass.General, LirRegisterClass.Address, LirRegisterClass.Floating),
                 stackAlignment: options.StackAlignment,
                 spillSlotSize: options.SpillSlotSize,
                 spillSlotAlignment: options.SpillSlotAlignment,
@@ -134,6 +135,7 @@ namespace Cnidaria.C
                 ? EmitLinuxRuntime(selectedEntry)
                 : selectedEntry;
 
+            _text.RelaxBranches(_symbols);
             AddSectionSymbols();
             var dataSections = ImmutableArray.CreateBuilder<RVDataSection>();
             dataSections.Add(_rodata.ToSection());
@@ -614,6 +616,9 @@ namespace Cnidaria.C
             private readonly int _riscVVarArgsSaveAreaSize;
             private readonly int _totalFrameSize;
             private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
+            private int _currentInstructionPosition;
+            private LirBlock? _fallthroughBlock;
+            private bool _useCallPreservationSources;
 
             private enum IntegerRepresentationKind : byte
             {
@@ -676,13 +681,22 @@ namespace Cnidaria.C
 
             public void EmitBlocks()
             {
-                foreach (var block in _function.Blocks)
+                _currentInstructionPosition = 0;
+                for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
                 {
+                    var block = _function.Blocks[blockIndex];
+                    _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
+                        ? _function.Blocks[blockIndex + 1]
+                        : null;
                     ClearIntegerRepresentationFacts();
                     _owner._text.DefineLabel(LabelOf(block));
                     foreach (var instruction in block.Instructions)
+                    {
                         EmitInstruction(instruction);
+                        _currentInstructionPosition += 2;
+                    }
                 }
+                _fallthroughBlock = null;
             }
 
             public void EmitTrap()
@@ -2235,19 +2249,61 @@ namespace Cnidaria.C
                 if (TryEmitRiscVVectorIntrinsic(instruction))
                     return;
 
-                MarshalCallArguments(instruction, 1);
-                var callee = instruction.Operands[0];
-                if (TryResolveDirectCallLabel(callee, out var label))
+                var preservations = _allocation.GetCallPreservations(_currentInstructionPosition);
+                SaveCallPreservations(preservations);
+                _useCallPreservationSources = preservations.Length != 0;
+                try
                 {
-                    EmitCall(label);
+                    MarshalCallArguments(instruction, 1);
+                    var callee = instruction.Operands[0];
+                    if (TryResolveDirectCallLabel(callee, out var label))
+                    {
+                        EmitCall(label);
+                    }
+                    else
+                    {
+                        var target = LoadOperand(callee, GpScratch0);
+                        Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X1, ToRegister(target), 0));
+                    }
                 }
-                else
+                finally
                 {
-                    var target = LoadOperand(callee, GpScratch0);
-                    Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X1, ToRegister(target), 0));
+                    _useCallPreservationSources = false;
                 }
 
                 EmitCallResult(instruction);
+                RestoreCallPreservations(preservations);
+            }
+
+            private void SaveCallPreservations(ImmutableArray<CallPreservation> preservations)
+            {
+                foreach (var preservation in preservations)
+                {
+                    if (preservation.UsesRegister)
+                    {
+                        MoveRegister(preservation.PreservationRegister, preservation.PhysicalRegister);
+                        continue;
+                    }
+
+                    var size = Math.Min(SizeOfRegisterType(preservation.Register.Type), SizeOf(preservation.Register.Type));
+                    StoreToMemory(preservation.PhysicalRegister, Sp, preservation.StackOffset, size);
+                }
+            }
+
+            private void RestoreCallPreservations(ImmutableArray<CallPreservation> preservations)
+            {
+                foreach (var preservation in preservations)
+                {
+                    if (preservation.UsesRegister)
+                    {
+                        MoveRegister(preservation.PhysicalRegister, preservation.PreservationRegister);
+                        continue;
+                    }
+
+                    var size = Math.Min(SizeOfRegisterType(preservation.Register.Type), SizeOf(preservation.Register.Type));
+                    LoadFromMemory(preservation.PhysicalRegister, Sp, preservation.StackOffset, size, IsSignedIntegerType(preservation.Register.Type));
+                    NormalizeScalarRegister(preservation.PhysicalRegister, preservation.Register.Type);
+                }
             }
 
             private bool TryEmitRiscVVectorIntrinsic(LirInstruction instruction)
@@ -2811,8 +2867,14 @@ namespace Cnidaria.C
 
             private void EmitBranch(LirInstruction instruction)
             {
+                if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
+                {
+                    EmitComparisonBranch(instruction);
+                    return;
+                }
+
                 if (instruction.Operands.Length != 1)
-                    throw Unsupported(instruction, "Branch expects one condition operand.");
+                    throw Unsupported(instruction, "Branch expects one condition operand or two comparison operands.");
                 var trueFallsThrough = IsFallthroughTarget(instruction.TrueTarget);
                 var falseFallsThrough = IsFallthroughTarget(instruction.FalseTarget);
                 MachineRegister cond;
@@ -2846,6 +2908,125 @@ namespace Cnidaria.C
                 if (!falseFallsThrough)
                     EmitJump(LabelOf(instruction.FalseTarget));
             }
+
+            private void EmitComparisonBranch(LirInstruction instruction)
+            {
+                var left = instruction.Operands[0];
+                var right = instruction.Operands[1];
+
+                if (IsFloatType(left.Type) || IsFloatType(right.Type))
+                {
+                    if (IsLongDouble(left.Type) || IsLongDouble(right.Type))
+                        throw HelperRequired(instruction, SelectFloatingHelper(instruction.Operator, IsLongDouble(left.Type) ? left.Type : right.Type), "long double comparison branch requires a runtime helper.");
+                    var floatType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(left.Type) ? left.Type : right.Type);
+                    RequireFloatingHardware(floatType, instruction);
+                    var leftRegister = LoadOperandAsFloating(left, floatType, FpScratch1, instruction);
+                    var rightRegister = LoadOperandAsFloating(right, floatType, FpScratch2, instruction);
+                    EmitFloatingRelation(instruction.Operator, floatType, GpScratch0, leftRegister, rightRegister);
+                    EmitBranch(RVInstrKind.Bne, GpScratch0, MachineRegister.X0, LabelOf(instruction.TrueTarget));
+                    if (!IsFallthroughTarget(instruction.FalseTarget))
+                        EmitJump(LabelOf(instruction.FalseTarget));
+                    return;
+                }
+
+                if (IsRv32WideInteger(left.Type) || IsRv32WideInteger(right.Type))
+                {
+                    EmitWideComparisonBranch(instruction);
+                    return;
+                }
+
+                if (RequiresStackBackedScalar(left.Type) || RequiresStackBackedScalar(right.Type))
+                    throw HelperRequired(instruction, SelectScalarMoveHelper(left.Type), "Comparison branch on a scalar wider than one machine register is not implemented yet.");
+
+                var leftRegisterInteger = LoadOperand(left, GpScratch1);
+                var rightRegisterInteger = LoadOperand(right, GpScratch2);
+                var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
+                var opcode = SelectIntegerBranchOpcode(instruction.Operator, signed, out var swapOperands);
+                EmitBranch(
+                    opcode,
+                    swapOperands ? rightRegisterInteger : leftRegisterInteger,
+                    swapOperands ? leftRegisterInteger : rightRegisterInteger,
+                    LabelOf(instruction.TrueTarget));
+                if (!IsFallthroughTarget(instruction.FalseTarget))
+                    EmitJump(LabelOf(instruction.FalseTarget));
+            }
+
+            private void EmitWideComparisonBranch(LirInstruction instruction)
+            {
+                var left = instruction.Operands[0];
+                var right = instruction.Operands[1];
+                LoadWideIntegerOperand(left, GpScratch0, GpScratch1, instruction);
+                LoadWideIntegerOperand(right, GpScratch2, GpScratch3, instruction);
+                var trueLabel = LabelOf(instruction.TrueTarget);
+                var falseLabel = LabelOf(instruction.FalseTarget);
+
+                if (instruction.Operator == "==")
+                {
+                    EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, falseLabel);
+                    EmitBranch(RVInstrKind.Beq, GpScratch0, GpScratch2, trueLabel);
+                }
+                else if (instruction.Operator == "!=")
+                {
+                    EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, trueLabel);
+                    EmitBranch(RVInstrKind.Bne, GpScratch0, GpScratch2, trueLabel);
+                }
+                else
+                {
+                    var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
+                    var highLess = signed ? RVInstrKind.Blt : RVInstrKind.Bltu;
+                    switch (instruction.Operator)
+                    {
+                        case "<":
+                            EmitBranch(highLess, GpScratch1, GpScratch3, trueLabel);
+                            EmitBranch(highLess, GpScratch3, GpScratch1, falseLabel);
+                            EmitBranch(RVInstrKind.Bltu, GpScratch0, GpScratch2, trueLabel);
+                            break;
+                        case "<=":
+                            EmitBranch(highLess, GpScratch1, GpScratch3, trueLabel);
+                            EmitBranch(highLess, GpScratch3, GpScratch1, falseLabel);
+                            EmitBranch(RVInstrKind.Bgeu, GpScratch2, GpScratch0, trueLabel);
+                            break;
+                        case ">":
+                            EmitBranch(highLess, GpScratch3, GpScratch1, trueLabel);
+                            EmitBranch(highLess, GpScratch1, GpScratch3, falseLabel);
+                            EmitBranch(RVInstrKind.Bltu, GpScratch2, GpScratch0, trueLabel);
+                            break;
+                        case ">=":
+                            EmitBranch(highLess, GpScratch3, GpScratch1, trueLabel);
+                            EmitBranch(highLess, GpScratch1, GpScratch3, falseLabel);
+                            EmitBranch(RVInstrKind.Bgeu, GpScratch0, GpScratch2, trueLabel);
+                            break;
+                        default:
+                            throw Unsupported(instruction, $"Unsupported comparison branch operator '{instruction.Operator}'.");
+                    }
+                }
+
+                if (!IsFallthroughTarget(instruction.FalseTarget))
+                    EmitJump(falseLabel);
+            }
+
+            private static RVInstrKind SelectIntegerBranchOpcode(string op, bool signed, out bool swapOperands)
+            {
+                swapOperands = false;
+                switch (op)
+                {
+                    case "==": return RVInstrKind.Beq;
+                    case "!=": return RVInstrKind.Bne;
+                    case "<": return signed ? RVInstrKind.Blt : RVInstrKind.Bltu;
+                    case ">=": return signed ? RVInstrKind.Bge : RVInstrKind.Bgeu;
+                    case ">":
+                        swapOperands = true;
+                        return signed ? RVInstrKind.Blt : RVInstrKind.Bltu;
+                    case "<=":
+                        swapOperands = true;
+                        return signed ? RVInstrKind.Bge : RVInstrKind.Bgeu;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(op));
+                }
+            }
+
+            private static bool IsComparisonOperator(string op)
+                => op is "==" or "!=" or "<" or "<=" or ">" or ">=";
 
             private void EmitStackBackedScalarIsZero(LirVirtualRegister destinationRegister, LirOperand operand, LirInstruction instruction)
             {
@@ -3195,12 +3376,7 @@ namespace Cnidaria.C
 
             private void LoadOperandIntoAs(LirOperand operand, MachineRegister destination, QualifiedType targetType, LirInstruction instruction)
             {
-                var scratch = IsRiscVVectorType(targetType)
-                    ? (destination == VecScratch0 ? VecScratch1 : VecScratch0)
-                    : IsFloatType(targetType) && (UsesHardwareFloating(targetType) || IsFloatRegister(destination))
-                        ? (destination == FpScratch0 ? FpScratch1 : FpScratch0)
-                        : (destination == GpScratch0 ? GpScratch1 : GpScratch0);
-                var source = LoadOperandAs(operand, targetType, scratch, instruction);
+                var source = LoadOperandAs(operand, targetType, destination, instruction);
                 MoveRegister(destination, source);
             }
 
@@ -3279,7 +3455,25 @@ namespace Cnidaria.C
                     throw new NotSupportedException($"Virtual register {register.Name} cannot be loaded as a single scalar register.");
                 var alloc = _allocation[register];
                 if (!alloc.IsSpilled)
+                {
+                    if (_useCallPreservationSources &&
+                        _allocation.TryGetCallPreservation(_currentInstructionPosition, register, out var preservation))
+                    {
+                        if (preservation.UsesRegister)
+                            return preservation.PreservationRegister;
+
+                        if (IsRiscVVectorType(register.Type) && !IsVectorRegister(preferred))
+                            preferred = VecScratch0;
+                        else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
+                            preferred = FpScratch0;
+                        var size = Math.Min(SizeOfRegisterType(register.Type), SizeOf(register.Type));
+                        LoadFromMemory(preferred, Sp, preservation.StackOffset, size, IsSignedIntegerType(register.Type));
+                        NormalizeScalarRegister(preferred, register.Type);
+                        return preferred;
+                    }
+
                     return alloc.PhysicalRegister;
+                }
                 if (IsRiscVVectorType(register.Type) && !IsVectorRegister(preferred))
                     preferred = VecScratch0;
                 else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
@@ -4272,7 +4466,7 @@ namespace Cnidaria.C
             }
 
             private bool IsFallthroughTarget(LirBlock? target)
-                => false;
+                => target is not null && ReferenceEquals(target, _fallthroughBlock);
 
             private int IncomingStackOffset(int abiStackOffset)
                 => checked(_totalFrameSize + abiStackOffset);
@@ -4586,6 +4780,202 @@ namespace Cnidaria.C
 
             public void AddRelocation(int offset, string symbol, int addend, RVObjectRelocationKind kind)
                 => _relocations.Add(new RVObjectRelocation(Name, offset, symbol, addend, kind));
+
+            public void RelaxBranches(List<RVObjectSymbol> symbols)
+            {
+                while (true)
+                {
+                    var relaxations = new BranchRelaxationKind[_instructions.Count];
+                    var extraInstructions = new int[_instructions.Count];
+                    var relaxationCount = 0;
+                    for (var i = 0; i < _instructions.Count; i++)
+                    {
+                        var instruction = _instructions[i];
+                        if (instruction.Symbol is null || !_labels.TryGetValue(instruction.Symbol, out var targetOffset))
+                            continue;
+
+                        var displacement = checked(targetOffset - i * 4);
+                        BranchRelaxationKind relaxation;
+                        if (IsConditionalBranch(instruction.Opcode))
+                            relaxation = FitsBranchImmediate(displacement) ? BranchRelaxationKind.None : BranchRelaxationKind.ConditionalViaJal;
+                        else if (instruction.Opcode == RVInstrKind.Jal)
+                            relaxation = FitsJalImmediate(displacement) ? BranchRelaxationKind.None : BranchRelaxationKind.LongJal;
+                        else
+                            relaxation = BranchRelaxationKind.None;
+
+                        if (relaxation == BranchRelaxationKind.None)
+                            continue;
+                        relaxations[i] = relaxation;
+                        extraInstructions[i] = 1;
+                        relaxationCount++;
+                    }
+
+                    if (relaxationCount == 0)
+                        return;
+
+                    var prefix = new int[_instructions.Count + 1];
+                    for (var i = 0; i < _instructions.Count; i++)
+                        prefix[i + 1] = checked(prefix[i] + extraInstructions[i]);
+
+                    int RemapOffset(int offset)
+                    {
+                        var instructionIndex = offset / 4;
+                        if ((uint)instructionIndex > (uint)_instructions.Count)
+                            throw new InvalidOperationException("RISC-V text offset is outside the instruction stream.");
+                        return checked(offset + prefix[instructionIndex] * 4);
+                    }
+
+                    var rewritten = new List<RVInstruction>(checked(_instructions.Count + prefix[_instructions.Count]));
+                    var generatedLabels = new List<KeyValuePair<string, int>>();
+                    var generatedRelocations = new List<RVObjectRelocation>();
+                    for (var i = 0; i < _instructions.Count; i++)
+                    {
+                        var instruction = _instructions[i];
+                        var relaxation = relaxations[i];
+                        if (relaxation == BranchRelaxationKind.None)
+                        {
+                            rewritten.Add(instruction);
+                            continue;
+                        }
+
+                        var rewrittenOffset = checked(rewritten.Count * 4);
+                        switch (relaxation)
+                        {
+                            case BranchRelaxationKind.ConditionalViaJal:
+                                {
+                                    var skipLabel = CreateRelaxationLabel();
+                                    rewritten.Add(RVInstruction.B(InvertBranch(instruction.Opcode), instruction.Rs1, instruction.Rs2, skipLabel));
+                                    rewritten.Add(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, instruction.Symbol!));
+                                    generatedLabels.Add(new KeyValuePair<string, int>(skipLabel, checked(rewrittenOffset + 8)));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        checked(rewrittenOffset + 4),
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.Jal20));
+                                    break;
+                                }
+                            case BranchRelaxationKind.LongJal:
+                                {
+                                    var baseRegister = instruction.Rd == RVRegister.X0 ? RVRegister.X5 : instruction.Rd;
+                                    rewritten.Add(new RVInstruction(
+                                        RVInstrKind.Auipc,
+                                        baseRegister,
+                                        symbol: instruction.Symbol,
+                                        relocationKind: RVRelocationKind.AbsoluteUpper20));
+                                    rewritten.Add(new RVInstruction(
+                                        RVInstrKind.Jalr,
+                                        instruction.Rd,
+                                        baseRegister,
+                                        immediate: 0,
+                                        symbol: instruction.Symbol,
+                                        relocationKind: RVRelocationKind.AbsoluteLow12));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        rewrittenOffset,
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.PcrelHi20));
+                                    generatedRelocations.Add(new RVObjectRelocation(
+                                        Name,
+                                        checked(rewrittenOffset + 4),
+                                        instruction.Symbol!,
+                                        0,
+                                        RVObjectRelocationKind.PcrelLo12I));
+                                    break;
+                                }
+                            default:
+                                throw new ArgumentOutOfRangeException();
+                        }
+                    }
+
+                    foreach (var label in _labels.Keys.ToArray())
+                        _labels[label] = RemapOffset(_labels[label]);
+                    foreach (var pair in generatedLabels)
+                        _labels.Add(pair.Key, pair.Value);
+
+                    var oldRelocations = _relocations.ToArray();
+                    _relocations.Clear();
+                    foreach (var relocation in oldRelocations)
+                    {
+                        var oldInstructionIndex = relocation.Offset / 4;
+                        if ((uint)oldInstructionIndex < (uint)relaxations.Length &&
+                            relaxations[oldInstructionIndex] != BranchRelaxationKind.None &&
+                            relocation.Kind is RVObjectRelocationKind.Branch12 or RVObjectRelocationKind.Jal20)
+                        {
+                            continue;
+                        }
+
+                        _relocations.Add(new RVObjectRelocation(
+                            relocation.SectionName,
+                            RemapOffset(relocation.Offset),
+                            relocation.SymbolName,
+                            relocation.Addend,
+                            relocation.Kind));
+                    }
+                    _relocations.AddRange(generatedRelocations);
+
+                    for (var i = 0; i < symbols.Count; i++)
+                    {
+                        var symbol = symbols[i];
+                        if (!string.Equals(symbol.SectionName, Name, StringComparison.Ordinal))
+                            continue;
+                        var start = RemapOffset(symbol.Offset);
+                        var end = RemapOffset(checked(symbol.Offset + symbol.Size));
+                        symbols[i] = new RVObjectSymbol(
+                            symbol.Name,
+                            symbol.SectionName,
+                            start,
+                            checked(end - start),
+                            symbol.Binding,
+                            symbol.Kind,
+                            symbol.IsTentative);
+                    }
+
+                    _instructions.Clear();
+                    _instructions.AddRange(rewritten);
+                }
+            }
+
+            private string CreateRelaxationLabel()
+            {
+                while (true)
+                {
+                    var label = $"__riscv_relax_skip_{_nextRelaxationLabelId++}";
+                    if (!_labels.ContainsKey(label))
+                        return label;
+                }
+            }
+
+            private static bool FitsJalImmediate(int displacement)
+                => (displacement & 1) == 0 && displacement >= -1048576 && displacement <= 1048574;
+
+            private static bool FitsBranchImmediate(int displacement)
+                => (displacement & 1) == 0 && displacement >= -4096 && displacement <= 4094;
+
+            private static bool IsConditionalBranch(RVInstrKind opcode)
+                => opcode is RVInstrKind.Beq or RVInstrKind.Bne or RVInstrKind.Blt or RVInstrKind.Bge or RVInstrKind.Bltu or RVInstrKind.Bgeu;
+
+            private static RVInstrKind InvertBranch(RVInstrKind opcode)
+                => opcode switch
+                {
+                    RVInstrKind.Beq => RVInstrKind.Bne,
+                    RVInstrKind.Bne => RVInstrKind.Beq,
+                    RVInstrKind.Blt => RVInstrKind.Bge,
+                    RVInstrKind.Bge => RVInstrKind.Blt,
+                    RVInstrKind.Bltu => RVInstrKind.Bgeu,
+                    RVInstrKind.Bgeu => RVInstrKind.Bltu,
+                    _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
+                };
+
+            private enum BranchRelaxationKind : byte
+            {
+                None,
+                ConditionalViaJal,
+                LongJal,
+            }
+
+            private int _nextRelaxationLabelId;
 
             public RVTextSection ToSection()
                 => new RVTextSection(_instructions, _labels, _relocations.ToImmutableArray());
