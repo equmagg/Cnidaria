@@ -416,6 +416,42 @@ namespace Cnidaria.Cs
 
             var int32 = context.Compilation.GetSpecialType(SpecialType.System_Int32);
 
+            if (CanLowerStackAllocToReadOnlySpanStaticData(sa, spanLikeType))
+            {
+                var pointerArgument = new BoundStaticDataExpression(
+                    exprSyntax,
+                    (PointerTypeSymbol)sa.Type,
+                    sa.ElementType,
+                    sa.InitializerOpt!.Elements);
+                var lengthArgument = new BoundLiteralExpression(
+                    exprSyntax,
+                    int32,
+                    sa.InitializerOpt.Elements.Length);
+
+                var arg0 = ApplyConversion(
+                    exprSyntax,
+                    pointerArgument,
+                    ctor.Parameters[0].Type,
+                    diagnosticNode,
+                    context,
+                    diagnostics,
+                    requireImplicit: true);
+                var arg1 = ApplyConversion(
+                    exprSyntax,
+                    lengthArgument,
+                    ctor.Parameters[1].Type,
+                    diagnosticNode,
+                    context,
+                    diagnostics,
+                    requireImplicit: true);
+
+                return new BoundObjectCreationExpression(
+                    exprSyntax,
+                    spanLikeType,
+                    ctor,
+                    ImmutableArray.Create(arg0, arg1));
+            }
+
             var countTmp = NewTemp("$stackalloc_len", int32);
             var ptrTmp = NewTemp("$stackalloc_ptr", sa.Type);
 
@@ -432,16 +468,70 @@ namespace Cnidaria.Cs
             var ptrDecl = new BoundLocalDeclarationStatement(diagnosticNode, ptrTmp, sa2);
             var ptrExpr = new BoundLocalExpression(diagnosticNode, ptrTmp);
 
-            var arg0 = ApplyConversion(exprSyntax, ptrExpr, ctor.Parameters[0].Type, diagnosticNode, context, diagnostics, requireImplicit: true);
-            var arg1 = ApplyConversion(exprSyntax, countExpr, ctor.Parameters[1].Type, diagnosticNode, context, diagnostics, requireImplicit: true);
+            {
+                var arg0 = ApplyConversion(exprSyntax, ptrExpr, ctor.Parameters[0].Type, diagnosticNode, context, diagnostics, requireImplicit: true);
+                var arg1 = ApplyConversion(exprSyntax, countExpr, ctor.Parameters[1].Type, diagnosticNode, context, diagnostics, requireImplicit: true);
 
-            var created = new BoundObjectCreationExpression(exprSyntax, spanLikeType, ctor, ImmutableArray.Create(arg0, arg1));
+                var created = new BoundObjectCreationExpression(exprSyntax, spanLikeType, ctor, ImmutableArray.Create(arg0, arg1));
 
-            return new BoundSequenceExpression(
-                diagnosticNode,
-                locals: ImmutableArray.Create(countTmp, ptrTmp),
-                sideEffects: ImmutableArray.Create<BoundStatement>(countDecl, ptrDecl),
-                value: created);
+                return new BoundSequenceExpression(
+                    diagnosticNode,
+                    locals: ImmutableArray.Create(countTmp, ptrTmp),
+                    sideEffects: ImmutableArray.Create<BoundStatement>(countDecl, ptrDecl),
+                    value: created);
+            }
+        }
+        private static bool CanLowerStackAllocToReadOnlySpanStaticData(BoundStackAllocArrayCreationExpression stackAlloc, NamedTypeSymbol spanLikeType)
+        {
+            var definition = spanLikeType.OriginalDefinition;
+            if (definition.Arity != 1 || !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                return false;
+
+            if (definition.ContainingSymbol is not NamespaceSymbol ns ||
+                !string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                return false;
+
+            var initializer = stackAlloc.InitializerOpt;
+            if (initializer is null)
+                return false;
+
+            if (!stackAlloc.Count.ConstantValueOpt.HasValue ||
+                stackAlloc.Count.ConstantValueOpt.Value is not int count ||
+                count != initializer.Elements.Length)
+                return false;
+
+            if (!GenericConstraintFacts.IsUnmanagedType(stackAlloc.ElementType))
+                return false;
+
+            if (!IsSupportedStaticDataElementType(stackAlloc.ElementType))
+                return false;
+
+            for (int i = 0; i < initializer.Elements.Length; i++)
+            {
+                if (!initializer.Elements[i].ConstantValueOpt.HasValue)
+                    return false;
+            }
+
+            return true;
+        }
+        private static bool IsSupportedStaticDataElementType(TypeSymbol type)
+        {
+            if (type is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum)
+                type = nt.EnumUnderlyingType ?? type;
+
+            return type.SpecialType is
+                SpecialType.System_Boolean or
+                SpecialType.System_Char or
+                SpecialType.System_Int8 or
+                SpecialType.System_UInt8 or
+                SpecialType.System_Int16 or
+                SpecialType.System_UInt16 or
+                SpecialType.System_Int32 or
+                SpecialType.System_UInt32 or
+                SpecialType.System_Int64 or
+                SpecialType.System_UInt64 or
+                SpecialType.System_Single or
+                SpecialType.System_Double;
         }
         private static bool TryGetSystemSpanDefinition(Compilation compilation, out NamedTypeSymbol spanDef)
         {
@@ -693,11 +783,11 @@ namespace Cnidaria.Cs
             parameter.SetDefaultValue(init.ConstantValueOpt);
         }
         private ImmutableArray<TypeParameterSymbol> DeclareLocalFunctionTypeParameters(
-        LocalFunctionStatementSyntax lf,
-        LocalFunctionSymbol owner,
-        SyntaxTree tree,
-        BindingContext context,
-        DiagnosticBag diagnostics)
+            LocalFunctionStatementSyntax lf,
+            LocalFunctionSymbol owner,
+            SyntaxTree tree,
+            BindingContext context,
+            DiagnosticBag diagnostics)
         {
             var list = lf.TypeParameterList;
             if (list == null || list.Parameters.Count == 0)

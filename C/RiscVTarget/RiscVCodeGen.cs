@@ -76,8 +76,41 @@ namespace Cnidaria.C
             if (_target.Architecture is not TargetArchitectureKind.RiscV32 and not TargetArchitectureKind.RiscV64)
                 throw new NotSupportedException("RISC-V C backend requires RiscV32 or RiscV64 target.");
             _machineTarget = RVTarget.FromTargetInfo(_target);
-            _allocationOptions = allocationOptions ?? LSRAOptions.ForTarget(_target);
+            _allocationOptions = ReserveCodeGenScratchRegisters(allocationOptions ?? LSRAOptions.ForTarget(_target));
             _options = options ?? RiscVCodeGeneratorOptions.Default;
+        }
+
+        private static LSRAOptions ReserveCodeGenScratchRegisters(LSRAOptions options)
+        {
+            var reservedGeneral = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            reservedGeneral.UnionWith(new[]
+            {
+                MachineRegister.X5,
+                MachineRegister.X6,
+                MachineRegister.X7,
+                MachineRegister.X28,
+                MachineRegister.X29,
+                MachineRegister.X30,
+                MachineRegister.X31,
+            });
+            var reservedFloating = ImmutableHashSet.Create(
+                MachineRegister.F0,
+                MachineRegister.F1,
+                MachineRegister.F2);
+            var reservedVector = ImmutableHashSet.Create(
+                MachineRegister.V28,
+                MachineRegister.V29,
+                MachineRegister.V30,
+                MachineRegister.V31);
+
+            return new LSRAOptions(
+                generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
+                floatingRegisters: options.FloatingRegisters.Where(r => !reservedFloating.Contains(r)).ToImmutableArray(),
+                vectorRegisters: options.VectorRegisters.Where(r => !reservedVector.Contains(r)).ToImmutableArray(),
+                stackAlignment: options.StackAlignment,
+                spillSlotSize: options.SpillSlotSize,
+                spillSlotAlignment: options.SpillSlotAlignment,
+                stackArgumentSlotSize: options.StackArgumentSlotSize);
         }
 
         public static RiscVProgram Generate(
@@ -580,6 +613,31 @@ namespace Cnidaria.C
             private readonly int _riscVVarArgsSaveAreaOffset;
             private readonly int _riscVVarArgsSaveAreaSize;
             private readonly int _totalFrameSize;
+            private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
+
+            private enum IntegerRepresentationKind : byte
+            {
+                Unknown,
+                SignExtended,
+                ZeroExtended,
+            }
+
+            private readonly struct IntegerRepresentationFact
+            {
+                public IntegerRepresentationFact(IntegerRepresentationKind kind, int bits)
+                {
+                    Kind = kind;
+                    Bits = bits;
+                }
+
+                public IntegerRepresentationKind Kind { get; }
+                public int Bits { get; }
+                public bool IsKnown => Kind != IntegerRepresentationKind.Unknown;
+
+                public static IntegerRepresentationFact Unknown => default;
+                public static IntegerRepresentationFact SignExtended(int bits) => new IntegerRepresentationFact(IntegerRepresentationKind.SignExtended, bits);
+                public static IntegerRepresentationFact ZeroExtended(int bits) => new IntegerRepresentationFact(IntegerRepresentationKind.ZeroExtended, bits);
+            }
 
             public FunctionEmissionContext(
                 RiscVCodeGenerator owner,
@@ -620,6 +678,7 @@ namespace Cnidaria.C
             {
                 foreach (var block in _function.Blocks)
                 {
+                    ClearIntegerRepresentationFacts();
                     _owner._text.DefineLabel(LabelOf(block));
                     foreach (var instruction in block.Instructions)
                         EmitInstruction(instruction);
@@ -880,7 +939,11 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
 
                 var register = GetWritableRegister(destination, PreferredScratch(destination.Type, GpScratch0, FpScratch0, VecScratch0));
-                finalizers.Add(() => StoreWritableRegisterIfSpilled(destination, register));
+                finalizers.Add(() =>
+                {
+                    NormalizeScalarRegister(register, destination.Type);
+                    StoreWritableRegisterIfSpilled(destination, register);
+                });
                 return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(register)));
             }
 
@@ -911,6 +974,7 @@ namespace Cnidaria.C
                 var writable = GetWritableRegister(destination, source);
                 if (writable != source)
                     MoveRegister(writable, source);
+                NormalizeScalarRegister(writable, destination.Type);
                 StoreWritableRegisterIfSpilled(destination, writable);
             }
 
@@ -957,6 +1021,7 @@ namespace Cnidaria.C
                 try
                 {
                     _owner._text.EmitAssembly(text, _owner.CreateLocalLabel(_functionLabel + "_asm"), _owner._machineTarget);
+                    ClearIntegerRepresentationFacts();
                 }
                 catch (Exception ex) when (ex is FormatException or ArgumentException or InvalidOperationException)
                 {
@@ -1059,13 +1124,13 @@ namespace Cnidaria.C
                 {
                     LoadFromMemory(destination, Sp, IncomingStackOffset(
                         scalarLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsSignedIntegerType(type));
-                    NormalizeScalarRegister(destination, type);
                 }
                 else
                 {
                     throw Unsupported(instruction, "Invalid scalar parameter ABI location.");
                 }
 
+                NormalizeScalarRegister(destination, type);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
 
@@ -3120,7 +3185,7 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Implicit floating-point to non-floating load is not supported.");
 
                 var source = LoadOperand(operand, scratch);
-                if (!TypesNeedIntegerConversion(operand.Type, targetType))
+                if (!TypesNeedIntegerConversion(operand.Type, targetType) || IntegerRepresentationSatisfies(GetIntegerRepresentation(source), targetType))
                     return source;
                 if (source != scratch)
                     MoveRegister(scratch, source);
@@ -3137,7 +3202,6 @@ namespace Cnidaria.C
                         : (destination == GpScratch0 ? GpScratch1 : GpScratch0);
                 var source = LoadOperandAs(operand, targetType, scratch, instruction);
                 MoveRegister(destination, source);
-                NormalizeScalarRegister(destination, targetType);
             }
 
             private MachineRegister LoadOperand(LirOperand operand, MachineRegister preferred)
@@ -3757,15 +3821,18 @@ namespace Cnidaria.C
 
             private void LoadImmediate(MachineRegister destination, long value)
             {
+                var representation = RepresentationForConstant(value);
                 if (value == 0)
                 {
                     MoveRegister(destination, MachineRegister.X0);
+                    SetIntegerRepresentation(destination, representation);
                     return;
                 }
 
                 if (FitsSignedImmediate(value, 12))
                 {
                     EmitImm(RVInstrKind.Addi, destination, MachineRegister.X0, (int)value);
+                    SetIntegerRepresentation(destination, representation);
                     return;
                 }
 
@@ -3776,6 +3843,7 @@ namespace Cnidaria.C
                     Emit(RVInstruction.U(RVInstrKind.Lui, ToRegister(destination), hi));
                     if (lo != 0)
                         EmitImm(RVInstrKind.Addi, destination, destination, lo);
+                    SetIntegerRepresentation(destination, representation);
                     return;
                 }
 
@@ -3788,6 +3856,7 @@ namespace Cnidaria.C
                 _owner._rodata.EmitInteger(value, 8, _owner._target.Endianness);
                 MaterializeSymbolAddress(label, destination);
                 LoadFromMemory(destination, destination, 0, 8, signed: false);
+                SetIntegerRepresentation(destination, representation);
             }
 
             private void MaterializeSymbolAddress(string symbol, MachineRegister destination)
@@ -3899,17 +3968,15 @@ namespace Cnidaria.C
                 if (!IsIntegerLike(type) && !IsPointerLike(type))
                     return;
                 if (IsPointerLike(type))
-                {
-                    if (_owner._target.Is32Bit)
-                        EmitShiftPair(register, 0, unsignedShift: true);
                     return;
-                }
+
+                var required = CanonicalIntegerRepresentation(type);
+                if (!required.IsKnown || IntegerRepresentationSatisfies(GetIntegerRepresentation(register), required))
+                    return;
 
                 var size = SizeOf(type);
                 if (_owner._target.Is64Bit)
                 {
-                    if (size >= 8)
-                        return;
                     if (size == 4)
                     {
                         if (IsUnsignedIntegerType(type))
@@ -3921,28 +3988,251 @@ namespace Cnidaria.C
                         {
                             EmitImm(RVInstrKind.Addiw, register, register, 0);
                         }
+                        SetIntegerRepresentation(register, required);
                         return;
                     }
 
                     var shift = 64 - size * 8;
                     EmitShiftImmediate(RVInstrKind.Slli, register, register, shift);
                     EmitShiftImmediate(IsUnsignedIntegerType(type) ? RVInstrKind.Srli : RVInstrKind.Srai, register, register, shift);
+                    SetIntegerRepresentation(register, required);
                     return;
                 }
 
-                if (size >= 4)
-                    return;
                 var shift32 = 32 - size * 8;
                 EmitShiftImmediate(RVInstrKind.Slli, register, register, shift32);
                 EmitShiftImmediate(IsUnsignedIntegerType(type) ? RVInstrKind.Srli : RVInstrKind.Srai, register, register, shift32);
+                SetIntegerRepresentation(register, required);
             }
 
-            private void EmitShiftPair(MachineRegister register, int shift, bool unsignedShift)
+            private IntegerRepresentationFact CanonicalIntegerRepresentation(QualifiedType type)
             {
-                if (shift == 0)
+                if (!IsIntegerLike(type) || IsPointerLike(type))
+                    return IntegerRepresentationFact.Unknown;
+
+                var bits = checked(SizeOf(type) * 8);
+                var registerBits = checked(_owner._target.RegisterSize * 8);
+                if (bits >= registerBits)
+                    return IntegerRepresentationFact.Unknown;
+                return IsUnsignedIntegerType(type)
+                    ? IntegerRepresentationFact.ZeroExtended(bits)
+                    : IntegerRepresentationFact.SignExtended(bits);
+            }
+
+            private bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, QualifiedType type)
+            {
+                if (IsPointerLike(type))
+                    return true;
+                var required = CanonicalIntegerRepresentation(type);
+                return !required.IsKnown || IntegerRepresentationSatisfies(actual, required);
+            }
+
+            private static bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, IntegerRepresentationFact required)
+            {
+                if (!required.IsKnown)
+                    return true;
+                if (!actual.IsKnown)
+                    return false;
+                if (required.Kind == IntegerRepresentationKind.ZeroExtended)
+                    return actual.Kind == IntegerRepresentationKind.ZeroExtended && actual.Bits <= required.Bits;
+                if (actual.Kind == IntegerRepresentationKind.SignExtended)
+                    return actual.Bits <= required.Bits;
+                return actual.Kind == IntegerRepresentationKind.ZeroExtended && actual.Bits < required.Bits;
+            }
+
+            private IntegerRepresentationFact GetIntegerRepresentation(MachineRegister register)
+                => GetIntegerRepresentation(ToRegister(register));
+
+            private IntegerRepresentationFact GetIntegerRepresentation(RVRegister register)
+            {
+                if (register == RVRegister.X0)
+                    return IntegerRepresentationFact.ZeroExtended(1);
+                var index = (int)register;
+                return index > 0 && index < _integerRepresentationFacts.Length
+                    ? _integerRepresentationFacts[index]
+                    : IntegerRepresentationFact.Unknown;
+            }
+
+            private void SetIntegerRepresentation(MachineRegister register, IntegerRepresentationFact fact)
+                => SetIntegerRepresentation(ToRegister(register), fact);
+
+            private void SetIntegerRepresentation(RVRegister register, IntegerRepresentationFact fact)
+            {
+                var index = (int)register;
+                if (index > 0 && index < _integerRepresentationFacts.Length)
+                    _integerRepresentationFacts[index] = fact;
+            }
+
+            private void ClearIntegerRepresentationFacts()
+                => Array.Clear(_integerRepresentationFacts, 0, _integerRepresentationFacts.Length);
+
+            private void ClearCallerClobberedIntegerRepresentationFacts()
+            {
+                _integerRepresentationFacts[1] = IntegerRepresentationFact.Unknown;
+                for (var i = 5; i <= 7; i++)
+                    _integerRepresentationFacts[i] = IntegerRepresentationFact.Unknown;
+                for (var i = 10; i <= 17; i++)
+                    _integerRepresentationFacts[i] = IntegerRepresentationFact.Unknown;
+                for (var i = 28; i <= 31; i++)
+                    _integerRepresentationFacts[i] = IntegerRepresentationFact.Unknown;
+            }
+
+            private void TrackIntegerRepresentation(RVInstruction instruction)
+            {
+                if (instruction.Opcode is RVInstrKind.Jal or RVInstrKind.Jalr or RVInstrKind.Ecall)
+                {
+                    if (instruction.Opcode == RVInstrKind.Ecall || instruction.Rd != RVRegister.X0)
+                        ClearCallerClobberedIntegerRepresentationFacts();
                     return;
-                EmitShiftImmediate(RVInstrKind.Slli, register, register, shift);
-                EmitShiftImmediate(unsignedShift ? RVInstrKind.Srli : RVInstrKind.Srai, register, register, shift);
+                }
+
+                var rd = (int)instruction.Rd;
+                if (rd <= 0 || rd >= _integerRepresentationFacts.Length)
+                    return;
+
+                var source = GetIntegerRepresentation(instruction.Rs1);
+                var fact = IntegerRepresentationFact.Unknown;
+                switch (instruction.Opcode)
+                {
+                    case RVInstrKind.Lb:
+                        fact = IntegerRepresentationFact.SignExtended(8);
+                        break;
+                    case RVInstrKind.Lh:
+                        fact = IntegerRepresentationFact.SignExtended(16);
+                        break;
+                    case RVInstrKind.Lw:
+                    case RVInstrKind.LrW:
+                    case RVInstrKind.AmoSwapW:
+                    case RVInstrKind.AmoAddW:
+                    case RVInstrKind.AmoXorW:
+                    case RVInstrKind.AmoAndW:
+                    case RVInstrKind.AmoOrW:
+                    case RVInstrKind.AmoMinW:
+                    case RVInstrKind.AmoMaxW:
+                    case RVInstrKind.AmoMinuW:
+                    case RVInstrKind.AmoMaxuW:
+                        fact = IntegerRepresentationFact.SignExtended(32);
+                        break;
+                    case RVInstrKind.Lbu:
+                        fact = IntegerRepresentationFact.ZeroExtended(8);
+                        break;
+                    case RVInstrKind.Lhu:
+                        fact = IntegerRepresentationFact.ZeroExtended(16);
+                        break;
+                    case RVInstrKind.Lwu:
+                        fact = IntegerRepresentationFact.ZeroExtended(32);
+                        break;
+                    case RVInstrKind.Addiw:
+                    case RVInstrKind.Slliw:
+                    case RVInstrKind.Srliw:
+                    case RVInstrKind.Sraiw:
+                    case RVInstrKind.Addw:
+                    case RVInstrKind.Subw:
+                    case RVInstrKind.Sllw:
+                    case RVInstrKind.Srlw:
+                    case RVInstrKind.Sraw:
+                    case RVInstrKind.Mulw:
+                    case RVInstrKind.Divw:
+                    case RVInstrKind.Divuw:
+                    case RVInstrKind.Remw:
+                    case RVInstrKind.Remuw:
+                    case RVInstrKind.FcvtWS:
+                    case RVInstrKind.FcvtWuS:
+                    case RVInstrKind.FcvtWD:
+                    case RVInstrKind.FcvtWuD:
+                    case RVInstrKind.FmvXW:
+                        fact = IntegerRepresentationFact.SignExtended(32);
+                        break;
+                    case RVInstrKind.Slti:
+                    case RVInstrKind.Sltiu:
+                    case RVInstrKind.Slt:
+                    case RVInstrKind.Sltu:
+                    case RVInstrKind.FeqS:
+                    case RVInstrKind.FltS:
+                    case RVInstrKind.FleS:
+                    case RVInstrKind.FeqD:
+                    case RVInstrKind.FltD:
+                    case RVInstrKind.FleD:
+                        fact = IntegerRepresentationFact.ZeroExtended(1);
+                        break;
+                    case RVInstrKind.Addi when instruction.Rs1 == RVRegister.X0:
+                        fact = RepresentationForConstant(instruction.Immediate);
+                        break;
+                    case RVInstrKind.Addi when instruction.Immediate == 0:
+                        fact = source;
+                        break;
+                    case RVInstrKind.Xori when instruction.Immediate == 1 && source.Kind == IntegerRepresentationKind.ZeroExtended && source.Bits <= 1:
+                        fact = IntegerRepresentationFact.ZeroExtended(1);
+                        break;
+                    case RVInstrKind.Andi when instruction.Immediate >= 0:
+                        fact = RepresentationForNonNegativeMask((uint)instruction.Immediate);
+                        break;
+                    case RVInstrKind.And:
+                        {
+                            var right = GetIntegerRepresentation(instruction.Rs2);
+                            if (source.Kind == IntegerRepresentationKind.ZeroExtended && right.Kind == IntegerRepresentationKind.ZeroExtended)
+                                fact = IntegerRepresentationFact.ZeroExtended(Math.Min(source.Bits, right.Bits));
+                            else if (source.Kind == IntegerRepresentationKind.ZeroExtended)
+                                fact = source;
+                            else if (right.Kind == IntegerRepresentationKind.ZeroExtended)
+                                fact = right;
+                            break;
+                        }
+                    case RVInstrKind.Or:
+                    case RVInstrKind.Xor:
+                        {
+                            var right = GetIntegerRepresentation(instruction.Rs2);
+                            if (source.Kind == IntegerRepresentationKind.ZeroExtended && right.Kind == IntegerRepresentationKind.ZeroExtended)
+                                fact = IntegerRepresentationFact.ZeroExtended(Math.Max(source.Bits, right.Bits));
+                            break;
+                        }
+                    case RVInstrKind.Srli when instruction.Immediate > 0:
+                        fact = IntegerRepresentationFact.ZeroExtended(Math.Max(1, _owner._target.RegisterSize * 8 - instruction.Immediate));
+                        break;
+                    case RVInstrKind.Srai when instruction.Immediate > 0:
+                        fact = IntegerRepresentationFact.SignExtended(Math.Max(1, _owner._target.RegisterSize * 8 - instruction.Immediate));
+                        break;
+                    case RVInstrKind.Lui when _owner._target.Is64Bit:
+                        fact = IntegerRepresentationFact.SignExtended(32);
+                        break;
+                }
+
+                _integerRepresentationFacts[rd] = fact;
+            }
+
+            private static IntegerRepresentationFact RepresentationForConstant(long value)
+            {
+                if (value >= 0)
+                {
+                    if (value <= 1)
+                        return IntegerRepresentationFact.ZeroExtended(1);
+                    if (value <= byte.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(8);
+                    if (value <= ushort.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(16);
+                    if ((ulong)value <= uint.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(32);
+                    return IntegerRepresentationFact.Unknown;
+                }
+
+                if (value >= sbyte.MinValue)
+                    return IntegerRepresentationFact.SignExtended(8);
+                if (value >= short.MinValue)
+                    return IntegerRepresentationFact.SignExtended(16);
+                if (value >= int.MinValue)
+                    return IntegerRepresentationFact.SignExtended(32);
+                return IntegerRepresentationFact.Unknown;
+            }
+
+            private static IntegerRepresentationFact RepresentationForNonNegativeMask(uint mask)
+            {
+                if (mask <= 1)
+                    return IntegerRepresentationFact.ZeroExtended(1);
+                if (mask <= byte.MaxValue)
+                    return IntegerRepresentationFact.ZeroExtended(8);
+                if (mask <= ushort.MaxValue)
+                    return IntegerRepresentationFact.ZeroExtended(16);
+                return IntegerRepresentationFact.ZeroExtended(32);
             }
 
             private void EmitCall(string label)
@@ -3969,7 +4259,10 @@ namespace Cnidaria.C
                 => Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X0, RVRegister.X0, 0));
 
             private void Emit(RVInstruction instruction)
-                => _owner._text.Emit(instruction);
+            {
+                _owner._text.Emit(instruction);
+                TrackIntegerRepresentation(instruction);
+            }
 
             private string LabelOf(LirBlock? block)
             {
@@ -4016,8 +4309,18 @@ namespace Cnidaria.C
                 return Math.Max(1, _owner._target.RegisterSize);
             }
 
-            private static bool TypesNeedIntegerConversion(QualifiedType source, QualifiedType destination)
-                => (IsIntegerLike(source) || IsPointerLike(source)) && (IsIntegerLike(destination) || IsPointerLike(destination));
+            private bool TypesNeedIntegerConversion(QualifiedType source, QualifiedType destination)
+            {
+                if ((!IsIntegerLike(source) && !IsPointerLike(source)) || (!IsIntegerLike(destination) && !IsPointerLike(destination)))
+                    return false;
+                if (IsPointerLike(destination))
+                    return false;
+
+                var required = CanonicalIntegerRepresentation(destination);
+                if (!required.IsKnown)
+                    return false;
+                return !IntegerRepresentationSatisfies(CanonicalIntegerRepresentation(source), required);
+            }
 
             private bool RequiresSoftwareScalar(QualifiedType type)
             {

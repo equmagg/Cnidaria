@@ -523,6 +523,14 @@ namespace Cnidaria.C
                     MachineRegister.X14),
 
                 TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => ImmutableArray.Create(
+                    MachineRegister.X10,
+                    MachineRegister.X11,
+                    MachineRegister.X12,
+                    MachineRegister.X13,
+                    MachineRegister.X14,
+                    MachineRegister.X15,
+                    MachineRegister.X16,
+                    MachineRegister.X17,
                     MachineRegister.X9,
                     MachineRegister.X18,
                     MachineRegister.X19,
@@ -592,6 +600,14 @@ namespace Cnidaria.C
                 return CAbi.RiscVAbiFloatingRegisterSize(target) == 0
                     ? ImmutableArray<MachineRegister>.Empty
                     : ImmutableArray.Create(
+                        MachineRegister.F10,
+                        MachineRegister.F11,
+                        MachineRegister.F12,
+                        MachineRegister.F13,
+                        MachineRegister.F14,
+                        MachineRegister.F15,
+                        MachineRegister.F16,
+                        MachineRegister.F17,
                         MachineRegister.F3,
                         MachineRegister.F4,
                         MachineRegister.F5,

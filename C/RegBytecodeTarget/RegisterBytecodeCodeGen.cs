@@ -1610,19 +1610,22 @@ namespace Cnidaria.C
                     var directCallFlags = BuildCallFlags(instruction);
                     MarshalCallArguments(instruction, startOperand: 1);
                     PrepareVariadicCall(instruction);
-                    var directCallOp = CallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void), isInternal: false);
+                    var returnType = instruction.CallSignature?.ReturnType ?? instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
+                    var directCallOp = CallOpForReturn(returnType, isInternal: false);
                     EmitManagedDirectCall(directCallOp, methodId, directCallFlags);
                     EmitCallResult(instruction);
                     return;
                 }
-
-                var indirectCallFlags = BuildCallFlags(instruction);
-                MarshalCallArguments(instruction, startOperand: 1);
-                PrepareVariadicCall(instruction);
-                var target = LoadOperand(callee, GpScratch0);
-                var indirectCallOp = IndirectCallOpForReturn(instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void));
-                EmitRawIndirectCall(indirectCallOp, target, indirectCallFlags);
-                EmitCallResult(instruction);
+                {
+                    var indirectCallFlags = BuildCallFlags(instruction);
+                    MarshalCallArguments(instruction, startOperand: 1);
+                    PrepareVariadicCall(instruction);
+                    var target = LoadOperand(callee, GpScratch0);
+                    var returnType = instruction.CallSignature?.ReturnType ?? instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
+                    var indirectCallOp = IndirectCallOpForReturn(returnType);
+                    EmitRawIndirectCall(indirectCallOp, target, indirectCallFlags);
+                    EmitCallResult(instruction);
+                }
             }
 
             private void EmitCallResult(LirInstruction instruction)

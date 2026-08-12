@@ -408,6 +408,7 @@ namespace Cnidaria.C
         public static TargetInfo Arm64Linux { get; } = ForArchitecture(TargetArchitectureKind.Arm64, OperatingSystemKind.Linux);
         public static TargetInfo Arm64Windows { get; } = ForArchitecture(TargetArchitectureKind.Arm64, OperatingSystemKind.Windows);
         public static TargetInfo RV64GLinux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RiscVG);
+        public static TargetInfo RVA32Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RVA23);
         public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Windows);
         public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux);
         public static TargetInfo Default => RegisterBytecode32;

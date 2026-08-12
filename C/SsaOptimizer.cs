@@ -54,6 +54,9 @@ namespace Cnidaria.C
             private readonly Dictionary<SsaName, SsaName> _copies = new();
             private readonly Dictionary<SsaName, GimpleConstantValue> _constants = new();
             private readonly Dictionary<int, List<SsaName>> _representativesByValueNumber = new();
+            private readonly Dictionary<SsaName, int> _useCounts = new();
+            private readonly Dictionary<SsaName, int> _definitionOrder = new();
+            private readonly Dictionary<ControlFlowBlock, int> _dominatorDepths = new();
             private readonly Dictionary<SsaDefinition, SsaDefinition> _definitionMap = new();
             private readonly HashSet<SsaDefinition> _removedDefinitions = new();
             private readonly List<SsaUse> _uses = new();
@@ -70,6 +73,69 @@ namespace Cnidaria.C
                 _target = target;
                 _options = options;
                 _valueNumberingOptions = valueNumberingOptions;
+                IndexUseCounts();
+                IndexDefinitionOrder();
+                IndexDominatorDepths();
+            }
+
+            private void IndexUseCounts()
+            {
+                foreach (var use in _function.Uses)
+                {
+                    if (use.Name.Variable.Kind == SsaVariableKind.Memory)
+                        continue;
+
+                    _useCounts.TryGetValue(use.Name, out var count);
+                    _useCounts[use.Name] = count + 1;
+                }
+
+                foreach (var block in _function.Blocks)
+                {
+                    foreach (var phi in block.Phis)
+                    {
+                        foreach (var operand in phi.Operands)
+                        {
+                            if (operand.Value.Variable.Kind == SsaVariableKind.Memory)
+                                continue;
+
+                            _useCounts.TryGetValue(operand.Value, out var count);
+                            _useCounts[operand.Value] = count + 1;
+                        }
+                    }
+                }
+            }
+
+            private void IndexDefinitionOrder()
+            {
+                foreach (var definition in _function.Definitions)
+                {
+                    if (definition.Kind == SsaDefinitionKind.Entry)
+                        _definitionOrder[definition.Name] = -2;
+                    else if (definition.Kind == SsaDefinitionKind.Phi)
+                        _definitionOrder[definition.Name] = -1;
+                }
+
+                foreach (var block in _function.Blocks)
+                {
+                    for (var instructionIndex = 0; instructionIndex < block.Instructions.Length; instructionIndex++)
+                    {
+                        foreach (var definition in block.Instructions[instructionIndex].Definitions)
+                            _definitionOrder[definition.Name] = instructionIndex;
+                    }
+                }
+            }
+
+            private void IndexDominatorDepths()
+            {
+                foreach (var block in _function.ControlFlowFunction.ReversePostOrder)
+                {
+                    if (!block.IsReachable || block.IsExit)
+                        continue;
+
+                    _dominatorDepths[block] = block.ImmediateDominator is null || ReferenceEquals(block.ImmediateDominator, block)
+                        ? 0
+                        : (_dominatorDepths.TryGetValue(block.ImmediateDominator, out var parentDepth) ? parentDepth + 1 : 0);
+                }
             }
 
             public SsaFunction Run()
@@ -384,6 +450,12 @@ namespace Cnidaria.C
                             ? ResolveCopyForBlock(operand.Value, operand.Predecessor)
                             : operand.Value;
 
+                        if (_options.EnableCopyPropagation &&
+                            TryGetValueNumberRepresentative(value, operand.Predecessor, out var representative))
+                        {
+                            value = representative;
+                        }
+
                         if (!ReferenceEquals(value, operand.Value))
                             changed = true;
 
@@ -399,7 +471,11 @@ namespace Cnidaria.C
 
                     phis.Add(rewritten);
 
-                    if (_options.EnableCopyPropagation && TryGetTrivialPhiCopy(rewritten, out var copy))
+                    if (_options.EnableConstantFolding && TryGetPhiConstant(rewritten, out var phiConstant))
+                        AddConstant(phi.Result, phiConstant);
+
+                    if (_options.EnableCopyPropagation &&
+                        (TryGetTrivialPhiCopy(rewritten, out var copy) || TryGetValueNumberPhiCopy(rewritten, out copy)))
                     {
                         AddCopy(phi.Result, copy);
                     }
@@ -522,10 +598,20 @@ namespace Cnidaria.C
                     if (_options.EnableCopyPropagation)
                         name = ResolveCopyForBlock(name, useBlock);
 
-                    if (_options.EnableConstantFolding && _constants.TryGetValue(name, out var constant))
+                    if (_options.EnableConstantFolding &&
+                        CanReplaceNameWithConstant(name) &&
+                        _constants.TryGetValue(name, out var constant))
                     {
                         Changed = true;
                         return CreateConstantExpression(CloneConstant(constant, expression.Original.Syntax));
+                    }
+
+                    if (_options.EnableConstantFolding &&
+                        CanReplaceNameWithConstant(name) &&
+                        _function.ValueNumbering.TryGetConstantValue(name, out var numberedConstant))
+                    {
+                        Changed = true;
+                        return CreateConstantExpression(new GimpleConstantValue(numberedConstant, name.Type, expression.Original.Syntax));
                     }
 
                     if (_options.EnableCopyPropagation && TryGetValueNumberRepresentative(name, useBlock, out var representative))
@@ -656,6 +742,13 @@ namespace Cnidaria.C
                     return;
                 }
 
+                if (_options.EnableConstantFolding &&
+                    _function.ValueNumbering.TryGetConstantValue(definition.Name, out var numberedConstant))
+                {
+                    AddConstant(definition.Name, new GimpleConstantValue(numberedConstant, definition.Name.Type, instruction.Statement.Syntax));
+                    return;
+                }
+
                 if ((instruction.Flags & (SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall)) != 0)
                     return;
 
@@ -703,7 +796,7 @@ namespace Cnidaria.C
                 if (!CanUseValueNumberForCopy(valueNumber))
                     return;
 
-                if (TryGetValueNumberRepresentative(valueNumber, name.Type, useBlock, out var representative) &&
+                if (TryGetValueNumberRepresentative(valueNumber, name, useBlock, out var representative) &&
                     !ReferenceEquals(representative, name))
                 {
                     AddCopy(name, representative);
@@ -716,7 +809,8 @@ namespace Cnidaria.C
                     _representativesByValueNumber.Add(valueNumber.Id, list);
                 }
 
-                list.Add(name);
+                if (!list.Contains(name))
+                    list.Add(name);
             }
 
             private bool TryGetValueNumberRepresentative(SsaName name, ControlFlowBlock useBlock, out SsaName representative)
@@ -729,12 +823,12 @@ namespace Cnidaria.C
                 if (!CanUseValueNumberForCopy(valueNumber))
                     return false;
 
-                return TryGetValueNumberRepresentative(valueNumber, name.Type, useBlock, out representative);
+                return TryGetValueNumberRepresentative(valueNumber, name, useBlock, out representative);
             }
 
             private bool TryGetValueNumberRepresentative(
                 ValueNumber valueNumber,
-                QualifiedType type,
+                SsaName useName,
                 ControlFlowBlock useBlock,
                 out SsaName representative)
             {
@@ -743,23 +837,31 @@ namespace Cnidaria.C
                 if (!_representativesByValueNumber.TryGetValue(valueNumber.Id, out var candidates))
                     return false;
 
+                var bestScore = int.MinValue;
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var candidate = ResolveCopyForBlock(candidates[i], useBlock);
                     if (candidate.IsUndefined || candidate.Variable.Kind == SsaVariableKind.Memory)
                         continue;
 
-                    if (!SameType(candidate.Type, type))
+                    if (ReferenceEquals(candidate, useName))
                         continue;
 
-                    if (CanUseNameAtBlock(candidate, useBlock))
-                    {
-                        representative = candidate;
-                        return true;
-                    }
+                    if (!CanSubstituteName(useName, candidate))
+                        continue;
+
+                    if (!CanUseNameAtBlock(candidate, useBlock))
+                        continue;
+
+                    var score = ScoreCopyCandidate(useName, candidate, useBlock);
+                    if (score <= 0 || score <= bestScore)
+                        continue;
+
+                    bestScore = score;
+                    representative = candidate;
                 }
 
-                return false;
+                return representative is not null;
             }
 
             private static bool CanUseValueNumberForCopy(ValueNumber valueNumber)
@@ -770,14 +872,41 @@ namespace Cnidaria.C
                 return valueNumber.Kind is ValueNumberKind.Entry or ValueNumberKind.Constant or ValueNumberKind.Expression or ValueNumberKind.Phi;
             }
 
+            private int ScoreCopyCandidate(SsaName useName, SsaName candidate, ControlFlowBlock useBlock)
+            {
+                var score = 1;
+
+                if (useName.Variable.Kind == SsaVariableKind.Temporary)
+                    score += 8;
+                if (candidate.Variable.Kind == SsaVariableKind.Temporary)
+                    score -= 8;
+
+                if (ReferenceEquals(useName.Variable, candidate.Variable))
+                    score += 2;
+
+                if (_useCounts.TryGetValue(candidate, out var useCount))
+                    score += Math.Min(useCount, 8);
+
+                if (_function.TryGetDefinition(candidate, out var definition) && definition?.Block is not null)
+                {
+                    if (ReferenceEquals(definition.Block, useBlock))
+                        score += 8;
+
+                    if (_dominatorDepths.TryGetValue(definition.Block, out var depth))
+                        score += Math.Min(depth, 16);
+                }
+
+                return score;
+            }
+
             private SsaName ResolveCopyForBlock(SsaName name, ControlFlowBlock useBlock)
             {
                 var current = name;
-                var seen = new HashSet<SsaName>();
+                var remaining = _copies.Count + 1;
 
-                while (_copies.TryGetValue(current, out var next))
+                while (remaining-- > 0 && _copies.TryGetValue(current, out var next))
                 {
-                    if (!seen.Add(current) || !CanUseNameAtBlock(next, useBlock))
+                    if (!CanUseNameAtBlock(next, useBlock))
                         break;
 
                     current = next;
@@ -792,22 +921,72 @@ namespace Cnidaria.C
                     return;
                 if (destination.Variable.Kind == SsaVariableKind.Memory || source.Variable.Kind == SsaVariableKind.Memory)
                     return;
-                if (!SameType(destination.Type, source.Type))
+                if (!CanSubstituteName(destination, source))
                     return;
                 if (ReferenceEquals(destination, source))
                     return;
 
+                if (_function.TryGetDefinition(destination, out var destinationDefinition) &&
+                    destinationDefinition is not null &&
+                    !CanUseNameAtDefinition(source, destinationDefinition))
+                {
+                    return;
+                }
+
                 _copies[destination] = source;
             }
+
+            private static bool CanSubstituteName(SsaName destination, SsaName source)
+            {
+                if (!SameType(destination.Type, source.Type))
+                    return false;
+
+                if (IsVolatileOrAtomic(destination.Type) || IsVolatileOrAtomic(source.Type))
+                    return false;
+
+                if (ReferenceEquals(destination.Variable, source.Variable))
+                    return true;
+
+                return !HasExplicitRegister(destination) && !HasExplicitRegister(source);
+            }
+
+            private static bool HasExplicitRegister(SsaName name)
+                => name.Variable.Symbol is VariableSymbol { ExplicitRegisterName: not null };
+
+            private static bool CanReplaceNameWithConstant(SsaName name)
+                => !IsVolatileOrAtomic(name.Type) && !HasExplicitRegister(name);
 
             private void AddConstant(SsaName destination, GimpleConstantValue constant)
             {
                 if (destination.IsUndefined || destination.Variable.Kind == SsaVariableKind.Memory)
                     return;
-                if (!SameType(destination.Type, constant.Type))
+                if (!CanReplaceNameWithConstant(destination) || !SameType(destination.Type, constant.Type))
                     return;
 
                 _constants[destination] = constant;
+            }
+
+            private bool CanUseNameAtDefinition(SsaName name, SsaDefinition destination)
+            {
+                if (!_function.TryGetDefinition(name, out var source) || source is null)
+                    return false;
+
+                if (source.Kind == SsaDefinitionKind.Undefined || source.Block is null || destination.Block is null)
+                    return false;
+
+                if (!ReferenceEquals(source.Block, destination.Block))
+                    return source.Block.Dominates(destination.Block);
+
+                if (!_definitionOrder.TryGetValue(name, out var sourceOrder) ||
+                    !_definitionOrder.TryGetValue(destination.Name, out var destinationOrder))
+                {
+                    return false;
+                }
+
+                if (sourceOrder < 0 && destinationOrder < 0)
+                    return sourceOrder <= destinationOrder;
+
+                return sourceOrder < destinationOrder;
             }
 
             private bool CanUseNameAtBlock(SsaName name, ControlFlowBlock useBlock)
@@ -841,6 +1020,77 @@ namespace Cnidaria.C
                 }
 
                 copy = first;
+                return true;
+            }
+
+            private bool TryGetValueNumberPhiCopy(SsaPhi phi, out SsaName copy)
+            {
+                copy = null!;
+                if (phi.Operands.Length == 0 || phi.Result.Variable.Kind == SsaVariableKind.Memory)
+                    return false;
+
+                if (!_function.ValueNumbering.TryGetValueNumber(phi.Operands[0].Value, out var valueNumber) ||
+                    valueNumber is null ||
+                    !CanUseValueNumberForCopy(valueNumber))
+                {
+                    return false;
+                }
+
+                for (var i = 1; i < phi.Operands.Length; i++)
+                {
+                    if (!_function.ValueNumbering.TryGetValueNumber(phi.Operands[i].Value, out var operandNumber) ||
+                        !ReferenceEquals(valueNumber, operandNumber))
+                    {
+                        return false;
+                    }
+                }
+
+                if (!_function.TryGetDefinition(phi.Result, out var phiDefinition) || phiDefinition is null)
+                    return false;
+
+                var bestScore = int.MinValue;
+                foreach (var operand in phi.Operands)
+                {
+                    var candidate = ResolveCopyForBlock(operand.Value, operand.Predecessor);
+                    if (ReferenceEquals(candidate, phi.Result) || !CanSubstituteName(phi.Result, candidate))
+                        continue;
+                    if (!CanUseNameAtDefinition(candidate, phiDefinition))
+                        continue;
+
+                    var score = ScoreCopyCandidate(phi.Result, candidate, phi.Block);
+                    if (score <= bestScore)
+                        continue;
+
+                    bestScore = score;
+                    copy = candidate;
+                }
+
+                return copy is not null;
+            }
+
+            private bool TryGetPhiConstant(SsaPhi phi, out GimpleConstantValue constant)
+            {
+                constant = null!;
+                if (phi.Operands.Length == 0 || !CanReplaceNameWithConstant(phi.Result))
+                    return false;
+
+                if (!_function.ValueNumbering.TryGetValueNumber(phi.Operands[0].Value, out var valueNumber) ||
+                    valueNumber is null ||
+                    !valueNumber.HasConstantValue)
+                {
+                    return false;
+                }
+
+                for (var i = 1; i < phi.Operands.Length; i++)
+                {
+                    if (!_function.ValueNumbering.TryGetValueNumber(phi.Operands[i].Value, out var operandNumber) ||
+                        !ReferenceEquals(valueNumber, operandNumber))
+                    {
+                        return false;
+                    }
+                }
+
+                constant = new GimpleConstantValue(valueNumber.ConstantValue, phi.Result.Type);
                 return true;
             }
 
@@ -1626,11 +1876,27 @@ namespace Cnidaria.C
             private bool IsScalarZeroFoldable(QualifiedType type)
                 => TryGetIntegerInfo(type, out _);
 
-            private static bool TryGetConstant(SsaExpression expression, out GimpleConstantValue constant)
+            private bool TryGetConstant(SsaExpression expression, out GimpleConstantValue constant)
             {
                 if (expression.Name is null && expression.Children.Length == 0 && expression.Original is GimpleConstantValue value)
                 {
                     constant = value;
+                    return true;
+                }
+
+                if (expression.Name is not null &&
+                    CanReplaceNameWithConstant(expression.Name) &&
+                    _constants.TryGetValue(expression.Name, out var propagated))
+                {
+                    constant = propagated;
+                    return true;
+                }
+
+                if (expression.Name is not null &&
+                    CanReplaceNameWithConstant(expression.Name) &&
+                    _function.ValueNumbering.TryGetConstantValue(expression.Name, out var numberedConstant))
+                {
+                    constant = new GimpleConstantValue(numberedConstant, expression.Name.Type, expression.Original.Syntax);
                     return true;
                 }
 
@@ -1711,6 +1977,9 @@ namespace Cnidaria.C
                     GimpleTypeHelpers.Normalize(left).ToDisplayString(),
                     GimpleTypeHelpers.Normalize(right).ToDisplayString(),
                     StringComparison.Ordinal);
+
+            private static bool IsVolatileOrAtomic(QualifiedType type)
+                => (GimpleTypeHelpers.Normalize(type).Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;
 
             private static bool IsPointerLike(QualifiedType type)
                 => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;

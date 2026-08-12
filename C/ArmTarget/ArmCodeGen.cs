@@ -784,6 +784,31 @@ namespace Cnidaria.C
             private readonly int _scratchSaveOffset;
             private readonly int _backendTempOffset;
             private readonly int _totalFrameSize;
+            private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
+
+            private enum IntegerRepresentationKind : byte
+            {
+                Unknown,
+                SignExtended,
+                ZeroExtended,
+            }
+
+            private readonly struct IntegerRepresentationFact
+            {
+                public IntegerRepresentationFact(IntegerRepresentationKind kind, int bits)
+                {
+                    Kind = kind;
+                    Bits = bits;
+                }
+
+                public IntegerRepresentationKind Kind { get; }
+                public int Bits { get; }
+                public bool IsKnown => Kind != IntegerRepresentationKind.Unknown;
+
+                public static IntegerRepresentationFact Unknown => default;
+                public static IntegerRepresentationFact SignExtended(int bits) => new IntegerRepresentationFact(IntegerRepresentationKind.SignExtended, bits);
+                public static IntegerRepresentationFact ZeroExtended(int bits) => new IntegerRepresentationFact(IntegerRepresentationKind.ZeroExtended, bits);
+            }
 
             public FunctionEmissionContext(
                 ArmCodeGenerator owner,
@@ -848,6 +873,7 @@ namespace Cnidaria.C
             {
                 foreach (var block in _function.Blocks)
                 {
+                    ClearIntegerRepresentationFacts();
                     _owner._text.DefineLabel(LabelOf(block));
                     foreach (var instruction in block.Instructions)
                         EmitInstruction(instruction);
@@ -1034,7 +1060,6 @@ namespace Cnidaria.C
                 else
                 {
                     LoadOperandIntoAs(instruction.Operands[0], destination, instruction.Result.Type, instruction);
-                    NormalizeIntegerRegister(destination, instruction.Result.Type);
                 }
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
@@ -1059,6 +1084,8 @@ namespace Cnidaria.C
                 var size = RegisterSize(instruction.Result.Type);
                 var destination = GetWritableRegister(instruction.Result, Scratch0);
                 var source = LoadOperand(instruction.Operands[0], Scratch1);
+                if (instruction.Operator != "+")
+                    InvalidateIntegerRepresentation(destination);
                 switch (instruction.Operator)
                 {
                     case "+":
@@ -1078,6 +1105,7 @@ namespace Cnidaria.C
                         throw Unsupported(instruction, $"Unsupported unary operator '{instruction.Operator}'.");
                 }
 
+                RecordIntegerRegisterWrite(destination, size);
                 NormalizeIntegerRegister(destination, instruction.Result.Type);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
@@ -1101,6 +1129,7 @@ namespace Cnidaria.C
                 var right = LoadOperand(instruction.Operands[1], Scratch2);
                 if (right != Scratch2)
                     MoveRegister(Scratch2, right, size);
+                InvalidateIntegerRepresentation(destination);
 
                 switch (instruction.Operator)
                 {
@@ -1169,6 +1198,7 @@ namespace Cnidaria.C
                         EmitBooleanFromRegister(Scratch3, Scratch1);
                         EmitBooleanFromRegister(Scratch4, Scratch2);
                         Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(destination), size), Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch4), size)));
+                        SetIntegerRepresentation(destination, IntegerRepresentationFact.ZeroExtended(1));
                         break;
                     case "||":
                         Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
@@ -1178,6 +1208,7 @@ namespace Cnidaria.C
                         throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
                 }
 
+                RecordIntegerRegisterWrite(destination, size);
                 NormalizeIntegerRegister(destination, instruction.Result.Type);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
             }
@@ -1194,6 +1225,7 @@ namespace Cnidaria.C
                 if (op == "+" && IsPointerLike(leftType) && IsIntegerLike(rightType))
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                    InvalidateIntegerRepresentation(destination);
                     var pointer = LoadOperand(instruction.Operands[0], Scratch1);
                     if (pointer != Scratch1)
                         MoveRegister(Scratch1, pointer, size);
@@ -1209,6 +1241,7 @@ namespace Cnidaria.C
                 if (op == "+" && IsIntegerLike(leftType) && IsPointerLike(rightType))
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                    InvalidateIntegerRepresentation(destination);
                     var index = LoadOperand(instruction.Operands[0], Scratch2);
                     if (index != Scratch2)
                         MoveRegister(Scratch2, index, size);
@@ -1224,6 +1257,7 @@ namespace Cnidaria.C
                 if (op == "-" && IsPointerLike(leftType) && IsIntegerLike(rightType))
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                    InvalidateIntegerRepresentation(destination);
                     var pointer = LoadOperand(instruction.Operands[0], Scratch1);
                     if (pointer != Scratch1)
                         MoveRegister(Scratch1, pointer, size);
@@ -1239,6 +1273,7 @@ namespace Cnidaria.C
                 if (op == "-" && IsPointerLike(leftType) && IsPointerLike(rightType))
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                    InvalidateIntegerRepresentation(destination);
                     var left = LoadOperand(instruction.Operands[0], Scratch1);
                     if (left != Scratch1)
                         MoveRegister(Scratch1, left, size);
@@ -1367,6 +1402,7 @@ namespace Cnidaria.C
                     Emit(ArmInstruction.Unary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Blr : ArmInstrKind.Blx, Reg(ToArm(Scratch0), _owner._target.PointerSize)));
                 }
 
+                ClearCallerClobberedIntegerRepresentationFacts();
                 EmitCallResult(instruction);
             }
 
@@ -1588,14 +1624,12 @@ namespace Cnidaria.C
                 RequireScalar(operand.Type, instruction);
                 RequireScalar(targetType, instruction);
                 var source = LoadOperand(operand, scratch);
-                if (source != scratch && NeedsIntegerConversion(operand.Type, targetType))
-                {
+                if (!NeedsIntegerConversion(operand.Type, targetType) || IntegerRepresentationSatisfies(GetIntegerRepresentation(source), targetType))
+                    return source;
+                if (source != scratch)
                     MoveRegister(scratch, source, RegisterSize(targetType));
-                    source = scratch;
-                }
-                if (NeedsIntegerConversion(operand.Type, targetType))
-                    NormalizeIntegerRegister(source, targetType);
-                return source;
+                NormalizeIntegerRegister(scratch, targetType);
+                return scratch;
             }
 
             private void LoadOperandIntoAs(LirOperand operand, MachineRegister destination, QualifiedType targetType, LirInstruction instruction)
@@ -1603,7 +1637,6 @@ namespace Cnidaria.C
                 var scratch = destination == Scratch0 ? Scratch1 : Scratch0;
                 var source = LoadOperandAs(operand, targetType, scratch, instruction);
                 MoveRegister(destination, source, RegisterSize(targetType));
-                NormalizeIntegerRegister(destination, targetType);
             }
 
             private MachineRegister LoadOperand(LirOperand operand, MachineRegister preferred)
@@ -1723,6 +1756,7 @@ namespace Cnidaria.C
                             AddImmediate(scratchBase, elementBase.BaseRegister, elementBase.Offset);
                             elementBase = new AddressParts(scratchBase, 0);
                         }
+                        InvalidateIntegerRepresentation(scratchBase);
                         Emit(ArmInstruction.Ternary(
                             ArmInstrKind.Add,
                             Reg(ToArm(scratchBase), _owner._target.PointerSize),
@@ -1742,6 +1776,7 @@ namespace Cnidaria.C
                     return;
                 if (IsPowerOfTwo(scale))
                 {
+                    InvalidateIntegerRepresentation(index);
                     Emit(ArmInstruction.Ternary(
                         ArmInstrKind.Lsl,
                         Reg(ToArm(index),
@@ -1752,6 +1787,7 @@ namespace Cnidaria.C
                     return;
                 }
                 LoadImmediate(scratch, scale, _owner._target.PointerSize);
+                InvalidateIntegerRepresentation(index);
                 Emit(ArmInstruction.Ternary(
                     ArmInstrKind.Mul,
                     Reg(ToArm(index),
@@ -1830,10 +1866,16 @@ namespace Cnidaria.C
                 => EmitMemoryLoad(destination, StackPointerArm, offset, size, false);
 
             private void LoadFromMemory(MachineRegister destination, int offset, int size, bool signed)
-                => EmitMemoryLoad(ToArm(destination), StackPointerArm, offset, size, signed);
+            {
+                EmitMemoryLoad(ToArm(destination), StackPointerArm, offset, size, signed);
+                SetIntegerRepresentation(destination, RepresentationForLoad(size, signed));
+            }
 
             private void LoadFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size, bool signed)
-                => EmitMemoryLoad(ToArm(destination), ToArm(baseRegister), offset, size, signed);
+            {
+                EmitMemoryLoad(ToArm(destination), ToArm(baseRegister), offset, size, signed);
+                SetIntegerRepresentation(destination, RepresentationForLoad(size, signed));
+            }
 
             private void StoreToMemory(MachineRegister source, int offset, int size)
                 => EmitMemoryStore(ToArm(source), StackPointerArm, offset, size);
@@ -1922,19 +1964,28 @@ namespace Cnidaria.C
             }
 
             private void LoadImmediate(MachineRegister destination, long value, int size)
-                => _owner.EmitLoadImmediate(ToArm(destination), value, size);
+            {
+                _owner.EmitLoadImmediate(ToArm(destination), value, size);
+                SetIntegerRepresentation(destination, RepresentationForImmediate(value, size));
+            }
 
             private void MaterializeSymbolAddress(string symbol, MachineRegister destination)
-                => _owner.MaterializeSymbolAddress(symbol, ToArm(destination));
+            {
+                _owner.MaterializeSymbolAddress(symbol, ToArm(destination));
+                InvalidateIntegerRepresentation(destination);
+            }
 
             private void AddImmediate(MachineRegister destination, MachineRegister source, int immediate)
             {
+                var sourceRepresentation = GetIntegerRepresentation(source);
                 if (_owner._machineTarget.Is64Bit)
                 {
                     _owner.EmitAddImmediate(ToArm(destination), ToArm(source), immediate, _owner._target.PointerSize);
+                    SetIntegerRepresentation(destination, immediate == 0 ? sourceRepresentation : IntegerRepresentationFact.Unknown);
                     return;
                 }
 
+                InvalidateIntegerRepresentation(destination);
                 var magnitude = Math.Abs((long)immediate);
                 if (magnitude <= 255)
                 {
@@ -1962,22 +2013,19 @@ namespace Cnidaria.C
             {
                 if (destination == source)
                     return;
-                Emit(ArmInstruction.Binary(ArmInstrKind.Mov, Reg(ToArm(destination), size), Reg(ToArm(source), size)));
+                var moveSize = _owner._machineTarget.Is64Bit ? _owner._target.RegisterSize : size;
+                Emit(ArmInstruction.Binary(ArmInstrKind.Mov, Reg(ToArm(destination), moveSize), Reg(ToArm(source), moveSize)));
+                SetIntegerRepresentation(destination, GetIntegerRepresentation(source));
             }
 
             private void NormalizeIntegerRegister(MachineRegister register, QualifiedType type)
             {
-                if (!IsIntegerLike(type) && !IsPointerLike(type))
-                    return;
-                if (IsPointerLike(type))
+                var required = CanonicalIntegerRepresentation(type);
+                if (!required.IsKnown || IntegerRepresentationSatisfies(GetIntegerRepresentation(register), required))
                     return;
 
-                var size = SizeOf(type);
                 var registerBits = _owner._target.RegisterSize * 8;
-                var valueBits = Math.Min(registerBits, size * 8);
-                if (valueBits >= registerBits)
-                    return;
-                var shift = registerBits - valueBits;
+                var shift = registerBits - required.Bits;
                 Emit(ArmInstruction.Ternary(
                     ArmInstrKind.Lsl,
                     Reg(ToArm(register),
@@ -1986,12 +2034,13 @@ namespace Cnidaria.C
                     _owner._target.RegisterSize),
                     ArmOperand.ImmediateOperand(shift)));
                 Emit(ArmInstruction.Ternary(
-                    IsUnsignedIntegerType(type) ? ArmInstrKind.Lsr : ArmInstrKind.Asr,
+                    required.Kind == IntegerRepresentationKind.ZeroExtended ? ArmInstrKind.Lsr : ArmInstrKind.Asr,
                     Reg(ToArm(register),
                     _owner._target.RegisterSize),
                     Reg(ToArm(register),
                     _owner._target.RegisterSize),
                     ArmOperand.ImmediateOperand(shift)));
+                SetIntegerRepresentation(register, required);
             }
 
             private void EmitDirectCall(string label)
@@ -2065,8 +2114,148 @@ namespace Cnidaria.C
                 }
             }
 
-            private static bool NeedsIntegerConversion(QualifiedType source, QualifiedType destination)
-                => source.Type != destination.Type || source.Qualifiers != destination.Qualifiers;
+            private void RecordIntegerRegisterWrite(MachineRegister register, int size)
+            {
+                if (GetIntegerRepresentation(register).IsKnown)
+                    return;
+                if (_owner._machineTarget.Is64Bit && size <= 4)
+                    SetIntegerRepresentation(register, IntegerRepresentationFact.ZeroExtended(32));
+            }
+
+            private IntegerRepresentationFact CanonicalIntegerRepresentation(QualifiedType type)
+            {
+                if (!IsIntegerLike(type) || IsPointerLike(type))
+                    return IntegerRepresentationFact.Unknown;
+                var registerBits = _owner._target.RegisterSize * 8;
+                var bits = Math.Min(registerBits, SizeOf(type) * 8);
+                if (bits >= registerBits)
+                    return IntegerRepresentationFact.Unknown;
+                return IsUnsignedIntegerType(type)
+                    ? IntegerRepresentationFact.ZeroExtended(bits)
+                    : IntegerRepresentationFact.SignExtended(bits);
+            }
+
+            private bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, QualifiedType type)
+            {
+                var required = CanonicalIntegerRepresentation(type);
+                return !required.IsKnown || IntegerRepresentationSatisfies(actual, required);
+            }
+
+            private static bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, IntegerRepresentationFact required)
+            {
+                if (!required.IsKnown)
+                    return true;
+                if (!actual.IsKnown)
+                    return false;
+                if (required.Kind == IntegerRepresentationKind.ZeroExtended)
+                    return actual.Kind == IntegerRepresentationKind.ZeroExtended && actual.Bits <= required.Bits;
+                if (actual.Kind == IntegerRepresentationKind.SignExtended)
+                    return actual.Bits <= required.Bits;
+                return actual.Kind == IntegerRepresentationKind.ZeroExtended && actual.Bits < required.Bits;
+            }
+
+            private IntegerRepresentationFact GetIntegerRepresentation(MachineRegister register)
+            {
+                var index = (int)register - (int)MachineRegister.X0;
+                return index >= 0 && index < _integerRepresentationFacts.Length
+                    ? _integerRepresentationFacts[index]
+                    : IntegerRepresentationFact.Unknown;
+            }
+
+            private void SetIntegerRepresentation(MachineRegister register, IntegerRepresentationFact fact)
+            {
+                var index = (int)register - (int)MachineRegister.X0;
+                if (index >= 0 && index < _integerRepresentationFacts.Length)
+                    _integerRepresentationFacts[index] = fact;
+            }
+
+            private void InvalidateIntegerRepresentation(MachineRegister register)
+                => SetIntegerRepresentation(register, IntegerRepresentationFact.Unknown);
+
+            private void ClearIntegerRepresentationFacts()
+                => Array.Clear(_integerRepresentationFacts, 0, _integerRepresentationFacts.Length);
+
+            private void ClearCallerClobberedIntegerRepresentationFacts()
+            {
+                if (_owner._machineTarget.Is64Bit)
+                {
+                    for (var i = 0; i <= 18; i++)
+                        _integerRepresentationFacts[i] = IntegerRepresentationFact.Unknown;
+                    return;
+                }
+
+                for (var i = 0; i <= 3; i++)
+                    _integerRepresentationFacts[i] = IntegerRepresentationFact.Unknown;
+                _integerRepresentationFacts[12] = IntegerRepresentationFact.Unknown;
+            }
+
+            private IntegerRepresentationFact RepresentationForLoad(int size, bool signed)
+            {
+                var registerBits = _owner._target.RegisterSize * 8;
+                var bits = Math.Min(registerBits, Math.Max(1, size) * 8);
+                if (bits >= registerBits)
+                    return IntegerRepresentationFact.Unknown;
+                if (_owner._machineTarget.Is64Bit && size == 4)
+                    return IntegerRepresentationFact.ZeroExtended(32);
+                return signed ? IntegerRepresentationFact.SignExtended(bits) : IntegerRepresentationFact.ZeroExtended(bits);
+            }
+
+            private IntegerRepresentationFact RepresentationForImmediate(long value, int size)
+            {
+                if (_owner._machineTarget.Is64Bit && size <= 4)
+                    return RepresentationForUnsignedConstant(unchecked((uint)value));
+                if (!_owner._machineTarget.Is64Bit)
+                    value = unchecked((int)(uint)value);
+                return RepresentationForConstant(value);
+            }
+
+            private static IntegerRepresentationFact RepresentationForUnsignedConstant(uint value)
+            {
+                if (value <= 1)
+                    return IntegerRepresentationFact.ZeroExtended(1);
+                if (value <= byte.MaxValue)
+                    return IntegerRepresentationFact.ZeroExtended(8);
+                if (value <= ushort.MaxValue)
+                    return IntegerRepresentationFact.ZeroExtended(16);
+                return IntegerRepresentationFact.ZeroExtended(32);
+            }
+
+            private static IntegerRepresentationFact RepresentationForConstant(long value)
+            {
+                if (value >= 0)
+                {
+                    if (value <= 1)
+                        return IntegerRepresentationFact.ZeroExtended(1);
+                    if (value <= byte.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(8);
+                    if (value <= ushort.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(16);
+                    if ((ulong)value <= uint.MaxValue)
+                        return IntegerRepresentationFact.ZeroExtended(32);
+                    return IntegerRepresentationFact.Unknown;
+                }
+
+                if (value >= sbyte.MinValue)
+                    return IntegerRepresentationFact.SignExtended(8);
+                if (value >= short.MinValue)
+                    return IntegerRepresentationFact.SignExtended(16);
+                if (value >= int.MinValue)
+                    return IntegerRepresentationFact.SignExtended(32);
+                return IntegerRepresentationFact.Unknown;
+            }
+
+            private bool NeedsIntegerConversion(QualifiedType source, QualifiedType destination)
+            {
+                if ((!IsIntegerLike(source) && !IsPointerLike(source)) || (!IsIntegerLike(destination) && !IsPointerLike(destination)))
+                    return false;
+                if (IsPointerLike(destination))
+                    return false;
+
+                var required = CanonicalIntegerRepresentation(destination);
+                if (!required.IsKnown)
+                    return false;
+                return !IntegerRepresentationSatisfies(CanonicalIntegerRepresentation(source), required);
+            }
 
             private static bool IsPowerOfTwo(int value)
                 => value > 0 && (value & (value - 1)) == 0;

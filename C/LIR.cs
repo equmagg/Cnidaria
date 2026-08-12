@@ -1054,9 +1054,9 @@ namespace Cnidaria.C
 
                 case GimpleExpressionStatement expressionStatement:
                     if (TryGetExpression(instruction, 0, out var expression))
-                        _ = EmitValue(block, expression);
+                        _ = EmitValue(block, expression, materializeCallResult: false);
                     else
-                        _ = EmitValue(block, expressionStatement.Expression);
+                        _ = EmitValue(block, expressionStatement.Expression, expression: null, materializeCallResult: false);
                     break;
 
                 case GimpleGotoStatement gotoStatement:
@@ -1099,16 +1099,23 @@ namespace Cnidaria.C
             var valueExpression = TryGetAssignmentValueExpression(instruction, assignment, out var expression)
                 ? expression
                 : null;
+            var definition = GetPrimaryDefinition(instruction);
+
+            if (definition is not null && !IsSsaNameUsed(definition.Name))
+            {
+                if (valueExpression is null)
+                    _ = EmitValue(block, assignment.Value, expression: null, materializeCallResult: false);
+                else
+                    _ = EmitValue(block, valueExpression, materializeCallResult: false);
+                return;
+            }
+
             var value = valueExpression is null ? EmitValue(block, assignment.Value) : EmitValue(block, valueExpression);
             if (IsVoid(assignment.Target.Type) || value.Kind == LirOperandKind.Void || IsVoid(value.Type))
                 return;
-            var definition = GetPrimaryDefinition(instruction);
 
             if (definition is not null)
             {
-                if (!IsSsaNameUsed(definition.Name))
-                    return;
-
                 var destination = GetRegister(definition.Name);
                 if (value.ReferencesSameRegister(destination))
                     return;
@@ -1352,7 +1359,7 @@ namespace Cnidaria.C
             return false;
         }
 
-        private LirOperand EmitValue(LirBlock block, SsaExpression expression)
+        private LirOperand EmitValue(LirBlock block, SsaExpression expression, bool materializeCallResult = true)
         {
             if (expression.Name is not null && !expression.IsAddress)
                 return GetOperand(expression.Name);
@@ -1363,13 +1370,13 @@ namespace Cnidaria.C
                 return EmitAddressValue(block, address, expression.Original, expression);
             }
 
-            return EmitValue(block, expression.Original, expression);
+            return EmitValue(block, expression.Original, expression, materializeCallResult);
         }
 
         private LirOperand EmitValue(LirBlock block, GimpleValue value)
-            => EmitValue(block, value, expression: null);
+            => EmitValue(block, value, expression: null, materializeCallResult: true);
 
-        private LirOperand EmitValue(LirBlock block, GimpleValue value, SsaExpression? expression)
+        private LirOperand EmitValue(LirBlock block, GimpleValue value, SsaExpression? expression, bool materializeCallResult = true)
         {
             switch (value)
             {
@@ -1395,10 +1402,10 @@ namespace Cnidaria.C
                     return EmitBinary(block, binary, expression);
 
                 case GimpleConversionExpression conversion:
-                    return EmitConversion(block, conversion, expression);
+                    return EmitConversion(block, conversion, expression, materializeCallResult);
 
                 case GimpleCastExpression cast:
-                    return EmitCast(block, cast, expression);
+                    return EmitCast(block, cast, expression, materializeCallResult);
 
                 case GimpleAddressOfExpression addressOf:
                     return EmitAddressValue(block, EmitAddress(block, addressOf.Target, GetChild(expression, 0)), addressOf, expression);
@@ -1413,7 +1420,7 @@ namespace Cnidaria.C
                     return EmitLoad(block, EmitAddress(block, memberAccess, expression), memberAccess.Type, memberAccess, expression);
 
                 case GimpleCallExpression call:
-                    return EmitCall(block, call, expression);
+                    return EmitCall(block, call, expression, materializeCallResult);
 
                 case GimpleErrorValue:
                     return LirOperand.Undefined(null, value.Type);
@@ -1451,8 +1458,17 @@ namespace Cnidaria.C
             return LirOperand.ForRegister(result);
         }
 
-        private LirOperand EmitConversion(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression)
+        private LirOperand EmitConversion(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression, bool materializeResult = true)
         {
+            if (!materializeResult)
+            {
+                if (GetChild(expression, 0) is { } discardedChild)
+                    _ = EmitValue(block, discardedChild, materializeCallResult: false);
+                else
+                    _ = EmitValue(block, conversion.Operand, expression: null, materializeCallResult: false);
+                return LirOperand.Void;
+            }
+
             if (conversion.ConversionKind == GimpleConversionKind.ArrayToPointer)
                 return EmitArrayToPointer(block, conversion, expression);
 
@@ -1516,8 +1532,17 @@ namespace Cnidaria.C
 
             return LirOperand.Undefined(null, conversion.Type);
         }
-        private LirOperand EmitCast(LirBlock block, GimpleCastExpression cast, SsaExpression? expression)
+        private LirOperand EmitCast(LirBlock block, GimpleCastExpression cast, SsaExpression? expression, bool materializeResult = true)
         {
+            if (!materializeResult)
+            {
+                if (GetChild(expression, 0) is { } discardedChild)
+                    _ = EmitValue(block, discardedChild, materializeCallResult: false);
+                else
+                    _ = EmitValue(block, cast.Operand, expression: null, materializeCallResult: false);
+                return LirOperand.Void;
+            }
+
             var operand = GetChild(expression, 0) is { } child
                 ? EmitValue(block, child)
                 : EmitValue(block, cast.Operand);
@@ -1530,7 +1555,7 @@ namespace Cnidaria.C
             return LirOperand.ForRegister(result);
         }
 
-        private LirOperand EmitCall(LirBlock block, GimpleCallExpression call, SsaExpression? expression)
+        private LirOperand EmitCall(LirBlock block, GimpleCallExpression call, SsaExpression? expression, bool materializeResult = true)
         {
             if (TryGetRuntimeIntrinsic(call.Callee, out var intrinsic))
             {
@@ -1553,11 +1578,22 @@ namespace Cnidaria.C
                 operands.Add(child is null ? EmitValue(block, call.Arguments[i]) : EmitValue(block, child));
             }
 
-            LirVirtualRegister? result = IsVoid(call.Type) ? null : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
+            var needsMaterializedResult = materializeResult || RequiresMaterializedCallResult(call);
+            LirVirtualRegister? result = IsVoid(call.Type) || !needsMaterializedResult
+                ? null
+                : NewVirtualRegister(call.Type, sourceName: null, GetValueNumber(expression));
             Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
                 callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
+        }
+
+        private bool RequiresMaterializedCallResult(GimpleCallExpression call)
+        {
+            if (IsVoid(call.Type))
+                return false;
+
+            return call.Type.Type is RVVectorType || CAbi.RequiresHiddenReturnBuffer(_target, call.Type);
         }
 
         private LirOperand EmitVaStart(LirBlock block, GimpleCallExpression call, SsaExpression? expression)

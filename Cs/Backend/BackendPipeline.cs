@@ -101,7 +101,7 @@ namespace Cnidaria.Cs
                 program,
                 options,
                 nonCallOperationsClobberCallerSavedRegisters: false);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, program.Target);
+            var image = RegisterBytecodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, program.Target);
             swCompile.Stop();
             return new BackendResult(
                 lowered.HirProgram,
@@ -122,7 +122,7 @@ namespace Cnidaria.Cs
                 method,
                 options,
                 nonCallOperationsClobberCallerSavedRegisters: false);
-            var image = CodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, method.Target);
+            var image = RegisterBytecodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, method.Target);
             return new BackendResult(
                 lowered.HirProgram,
                 lowered.SsaProgram,

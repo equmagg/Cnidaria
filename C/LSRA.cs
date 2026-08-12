@@ -85,7 +85,7 @@ namespace Cnidaria.C
         private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
         private readonly List<int> _callPositions = new();
         private readonly Dictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> _callArgumentTargets = new();
-        private readonly Dictionary<int, ImmutableHashSet<MachineRegister>> _callSetupClobbers = new();
+        private readonly Dictionary<int, ImmutableHashSet<MachineRegister>> _instructionClobbers = new();
         private readonly List<InlineAssemblySite> _inlineAssemblySites = new();
         private readonly Dictionary<MachineRegister, int> _incomingRegisterReleasePositions = new();
         private readonly Dictionary<string, ImmutableArray<MachineRegister>> _incomingParameterRegisters = new(StringComparer.Ordinal);
@@ -105,7 +105,7 @@ namespace Cnidaria.C
         {
             _callPositions.Clear();
             _callArgumentTargets.Clear();
-            _callSetupClobbers.Clear();
+            _instructionClobbers.Clear();
             _inlineAssemblySites.Clear();
             _incomingRegisterReleasePositions.Clear();
             _abiPreferences.Clear();
@@ -119,9 +119,9 @@ namespace Cnidaria.C
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
             }
 
-            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _callSetupClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _callSetupClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _callSetupClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
 
             foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
             {
@@ -175,11 +175,11 @@ namespace Cnidaria.C
                 {
                     var pos = position;
                     position += 2;
+                    RecordInstructionClobbers(instruction, pos);
                     if (instruction.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(instruction))
                     {
                         _callPositions.Add(pos);
                         RecordCallArgumentTargets(instruction, pos);
-                        RecordCallSetupClobbers(instruction, pos);
                     }
                     else if (instruction.Kind == LirInstructionKind.InlineAssembly)
                         _inlineAssemblySites.Add(CreateInlineAssemblySite(instruction, pos));
@@ -339,14 +339,33 @@ namespace Cnidaria.C
             }
         }
 
-        private void RecordCallSetupClobbers(LirInstruction instruction, int position)
+        private void RecordInstructionClobbers(LirInstruction instruction, int position)
         {
+            var clobbers = ImmutableHashSet.CreateBuilder<MachineRegister>();
+
             if (_target.Architecture == TargetArchitectureKind.X86_64 &&
                 !TargetRegisterInfo.IsWindowsX64(_target) &&
+                instruction.Kind == LirInstructionKind.Call &&
                 instruction.CallSignature is { IsVariadic: true })
             {
-                _callSetupClobbers[position] = ImmutableHashSet.Create(MachineRegister.X0);
+                clobbers.Add(MachineRegister.X0);
             }
+
+            if (_target.Architecture == TargetArchitectureKind.RiscV32 &&
+                instruction.Kind == LirInstructionKind.Binary &&
+                instruction.Operator is "/" or "%" &&
+                instruction.Result is not null &&
+                (instruction.Result.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address) &&
+                Math.Max(1, _target.SizeOf(instruction.Result.Type)) > Math.Max(1, _target.RegisterSize))
+            {
+                clobbers.Add(MachineRegister.X10);
+                clobbers.Add(MachineRegister.X11);
+                clobbers.Add(MachineRegister.X12);
+                clobbers.Add(MachineRegister.X13);
+            }
+
+            if (clobbers.Count != 0)
+                _instructionClobbers[position] = clobbers.ToImmutable();
         }
 
         private void RecordCallArgumentTargets(LirInstruction instruction, int position)
@@ -450,6 +469,8 @@ namespace Cnidaria.C
             if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
                 return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
 
+            ReserveInlineAssemblyTemplateRegisters(asmStatement.Text, reserved, touched);
+
             foreach (var output in asmStatement.Outputs)
             {
                 if (output.Target is null ||
@@ -487,6 +508,35 @@ namespace Cnidaria.C
             }
 
             return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable());
+        }
+
+        private void ReserveInlineAssemblyTemplateRegisters(
+            string text,
+            ImmutableHashSet<MachineRegister>.Builder reserved,
+            ImmutableHashSet<MachineRegister>.Builder touched)
+        {
+            if (!_target.IsRiscV || string.IsNullOrEmpty(text))
+                return;
+
+            var start = -1;
+            for (var i = 0; i <= text.Length; i++)
+            {
+                var isIdentifier = i < text.Length && (char.IsLetterOrDigit(text[i]) || text[i] == '_');
+                if (isIdentifier)
+                {
+                    if (start < 0)
+                        start = i;
+                    continue;
+                }
+
+                if (start < 0)
+                    continue;
+
+                var token = text.Substring(start, i - start);
+                if (TryParseInlineAssemblyRegister(token, out var register))
+                    AddInlineAssemblyRegister(reserved, touched, register);
+                start = -1;
+            }
         }
 
         private void ReserveInlineAssemblyOperand(
@@ -825,7 +875,7 @@ namespace Cnidaria.C
             TargetInfo target,
             IReadOnlyList<int> callPositions,
             IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
-            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> callSetupClobbers,
+            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
             IReadOnlyList<InlineAssemblySite> inlineAssemblySites,
             IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions)
         {
@@ -846,7 +896,7 @@ namespace Cnidaria.C
             {
                 ExpireOldIntervals(interval, active, allocations);
 
-                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, abiPreferences, callArgumentRegisters, target, callPositions, callArgumentTargets, callSetupClobbers, inlineAssemblySites, incomingRegisterReleasePositions);
+                var allowedRegisters = AllowedRegistersForInterval(interval, physicalRegisters, abiPreferences, callArgumentRegisters, target, callPositions, callArgumentTargets, instructionClobbers, inlineAssemblySites, incomingRegisterReleasePositions);
                 if (allowedRegisters.IsDefaultOrEmpty)
                 {
                     allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
@@ -876,7 +926,7 @@ namespace Cnidaria.C
             TargetInfo target,
             IReadOnlyList<int> callPositions,
             IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
-            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> callSetupClobbers,
+            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
             IReadOnlyList<InlineAssemblySite> inlineAssemblySites,
             IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions)
         {
@@ -894,21 +944,24 @@ namespace Cnidaria.C
                     continue;
                 if (spansCall && !CanUseRegisterAcrossCall(target, interval, register))
                     continue;
-                if (liveBeforeCall && ContainsRegister(callArgumentRegisters, register) && register != safeCallArgumentRegister)
+                if (liveBeforeCall && ContainsRegister(callArgumentRegisters, register) &&
+                    (target.IsRiscV || register != safeCallArgumentRegister))
                     continue;
-                if (IsClobberedDuringCallSetup(interval, register, callSetupClobbers))
+                if (IsClobberedAtInstruction(interval, register, instructionClobbers))
                     continue;
 
                 var reserved = false;
                 foreach (var site in inlineAssemblySites)
                 {
-                    if (!IntervalSpansPosition(interval, site.Position))
+                    var conflictsWithSite = IntervalSpansPosition(interval, site.Position) ||
+                        (target.IsRiscV && interval.IsLiveBefore(site.Position));
+                    if (!conflictsWithSite)
                         continue;
-                    if (site.ReservedRegisters.Contains(register))
-                    {
-                        reserved = true;
-                        break;
-                    }
+                    if (!site.ReservedRegisters.Contains(register))
+                        continue;
+
+                    reserved = true;
+                    break;
                 }
 
                 if (!reserved)
@@ -918,12 +971,12 @@ namespace Cnidaria.C
             return builder.ToImmutable();
         }
 
-        private static bool IsClobberedDuringCallSetup(
+        private static bool IsClobberedAtInstruction(
             LiveInterval interval,
             MachineRegister register,
-            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> callSetupClobbers)
+            IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers)
         {
-            foreach (var pair in callSetupClobbers)
+            foreach (var pair in instructionClobbers)
             {
                 if (pair.Key < interval.Start)
                     continue;

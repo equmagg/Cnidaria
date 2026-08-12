@@ -636,7 +636,7 @@ namespace Cnidaria.RiscV
 
         private static RVInstruction ParseVectorLoad(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
         {
-            bool unmasked = ParseOptionalVectorMask(ref operands);
+            bool unmasked = ParseOptionalVectorMask(ref operands, 2);
             ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
             var memory = ParseMemoryOperand(operands[1]);
             return RVInstruction.Vl(opcode, ParseVreg(operands[0]), memory.Base, unmasked);
@@ -644,7 +644,7 @@ namespace Cnidaria.RiscV
 
         private static RVInstruction ParseVectorStore(RVInstrKind opcode, ImmutableArray<string> operands, int lineNumber)
         {
-            bool unmasked = ParseOptionalVectorMask(ref operands);
+            bool unmasked = ParseOptionalVectorMask(ref operands, 2);
             ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 2, lineNumber);
             var memory = ParseMemoryOperand(operands[1]);
             return RVInstruction.Vs(opcode, ParseVreg(operands[0]), memory.Base, unmasked);
@@ -652,7 +652,7 @@ namespace Cnidaria.RiscV
 
         private static RVInstruction ParseVectorOp(RVInstrKind opcode, RVInstructionMetadata metadata, ImmutableArray<string> operands, int lineNumber)
         {
-            bool unmasked = ParseOptionalVectorMask(ref operands);
+            bool unmasked = ParseOptionalVectorMask(ref operands, 3);
             ValidateOperandCount(RVInstructionTable.GetMnemonic(opcode), operands, 3, lineNumber);
             if (metadata.Funct3 is 0 or 1 or 2)
                 return RVInstruction.Vv(opcode, ParseVreg(operands[0]), ParseVreg(operands[1]), ParseVreg(operands[2]), unmasked);
@@ -665,12 +665,12 @@ namespace Cnidaria.RiscV
             throw new FormatException($"Unsupported vector operand form on line {lineNumber}");
         }
 
-        private static bool ParseOptionalVectorMask(ref ImmutableArray<string> operands)
+        private static bool ParseOptionalVectorMask(ref ImmutableArray<string> operands, int unmaskedOperandCount)
         {
             if (operands.Length == 0)
                 return true;
             string last = operands[operands.Length - 1].Trim().ToLowerInvariant();
-            if (last == "v0.t" || last == "v0")
+            if (last == "v0.t" || (last == "v0" && operands.Length == unmaskedOperandCount + 1))
             {
                 operands = operands.RemoveAt(operands.Length - 1);
                 return false;

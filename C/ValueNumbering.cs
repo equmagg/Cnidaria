@@ -13,6 +13,7 @@ namespace Cnidaria.C
         public static ValueNumberingOptions Default { get; } = new ValueNumberingOptions();
 
         public bool CanonicalizeCommutativeComparisons { get; }
+        public bool CanonicalizeRelationalComparisons { get; }
         public bool CanonicalizeCommutativeBitwiseOperators { get; }
         public bool CanonicalizeCommutativeIntegerArithmetic { get; }
         public bool TreatCallsAsUniqueValues { get; }
@@ -20,12 +21,14 @@ namespace Cnidaria.C
 
         public ValueNumberingOptions(
             bool canonicalizeCommutativeComparisons = true,
+            bool canonicalizeRelationalComparisons = true,
             bool canonicalizeCommutativeBitwiseOperators = true,
-            bool canonicalizeCommutativeIntegerArithmetic = false,
+            bool canonicalizeCommutativeIntegerArithmetic = true,
             bool treatCallsAsUniqueValues = true,
             bool treatMemoryDefinitionsAsUniqueStates = true)
         {
             CanonicalizeCommutativeComparisons = canonicalizeCommutativeComparisons;
+            CanonicalizeRelationalComparisons = canonicalizeRelationalComparisons;
             CanonicalizeCommutativeBitwiseOperators = canonicalizeCommutativeBitwiseOperators;
             CanonicalizeCommutativeIntegerArithmetic = canonicalizeCommutativeIntegerArithmetic;
             TreatCallsAsUniqueValues = treatCallsAsUniqueValues;
@@ -163,6 +166,36 @@ namespace Cnidaria.C
                    TryGetValueNumber(right, out var rightNumber) &&
                    ReferenceEquals(leftNumber, rightNumber);
         }
+
+        public bool TryGetConstantValue(SsaName name, out object? value)
+        {
+            if (name is null)
+                throw new ArgumentNullException(nameof(name));
+
+            if (_nameNumbers.TryGetValue(name, out var number) && number.HasConstantValue)
+            {
+                value = number.ConstantValue;
+                return true;
+            }
+
+            value = null;
+            return false;
+        }
+
+        public bool TryGetConstantValue(SsaExpression expression, out object? value)
+        {
+            if (expression is null)
+                throw new ArgumentNullException(nameof(expression));
+
+            if (_expressionNumbers.TryGetValue(expression, out var number) && number.HasConstantValue)
+            {
+                value = number.ConstantValue;
+                return true;
+            }
+
+            value = null;
+            return false;
+        }
     }
 
     public sealed class ValueNumber
@@ -172,10 +205,12 @@ namespace Cnidaria.C
         public ValueNumberOperation Operation => Key.Operation;
         public QualifiedType Type { get; }
         public ValueNumberKey Key { get; }
-        public ImmutableArray<ValueNumber> Operands { get; }
+        public ImmutableArray<ValueNumber> Operands { get; private set; }
         public ValueNumberFlags Flags { get; }
         public bool IsMemoryDependent => (Flags & ValueNumberFlags.ReadsMemory) != 0;
         public bool IsUnique => (Flags & ValueNumberFlags.Unique) != 0;
+        public bool HasConstantValue { get; }
+        public object? ConstantValue { get; }
         public string Display { get; }
 
         internal ValueNumber(
@@ -185,7 +220,9 @@ namespace Cnidaria.C
             ValueNumberKey key,
             ImmutableArray<ValueNumber> operands,
             ValueNumberFlags flags,
-            string display)
+            string display,
+            bool hasConstantValue = false,
+            object? constantValue = null)
         {
             if (id < 0)
                 throw new ArgumentOutOfRangeException(nameof(id));
@@ -196,10 +233,15 @@ namespace Cnidaria.C
             Key = key;
             Operands = operands.IsDefault ? ImmutableArray<ValueNumber>.Empty : operands;
             Flags = flags;
+            HasConstantValue = hasConstantValue;
+            ConstantValue = constantValue;
             Display = string.IsNullOrWhiteSpace(display)
                 ? $"vn{id.ToString(CultureInfo.InvariantCulture)}"
                 : display;
         }
+
+        internal void SetOperands(ImmutableArray<ValueNumber> operands)
+            => Operands = operands.IsDefault ? ImmutableArray<ValueNumber>.Empty : operands;
 
         public override string ToString()
             => $"vn{Id.ToString(CultureInfo.InvariantCulture)}";
@@ -295,6 +337,7 @@ namespace Cnidaria.C
         private readonly Dictionary<SsaExpression, ValueNumber> _expressionNumbers = new();
         private readonly Dictionary<SsaDefinition, ValueNumber> _definitionNumbers = new();
         private readonly Dictionary<SsaPhi, ValueNumber> _phiNumbers = new();
+        private readonly HashSet<SsaPhi> _stablePhis = new();
         private readonly List<ValueNumber> _numbers = new();
         private int _uniqueOrdinal;
 
@@ -322,6 +365,8 @@ namespace Cnidaria.C
                 foreach (var instruction in block.Instructions)
                     NumberInstruction(instruction);
             }
+
+            RefreshStablePhiOperands();
 
             return new SsaValueNumbering(
                 _function,
@@ -398,18 +443,11 @@ namespace Cnidaria.C
                 return;
             }
 
-            var keyOperands = ImmutableArray.CreateBuilder<int>(phi.Operands.Length * 2);
-            for (var i = 0; i < phi.Operands.Length; i++)
-            {
-                keyOperands.Add(phi.Operands[i].Predecessor.Ordinal);
-                keyOperands.Add(operandNumbers[i].Id);
-            }
-
             var key = new ValueNumberKey(
                 ValueNumberOperation.Phi,
                 TypeKey(phi.Result.Type),
-                "v" + phi.Variable.Ordinal.ToString(CultureInfo.InvariantCulture),
-                keyOperands.ToImmutable(),
+                "v" + phi.Variable.Ordinal.ToString(CultureInfo.InvariantCulture) + ":" + phi.Result.Version.ToString(CultureInfo.InvariantCulture),
+                ImmutableArray<int>.Empty,
                 blockOrdinal: phi.Block.Ordinal);
 
             var number = GetOrCreateNumber(
@@ -418,9 +456,26 @@ namespace Cnidaria.C
                 phi.Result.Type,
                 operandNumbers,
                 ValueNumberFlags.None,
-                "phi " + phi.Result.ToString());
+                "phi " + phi.Result.ToString(),
+                hasConstantValue: false,
+                constantValue: null);
 
+            _stablePhis.Add(phi);
             AssignPhi(phi, number);
+        }
+
+        private void RefreshStablePhiOperands()
+        {
+            foreach (var phi in _stablePhis)
+            {
+                if (!_phiNumbers.TryGetValue(phi, out var number))
+                    continue;
+
+                var operands = phi.Operands
+                    .Select(operand => GetNameNumber(operand.Value))
+                    .ToImmutableArray();
+                number.SetOperands(operands);
+            }
         }
 
         private void NumberInstruction(SsaInstruction instruction)
@@ -449,6 +504,9 @@ namespace Cnidaria.C
         {
             if (instruction.Statement is GimpleZeroInitializeStatement && expressionNumbers.Length == 0)
             {
+                if (IsIntegerLike(definition.Name.Type))
+                    return NumberConstantValue(0, definition.Name.Type);
+
                 return GetCanonicalNumber(
                     ValueNumberKind.Constant,
                     definition.Name.Type,
@@ -514,7 +572,9 @@ namespace Cnidaria.C
             ValueNumber number;
             if (expression.Name is not null)
             {
-                number = GetNameNumber(expression.Name);
+                number = expression.IsAddress
+                    ? NumberSsaAddress(expression.Name)
+                    : GetNameNumber(expression.Name);
             }
             else if (expression.Original is GimpleConstantValue constant)
             {
@@ -543,6 +603,20 @@ namespace Cnidaria.C
             return number;
         }
 
+        private ValueNumber NumberSsaAddress(SsaName name)
+        {
+            var operation = name.Variable.Kind == SsaVariableKind.Temporary
+                ? ValueNumberOperation.TemporaryAddress
+                : ValueNumberOperation.SymbolAddress;
+
+            return GetCanonicalNumber(
+                ValueNumberKind.Expression,
+                name.Type,
+                operation,
+                "v" + name.Variable.Ordinal.ToString(CultureInfo.InvariantCulture),
+                ImmutableArray<ValueNumber>.Empty);
+        }
+
         private ValueNumber NumberConstant(GimpleConstantValue constant)
             => NumberConstantValue(constant.Value, constant.Type);
 
@@ -552,7 +626,9 @@ namespace Cnidaria.C
                 type,
                 ValueNumberOperation.Constant,
                 NormalizeConstantKey(value),
-                ImmutableArray<ValueNumber>.Empty);
+                ImmutableArray<ValueNumber>.Empty,
+                hasConstantValue: true,
+                constantValue: value);
 
         private ValueNumber NumberCompositeExpression(
             SsaExpression expression,
@@ -560,6 +636,17 @@ namespace Cnidaria.C
             ValueNumber? memoryInput)
         {
             var flags = TranslateFlags(expression);
+            if (expression.ReadsMemory && IsVolatileOrAtomic(expression.Original.Type))
+            {
+                return GetUniqueNumber(
+                    ValueNumberKind.Unique,
+                    expression.Original.Type,
+                    GetOperation(expression),
+                    GetOperatorKey(expression.Original),
+                    childNumbers,
+                    flags | ValueNumberFlags.Unique);
+            }
+
             if (expression.ReadsMemory && memoryInput is null)
             {
                 return GetUniqueNumber(
@@ -596,12 +683,27 @@ namespace Cnidaria.C
             if (expression.IsAddress && expression.Original is GimpleIndirectExpression && childNumbers.Length == 1)
                 return childNumbers[0];
 
+            if (expression.Original is GimpleConversionExpression { ConversionKind: GimpleConversionKind.Identity } conversion &&
+                childNumbers.Length == 1 &&
+                SameType(conversion.Operand.Type, conversion.Type))
+            {
+                return childNumbers[0];
+            }
+
+            if (expression.Original is GimpleCastExpression cast &&
+                childNumbers.Length == 1 &&
+                SameType(cast.Operand.Type, cast.Type))
+            {
+                return childNumbers[0];
+            }
+
             if (TryFoldCompositeExpression(expression, childNumbers, out var folded))
                 return folded;
 
             var operation = GetOperation(expression);
             var operatorKey = GetOperatorKey(expression.Original);
-            var operands = CanonicalizeOperands(expression.Original, childNumbers);
+            var operands = childNumbers;
+            CanonicalizeExpression(expression.Original, ref operatorKey, ref operands);
             var memoryInputId = expression.ReadsMemory ? memoryInput?.Id ?? -1 : -1;
 
             return GetCanonicalNumber(
@@ -614,14 +716,42 @@ namespace Cnidaria.C
                 memoryInputId: memoryInputId);
         }
 
-        private ImmutableArray<ValueNumber> CanonicalizeOperands(GimpleValue value, ImmutableArray<ValueNumber> operands)
+        private void CanonicalizeExpression(
+            GimpleValue value,
+            ref string operatorKey,
+            ref ImmutableArray<ValueNumber> operands)
         {
-            if (operands.Length != 2 || value is not GimpleBinaryExpression binary || !IsCommutative(binary))
-                return operands;
+            if (operands.Length != 2 || value is not GimpleBinaryExpression binary)
+                return;
 
-            return operands[0].Id <= operands[1].Id
-                ? operands
-                : ImmutableArray.Create(operands[1], operands[0]);
+            if (_options.CanonicalizeRelationalComparisons)
+            {
+                switch (binary.OperatorToken.Kind)
+                {
+                    case SyntaxKind.LessThanToken:
+                        operatorKey = "rel:lt";
+                        return;
+
+                    case SyntaxKind.GreaterThanToken:
+                        operatorKey = "rel:lt";
+                        operands = ImmutableArray.Create(operands[1], operands[0]);
+                        return;
+
+                    case SyntaxKind.LessThanEqualsToken:
+                        operatorKey = "rel:le";
+                        return;
+
+                    case SyntaxKind.GreaterThanEqualsToken:
+                        operatorKey = "rel:le";
+                        operands = ImmutableArray.Create(operands[1], operands[0]);
+                        return;
+                }
+            }
+
+            if (!IsCommutative(binary) || operands[0].Id <= operands[1].Id)
+                return;
+
+            operands = ImmutableArray.Create(operands[1], operands[0]);
         }
 
         private bool TryFoldCompositeExpression(SsaExpression expression, ImmutableArray<ValueNumber> childNumbers, out ValueNumber folded)
@@ -654,7 +784,7 @@ namespace Cnidaria.C
                     folded = operandNumber;
                     return true;
 
-                case SyntaxKind.BangToken when children.Length == 1 && TryGetIntegerConstant(children[0], out var value):
+                case SyntaxKind.BangToken when TryGetIntegerConstant(operandNumber, out var value):
                     folded = NumberConstantValue(value == 0 ? 1 : 0, unary.Type);
                     return true;
             }
@@ -673,28 +803,27 @@ namespace Cnidaria.C
             var left = childNumbers[0];
             var right = childNumbers[1];
             var canUseIntegerIdentities = IsIntegerLike(binary.Type) || IsPointerLike(binary.Type);
+            var hasLeftInteger = TryGetIntegerConstant(left, out var leftValue);
+            var hasRightInteger = TryGetIntegerConstant(right, out var rightValue);
 
             if (canUseIntegerIdentities)
             {
                 if (kind == SyntaxKind.PlusToken)
                 {
-                    if (children.Length == 2 && TryGetIntegerConstant(children[1], out var rightValue) && rightValue == 0)
+                    if (hasRightInteger && rightValue == 0)
                     {
                         folded = left;
                         return true;
                     }
 
-                    if (children.Length == 2 && TryGetIntegerConstant(children[0], out var leftValue) && leftValue == 0)
+                    if (hasLeftInteger && leftValue == 0)
                     {
                         folded = right;
                         return true;
                     }
                 }
 
-                if (kind == SyntaxKind.MinusToken &&
-                    children.Length == 2 &&
-                    TryGetIntegerConstant(children[1], out var subtractValue) &&
-                    subtractValue == 0)
+                if (kind == SyntaxKind.MinusToken && hasRightInteger && rightValue == 0)
                 {
                     folded = left;
                     return true;
@@ -705,26 +834,58 @@ namespace Cnidaria.C
             {
                 if (kind == SyntaxKind.StarToken)
                 {
-                    if (children.Length == 2 && TryGetIntegerConstant(children[1], out var rightValue) && rightValue == 1)
+                    if (hasRightInteger && rightValue == 1)
                     {
                         folded = left;
                         return true;
                     }
 
-                    if (children.Length == 2 && TryGetIntegerConstant(children[0], out var leftValue) && leftValue == 1)
+                    if (hasLeftInteger && leftValue == 1)
                     {
                         folded = right;
                         return true;
                     }
+
+                    if ((hasRightInteger && rightValue == 0) || (hasLeftInteger && leftValue == 0))
+                    {
+                        folded = NumberConstantValue(0, binary.Type);
+                        return true;
+                    }
                 }
 
-                if (kind == SyntaxKind.SlashToken &&
-                    children.Length == 2 &&
-                    TryGetIntegerConstant(children[1], out var divisor) &&
-                    divisor == 1)
+                if ((kind == SyntaxKind.SlashToken || kind == SyntaxKind.PercentToken) &&
+                    hasRightInteger && rightValue == 1)
+                {
+                    folded = kind == SyntaxKind.SlashToken ? left : NumberConstantValue(0, binary.Type);
+                    return true;
+                }
+
+                if ((kind == SyntaxKind.LessThanLessThanToken || kind == SyntaxKind.GreaterThanGreaterThanToken) &&
+                    hasRightInteger && rightValue == 0)
                 {
                     folded = left;
                     return true;
+                }
+
+                if (kind == SyntaxKind.AmpersandToken && ((hasRightInteger && rightValue == 0) || (hasLeftInteger && leftValue == 0)))
+                {
+                    folded = NumberConstantValue(0, binary.Type);
+                    return true;
+                }
+
+                if (kind == SyntaxKind.PipeToken || kind == SyntaxKind.HatToken)
+                {
+                    if (hasRightInteger && rightValue == 0)
+                    {
+                        folded = left;
+                        return true;
+                    }
+
+                    if (hasLeftInteger && leftValue == 0)
+                    {
+                        folded = right;
+                        return true;
+                    }
                 }
 
                 if (ReferenceEquals(left, right))
@@ -749,10 +910,14 @@ namespace Cnidaria.C
                 switch (kind)
                 {
                     case SyntaxKind.EqualsEqualsToken:
+                    case SyntaxKind.LessThanEqualsToken:
+                    case SyntaxKind.GreaterThanEqualsToken:
                         folded = NumberConstantValue(1, binary.Type);
                         return true;
 
                     case SyntaxKind.BangEqualsToken:
+                    case SyntaxKind.LessThanToken:
+                    case SyntaxKind.GreaterThanToken:
                         folded = NumberConstantValue(0, binary.Type);
                         return true;
                 }
@@ -762,9 +927,9 @@ namespace Cnidaria.C
             return false;
         }
 
-        private static bool TryGetIntegerConstant(SsaExpression expression, out long value)
+        private static bool TryGetIntegerConstant(ValueNumber number, out long value)
         {
-            if (expression.Original is GimpleConstantValue constant && TryConvertIntegerConstant(constant.Value, out value))
+            if (number.HasConstantValue && TryConvertIntegerConstant(number.ConstantValue, out value))
                 return true;
 
             value = 0;
@@ -813,6 +978,12 @@ namespace Cnidaria.C
                     return false;
             }
         }
+
+        private static bool SameType(QualifiedType left, QualifiedType right)
+            => StringComparer.Ordinal.Equals(TypeKey(left), TypeKey(right));
+
+        private static bool IsVolatileOrAtomic(QualifiedType type)
+            => (GimpleTypeHelpers.Normalize(type).Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;
 
         private static bool IsPointerLike(QualifiedType type)
             => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
@@ -888,6 +1059,9 @@ namespace Cnidaria.C
         {
             _phiNumbers[phi] = number;
             AssignName(phi.Result, number);
+
+            if (_function.TryGetDefinition(phi.Result, out var definition) && definition is not null)
+                _definitionNumbers[definition] = number;
         }
 
         private void AssignDefinition(SsaDefinition definition, ValueNumber number)
@@ -897,10 +1071,7 @@ namespace Cnidaria.C
         }
 
         private void AssignName(SsaName name, ValueNumber number)
-        {
-            if (!_nameNumbers.ContainsKey(name))
-                _nameNumbers.Add(name, number);
-        }
+            => _nameNumbers[name] = number;
 
         private ValueNumber GetCanonicalNumber(
             ValueNumberKind kind,
@@ -910,10 +1081,12 @@ namespace Cnidaria.C
             ImmutableArray<ValueNumber> operands,
             ValueNumberFlags flags = ValueNumberFlags.None,
             int memoryInputId = -1,
-            int blockOrdinal = -1)
+            int blockOrdinal = -1,
+            bool hasConstantValue = false,
+            object? constantValue = null)
         {
             var key = CreateKey(operation, type, operatorKey, operands, memoryInputId, blockOrdinal, discriminator: -1);
-            return GetOrCreateNumber(key, kind, type, operands, flags, operatorKey);
+            return GetOrCreateNumber(key, kind, type, operands, flags, operatorKey, hasConstantValue, constantValue);
         }
 
         private ValueNumber GetUniqueNumber(
@@ -926,7 +1099,7 @@ namespace Cnidaria.C
             int blockOrdinal = -1)
         {
             var key = CreateKey(operation, type, operatorKey, operands, memoryInputId: -1, blockOrdinal, discriminator: _uniqueOrdinal++);
-            return GetOrCreateNumber(key, kind, type, operands, flags | ValueNumberFlags.Unique, operatorKey);
+            return GetOrCreateNumber(key, kind, type, operands, flags | ValueNumberFlags.Unique, operatorKey, hasConstantValue: false, constantValue: null);
         }
 
         private ValueNumber GetOrCreateNumber(
@@ -935,12 +1108,14 @@ namespace Cnidaria.C
             QualifiedType type,
             ImmutableArray<ValueNumber> operands,
             ValueNumberFlags flags,
-            string display)
+            string display,
+            bool hasConstantValue,
+            object? constantValue)
         {
             if ((flags & ValueNumberFlags.Unique) == 0 && _canonicalNumbers.TryGetValue(key, out var existing))
                 return existing;
 
-            var number = new ValueNumber(_numbers.Count, kind, type, key, operands, flags, display);
+            var number = new ValueNumber(_numbers.Count, kind, type, key, operands, flags, display, hasConstantValue, constantValue);
             _numbers.Add(number);
 
             if ((flags & ValueNumberFlags.Unique) == 0)
@@ -1112,16 +1287,65 @@ namespace Cnidaria.C
             if (value is null)
                 return "null";
 
+            if (TryNormalizeIntegerConstant(value, out var integer))
+                return "i:" + integer.ToString("X16", CultureInfo.InvariantCulture);
+
+            if (value is float single)
+                return "f32:" + unchecked((uint)BitConverter.SingleToInt32Bits(single)).ToString("X8", CultureInfo.InvariantCulture);
+
+            if (value is double @double)
+                return "f64:" + unchecked((ulong)BitConverter.DoubleToInt64Bits(@double)).ToString("X16", CultureInfo.InvariantCulture);
+
             var typeName = value.GetType().FullName ?? value.GetType().Name;
             var text = value switch
             {
-                string s => s,
-                char c => ((int)c).ToString(CultureInfo.InvariantCulture),
+                string textValue => textValue,
                 IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
                 _ => value.ToString() ?? string.Empty,
             };
 
             return typeName + ":" + text;
         }
+
+        private static bool TryNormalizeIntegerConstant(object value, out ulong result)
+        {
+            switch (value)
+            {
+                case bool b:
+                    result = b ? 1UL : 0UL;
+                    return true;
+                case char c:
+                    result = c;
+                    return true;
+                case byte b:
+                    result = b;
+                    return true;
+                case sbyte sb:
+                    result = unchecked((ulong)sb);
+                    return true;
+                case short s:
+                    result = unchecked((ulong)s);
+                    return true;
+                case ushort us:
+                    result = us;
+                    return true;
+                case int i:
+                    result = unchecked((ulong)i);
+                    return true;
+                case uint ui:
+                    result = ui;
+                    return true;
+                case long l:
+                    result = unchecked((ulong)l);
+                    return true;
+                case ulong ul:
+                    result = ul;
+                    return true;
+                default:
+                    result = 0;
+                    return false;
+            }
+        }
+
     }
 }

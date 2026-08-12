@@ -5,7 +5,7 @@ using System.Diagnostics;
 
 namespace Cnidaria.Cs
 {
-    internal static class CodeGenerator
+    internal static class RegisterBytecodeGenerator
     {
         public static CodeImage Build(GenTreeProgram program, CodeGeneratorOptions? options = null, TargetInfo? target = null)
         {
