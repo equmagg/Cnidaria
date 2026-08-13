@@ -240,6 +240,7 @@ static u8* rh_heap_used;
 static u8* rh_heap_committed;
 static u8* rh_heap_limit;
 static usize rh_allocation_debt;
+#define RH_GC_POLL_DEBT_LIMIT 262144ul
 static RhBlock* rh_mark_stack;
 static RhBlock* rh_free_list;
 static int rh_gc_running;
@@ -253,6 +254,7 @@ static usize rh_catch_context_count;
 
 const RhSafePoint* RhpCurrentSafePoint;
 void* RhpCurrentFramePointer;
+volatile u32 RhpGcPollRequested;
 usize RhpEhFrameCount;
 RhEhFrame RhpEhFrames[RH_EH_MAX_FRAMES];
 RhEhRegisterContext RhpEhRegisterContexts[RH_EH_MAX_FRAMES];
@@ -1858,6 +1860,7 @@ static void rh_initialize_heap(void)
     rh_mark_stack = (RhBlock*)0;
     rh_free_list = (RhBlock*)0;
     rh_allocation_debt = 0ul;
+    RhpGcPollRequested = 0u;
 }
 
 void RhpInitialize(
@@ -2299,6 +2302,7 @@ static void rh_sweep(void)
     rh_decommit_unused_tail();
     rh_rebuild_free_list();
     rh_allocation_debt = 0ul;
+    RhpGcPollRequested = 0u;
 }
 
 static void rh_collect(const RhSafePoint* safe_point, void* frame_pointer)
@@ -2429,7 +2433,7 @@ static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
     void* object;
     usize maximum = (usize)-1;
 
-    if (rh_allocation_debt >= 262144ul)
+    if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
         rh_collect_current();
 
     storage = rh_try_allocate(gc_size);
@@ -2448,6 +2452,8 @@ static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
         rh_allocation_debt = maximum;
     else
         rh_allocation_debt = rh_allocation_debt + gc_size;
+    if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
+        RhpGcPollRequested = 1u;
     return object;
 }
 
@@ -3001,7 +3007,7 @@ void* RhpNewStringFromCharArrayRange(
 
 void RhpGcPoll(void)
 {
-    if (rh_allocation_debt >= 262144ul)
+    if (RhpGcPollRequested != 0u)
         rh_collect_current();
 }
 

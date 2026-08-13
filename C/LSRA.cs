@@ -1602,10 +1602,10 @@ namespace Cnidaria.C
             offset = AlignUp(offset, _options.StackAlignment);
             var parallelCopyTempOffset = offset;
             offset = checked(offset + parallelCopyTempSize);
-            offset = AlignUp(offset, _options.SpillSlotAlignment);
+            var floatingImmediateTempSize = ComputeFloatingImmediateTempSize();
+            if (floatingImmediateTempSize != 0)
+                offset = AlignUp(offset, _options.SpillSlotAlignment);
             var floatingImmediateTempOffset = offset;
-            var floatingImmediateTempMinimum = _target.Architecture == TargetArchitectureKind.I386 ? 32 : 8;
-            var floatingImmediateTempSize = AlignUp(Math.Max(floatingImmediateTempMinimum, _options.SpillSlotSize), _options.SpillSlotAlignment);
             offset = checked(offset + floatingImmediateTempSize);
 
             var usedRegisters = allocations.Values
@@ -1689,6 +1689,189 @@ namespace Cnidaria.C
             return callee.Kind == LirOperandKind.Symbol &&
                 callee.Symbol is FunctionSymbol function &&
                 function.Name.StartsWith("__riscv_v", StringComparison.Ordinal);
+        }
+
+        private int ComputeFloatingImmediateTempSize()
+        {
+            if (!NeedsFloatingImmediateTemp())
+                return 0;
+
+            var minimum = _target.Architecture == TargetArchitectureKind.I386 ? 32 : 8;
+            return AlignUp(Math.Max(minimum, _options.SpillSlotSize), _options.SpillSlotAlignment);
+        }
+
+        private bool NeedsFloatingImmediateTemp()
+        {
+            if (_target.IsRegisterBytecode)
+                return NeedsRegisterBytecodeFloatingImmediateTemp();
+
+            if (_target.Architecture == TargetArchitectureKind.I386)
+                return HasWideScalarUse();
+
+            if (_target.IsRiscV)
+                return HasWideScalarUse() || HasRiscVScalarBitsTempUse();
+
+            if (_target.Architecture == TargetArchitectureKind.X86_64 && TargetRegisterInfo.IsWindowsX64(_target))
+                return HasWindowsX64VariadicFloatingArgument();
+
+            return false;
+        }
+
+        private bool NeedsRegisterBytecodeFloatingImmediateTemp()
+        {
+            foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
+            {
+                if (instruction.Kind == LirInstructionKind.Zero &&
+                    instruction.Result is not null &&
+                    CAbi.IsFloating(instruction.Result.Type))
+                {
+                    return true;
+                }
+
+                if (instruction.Kind == LirInstructionKind.Unary &&
+                    instruction.Operator == "!" &&
+                    instruction.Operands.Length != 0 &&
+                    CAbi.IsFloating(instruction.Operands[0].Type))
+                {
+                    return true;
+                }
+
+                if (instruction.Kind == LirInstructionKind.Branch &&
+                    instruction.Operands.Length == 1 &&
+                    CAbi.IsFloating(instruction.Operands[0].Type))
+                {
+                    return true;
+                }
+
+                foreach (var operand in instruction.Operands)
+                {
+                    if (CAbi.IsFloating(operand.Type) &&
+                        operand.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                    {
+                        return true;
+                    }
+                }
+
+                foreach (var copy in instruction.ParallelCopies)
+                {
+                    if (CAbi.IsFloating(copy.Source.Type) &&
+                        copy.Source.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool HasWideScalarUse()
+        {
+            foreach (var register in _function.VirtualRegisters)
+            {
+                if (RequiresStackBackedScalar(register))
+                    return true;
+            }
+
+            foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
+            {
+                if (instruction.Result is not null && IsWideScalarType(instruction.Result.Type))
+                    return true;
+
+                foreach (var operand in instruction.Operands)
+                {
+                    if (IsWideScalarType(operand.Type))
+                        return true;
+                }
+
+                foreach (var copy in instruction.ParallelCopies)
+                {
+                    if (IsWideScalarType(copy.Destination.Type) || IsWideScalarType(copy.Source.Type))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool IsWideScalarType(QualifiedType type)
+        {
+            if (type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function or TypeKind.Struct or TypeKind.Union or TypeKind.Vector)
+                return false;
+            if (CAbi.IsFloating(type) && CAbi.UsesHardwareFloatingRegister(_target, type, isVariadicUnnamedArgument: false))
+                return false;
+            return SizeOfStorage(type) > Math.Max(1, _target.RegisterSize);
+        }
+
+        private bool HasRiscVScalarBitsTempUse()
+        {
+            foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
+            {
+                if (instruction.Kind != LirInstructionKind.Call)
+                    continue;
+
+                var signature = instruction.CallSignature;
+                for (var i = 1; i < instruction.Operands.Length; i++)
+                {
+                    var operand = instruction.Operands[i];
+                    var isVariadicUnnamed = signature is not null && signature.IsVariadic && i - 1 >= signature.Parameters.Length;
+                    var value = CAbi.ClassifyValue(_target, operand.Type, isReturn: false, isVariadicUnnamed);
+                    if (value.PassingKind == AbiPassingKind.MultiRegister &&
+                        !CAbi.IsAggregate(operand.Type) &&
+                        !RequiresStackBackedScalarStorage(operand.Type))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool RequiresStackBackedScalarStorage(QualifiedType type)
+        {
+            if (CAbi.IsAggregate(type) || type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function or TypeKind.Vector)
+                return false;
+            if (CAbi.UsesHardwareFloatingRegister(_target, type, isVariadicUnnamedArgument: false))
+                return false;
+            return SizeOfStorage(type) > Math.Max(1, _target.RegisterSize);
+        }
+
+        private bool HasWindowsX64VariadicFloatingArgument()
+        {
+            foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
+            {
+                var signature = instruction.CallSignature;
+                if (instruction.Kind != LirInstructionKind.Call || signature is null || !signature.IsVariadic)
+                    continue;
+
+                var cursor = new AbiCursor();
+                if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_target, instruction.Result.Type))
+                    _ = CAbi.AssignHiddenReturnBufferLocation(_target, ref cursor, _options.StackArgumentSlotSize);
+
+                for (var i = 1; i < instruction.Operands.Length; i++)
+                {
+                    var operand = instruction.Operands[i];
+                    var isVariadicUnnamed = i - 1 >= signature.Parameters.Length;
+                    var value = CAbi.ClassifyValue(_target, operand.Type, isReturn: false, isVariadicUnnamed);
+                    if (value.PassingKind == AbiPassingKind.MultiRegister)
+                    {
+                        foreach (var segment in value.Segments)
+                        {
+                            var location = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _options.StackArgumentSlotSize);
+                            if (isVariadicUnnamed && CAbi.IsFloating(operand.Type) && location.Kind == AbiLocationKind.Register)
+                                return true;
+                        }
+                        continue;
+                    }
+
+                    var scalarLocation = CAbi.AssignArgumentLocation(value, ref cursor, _options.StackArgumentSlotSize);
+                    if (isVariadicUnnamed && CAbi.IsFloating(operand.Type) && scalarLocation.Kind == AbiLocationKind.Register)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private int ComputeParallelCopyTempSize(

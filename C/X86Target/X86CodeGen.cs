@@ -61,12 +61,19 @@ namespace Cnidaria.C
             var reservedGeneral = target.Architecture switch
             {
                 TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2),
-                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
-                TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
+                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
+                TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
                 _ => ImmutableHashSet<MachineRegister>.Empty,
             };
 
-            var reservedVector = ImmutableHashSet.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2);
+            var blockCopyScratch = target.Architecture switch
+            {
+                TargetArchitectureKind.I386 => MachineRegister.V7,
+                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => MachineRegister.V4,
+                TargetArchitectureKind.X86_64 => MachineRegister.V15,
+                _ => throw new NotSupportedException("x86 block copy scratch register is unavailable for the selected target."),
+            };
+            var reservedVector = ImmutableHashSet.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, blockCopyScratch);
 
             return new LSRAOptions(
                 generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
@@ -4696,42 +4703,171 @@ namespace Cnidaria.C
 
             private void EmitMemoryCopy(X86Operand source, X86Operand destination, int size)
             {
-                var scratch = SelectMemoryScratch(source, destination);
-                for (var offset = 0; offset < size;)
+                if (size <= 0)
+                    return;
+
+                const int inlineThreshold = 64;
+                const int vectorSize = 16;
+                const int loopStride = 64;
+                if (size <= inlineThreshold)
                 {
-                    var chunk = Math.Min(_wordSize, size - offset);
-                    if (chunk > 4 && _wordSize == 8)
-                        chunk = 8;
-                    else if (chunk > 2)
-                        chunk = 4;
-                    else if (chunk > 1)
-                        chunk = 2;
-                    else
-                        chunk = 1;
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(scratch, chunk), source.WithSize(chunk).WithDisplacement(source.Displacement + offset)));
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(scratch, chunk)));
+                    EmitInlineMemoryCopy(source, destination, size);
+                    return;
+                }
+
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch2, _wordSize), source.WithSize(_wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch0, _wordSize), destination.WithSize(_wordSize)));
+                MoveRegister(Scratch1, Scratch2, _wordSize);
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch2, _wordSize), Imm(size / loopStride)));
+
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_loop");
+                _owner._text.DefineLabel(loop);
+                for (var offset = 0; offset < loopStride; offset += vectorSize)
+                {
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Movdqu,
+                        Reg(BlockCopyScratch, vectorSize),
+                        RegMem(Scratch1, vectorSize).WithDisplacement(offset)));
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Movdqu,
+                        RegMem(Scratch0, vectorSize).WithDisplacement(offset),
+                        Reg(BlockCopyScratch, vectorSize)));
+                }
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch1, _wordSize), Imm(loopStride)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch0, _wordSize), Imm(loopStride)));
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(Scratch2, _wordSize), Imm(1)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
+
+                EmitInlineMemoryCopy(RegMem(Scratch1, 1), RegMem(Scratch0, 1), size % loopStride);
+            }
+
+            private void EmitInlineMemoryCopy(X86Operand source, X86Operand destination, int size)
+            {
+                const int vectorSize = 16;
+                var offset = 0;
+                while (size - offset >= vectorSize)
+                {
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Movdqu,
+                        Reg(BlockCopyScratch, vectorSize),
+                        source.WithSize(vectorSize).WithDisplacement(source.Displacement + offset)));
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Movdqu,
+                        destination.WithSize(vectorSize).WithDisplacement(destination.Displacement + offset),
+                        Reg(BlockCopyScratch, vectorSize)));
+                    offset += vectorSize;
+                }
+
+                EmitScalarMemoryCopyTail(
+                    source.WithDisplacement(source.Displacement + offset),
+                    destination.WithDisplacement(destination.Displacement + offset),
+                    size - offset);
+            }
+
+            private void EmitScalarMemoryCopyTail(X86Operand source, X86Operand destination, int size)
+            {
+                if (size <= 0)
+                    return;
+
+                var scratch = SelectMemoryScratch(source, destination);
+                var offset = 0;
+                while (offset < size)
+                {
+                    var chunk = SelectScalarBlockChunk(size - offset);
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(scratch, chunk),
+                        source.WithSize(chunk).WithDisplacement(source.Displacement + offset)));
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset),
+                        Reg(scratch, chunk)));
                     offset += chunk;
                 }
             }
 
             private void ZeroMemory(X86Operand destination, int size)
             {
+                if (size <= 0)
+                    return;
+
+                const int inlineThreshold = 64;
+                const int vectorSize = 16;
+                const int loopStride = 64;
+                if (size <= inlineThreshold)
+                {
+                    EmitInlineZeroMemory(destination, size);
+                    return;
+                }
+
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch0, _wordSize), destination.WithSize(_wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, _wordSize), Imm(size / loopStride)));
+                Emit(X86Instruction.Binary(X86InstrKind.Pxor, Reg(BlockCopyScratch, vectorSize), Reg(BlockCopyScratch, vectorSize)));
+
+                var loop = _owner.CreateLocalLabel(_functionLabel + "_memzero_loop");
+                _owner._text.DefineLabel(loop);
+                for (var offset = 0; offset < loopStride; offset += vectorSize)
+                {
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Movdqu,
+                        RegMem(Scratch0, vectorSize).WithDisplacement(offset),
+                        Reg(BlockCopyScratch, vectorSize)));
+                }
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch0, _wordSize), Imm(loopStride)));
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(Scratch1, _wordSize), Imm(1)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
+
+                EmitInlineZeroMemory(RegMem(Scratch0, 1), size % loopStride);
+            }
+
+            private void EmitInlineZeroMemory(X86Operand destination, int size)
+            {
+                const int vectorSize = 16;
+                var offset = 0;
+                if (size >= vectorSize)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Pxor, Reg(BlockCopyScratch, vectorSize), Reg(BlockCopyScratch, vectorSize)));
+                    while (size - offset >= vectorSize)
+                    {
+                        Emit(X86Instruction.Binary(
+                            X86InstrKind.Movdqu,
+                            destination.WithSize(vectorSize).WithDisplacement(destination.Displacement + offset),
+                            Reg(BlockCopyScratch, vectorSize)));
+                        offset += vectorSize;
+                    }
+                }
+
+                EmitScalarZeroTail(destination.WithDisplacement(destination.Displacement + offset), size - offset);
+            }
+
+            private void EmitScalarZeroTail(X86Operand destination, int size)
+            {
+                if (size <= 0)
+                    return;
+
                 var scratch = SelectMemoryScratch(destination, X86Operand.None);
                 Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(scratch, 4), Reg(scratch, 4)));
-                for (var offset = 0; offset < size;)
+                var offset = 0;
+                while (offset < size)
                 {
-                    var chunk = Math.Min(_wordSize, size - offset);
-                    if (chunk > 4 && _wordSize == 8)
-                        chunk = 8;
-                    else if (chunk > 2)
-                        chunk = 4;
-                    else if (chunk > 1)
-                        chunk = 2;
-                    else
-                        chunk = 1;
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset), Reg(scratch, chunk)));
+                    var chunk = SelectScalarBlockChunk(size - offset);
+                    Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        destination.WithSize(chunk).WithDisplacement(destination.Displacement + offset),
+                        Reg(scratch, chunk)));
                     offset += chunk;
                 }
+            }
+
+            private int SelectScalarBlockChunk(int remaining)
+            {
+                if (_wordSize == 8 && remaining >= 8)
+                    return 8;
+                if (remaining >= 4)
+                    return 4;
+                if (remaining >= 2)
+                    return 2;
+                return 1;
             }
 
             private X86Register SelectMemoryScratch(X86Operand first, X86Operand second)
@@ -4808,6 +4944,14 @@ namespace Cnidaria.C
 
             private X86Register Scratch1
                 => _owner._machineTarget.Is64Bit ? X86Register.R11 : X86Register.Rdx;
+
+            private X86Register Scratch2
+                => _owner._machineTarget.Is64Bit ? X86Register.Rax : X86Register.Rcx;
+
+            private X86Register BlockCopyScratch
+                => !_owner._machineTarget.Is64Bit
+                    ? X86Register.Xmm7
+                    : TargetRegisterInfo.IsWindowsX64(_owner._target) ? X86Register.Xmm4 : X86Register.Xmm15;
 
             private X86Register VarArgsRegister
                 => _owner._machineTarget.Is64Bit ? X86Register.R11 : X86Register.Rax;

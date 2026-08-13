@@ -455,12 +455,20 @@ namespace Cnidaria.Cs
 
             private StackFrameLayout BuildLayout()
             {
+                bool usesFramePointer = RequiresFramePointer();
+                var layout = BuildLayout(usesFramePointer);
+                if (!usesFramePointer && _options.SaveFramePointerWhenFrameIsUsed && layout.FrameSize != 0)
+                    layout = BuildLayout(usesFramePointer: true);
+                return layout;
+            }
+
+            private StackFrameLayout BuildLayout(bool usesFramePointer)
+            {
                 int cursor = 0;
                 int frameAlignment = Math.Max(1, _options.FrameAlignment);
                 if (!IsPowerOfTwo(frameAlignment))
                     throw new InvalidOperationException($"Frame alignment must be a power of two: {frameAlignment}.");
 
-                bool usesFramePointer = ShouldUseFramePointer();
                 bool saveReturnAddress = RegisterInfo.ReturnAddress(Target) != MachineRegister.Invalid &&
                     (_options.SaveReturnAddressForLeafMethods || (_options.SaveReturnAddressForNonLeafMethods && MethodMayCall()));
 
@@ -706,21 +714,62 @@ namespace Cnidaria.Cs
 
             private int ComputeGcRootSpillSlotCount()
             {
-                int count = 0;
-
-                for (int i = 0; i < _method.Allocations.Length; i++)
-                {
-                    var allocation = _method.Allocations[i];
-                    if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(allocation.ValueKey, out var info))
-                        continue;
-                    count = checked(count + GcCellCount(info.Type, info.StackKind));
-                }
-
+                int count = ComputeMaximumLiveAllocationGcCellCount();
                 count = checked(count + GcCellCount(_method.GenTreeMethod.ArgDescriptors));
                 count = checked(count + GcCellCount(_method.GenTreeMethod.LocalDescriptors));
                 count = checked(count + GcCellCount(_method.GenTreeMethod.TempDescriptors));
                 count = checked(count + GcSafePointOperandCellCount());
                 return checked(count + 1);
+            }
+
+            private int ComputeMaximumLiveAllocationGcCellCount()
+            {
+                int maximum = 0;
+                for (int n = 0; n < _method.LinearNodes.Length; n++)
+                {
+                    GenTree node = _method.LinearNodes[n];
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
+                        continue;
+                    if (!_method.LsraNodePositions.TryGetValue(node.LinearId, out int position))
+                        continue;
+
+                    int count = 0;
+                    for (int i = 0; i < _method.Allocations.Length; i++)
+                    {
+                        RegisterAllocationInfo allocation = _method.Allocations[i];
+                        if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(allocation.ValueKey, out var info))
+                            continue;
+
+                        int cells = GcCellCount(info.Type, info.StackKind);
+                        if (cells == 0 || !AllocationIsLiveAt(allocation, position))
+                            continue;
+                        count = checked(count + cells);
+                    }
+                    maximum = Math.Max(maximum, count);
+                }
+                return maximum;
+            }
+
+            private static bool AllocationIsLiveAt(RegisterAllocationInfo allocation, int position)
+            {
+                for (int i = 0; i < allocation.Segments.Length; i++)
+                {
+                    RegisterAllocationSegment segment = allocation.Segments[i];
+                    if (!segment.Location.IsNone && segment.Start <= position && position < segment.End)
+                        return true;
+                }
+
+                for (int i = 0; i < allocation.Fragments.Length; i++)
+                {
+                    RegisterAllocationFragment fragment = allocation.Fragments[i];
+                    for (int s = 0; s < fragment.Segments.Length; s++)
+                    {
+                        RegisterAllocationSegment segment = fragment.Segments[s];
+                        if (!segment.Location.IsNone && segment.Start <= position && position < segment.End)
+                            return true;
+                    }
+                }
+                return false;
             }
 
             private int GcSafePointOperandCellCount()
@@ -786,7 +835,7 @@ namespace Cnidaria.Cs
                 return frameSize == 0 ? RegisterStackFrameModel.Leaf : RegisterStackFrameModel.RootFrame;
             }
 
-            private bool ShouldUseFramePointer()
+            private bool RequiresFramePointer()
             {
                 if ((Target.IsRiscV || Target.IsX86) && MethodHasGcSafePoint())
                     return true;
@@ -802,10 +851,7 @@ namespace Cnidaria.Cs
                 if (MethodHasDynamicStackAllocation())
                     return true;
 
-                if (UsesSpecificCalleeSavedRegister(RegisterInfo.FramePointer(Target)))
-                    return true;
-
-                return _options.SaveFramePointerWhenFrameIsUsed;
+                return UsesSpecificCalleeSavedRegister(RegisterInfo.FramePointer(Target));
             }
 
             private bool MethodHasDynamicStackAllocation()
@@ -823,7 +869,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     var node = _method.LinearNodes[i];
-                    if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
+                    if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill) ||
+                        node.HasLoweringFlag(GenTreeLinearFlags.MayCall))
                         return true;
                 }
 

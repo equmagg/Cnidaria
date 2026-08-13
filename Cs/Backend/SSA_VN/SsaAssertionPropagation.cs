@@ -290,6 +290,23 @@ namespace Cnidaria.Cs
             public bool IsExact => Lower == Upper;
         }
 
+        private readonly struct StackAllocationAddressRange
+        {
+            public readonly ValueNumber Allocation;
+            public readonly AssertionRange ByteOffsets;
+            public readonly int RecurrenceDirections;
+
+            public StackAllocationAddressRange(
+                ValueNumber allocation,
+                AssertionRange byteOffsets,
+                int recurrenceDirections = 0)
+            {
+                Allocation = allocation;
+                ByteOffsets = byteOffsets;
+                RecurrenceDirections = recurrenceDirections;
+            }
+        }
+
         private sealed class AssertionTable
         {
             private readonly int _maximumCount;
@@ -470,6 +487,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<GenTree, List<int>> _generatedAfter = new(ReferenceEqualityComparer<GenTree>.Instance);
             private readonly Dictionary<CfgEdge, List<int>> _generatedOnEdge = new();
             private readonly Dictionary<ValueNumber, SsaPhi> _phiByValueNumber = new();
+            private readonly Dictionary<ValueNumber, SsaPhi> _stackAllocationPhiByValueNumber = new();
             private readonly Dictionary<GenTree, ValueNumberPair> _treeValueUpdates = new(ReferenceEqualityComparer<GenTree>.Instance);
             private AssertionSet[] _blockIn = Array.Empty<AssertionSet>();
             private Dictionary<CfgEdge, AssertionSet> _edgeOut = new();
@@ -499,9 +517,20 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    ValueNumber value = _store.VNNormalValue(pair.Conservative);
-                    if (value.IsValid && _store.TryGetEntry(value, out var entry) && entry.Function == ValueNumberFunction.PhiDef)
-                        _phiByValueNumber[value] = definition.Phi;
+                    ValueNumber liberal = _store.VNNormalValue(pair.Liberal);
+                    if (liberal.IsValid && _store.TryGetEntry(liberal, out var liberalEntry) &&
+                        liberalEntry.Function == ValueNumberFunction.PhiDef)
+                    {
+                        _stackAllocationPhiByValueNumber[liberal] = definition.Phi;
+                    }
+
+                    ValueNumber conservative = _store.VNNormalValue(pair.Conservative);
+                    if (conservative.IsValid && _store.TryGetEntry(conservative, out var conservativeEntry) &&
+                        conservativeEntry.Function == ValueNumberFunction.PhiDef)
+                    {
+                        _phiByValueNumber[conservative] = definition.Phi;
+                        _stackAllocationPhiByValueNumber[conservative] = definition.Phi;
+                    }
                 }
             }
 
@@ -1747,11 +1776,270 @@ namespace Cnidaria.Cs
                 if (_method.GenTreeMethod.Target.IsRegisterBytecode)
                     return false;
 
+                int budget = 128;
+                var visiting = new HashSet<ValueNumber>();
+                if (!TryGetStackAllocationAddressRange(value, active, visiting, ref budget, out var addressRange))
+                    return false;
+
+                if (addressRange.ByteOffsets.Lower < 0)
+                    return false;
+
+                if (addressRange.ByteOffsets.Upper == 0)
+                    return true;
+
+                return TryGetMinimumStackAllocationSize(addressRange.Allocation, active, out long minimumAllocationSize) &&
+                       addressRange.ByteOffsets.Upper < minimumAllocationSize;
+            }
+
+            private bool TryGetStackAllocationAddressRange(
+                ValueNumber value,
+                AssertionSet active,
+                HashSet<ValueNumber> visiting,
+                ref int budget,
+                out StackAllocationAddressRange range)
+            {
+                range = default;
                 value = _store.VNNormalValue(value);
-                long byteOffset = 0;
+                if (!value.IsValid || budget <= 0 || !visiting.Add(value))
+                    return false;
+
+                budget--;
+                try
+                {
+                    if (!_store.TryGetEntry(value, out var entry))
+                        return false;
+
+                    if (entry.Function == ValueNumberFunction.StackAlloc && entry.Args.Length == 2)
+                    {
+                        range = new StackAllocationAddressRange(value, new AssertionRange(0, 0));
+                        return true;
+                    }
+
+                    if (entry.Function == ValueNumberFunction.SsaNormalize && entry.Args.Length >= 1)
+                    {
+                        return TryGetStackAllocationAddressRange(
+                            entry.Args[0],
+                            active,
+                            visiting,
+                            ref budget,
+                            out range);
+                    }
+
+                    if (entry.Function == ValueNumberFunction.PointerElementAddr)
+                    {
+                        if (entry.Args.Length != 3 ||
+                            !TryGetKnownIntegralConstant(entry.Args[1], active, out long index) ||
+                            !TryGetKnownIntegralConstant(entry.Args[2], active, out long elementSize) ||
+                            elementSize <= 0 ||
+                            !TryGetStackAllocationAddressRange(
+                                entry.Args[0],
+                                active,
+                                visiting,
+                                ref budget,
+                                out var baseRange))
+                        {
+                            return false;
+                        }
+
+                        long byteOffset;
+                        long lower;
+                        long upper;
+                        try
+                        {
+                            byteOffset = checked(index * elementSize);
+                            lower = checked(baseRange.ByteOffsets.Lower + byteOffset);
+                            upper = checked(baseRange.ByteOffsets.Upper + byteOffset);
+                        }
+                        catch (OverflowException)
+                        {
+                            return false;
+                        }
+
+                        var shifted = new AssertionRange(lower, upper);
+                        if (baseRange.RecurrenceDirections != 0)
+                        {
+                            bool allowLowerClamp = byteOffset < 0 && (baseRange.RecurrenceDirections & 1) != 0;
+                            bool allowUpperClamp = byteOffset > 0 && (baseRange.RecurrenceDirections & 2) != 0;
+                            if (!TryConstrainStackAllocationOffsetRange(
+                                baseRange.Allocation,
+                                shifted,
+                                active,
+                                allowLowerClamp,
+                                allowUpperClamp,
+                                out shifted))
+                            {
+                                return false;
+                            }
+                        }
+
+                        range = new StackAllocationAddressRange(
+                            baseRange.Allocation,
+                            shifted,
+                            baseRange.RecurrenceDirections);
+                        return true;
+                    }
+
+                    if (entry.Function == ValueNumberFunction.PhiDef &&
+                        _stackAllocationPhiByValueNumber.TryGetValue(value, out var phi))
+                    {
+                        return TryGetStackAllocationPhiAddressRange(
+                            value,
+                            phi,
+                            active,
+                            visiting,
+                            ref budget,
+                            out range);
+                    }
+
+                    return false;
+                }
+                finally
+                {
+                    visiting.Remove(value);
+                }
+            }
+
+            private bool TryGetStackAllocationPhiAddressRange(
+                ValueNumber phiValue,
+                SsaPhi phi,
+                AssertionSet active,
+                HashSet<ValueNumber> visiting,
+                ref int budget,
+                out StackAllocationAddressRange range)
+            {
+                range = default;
+                bool hasEntryRange = false;
+                bool hasNegativeRecurrence = false;
+                bool hasPositiveRecurrence = false;
+                int recurrenceDirections = 0;
+                ValueNumber liberalPhiValue = phiValue;
+                ValueNumber conservativePhiValue = phiValue;
+                if (_valueNumbers.TryGetSsaValue(phi.Target, out var phiPair))
+                {
+                    liberalPhiValue = _store.VNNormalValue(phiPair.Liberal);
+                    conservativePhiValue = _store.VNNormalValue(phiPair.Conservative);
+                }
+
+                for (int i = 0; i < phi.Inputs.Length; i++)
+                {
+                    var input = phi.Inputs[i];
+                    if (!_valueNumbers.TryGetSsaValue(input.Value, out var pair))
+                        return false;
+
+                    ValueNumber inputValue = _store.VNNormalValue(pair.Conservative);
+                    if (!inputValue.IsValid)
+                        return false;
+
+                    AssertionSet edgeAssertions = GetPhiInputAssertions(phi, input.PredecessorBlockId);
+                    if (TryGetPointerPhiConstantByteOffset(
+                        inputValue,
+                        liberalPhiValue,
+                        conservativePhiValue,
+                        edgeAssertions,
+                        out long recurrenceOffset))
+                    {
+                        if (recurrenceOffset < 0)
+                            hasNegativeRecurrence = true;
+                        else if (recurrenceOffset > 0)
+                            hasPositiveRecurrence = true;
+                        continue;
+                    }
+
+                    if (!TryGetStackAllocationAddressRange(
+                        inputValue,
+                        edgeAssertions,
+                        visiting,
+                        ref budget,
+                        out var inputRange))
+                    {
+                        return false;
+                    }
+
+                    if (!hasEntryRange)
+                    {
+                        range = inputRange;
+                        hasEntryRange = true;
+                    }
+                    else
+                    {
+                        if (range.Allocation != inputRange.Allocation)
+                            return false;
+
+                        range = new StackAllocationAddressRange(
+                            range.Allocation,
+                            range.ByteOffsets.Union(inputRange.ByteOffsets),
+                            range.RecurrenceDirections | inputRange.RecurrenceDirections);
+                    }
+                }
+
+                if (!hasEntryRange)
+                    return false;
+
+                if (!TryConstrainStackAllocationOffsetRange(
+                    range.Allocation,
+                    range.ByteOffsets,
+                    active,
+                    allowLowerClamp: false,
+                    allowUpperClamp: false,
+                    out var entryOffsets))
+                {
+                    return false;
+                }
+
+                recurrenceDirections = range.RecurrenceDirections;
+                long lower = entryOffsets.Lower;
+                long upper = entryOffsets.Upper;
+
+                if (hasNegativeRecurrence)
+                {
+                    lower = 0;
+                    recurrenceDirections |= 1;
+                }
+
+                if (hasPositiveRecurrence)
+                {
+                    if (!TryGetMinimumStackAllocationSize(range.Allocation, active, out long minimumAllocationSize) ||
+                        minimumAllocationSize <= 0)
+                    {
+                        return false;
+                    }
+
+                    upper = minimumAllocationSize - 1;
+                    recurrenceDirections |= 2;
+                }
+
+                if (!TryConstrainStackAllocationOffsetRange(
+                    range.Allocation,
+                    new AssertionRange(lower, upper),
+                    active,
+                    allowLowerClamp: false,
+                    allowUpperClamp: false,
+                    out var constrained))
+                {
+                    return false;
+                }
+
+                range = new StackAllocationAddressRange(range.Allocation, constrained, recurrenceDirections);
+                return true;
+            }
+
+            private bool TryGetPointerPhiConstantByteOffset(
+                ValueNumber value,
+                ValueNumber liberalPhiValue,
+                ValueNumber conservativePhiValue,
+                AssertionSet active,
+                out long byteOffset)
+            {
+                value = _store.VNNormalValue(value);
+                liberalPhiValue = _store.VNNormalValue(liberalPhiValue);
+                conservativePhiValue = _store.VNNormalValue(conservativePhiValue);
+                byteOffset = 0;
 
                 for (int depth = 0; depth < 32; depth++)
                 {
+                    if (value == liberalPhiValue || value == conservativePhiValue)
+                        return true;
+
                     if (!_store.TryGetEntry(value, out var entry))
                         return false;
 
@@ -1761,55 +2049,98 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    if (entry.Function == ValueNumberFunction.PointerElementAddr)
-                    {
-                        if (entry.Args.Length != 3 ||
-                            !TryGetKnownIntegralConstant(entry.Args[1], active, out long index) ||
-                            !TryGetKnownIntegralConstant(entry.Args[2], active, out long elementSize) ||
-                            elementSize <= 0)
-                        {
-                            return false;
-                        }
-
-                        try
-                        {
-                            byteOffset = checked(byteOffset + checked(index * elementSize));
-                        }
-                        catch (OverflowException)
-                        {
-                            return false;
-                        }
-
-                        value = _store.VNNormalValue(entry.Args[0]);
-                        continue;
-                    }
-
-                    if (entry.Function != ValueNumberFunction.StackAlloc || entry.Args.Length != 2)
-                        return false;
-
-                    if (byteOffset == 0)
-                        return true;
-                    if (byteOffset < 0 ||
-                        !TryGetKnownIntegralConstant(entry.Args[1], active, out long allocationElementSize) ||
-                        allocationElementSize <= 0 ||
-                        !TryGetIntegralRange(entry.Args[0], active, out var countRange) ||
-                        countRange.Lower <= 0)
+                    if (entry.Function != ValueNumberFunction.PointerElementAddr ||
+                        entry.Args.Length != 3 ||
+                        !TryGetKnownIntegralConstant(entry.Args[1], active, out long index) ||
+                        !TryGetKnownIntegralConstant(entry.Args[2], active, out long elementSize) ||
+                        elementSize <= 0)
                     {
                         return false;
                     }
 
                     try
                     {
-                        long minimumAllocationSize = checked(countRange.Lower * allocationElementSize);
-                        return byteOffset < minimumAllocationSize;
+                        byteOffset = checked(byteOffset + checked(index * elementSize));
                     }
                     catch (OverflowException)
                     {
                         return false;
                     }
+
+                    value = _store.VNNormalValue(entry.Args[0]);
                 }
 
                 return false;
+            }
+
+            private bool TryConstrainStackAllocationOffsetRange(
+                ValueNumber allocation,
+                AssertionRange offsets,
+                AssertionSet active,
+                bool allowLowerClamp,
+                bool allowUpperClamp,
+                out AssertionRange constrained)
+            {
+                constrained = offsets;
+                if (!constrained.IsValid)
+                    return false;
+
+                if (constrained.Lower < 0)
+                {
+                    if (!allowLowerClamp)
+                        return false;
+                    constrained = new AssertionRange(0, constrained.Upper);
+                    if (!constrained.IsValid)
+                        return false;
+                }
+
+                if (constrained.Upper == 0)
+                    return true;
+
+                if (!TryGetMinimumStackAllocationSize(allocation, active, out long minimumAllocationSize) ||
+                    minimumAllocationSize <= 0)
+                {
+                    return false;
+                }
+
+                if (constrained.Upper >= minimumAllocationSize)
+                {
+                    if (!allowUpperClamp)
+                        return false;
+                    constrained = new AssertionRange(constrained.Lower, minimumAllocationSize - 1);
+                }
+
+                return constrained.IsValid;
+            }
+
+            private bool TryGetMinimumStackAllocationSize(
+                ValueNumber allocation,
+                AssertionSet active,
+                out long minimumAllocationSize)
+            {
+                allocation = _store.VNNormalValue(allocation);
+                minimumAllocationSize = 0;
+                if (!_store.TryGetEntry(allocation, out var entry) ||
+                    entry.Function != ValueNumberFunction.StackAlloc ||
+                    entry.Args.Length != 2 ||
+                    !TryGetKnownIntegralConstant(entry.Args[1], active, out long allocationElementSize) ||
+                    allocationElementSize <= 0 ||
+                    !TryGetIntegralRange(entry.Args[0], active, out var countRange) ||
+                    countRange.Lower <= 0)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    minimumAllocationSize = checked(countRange.Lower * allocationElementSize);
+                    return minimumAllocationSize > 0;
+                }
+                catch (OverflowException)
+                {
+                    minimumAllocationSize = 0;
+                    return false;
+                }
             }
 
             private bool TryGetKnownIntegralConstant(ValueNumber value, AssertionSet active, out long result)

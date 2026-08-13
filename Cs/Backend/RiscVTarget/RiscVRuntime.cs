@@ -12,6 +12,7 @@ namespace Cnidaria.Cs
     {
         public const string InitializeSymbol = "RhpInitialize";
         public const string GcPollSymbol = "RhpGcPoll";
+        public const string GcPollRequestedSymbol = "RhpGcPollRequested";
         public const string CurrentSafePointSymbol = "RhpCurrentSafePoint";
         public const string CurrentFramePointerSymbol = "RhpCurrentFramePointer";
         public const string NewFastSymbol = "RhpNewFast";

@@ -2365,6 +2365,7 @@ namespace Cnidaria.Cs
                     new Dictionary<(int Offset, int Length), string>();
                 private readonly EhMethodDraft? _ehMethod;
                 private readonly string _returnThunkLabel;
+                private readonly List<GcPollStub> _gcPollStubs = new List<GcPollStub>();
                 private int _nextBlockId = -1;
                 private bool _ehFrameRegistered;
                 private bool _returnThunkNeeded;
@@ -2406,6 +2407,7 @@ namespace Cnidaria.Cs
                         EmitFallthroughFixup(blockId, _nextBlockId);
                         _owner.DefineLabel(_blockEndLabels[blockId]);
                     }
+                    EmitGcPollStubs();
                     BindEhNativeRanges();
                     if (_returnThunkNeeded)
                         EmitReturnThunk();
@@ -2800,11 +2802,163 @@ namespace Cnidaria.Cs
 
                 private void EmitGcPoll(GenTree node)
                 {
-                    SafePointDraft safePoint = PrepareSafePoint(node);
-                    PublishGcTransition(safePoint);
-                    MarkEhCallSite(node, "gc_poll");
-                    _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.GcPollSymbol));
-                    _owner.DefineLabel(safePoint.ReturnLabel);
+                    string slowLabel = _owner.CreateLocalLabel($"{_methodLabel}_gc_poll_slow_{node.LinearId}");
+                    string continuationLabel = _owner.CreateLocalLabel($"{_methodLabel}_gc_poll_continue_{node.LinearId}");
+                    string requested = _owner.ResolveExternalObject(X86Runtime.GcPollRequestedSymbol);
+
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Cmp,
+                        _owner.SymbolMemory(requested, size: 4),
+                        Imm(0)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.Ne,
+                        X86Operand.SymbolOperand(slowLabel, 4, X86ObjectRelocationKind.Relative32)));
+                    _owner.DefineLabel(continuationLabel);
+                    _gcPollStubs.Add(new GcPollStub(node, slowLabel, continuationLabel));
+                }
+
+                private void EmitGcPollStubs()
+                {
+                    if (_gcPollStubs.Count == 0)
+                        return;
+
+                    string endLabel = _owner.CreateLocalLabel(_methodLabel + "_gc_poll_stubs_end");
+                    EmitJump(endLabel);
+                    for (int i = 0; i < _gcPollStubs.Count; i++)
+                    {
+                        GcPollStub stub = _gcPollStubs[i];
+                        _owner.DefineLabel(stub.SlowLabel);
+
+                        int saveAreaSize = EmitSaveCallerSavedRegistersForGcPoll();
+                        SafePointDraft safePoint = PrepareSafePoint(stub.Node, dynamicStackAdjustment: saveAreaSize);
+                        PublishGcTransition(safePoint);
+                        MarkEhGcPollCallSite(stub.Node);
+                        _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.GcPollSymbol));
+                        _owner.DefineLabel(safePoint.ReturnLabel);
+                        EmitRestoreCallerSavedRegistersForGcPoll(saveAreaSize);
+                        ReloadGcRegisterRoots(stub.Node);
+                        EmitJump(stub.ContinuationLabel);
+                    }
+                    _owner.DefineLabel(endLabel);
+                }
+
+                private int EmitSaveCallerSavedRegistersForGcPoll()
+                {
+                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
+                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
+                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
+                    for (int i = 0; i < registers.Length; i++)
+                    {
+                        MachineRegister register = registers[i];
+                        if (RegisterInfo.IsReserved(Target, register))
+                            continue;
+                        int size = RegisterInfo.RegisterSaveSize(Target, register);
+                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                        offset = AlignUp(offset, alignment);
+                        locations.Add((register, offset, size));
+                        offset = checked(offset + size);
+                    }
+
+                    int saveAreaSize = AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    if (saveAreaSize != 0)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Sub,
+                            Reg(X86Register.Rsp, Target.PointerSize),
+                            Imm(saveAreaSize)));
+                    }
+
+                    for (int i = 0; i < locations.Count; i++)
+                    {
+                        var location = locations[i];
+                        X86Register register = ToX86Register(location.Register, Target);
+                        X86InstrKind kind = MachineRegisters.GetClass(location.Register) == RegisterClass.Float
+                            ? X86InstrKind.Movdqu
+                            : X86InstrKind.Mov;
+                        _owner.Emit(X86Instruction.Binary(
+                            kind,
+                            Mem(X86Register.Rsp, location.Offset, location.Size),
+                            Reg(register, location.Size)));
+                    }
+                    return saveAreaSize;
+                }
+
+                private void EmitRestoreCallerSavedRegistersForGcPoll(int saveAreaSize)
+                {
+                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
+                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
+                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
+                    for (int i = 0; i < registers.Length; i++)
+                    {
+                        MachineRegister register = registers[i];
+                        if (RegisterInfo.IsReserved(Target, register))
+                            continue;
+                        int size = RegisterInfo.RegisterSaveSize(Target, register);
+                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                        offset = AlignUp(offset, alignment);
+                        locations.Add((register, offset, size));
+                        offset = checked(offset + size);
+                    }
+
+                    for (int i = locations.Count - 1; i >= 0; i--)
+                    {
+                        var location = locations[i];
+                        X86Register register = ToX86Register(location.Register, Target);
+                        X86InstrKind kind = MachineRegisters.GetClass(location.Register) == RegisterClass.Float
+                            ? X86InstrKind.Movdqu
+                            : X86InstrKind.Mov;
+                        _owner.Emit(X86Instruction.Binary(
+                            kind,
+                            Reg(register, location.Size),
+                            Mem(X86Register.Rsp, location.Offset, location.Size)));
+                    }
+
+                    if (saveAreaSize != 0)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Add,
+                            Reg(X86Register.Rsp, Target.PointerSize),
+                            Imm(saveAreaSize)));
+                    }
+                }
+
+                private void ReloadGcRegisterRoots(GenTree node)
+                {
+                    if (!_nodePositions.TryGetValue(node.LinearId, out int position))
+                        throw Unsupported(node, "GC poll has no final LIR position");
+
+                    var liveRoots = new List<RegisterGcLiveRoot>();
+                    for (int i = 0; i < _method.GcLiveRanges.Length; i++)
+                    {
+                        RegisterGcLiveRange range = _method.GcLiveRanges[i];
+                        if (range.FuncletIndex != 0 || range.StartPosition > position || position >= range.EndPosition)
+                            continue;
+                        if (!ContainsRootCell(liveRoots, range.Root))
+                            liveRoots.Add(range.Root);
+                    }
+
+                    for (int i = 0; i < liveRoots.Count; i++)
+                    {
+                        RegisterGcLiveRoot root = liveRoots[i];
+                        if (!root.Location.IsRegister)
+                            continue;
+                        if (root.Offset != 0 || root.Location.RegisterClass != RegisterClass.General)
+                            throw Unsupported(node, "register GC root has an unsupported shape");
+                        int spillOffset = checked(_method.StackFrame.GcSpillAreaOffset + i * Target.PointerSize);
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(ToX86Register(root.Location.Register, Target), Target.PointerSize),
+                            Mem(X86Register.Rbp, spillOffset, Target.PointerSize)));
+                    }
+                }
+
+                private void MarkEhGcPollCallSite(GenTree node)
+                {
+                    if (_ehMethod is null)
+                        return;
+                    if (node.LinearBlockId < 0 || node.LinearBlockId >= _blockLabels.Length)
+                        throw Unsupported(node, "GC poll has no containing block for EH state publication");
+                    EmitEhSetCurrentIpAndSaveContext(_blockLabels[node.LinearBlockId]);
                 }
 
                 private void BindEhNativeRanges()
@@ -8582,6 +8736,20 @@ namespace Cnidaria.Cs
                 {
                     Offset = offset;
                     Kind = kind;
+                }
+            }
+
+            private readonly struct GcPollStub
+            {
+                public readonly GenTree Node;
+                public readonly string SlowLabel;
+                public readonly string ContinuationLabel;
+
+                public GcPollStub(GenTree node, string slowLabel, string continuationLabel)
+                {
+                    Node = node;
+                    SlowLabel = slowLabel;
+                    ContinuationLabel = continuationLabel;
                 }
             }
 

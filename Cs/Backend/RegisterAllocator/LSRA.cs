@@ -40,7 +40,7 @@ namespace Cnidaria.Cs
                 StackLayoutOptions = new RegisterStackLayoutOptions
                 {
                     FrameAlignment = target.CallFrameAlignment,
-                    SaveFramePointerWhenFrameIsUsed = target.IsRiscV || target.Architecture == TargetArchitectureKind.I386,
+                    SaveFramePointerWhenFrameIsUsed = target.Architecture == TargetArchitectureKind.I386,
                     SaveReturnAddressForNonLeafMethods = RegisterInfo.ReturnAddress(target) != MachineRegister.Invalid,
                 },
             };
@@ -2224,16 +2224,12 @@ namespace Cnidaria.Cs
                 }
             }
 
-            private bool TryAllocatePreferredRegister(
-                AllocationInterval current,
-                int allocationStart,
-                List<AllocationStreamItem> stream,
-                ref int streamIndex)
+            private bool TryAllocatePreferredRegister(AllocationInterval current, int allocationStart, List<AllocationStreamItem> stream, ref int streamIndex)
             {
-                if (TryAllocatePreferredMachineRegister(current, allocationStart, stream, ref streamIndex))
+                if (TryAllocatePreferredValueRegister(current, allocationStart, _phiPreferences, stream, ref streamIndex))
                     return true;
 
-                if (TryAllocatePreferredValueRegister(current, allocationStart, _phiPreferences, stream, ref streamIndex))
+                if (TryAllocatePreferredMachineRegister(current, allocationStart, stream, ref streamIndex))
                     return true;
 
                 if (!_options.PreferCopySourceRegister)

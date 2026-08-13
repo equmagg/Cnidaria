@@ -115,6 +115,18 @@ namespace Cnidaria.Cs
                     {
                         throw new InvalidOperationException($"pre-LSRA lowering invariant failed: GC poll node {node.LinearId} has no caller-saved register policy.");
                     }
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedRegistersPreserved))
+                    {
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: GC poll node {node.LinearId} must preserve caller-saved registers on the hot path.");
+                    }
+                    if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill))
+                    {
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: GC poll node {node.LinearId} must not model its rare helper call as a hot-path caller-saved kill.");
+                    }
+                    if (!method.Target.IsRegisterBytecode && !node.HasLoweringFlag(GenTreeLinearFlags.MayCall))
+                    {
+                        throw new InvalidOperationException($"pre-LSRA lowering invariant failed: native GC poll node {node.LinearId} must retain rare-call stack-layout semantics.");
+                    }
                 }
 
                 if (node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedKill) &&

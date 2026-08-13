@@ -2755,6 +2755,103 @@ namespace Cnidaria.C
 
             private void CopyMemory(MachineRegister destination, MachineRegister source, int size)
             {
+                if (size <= 0 || destination == source)
+                    return;
+
+                const int inlineThreshold = 64;
+                if (size <= inlineThreshold)
+                {
+                    EmitInlineMemoryCopy(destination, source, size);
+                    return;
+                }
+
+                PrepareBlockCopyPointers(destination, source);
+                LoadImmediate(Scratch1, size, _owner._target.RegisterSize);
+                LoadImmediate(Scratch0, _owner._target.RegisterSize - 1, _owner._target.RegisterSize);
+
+                var byteLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_byte_loop");
+                var alignLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_align_loop");
+                var wordLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_word_loop");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_memcpy_done");
+                var registerSize = _owner._target.RegisterSize;
+
+                Emit(ArmInstruction.Ternary(
+                    ArmInstrKind.Eor,
+                    Reg(ToArm(Scratch2), registerSize),
+                    Reg(ToArm(Scratch3), registerSize),
+                    Reg(ToArm(Scratch4), registerSize)));
+                Emit(ArmInstruction.Ternary(
+                    ArmInstrKind.And,
+                    Reg(ToArm(Scratch2), registerSize),
+                    Reg(ToArm(Scratch2), registerSize),
+                    Reg(ToArm(Scratch0), registerSize)));
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Ne, byteLoop);
+
+                _owner._text.DefineLabel(alignLoop);
+                Emit(ArmInstruction.Ternary(
+                    ArmInstrKind.And,
+                    Reg(ToArm(Scratch2), registerSize),
+                    Reg(ToArm(Scratch3), registerSize),
+                    Reg(ToArm(Scratch0), registerSize)));
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Eq, wordLoop);
+                LoadFromMemory(Scratch2, Scratch4, 0, 1, false);
+                StoreToMemory(Scratch2, Scratch3, 0, 1);
+                AddImmediate(Scratch4, Scratch4, 1);
+                AddImmediate(Scratch3, Scratch3, 1);
+                AddImmediate(Scratch1, Scratch1, -1);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Ne, alignLoop);
+                EmitJump(done);
+
+                _owner._text.DefineLabel(wordLoop);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(registerSize)));
+                EmitConditionalJump(ArmCondition.Lo, byteLoop);
+                LoadFromMemory(Scratch2, Scratch4, 0, registerSize, false);
+                StoreToMemory(Scratch2, Scratch3, 0, registerSize);
+                AddImmediate(Scratch4, Scratch4, registerSize);
+                AddImmediate(Scratch3, Scratch3, registerSize);
+                AddImmediate(Scratch1, Scratch1, -registerSize);
+                EmitJump(wordLoop);
+
+                _owner._text.DefineLabel(byteLoop);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Eq, done);
+                LoadFromMemory(Scratch2, Scratch4, 0, 1, false);
+                StoreToMemory(Scratch2, Scratch3, 0, 1);
+                AddImmediate(Scratch4, Scratch4, 1);
+                AddImmediate(Scratch3, Scratch3, 1);
+                AddImmediate(Scratch1, Scratch1, -1);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Ne, byteLoop);
+
+                _owner._text.DefineLabel(done);
+            }
+
+            private void PrepareBlockCopyPointers(MachineRegister destination, MachineRegister source)
+            {
+                if (destination == Scratch4 && source == Scratch3)
+                {
+                    MoveRegister(Scratch2, Scratch3, _owner._target.RegisterSize);
+                    MoveRegister(Scratch3, Scratch4, _owner._target.RegisterSize);
+                    MoveRegister(Scratch4, Scratch2, _owner._target.RegisterSize);
+                    return;
+                }
+
+                if (source == Scratch3)
+                {
+                    MoveRegister(Scratch4, source, _owner._target.RegisterSize);
+                    MoveRegister(Scratch3, destination, _owner._target.RegisterSize);
+                    return;
+                }
+
+                MoveRegister(Scratch3, destination, _owner._target.RegisterSize);
+                MoveRegister(Scratch4, source, _owner._target.RegisterSize);
+            }
+
+            private void EmitInlineMemoryCopy(MachineRegister destination, MachineRegister source, int size)
+            {
                 var offset = 0;
                 while (size - offset >= _owner._target.RegisterSize)
                 {
@@ -2783,6 +2880,66 @@ namespace Cnidaria.C
             }
 
             private void ZeroMemory(MachineRegister destination, int size)
+            {
+                if (size <= 0)
+                    return;
+
+                const int inlineThreshold = 64;
+                if (size <= inlineThreshold)
+                {
+                    EmitInlineZeroMemory(destination, size);
+                    return;
+                }
+
+                var pointer = destination == Scratch3 ? Scratch4 : Scratch3;
+                MoveRegister(pointer, destination, _owner._target.RegisterSize);
+                LoadImmediate(Scratch1, size, _owner._target.RegisterSize);
+                LoadImmediate(Scratch0, _owner._target.RegisterSize - 1, _owner._target.RegisterSize);
+                var registerSize = _owner._target.RegisterSize;
+
+                var alignLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_align_loop");
+                var wordLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_word_loop");
+                var byteLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_byte_loop");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_memzero_done");
+
+                _owner._text.DefineLabel(alignLoop);
+                Emit(ArmInstruction.Ternary(
+                    ArmInstrKind.And,
+                    Reg(ToArm(Scratch2), registerSize),
+                    Reg(ToArm(pointer), registerSize),
+                    Reg(ToArm(Scratch0), registerSize)));
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Eq, wordLoop);
+                LoadImmediate(Scratch2, 0, registerSize);
+                StoreToMemory(Scratch2, pointer, 0, 1);
+                AddImmediate(pointer, pointer, 1);
+                AddImmediate(Scratch1, Scratch1, -1);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Ne, alignLoop);
+                EmitJump(done);
+
+                _owner._text.DefineLabel(wordLoop);
+                LoadImmediate(Scratch0, 0, registerSize);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(registerSize)));
+                EmitConditionalJump(ArmCondition.Lo, byteLoop);
+                StoreToMemory(Scratch0, pointer, 0, registerSize);
+                AddImmediate(pointer, pointer, registerSize);
+                AddImmediate(Scratch1, Scratch1, -registerSize);
+                EmitJump(wordLoop);
+
+                _owner._text.DefineLabel(byteLoop);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Eq, done);
+                StoreToMemory(Scratch0, pointer, 0, 1);
+                AddImmediate(pointer, pointer, 1);
+                AddImmediate(Scratch1, Scratch1, -1);
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), registerSize), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Ne, byteLoop);
+
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitInlineZeroMemory(MachineRegister destination, int size)
             {
                 LoadImmediate(Scratch1, 0, _owner._target.RegisterSize);
                 var offset = 0;

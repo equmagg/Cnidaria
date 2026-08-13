@@ -627,6 +627,27 @@ namespace Cnidaria.Cs
                 _text.AddRelocation(loOffset, symbol, 0, RVObjectRelocationKind.PcrelLo12I);
             }
 
+            public void EmitPcrelLoadUnsigned32(string symbol, RVRegister destination)
+            {
+                int hiOffset = _text.ByteLength;
+                Emit(new RVInstruction(
+                    RVInstrKind.Auipc,
+                    destination,
+                    symbol: symbol,
+                    relocationKind: RVRelocationKind.AbsoluteUpper20));
+                _text.AddRelocation(hiOffset, symbol, 0, RVObjectRelocationKind.PcrelHi20);
+
+                int loOffset = _text.ByteLength;
+                Emit(new RVInstruction(
+                    _machineTarget.Is64Bit ? RVInstrKind.Lwu : RVInstrKind.Lw,
+                    destination,
+                    destination,
+                    immediate: 0,
+                    symbol: symbol,
+                    relocationKind: RVRelocationKind.AbsoluteLow12));
+                _text.AddRelocation(loOffset, symbol, 0, RVObjectRelocationKind.PcrelLo12I);
+            }
+
             public void EmitLoadImmediate(RVRegister destination, long value)
             {
                 if (FitsSignedImmediate(value, 12))
@@ -1021,6 +1042,8 @@ namespace Cnidaria.Cs
                 public readonly int Size;
                 public readonly int SaveOffset;
 
+                public bool IsGeneralWord => RegisterClass == RegisterClass.General && Size == 4;
+
                 public DelegateAbiSlice(
                     AbiArgumentLocation location,
                     RegisterClass registerClass,
@@ -1116,6 +1139,20 @@ namespace Cnidaria.Cs
                     Initializer = initializer;
                     StateLabel = stateLabel;
                     Label = label;
+                }
+            }
+
+            private readonly struct GcPollStub
+            {
+                public readonly GenTree Node;
+                public readonly string SlowLabel;
+                public readonly string ContinuationLabel;
+
+                public GcPollStub(GenTree node, string slowLabel, string continuationLabel)
+                {
+                    Node = node;
+                    SlowLabel = slowLabel;
+                    ContinuationLabel = continuationLabel;
                 }
             }
 
@@ -1837,7 +1874,7 @@ namespace Cnidaria.Cs
                             RVRegister.X8,
                             sourceOffset,
                             slice.Size,
-                            signed: false);
+                            signed: _machineTarget.Is64Bit && slice.IsGeneralWord);
                     }
                     else
                     {
@@ -3129,6 +3166,7 @@ namespace Cnidaria.Cs
                 private readonly Dictionary<(int Offset, int Length), string> _staticDataLabels = new Dictionary<(int Offset, int Length), string>();
                 private readonly EhMethodDraft? _ehMethod;
                 private readonly string _returnThunkLabel;
+                private readonly List<GcPollStub> _gcPollStubs = new List<GcPollStub>();
                 private int _nextBlockId = -1;
                 private bool _ehFrameRegistered;
                 private bool _returnThunkNeeded;
@@ -3173,6 +3211,7 @@ namespace Cnidaria.Cs
                         EmitFallthroughFixup(blockId, _nextBlockId);
                         _owner.DefineLabel(_blockEndLabels[blockId]);
                     }
+                    EmitGcPollStubs();
                     BindEhNativeRanges();
                     if (_returnThunkNeeded)
                         EmitReturnThunk();
@@ -3856,7 +3895,7 @@ namespace Cnidaria.Cs
                         case GenTreeKind.Branch:
                             if (node.SourceOp == BytecodeOp.Leave && _ehMethod is not null)
                                 EmitLeave(node);
-                            else
+                            else if (node.TargetBlockId != _nextBlockId)
                                 EmitJump(LabelForTarget(node));
                             return;
                         case GenTreeKind.BranchTrue:
@@ -3976,11 +4015,127 @@ namespace Cnidaria.Cs
                     if (Target.OperatingSystem != OperatingSystemKind.Linux)
                         return;
 
-                    SafePointDraft safePoint = PrepareSafePoint(node);
-                    PublishGcTransition(safePoint);
-                    MarkEhCallSite(node, "gc_poll");
-                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.GcPollSymbol), link: true);
-                    _owner.DefineLabel(safePoint.ReturnLabel);
+                    string slowLabel = _owner.CreateLocalLabel($"{_methodLabel}_gc_poll_slow_{node.LinearId}");
+                    string continuationLabel = _owner.CreateLocalLabel($"{_methodLabel}_gc_poll_continue_{node.LinearId}");
+                    _owner.EmitPcrelLoadUnsigned32(
+                        _owner.ResolveExternalObjectSymbol(RiscVRuntime.GcPollRequestedSymbol),
+                        RVRegister.X31);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, slowLabel);
+                    _owner.DefineLabel(continuationLabel);
+                    _gcPollStubs.Add(new GcPollStub(node, slowLabel, continuationLabel));
+                }
+
+                private void EmitGcPollStubs()
+                {
+                    if (_gcPollStubs.Count == 0)
+                        return;
+
+                    string endLabel = _owner.CreateLocalLabel(_methodLabel + "_gc_poll_stubs_end");
+                    _owner.EmitPcrelTransfer(endLabel, link: false);
+                    for (int i = 0; i < _gcPollStubs.Count; i++)
+                    {
+                        GcPollStub stub = _gcPollStubs[i];
+                        _owner.DefineLabel(stub.SlowLabel);
+                        int saveAreaSize = EmitSaveCallerSavedRegistersForGcPoll();
+                        SafePointDraft safePoint = PrepareSafePoint(stub.Node);
+                        PublishGcTransition(safePoint);
+                        MarkEhGcPollCallSite(stub.Node);
+                        _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.GcPollSymbol), link: true);
+                        _owner.DefineLabel(safePoint.ReturnLabel);
+                        EmitRestoreCallerSavedRegistersForGcPoll(saveAreaSize);
+                        ReloadGcRegisterRoots(stub.Node);
+                        _owner.EmitPcrelTransfer(stub.ContinuationLabel, link: false);
+                    }
+                    _owner.DefineLabel(endLabel);
+                }
+
+                private int EmitSaveCallerSavedRegistersForGcPoll()
+                {
+                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
+                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
+                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
+                    for (int i = 0; i < registers.Length; i++)
+                    {
+                        MachineRegister register = registers[i];
+                        if (RegisterInfo.IsReserved(Target, register))
+                            continue;
+                        int size = RegisterInfo.RegisterSaveSize(Target, register);
+                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                        offset = AlignUp(offset, alignment);
+                        locations.Add((register, offset, size));
+                        offset = checked(offset + size);
+                    }
+
+                    int saveAreaSize = AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    if (saveAreaSize != 0)
+                        _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, -saveAreaSize);
+                    for (int i = 0; i < locations.Count; i++)
+                    {
+                        var location = locations[i];
+                        EmitMemoryStore(location.Register, RVRegister.X2, location.Offset, location.Size);
+                    }
+                    return saveAreaSize;
+                }
+
+                private void EmitRestoreCallerSavedRegistersForGcPoll(int saveAreaSize)
+                {
+                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
+                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
+                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
+                    for (int i = 0; i < registers.Length; i++)
+                    {
+                        MachineRegister register = registers[i];
+                        if (RegisterInfo.IsReserved(Target, register))
+                            continue;
+                        int size = RegisterInfo.RegisterSaveSize(Target, register);
+                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
+                        offset = AlignUp(offset, alignment);
+                        locations.Add((register, offset, size));
+                        offset = checked(offset + size);
+                    }
+                    for (int i = locations.Count - 1; i >= 0; i--)
+                    {
+                        var location = locations[i];
+                        EmitMemoryLoad(location.Register, RVRegister.X2, location.Offset, location.Size, signed: false);
+                    }
+                    if (saveAreaSize != 0)
+                        _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, saveAreaSize);
+                }
+
+                private void ReloadGcRegisterRoots(GenTree node)
+                {
+                    if (!_nodePositions.TryGetValue(node.LinearId, out int position))
+                        throw Unsupported(node, "GC poll has no final LIR position");
+
+                    var liveRoots = new List<RegisterGcLiveRoot>();
+                    for (int i = 0; i < _method.GcLiveRanges.Length; i++)
+                    {
+                        RegisterGcLiveRange range = _method.GcLiveRanges[i];
+                        if (range.FuncletIndex != 0 || range.StartPosition > position || position >= range.EndPosition)
+                            continue;
+                        if (!ContainsRootCell(liveRoots, range.Root))
+                            liveRoots.Add(range.Root);
+                    }
+
+                    for (int i = 0; i < liveRoots.Count; i++)
+                    {
+                        RegisterGcLiveRoot root = liveRoots[i];
+                        if (!root.Location.IsRegister)
+                            continue;
+                        if (root.Offset != 0 || root.Location.RegisterClass != RegisterClass.General)
+                            throw Unsupported(node, "register GC root has an unsupported shape");
+                        int spillOffset = checked(_method.StackFrame.GcSpillAreaOffset + i * Target.PointerSize);
+                        EmitMemoryLoad(root.Location.Register, RVRegister.X8, spillOffset, Target.PointerSize, signed: false);
+                    }
+                }
+
+                private void MarkEhGcPollCallSite(GenTree node)
+                {
+                    if (_ehMethod is null)
+                        return;
+                    if (node.LinearBlockId < 0 || node.LinearBlockId >= _blockLabels.Length)
+                        throw Unsupported(node, "GC poll has no containing block for EH state publication");
+                    EmitEhSetCurrentIp(_blockLabels[node.LinearBlockId]);
                 }
 
                 private void EmitRuntimeTypeCheck(GenTree node, bool throwOnFailure)
@@ -4269,7 +4424,7 @@ namespace Cnidaria.Cs
                     RVRegister allocationCount = count;
                     RVRegister byteCountRegister = RVRegister.X31;
 
-                    if (MachineTarget.Is64Bit)
+                    if (MachineTarget.Is64Bit && !IsI4(OperandType(node, 0), OperandStackKind(node, 0)))
                     {
                         _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X30, count, 0));
                         allocationCount = RVRegister.X30;
@@ -4805,8 +4960,6 @@ namespace Cnidaria.Cs
                                 ToIntegerRegister(destination),
                                 ToIntegerRegister(source),
                                 -1));
-                            if (IsI4(type, kind) && MachineTarget.Is64Bit)
-                                _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, ToIntegerRegister(destination), ToIntegerRegister(destination), 0));
                             return;
                         case BytecodeOp.FnPtrToPtr:
                         case BytecodeOp.PtrToFnPtr:
@@ -4955,15 +5108,12 @@ namespace Cnidaria.Cs
                             return;
                         case BytecodeOp.And:
                             _owner.Emit(RVInstruction.R(RVInstrKind.And, rd, a, b));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Or:
                             _owner.Emit(RVInstruction.R(RVInstrKind.Or, rd, a, b));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Xor:
                             _owner.Emit(RVInstruction.R(RVInstrKind.Xor, rd, a, b));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Shl:
                             EmitIntegerR(i4 ? RVInstrKind.Sllw : RVInstrKind.Sll, rd, a, b, i4);
@@ -4973,20 +5123,16 @@ namespace Cnidaria.Cs
                             EmitIntegerR(i4 ? (unsigned ? RVInstrKind.Srlw : RVInstrKind.Sraw) : (unsigned ? RVInstrKind.Srl : RVInstrKind.Sra), rd, a, b, i4);
                             return;
                         case BytecodeOp.Ceq:
-                            _owner.Emit(RVInstruction.R(
-                                i4 && MachineTarget.Is64Bit ? RVInstrKind.Subw : RVInstrKind.Xor,
-                                RVRegister.X31,
-                                a,
-                                b));
+                            _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X31, a, b));
                             _owner.Emit(RVInstruction.I(RVInstrKind.Sltiu, rd, RVRegister.X31, 1));
                             return;
                         case BytecodeOp.Clt:
                         case BytecodeOp.Clt_Un:
-                            EmitLessThan(rd, a, b, i4, unsigned);
+                            EmitLessThan(rd, a, b, unsigned);
                             return;
                         case BytecodeOp.Cgt:
                         case BytecodeOp.Cgt_Un:
-                            EmitLessThan(rd, b, a, i4, unsigned);
+                            EmitLessThan(rd, b, a, unsigned);
                             return;
                         case BytecodeOp.Add_Ovf:
                         case BytecodeOp.Add_Ovf_Un:
@@ -5031,26 +5177,10 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    _owner.EmitMove(RVRegister.X28, left);
-                    _owner.EmitMove(RVRegister.X29, right);
-                    if (i4 && MachineTarget.Is64Bit)
-                    {
-                        if (unsigned)
-                        {
-                            EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
-                            EmitZeroExtend32(RVRegister.X29, RVRegister.X29);
-                        }
-                        else
-                        {
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X28, RVRegister.X28, 0));
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X29, RVRegister.X29, 0));
-                        }
-                    }
-
                     if (checkDivideByZero)
                     {
                         string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_div_nonzero_{node.LinearId}");
-                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X0, nonZero);
+                        EmitConditionalBranch(RVInstrKind.Bne, right, RVRegister.X0, nonZero);
                         EmitManagedExceptionThrow(node, "DivideByZeroException");
                         _owner.DefineLabel(nonZero);
                     }
@@ -5059,14 +5189,14 @@ namespace Cnidaria.Cs
                     {
                         string perform = _owner.CreateLocalLabel($"{_methodLabel}_div_perform_{node.LinearId}");
                         _owner.EmitLoadImmediate(RVRegister.X30, -1);
-                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X29, RVRegister.X30, perform);
+                        EmitConditionalBranch(RVInstrKind.Bne, right, RVRegister.X30, perform);
                         _owner.EmitLoadImmediate(RVRegister.X30, i4 ? int.MinValue : long.MinValue);
-                        EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X30, perform);
+                        EmitConditionalBranch(RVInstrKind.Bne, left, RVRegister.X30, perform);
                         EmitManagedExceptionThrow(node, "OverflowException");
                         _owner.DefineLabel(perform);
                     }
 
-                    EmitIntegerR(opcode, destination, RVRegister.X28, RVRegister.X29, i4);
+                    EmitIntegerR(opcode, destination, left, right, i4);
                 }
 
                 private void EmitCheckedIntegerBinary(
@@ -5083,19 +5213,6 @@ namespace Cnidaria.Cs
 
                     _owner.EmitMove(RVRegister.X28, left);
                     _owner.EmitMove(RVRegister.X29, right);
-                    if (i4 && MachineTarget.Is64Bit)
-                    {
-                        if (unsigned)
-                        {
-                            EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
-                            EmitZeroExtend32(RVRegister.X29, RVRegister.X29);
-                        }
-                        else
-                        {
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X28, RVRegister.X28, 0));
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X29, RVRegister.X29, 0));
-                        }
-                    }
 
                     string overflow = _owner.CreateLocalLabel($"{_methodLabel}_overflow_{node.LinearId}");
                     string done = _owner.CreateLocalLabel($"{_methodLabel}_checked_done_{node.LinearId}");
@@ -5107,11 +5224,7 @@ namespace Cnidaria.Cs
                             EmitIntegerR(i4 ? RVInstrKind.Addw : RVInstrKind.Add, destination, RVRegister.X28, RVRegister.X29, i4);
                             if (unsigned)
                             {
-                                if (i4 && MachineTarget.Is64Bit)
-                                    EmitZeroExtend32(RVRegister.X30, destination);
-                                else
-                                    _owner.EmitMove(RVRegister.X30, destination);
-                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X30, RVRegister.X28, overflow);
+                                EmitConditionalBranch(RVInstrKind.Bltu, destination, RVRegister.X28, overflow);
                             }
                             else
                             {
@@ -5144,6 +5257,8 @@ namespace Cnidaria.Cs
                             {
                                 if (i4 && MachineTarget.Is64Bit)
                                 {
+                                    EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
+                                    EmitZeroExtend32(RVRegister.X29, RVRegister.X29);
                                     _owner.Emit(RVInstruction.R(RVInstrKind.Mul, RVRegister.X30, RVRegister.X28, RVRegister.X29));
                                     _owner.Emit(RVInstruction.I(RVInstrKind.Srli, RVRegister.X31, RVRegister.X30, 32));
                                     EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
@@ -5221,15 +5336,12 @@ namespace Cnidaria.Cs
                             return;
                         case BytecodeOp.And when FitsSignedImmediate(value, 12):
                             _owner.Emit(RVInstruction.I(RVInstrKind.Andi, rd, rs, value));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Or when FitsSignedImmediate(value, 12):
                             _owner.Emit(RVInstruction.I(RVInstrKind.Ori, rd, rs, value));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Xor when FitsSignedImmediate(value, 12):
                             _owner.Emit(RVInstruction.I(RVInstrKind.Xori, rd, rs, value));
-                            CanonicalizeI4(rd, i4);
                             return;
                         case BytecodeOp.Shl:
                             _owner.Emit(RVInstruction.I(i4 && MachineTarget.Is64Bit ? RVInstrKind.Slliw : RVInstrKind.Slli, rd, rs, value & (i4 ? 31 : MachineTarget.XLen - 1)));
@@ -5290,18 +5402,13 @@ namespace Cnidaria.Cs
                             EmitIntegerNarrow(destination, sourceFloat ? destination : source, 16, signed: false);
                             return;
                         case NumericConvKind.I4:
+                        case NumericConvKind.U4:
                             if (sourceFloat)
-                                EmitFloatToInteger(destination, source, sourceType, sourceKind, unsigned: false, width64: false);
+                                EmitFloatToInteger(destination, source, sourceType, sourceKind, unsigned: node.ConvKind == NumericConvKind.U4, width64: false);
                             else if (MachineTarget.Is64Bit)
                                 _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, ToIntegerRegister(destination), ToIntegerRegister(source), 0));
                             else
                                 _owner.EmitMove(ToIntegerRegister(destination), ToIntegerRegister(source));
-                            return;
-                        case NumericConvKind.U4:
-                            if (sourceFloat)
-                                EmitFloatToInteger(destination, source, sourceType, sourceKind, unsigned: true, width64: false);
-                            else
-                                EmitZeroExtend32(ToIntegerRegister(destination), ToIntegerRegister(source));
                             return;
                         case NumericConvKind.I8:
                         case NumericConvKind.U8:
@@ -5413,13 +5520,8 @@ namespace Cnidaria.Cs
                     bool sourceWidth64 = IsI8(sourceType, sourceKind) ||
                         ((sourceKind is GenStackKind.NativeInt or GenStackKind.NativeUInt) && MachineTarget.Is64Bit);
                     _owner.EmitMove(RVRegister.X28, ToIntegerRegister(source));
-                    if (MachineTarget.Is64Bit && !sourceWidth64)
-                    {
-                        if (sourceUnsigned)
-                            EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
-                        else
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X28, RVRegister.X28, 0));
-                    }
+                    if (MachineTarget.Is64Bit && !sourceWidth64 && sourceUnsigned)
+                        EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
 
                     string overflow = _owner.CreateLocalLabel($"{_methodLabel}_conv_overflow_{node.LinearId}");
                     string valid = _owner.CreateLocalLabel($"{_methodLabel}_conv_valid_{node.LinearId}");
@@ -5646,21 +5748,9 @@ namespace Cnidaria.Cs
                     }
 
                     bool unsigned = IsUnsigned(type) || node.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un;
-                    bool i4 = IsI4(type, kind);
                     RVRegister aReg = ToIntegerRegister(left);
                     RVRegister bReg = ToIntegerRegister(right);
                     RVInstrKind branch;
-
-                    if (node.SourceOp == BytecodeOp.Ceq && i4 && MachineTarget.Is64Bit)
-                    {
-                        _owner.Emit(RVInstruction.R(RVInstrKind.Subw, RVRegister.X31, aReg, bReg));
-                        EmitConditionalBranch(
-                            branchWhenTrue ? RVInstrKind.Beq : RVInstrKind.Bne,
-                            RVRegister.X31,
-                            RVRegister.X0,
-                            target);
-                        return;
-                    }
 
                     switch (node.SourceOp)
                     {
@@ -5683,9 +5773,6 @@ namespace Cnidaria.Cs
                         default:
                             throw Unsupported(node, $"Unsupported compare branch opcode {node.SourceOp}");
                     }
-
-                    if (i4)
-                        NormalizeI4ComparisonOperands(ref aReg, ref bReg, unsigned);
 
                     EmitConditionalBranch(branch, aReg, bReg, target);
                 }
@@ -6092,7 +6179,7 @@ namespace Cnidaria.Cs
                                 RVRegister.X2,
                                 sourceOffset,
                                 slice.Size,
-                                signed: false);
+                                signed: MachineTarget.Is64Bit && slice.IsGeneralWord);
                             continue;
                         }
 
@@ -6301,7 +6388,7 @@ namespace Cnidaria.Cs
                     MachineRegister length = RequireUseRegisterForOperand(node, 0, "array length");
                     MachineRegister result = RequireResultRegister(node);
                     RVRegister checkedLength = ToIntegerRegister(length);
-                    if (MachineTarget.Is64Bit)
+                    if (MachineTarget.Is64Bit && !IsI4(OperandType(node, 0), OperandStackKind(node, 0)))
                     {
                         _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X28, checkedLength, 0));
                         checkedLength = RVRegister.X28;
@@ -6565,12 +6652,7 @@ namespace Cnidaria.Cs
                     if (!nullChecked && (node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         EmitArrayNullCheck(node, array);
 
-                    if (MachineTarget.Is64Bit && IsI4(OperandType(node, 1), OperandStackKind(node, 1)))
-                    {
-                        _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X29, index, 0));
-                        index = RVRegister.X29;
-                    }
-                    else if (index != RVRegister.X29)
+                    if (index != RVRegister.X29)
                     {
                         _owner.EmitMove(RVRegister.X29, index);
                         index = RVRegister.X29;
@@ -6828,7 +6910,7 @@ namespace Cnidaria.Cs
                         ? StackKindForSegment(segments[0])
                         : kind;
                     int size = segments.Length == 1 ? segments[0].Size : StorageSize(type, kind, result);
-                    bool signed = accessType is not null && IsSigned(accessType, accessKind);
+                    bool signed = !IsAggregate(type, kind) && UseSignedScalarLoad(accessType, accessKind, size);
 
                     if (result.IsRegister)
                     {
@@ -7607,12 +7689,9 @@ namespace Cnidaria.Cs
                     RVRegister index = ToIntegerRegister(RequireUseRegisterForOperand(node, 1, "pointer index"));
                     RuntimeType? indexType = OperandType(node, 1);
                     GenStackKind indexKind = OperandStackKind(node, 1);
-                    if (MachineTarget.Is64Bit && IsI4(indexType, indexKind))
+                    if (MachineTarget.Is64Bit && IsI4(indexType, indexKind) && IsUnsigned(indexType))
                     {
-                        if (IsUnsigned(indexType))
-                            EmitZeroExtend32(RVRegister.X30, index);
-                        else
-                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X30, index, 0));
+                        EmitZeroExtend32(RVRegister.X30, index);
                         index = RVRegister.X30;
                     }
 
@@ -7769,7 +7848,7 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    EmitMemoryLoad(destination, baseRegister, offset, size, IsSigned(type, kind));
+                    EmitMemoryLoad(destination, baseRegister, offset, size, UseSignedScalarLoad(type, kind, size));
                 }
 
                 private void EmitStore(RegisterOperand destination, MachineRegister source, RuntimeType? type, GenStackKind kind)
@@ -7949,7 +8028,7 @@ namespace Cnidaria.Cs
                     GenStackKind kind)
                 {
                     int size = StorageSize(type, kind);
-                    EmitMemoryLoad(destination, ToIntegerRegister(address), offset, size, IsSigned(type, kind));
+                    EmitMemoryLoad(destination, ToIntegerRegister(address), offset, size, UseSignedScalarLoad(type, kind, size));
                 }
 
                 private void EmitStoreToAddress(
@@ -7992,6 +8071,9 @@ namespace Cnidaria.Cs
                         _owner.Emit(RVInstruction.R(RVInstrKind.FcvtDW, RVRegister.F29, RVRegister.X0, RVRegister.X0));
                     EmitMemoryStore(MachineRegister.F29, ToIntegerRegister(address), offset, size);
                 }
+
+                private bool UseSignedScalarLoad(RuntimeType? type, GenStackKind kind, int size)
+                    => IsSigned(type, kind) || (MachineTarget.Is64Bit && size == 4 && IsI4(type, kind));
 
                 private void EmitMemoryLoad(MachineRegister destination, RVRegister baseRegister, int offset, int size, bool signed)
                 {
@@ -8153,40 +8235,8 @@ namespace Cnidaria.Cs
                     _owner.Emit(RVInstruction.R(opcode, destination, left, right));
                 }
 
-                private void EmitLessThan(RVRegister destination, RVRegister left, RVRegister right, bool i4, bool unsigned)
-                {
-                    if (i4)
-                        NormalizeI4ComparisonOperands(ref left, ref right, unsigned);
-                    _owner.Emit(RVInstruction.R(unsigned ? RVInstrKind.Sltu : RVInstrKind.Slt, destination, left, right));
-                }
-
-                private void NormalizeI4ComparisonOperands(ref RVRegister left, ref RVRegister right, bool unsigned)
-                {
-                    if (!MachineTarget.Is64Bit)
-                        return;
-
-                    if (left == RVRegister.X30)
-                    {
-                        NormalizeI4ComparisonOperand(RVRegister.X31, left, unsigned);
-                        NormalizeI4ComparisonOperand(RVRegister.X30, right, unsigned);
-                    }
-                    else
-                    {
-                        NormalizeI4ComparisonOperand(RVRegister.X30, right, unsigned);
-                        NormalizeI4ComparisonOperand(RVRegister.X31, left, unsigned);
-                    }
-
-                    left = RVRegister.X31;
-                    right = RVRegister.X30;
-                }
-
-                private void NormalizeI4ComparisonOperand(RVRegister destination, RVRegister source, bool unsigned)
-                {
-                    if (unsigned)
-                        EmitZeroExtend32(destination, source);
-                    else
-                        _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, destination, source, 0));
-                }
+                private void EmitLessThan(RVRegister destination, RVRegister left, RVRegister right, bool unsigned)
+                    => _owner.Emit(RVInstruction.R(unsigned ? RVInstrKind.Sltu : RVInstrKind.Slt, destination, left, right));
 
                 private void EmitZeroExtend32(RVRegister destination, RVRegister source)
                 {
@@ -8197,12 +8247,6 @@ namespace Cnidaria.Cs
                     }
                     _owner.Emit(RVInstruction.I(RVInstrKind.Slli, destination, source, 32));
                     _owner.Emit(RVInstruction.I(RVInstrKind.Srli, destination, destination, 32));
-                }
-
-                private void CanonicalizeI4(RVRegister register, bool i4)
-                {
-                    if (i4 && MachineTarget.Is64Bit)
-                        _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, register, register, 0));
                 }
 
                 private void RequireM(GenTree node)

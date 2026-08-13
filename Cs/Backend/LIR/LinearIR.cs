@@ -72,8 +72,8 @@ namespace Cnidaria.Cs
         // The node is an ABI shaped call. Lowering must expose argument and return registers
         AbiCall = 1 << 0,
 
-        // The node can clobber caller saved registers. This is broader than AbiCall because
-        // helper expanded nodes such as allocation and type check nodes may still lower to calls
+        // The node can clobber caller saved registers.
+        // Helper expanded nodes such as allocation and type check nodes may still lower to calls
         CallerSavedKill = 1 << 1,
 
         // The backend expects all non contained operands and any result to be registers
@@ -91,6 +91,9 @@ namespace Cnidaria.Cs
 
         UnusedValue = 1 << 8,
         CallerSavedRegistersPreserved = 1 << 9,
+
+        // The lowered node may execute a real ABI call on a rare path
+        MayCall = 1 << 10,
     }
     internal enum LirOperandFlags : ushort
     {

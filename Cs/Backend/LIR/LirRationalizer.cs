@@ -1919,11 +1919,11 @@ namespace Cnidaria.Cs
                     flags: GenTreeFlags.SideEffect | GenTreeFlags.Ordered,
                     operands: ImmutableArray<GenTree>.Empty);
 
-                var flags = GenTreeLinearFlags.IsStandaloneLoweredNode | GenTreeLinearFlags.GcSafePoint;
-                if (_target.IsRegisterBytecode)
-                    flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
-                else
-                    flags |= GenTreeLinearFlags.CallerSavedKill;
+                var flags = GenTreeLinearFlags.IsStandaloneLoweredNode |
+                    GenTreeLinearFlags.GcSafePoint |
+                    GenTreeLinearFlags.CallerSavedRegistersPreserved;
+                if (!_target.IsRegisterBytecode)
+                    flags |= GenTreeLinearFlags.MayCall;
 
                 var lowering = new GenTreeLinearLoweringInfo(
                     flags,

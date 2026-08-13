@@ -1076,7 +1076,7 @@ namespace Cnidaria.C
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                     if (loc.Kind == AbiLocationKind.Register)
                     {
-                        CopyMemory(destinationAddress, loc.Register, value.Size);
+                        CopyMemory(destinationAddress, loc.Register, value.Size, BlockAlignment(type));
                     }
                     else if (loc.Kind == AbiLocationKind.Stack)
                     {
@@ -1086,7 +1086,7 @@ namespace Cnidaria.C
                             IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
                             _owner._target.PointerSize,
                             signed: false);
-                        CopyMemory(destinationAddress, GpScratch1, value.Size);
+                        CopyMemory(destinationAddress, GpScratch1, value.Size, BlockAlignment(type));
                     }
                     else
                     {
@@ -1124,7 +1124,7 @@ namespace Cnidaria.C
                     var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                     AddImmediate(GpScratch1, Sp, IncomingStackOffset(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)));
-                    CopyMemory(destinationAddress, GpScratch1, value.Size);
+                    CopyMemory(destinationAddress, GpScratch1, value.Size, BlockAlignment(type));
                     return;
                 }
 
@@ -1195,14 +1195,14 @@ namespace Cnidaria.C
                 if (IsAggregateType(instruction.Result.Type))
                 {
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
-                    ZeroMemory(destinationAddress, SizeOf(instruction.Result.Type));
+                    ZeroMemory(destinationAddress, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                     return;
                 }
 
                 if (RequiresStackBackedScalar(instruction.Result.Type))
                 {
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
-                    ZeroMemory(destinationAddress, SizeOf(instruction.Result.Type));
+                    ZeroMemory(destinationAddress, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                     return;
                 }
 
@@ -1628,7 +1628,7 @@ namespace Cnidaria.C
                     if (source.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
                     {
                         var address = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
-                        ZeroMemory(address, SizeOf(instruction.Result.Type));
+                        ZeroMemory(address, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                         return true;
                     }
 
@@ -2169,7 +2169,7 @@ namespace Cnidaria.C
                 {
                     var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                     MaterializeAddress(instruction.Address, GpScratch1);
-                    CopyMemory(destinationAddress, GpScratch1, SizeOf(instruction.Result.Type));
+                    CopyMemory(destinationAddress, GpScratch1, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                     return;
                 }
 
@@ -2180,11 +2180,11 @@ namespace Cnidaria.C
                     if (sourceAddress.Offset != 0)
                     {
                         AddImmediate(GpScratch1, sourceAddress.BaseRegister, sourceAddress.Offset);
-                        CopyMemory(destinationAddress, GpScratch1, SizeOf(instruction.Result.Type));
+                        CopyMemory(destinationAddress, GpScratch1, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                     }
                     else
                     {
-                        CopyMemory(destinationAddress, sourceAddress.BaseRegister, SizeOf(instruction.Result.Type));
+                        CopyMemory(destinationAddress, sourceAddress.BaseRegister, SizeOf(instruction.Result.Type), BlockAlignment(instruction.Result.Type));
                     }
                     return;
                 }
@@ -2208,7 +2208,7 @@ namespace Cnidaria.C
                 {
                     MaterializeAddress(instruction.Address, GpScratch0);
                     MaterializeOperandStorageAddress(instruction.Operands[0], GpScratch1, instruction);
-                    CopyMemory(GpScratch0, GpScratch1, SizeOf(storeType));
+                    CopyMemory(GpScratch0, GpScratch1, SizeOf(storeType), BlockAlignment(storeType));
                     return;
                 }
 
@@ -2219,11 +2219,11 @@ namespace Cnidaria.C
                     if (destinationAddress.Offset != 0)
                     {
                         AddImmediate(GpScratch0, destinationAddress.BaseRegister, destinationAddress.Offset);
-                        CopyMemory(GpScratch0, sourceAddress, SizeOf(storeType));
+                        CopyMemory(GpScratch0, sourceAddress, SizeOf(storeType), BlockAlignment(storeType));
                     }
                     else
                     {
-                        CopyMemory(destinationAddress.BaseRegister, sourceAddress, SizeOf(storeType));
+                        CopyMemory(destinationAddress.BaseRegister, sourceAddress, SizeOf(storeType), BlockAlignment(storeType));
                     }
                     return;
                 }
@@ -2239,7 +2239,7 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Invalid zeromem instruction.");
                 var size = instruction.Operands.Length == 0 ? SizeOf(instruction.Address.ElementType) : ImmediateToInt32(instruction.Operands[0]);
                 MaterializeAddress(instruction.Address, GpScratch0);
-                ZeroMemory(GpScratch0, size);
+                ZeroMemory(GpScratch0, size, BlockAlignment(instruction.Address.ElementType));
             }
 
             private void EmitCall(LirInstruction instruction)
@@ -2684,7 +2684,7 @@ namespace Cnidaria.C
                     var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                     MaterializeOperandStorageAddress(operand, GpScratch0, instruction);
                     AddImmediate(GpScratch1, Sp, _allocation.Frame.OutgoingArgumentAreaOffset + loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize));
-                    CopyMemory(GpScratch1, GpScratch0, value.Size);
+                    CopyMemory(GpScratch1, GpScratch0, value.Size, BlockAlignment(operand.Type));
                     return;
                 }
 
@@ -3104,7 +3104,7 @@ namespace Cnidaria.C
                     if (value.PassingKind == AbiPassingKind.Indirect)
                     {
                         MaterializeIncomingHiddenReturnBufferAddress(GpScratch1);
-                        CopyMemory(GpScratch1, GpScratch0, value.Size);
+                        CopyMemory(GpScratch1, GpScratch0, value.Size, BlockAlignment(operand.Type));
                         EmitEpilogue();
                         EmitReturnInstruction();
                         return;
@@ -3127,7 +3127,7 @@ namespace Cnidaria.C
                 {
                     var sourceAddress = MaterializeScalarStorageAddress(operand, GpScratch0, instruction);
                     MaterializeIncomingHiddenReturnBufferAddress(GpScratch1);
-                    CopyMemory(GpScratch1, sourceAddress, returnAbi.Size);
+                    CopyMemory(GpScratch1, sourceAddress, returnAbi.Size, BlockAlignment(returnType));
                     EmitEpilogue();
                     EmitReturnInstruction();
                     return;
@@ -3194,7 +3194,7 @@ namespace Cnidaria.C
                             ? MaterializeAnyStorageAddress(copy.Source, GpScratch0, instruction)
                             : MaterializeScalarStorageAddress(copy.Source, GpScratch0, instruction);
                         AddImmediate(GpScratch1, Sp, tempOffset + tempCursor);
-                        CopyMemory(GpScratch1, sourceAddress, SizeOf(copy.Destination.Type));
+                        CopyMemory(GpScratch1, sourceAddress, SizeOf(copy.Destination.Type), BlockAlignment(copy.Destination.Type));
                         tempCursor += AlignUp(SizeOf(copy.Destination.Type), _owner._allocationOptions.SpillSlotAlignment);
                     }
                     else
@@ -3212,7 +3212,7 @@ namespace Cnidaria.C
                     {
                         var dest = MaterializeVirtualRegisterStorageAddress(copy.Destination, GpScratch0);
                         AddImmediate(GpScratch1, Sp, tempOffset + tempCursor);
-                        CopyMemory(dest, GpScratch1, SizeOf(copy.Destination.Type));
+                        CopyMemory(dest, GpScratch1, SizeOf(copy.Destination.Type), BlockAlignment(copy.Destination.Type));
                         tempCursor += AlignUp(SizeOf(copy.Destination.Type), _owner._allocationOptions.SpillSlotAlignment);
                     }
                     else
@@ -3582,7 +3582,7 @@ namespace Cnidaria.C
                         if (size > _allocation.Frame.FloatingImmediateTempSize)
                             throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Undefined scalar storage materialization requires a runtime helper.");
                         AddImmediate(destination, Sp, _allocation.Frame.FloatingImmediateTempOffset);
-                        ZeroMemory(destination, size);
+                        ZeroMemory(destination, size, BlockAlignment(operand.Type));
                         return destination;
                 }
 
@@ -3601,7 +3601,7 @@ namespace Cnidaria.C
                 var size = SizeOf(destination.Type);
                 if (source.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
                 {
-                    ZeroMemory(destinationAddress, size);
+                    ZeroMemory(destinationAddress, size, BlockAlignment(destination.Type));
                     return;
                 }
 
@@ -3615,7 +3615,7 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Stack-backed scalar copy requires equal source and destination sizes.");
 
                 var sourceAddress = MaterializeScalarStorageAddress(source, GpScratch1, instruction);
-                CopyMemory(destinationAddress, sourceAddress, size);
+                CopyMemory(destinationAddress, sourceAddress, size, BlockAlignment(destination.Type));
             }
 
             private void StoreImmediateScalarToMemory(LirOperand operand, MachineRegister baseRegister, int offset, int size, LirInstruction instruction)
@@ -3672,11 +3672,11 @@ namespace Cnidaria.C
                 var size = SizeOf(destination.Type);
                 if (source.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
                 {
-                    ZeroMemory(destinationAddress, size);
+                    ZeroMemory(destinationAddress, size, BlockAlignment(destination.Type));
                     return;
                 }
                 MaterializeOperandStorageAddress(source, GpScratch1, instruction);
-                CopyMemory(destinationAddress, GpScratch1, size);
+                CopyMemory(destinationAddress, GpScratch1, size, BlockAlignment(destination.Type));
             }
 
             private void MaterializeIncomingHiddenReturnBufferAddress(MachineRegister destination)
@@ -3792,19 +3792,217 @@ namespace Cnidaria.C
                 Emit(RVInstruction.R(RVInstrKind.Div, ToRegister(register), ToRegister(register), ToRegister(scratch)));
             }
 
-            private void CopyMemory(MachineRegister destination, MachineRegister source, int size)
+            private void CopyMemory(MachineRegister destination, MachineRegister source, int size, int alignment)
             {
-                for (var i = 0; i < Math.Max(0, size); i++)
+                if (size <= 0 || destination == source)
+                    return;
+
+                const int inlineThreshold = 16;
+                var accessSize = BlockAccessSize(alignment);
+                if (size <= inlineThreshold && (accessSize > 1 || size <= 4))
                 {
-                    LoadFromMemory(GpScratch2, source, i, 1, signed: false);
-                    StoreToMemory(GpScratch2, destination, i, 1);
+                    EmitInlineMemoryCopy(destination, source, size, accessSize);
+                    return;
+                }
+
+                if (accessSize > 1)
+                {
+                    PrepareBlockCopyPointers(destination, source);
+                    var bulkSize = size - size % accessSize;
+                    if (bulkSize != 0)
+                    {
+                        LoadImmediate(GpScratch6, bulkSize);
+                        var loop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_known_loop");
+                        _owner._text.DefineLabel(loop);
+                        LoadFromMemory(GpScratch2, GpScratch5, 0, accessSize, signed: false);
+                        StoreToMemory(GpScratch2, GpScratch4, 0, accessSize);
+                        AddImmediate(GpScratch5, GpScratch5, accessSize);
+                        AddImmediate(GpScratch4, GpScratch4, accessSize);
+                        AddImmediate(GpScratch6, GpScratch6, -accessSize);
+                        EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
+                    }
+
+                    var tailSize = size - bulkSize;
+                    if (tailSize != 0)
+                        EmitInlineMemoryCopy(GpScratch4, GpScratch5, tailSize, accessSize);
+                    return;
+                }
+
+                PrepareBlockCopyPointers(destination, source);
+                LoadImmediate(GpScratch6, size);
+                LoadImmediate(GpScratch0, _owner._target.RegisterSize);
+
+                var byteLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_byte_loop");
+                var alignLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_align_loop");
+                var wordLoop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_word_loop");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_memcpy_done");
+                var wordSize = _owner._target.RegisterSize;
+                var alignmentMask = wordSize - 1;
+
+                Emit(RVInstruction.R(RVInstrKind.Xor, ToRegister(GpScratch3), ToRegister(GpScratch4), ToRegister(GpScratch5)));
+                EmitImm(RVInstrKind.Andi, GpScratch3, GpScratch3, alignmentMask);
+                EmitBranch(RVInstrKind.Bne, GpScratch3, MachineRegister.X0, byteLoop);
+
+                _owner._text.DefineLabel(alignLoop);
+                EmitImm(RVInstrKind.Andi, GpScratch3, GpScratch4, alignmentMask);
+                EmitBranch(RVInstrKind.Beq, GpScratch3, MachineRegister.X0, wordLoop);
+                LoadFromMemory(GpScratch2, GpScratch5, 0, 1, signed: false);
+                StoreToMemory(GpScratch2, GpScratch4, 0, 1);
+                AddImmediate(GpScratch5, GpScratch5, 1);
+                AddImmediate(GpScratch4, GpScratch4, 1);
+                AddImmediate(GpScratch6, GpScratch6, -1);
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, alignLoop);
+                EmitJump(done);
+
+                _owner._text.DefineLabel(wordLoop);
+                EmitBranch(RVInstrKind.Bltu, GpScratch6, GpScratch0, byteLoop);
+                LoadFromMemory(GpScratch2, GpScratch5, 0, wordSize, signed: false);
+                StoreToMemory(GpScratch2, GpScratch4, 0, wordSize);
+                AddImmediate(GpScratch5, GpScratch5, wordSize);
+                AddImmediate(GpScratch4, GpScratch4, wordSize);
+                AddImmediate(GpScratch6, GpScratch6, -wordSize);
+                EmitJump(wordLoop);
+
+                _owner._text.DefineLabel(byteLoop);
+                EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, done);
+                LoadFromMemory(GpScratch2, GpScratch5, 0, 1, signed: false);
+                StoreToMemory(GpScratch2, GpScratch4, 0, 1);
+                AddImmediate(GpScratch5, GpScratch5, 1);
+                AddImmediate(GpScratch4, GpScratch4, 1);
+                AddImmediate(GpScratch6, GpScratch6, -1);
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, byteLoop);
+
+                _owner._text.DefineLabel(done);
+            }
+
+            private void PrepareBlockCopyPointers(MachineRegister destination, MachineRegister source)
+            {
+                if (destination == GpScratch5 && source == GpScratch4)
+                {
+                    MoveRegister(GpScratch6, GpScratch4);
+                    MoveRegister(GpScratch4, GpScratch5);
+                    MoveRegister(GpScratch5, GpScratch6);
+                    return;
+                }
+
+                if (source == GpScratch4)
+                {
+                    MoveRegister(GpScratch5, source);
+                    MoveRegister(GpScratch4, destination);
+                    return;
+                }
+
+                MoveRegister(GpScratch4, destination);
+                MoveRegister(GpScratch5, source);
+            }
+
+            private void EmitInlineMemoryCopy(MachineRegister destination, MachineRegister source, int size, int maxAccessSize)
+            {
+                var offset = 0;
+                for (var accessSize = maxAccessSize; accessSize >= 1; accessSize >>= 1)
+                {
+                    while (size - offset >= accessSize)
+                    {
+                        LoadFromMemory(GpScratch2, source, offset, accessSize, signed: false);
+                        StoreToMemory(GpScratch2, destination, offset, accessSize);
+                        offset += accessSize;
+                    }
                 }
             }
 
-            private void ZeroMemory(MachineRegister destination, int size)
+            private void ZeroMemory(MachineRegister destination, int size, int alignment)
             {
-                for (var i = 0; i < Math.Max(0, size); i++)
-                    StoreToMemory(MachineRegister.X0, destination, i, 1);
+                if (size <= 0)
+                    return;
+
+                const int inlineThreshold = 16;
+                var accessSize = BlockAccessSize(alignment);
+                if (size <= inlineThreshold && (accessSize > 1 || size <= 4))
+                {
+                    EmitInlineZeroMemory(destination, size, accessSize);
+                    return;
+                }
+
+                if (accessSize > 1)
+                {
+                    var pointer = destination == GpScratch4 ? GpScratch5 : GpScratch4;
+                    MoveRegister(pointer, destination);
+                    var bulkSize = size - size % accessSize;
+                    if (bulkSize != 0)
+                    {
+                        LoadImmediate(GpScratch6, bulkSize);
+                        var loop = _owner.CreateLocalLabel(_functionLabel + "_memzero_known_loop");
+                        _owner._text.DefineLabel(loop);
+                        StoreToMemory(MachineRegister.X0, pointer, 0, accessSize);
+                        AddImmediate(pointer, pointer, accessSize);
+                        AddImmediate(GpScratch6, GpScratch6, -accessSize);
+                        EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
+                    }
+
+                    var tailSize = size - bulkSize;
+                    if (tailSize != 0)
+                        EmitInlineZeroMemory(pointer, tailSize, accessSize);
+                    return;
+                }
+
+                var dynamicPointer = destination == GpScratch4 ? GpScratch5 : GpScratch4;
+                MoveRegister(dynamicPointer, destination);
+                LoadImmediate(GpScratch6, size);
+                LoadImmediate(GpScratch0, _owner._target.RegisterSize);
+
+                var alignLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_align_loop");
+                var wordLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_word_loop");
+                var byteLoop = _owner.CreateLocalLabel(_functionLabel + "_memzero_byte_loop");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_memzero_done");
+                var wordSize = _owner._target.RegisterSize;
+                var alignmentMask = wordSize - 1;
+
+                _owner._text.DefineLabel(alignLoop);
+                EmitImm(RVInstrKind.Andi, GpScratch3, dynamicPointer, alignmentMask);
+                EmitBranch(RVInstrKind.Beq, GpScratch3, MachineRegister.X0, wordLoop);
+                StoreToMemory(MachineRegister.X0, dynamicPointer, 0, 1);
+                AddImmediate(dynamicPointer, dynamicPointer, 1);
+                AddImmediate(GpScratch6, GpScratch6, -1);
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, alignLoop);
+                EmitJump(done);
+
+                _owner._text.DefineLabel(wordLoop);
+                EmitBranch(RVInstrKind.Bltu, GpScratch6, GpScratch0, byteLoop);
+                StoreToMemory(MachineRegister.X0, dynamicPointer, 0, wordSize);
+                AddImmediate(dynamicPointer, dynamicPointer, wordSize);
+                AddImmediate(GpScratch6, GpScratch6, -wordSize);
+                EmitJump(wordLoop);
+
+                _owner._text.DefineLabel(byteLoop);
+                EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, done);
+                StoreToMemory(MachineRegister.X0, dynamicPointer, 0, 1);
+                AddImmediate(dynamicPointer, dynamicPointer, 1);
+                AddImmediate(GpScratch6, GpScratch6, -1);
+                EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, byteLoop);
+
+                _owner._text.DefineLabel(done);
+            }
+
+            private void EmitInlineZeroMemory(MachineRegister destination, int size, int maxAccessSize)
+            {
+                var offset = 0;
+                for (var accessSize = maxAccessSize; accessSize >= 1; accessSize >>= 1)
+                {
+                    while (size - offset >= accessSize)
+                    {
+                        StoreToMemory(MachineRegister.X0, destination, offset, accessSize);
+                        offset += accessSize;
+                    }
+                }
+            }
+
+            private int BlockAccessSize(int alignment)
+            {
+                var accessSize = _owner._target.RegisterSize;
+                alignment = Math.Max(1, alignment);
+                while (accessSize > 1 && alignment % accessSize != 0)
+                    accessSize >>= 1;
+                return accessSize;
             }
 
             private void LoadRawBitsFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size)
@@ -4473,6 +4671,9 @@ namespace Cnidaria.C
 
             private int SizeOf(QualifiedType type)
                 => Math.Max(1, _owner._target.SizeOf(type));
+
+            private int BlockAlignment(QualifiedType type)
+                => Math.Max(1, _owner._target.AlignOf(type));
 
             private int SizeOfRegisterType(QualifiedType type)
             {
