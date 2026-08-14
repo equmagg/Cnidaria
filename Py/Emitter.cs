@@ -331,7 +331,8 @@ namespace Cnidaria.Python
             InitializeHiddenComprehensionLocals();
 
             var statements = SyntaxAccess.GetNode(root, 0);
-            var parsedDocString = TryGetDocString(statements, out var docStatement);
+            SyntaxNode? docStatement = null;
+            var parsedDocString = _options.ReplMode ? null : TryGetDocString(statements, out docStatement);
             var moduleDocString = _options.OptimizationLevel < 2
                 ? parsedDocString
                 : null;
@@ -1107,6 +1108,10 @@ namespace Cnidaria.Python
 
                 case SyntaxKind.ExpressionStatement:
                     EmitExpression(SyntaxAccess.GetNode(statement, 0));
+                    if (_options.ReplMode && _codeUnitKind == CodeUnitKind.Module)
+                    {
+                        _bytecode.Emit(PythonOpcode.CallIntrinsic1, (int)PythonIntrinsic1.Print, statement.Span);
+                    }
                     _bytecode.Emit(PythonOpcode.PopTop, sourceSpan: statement.Span);
                     return;
 

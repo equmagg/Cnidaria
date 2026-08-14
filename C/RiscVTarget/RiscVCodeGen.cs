@@ -1783,9 +1783,7 @@ namespace Cnidaria.C
                     return;
 
                 var dst = GetWritableRegister(instruction.Result, GpScratch0);
-                var left = LoadOperand(instruction.Operands[0], GpScratch1);
-                var right = LoadOperand(instruction.Operands[1], GpScratch2);
-                EmitIntegerBinary(instruction, dst, left, right);
+                EmitIntegerBinary(instruction, dst);
                 NormalizeIntegerRegister(dst, instruction.Result.Type);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
@@ -1910,10 +1908,17 @@ namespace Cnidaria.C
                 {
                     var dst = GetWritableRegister(instruction.Result, GpScratch0);
                     var ptr = LoadOperand(instruction.Operands[0], GpScratch1);
-                    var index = LoadOperand(instruction.Operands[1], GpScratch2);
-                    MoveRegister(GpScratch2, index);
-                    ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    if (TryGetScaledPointerImmediate(instruction.Operands[1], PointerScale(lhsType), negate: false, out var offset))
+                    {
+                        EmitImm(RVInstrKind.Addi, dst, ptr, offset);
+                    }
+                    else
+                    {
+                        var index = LoadOperand(instruction.Operands[1], GpScratch2);
+                        MoveRegister(GpScratch2, index);
+                        ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
                 }
@@ -1921,11 +1926,18 @@ namespace Cnidaria.C
                 if (op == "+" && IsIntegerLike(lhsType) && IsPointerLike(rhsType))
                 {
                     var dst = GetWritableRegister(instruction.Result, GpScratch0);
-                    var index = LoadOperand(instruction.Operands[0], GpScratch2);
                     var ptr = LoadOperand(instruction.Operands[1], GpScratch1);
-                    MoveRegister(GpScratch2, index);
-                    ScaleIndex(GpScratch2, PointerScale(rhsType), GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    if (TryGetScaledPointerImmediate(instruction.Operands[0], PointerScale(rhsType), negate: false, out var offset))
+                    {
+                        EmitImm(RVInstrKind.Addi, dst, ptr, offset);
+                    }
+                    else
+                    {
+                        var index = LoadOperand(instruction.Operands[0], GpScratch2);
+                        MoveRegister(GpScratch2, index);
+                        ScaleIndex(GpScratch2, PointerScale(rhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
                 }
@@ -1934,10 +1946,17 @@ namespace Cnidaria.C
                 {
                     var dst = GetWritableRegister(instruction.Result, GpScratch0);
                     var ptr = LoadOperand(instruction.Operands[0], GpScratch1);
-                    var index = LoadOperand(instruction.Operands[1], GpScratch2);
-                    MoveRegister(GpScratch2, index);
-                    ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    if (TryGetScaledPointerImmediate(instruction.Operands[1], PointerScale(lhsType), negate: true, out var offset))
+                    {
+                        EmitImm(RVInstrKind.Addi, dst, ptr, offset);
+                    }
+                    else
+                    {
+                        var index = LoadOperand(instruction.Operands[1], GpScratch2);
+                        MoveRegister(GpScratch2, index);
+                        ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                    }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
                 }
@@ -1958,6 +1977,11 @@ namespace Cnidaria.C
                 if ((op == "==" || op == "!=") && IsPointerLike(lhsType) && IsPointerLike(rhsType))
                 {
                     var dst = GetWritableRegister(instruction.Result, GpScratch0);
+                    if (TryEmitPointerEqualityImmediate(instruction, dst))
+                    {
+                        StoreWritableRegisterIfSpilled(instruction.Result, dst);
+                        return true;
+                    }
                     var left = LoadOperand(instruction.Operands[0], GpScratch1);
                     var right = LoadOperand(instruction.Operands[1], GpScratch2);
                     EmitEquality(dst, left, right, op == "==");
@@ -1968,7 +1992,142 @@ namespace Cnidaria.C
                 return false;
             }
 
-            private void EmitIntegerBinary(LirInstruction instruction, MachineRegister dst, MachineRegister left, MachineRegister right)
+            private bool TryGetScaledPointerImmediate(LirOperand operand, int scale, bool negate, out int immediate)
+            {
+                if (!IsIntegerImmediate(operand))
+                {
+                    immediate = 0;
+                    return false;
+                }
+
+                var operationBits = _owner._target.RegisterSize * 8;
+                var bits = GetIntegerImmediateBits(operand, operationBits);
+                var scaled = MaskIntegerBits(unchecked(bits * (ulong)scale), operationBits);
+                if (negate)
+                    scaled = MaskIntegerBits(unchecked(0UL - scaled), operationBits);
+                return TryEncodeSignedImmediate12(scaled, operationBits, out immediate);
+            }
+
+            private bool TryEmitPointerEqualityImmediate(LirInstruction instruction, MachineRegister dst)
+            {
+                var leftOperand = instruction.Operands[0];
+                var rightOperand = instruction.Operands[1];
+                if (!IsIntegerImmediate(rightOperand) && IsIntegerImmediate(leftOperand))
+                    (leftOperand, rightOperand) = (rightOperand, leftOperand);
+                if (!IsIntegerImmediate(rightOperand)
+                    || !TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var immediate))
+                    return false;
+
+                EmitEqualityImmediate(dst, LoadOperand(leftOperand, GpScratch1), immediate, instruction.Operator == "==");
+                return true;
+            }
+
+            private void EmitIntegerBinary(LirInstruction instruction, MachineRegister dst)
+            {
+                if (TryEmitIntegerBinaryImmediate(instruction, dst))
+                    return;
+
+                var left = LoadOperand(instruction.Operands[0], GpScratch1);
+                var right = LoadOperand(instruction.Operands[1], GpScratch2);
+                EmitIntegerBinaryRegisters(instruction, dst, left, right);
+            }
+
+            private bool TryEmitIntegerBinaryImmediate(LirInstruction instruction, MachineRegister dst)
+            {
+                var leftOperand = instruction.Operands[0];
+                var rightOperand = instruction.Operands[1];
+                var op = instruction.Operator;
+
+                if (rightOperand.Kind != LirOperandKind.Immediate && leftOperand.Kind == LirOperandKind.Immediate)
+                {
+                    if (op is "+" or "&" or "|" or "^" or "==" or "!=")
+                    {
+                        (leftOperand, rightOperand) = (rightOperand, leftOperand);
+                    }
+                    else
+                    {
+                        var swappedRelation = op switch
+                        {
+                            "<" => ">",
+                            "<=" => ">=",
+                            ">" => "<",
+                            ">=" => "<=",
+                            _ => null,
+                        };
+                        if (swappedRelation is null)
+                            return false;
+                        (leftOperand, rightOperand) = (rightOperand, leftOperand);
+                        op = swappedRelation;
+                    }
+                }
+
+                if (!IsIntegerImmediate(rightOperand))
+                    return false;
+
+                var signed = IsSignedIntegerType(instruction.Operands[0].Type) || IsSignedIntegerType(instruction.Operands[1].Type);
+                var wordOp = _owner._target.Is64Bit && Math.Max(SizeOf(instruction.Operands[0].Type), SizeOf(instruction.Operands[1].Type)) <= 4;
+                var operationBits = wordOp ? 32 : _owner._target.RegisterSize * 8;
+
+                switch (op)
+                {
+                    case "+":
+                        if (!TryGetSignedImmediate12(rightOperand, operationBits, out var addImmediate))
+                            return false;
+                        EmitImm(wordOp ? RVInstrKind.Addiw : RVInstrKind.Addi, dst, LoadOperand(leftOperand, GpScratch1), addImmediate);
+                        return true;
+                    case "-":
+                        if (!TryGetNegatedSignedImmediate12(rightOperand, operationBits, out var subtractImmediate))
+                            return false;
+                        EmitImm(wordOp ? RVInstrKind.Addiw : RVInstrKind.Addi, dst, LoadOperand(leftOperand, GpScratch1), subtractImmediate);
+                        return true;
+                    case "&":
+                    case "|":
+                    case "^":
+                        if (!TryGetSignedImmediate12(rightOperand, operationBits, out var bitwiseImmediate))
+                            return false;
+                        var bitwiseOpcode = op == "&" ? RVInstrKind.Andi : op == "|" ? RVInstrKind.Ori : RVInstrKind.Xori;
+                        EmitImm(bitwiseOpcode, dst, LoadOperand(leftOperand, GpScratch1), bitwiseImmediate);
+                        return true;
+                    case "<<":
+                    case ">>":
+                        var shiftBits = wordOp ? 32 : _owner._target.RegisterSize * 8;
+                        var shiftAmount = GetShiftImmediate(rightOperand, shiftBits);
+                        var shiftOpcode = op == "<<"
+                            ? (wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli)
+                            : signed
+                                ? (wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai)
+                                : (wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli);
+                        EmitShiftImmediate(shiftOpcode, dst, LoadOperand(leftOperand, GpScratch1), shiftAmount);
+                        return true;
+                    case "==":
+                    case "!=":
+                        if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var equalityImmediate))
+                            return false;
+                        EmitEqualityImmediate(dst, LoadOperand(leftOperand, GpScratch1), equalityImmediate, op == "==");
+                        return true;
+                    case "<":
+                    case ">=":
+                        if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var relationImmediate))
+                            return false;
+                        EmitImm(signed ? RVInstrKind.Slti : RVInstrKind.Sltiu, dst, LoadOperand(leftOperand, GpScratch1), relationImmediate);
+                        if (op == ">=")
+                            EmitImm(RVInstrKind.Xori, dst, dst, 1);
+                        return true;
+                    case "<=":
+                    case ">":
+                        if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var boundImmediate)
+                            || !TryGetComparisonSuccessorImmediate(boundImmediate, signed, out var successorImmediate))
+                            return false;
+                        EmitImm(signed ? RVInstrKind.Slti : RVInstrKind.Sltiu, dst, LoadOperand(leftOperand, GpScratch1), successorImmediate);
+                        if (op == ">")
+                            EmitImm(RVInstrKind.Xori, dst, dst, 1);
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
+            private void EmitIntegerBinaryRegisters(LirInstruction instruction, MachineRegister dst, MachineRegister left, MachineRegister right)
             {
                 var signed = IsSignedIntegerType(instruction.Operands[0].Type) || IsSignedIntegerType(instruction.Operands[1].Type);
                 var wordOp = _owner._target.Is64Bit && Math.Max(SizeOf(instruction.Operands[0].Type), SizeOf(instruction.Operands[1].Type)) <= 4;
@@ -2002,6 +2161,95 @@ namespace Cnidaria.C
                     default: throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
                 }
             }
+
+            private void EmitEqualityImmediate(MachineRegister dst, MachineRegister left, int immediate, bool equal)
+            {
+                if (immediate == 0)
+                {
+                    if (equal)
+                        EmitImm(RVInstrKind.Sltiu, dst, left, 1);
+                    else
+                        Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(dst), RVRegister.X0, ToRegister(left)));
+                    return;
+                }
+
+                EmitImm(RVInstrKind.Xori, dst, left, immediate);
+                if (equal)
+                    EmitImm(RVInstrKind.Sltiu, dst, dst, 1);
+                else
+                    Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(dst), RVRegister.X0, ToRegister(dst)));
+            }
+
+            private static bool IsIntegerImmediate(LirOperand operand)
+                => operand.Kind == LirOperandKind.Immediate && operand.Immediate is not string && !IsFloatType(operand.Type);
+
+            private bool IsZeroIntegerImmediate(LirOperand operand)
+                => IsIntegerImmediate(operand) && GetIntegerImmediateBits(operand, 64) == 0;
+
+            private bool TryGetSignedImmediate12(LirOperand operand, int operationBits, out int immediate)
+                => TryEncodeSignedImmediate12(GetIntegerImmediateBits(operand, operationBits), operationBits, out immediate);
+
+            private bool TryGetNegatedSignedImmediate12(LirOperand operand, int operationBits, out int immediate)
+            {
+                var bits = GetIntegerImmediateBits(operand, operationBits);
+                var negated = MaskIntegerBits(unchecked(0UL - bits), operationBits);
+                return TryEncodeSignedImmediate12(negated, operationBits, out immediate);
+            }
+
+            private ulong GetIntegerImmediateBits(LirOperand operand, int operationBits)
+            {
+                if (!IsIntegerImmediate(operand))
+                    throw new InvalidOperationException("Expected integer immediate operand.");
+
+                var registerBits = _owner._target.RegisterSize * 8;
+                var raw = unchecked((ulong)ConvertIntegerConstant(operand.Immediate));
+                if (IsIntegerLike(operand.Type))
+                {
+                    var typeBits = checked(SizeOf(operand.Type) * 8);
+                    if (typeBits > 0 && typeBits < registerBits)
+                    {
+                        var typeMask = (1UL << typeBits) - 1;
+                        raw &= typeMask;
+                        if (IsSignedIntegerType(operand.Type) && (raw & (1UL << (typeBits - 1))) != 0)
+                            raw |= ~typeMask;
+                    }
+                }
+
+                return MaskIntegerBits(raw, operationBits);
+            }
+
+            private int GetShiftImmediate(LirOperand operand, int operationBits)
+                => (int)(GetIntegerImmediateBits(operand, operationBits) & (ulong)(operationBits - 1));
+
+            private static bool TryEncodeSignedImmediate12(ulong bits, int operationBits, out int immediate)
+            {
+                bits = MaskIntegerBits(bits, operationBits);
+                var low = (int)(bits & 0xfffUL);
+                immediate = (low & 0x800) != 0 ? low - 0x1000 : low;
+                return MaskIntegerBits(unchecked((ulong)(long)immediate), operationBits) == bits;
+            }
+
+            private static bool TryGetComparisonSuccessorImmediate(int immediate, bool signed, out int successor)
+            {
+                if (!signed && immediate == -1)
+                {
+                    successor = 0;
+                    return false;
+                }
+
+                var candidate = (long)immediate + 1;
+                if (!FitsSignedImmediate(candidate, 12))
+                {
+                    successor = 0;
+                    return false;
+                }
+
+                successor = (int)candidate;
+                return true;
+            }
+
+            private static ulong MaskIntegerBits(ulong value, int bits)
+                => bits >= 64 ? value : value & ((1UL << bits) - 1);
 
             private void EmitEquality(MachineRegister dst, MachineRegister left, MachineRegister right, bool equal)
             {
@@ -2895,7 +3143,7 @@ namespace Cnidaria.C
                 }
                 else
                 {
-                    cond = LoadOperand(instruction.Operands[0], GpScratch0);
+                    cond = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
                 }
 
                 if (trueFallsThrough && !falseFallsThrough)
@@ -2938,8 +3186,8 @@ namespace Cnidaria.C
                 if (RequiresStackBackedScalar(left.Type) || RequiresStackBackedScalar(right.Type))
                     throw HelperRequired(instruction, SelectScalarMoveHelper(left.Type), "Comparison branch on a scalar wider than one machine register is not implemented yet.");
 
-                var leftRegisterInteger = LoadOperand(left, GpScratch1);
-                var rightRegisterInteger = LoadOperand(right, GpScratch2);
+                var leftRegisterInteger = LoadIntegerBranchOperand(left, GpScratch1);
+                var rightRegisterInteger = LoadIntegerBranchOperand(right, GpScratch2);
                 var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
                 var opcode = SelectIntegerBranchOpcode(instruction.Operator, signed, out var swapOperands);
                 EmitBranch(
@@ -2955,20 +3203,20 @@ namespace Cnidaria.C
             {
                 var left = instruction.Operands[0];
                 var right = instruction.Operands[1];
-                LoadWideIntegerOperand(left, GpScratch0, GpScratch1, instruction);
-                LoadWideIntegerOperand(right, GpScratch2, GpScratch3, instruction);
+                LoadWideIntegerBranchOperand(left, GpScratch0, GpScratch1, instruction, out var leftLow, out var leftHigh);
+                LoadWideIntegerBranchOperand(right, GpScratch2, GpScratch3, instruction, out var rightLow, out var rightHigh);
                 var trueLabel = LabelOf(instruction.TrueTarget);
                 var falseLabel = LabelOf(instruction.FalseTarget);
 
                 if (instruction.Operator == "==")
                 {
-                    EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, falseLabel);
-                    EmitBranch(RVInstrKind.Beq, GpScratch0, GpScratch2, trueLabel);
+                    EmitBranch(RVInstrKind.Bne, leftHigh, rightHigh, falseLabel);
+                    EmitBranch(RVInstrKind.Beq, leftLow, rightLow, trueLabel);
                 }
                 else if (instruction.Operator == "!=")
                 {
-                    EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, trueLabel);
-                    EmitBranch(RVInstrKind.Bne, GpScratch0, GpScratch2, trueLabel);
+                    EmitBranch(RVInstrKind.Bne, leftHigh, rightHigh, trueLabel);
+                    EmitBranch(RVInstrKind.Bne, leftLow, rightLow, trueLabel);
                 }
                 else
                 {
@@ -2977,24 +3225,24 @@ namespace Cnidaria.C
                     switch (instruction.Operator)
                     {
                         case "<":
-                            EmitBranch(highLess, GpScratch1, GpScratch3, trueLabel);
-                            EmitBranch(highLess, GpScratch3, GpScratch1, falseLabel);
-                            EmitBranch(RVInstrKind.Bltu, GpScratch0, GpScratch2, trueLabel);
+                            EmitBranch(highLess, leftHigh, rightHigh, trueLabel);
+                            EmitBranch(highLess, rightHigh, leftHigh, falseLabel);
+                            EmitBranch(RVInstrKind.Bltu, leftLow, rightLow, trueLabel);
                             break;
                         case "<=":
-                            EmitBranch(highLess, GpScratch1, GpScratch3, trueLabel);
-                            EmitBranch(highLess, GpScratch3, GpScratch1, falseLabel);
-                            EmitBranch(RVInstrKind.Bgeu, GpScratch2, GpScratch0, trueLabel);
+                            EmitBranch(highLess, leftHigh, rightHigh, trueLabel);
+                            EmitBranch(highLess, rightHigh, leftHigh, falseLabel);
+                            EmitBranch(RVInstrKind.Bgeu, rightLow, leftLow, trueLabel);
                             break;
                         case ">":
-                            EmitBranch(highLess, GpScratch3, GpScratch1, trueLabel);
-                            EmitBranch(highLess, GpScratch1, GpScratch3, falseLabel);
-                            EmitBranch(RVInstrKind.Bltu, GpScratch2, GpScratch0, trueLabel);
+                            EmitBranch(highLess, rightHigh, leftHigh, trueLabel);
+                            EmitBranch(highLess, leftHigh, rightHigh, falseLabel);
+                            EmitBranch(RVInstrKind.Bltu, rightLow, leftLow, trueLabel);
                             break;
                         case ">=":
-                            EmitBranch(highLess, GpScratch3, GpScratch1, trueLabel);
-                            EmitBranch(highLess, GpScratch1, GpScratch3, falseLabel);
-                            EmitBranch(RVInstrKind.Bgeu, GpScratch0, GpScratch2, trueLabel);
+                            EmitBranch(highLess, rightHigh, leftHigh, trueLabel);
+                            EmitBranch(highLess, leftHigh, rightHigh, falseLabel);
+                            EmitBranch(RVInstrKind.Bgeu, leftLow, rightLow, trueLabel);
                             break;
                         default:
                             throw Unsupported(instruction, $"Unsupported comparison branch operator '{instruction.Operator}'.");
@@ -3003,6 +3251,33 @@ namespace Cnidaria.C
 
                 if (!IsFallthroughTarget(instruction.FalseTarget))
                     EmitJump(falseLabel);
+            }
+
+            private MachineRegister LoadIntegerBranchOperand(LirOperand operand, MachineRegister preferred)
+            {
+                if (IsZeroIntegerImmediate(operand))
+                    return MachineRegister.X0;
+                return LoadOperand(operand, preferred);
+            }
+
+            private void LoadWideIntegerBranchOperand(
+                LirOperand operand,
+                MachineRegister lowScratch,
+                MachineRegister highScratch,
+                LirInstruction instruction,
+                out MachineRegister low,
+                out MachineRegister high)
+            {
+                if (IsZeroIntegerImmediate(operand))
+                {
+                    low = MachineRegister.X0;
+                    high = MachineRegister.X0;
+                    return;
+                }
+
+                LoadWideIntegerOperand(operand, lowScratch, highScratch, instruction);
+                low = lowScratch;
+                high = highScratch;
             }
 
             private static RVInstrKind SelectIntegerBranchOpcode(string op, bool signed, out bool swapOperands)
@@ -3057,15 +3332,21 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Switch expects one key operand.");
                 if (IsRv32WideInteger(instruction.Operands[0].Type))
                 {
-                    LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+                    LoadWideIntegerBranchOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction, out var keyLow, out var keyHigh);
                     foreach (var @case in instruction.SwitchCases)
                     {
                         var next = _owner.CreateLocalLabel(_functionLabel + "_i64_switch_next");
                         var value = unchecked((ulong)ImmediateToInt64(@case.Value));
-                        LoadImmediate(GpScratch2, unchecked((int)value));
-                        LoadImmediate(GpScratch3, unchecked((int)(value >> 32)));
-                        EmitBranch(RVInstrKind.Bne, GpScratch1, GpScratch3, next);
-                        EmitBranch(RVInstrKind.Beq, GpScratch0, GpScratch2, LabelOf(@case.Target));
+                        var lowValue = unchecked((int)value);
+                        var highValue = unchecked((int)(value >> 32));
+                        var lowRegister = lowValue == 0 ? MachineRegister.X0 : GpScratch2;
+                        var highRegister = highValue == 0 ? MachineRegister.X0 : GpScratch3;
+                        if (lowRegister != MachineRegister.X0)
+                            LoadImmediate(lowRegister, lowValue);
+                        if (highRegister != MachineRegister.X0)
+                            LoadImmediate(highRegister, highValue);
+                        EmitBranch(RVInstrKind.Bne, keyHigh, highRegister, next);
+                        EmitBranch(RVInstrKind.Beq, keyLow, lowRegister, LabelOf(@case.Target));
                         _owner._text.DefineLabel(next);
                     }
 
@@ -3076,11 +3357,14 @@ namespace Cnidaria.C
                 if (RequiresStackBackedScalar(instruction.Operands[0].Type))
                     throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Operands[0].Type), "Switch on scalar wider than one machine register is not implemented yet.");
 
-                var key = LoadOperand(instruction.Operands[0], GpScratch0);
+                var key = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
                 foreach (var @case in instruction.SwitchCases)
                 {
-                    LoadImmediate(GpScratch1, ImmediateToInt64(@case.Value));
-                    EmitBranch(RVInstrKind.Beq, key, GpScratch1, LabelOf(@case.Target));
+                    var caseValue = ImmediateToInt64(@case.Value);
+                    var caseRegister = caseValue == 0 ? MachineRegister.X0 : GpScratch1;
+                    if (caseRegister != MachineRegister.X0)
+                        LoadImmediate(caseRegister, caseValue);
+                    EmitBranch(RVInstrKind.Beq, key, caseRegister, LabelOf(@case.Target));
                 }
 
                 if (!IsFallthroughTarget(instruction.Target))

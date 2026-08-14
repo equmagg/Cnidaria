@@ -10478,7 +10478,8 @@ namespace Cnidaria.Python
             switch (intrinsic)
             {
                 case PythonIntrinsic1.Print:
-                    AppendOutput(Str(argument) + "\n");
+                    if (!argument.IsNone)
+                        AppendOutput(Repr(argument, 0) + "\n");
                     return VmValue.None;
                 case PythonIntrinsic1.UnaryPositive:
                     if (IsInteger(argument))

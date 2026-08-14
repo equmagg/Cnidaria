@@ -309,6 +309,7 @@ namespace Cnidaria.Python
         public int FirstLineNumber { get; init; } = 1;
         public int OptimizationLevel { get; init; }
         public bool EmitNoMonitoringFlag { get; init; }
+        public bool ReplMode { get; init; }
     }
 
     public sealed class EmitResult
